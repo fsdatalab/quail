@@ -26,7 +26,9 @@ class Scan:
     the query returns its text. The
     projection pushdown rule fills ``columns``; before it runs the
     tuple is empty. ``predicates`` are regular predicates, all of which a
-    document must pass before any operator reads it.
+    document must pass before any operator reads it. ``schema`` is the
+    provider's Arrow schema, which types the plan's result; a front end
+    sets it from the catalog.
     """
 
     provider: str
@@ -34,6 +36,7 @@ class Scan:
     column: Any  # a value expression, or "" before a prompt names one
     columns: tuple = ()  # tuple[str, ...]
     predicates: tuple = ()  # tuple[RegularPredicate, ...]
+    schema: Any = None  # pa.Schema
 
     type_name: ClassVar[str] = "quail.scan"
 

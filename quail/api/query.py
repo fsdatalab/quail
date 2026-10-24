@@ -18,7 +18,7 @@ from quail.execution.projection import projection_for
 from quail.execution.reporting import collect_answers, execution_report
 from quail.execution.result import QueryResult
 from quail.execution.runner import ExecutionContext, GenericRunner
-from quail.execution.schema import cte_table, result_schema
+from quail.execution.schema import cte_table
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import estimated_rows, explain
 from quail.logical import (
@@ -27,6 +27,7 @@ from quail.logical import (
     WithPlan,
     column_name,
     cte_column_names,
+    cte_schema,
     join_conditions,
     oriented_join_conditions,
 )
@@ -572,7 +573,7 @@ class WithQuery:
         self._view = session.with_ctes(self.ctes)
         self._schemas = {}
         for cte in logical.ctes:
-            schema = result_schema(cte.plan, self._view.catalog)
+            schema = cte_schema(cte.plan)
             self._view.catalog.register(cte.name, MemoryTableProvider(
                 schema.empty_table(), id_col="", identity=f"cte:{cte.name}"))
             self._schemas[cte.name] = schema

@@ -9,7 +9,6 @@ from quail.api.query import Query, QueryLike, WithQuery
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, LayeredInputs, TableProvider
 from quail.catalog.tokens import GigatokenEncoder
-from quail.execution.schema import result_schema
 from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.prompts import PromptBinder
@@ -139,7 +138,7 @@ class Session:
                                dialect=SQLDialect(dialect).value)
         logical = compile_sql(
             text, self.catalog, dialect=dialect,
-            prompts=PromptBinder(model=self.model), cte_schema=result_schema,
+            prompts=PromptBinder(model=self.model),
         )
         if isinstance(logical, WithPlan):
             return WithQuery(self, logical, order=order)

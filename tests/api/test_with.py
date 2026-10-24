@@ -10,9 +10,9 @@ import quail
 from quail.api import execute as execution
 from quail.api.query import ASSUMED_ANSWER_TOKENS, WithQuery
 from quail.catalog import Catalog, DocumentProvider
-from quail.execution.schema import cte_table, result_schema
+from quail.execution.schema import cte_table
 from quail.frontend.sql import compile_sql
-from quail.logical import CompileError, WithPlan
+from quail.logical import CompileError, WithPlan, cte_schema
 from quail.planner.plan import EngineConfig
 
 CONTRACTS = pa.table({
@@ -255,31 +255,30 @@ def test_cte_results_have_the_schema_the_next_stage_was_compiled_for(session):
                    "{'terms': 'q?', 'when': 'w?'}) AS clause FROM contracts c",
         "aggregate": "SELECT AI.CLASSIFY(PROMPT('k {0}', c.text), "
                      "ARRAY['lease', 'deed']) AS kind, COUNT(*) AS n, "
-                     "AVG(c.id) AS mean_id, MAX(c.id) AS top "
+                     "AVG(c.id) AS mean_id, MAX(c.id) AS top, SUM(c.id) AS total "
                      "FROM contracts c GROUP BY kind",
         "window": "SELECT c.id, AI.SCORE(PROMPT('s {0}', c.text)) AS s, "
                   "ROW_NUMBER() OVER (ORDER BY c.id) AS rank, "
-                  "LAG(c.id) OVER (ORDER BY c.id) AS before "
+                  "LAG(c.id) OVER (ORDER BY c.id) AS before, "
+                  "SUM(c.id) OVER (ORDER BY c.id) AS running, "
+                  "COUNT(c.id) OVER (ORDER BY c.id) AS seen "
                   "FROM contracts c",
     }
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     labels=["lease", "deed", "lease"], probabilities=True)
     for name, text in queries.items():
         query = session.sql(text)
-        schema = result_schema(query.logical, session.catalog)
+        schema = cte_schema(query.logical)
         result = execution.execute_query(query, physical_executor=oracle_executor(
             oracle))
         table = cte_table(result.collect(), schema)
         assert table.schema == schema, name
     kinds = cte_table(result.collect(), schema)
     with pytest.raises(ValueError, match="compiled for"):
-        cte_table(kinds, result_schema(session.sql(queries["score"]).logical,
-                                       session.catalog))
-    assert result_schema(session.sql(queries["label"]).logical,
-                         session.catalog).names == ["id", "kind",
-                                                    "kind_probabilities"]
-    assert result_schema(session.sql(queries["extract"]).logical,
-                         session.catalog).names == [
+        cte_table(kinds, cte_schema(session.sql(queries["score"]).logical))
+    assert cte_schema(session.sql(queries["label"]).logical).names == [
+        "id", "kind", "kind_probabilities"]
+    assert cte_schema(session.sql(queries["extract"]).logical).names == [
         "id", "n", "clause", "clause_span"]
 
 
@@ -312,15 +311,12 @@ def test_with_rejects_what_the_stages_cannot_express(session):
     ):
         with pytest.raises(CompileError, match=message):
             session.sql(sql)
-    with pytest.raises(CompileError, match="Session.sql"):
-        compile_sql(f"WITH clauses AS ({extract}) {read}", session.catalog)
     assert isinstance(compile_sql(extract, session.catalog), type(
         session.sql(extract).logical))
     with pytest.raises(RuntimeError, match="edited plans"):
         session.sql(f"WITH clauses AS ({extract}) {read}").run(plan=object())
     assert isinstance(compile_sql(
-        f"WITH clauses AS ({extract}) {read}", session.catalog,
-        cte_schema=result_schema), WithPlan)
+        f"WITH clauses AS ({extract}) {read}", session.catalog), WithPlan)
 
 
 def test_a_session_closes_the_token_files_of_its_cte_results(tmp_path):

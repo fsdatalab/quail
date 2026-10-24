@@ -1,6 +1,5 @@
 """Parse SQL with SQLGlot and construct a Quail logical plan."""
 
-from collections.abc import Callable
 from enum import StrEnum
 
 import sqlglot
@@ -33,6 +32,7 @@ from quail.logical import (
     LogicalPlanBuilder,
     WithPlan,
     column_name,
+    cte_schema,
     is_score,
 )
 from quail.logical.expressions import aliased_call
@@ -231,7 +231,6 @@ def compile_sql(
     turn: tuple[str, str] = ("", ""),
     layout: str = "ai-if",
     prompts: PromptBinder | None = None,
-    cte_schema: Callable | None = None,
 ) -> LogicalPlan | WithPlan:
     """Compile AI SQL text into a LogicalPlan, or a WithPlan for a WITH query.
 
@@ -244,10 +243,6 @@ def compile_sql(
         turn: Model chat text placed before and after each prompt.
         layout: Prompt layout used by the model.
         prompts: Model-aware prompt binder. Overrides turn and layout.
-        cte_schema: Returns the Arrow schema of a CTE's result from its
-            LogicalPlan and the catalog it reads, so the queries reading
-            the CTE are compiled against its columns. Required when the
-            statement has a CTE or a subquery in FROM.
 
     Returns:
         The bound logical query plan: a WithPlan when the statement has
@@ -283,10 +278,6 @@ def compile_sql(
               if scope.scope_type is not ScopeType.SUBQUERY]
     if len(scopes) == 1:
         return _compile_select(tree, catalog, prompts, dialect)
-    if cte_schema is None:
-        raise CompileError(
-            "a WITH query or a subquery in FROM needs the schema of each "
-            "stage's result; compile it through Session.sql()")
     tables = Catalog(dict(catalog.providers))
     ctes = []
     for scope in scopes:
@@ -304,8 +295,7 @@ def compile_sql(
             raise CompileError(f"the CTE {name!r} is defined twice")
         ctes.append(Cte(name, plan, reads))
         tables.register(name, MemoryTableProvider(
-            cte_schema(plan, tables).empty_table(), id_col="",
-            identity=f"cte:{name}"))
+            cte_schema(plan).empty_table(), id_col="", identity=f"cte:{name}"))
     raise AssertionError("traverse_scope lists the statement's scope last")
 
 
@@ -386,6 +376,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
             ),
             extracts=tuple(extracts.get(alias, ())),
             extract_filters=tuple(b.extract_tests.get(alias, ())),
+            schema=catalog.get(provider).schema(),
         )
     for join in b.joins:
         logical.add_join(join)

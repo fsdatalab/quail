@@ -817,6 +817,7 @@ class Query:
                                for column in extracted
                                if column.expression.aliases() == (alias,)),
                 extract_filters=tuple(self._extract_filters.get(alias, ())),
+                schema=self._catalog.get(provider).schema(),
             )
         for join in self._joins:
             logical.add_join(join)
