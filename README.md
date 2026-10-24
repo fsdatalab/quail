@@ -7,11 +7,11 @@
 [![Docs](https://img.shields.io/badge/docs-fsdatalab.github.io%2Fquail-blue)](https://fsdatalab.github.io/quail)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Quail (QUery-Aware Inference Layer) runs language models over large
-datasets, from SQL, on your own GPUs. Co-optimized query planning and
-LLM inference make Quail lightning fast: **1.8x faster on average**
-than well-tuned vLLM baselines, and **up to 14x faster** on queries
-with AI joins
+Quail (QUery-Aware Inference Layer) runs LLMs over large datasets,
+from SQL, on your own GPUs. Quail's secret sauce is to optimize LLM
+inference and memory management for each query as a whole. This makes
+Quail lightning fast: **1.8x faster on average** than well-tuned vLLM
+baselines, and **up to 14x faster** on queries with AI joins
 ([details](https://fsdatalab.github.io/blog/introducing-quail/)).
 
 ```sql
