@@ -13,9 +13,10 @@ import numpy as np
 
 from quail.backends.quail.executor.readout import _HostReadout
 
-# rows per encode block, bounding the pre-activation the torch path
-# materializes (BLOCK_ROWS x sae_num_features floats)
-BLOCK_ROWS = 512
+# bytes of fp32 pre-activation one torch encode block materializes: it
+# lives in the device memory the arena leaves unclaimed (POOL_FRACTION
+# in quail.cost.budgets), and fewer, larger blocks mean fewer launches
+ENCODE_BLOCK_BYTES = 256 * 2**20
 
 
 # the fused path's histogram bins and candidate buffer capacity: bins
@@ -178,11 +179,16 @@ class SaeEncoder:
                 # without triton, the blocked torch path serves
                 pass
         indices, strengths = [], []
-        for start in range(0, rows.shape[0], BLOCK_ROWS):
-            pre = self._pre(rows[start:start + BLOCK_ROWS])
+        block = max(1, ENCODE_BLOCK_BYTES // (4 * self.num_features))
+        for start in range(0, rows.shape[0], block):
+            # the fp32 bias promotes the bf16 GEMM output in one pass; a
+            # negative value is selected only when a row has fewer than
+            # keep positives, and the clamp on the selection zeroes it
+            pre = self.F.linear(rows[start:start + block].to(torch.bfloat16),
+                                self.weight) + self.bias
             values, index = torch.topk(pre, self.keep, dim=1)
             indices.append(index.to(torch.int32))
-            strengths.append(values)
+            strengths.append(values.clamp_(min=0.0))
         return torch.cat(indices), torch.cat(strengths)
 
     def _fused_top_features(self, rows):
