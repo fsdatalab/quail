@@ -280,8 +280,8 @@ def test_a_with_query_runs_its_cte_before_the_select_on_the_server(make_client):
         content_id, sql=server_fakes.WITH_SQL)).json()
     final = wait_done(client, status["id"])
     assert final["state"] == "succeeded", final
-    assert "with kept:" in final["plan"]["text"]
-    assert "query:" in final["plan"]["text"]
+    assert "QueryStage kept:" in final["plan"]["text"]
+    assert "QueryStage query:" in final["plan"]["text"]
     rows = client.get(f"/v1/queries/{status['id']}/rows").json()
     assert rows["columns"] == ["a.id"]
     assert sorted(row[0] for row in rows["rows"]) == ["r0", "r1", "r3", "r4"]

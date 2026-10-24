@@ -139,7 +139,9 @@ def projection_for(logical, token_inputs, documents):
                 )
             store = token_inputs[source.alias]
             for ref in column_references(source_columns[name]):
-                if ref.column not in store.projected_columns:
+                loaded = (store.column_names if isinstance(store, pa.Table)
+                          else store.projected_columns)
+                if ref.column not in loaded:
                     raise CompileError(
                         f"projection column {name!r} was not loaded by the "
                         f"scan of {source.alias!r}; the "

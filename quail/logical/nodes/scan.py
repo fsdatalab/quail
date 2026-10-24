@@ -47,7 +47,8 @@ class Scan:
         return self.predicates
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        sources = source_columns(self.column)
+        sources = (source_columns(self.column) if self.column
+                   else tuple(self.schema.names) if self.schema is not None else ())
         fields = [ColumnRef(self.alias, self.provider, source) for source in sources]
         fields.extend(
             ColumnRef(self.alias, self.provider, column)
@@ -57,7 +58,8 @@ class Scan:
         return tuple(fields)
 
     def validate(self) -> None:
-        if not self.provider or not self.alias or not self.column:
+        if (not self.provider or not self.alias
+                or (not self.column and self.schema is None)):
             raise CompileError("Scan needs a provider, alias, and column")
         if not isinstance(self.column, str):
             self.column.validate()

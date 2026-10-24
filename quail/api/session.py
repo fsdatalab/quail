@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from quail.api.builder import BoundBuilder
-from quail.api.query import Query, QueryLike, WithQuery
+from quail.api.query import Query, QueryLike
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, TableProvider
 from quail.catalog.tokens import GigatokenEncoder
@@ -11,7 +11,6 @@ from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql
-from quail.logical import WithPlan
 from quail.planner.plan import EngineConfig, Refusal, RefusalError, resolve_model
 from quail.specs.files import resolve_model_path
 
@@ -122,8 +121,7 @@ class Session:
         """Compile SQL locally or prepare it for remote submission.
 
         Returns:
-            A local ``Query`` when the session has no endpoint, or a
-            ``WithQuery`` for a statement with a WITH clause. A remote
+            A local ``Query`` when the session has no endpoint. A remote
             session returns ``RemoteQuery`` and the server compiles the SQL.
         """
         if self._remote is not None:
@@ -135,8 +133,6 @@ class Session:
             text, self.catalog, dialect=dialect,
             prompts=PromptBinder(model=self.model),
         )
-        if isinstance(logical, WithPlan):
-            return WithQuery(self, logical, order=order)
         return Query(self, logical, order=order)
 
     def get_run(self, query_id: str):

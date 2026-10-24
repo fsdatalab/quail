@@ -4,14 +4,16 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
-from helpers.oracle import Oracle, oracle_executor
+from helpers.oracle import Oracle, finish, oracle_executor
 
 import quail
 from quail.api import execute as execution
-from quail.api.query import ASSUMED_ANSWER_TOKENS, Query, WithQuery, cte_table
+from quail.api.query import Query
+from quail.api.stages import ASSUMED_ANSWER_TOKENS, cte_table
 from quail.catalog import DocumentProvider
 from quail.logical import CompileError, cte_schema
-from quail.planner.plan import EngineConfig
+from quail.physical import QueryStage, decode_graph, encode_graph
+from quail.planner.plan import EngineConfig, PhysicalPlan
 
 CONTRACTS = pa.table({
     "id": [1, 2, 3],
@@ -73,7 +75,13 @@ def run(query, oracle):
 
 def test_extraction_then_score_sends_the_extracted_text_to_the_scorer(session):
     query = session.sql(EXTRACT_THEN_SCORE)
-    assert isinstance(query, WithQuery)
+    assert isinstance(query, Query)
+    plan = query.plan()
+    assert isinstance(plan, PhysicalPlan)
+    assert all(isinstance(node, QueryStage) for node in plan.nodes)
+    envelope = plan.to_envelope(session.registry.codecs)
+    decoded = decode_graph(envelope["graph"], session.registry.codecs)
+    assert encode_graph(decoded, session.registry.codecs) == envelope["graph"]
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     scores=lambda spec, ids: 0.9 if ids[0] == 0 else 0.1)
     result, recorder = run(query, oracle)
@@ -93,9 +101,12 @@ def test_extraction_then_score_sends_the_extracted_text_to_the_scorer(session):
     assert result.report["ctes"]["clauses"]["wall_s"] == 1.0
     assert result.report["ctes"]["clauses"]["node_metrics"]["ai-extract:0"][
         "evaluated_documents"] == 3
+    assert result.plan == query.plan().graph
+    assert "AiExtract" in result.explain()
+    assert "quail.ai_score" in result.explain()
 
 
-def test_a_label_feeds_a_later_filter_and_dependent_ctes_run_in_order(session):
+def test_filters_over_a_materialized_label_share_one_pipeline(session):
     query = session.sql("""
         WITH kinds AS (
             SELECT c.id, c.text,
@@ -107,21 +118,24 @@ def test_a_label_feeds_a_later_filter_and_dependent_ctes_run_in_order(session):
             SELECT k.id, k.kind FROM kinds k
             WHERE AI.IF(PROMPT('is a lease: {0}', k.kind))
         )
-        SELECT l.id FROM leases l
+        SELECT l.id AS result_id FROM leases l
         WHERE AI.IF(PROMPT('kept: {0}', l.kind))
-    """, dialect="bq")
-    assert [name for name, _ in query.logical.ctes] == ["kinds", "leases"]
+    """, dialect="bq", order="as_written")
+    assert [name for name, _ in query.logical.stages() if name] == ["kinds"]
     oracle = Oracle(
         labels=["lease", "deed", "lease"],
-        filters=lambda alias, document, position: {
-            "k": [True, False, True], "l": [True, False]}[alias][document])
+        filters=lambda alias, document, position: (
+            [True, False, True] if position == 0 else [True, False, False])[document])
     result, recorder = run(query, oracle)
-    assert result.collect().column("l.id").to_pylist() == [1]
+    assert result.collect().column("result_id").to_pylist() == [1]
     assert [list(request.inputs) for request in recorder.requests] == [
-        ["c"], ["k"], ["l"]]
+        ["c"], ["k"]]
     # the label column is text in the CTE's table, and the filter read it
     assert recorder.documents["k"] == [[["lease"], ["deed"], ["lease"]]]
-    assert recorder.documents["l"] == [[["lease"], ["lease"]]]
+    from quail.physical.pipelines import build_pipelines
+
+    graph = query.plan().nodes[-1].graph
+    assert any(len(pipeline) == 2 for pipeline in build_pipelines(graph).values())
 
 
 def test_a_cte_runs_once_however_many_times_it_is_read(session):
@@ -141,7 +155,7 @@ def test_a_cte_runs_once_however_many_times_it_is_read(session):
           ON AI.IF(PROMPT('same clause? {0} {1}', a.clause.terms, b.clause.terms))
     """, dialect="bq")
     # a CTE nothing reads is left out
-    assert [name for name, _ in query.logical.ctes] == ["clauses"]
+    assert [name for name, _ in query.logical.stages() if name] == ["clauses"]
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     joins=lambda node, assignment: (
                         assignment["a"] == assignment["b"]))
@@ -207,13 +221,13 @@ def test_an_empty_cte_result_gives_an_empty_result(session):
 def test_explain_plans_later_stages_on_named_assumptions(session, monkeypatch):
     query = session.sql(EXTRACT_THEN_SCORE)
     planned = query.explain()
-    assert planned.index("with clauses:") < planned.index("query:")
+    assert planned.index("QueryStage clauses:") < planned.index("QueryStage query:")
     assert ("'x' reads the CTE 'clauses', which has not run; planned on 3 rows "
             f"of {ASSUMED_ANSWER_TOKENS} tokens each") in planned
     assert "run:" not in planned
     plan = query.plan()
     assert plan.estimated_seconds == sum(
-        stage.estimated_seconds for stage in plan.plans)
+        stage.estimated_seconds for stage in plan.nodes)
 
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     scores=lambda spec, ids: 0.5)
@@ -224,7 +238,7 @@ def test_explain_plans_later_stages_on_named_assumptions(session, monkeypatch):
         lambda q, physical_executor=executor, **options: original(
             q, physical_executor=physical_executor, **options))
     measured = query.explain(analyze=True)
-    assert measured.count("run:") == 2
+    assert measured.count("run:") == 1
     assert "which has not run" not in measured
     # after the run, the second stage was planned on the real table
     assert "tokens=10, mean_document_tokens=3.3" in measured
@@ -302,3 +316,155 @@ def test_a_session_closes_the_token_files_of_its_cte_results():
     assert "clauses" not in session.catalog
     session.close()
     assert not directory.exists()
+
+
+@pytest.mark.parametrize("sql", [
+    """WITH first AS (SELECT c.id, c.text FROM contracts c ORDER BY c.id LIMIT 2)
+       SELECT f.id AS result_id FROM first f WHERE AI.IF(PROMPT('keep {0}', f.text))""",
+    """WITH first AS (
+           SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('keep {0}', c.text))
+           ORDER BY c.id LIMIT 2)
+       SELECT f.id AS result_id FROM first f WHERE f.id > 0""",
+    """WITH first AS (SELECT c.id, c.text FROM contracts c WHERE c.id < 3)
+       SELECT a.id AS result_id FROM first a JOIN first b
+       ON AI.IF(PROMPT('same? {0} {1}', a.text, b.text))""",
+    """WITH first AS (SELECT c.id, c.text FROM contracts c WHERE c.id < 3),
+       unused AS (SELECT u.id FROM first u)
+       SELECT f.id AS result_id FROM first f WHERE AI.IF(PROMPT('keep {0}', f.text))""",
+])
+def test_relational_stages_before_and_after_ai_return_the_selected_rows(session, sql):
+    result, recorder = run(session.sql(sql, dialect="bq"),
+                           Oracle(filters=lambda *args: True,
+                                  joins=lambda node, assignment:
+                                  len(set(assignment.values())) == 1))
+    assert result.collect().column("result_id").to_pylist() == [1, 2]
+    assert "Project" in result.explain()
+    assert len(recorder.requests) == 1
+
+
+def test_a_dictionary_source_column_keeps_its_type_across_materialization(session):
+    category = pa.array(["lease", "deed", "lease"]).dictionary_encode()
+    session.register("categorized", DocumentProvider.from_table(
+        CONTRACTS.append_column("category", category), id_col="id"))
+    query = session.sql("""
+        WITH kinds AS (
+            SELECT c.id, c.category,
+                   AI.CLASSIFY(PROMPT('kind {0}', c.text), ARRAY['lease', 'deed'])
+                       AS kind
+            FROM categorized c)
+        SELECT k.category FROM kinds k WHERE AI.IF(PROMPT('keep {0}', k.kind))
+    """, dialect="bq")
+    result, _ = run(query, Oracle(labels=["lease", "deed", "lease"],
+                                 filters=lambda *args: True))
+    assert result.collect().column("k.category").combine_chunks() == category
+
+
+def test_intermediate_files_are_released_after_success_and_failure(
+        session, monkeypatch, tmp_path):
+    from functools import partial
+    from tempfile import TemporaryDirectory
+
+    monkeypatch.setattr("quail.catalog.inputs.TemporaryDirectory",
+                        partial(TemporaryDirectory, dir=tmp_path))
+    query = session.sql(EXTRACT_THEN_SCORE)
+    query.plan()
+    source_directory = Path(session.inputs._token_directory.name)
+
+    def fail_score(spec, ids):
+        raise RuntimeError("score failed")
+
+    with pytest.raises(RuntimeError, match="score failed"):
+        run(query, Oracle(answers=lambda spec, document: CLAUSES[document],
+                          scores=fail_score))
+    assert list(tmp_path.iterdir()) == [source_directory]
+    result, _ = run(query, Oracle(answers=lambda spec, document: CLAUSES[document]))
+    assert result.count() == 3
+    assert list(tmp_path.iterdir()) == [source_directory]
+
+
+def test_repeated_execution_reads_the_newly_generated_text(session):
+    query = session.sql(EXTRACT_THEN_SCORE)
+    for clause in (CLAUSES[0], CLAUSES[2]):
+        result, recorder = run(query, Oracle(answers=lambda *args: clause))
+        assert result.count() == 3
+        assert recorder.documents["x"] == [[words(clause)] * 3]
+
+
+def test_stage_totals_include_cost_gpu_seconds_and_document_work(session):
+    result = finish(session.sql(EXTRACT_THEN_SCORE), Oracle(
+        answers=lambda spec, document: CLAUSES[document]),
+        usd_per_query=0.1, gpu_s=2, evaluated_documents=3,
+        evaluated_document_pairs=4)
+    assert result.report["usd_per_query"] == pytest.approx(0.2)
+    assert result.report["gpu_s"] == 4
+    assert result.report["evaluated_documents"] == 6
+    assert result.report["evaluated_document_pairs"] == 8
+
+
+def test_a_filtered_cte_on_the_right_of_a_join_keeps_its_filter(session):
+    query = session.sql("""
+        WITH kept AS (
+            SELECT c.id, c.text FROM contracts c
+            WHERE AI.IF(PROMPT('keep {0}', c.text)))
+        SELECT a.id, b.id AS other FROM contracts a JOIN kept b
+        ON AI.IF(PROMPT('same? {0} {1}', a.text, b.text))
+    """, dialect="bq")
+    result, recorder = run(query, Oracle(
+        filters=lambda alias, document, position: document != 1,
+        joins=lambda node, assignment: len(set(assignment.values())) == 1))
+    assert result.collect().to_pydict() == {"a.id": [1, 3], "other": [1, 3]}
+    assert len(recorder.requests) == 1
+
+
+def test_snowflake_qualification_preserves_an_implicit_table_alias(session):
+    query = session.sql("""
+        WITH kept AS (
+            SELECT contracts.id, contracts.text FROM contracts
+            WHERE AI_FILTER(PROMPT('keep {0}', contracts.text)))
+        SELECT kept.id FROM kept
+    """)
+    result, _ = run(query, Oracle(filters=lambda *args: True))
+    assert result.collect().to_pydict() == {"contracts.id": [1, 2, 3]}
+
+
+def test_an_exists_prompt_reads_a_materialized_computed_column(session):
+    query = session.sql("""
+        WITH kinds AS (
+            SELECT c.id,
+                   AI.CLASSIFY(PROMPT('kind {0}', c.text), ARRAY['lease', 'deed'])
+                       AS kind FROM contracts c)
+        SELECT a.id FROM contracts a WHERE EXISTS (
+            SELECT 1 FROM kinds k
+            WHERE AI.IF(PROMPT('matches? {0} {1}', a.text, k.kind)))
+    """, dialect="bq")
+    result, recorder = run(query, Oracle(
+        labels=["lease", "deed", "lease"], joins=lambda *args: True))
+    assert result.collect().column("a.id").to_pylist() == [1, 2, 3]
+    assert recorder.documents["k"] == [[["lease"], ["deed"], ["lease"]]]
+
+
+def test_a_scalar_expression_over_a_label_reads_the_materialized_labels(session):
+    query = session.sql("""
+        WITH kinds AS (
+            SELECT c.id,
+                   AI.CLASSIFY(PROMPT('kind {0}', c.text), ARRAY['lease', 'deed'])
+                       AS kind FROM contracts c),
+        capitalized AS (SELECT k.id, UPPER(k.kind) AS upper_kind FROM kinds k)
+        SELECT u.id AS result_id FROM capitalized u
+        WHERE AI.IF(PROMPT('keep {0}', u.upper_kind))
+    """, dialect="bq")
+    result, recorder = run(query, Oracle(
+        labels=["lease", "deed", "lease"], filters=lambda *args: True))
+    assert result.collect().column("result_id").to_pylist() == [1, 2, 3]
+    assert recorder.documents["k"] == [[["LEASE"], ["DEED"], ["LEASE"]]]
+
+
+def test_an_unsupported_deep_field_path_raises_a_compile_error(session):
+    session.register("nested", DocumentProvider.from_table(pa.table({
+        "id": [1], "details": [{"a": {"b": {"text": "lease"}}}]}), id_col="id"))
+    with pytest.raises(CompileError, match="field path"):
+        session.sql("""
+            WITH kept AS (SELECT n.id, n.details FROM nested n)
+            SELECT k.id FROM kept k
+            WHERE AI_FILTER(PROMPT('keep {0}', k.details.a.b.text))
+        """)

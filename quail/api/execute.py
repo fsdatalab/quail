@@ -6,7 +6,9 @@ import time
 
 from quail.backends import BackendExecutionContext
 from quail.execution.types import PhysicalRequest, PhysicalResponse
+from quail.logical import WithCTE
 from quail.physical import (
+    ExecutionLocation,
     Scan,
     check_plan_envelope,
     decode_graph,
@@ -113,29 +115,19 @@ def execute_query(query, physical_executor=None, plan=None,
         on_execution_ready: Optional callback after backend preparation and
             immediately before query execution.
     """
-    from quail.api.query import WithQuery
+    if isinstance(query.logical.root, WithCTE):
+        from quail.api.stages import execute_stages
 
-    if isinstance(query, WithQuery):
         if plan is not None:
-            raise RuntimeError(
-                "a WITH query runs the planner's plan for each stage; edited "
-                "plans are not supported")
-        return query.execute(physical_executor, on_backend_ready,
-                             on_execution_ready)
+            raise RuntimeError("edited query stage plans are not supported")
+        return execute_stages(query, physical_executor, on_backend_ready,
+                              on_execution_ready)
     total_started = time.perf_counter()
     if plan is not None:
         if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
             raise TypeError("plan must be a PhysicalPlan")
         query.plan()            # tokenization and pair tables first
         query._plan = plan
-    if physical_executor is None:
-        problem = gpu_problem()
-        if problem is not None:
-            raise RuntimeError(
-                f"cannot run the model in this process: {problem}. "
-                "Run your Session in a process with a CUDA GPU "
-                "and the backend installed."
-            )
     plan = query.plan()
     if isinstance(plan, Refusal):
         raise RefusalError(plan)
@@ -143,22 +135,35 @@ def execute_query(query, physical_executor=None, plan=None,
     plan.graph.validate_backend(plan.backend)
     if plan.gpus > 8:
         raise NotImplementedError("query execution supports at most 8 GPUs")
-    if physical_executor is None:
+    has_compute = any(node.backend is not None or
+                      node.location is ExecutionLocation.GPU_EXECUTOR
+                      for node in plan.nodes)
+    if has_compute and physical_executor is None:
+        problem = gpu_problem()
+        if problem is not None:
+            raise RuntimeError(
+                f"cannot run the model in this process: {problem}. "
+                "Run your Session in a process with a CUDA GPU "
+                "and the backend installed."
+            )
+    if has_compute and physical_executor is None:
         # Backend startup must not wait for background tokenization.
         _prepare_backend(plan, query.session.registry)
-    if on_backend_ready is not None:
+    if has_compute and on_backend_ready is not None:
         on_backend_ready()
     query.wait_for_tokens()
     physical_prepare_started = time.perf_counter()
-    request = query._prepare_physical()
+    request = query._prepare_physical() if has_compute else None
     physical_prepare_s = time.perf_counter() - physical_prepare_started
     if on_execution_ready is not None:
         on_execution_ready()
     started = time.perf_counter()
-    response = (
-        physical_executor(request) if physical_executor is not None
-        else _execute_physical(request, query.session.registry)
-    )
+    if has_compute:
+        response = (physical_executor(request) if physical_executor is not None
+                    else _execute_physical(request, query.session.registry))
+    else:
+        response = PhysicalResponse(
+            {}, {"wall_s": 0.0, "fresh_tokens": 0, "cached_tokens": 0})
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a physical executor must return PhysicalResponse")
     coordinator_wall_s = time.perf_counter() - started

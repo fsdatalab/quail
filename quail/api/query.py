@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import copy
 import time
-from dataclasses import dataclass, replace
+from contextlib import closing
+from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import pyarrow as pa
 
 from quail.api.execute import execute_query
-from quail.catalog import Catalog, MemoryTableProvider, inputs
+from quail.catalog import inputs
 from quail.catalog.pairs import columns_key, estimate_pair_fraction
+from quail.catalog.providers import ScanRequest
 from quail.catalog.selection import selected_rows
 from quail.catalog.tokens import TokenLengths
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
@@ -20,11 +21,10 @@ from quail.execution.reporting import collect_answers, execution_report
 from quail.execution.result import QueryResult
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.types import PhysicalRequest, document_input
-from quail.explain import estimated_rows, explain
+from quail.explain import explain
 from quail.logical import (
     LogicalPlan,
-    WithPlan,
-    cte_schema,
+    WithCTE,
     join_conditions,
     oriented_join_conditions,
 )
@@ -37,8 +37,9 @@ from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import logical_alternatives
-from quail.planner.plan import PhysicalPlan, Refusal, RefusalError
+from quail.planner.plan import Refusal, RefusalError
 from quail.planner.search.statistics import filter_stop_keys
+from quail.planner.stages import relational_plan
 
 if TYPE_CHECKING:
     from quail.api.session import Session
@@ -72,8 +73,10 @@ class Query:
     """A compiled query that plans and executes in the current process."""
 
     def __init__(self, session: "Session", logical: LogicalPlan,
-                 order: str | None = None):
+                 order: str | None = None, *, catalog=None, inputs=None):
         self.session = session
+        self.catalog = session.catalog if catalog is None else catalog
+        self.inputs = session.inputs if inputs is None else inputs
         self.logical = logical
         self._logical_input = logical
         self.order = order
@@ -112,6 +115,22 @@ class Query:
         Returns:
             The physical plan, or a Refusal when no backend can run it.
         """
+        if self._plan is not None:
+            return self._plan
+        if isinstance(self.logical.root, WithCTE):
+            from quail.api.stages import plan_stages
+
+            self._plan = plan_stages(self)
+            return self._plan
+        if not self.logical.operators().prompts:
+            (scan,) = self.logical.operators().scans
+            num_documents = self.catalog.get(scan.provider).statistics().num_rows
+            if self.inputs.pending(scan.provider):
+                num_documents = len(self.inputs.estimate_lengths(
+                    scan.provider, scan.column))
+            self._plan = relational_plan(
+                self.logical, self.session.config, num_documents or 0)
+            return self._plan
         if self._plan is None:
             self._planning_started_at = time.perf_counter()
             config = self.session.config
@@ -120,11 +139,11 @@ class Query:
             self._token_inputs = {}
             estimated = []
             for s in operators.scans:
-                exact = self.session.inputs.token_lengths(s.provider, s.column)
+                exact = self.inputs.token_lengths(s.provider, s.column)
                 if exact is not None:
                     self._document_tokens[s.alias] = exact
                     continue
-                self._document_tokens[s.alias] = self.session.inputs.estimate_lengths(
+                self._document_tokens[s.alias] = self.inputs.estimate_lengths(
                     s.provider, s.column)
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
@@ -136,7 +155,7 @@ class Query:
             self._scan_selectivities = scan_fractions
             self._pair_selectivities = pair_fractions
             context = PlanningContext(
-                catalog=self.session.catalog, engine_config=config,
+                catalog=self.catalog, engine_config=config,
                 model=self.session.model, device=self.session.device,
                 gpus=config.gpus, document_tokens=self._document_tokens,
                 backend=config.backend, order=self.order,
@@ -165,16 +184,18 @@ class Query:
             reads_text = getattr(backend, "reads_document_text", False)
             locates_answers = getattr(backend, "locates_answers_in_text", False)
             for s in scans.values():
+                if self.inputs.pending(s.provider):
+                    continue
                 columns = s.columns
                 with_offsets = locates_answers and s.alias in offset_aliases
                 if reads_text:
                     columns = tuple(dict.fromkeys(
                         (*columns, *source_columns(s.column))))
                 if s.alias not in self._estimated:
-                    self._token_inputs[s.alias] = self.session.inputs.tokenize(
+                    self._token_inputs[s.alias] = self.inputs.tokenize(
                         s.provider, s.column, columns, with_offsets=with_offsets)
                     continue
-                future = self.session.inputs.tokenize_async(
+                future = self.inputs.tokenize_async(
                     s.provider, s.column, columns, with_offsets=with_offsets)
 
                 def record_finished(_future, alias=s.alias):
@@ -195,7 +216,7 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions,
-                memo=context.memo, catalog=self.session.catalog,
+                memo=context.memo, catalog=self.catalog,
                 engine_config=config, logical_candidates=candidates)
             if not isinstance(self._plan, Refusal):
                 self.logical = self._plan.logical_plan
@@ -240,7 +261,7 @@ class Query:
                 for ref in refs:
                     if (ref.alias, ref.column) not in samples:
                         samples[(ref.alias, ref.column)] = (
-                            self.session.inputs.sample_columns(
+                            self.inputs.sample_columns(
                                 providers[ref.alias], [ref.column])[ref.column])
                 out.append(evaluate_expression(expression, pa.table({
                     ref.column: samples[(ref.alias, ref.column)] for ref in refs})))
@@ -263,7 +284,7 @@ class Query:
         for scan in scans:
             if not scan.predicates:
                 continue
-            columns = pa.table(self.session.inputs.sample_columns(
+            columns = pa.table(self.inputs.sample_columns(
                 scan.provider,
                 [predicate.column.column for predicate in scan.predicates]))
             sampled = columns.num_rows
@@ -286,14 +307,12 @@ class Query:
         result = self.run() if analyze else None
         return self._explain(result, verbose)
 
-    def _explain(self, result, verbose: bool, assumed=()) -> str:
+    def _explain(self, result, verbose: bool) -> str:
         """Return the plan text, with the measurements of result when given.
 
         Args:
             result: The QueryResult of running the plan, or None.
             verbose: Include runtime settings and internal node fields.
-            assumed: Aliases planned on assumed lengths, left out of the
-                note on sampled token counts.
         """
         # plan() first: it replaces self.logical with the optimized tree
         physical = self.plan()
@@ -313,10 +332,9 @@ class Query:
                        rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
-        sampled = [alias for alias in self._estimated if alias not in assumed]
-        if sampled:
+        if self._estimated:
             text += ("\n\n  note: token counts for "
-                     + ", ".join(repr(a) for a in sampled)
+                     + ", ".join(repr(a) for a in self._estimated)
                      + f" are estimated from a {inputs.ESTIMATE_SAMPLE} document "
                      "sample")
         return text
@@ -327,6 +345,9 @@ class Query:
         A plan made on estimated lengths is searched again with exact inputs,
         so prefix sharing can change which logical alternative wins.
         """
+        if not self.logical.operators().prompts:
+            self._prepare_relational()
+            return
         started = time.perf_counter()
         refine = bool(self._token_futures)
         for alias, future in list(self._token_futures.items()):
@@ -350,7 +371,7 @@ class Query:
             if self._plan is self._searched_plan:
                 self._plan = plan_query(
                     self._logical_input, scan_fractions=self._scan_selectivities,
-                    catalog=self.session.catalog, engine_config=self.session.config,
+                    catalog=self.catalog, engine_config=self.session.config,
                     **options)
                 if not isinstance(self._plan, Refusal):
                     self.logical = self._plan.logical_plan
@@ -362,6 +383,24 @@ class Query:
                     **self._plan.settings, "gpu_timing": True})
             self._replanning_s += time.perf_counter() - started
             self._estimated = ()
+
+    def _prepare_relational(self):
+        """Read a relational stage's value columns without tokenizing them."""
+        if self._token_inputs is not None:
+            return
+        (scan,) = self.logical.operators().scans
+        provider = self.catalog.get(scan.provider)
+        expressions = (*self.logical.projection.columns,
+                       *(key.expression for key in self.logical.result.order),
+                       *(predicate.column for predicate in scan.predicates))
+        columns = tuple(dict.fromkeys(
+            column for expression in expressions
+            for column in source_columns(expression)))
+        with closing(provider.scan(ScanRequest(columns=columns))) as reader:
+            table = reader.read_all()
+        self._token_inputs = {scan.alias: table}
+        self._document_tokens = {scan.alias: TokenLengths([0] * table.num_rows)}
+        self._plan = relational_plan(self.logical, self.session.config, table.num_rows)
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
@@ -456,12 +495,13 @@ class Query:
         plan = self.plan()
         out = response.metrics
         report = execution_report(
-            plan, out, self.session.inputs.notes, coordinator_wall)
+            plan, out, self.inputs.notes, coordinator_wall)
         sources = {
             node.input_id: range(node.num_documents)
             for node in plan.nodes
             if isinstance(node, Scan)
         }
+        sources.update(self._column_tables())
         observers = self.session.registry.new_observers()
         run = GenericRunner().run(
             plan.graph,
@@ -502,238 +542,3 @@ class Query:
          result.true_join_tables, report["stages"]) = collect_answers(
              self.logical, plan, response.outputs, self._document_tokens)
         return result
-
-
-# tokens assumed per row of a CTE's column when the CTE has not run yet
-ASSUMED_ANSWER_TOKENS = 32
-
-# report fields added up over the CTEs and the final SELECT
-SUMMED_REPORT_FIELDS = (
-    "wall_s", "model_wall_s", "coordinator_wall_s", "fresh_tokens",
-    "cached_tokens", "estimated_seconds", "planning_s", "input_ready_s",
-    "physical_prepare_s", "finish_s", "token_wait_s", "worker_total_s")
-
-
-@dataclass(frozen=True)
-class WithPhysicalPlan:
-    """The physical plan of each CTE the query needs, then of its SELECT.
-
-    Attributes:
-        ctes: (name, PhysicalPlan) pairs in execution order.
-        query: The final SELECT's plan.
-    """
-
-    ctes: tuple
-    query: PhysicalPlan
-
-    @property
-    def plans(self) -> tuple:
-        return (*(plan for _, plan in self.ctes), self.query)
-
-    @property
-    def estimated_seconds(self) -> float:
-        return sum(plan.estimated_seconds for plan in self.plans)
-
-    @property
-    def backend(self) -> str:
-        return self.query.backend
-
-    @property
-    def gpus(self) -> int:
-        return max(plan.gpus for plan in self.plans)
-
-    def to_envelope(self, codecs) -> dict:
-        """Return every stage's envelope under the CTE names and ``query``."""
-        return {"ctes": {name: plan.to_envelope(codecs) for name, plan in self.ctes},
-                "query": self.query.to_envelope(codecs)}
-
-
-class WithQuery:
-    """A query with CTEs: each CTE runs before the queries that read it.
-
-    A CTE's result is kept as an Arrow table in the session's catalog
-    view, its text columns are tokenized like a registered table's,
-    and the queries reading it are planned on it. Before a CTE has
-    run, the queries reading it are planned on its estimated row count
-    and an assumed token count per row, so ``explain()`` never runs
-    the model. ``run()`` executes the CTEs the final SELECT needs, in
-    written order, then the SELECT.
-    """
-
-    def __init__(self, session: "Session", logical: WithPlan,
-                 order: str | None = None):
-        self.session = session
-        self.logical = logical
-        self.order = order
-        self.ctes = dict(logical.ctes)
-        self._schemas = {name: cte_schema(plan) for name, plan in logical.ctes}
-        self._queries = {}     # stage name -> its Query; "" is the SELECT
-        self._results = {}     # stage name -> its QueryResult, once run
-        # the stages run on a view of the session whose catalog also
-        # holds each CTE's result, a placeholder until the CTE has run
-        self._assumptions = {
-            name: (lambda _column, name=name: self._assumed_lengths(name))
-            for name in self.ctes}
-        self._view = copy.copy(session)
-        self._view.catalog = Catalog({
-            **session.catalog.providers,
-            **{name: MemoryTableProvider(schema.empty_table(), id_col="",
-                                         identity=f"cte:{name}")
-               for name, schema in self._schemas.items()}})
-        self._view.inputs = session.inputs.over(self._view.catalog,
-                                                self._assumptions)
-
-    def _stages(self) -> tuple:
-        """Return (name, LogicalPlan) of every stage in execution order."""
-        return (*self.ctes.items(), ("", self.logical.query))
-
-    def _stage(self, name: str, fresh: bool = False) -> Query:
-        """Return the Query running one stage over the tables it has now."""
-        if fresh or name not in self._queries:
-            plan = self.logical.query if name == "" else self.ctes[name]
-            self._queries[name] = Query(self._view, plan, order=self.order)
-        return self._queries[name]
-
-    def _assumed_lengths(self, name: str) -> TokenLengths:
-        """Return the lengths a CTE that has not run is planned on.
-
-        The rows are the planner's estimate for the CTE, or its input
-        documents when it has none, at least one; each row is assumed
-        to hold ASSUMED_ANSWER_TOKENS.
-        """
-        physical = self._stage(name).plan()
-        rows = None if isinstance(physical, Refusal) else estimated_rows(physical)
-        if rows is None:
-            rows = sum(map(len, self._stage(name)._document_tokens.values()))
-        return TokenLengths([ASSUMED_ANSWER_TOKENS] * max(1, round(rows)))
-
-    def plan(self):
-        """Plan every stage and return the plans, or the first Refusal.
-
-        A stage reading a CTE that has not run is planned on the
-        assumptions ``explain()`` names.
-        """
-        plans = []
-        for name, _ in self._stages():
-            physical = self._stage(name).plan()
-            if isinstance(physical, Refusal):
-                return physical
-            plans.append((name, physical))
-        return WithPhysicalPlan(tuple(plans[:-1]), plans[-1][1])
-
-    def explain(self, *, verbose: bool = False, analyze: bool = False) -> str:
-        """Return each stage's plan, the CTEs first, then the final SELECT.
-
-        Args:
-            verbose: Include runtime settings and internal node fields.
-            analyze: Run the query first and show each stage's
-                measurements beside its estimates.
-        """
-        results = {}
-        if analyze:
-            self.run()
-            results = self._results
-        parts = []
-        for name, plan in self._stages():
-            title = "query" if name == "" else f"with {name}"
-            pending = {scan.alias: scan for scan in plan.operators().scans
-                       if scan.provider in self.ctes
-                       and scan.provider not in self._results}
-            query = self._stage(name)
-            lines = [title + ":",
-                     query._explain(results.get(name), verbose, assumed=pending)]
-            for alias, scan in pending.items():
-                rows = len(self._assumed_lengths(scan.provider))
-                lines.append(
-                    f"\n  note: {alias!r} reads the CTE {scan.provider!r}, "
-                    f"which has not run; planned on {rows:,} rows of "
-                    f"{ASSUMED_ANSWER_TOKENS:,} tokens each")
-            parts.append("\n".join(lines))
-        return "\n\n".join(parts)
-
-    def execute(self, physical_executor=None, on_backend_ready=None,
-                on_execution_ready=None) -> QueryResult:
-        """Run the CTEs the SELECT needs in written order, then the SELECT.
-
-        Each CTE's result replaces its placeholder in the catalog view,
-        so the next stage is planned on the rows it returned. The final
-        result's report adds every stage's times and tokens up and keeps
-        each CTE's own report under ``ctes``.
-        """
-        reports = {}
-        first = True
-        for name, _ in self._stages():
-            query = self._stage(name, fresh=True)
-            result = execute_query(
-                query, physical_executor=physical_executor,
-                on_backend_ready=on_backend_ready if first else None,
-                on_execution_ready=on_execution_ready if first else None)
-            first = False
-            self._results[name] = result
-            if name == "":
-                break
-            reports[name] = result.report
-            table = cte_table(result.collect(), self._schemas[name])
-            self._view.catalog.providers[name] = MemoryTableProvider(
-                table, id_col="", identity=f"cte:{name}")
-            self._assumptions.pop(name, None)
-        result.report = _summed_report(result.report, reports)
-        return result
-
-    def run(self, plan=None) -> QueryResult:
-        """Execute the query in the current process.
-
-        Args:
-            plan: Must be None; a WITH query runs the planner's plans.
-        """
-        return execute_query(self, plan=plan)
-
-    def submit(self, **_options):
-        """Submitting needs Quail Server; local queries use run()."""
-        raise RuntimeError(
-            "submit() needs a Session with an endpoint; this session runs "
-            "queries in the current process, so call run() or collect()")
-
-    def execute_stream(self, batch_rows: int = 65_536,
-                       limit: int | None = None) -> pa.RecordBatchReader:
-        """Execute the query and stream Arrow record batches."""
-        return self.run().execute_stream(batch_rows=batch_rows, limit=limit)
-
-    def collect(self, limit: int | None = None,
-                batch_rows: int = 65_536) -> pa.Table:
-        """Execute the query and collect one Arrow table."""
-        return self.run().collect(limit=limit, batch_rows=batch_rows)
-
-
-def cte_table(result: pa.Table, schema: pa.Schema) -> pa.Table:
-    """Return a stage's result as the table the next stage reads.
-
-    Label columns are decoded from dictionaries to text, and the
-    columns take the CTE's names.
-
-    Raises:
-        ValueError: The result's types differ from the schema the next
-            stage was compiled against.
-    """
-    columns = [
-        column.cast(column.type.value_type)
-        if pa.types.is_dictionary(column.type) else column
-        for column in result.columns]
-    if [column.type for column in columns] != schema.types:
-        raise ValueError(
-            f"the CTE's result has types {[c.type for c in columns]}, but "
-            f"the query reading it was compiled for {schema.types}")
-    return pa.table(dict(zip(schema.names, columns)))
-
-
-def _summed_report(report: dict, cte_reports: dict) -> dict:
-    """Return the SELECT's report with every stage's totals added up."""
-    summed = dict(report)
-    for key in SUMMED_REPORT_FIELDS:
-        values = [stage.get(key) for stage in (*cte_reports.values(), report)]
-        values = [value for value in values if value is not None]
-        if values:
-            summed[key] = (round(sum(values), 4) if isinstance(values[0], float)
-                           else sum(values))
-    summed["ctes"] = cte_reports
-    return summed

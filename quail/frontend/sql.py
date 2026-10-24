@@ -20,7 +20,7 @@ from quail.frontend.sql_binding.expressions import (
     ExpressionBinder,
     _conjuncts,
 )
-from quail.frontend.sql_binding.predicates import column_path
+from quail.frontend.sql_binding.predicates import SQL_FUNCTIONS, column_path
 from quail.frontend.sql_binding.relations import (
     JoinBinder,
     bind_where,
@@ -39,7 +39,7 @@ from quail.logical import (
     CompileError,
     LogicalPlan,
     LogicalPlanBuilder,
-    WithPlan,
+    WithCTE,
     column_name,
     cte_schema,
     is_score,
@@ -133,7 +133,7 @@ def _reject_forbidden(tree) -> None:
 
 def _validate_query(
     b: ExpressionBinder, joins: JoinBinder, columns: tuple[ColumnRef | Alias, ...],
-    structs: tuple = (),
+    structs: tuple = (), *, allow_relational: bool = False,
 ) -> None:
     """Validate output names and supported combinations of AI operators."""
     for struct in structs:
@@ -199,7 +199,8 @@ def _validate_query(
             "AI.SCORE cannot be mixed with generative AI predicates in one query"
         )
 
-    if not b.joins and not b.filters and not b.label_tests and not projected:
+    if (not allow_relational and not b.joins and not b.filters
+            and not b.label_tests and not projected):
         raise CompileError(
             "the query has no AI predicate; a plain "
             "scan belongs in the database the ids came "
@@ -240,8 +241,8 @@ def compile_sql(
     turn: tuple[str, str] = ("", ""),
     layout: str = "ai-if",
     prompts: PromptBinder | None = None,
-) -> LogicalPlan | WithPlan:
-    """Compile AI SQL text into a LogicalPlan, or a WithPlan for a WITH query.
+) -> LogicalPlan:
+    """Compile AI SQL text into one logical plan.
 
     Args:
         sql: A SELECT statement in the chosen dialect, with optional
@@ -254,8 +255,7 @@ def compile_sql(
         prompts: Model-aware prompt binder. Overrides turn and layout.
 
     Returns:
-        The bound logical query plan: a WithPlan when the statement has
-        a CTE or a subquery in FROM, a LogicalPlan otherwise.
+        The bound logical query plan, including any CTE definitions.
 
     Raises:
         CompileError: The query is invalid or uses unsupported SQL.
@@ -291,13 +291,20 @@ def compile_sql(
     ctes = []
     plan = _compile_stages(_qualified(tree, catalog, dialect), tables, prompts,
                            dialect, ctes)
-    if not ctes:
-        return plan
-    return WithPlan(tuple(ctes), plan)
+    result = (LogicalPlan(WithCTE(plan.root, tuple(
+        (name, definition.root) for name, definition in ctes))) if ctes else plan)
+    if not any(stage.operators().prompts for _, stage in result.stages()):
+        raise CompileError("the query has no AI predicate")
+    return result
 
 
 def _qualified(tree: exp.Select, catalog: Catalog, dialect: SQLDialect) -> exp.Select:
     """Qualify every column with its table, as sqlglot's merge requires."""
+    # Catalog names keep their spelling in both dialects; sqlglot otherwise
+    # uppercases the implicit aliases it adds for Snowflake tables.
+    for table in tree.find_all(exp.Table):
+        if not table.alias and isinstance(table.this, exp.Identifier):
+            table.set("alias", exp.TableAlias(this=table.this.copy()))
     schema = MappingSchema(
         {name: dict.fromkeys(provider.columns, "UNKNOWN")
          for name, provider in catalog.providers.items()},
@@ -320,6 +327,7 @@ def _compile_stages(tree: exp.Select, tables: Catalog, prompts, dialect,
     merged into the query that reads it, so the statement becomes as
     few plans as its model calls allow.
     """
+    tree = eliminate_ctes(tree)
     scopes = _scopes(tree)
     staged = _staged(scopes)
     # a merge appends a CTE's WHERE after its reader's; the CTE's runs first
@@ -331,8 +339,22 @@ def _compile_stages(tree: exp.Select, tables: Catalog, prompts, dialect,
     pool = [cte for cte in tree.find_all(exp.CTE)
             if not any(cte is scope.expression.parent for scope in staged)]
     for scope in staged:
-        _compile_stage(scope, pool, tables, prompts, dialect, ctes)
+        if any(candidate.expression is scope.expression
+               for candidate in _staged(_scopes(tree))):
+            _compile_stage(scope, pool, tables, prompts, dialect, ctes)
     tree = merge_subqueries(eliminate_ctes(tree))
+    # Merging the right side of a join moves its WHERE into ON. Restore
+    # those filters so they still run as document operators before the join.
+    for join in tree.args.get("joins") or ():
+        if join.args.get("on") is None:
+            continue
+        predicates = []
+        for term in _conjuncts(join.args["on"]):
+            if "stage" in term.meta:
+                tree = tree.where(term, copy=False)
+            else:
+                predicates.append(term)
+        join.set("on", exp.and_(*predicates, copy=False) if predicates else None)
     if tree.args.get("where"):
         tree.set("where", exp.Where(this=exp.and_(*sorted(
             _conjuncts(tree.args["where"].this),
@@ -349,14 +371,18 @@ def _compile_stages(tree: exp.Select, tables: Catalog, prompts, dialect,
             parts.insert(0, node.expression.name)
             node = node.this
         if isinstance(node, exp.Column):
-            dot.replace(exp.column(*reversed([*column_path(node), *parts])))
+            path = [*column_path(node), *parts]
+            if len(path) > 4:
+                raise CompileError(
+                    f"field path {dot.sql()} has more than two nested fields")
+            dot.replace(exp.column(*reversed(path)))
     # qualifying named every select item; a column keeps its own name
     for item in tree.selects:
         if isinstance(item, exp.Alias) and not item.meta.get("user_alias") and (
                 (isinstance(item.this, exp.Column) and item.alias == item.this.name)
                 or AUTO_ALIAS.fullmatch(item.alias)):
             item.replace(item.this)
-    return _compile_select(tree, tables, prompts, dialect)
+    return _compile_select(tree, tables, prompts, dialect, allow_relational=True)
 
 
 def _compile_stage(scope: Scope, pool, tables: Catalog, prompts, dialect,
@@ -407,15 +433,19 @@ def _staged(scopes) -> list:
     """
     readers = Counter()
     forced = set()
-    for scope in scopes:
+    for scope in dict.fromkeys(child for root in scopes for child in root.traverse()):
         for _, source in scope.selected_sources.values():
             if isinstance(source, Scope):
                 readers[id(source)] += 1
         for column in scope.columns:
-            source = scope.sources.get(column.table)
-            ancestor = column.find_ancestor(exp.Anonymous, exp.AIClassify)
+            owner = scope
+            while owner.parent is not None and column.table not in owner.sources:
+                owner = owner.parent
+            source = owner.sources.get(column.table)
+            ancestor = column.find_ancestor(
+                exp.Anonymous, exp.AIClassify, *SQL_FUNCTIONS)
             if (isinstance(source, Scope) and ancestor is not None
-                    and (isinstance(ancestor, exp.AIClassify)
+                    and (isinstance(ancestor, (exp.AIClassify, *SQL_FUNCTIONS))
                          or str(ancestor.this).upper() in AI_FUNCTIONS)
                     and column.name in _computed(source)):
                 forced.add(id(source))
@@ -435,15 +465,18 @@ def _computed(scope: Scope) -> set:
                 isinstance(node, exp.Anonymous)
                 and str(node.this).upper() in AI_FUNCTIONS) for node in value.walk()):
             names.add(item.alias_or_name)
-        elif isinstance(value, exp.Column):
-            source = scope.sources.get(value.table)
-            if isinstance(source, Scope) and value.name in _computed(source):
-                names.add(item.alias_or_name)
+        else:
+            for column in value.find_all(exp.Column):
+                source = scope.sources.get(column.table)
+                if isinstance(source, Scope) and column.name in _computed(source):
+                    names.add(item.alias_or_name)
+                    break
     return names
 
 
 def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
-                    dialect: SQLDialect) -> LogicalPlan:
+                    dialect: SQLDialect, *,
+                    allow_relational: bool = False) -> LogicalPlan:
     """Compile one SELECT against the tables in the catalog."""
     limit = _parse_limit(tree)
     offset = _parse_offset(tree)
@@ -459,7 +492,8 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
     columns, aggregation = selection.columns, selection.aggregation
     order = bind_order(tree, b, columns, aggregation, selection.structs,
                        selection.windows)
-    _validate_query(b, joins, columns, selection.structs)
+    _validate_query(b, joins, columns, selection.structs,
+                    allow_relational=allow_relational)
     named, labels = _bind_label_names(b, columns)
     extracts = {}
     for column in columns:

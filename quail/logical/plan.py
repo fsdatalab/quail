@@ -36,6 +36,7 @@ from quail.logical.nodes import (
     SemanticFilter,
     SemanticJoin,
     Window,
+    WithCTE,
 )
 
 
@@ -109,7 +110,7 @@ class LogicalPlan:
     @property
     def projection(self) -> Project:
         """Return the projection that supplies result columns."""
-        node = self.root
+        node = self.root.input if isinstance(self.root, WithCTE) else self.root
         while isinstance(node, (Result, Aggregate, Window)):
             node = node.input
         if not isinstance(node, Project):
@@ -119,7 +120,15 @@ class LogicalPlan:
     @property
     def result(self) -> Result:
         """Return result modifiers, using defaults when they are absent."""
-        return self.root if isinstance(self.root, Result) else Result(self.root)
+        root = self.root.input if isinstance(self.root, WithCTE) else self.root
+        return root if isinstance(root, Result) else Result(root)
+
+    def stages(self) -> tuple:
+        """Return CTE definitions and the final query in dependency order."""
+        if isinstance(self.root, WithCTE):
+            return (*((name, LogicalPlan(node)) for name, node in self.root.ctes),
+                    ("", LogicalPlan(self.root.input)))
+        return (("", self),)
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
         """Return the columns produced by the root node."""
@@ -154,6 +163,8 @@ class LogicalPlan:
         Raises:
             CompileError: A Scan carries no provider schema.
         """
+        if isinstance(self.root, WithCTE):
+            return LogicalPlan(self.root.input).schema()
         scans = {node.alias: node for node in self.walk() if isinstance(node, Scan)}
         for scan in scans.values():
             if scan.schema is None:
@@ -451,20 +462,3 @@ def cte_schema(plan: LogicalPlan) -> pa.Schema:
             f"the CTE returns a column name twice: {schema.names}; give one an "
             f"AS name")
     return schema
-
-
-@dataclass(frozen=True)
-class WithPlan:
-    """A query with CTEs; each CTE runs before the queries that read it.
-
-    A subquery in FROM is a CTE too, named by its alias.
-
-    Attributes:
-        ctes: (name, LogicalPlan) of each CTE in dependency order. Each
-            reads registered tables and earlier CTEs only, and each is
-            read by the query or by a later CTE.
-        query: The final SELECT.
-    """
-
-    ctes: tuple[tuple[str, LogicalPlan], ...]
-    query: LogicalPlan
