@@ -464,7 +464,9 @@ expression.
 Put the call in `UNNEST` in `FROM` to get one row for each feature. The
 rows have the columns `f.feature` and `f.strength`, where `f` is the
 `AS` name. The other columns repeat for each feature. Use these columns
-in `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates.
+in `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates. To give a
+field another name in the result, write `f.feature AS feature_id` in
+`SELECT`. `WHERE` uses the original name.
 
 For example, with the same `tickets` table, count the requests that
 have each feature with a strength above 1:

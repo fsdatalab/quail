@@ -305,6 +305,7 @@ class Result:
             if (
                 isinstance(key.expression, Alias)
                 and key.expression not in projection.columns
+                and key.name not in projected
             ):
                 raise CompileError(
                     f"ORDER BY {key.name!r} names an expression the "

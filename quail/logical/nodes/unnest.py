@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
-from quail.logical.expressions import ColumnRef, CompileError
+from quail.logical.expressions import Alias, ColumnRef, CompileError, column_name
 from quail.logical.nodes.base import LogicalNode
 
 
@@ -21,12 +21,18 @@ class Unnest:
     no rows. Two Unnest nodes over each other return the product of
     their lists.
 
+    Each of ``aliases`` returns one of the node's field columns again
+    under its name, as ``SELECT f.feature AS feature_id`` does. The
+    field column stays for the Filters above, which SQL applies before
+    the SELECT names; the nodes after them read the name.
+
     The input is the Project, or an Unnest or Filter above it, and
     returns the list columns by name.
     """
 
     input: LogicalNode
     columns: tuple[str, ...]
+    aliases: tuple[Alias, ...] = ()
     type_name: ClassVar[str] = "quail.logical_unnest"
 
     def children(self) -> tuple[LogicalNode, ...]:
@@ -54,7 +60,8 @@ class Unnest:
         """Return the input's columns, with each list as its field columns."""
         fields = self.fields()
         return tuple(name for column in self.input.result_columns()
-                     for name in fields.get(column, (column,)))
+                     for name in fields.get(column, (column,))) + tuple(
+                         alias.name for alias in self.aliases)
 
     def validate(self) -> None:
         if not self.columns:
@@ -67,6 +74,13 @@ class Unnest:
                 raise CompileError(
                     f"UNNEST reads a list column the rows below return, got "
                     f"{column!r}; the list columns are {sorted(types)}")
+        fields = {name for names in self.fields().values() for name in names}
+        for alias in self.aliases:
+            alias.validate()
+            if column_name(alias.expression) not in fields:
+                raise CompileError(
+                    f"{alias.name!r} names {column_name(alias.expression)}, "
+                    f"which is not a field column of this Unnest")
         names = self.result_columns()
         if len(names) != len(set(names)):
             raise CompileError(
@@ -84,5 +98,9 @@ class Unnest:
         return self
 
     def explain_fields(self) -> dict:
-        return {"columns": list(self.columns)}
+        fields = {"columns": list(self.columns)}
+        if self.aliases:
+            fields["aliases"] = {alias.name: column_name(alias.expression)
+                                 for alias in self.aliases}
+        return fields
 

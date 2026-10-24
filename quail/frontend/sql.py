@@ -570,4 +570,5 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
         output=selection.output,
         unnests=tuple(names for names, _ in unnests),
         unnest_tests=tuple(b.unnest_tests),
+        unnest_aliases=tuple(b.unnest_aliases),
     )

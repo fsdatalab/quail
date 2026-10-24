@@ -13,7 +13,13 @@ from __future__ import annotations
 from sqlglot import exp
 
 from quail.frontend.sql_binding.predicates import parse_plain_test
-from quail.logical import FEATURE_LIST, ColumnRef, CompileError, RegularPredicate
+from quail.logical import (
+    FEATURE_LIST,
+    ColumnRef,
+    CompileError,
+    RegularPredicate,
+    column_name,
+)
 
 
 def take_unnests(tree: exp.Select) -> tuple[tuple[tuple[str, ...], tuple], ...]:
@@ -75,6 +81,24 @@ def unnest_field(node, unnested: dict) -> str | None:
             f"{', '.join(f'{node.table}.{field}' for field in fields)}, "
             f"got {node.sql()}")
     return f"{node.table}.{node.name}"
+
+
+def field_reference(b, node):
+    """Return the expression later clauses read an unnested field by, or None.
+
+    A field with a SELECT name is read by its first Alias; any other by
+    its ColumnRef.
+
+    Raises:
+        CompileError: The column reads an unnested list but names no
+            field of it.
+    """
+    name = unnest_field(node, b.unnested)
+    if name is None:
+        return None
+    return next((alias for alias in b.unnest_aliases
+                 if column_name(alias.expression) == name),
+                ColumnRef(node.table, "", node.name))
 
 
 def bind_unnest_test(b, term) -> RegularPredicate | None:

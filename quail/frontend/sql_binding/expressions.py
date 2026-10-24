@@ -89,6 +89,8 @@ class ExpressionBinder:
         # the AS name of FROM's UNNEST, and WHERE's tests of its fields
         # each unnested list's name and its field names
         self.unnested: dict[str, tuple[str, ...]] = {}
+        # the SELECT names of unnested field columns, as Aliases
+        self.unnest_aliases: list[Alias] = []
         self.unnest_tests: list[RegularPredicate] = []
 
     # ---- scope ------------------------------------------------------

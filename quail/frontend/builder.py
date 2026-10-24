@@ -72,6 +72,7 @@ class Query:
         self._features = {}          # name -> Alias of an AI.SAE_FEATURES call
         self._unnests = []           # the list names of each unnest()
         self._unnest_tests = []      # RegularPredicate on their fields
+        self._unnest_aliases = []    # Aliases naming unnested fields
         self._regular_predicates = {}  # alias -> [RegularPredicate]
         # alias -> [(RegularPredicate on an answer or span, selectivity)]
         self._extract_filters = {}
@@ -254,6 +255,21 @@ class Query:
                 f"{', '.join(f'{spec.alias}.{field}' for field in fields)}, "
                 f"got {spec.alias}.{spec.column}")
         return f"{spec.alias}.{spec.column}"
+
+    def _unnest_name(self, c) -> Optional[str]:
+        """Return the result name of the unnested field ``c`` reads, or None.
+
+        A field read under ``named()`` is returned under that name.
+        """
+        field = self._unnest_field(c)
+        spec = col(c) if isinstance(c, str) else c
+        if field is None or spec.name is None or spec.name == field:
+            return field
+        alias = Alias(ColumnRef(spec.alias, "", spec.column), spec.name)
+        if alias not in self._unnest_aliases:
+            self._claim_name(spec.name)
+            self._unnest_aliases.append(alias)
+        return spec.name
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
                     descriptions=None,
@@ -863,7 +879,7 @@ class Query:
         windows, output = self._windowing(columns, cols)
         selected = []                # the result column names, in order
         for c in () if aggregation is not None or windows else cols:
-            unnested = self._unnest_field(c)
+            unnested = self._unnest_name(c)
             if unnested is not None:
                 selected.append(unnested)
                 continue
@@ -939,6 +955,7 @@ class Query:
         if aggregation is not None:
             named.update({a.name: a for a in aggregation.aggregates})
         named.update({window.name: window for window in windows})
+        named.update({alias.name: alias for alias in self._unnest_aliases})
         order = []
         for spec, descending, nulls_first in self._order:
             if spec.alias is None and spec.column in self._extracts:
@@ -946,7 +963,10 @@ class Query:
                     f"ORDER BY does not compare the AI.EXTRACT struct column "
                     f"{spec.column!r}; extract the field as its own column")
             if self._unnest_field(spec) is not None:
-                expression = ColumnRef(spec.alias, "", spec.column)
+                field = ColumnRef(spec.alias, "", spec.column)
+                # a renamed field is sorted by its name
+                expression = next((alias for alias in self._unnest_aliases
+                                   if alias.expression == field), field)
             else:
                 expression = (named[spec.column]
                               if spec.alias is None and spec.column in named
@@ -958,11 +978,12 @@ class Query:
                                aggregation=aggregation, structs=tuple(structs),
                                windows=windows, output=output,
                                unnests=tuple(self._unnests),
-                               unnest_tests=tuple(self._unnest_tests))
+                               unnest_tests=tuple(self._unnest_tests),
+                               unnest_aliases=tuple(self._unnest_aliases))
 
     def _project(self, columns: list, c) -> str:
         """Add the column or named output ``c`` to ``columns``; return its name."""
-        unnested = self._unnest_field(c)
+        unnested = self._unnest_name(c)
         if unnested is not None:
             return unnested
         if isinstance(c, str) and c in self._labels:

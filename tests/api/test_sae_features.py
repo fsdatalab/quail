@@ -345,3 +345,36 @@ def test_a_cte_can_unnest_features_for_the_query_that_reads_it(session):
     rows = finish(query, _unnest_oracle()).collect()
     assert [row["n"] for row in rows.to_pylist()] == [1, 1]
     assert rows.column(0).to_pylist() == [1, 2]
+
+
+def test_as_renames_an_unnested_field_after_where_reads_it(session):
+    sql = session.sql(
+        f"SELECT r.id, f.feature AS feature_id FROM reviews r, {UNNEST} "
+        f"WHERE f.strength > 1 ORDER BY feature_id DESC")
+    built = (session.docs("reviews").alias("r")
+             .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
+                              pooling="last", name="f")
+             .unnest("f").where(quail.col("f.strength") > 1)
+             .order_by(quail.col("feature_id").desc())
+             .select("r.id", quail.col("f.feature").named("feature_id")))
+    for query in (sql, built):
+        rows = finish(query, _unnest_oracle()).collect()
+        assert rows.to_pylist() == [{"r.id": 11, "feature_id": 2},
+                                    {"r.id": 9, "feature_id": 1}]
+    grouped = session.sql(
+        f"SELECT f.feature AS feature_id, COUNT(*) AS n FROM reviews r, "
+        f"{UNNEST} GROUP BY f.feature ORDER BY n DESC, feature_id LIMIT 2")
+    assert finish(grouped, _unnest_oracle()).collect().to_pylist() == [
+        {"feature_id": 100, "n": 3}, {"feature_id": 0, "n": 1}]
+
+
+def test_a_cte_returns_two_zipped_lists_under_their_select_names(session):
+    query = session.sql(
+        f"WITH pairs AS (SELECT r.id, f.feature AS first_feature, "
+        f"g.feature AS second_feature FROM reviews r, "
+        f"UNNEST({TWO_CALLS}) AS u(f, g)) "
+        f"SELECT id, first_feature, second_feature FROM pairs "
+        f"WHERE id = 9 ORDER BY first_feature")
+    rows = finish(query, _two_lists_oracle()).collect()
+    assert [tuple(row.values()) for row in rows.to_pylist()] == [
+        (9, 1, 1), (9, 100, None)]

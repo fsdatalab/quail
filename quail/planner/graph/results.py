@@ -5,7 +5,7 @@ from quail.logical import Filter as LogicalFilter
 from quail.logical import Result as LogicalResult
 from quail.logical import Unnest as LogicalUnnest
 from quail.logical import Window as LogicalWindow
-from quail.logical import packed_columns
+from quail.logical import column_name, packed_columns
 from quail.physical import (
     Aggregate,
     Filter,
@@ -72,6 +72,9 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
             node_id = f"unnest_{index}"
             nodes.append(Unnest(node_id=node_id, inputs=input_ports(rows),
                                 lists=tuple(logical.columns),
+                                aliases=tuple(
+                                    (column_name(alias.expression), alias.name)
+                                    for alias in logical.aliases),
                                 columns=result + hidden))
         else:
             node_id = f"filter_{index}"

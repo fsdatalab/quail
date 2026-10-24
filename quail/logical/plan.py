@@ -432,6 +432,8 @@ def _unnested_fields(node: Unnest, fields: dict) -> dict:
                           for field in value_type.value_type})
         else:
             types[name] = value_type
+    for alias in node.aliases:
+        types[alias.name] = types[column_name(alias.expression)]
     return types
 
 
