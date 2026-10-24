@@ -1,3 +1,5 @@
+<img src="docs/assets/quail-logo.svg" alt="Quail logo" width="96">
+
 # Quail
 
 **An open-source execution engine for AI functions in SQL,** from the
