@@ -25,7 +25,6 @@ from quail.physical import (
     PortRef,
     Project,
     Recombine,
-    ResultFilter,
     Scan,
     Sort,
     Unnest,
@@ -395,8 +394,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         elif isinstance(node, Unnest):
             title += ": " + ", ".join(node.lists)
             details.append("returns " + ", ".join(node.columns))
-        elif isinstance(node, ResultFilter):
-            title += f": {node.condition}"
         elif isinstance(node, Sort):
             title += ": " + ", ".join(
                 f"{column} {'DESC' if descending else 'ASC'} "

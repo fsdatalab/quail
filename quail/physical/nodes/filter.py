@@ -20,21 +20,33 @@ from ..base import (
 class Filter(PhysicalNode):
     """Physical operator that keeps the rows whose predicate holds.
 
-    The predicate is the logical plan's RegularPredicate over a label
-    AI.CLASSIFY produced, a score AI.SCORE produced, or an answer or
-    span AI.EXTRACT produced; its column names the rows table's
-    column. Single-document filters also return the kept document IDs;
-    filters over joined pairs return join answers.
+    With ``aliases``, the predicate is the logical plan's
+    RegularPredicate over a label AI.CLASSIFY produced, a score AI.SCORE
+    produced, or an answer or span AI.EXTRACT produced; its column names
+    the rows table's column. Single-document filters also return the
+    kept document IDs; filters over joined pairs return join answers.
+    Both run on the GPU executor.
+
+    Without ``aliases``, the filter reads result rows after the Project,
+    such as the field columns of an Unnest, and runs on the coordinator.
+    Its predicate names the column by its qualified name, and
+    ``columns`` are the output columns in result order.
     """
 
     predicate: RegularPredicate | None = None
     aliases: tuple[str, ...] = ()
     selectivity: float | None = None
     written_position: int = 0
+    columns: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.filter"
     runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def location(self) -> ExecutionLocation:
+        """The GPU executor for documents; the coordinator for result rows."""
+        return (ExecutionLocation.GPU_EXECUTOR if self.aliases
+                else ExecutionLocation.COORDINATOR)
 
     @property
     def document_aliases(self) -> tuple[str, ...]:
@@ -56,6 +68,8 @@ class Filter(PhysicalNode):
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
+        if not self.aliases:
+            return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
         if len(self.aliases) == 1:
             (alias,) = self.aliases
             return (

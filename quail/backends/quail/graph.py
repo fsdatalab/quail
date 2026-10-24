@@ -6,7 +6,6 @@ import time
 
 from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.executor.operators import execution_parts
-from quail.backends.quail.reranker import FilterRuntime
 from quail.backends.quail.retention import apply_retention
 from quail.catalog.pairs import columns_key
 from quail.execution.metrics import NodeResult, scalar_node_metrics
@@ -25,7 +24,6 @@ from quail.physical import (
     AiJoin,
     AiSaeFeatures,
     AiScore,
-    Filter,
     PhysicalGraph,
     Scan,
 )
@@ -41,7 +39,6 @@ def quail_runtimes() -> dict:
         AiClassify.runtime_key: model_runtime,
         AiExtract.runtime_key: model_runtime,
         AiSaeFeatures.runtime_key: model_runtime,
-        Filter.runtime_key: FilterRuntime(),
     }
 
 

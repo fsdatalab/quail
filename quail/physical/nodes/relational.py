@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.logical.expressions import RegularPredicate, WindowCall, packed_columns
+from quail.logical.expressions import WindowCall, packed_columns
 
 from ..base import (
     ExecutionLocation,
@@ -170,26 +170,6 @@ class Unnest(PhysicalNode):
     columns: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.unnest"
-    runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
-
-    @property
-    def outputs(self) -> tuple[OutputPort, ...]:
-        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
-
-
-@dataclass(frozen=True)
-class ResultFilter(PhysicalNode):
-    """Keep the result rows whose condition holds.
-
-    The condition tests a column of the rows, such as an unnested field
-    column. ``columns`` are the output columns in result order.
-    """
-
-    condition: RegularPredicate | None = None
-    columns: tuple[str, ...] = ()
-
-    type_name: ClassVar[str] = "quail.result_filter"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 

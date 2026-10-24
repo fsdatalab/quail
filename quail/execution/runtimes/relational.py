@@ -1,4 +1,4 @@
-"""Runtimes for the relational nodes: scan, project, filter, limit, aggregate, sort."""
+"""Runtimes for the relational nodes: scan, project, limit, aggregate, sort."""
 
 from __future__ import annotations
 
@@ -15,9 +15,8 @@ from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.rows import Rows, as_table
-from quail.logical.expressions import column_name
 from quail.logical.predicates import compare_literal
-from quail.physical import Aggregate, Limit, Project, ResultFilter, Scan, Sort, Window
+from quail.physical import Aggregate, Limit, Project, Scan, Sort, Window
 
 
 class ScanRuntime:
@@ -79,28 +78,6 @@ class ProjectRuntime:
         output_rows = _num_rows(value)
         return NodeResult({"rows": value}, NodeMetrics(
             input_rows=rows, output_rows=rows if output_rows is None else output_rows))
-
-
-class ResultFilterRuntime:
-    """Keep the result rows whose condition holds, one batch at a time."""
-
-    def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, ResultFilter):
-            raise TypeError(type(node).__name__)
-        if len(inputs) != 1:
-            raise ValueError("ResultFilter needs one input")
-        name = column_name(node.condition.column)
-        num_rows, batches = 0, []
-        for batch in row_batches(next(iter(inputs.values()))):
-            num_rows += batch.num_rows
-            # the condition reads its column by the bare column name
-            tested = pa.RecordBatch.from_arrays(
-                [batch.column(name)], names=[node.condition.column.column])
-            batches.append(batch.filter(node.condition.accepts(tested))
-                           .select(list(node.columns)))
-        table = pa.Table.from_batches(batches)
-        return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
-            input_rows=num_rows, output_rows=table.num_rows))
 
 
 def row_batches(value) -> Iterator[pa.RecordBatch]:

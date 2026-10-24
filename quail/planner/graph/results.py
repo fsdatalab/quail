@@ -8,10 +8,10 @@ from quail.logical import Window as LogicalWindow
 from quail.logical import packed_columns
 from quail.physical import (
     Aggregate,
+    Filter,
     Limit,
     PortRef,
     Project,
-    ResultFilter,
     Sort,
     Unnest,
     Window,
@@ -25,7 +25,7 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
 
     A sort key over a source column the projection does not return is
     projected as a hidden column, which the Sort drops. Each logical
-    Unnest and each Filter above it becomes an Unnest or a ResultFilter
+    Unnest and each Filter above it becomes an Unnest or a Filter
     after the Project, in plan order; the last of them returns the
     result columns in SELECT order. A GROUP BY adds
     an Aggregate over the projected columns, whose output the later
@@ -74,10 +74,10 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
                                 lists=tuple(logical.columns),
                                 columns=result + hidden))
         else:
-            node_id = f"result_filter_{index}"
-            nodes.append(ResultFilter(node_id=node_id, inputs=input_ports(rows),
-                                      condition=logical.condition,
-                                      columns=result + hidden))
+            node_id = f"filter_{index}"
+            nodes.append(Filter(node_id=node_id, inputs=input_ports(rows),
+                                predicate=logical.condition,
+                                columns=result + hidden))
         rows = (PortRef(node_id, "rows"),)
         if last and root.output:
             result = tuple(root.output)

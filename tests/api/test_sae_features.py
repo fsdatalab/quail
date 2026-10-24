@@ -311,8 +311,7 @@ def test_two_unnests_return_the_product_and_filter_above_their_own_list(session)
     for query in (sql, built):
         nodes = [type(node).__name__ for node in query.plan().nodes]
         start = nodes.index("Project")
-        assert nodes[start:start + 4] == ["Project", "Unnest", "ResultFilter",
-                                          "Unnest"]
+        assert nodes[start:start + 4] == ["Project", "Unnest", "Filter", "Unnest"]
         rows = finish(query, _unnest_oracle()).collect()
         assert rows.to_pylist() == [
             {"r.id": 9, "f.feature": 1, "g.feature": 1},
