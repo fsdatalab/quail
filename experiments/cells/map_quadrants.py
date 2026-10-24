@@ -101,8 +101,17 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
 @app.function(image=image, gpu="H100!", memory=98304, timeout=14400,
               volumes=VOLUMES)
 def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
-                  policies: str = "adaptive,fixed") -> str:
-    """Run the four map configurations; return the result JSON's volume path."""
+                  policies: str = "adaptive,fixed", only: str = "") -> str:
+    """Run the map configurations; return the result JSON's volume path.
+
+    Args:
+        model: The model to run.
+        scale_factor: The corpus scale factor.
+        policies: Comma-separated draft policies to run each
+            configuration under.
+        only: Comma-separated configuration names to run; empty runs
+            all four.
+    """
     import quail
     from bench.quailb import register_tables
     from quail.specs import H100_USD_PER_HOUR
@@ -114,8 +123,11 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
     with quail.Session(quail.EngineConfig(
             model=model, device="h100-sxm", backend="quail")) as session:
         register_tables(session, directory)
+        chosen = {name.strip() for name in only.split(",") if name.strip()}
         for policy in policies.split(","):
             for name, table, column, instruction, cap in CONFIGURATIONS:
+                if chosen and name not in chosen:
+                    continue
                 run_name = f"{name}_{policy}"
                 print(f"running {run_name}", flush=True)
                 measurements["runs"][run_name] = _run_one(
@@ -134,7 +146,8 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
 
 @app.local_entrypoint()
 def launch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
-           policies: str = "adaptive,fixed"):
-    call = map_quadrants.spawn(model=model, scale_factor=sf, policies=policies)
+           policies: str = "adaptive,fixed", only: str = ""):
+    call = map_quadrants.spawn(model=model, scale_factor=sf, policies=policies,
+                               only=only)
     print(f"function call id: {call.object_id}")
     print(call.get())

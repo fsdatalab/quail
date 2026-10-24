@@ -115,16 +115,26 @@ class MapDecoder:
 
     def _chain(self, answer: MapAnswer, document: MapDocument,
                policy: MapDraftPolicy, room: int, slack: float) -> tuple:
-        """Return a draft chained from the cache, and each hop's cell."""
+        """Return a draft chained from the cache, and each hop's cell.
+
+        The chain stops once the hops' combined odds fall below 2%:
+        tokens past that point add under 0.02 expected writes, so the
+        policy would not keep them, and each hop costs a cache lookup.
+        """
         context = list(answer.written[-max(MATCH_ORDERS):])
         tokens, cells, rates = [], [], []
+        combined = 1.0
         for _ in range(room):
             match = self.cache.lookup(context, document.index)
             if match is None:
                 break
+            cell, rate = policy.odds(match)
+            combined *= rate
+            if combined < 0.02:
+                break
             tokens.append(match.token)
-            cells.append(policy.cell(match))
-            rates.append(policy.hit_rate(match))
+            cells.append(cell)
+            rates.append(rate)
             context.append(match.token)
         length = policy.chain_length(document.rho, len(answer.written), rates,
                                      slack)
