@@ -11,6 +11,7 @@ from quail.backends.quail.executor.admission import (
     SKIP,
     JoinAdmission,
     OwnRequests,
+    SkipTo,
 )
 from quail.backends.quail.executor.readout_groups import ReadoutGroups
 from quail.backends.quail.executor.stages import (
@@ -327,10 +328,12 @@ class StageExecutor:
             if not stage.own_suffixes:
                 return None if stage.requests is None else stage.requests(key)
             got = stage.suffixes(key)
-            if got is DROP or got is SKIP:
+            if got is DROP or got is SKIP or isinstance(got, SkipTo):
                 return got
             own = got.suffixes
-            if len(own) and int(own.lengths.max()) > stage.suffix_tokens:
+            longest = (int(own.lengths[0]) if len(own) == 1
+                       else int(own.lengths.max()) if len(own) else 0)
+            if longest > stage.suffix_tokens:
                 raise ValueError(
                     f"{stage.label or f'stage {j}'}: a document's suffix has "
                     f"{int(own.lengths.max())} tokens, over the stage's "

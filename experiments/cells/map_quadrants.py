@@ -86,6 +86,8 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
     return {
         "wall_s": round(wall, 2),
         "engine_wall_s": report.get("wall_s"),
+        "gpu_s": report.get("gpu_s"),
+        "chunks": report.get("chunks"),
         "fresh_tokens": report.get("fresh_tokens"),
         "cached_tokens": report.get("cached_tokens"),
         "usd_per_query": (report.get("wall_s") or wall) / 3600 * usd_per_hour,
@@ -101,7 +103,8 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
 @app.function(image=image, gpu="H100!", memory=98304, timeout=14400,
               volumes=VOLUMES)
 def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
-                  policies: str = "adaptive,fixed", only: str = "") -> str:
+                  policies: str = "adaptive,fixed", only: str = "",
+                  gpu_timing: bool = True) -> str:
     """Run the map configurations; return the result JSON's volume path.
 
     Args:
@@ -111,6 +114,8 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
             configuration under.
         only: Comma-separated configuration names to run; empty runs
             all four.
+        gpu_timing: Whether to time the forward passes with CUDA
+            events and report their sum as gpu_s beside the wall.
     """
     import quail
     from bench.quailb import register_tables
@@ -121,7 +126,8 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     measurements = {"model": model, "scale_factor": scale_factor, "runs": {}}
     with quail.Session(quail.EngineConfig(
-            model=model, device="h100-sxm", backend="quail")) as session:
+            model=model, device="h100-sxm", backend="quail",
+            gpu_timing=gpu_timing)) as session:
         register_tables(session, directory)
         chosen = {name.strip() for name in only.split(",") if name.strip()}
         for policy in policies.split(","):

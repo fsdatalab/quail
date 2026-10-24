@@ -78,12 +78,16 @@ class AnswerStages:
         self.document_ids = document_ids[self.document_order]
         self.prefixes = [document.prefix for document in self.documents]
         self.keys = [document.key for document in self.documents]
+        self.documents_by_key = {}
 
     def _build(self) -> None:
         """Build each question's stages, in spec order."""
         self.stages = []
+        self.question_starts = []
         for q, (spec, tail) in enumerate(zip(self.specs, self.tails)):
+            self.question_starts.append(len(self.stages))
             self.stages.extend(self._question_stages(q, spec.name, tail))
+        self.question_starts.append(len(self.stages))
 
     def _question_stages(self, q: int, name: str, tail: list) -> list:
         """Build one question's stages: its tail, then the answer's rounds.
@@ -160,7 +164,8 @@ class AnswerStages:
         document = self._document(key)
         answer = document.answers[q]
         if answer.done:
-            return Stage.SKIP
+            # the rest of this question's rounds pass in one step
+            return Stage.SkipTo(self.question_starts[q + 1])
         accepted = answer.fed[:len(answer.fed) - answer.discard]
         tokens = self._draft(document, answer, q)
         if self.recurrent:
@@ -175,8 +180,13 @@ class AnswerStages:
         raise NotImplementedError
 
     def _document(self, key):
-        position = np.searchsorted(self.document_ids, key[1], side="right") - 1
-        return self.documents[self.document_order[position]]
+        document = self.documents_by_key.get(key)
+        if document is None:
+            position = np.searchsorted(self.document_ids, key[1],
+                                       side="right") - 1
+            document = self.documents[self.document_order[position]]
+            self.documents_by_key[key] = document
+        return document
 
     def _step_decide(self, q, anchor, row):
         """Verify the round's draft by the row after each of its tokens."""

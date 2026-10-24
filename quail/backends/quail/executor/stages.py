@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.admission import DROP, SKIP
+from quail.backends.quail.executor.admission import DROP, SKIP, SkipTo
 
 
 @dataclass
@@ -62,8 +62,9 @@ class Stage:
             or a callback from document key to StageRequests,
             asked when the document enters the stage, so a
             stage can feed what an earlier stage's answer chose for it.
-            The callback may return DROP or SKIP as requests does; it
-            takes the place of requests, and suffix_tokens bounds it.
+            The callback may return DROP, SKIP, or SkipTo as requests
+            does; it takes the place of requests, and suffix_tokens
+            bounds it.
         suffix_tokens: The most tokens one sequence of a callback
             suffixes may have; admission and page capacity count it.
         readout: Converts selected hidden states to Boolean answers, scores,
@@ -72,7 +73,8 @@ class Stage:
             frames are written only once.
         requests: Optional callback from document key to suffix indices.
             None selects all suffixes; DROP removes the document; SKIP
-            advances it without a request.
+            advances it without a request, and SkipTo(stage) advances
+            it to that stage.
         decide: Optional callback from document index and answer row to a
             Boolean. True advances the document or retains it at the final
             stage. Without a callback, any true answer is sufficient.
@@ -100,6 +102,7 @@ class Stage:
 
     DROP = DROP
     SKIP = SKIP
+    SkipTo = SkipTo
 
     suffixes: Any
     readout: Any

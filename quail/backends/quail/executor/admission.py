@@ -9,6 +9,7 @@ Tensor construction is handled by chunk.py.
 from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 
@@ -128,6 +129,21 @@ DROP = object()
 SKIP = object()
 
 
+# the partner list of an anchor with one request at a stage
+_ONE_PARTNER = np.zeros(1, dtype=np.int64)
+_ONE_PARTNER.setflags(write=False)
+
+
+class SkipTo(NamedTuple):
+    """A partner request that passes an anchor on to a later stage.
+
+    Every stage before `stage` is passed with nothing asked, in one
+    step; a stage index past the last finishes the anchor.
+    """
+
+    stage: int
+
+
 @dataclass(frozen=True)
 class Settlement:
     """Completion record indicating whether a document survived the last stage."""
@@ -169,10 +185,11 @@ class JoinAdmission:
             stage's partner list the anchor streams, or None for the
             whole list. Omitted anchors stream the whole list at every
             stage. An anchor's value may instead be a callable(stage)
-            -> list, None, DROP, or SKIP, asked when the anchor enters
-            the stage; DROP takes the anchor out of the run there,
-            SKIP passes it to the next stage with nothing asked (a
-            stage after the first only).
+            -> list, None, DROP, SKIP, or SkipTo, asked when the anchor
+            enters the stage; DROP takes the anchor out of the run
+            there, SKIP passes it to the next stage with nothing asked
+            (a stage after the first only), and SkipTo(stage) passes
+            it to that stage.
         frame_canvas_tokens: Rows a diffusion model adds after a frame
             entry. They take chunk room and page room but are never
             kept in the anchor's KV. A suffix's canvas rows are part of
@@ -363,14 +380,17 @@ class JoinAdmission:
             if lst is DROP:
                 self._stage[a] = _DONE
                 return "dropped"
-            if lst is SKIP:
-                # nothing asked here: the anchor passes this stage
-                self._true[a][j] = True
-                if j + 1 == k:
+            if lst is SKIP or isinstance(lst, SkipTo):
+                # nothing asked here: the anchor passes this stage,
+                # and every stage before a SkipTo's
+                until = j + 1 if lst is SKIP else max(lst.stage, j + 1)
+                for passed in range(j, min(until, k)):
+                    self._true[a][passed] = True
+                if until >= k:
                     self._stage[a] = _DONE
                     self.survivors += 1
                     return "finished"
-                j += 1
+                j = until
                 continue
             if ask is not None:
                 self._lists[a][j], self._cums[a][j] = self._partner_list(
@@ -390,6 +410,9 @@ class JoinAdmission:
         if lst is None:
             return None, None
         lengths = lst.lengths if isinstance(lst, OwnRequests) else None
+        if lengths is not None and len(lengths) == 1:
+            # a decode round's one request skips the array work
+            return _ONE_PARTNER, np.array([0, int(lengths[0])], dtype=np.int64)
         lst = np.asarray(lst, dtype=np.int64)
         if lengths is None:
             invalid = (lst < 0) | (lst >= len(self.stages[j]))
