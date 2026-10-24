@@ -16,8 +16,9 @@ def make_arena(*, window=None, slots=0, pages=8):
         extra = dict(layer_kv=[(1, 2), (1, 2)], sliding_layers=(1,),
                      sliding_window=window, num_sliding_pages=pages)
     if slots:
+        # a recurrent layer holds no KV, as a hybrid model's do
         extra.update(num_state_slots=slots, gdn_state_shape=(1, 2, 2),
-                     conv_state_shape=(1, 3))
+                     conv_state_shape=(1, 3), layer_kv=[(1, 2), (0, 0)])
     return KVArena(num_layers=2, num_pages=pages, page_tokens=PAGE,
                    num_kv_heads=1, d_head=2, dtype=torch.float32, device="cpu",
                    **extra)
@@ -33,7 +34,9 @@ def attach(arena, entries=2, tokens=6):
 
 def write_prefix(arena, key, tokens, seed):
     """Fill the key's first `tokens` rows of every layer with known values."""
-    for layer in range(len(arena.shapes)):
+    for layer, (heads, dim) in enumerate(arena.shapes):
+        if not heads * dim:
+            continue
         k, v = arena.layer_kv(layer)
         rows = (arena.capacity_rows_sliding(key) if layer in arena.sliding_layers
                 else arena.capacity_rows(key))
@@ -46,7 +49,9 @@ def write_prefix(arena, key, tokens, seed):
 def read_prefix(arena, key, first, last):
     """The key's rows first..last of every layer, as (layer, side, row, values)."""
     out = {}
-    for layer in range(len(arena.shapes)):
+    for layer, (heads, dim) in enumerate(arena.shapes):
+        if not heads * dim:
+            continue
         sliding = layer in arena.sliding_layers
         rows = arena.capacity_rows_sliding(key) if sliding else arena.capacity_rows(key)
         start = arena.sliding_start(key) if sliding else 0

@@ -35,9 +35,11 @@ from quail.backends.quail.executor.host_copy import copy_rows
 from quail.catalog.tokens import token_array
 
 # pinned slots for row indices on their way to the device, and the
-# longest prefix a slot holds; a longer one pins its own buffer
-INDEX_SLOTS = 64
-INDEX_TOKENS = 16384
+# longest prefix a slot holds; a longer one pins its own buffer. A
+# save in flight holds its slot, so a burst of saves past the slots
+# waits at the link's speed; 4096 slots of 4096 rows are 128 MB
+INDEX_SLOTS = 4096
+INDEX_TOKENS = 4096
 
 
 def prefix_hash(prefix) -> bytes:
@@ -193,9 +195,15 @@ class HostKV:
 
     @staticmethod
     def _layer_groups(arena):
-        """Group layers by pool and KV shape: (layer ids, row width, sliding)."""
+        """Group layers by pool and KV shape: (layer ids, row width, sliding).
+
+        A hybrid model's recurrent layers hold no KV and are left out;
+        their state travels as the key's checkpoint.
+        """
         groups = {}
         for layer, (heads, dim) in enumerate(arena.shapes):
+            if not heads * dim:
+                continue
             sliding = layer in arena.sliding_layers
             groups.setdefault((sliding, heads * dim), []).append(layer)
         return [(tuple(layers), width, sliding)
