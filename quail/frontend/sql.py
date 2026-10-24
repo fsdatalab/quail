@@ -1,16 +1,25 @@
 """Parse SQL with SQLGlot and construct a Quail logical plan."""
 
+import re
+from collections import Counter
 from enum import StrEnum
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.errors import OptimizeError
+from sqlglot.optimizer.eliminate_ctes import eliminate_ctes
+from sqlglot.optimizer.merge_subqueries import merge_subqueries
+from sqlglot.optimizer.qualify_columns import qualify_columns
+from sqlglot.optimizer.qualify_tables import qualify_tables
 from sqlglot.optimizer.scope import Scope, ScopeType, traverse_scope
+from sqlglot.schema import MappingSchema
 
 from quail.catalog import Catalog, MemoryTableProvider
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql_binding.expressions import (
     ExpressionBinder,
 )
+from quail.frontend.sql_binding.predicates import column_path
 from quail.frontend.sql_binding.relations import (
     JoinBinder,
     bind_where,
@@ -272,67 +281,163 @@ def compile_sql(
                 "WITH RECURSIVE is not supported; a CTE reads registered "
                 "tables and the CTEs before it")
     prompts = prompts or PromptBinder(turn=turn, layout=layout)
-    # sqlglot lists each CTE and FROM subquery before the query reading
-    # it, and the statement last; an EXISTS body compiles with its query
-    scopes = [scope for scope in traverse_scope(tree)
-              if scope.scope_type is not ScopeType.SUBQUERY]
-    if len(scopes) == 1:
+    if len(_scopes(tree)) == 1:
         return _compile_select(tree, catalog, prompts, dialect)
+    for select in tree.find_all(exp.Select):
+        for item in select.selects:
+            if isinstance(item, exp.Alias):
+                item.meta["user_alias"] = True
     tables = Catalog(dict(catalog.providers))
     ctes = []
-    for scope in scopes:
-        reads = tuple(dict.fromkeys(
-            _stage_name(source) for _, source in scope.selected_sources.values()
-            if isinstance(source, Scope)))
-        plan = _compile_select(_stage_select(scope), tables, prompts, dialect)
-        if scope.is_root:
-            return WithPlan(tuple(ctes), plan, reads)
-        name = _stage_name(scope)
-        if name in catalog:
-            raise CompileError(
-                f"the CTE {name!r} is also a registered table; pick another name")
-        if name in tables:
-            raise CompileError(f"the CTE {name!r} is defined twice")
-        ctes.append(Cte(name, plan, reads))
-        tables.register(name, MemoryTableProvider(
-            cte_schema(plan).empty_table(), id_col="", identity=f"cte:{name}"))
-    raise AssertionError("traverse_scope lists the statement's scope last")
+    plan = _compile_stages(_qualified(tree, catalog, dialect), tables, prompts,
+                           dialect, ctes)
+    if not ctes:
+        return plan
+    return WithPlan(tuple(ctes), plan, _cte_reads(plan, ctes))
 
 
-def _stage_name(scope: Scope) -> str:
-    """Return the name a CTE's or a FROM subquery's result is read under.
+def _qualified(tree: exp.Select, catalog: Catalog, dialect: SQLDialect) -> exp.Select:
+    """Qualify every column with its table, as sqlglot's merge requires."""
+    schema = MappingSchema(
+        {name: dict.fromkeys(provider.columns, "UNKNOWN")
+         for name, provider in catalog.providers.items()},
+        dialect=_sqlglot_dialect(dialect), normalize=False)
+    try:
+        return qualify_columns(
+            qualify_tables(tree, dialect=_sqlglot_dialect(dialect)),
+            schema=schema, dialect=_sqlglot_dialect(dialect))
+    except OptimizeError as error:
+        raise CompileError(str(error)) from error
 
-    Raises:
-        CompileError: The subquery has no alias, or the CTE lists
-            column names.
+
+def _compile_stages(tree: exp.Select, tables: Catalog, prompts, dialect,
+                    ctes: list) -> LogicalPlan:
+    """Compile a statement's stages into ctes and return the plan of its SELECT.
+
+    A CTE or FROM subquery runs as its own stage when an AI function
+    reads a column it computes, when two queries read it, or when
+    sqlglot's merge_subqueries cannot inline it; every other one is
+    merged into the query that reads it, so the statement becomes as
+    few plans as its model calls allow.
     """
+    scopes = _scopes(tree)
+    staged = _staged(scopes)
+    # the merged CTEs, which a detached stage may still read
+    pool = [cte for cte in tree.find_all(exp.CTE)
+            if not any(cte is scope.expression.parent for scope in staged)]
+    for scope in staged:
+        _compile_stage(scope, pool, tables, prompts, dialect, ctes)
+    tree = merge_subqueries(eliminate_ctes(tree))
+    for scope in _scopes(tree):
+        if not scope.is_root:
+            _compile_stage(scope, (), tables, prompts, dialect, ctes)
+    tree.set("with_", None)
+    # qualifying wrote a struct field path as Dot nodes over the column;
+    # the binders read the path as one column
+    for dot in list(tree.find_all(exp.Dot)):
+        parts, node = [], dot
+        while isinstance(node, exp.Dot):
+            parts.insert(0, node.expression.name)
+            node = node.this
+        if isinstance(node, exp.Column):
+            dot.replace(exp.column(*reversed([*column_path(node), *parts])))
+    # qualifying named every select item; a column keeps its own name
+    for item in tree.selects:
+        if isinstance(item, exp.Alias) and not item.meta.get("user_alias") and (
+                (isinstance(item.this, exp.Column) and item.alias == item.this.name)
+                or AUTO_ALIAS.fullmatch(item.alias)):
+            item.replace(item.this)
+    return _compile_select(tree, tables, prompts, dialect)
+
+
+def _compile_stage(scope: Scope, pool, tables: Catalog, prompts, dialect,
+                   ctes: list) -> None:
+    """Detach one stage from its statement, compile it, and add it to ctes.
+
+    The statement reads the stage's result as a table named by the
+    CTE name or the subquery alias.
+    """
+    # the CTE name, or the subquery alias sqlglot gave or qualifying added
+    name = scope.expression.parent.alias
+    if name in tables:
+        raise CompileError(
+            f"{name!r} names a registered table or another CTE; pick "
+            f"another name")
     owner = scope.expression.parent
-    name = owner.alias
-    if not name:
-        raise CompileError(
-            f"a subquery in FROM needs an alias: ({scope.expression.sql()}) AS name")
-    if owner.args["alias"].columns:
-        raise CompileError(
-            f"WITH {name} (...) column names are not supported; name "
-            f"the columns with AS inside the CTE")
-    return name
+    body = scope.expression
+    if isinstance(owner, exp.CTE):
+        owner.pop()
+    else:
+        owner.replace(exp.table_(name, alias=name))
+    body.set("with_", exp.With(expressions=[cte.copy() for cte in pool])
+             if pool else None)
+    plan = _compile_stages(body, tables, prompts, dialect, ctes)
+    ctes.append(Cte(name, plan, _cte_reads(plan, ctes)))
+    tables.register(name, MemoryTableProvider(
+        cte_schema(plan).empty_table(), id_col="", identity=f"cte:{name}"))
 
 
-def _stage_select(scope: Scope) -> exp.Select:
-    """Return a scope's SELECT with its CTEs and FROM subqueries as tables.
+def _scopes(tree) -> list:
+    """Return the CTE, FROM subquery, and statement scopes in dependency order."""
+    # an EXISTS body is bound with its query, not as a stage
+    return [scope for scope in traverse_scope(tree)
+            if scope.scope_type is not ScopeType.SUBQUERY]
 
-    The CTEs compile as their own stages, so the WITH clause comes off.
-    Each FROM subquery is replaced by a reference to the table its
-    stage returns, named by the subquery's alias.
+
+AI_FUNCTIONS = {"PROMPT", "AI_FILTER", "AI_SCORE", "AI_EXTRACT"}
+# the name sqlglot gives a select item that is not a column
+AUTO_ALIAS = re.compile(r"_col_\d+", re.IGNORECASE)
+
+
+def _staged(scopes) -> list:
+    """Return the scopes that must run as stages, in dependency order.
+
+    A CTE or FROM subquery is a stage when an AI function reads a
+    column it computes, so the text does not exist before the model has
+    run, or when two queries read it, so it runs once.
     """
-    select = scope.expression
-    if not isinstance(select, exp.Select):
-        raise CompileError(f"{select.sql()} must be a SELECT")
-    select.set("with_", None)
-    for subquery in list(select.find_all(exp.Subquery)):
-        if isinstance(subquery.parent, (exp.From, exp.Join)):
-            subquery.replace(exp.table_(subquery.alias, alias=subquery.alias))
-    return select
+    readers = Counter()
+    forced = set()
+    for scope in scopes:
+        for _, source in scope.selected_sources.values():
+            if isinstance(source, Scope):
+                readers[id(source)] += 1
+        for column in scope.columns:
+            source = scope.sources.get(column.table)
+            ancestor = column.find_ancestor(exp.Anonymous, exp.AIClassify)
+            if (isinstance(source, Scope) and ancestor is not None
+                    and (isinstance(ancestor, exp.AIClassify)
+                         or str(ancestor.this).upper() in AI_FUNCTIONS)
+                    and column.name in _computed(source)):
+                forced.add(id(source))
+    return [scope for scope in scopes if not scope.is_root
+            and (readers[id(scope)] > 1 or id(scope) in forced)]
+
+
+def _computed(scope: Scope) -> set:
+    """Return the names of a scope's result columns an AI function computes.
+
+    A column passed through from another CTE's computed column counts.
+    """
+    names = set()
+    for item in scope.expression.selects:
+        value = item.unalias()
+        if any(isinstance(node, exp.AIClassify) or (
+                isinstance(node, exp.Anonymous)
+                and str(node.this).upper() in AI_FUNCTIONS) for node in value.walk()):
+            names.add(item.alias_or_name)
+        elif isinstance(value, exp.Column):
+            source = scope.sources.get(value.table)
+            if isinstance(source, Scope) and value.name in _computed(source):
+                names.add(item.alias_or_name)
+    return names
+
+
+def _cte_reads(plan: LogicalPlan, ctes: list) -> tuple:
+    """Return the names of the stages the plan scans."""
+    names = {cte.name for cte in ctes}
+    return tuple(dict.fromkeys(
+        scan.provider for scan in plan.operators().scans if scan.provider in names))
 
 
 def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,

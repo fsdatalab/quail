@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import copy
-
 from quail.api.builder import BoundBuilder
 from quail.api.query import Query, QueryLike, WithQuery
 from quail.builtins import built_in_registry
-from quail.catalog import Catalog, InputStore, LayeredInputs, TableProvider
+from quail.catalog import Catalog, InputStore, TableProvider
 from quail.catalog.tokens import GigatokenEncoder
 from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
@@ -63,7 +61,6 @@ class Session:
         self.inputs = InputStore(
             self.catalog, tokenizer=lambda: self.tokenizer,
             tokenizer_name="configured tokenizer" if tokenizer else "Gigatoken")
-        self._cte_inputs = []
         self._remote = None
         if endpoint is not None:
             from quail.remote.client import RemoteConnection
@@ -95,8 +92,6 @@ class Session:
         """
         if self._remote is not None:
             self._remote.close()
-        for inputs in self._cte_inputs:
-            inputs.close()
         self.inputs.close()
 
     def __enter__(self):
@@ -143,25 +138,6 @@ class Session:
         if isinstance(logical, WithPlan):
             return WithQuery(self, logical, order=order)
         return Query(self, logical, order=order)
-
-    def with_ctes(self, names) -> "Session":
-        """Return a view of this session whose catalog can hold CTE results.
-
-        The view shares this session's model, registry, and tokenized
-        tables. Its catalog is a copy to register CTE results in, and
-        its inputs store the CTE columns in token files this session
-        closes with its own.
-
-        Args:
-            names: The CTE names the view's catalog will hold.
-        """
-        view = copy.copy(self)
-        view.catalog = Catalog(dict(self.catalog.providers))
-        own = InputStore(view.catalog, tokenizer=lambda: self.tokenizer,
-                         tokenizer_name=self.inputs.tokenizer_name)
-        self._cte_inputs.append(own)
-        view.inputs = LayeredInputs(self.inputs, own, names)
-        return view
 
     def get_run(self, query_id: str):
         """Reattach to a query the server already accepted.

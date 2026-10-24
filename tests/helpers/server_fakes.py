@@ -13,9 +13,7 @@ from helpers.sessions import fake_tok, make_executor
 from quail.server.executor import Hooks
 
 TRUTH = {"r": {"q1:": [1, 1, 0, 1, 1, 0],
-               "q2:": [1, 0, 1, 1, 0, 1]},
-         # the CTE of WITH_SQL keeps r0, r1, r3, and r4, in that order
-         "k": {"q2:": [1, 0, 1, 1]}}
+               "q2:": [1, 0, 1, 1, 0, 1]}}
 
 FILTER_SQL = """
     SELECT r.id FROM reviews r
@@ -23,13 +21,14 @@ FILTER_SQL = """
       AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5})
 """
 
+# the CTE is read twice, so it runs as a stage; it keeps r0, r1, r3, r4
 WITH_SQL = """
     WITH kept AS (
         SELECT r.id, r.review FROM reviews r
         WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5})
     )
-    SELECT k.id FROM kept k
-    WHERE AI_FILTER(PROMPT('q2: {0}', k.review), {'selectivity': 0.5})
+    SELECT a.id FROM kept a JOIN kept b
+      ON AI_FILTER(PROMPT('m {0} {1}', a.review, b.review), {'anchor': 'a'})
 """
 
 JOIN_SQL = """
@@ -39,7 +38,8 @@ JOIN_SQL = """
 """
 
 # answer for the pair (review i, product j); r0 matches p0 and p2
-JOIN_TRUTH = {("r", "p"): lambda a, b: (a + b) % 2 == 0}
+JOIN_TRUTH = {("r", "p"): lambda a, b: (a + b) % 2 == 0,
+              ("a", "b"): lambda a, b: a == b}
 
 CONFIG = {"model": "qwen3-4b-fp8", "device": "h100-sxm",
           "gpus": 1, "backend": "quail"}

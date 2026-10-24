@@ -483,7 +483,8 @@ class WithPlan:
 
     Attributes:
         ctes: The CTEs in dependency order. Each reads registered tables
-            and earlier CTEs only.
+            and earlier CTEs only, and each is read by the query or by
+            a later CTE.
         query: The final SELECT.
         reads: The names of the CTEs the final SELECT's scans read.
     """
@@ -491,19 +492,3 @@ class WithPlan:
     ctes: tuple[Cte, ...]
     query: LogicalPlan
     reads: tuple[str, ...]
-
-    def needed(self) -> tuple[Cte, ...]:
-        """Return the CTEs the final SELECT depends on, in written order.
-
-        A CTE nothing reads, directly or through another CTE, is left
-        out and does not run.
-        """
-        by_name = {cte.name: cte for cte in self.ctes}
-        needed = set()
-        pending = list(self.reads)
-        while pending:
-            name = pending.pop()
-            if name not in needed:
-                needed.add(name)
-                pending.extend(by_name[name].reads)
-        return tuple(cte for cte in self.ctes if cte.name in needed)

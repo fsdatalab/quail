@@ -283,8 +283,8 @@ def test_a_with_query_runs_its_cte_before_the_select_on_the_server(make_client):
     assert "with kept:" in final["plan"]["text"]
     assert "query (reads kept):" in final["plan"]["text"]
     rows = client.get(f"/v1/queries/{status['id']}/rows").json()
-    assert rows["columns"] == ["k.id"]
-    assert sorted(row[0] for row in rows["rows"]) == ["r0", "r3", "r4"]
+    assert rows["columns"] == ["a.id"]
+    assert sorted(row[0] for row in rows["rows"]) == ["r0", "r1", "r3", "r4"]
 
 
 def test_bearer_token_guards_the_api_but_not_the_page(make_client):

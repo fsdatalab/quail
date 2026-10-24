@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import pyarrow as pa
 
 from quail.api.execute import execute_query
-from quail.catalog import MemoryTableProvider, inputs
+from quail.catalog import Catalog, MemoryTableProvider, inputs
 from quail.catalog.pairs import columns_key, estimate_pair_fraction
 from quail.catalog.selection import selected_rows
 from quail.catalog.tokens import TokenLengths
@@ -18,7 +19,6 @@ from quail.execution.projection import projection_for
 from quail.execution.reporting import collect_answers, execution_report
 from quail.execution.result import QueryResult
 from quail.execution.runner import ExecutionContext, GenericRunner
-from quail.execution.schema import cte_table
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import estimated_rows, explain
 from quail.logical import (
@@ -569,19 +569,23 @@ class WithQuery:
         self.session = session
         self.logical = logical
         self.order = order
-        self.ctes = {cte.name: cte for cte in logical.needed()}
-        self._view = session.with_ctes(self.ctes)
-        self._schemas = {}
-        for cte in logical.ctes:
-            schema = cte_schema(cte.plan)
-            self._view.catalog.register(cte.name, MemoryTableProvider(
-                schema.empty_table(), id_col="", identity=f"cte:{cte.name}"))
-            self._schemas[cte.name] = schema
+        self.ctes = {cte.name: cte for cte in logical.ctes}
+        self._schemas = {cte.name: cte_schema(cte.plan) for cte in logical.ctes}
         self._queries = {}     # stage name -> its Query; "" is the SELECT
         self._results = {}     # stage name -> its QueryResult, once run
-        for name in self.ctes:
-            self._view.inputs.assumed_lengths[name] = (
-                lambda column, name=name: self._assumed_lengths(name, column))
+        # the stages run on a view of the session whose catalog also
+        # holds each CTE's result, a placeholder until the CTE has run
+        self._assumptions = {
+            name: (lambda column, name=name: self._assumed_lengths(name, column))
+            for name in self.ctes}
+        self._view = copy.copy(session)
+        self._view.catalog = Catalog({
+            **session.catalog.providers,
+            **{name: MemoryTableProvider(schema.empty_table(), id_col="",
+                                         identity=f"cte:{name}")
+               for name, schema in self._schemas.items()}})
+        self._view.inputs = session.inputs.over(self._view.catalog,
+                                                self._assumptions)
 
     def _stages(self) -> tuple:
         """Return (name, LogicalPlan) of every stage in execution order."""
@@ -694,7 +698,7 @@ class WithQuery:
             table = cte_table(result.collect(), self._schemas[name])
             self._view.catalog.providers[name] = MemoryTableProvider(
                 table, id_col="", identity=f"cte:{name}")
-            self._view.inputs.assumed_lengths.pop(name, None)
+            self._assumptions.pop(name, None)
         result.report = _summed_report(result.report, reports)
         return result
 
@@ -725,6 +729,28 @@ class WithQuery:
                 batch_rows: int = 65_536) -> pa.Table:
         """Execute the query and collect one Arrow table."""
         return self.run().collect(limit=limit, batch_rows=batch_rows)
+
+
+def cte_table(result: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Return a stage's result as the table the next stage reads.
+
+    Label columns are decoded from dictionaries to text, and the
+    columns take the CTE's names.
+
+    Raises:
+        ValueError: The result's types differ from the schema the next
+            stage was compiled against.
+    """
+    columns = [
+        column.cast(column.type.value_type)
+        if pa.types.is_dictionary(column.type) else column
+        for column in result.columns]
+    if len(columns) != len(schema) or [
+            column.type for column in columns] != [field.type for field in schema]:
+        raise ValueError(
+            f"the CTE's result has types {[c.type for c in columns]}, but "
+            f"the query reading it was compiled for {schema.types}")
+    return pa.table(dict(zip(schema.names, columns)))
 
 
 def _summed_report(report: dict, cte_reports: dict) -> dict:

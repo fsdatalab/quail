@@ -8,9 +8,8 @@ from helpers.oracle import Oracle, oracle_executor
 
 import quail
 from quail.api import execute as execution
-from quail.api.query import ASSUMED_ANSWER_TOKENS, WithQuery
-from quail.catalog import Catalog, DocumentProvider
-from quail.execution.schema import cte_table
+from quail.api.query import ASSUMED_ANSWER_TOKENS, Query, WithQuery, cte_table
+from quail.catalog import DocumentProvider
 from quail.frontend.sql import compile_sql
 from quail.logical import CompileError, WithPlan, cte_schema
 from quail.planner.plan import EngineConfig
@@ -144,8 +143,8 @@ def test_a_cte_runs_once_however_many_times_it_is_read(session):
         FROM clauses a JOIN clauses b
           ON AI.IF(PROMPT('same clause? {0} {1}', a.clause.terms, b.clause.terms))
     """, dialect="bq")
-    # a CTE nothing reads is compiled but does not run
-    assert [cte.name for cte in query.logical.needed()] == ["clauses"]
+    # a CTE nothing reads is left out
+    assert [cte.name for cte in query.logical.ctes] == ["clauses"]
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     joins=lambda node, assignment: (
                         assignment["a"] == assignment["b"]))
@@ -189,13 +188,43 @@ def test_a_subquery_in_from_and_a_nested_with_are_stages_too(session):
     assert result.collect().to_pylist() == [{"s.id": 1, "s.score": 0.9}]
 
 
+def test_a_cte_no_model_output_feeds_merges_into_one_plan(session):
+    # a regular CTE, a FROM subquery without an alias, and a CTE whose
+    # computed column is only compared become one plan, as in DuckDB
+    merged = session.sql("""
+        WITH recent AS (SELECT c.id, c.text FROM contracts c WHERE c.id > 1),
+        kinds AS (
+            SELECT r.id, r.text,
+                   AI.CLASSIFY(PROMPT('kind of {0}?', r.text), ARRAY['lease', 'deed'])
+                       AS kind
+            FROM recent r
+        )
+        SELECT id FROM (SELECT k.id, k.text FROM kinds k WHERE k.kind = 'lease')
+        WHERE AI.IF(PROMPT('keep: {0}', text))
+        ORDER BY id LIMIT 5
+    """, dialect="bq")
+    assert isinstance(merged, Query)
+    operators = merged.logical.operators()
+    (scan,) = operators.scans
+    assert scan.provider == "contracts" and str(scan.predicates[0]) == "c.id > 1"
+    assert len(operators.classifies) == 1 and list(operators.filters) == ["c"]
+    oracle = Oracle(labels=["lease", "deed", "lease"],
+                    filters=lambda alias, document, position: True)
+    result, recorder = run(merged, oracle)
+    assert len(recorder.requests) == 1
+    assert result.collect().column("c.id").to_pylist() == [3]
+
+
 def test_an_empty_cte_result_gives_an_empty_result(session):
     query = session.sql("""
         WITH kept AS (
-            SELECT c.id, c.text FROM contracts c
+            SELECT c.id,
+                   AI.CLASSIFY(PROMPT('kind of {0}?', c.text), ARRAY['lease', 'deed'])
+                       AS kind
+            FROM contracts c
             WHERE AI.IF(PROMPT('keep: {0}', c.text))
         )
-        SELECT k.id, AI.SCORE(PROMPT('score {0}', k.text)) AS score FROM kept k
+        SELECT k.id, AI.SCORE(PROMPT('score {0}', k.kind)) AS score FROM kept k
     """, dialect="bq")
     oracle = Oracle(filters=lambda alias, document, position: False)
     result, recorder = run(query, oracle)
@@ -223,7 +252,8 @@ def test_explain_plans_later_stages_on_named_assumptions(session, monkeypatch):
             SELECT c.id, c.text FROM contracts c
             WHERE AI.IF(PROMPT('keep: {0}', c.text))
         )
-        SELECT k.id FROM kept k WHERE AI.IF(PROMPT('again: {0}', k.text))
+        SELECT a.id FROM kept a JOIN kept b
+          ON AI.IF(PROMPT('alike: {0} {1}', a.text, b.text))
     """, dialect="bq")
     assert "planned on 1 rows of 8 tokens each" in passthrough.explain()
 
@@ -288,46 +318,53 @@ def test_with_rejects_what_the_stages_cannot_express(session):
     read = "SELECT x.id FROM clauses x WHERE AI_FILTER(PROMPT('k {0}', x.clause.terms))"
     for sql, message in (
         (f"WITH RECURSIVE clauses AS ({extract}) {read}", "RECURSIVE"),
-        (f"WITH clauses (a, b) AS ({extract}) {read}", "column names"),
-        (f"WITH clauses AS ({extract}), clauses AS ({extract}) {read}",
-         "defined twice"),
-        (f"WITH contracts AS ({extract}) {read}", "registered table"),
-        (f"SELECT x.id FROM ({extract}) WHERE "
-         f"AI_FILTER(PROMPT('k {{0}}', x.clause.terms))", "needs an alias"),
+        (f"WITH contracts AS ({extract}) SELECT x.id FROM contracts x "
+         f"WHERE AI_FILTER(PROMPT('k {{0}}', x.clause.terms))", "another name"),
         ("SELECT c.id FROM contracts c WHERE c.id IN (SELECT d.id FROM contracts d) "
          "AND AI_FILTER(PROMPT('k {0}', c.text))", "subqueries other than"),
-        (f"WITH clauses AS (SELECT LENGTH(c.text), AI.EXTRACT(c.text, "
-         f"{{'terms': 'q?'}}) AS clause FROM contracts c) {read}", "AS name"),
-        (f"WITH clauses AS (SELECT c.id, d.id FROM contracts c JOIN contracts d "
+        ("WITH clauses AS (SELECT LENGTH(c.text), AI.EXTRACT(c.text, "
+         "{'terms': 'q?'}) AS clause FROM contracts c) SELECT x.clause "
+         "FROM clauses x WHERE AI_FILTER(PROMPT('k {0}', x.clause.terms))",
+         "AS name"),
+        (f"WITH clauses AS (SELECT c.id, d.id, AI.EXTRACT(c.text, {{'terms': 'q?'}}) "
+         f"AS clause FROM contracts c JOIN contracts d "
          f"ON AI_FILTER(PROMPT('k {{0}} {{1}}', c.text, d.text))) {read}",
          "name twice"),
         (f"WITH later AS (SELECT x.id FROM clauses x WHERE "
          f"AI_FILTER(PROMPT('k {{0}}', x.clause.terms))), clauses AS ({extract}) "
          f"SELECT l.id FROM later l WHERE AI_FILTER(PROMPT('k {{0}}', l.id))",
-         "unknown provider 'clauses'"),
+         "clauses"),
         (f"WITH clauses AS ({extract}) SELECT x.id FROM clauses x",
          "no AI predicate"),
-        (f"WITH clauses AS (SELECT c.id FROM contracts c) {read}", "no AI predicate"),
+        (f"WITH clauses AS (SELECT c.id FROM contracts c) {read}", "clause"),
+        (f"WITH clauses AS ({extract}) SELECT x.nope FROM clauses x "
+         f"WHERE AI_FILTER(PROMPT('k {{0}}', x.clause.terms))", "nope"),
     ):
         with pytest.raises(CompileError, match=message):
             session.sql(sql)
-    assert isinstance(compile_sql(extract, session.catalog), type(
-        session.sql(extract).logical))
+    # a CTE column list renames the result, and a subquery without an
+    # alias gets one, as sqlglot applies both
+    renamed = session.sql(
+        f"WITH clauses (a, b) AS ({extract}) SELECT x.a FROM clauses x "
+        f"WHERE AI_FILTER(PROMPT('k {{0}}', x.b.terms))")
+    assert renamed.logical.ctes[0].plan.schema().names == ["a", "b", "b_span"]
+    unnamed = session.sql(
+        f"SELECT id FROM ({extract}) WHERE AI_FILTER(PROMPT('k {{0}}', clause.terms))")
+    assert [cte.name for cte in unnamed.logical.ctes] == list(unnamed.logical.reads)
     with pytest.raises(RuntimeError, match="edited plans"):
         session.sql(f"WITH clauses AS ({extract}) {read}").run(plan=object())
     assert isinstance(compile_sql(
         f"WITH clauses AS ({extract}) {read}", session.catalog), WithPlan)
 
 
-def test_a_session_closes_the_token_files_of_its_cte_results(tmp_path):
+def test_a_session_closes_the_token_files_of_its_cte_results():
     session = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
                             tokenizer=words)
     session.register("contracts", DocumentProvider.from_table(CONTRACTS, id_col="id"))
     query = session.sql(EXTRACT_THEN_SCORE)
     run(query, Oracle(answers=lambda spec, document: CLAUSES[document]))
-    (own,) = session._cte_inputs
-    directory = Path(own._token_directory.name)
+    directory = Path(session.inputs._token_directory.name)
     assert list(directory.iterdir())
+    assert "clauses" not in session.catalog
     session.close()
     assert not directory.exists()
-    assert isinstance(session.catalog, Catalog) and "clauses" not in session.catalog
