@@ -56,4 +56,19 @@ def test_the_kernel_moves_a_document_at_the_link_speed():
     total_s = time.perf_counter() - started
     print(f"{repeats} scatters from the host: host {host_s * 1e3 / repeats:.3f} ms "
           f"per launch, {moved / total_s / 1e9:.1f} GB/s")
+    # the copy engine on the same host, for the same bytes, contiguous
+    staging = pool[:count].contiguous()
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    for repeat in range(repeats):
+        host[repeat].copy_(staging, non_blocking=True)
+    torch.cuda.synchronize()
+    total_s = time.perf_counter() - started
+    print(f"copy engine to the host: {moved / total_s / 1e9:.1f} GB/s")
+    started = time.perf_counter()
+    for repeat in range(repeats):
+        staging.copy_(host[repeat], non_blocking=True)
+    torch.cuda.synchronize()
+    total_s = time.perf_counter() - started
+    print(f"copy engine from the host: {moved / total_s / 1e9:.1f} GB/s")
     assert host_s / repeats < 0.001

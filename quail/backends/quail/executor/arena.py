@@ -432,8 +432,8 @@ class KVArena:
         """Free the pages of draining keys whose save has landed.
 
         A freed key whose save is still reading its pages keeps them
-        until the save's event fires. With wait, the oldest such save
-        is waited for first. Returns the pages freed.
+        until the save's event fires. With wait, every save is waited
+        for. Returns the pages freed.
         """
         freed = 0
         for key, event in list(self._draining.items()):
@@ -441,10 +441,17 @@ class KVArena:
                 if not wait:
                     break
                 event.synchronize()
-                wait = False
             del self._draining[key]
             freed += self._free_now(key)
         return freed
+
+    def reclaim_oldest(self) -> int:
+        """Wait for the oldest save in flight and free its key's pages."""
+        for key, event in self._draining.items():
+            event.synchronize()
+            del self._draining[key]
+            return self._free_now(key)
+        return 0
 
     def retain(self, key, tokens: int, priority=None):
         """Rewind a prefix and make it available for a later operator.
@@ -495,7 +502,7 @@ class KVArena:
         while not satisfied():
             victim = self.accounting.pop_retained_victim(keep=keep)
             if victim is None:
-                if not self._draining or not self.reclaim(wait=True):
+                if not self._draining or not self.reclaim_oldest():
                     break
                 continue
             keys.append(victim[0])
@@ -503,7 +510,7 @@ class KVArena:
             # an evicted key saving to the host keeps its pages until
             # the save has read them: wait for that before evicting more
             if not satisfied() and victim[0] in self._draining:
-                self.reclaim(wait=True)
+                self.reclaim_oldest()
         return tuple(keys)
 
     def _evict_for_pages(self, need, need_sliding):

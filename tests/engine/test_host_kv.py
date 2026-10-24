@@ -243,5 +243,8 @@ def test_a_freed_key_keeps_its_pages_until_its_save_has_landed():
     assert arena.reserve(key, 6, capacity_tokens=8)
     assert events[1].waited and not arena._draining
     assert arena.free_key(key) == 0
-    # with wait, reclaim waits for the oldest save itself
-    assert arena.reclaim(wait=True) == 2 and events[2].waited
+    assert arena.reserve(("d", 1), 6, capacity_tokens=8)
+    arena.free_key(("d", 1))
+    # the oldest save alone, or every save, is waited for
+    assert arena.reclaim_oldest() == 2 and events[2].waited and not events[3].waited
+    assert arena.reclaim(wait=True) == 2 and events[3].waited and not arena._draining

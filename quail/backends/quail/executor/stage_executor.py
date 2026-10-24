@@ -683,7 +683,7 @@ class StageExecutor:
                 if self._readmit:
                     self._readmit = False
                     continue
-                if self.paged and self.arena.reclaim(wait=True):
+                if self.paged and self.arena.reclaim_oldest():
                     continue
                 raise AssertionError("nothing buildable and nothing in flight")
             self._run_part(groups)
