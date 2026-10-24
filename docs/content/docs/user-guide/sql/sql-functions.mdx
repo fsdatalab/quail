@@ -98,10 +98,6 @@ In this example, the CTE `clauses` first extracts the termination
 clause of each contract. Then the main query scores each extracted
 clause, so the model reads the clause instead of the full contract.
 
-The main query reads the clause as `x.clause.terms`. `clause` is the
-struct that `AI.EXTRACT` returns, and `terms` is its field. When a
-contract has no termination clause, `AI.SCORE` reads empty text.
-
 In a CTE, give each computed column an `AS` name so that a later
 query can read it.
 
