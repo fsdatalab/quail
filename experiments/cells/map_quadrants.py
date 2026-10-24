@@ -9,7 +9,7 @@ copy, so the run isolates what the policy buys.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-map-quadrants.log"
     uv run modal run --detach \
-      experiments/cells/map_quadrants.py::map_quadrants \
+      experiments/cells/map_quadrants.py::launch \
       2>&1 | tee "$run_log"
 
 The result JSON lands under /results/ablations/ on the quail-results
@@ -17,12 +17,9 @@ volume; the function prints its path.
 """
 
 import json
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from bench.quailb_parallel import DATA_DIR, VOLUMES, app, image, results_vol
 
@@ -136,8 +133,8 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
 
 
 @app.local_entrypoint()
-def main(model: str = "qwen3-4b-fp8", sf: float = 0.1,
-         policies: str = "adaptive,fixed"):
+def launch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
+           policies: str = "adaptive,fixed"):
     call = map_quadrants.spawn(model=model, scale_factor=sf, policies=policies)
     print(f"function call id: {call.object_id}")
     print(call.get())
