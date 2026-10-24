@@ -41,7 +41,7 @@ class SaeFeaturesRefusedError(ScoreRefusedError):
     """Carries an AI.SAE_FEATURES Refusal out of the plan builder."""
 
 
-def sae_features_refusal(operators, context) -> Refusal | None:
+def sae_features_refusal(operators, context, scored: bool) -> Refusal | None:
     """Check whether the model supports feature-call planning.
 
     A feature call needs a model loaded with an SAE and a residual
@@ -55,7 +55,7 @@ def sae_features_refusal(operators, context) -> Refusal | None:
             needed=1, available=0, unit="queries")
     model = context.model
     features = bool(operators.sae_features)
-    others = bool(operators.filters or operators.joins
+    others = bool(operators.filters or operators.joins or scored
                   or operators.labels.calls or operators.extracts)
     if features and (not model.sae_hf_name or not model.residual_readout):
         return Refusal(
@@ -272,12 +272,12 @@ def score_input_tokens(spec, context) -> tuple[int, int]:
 def validate_query(plan, operators, context, model, device, gpus):
     """Return a refusal for unsupported inference or hardware requirements."""
     labels, applies = operators.labels, operators.applies
+    scored = has_score(plan)
     if operators.sae_features or (
             context is not None and context.model.residual_readout):
-        refusal = sae_features_refusal(operators, context)
+        refusal = sae_features_refusal(operators, context, scored)
         if refusal is not None:
             return refusal
-    scored = has_score(plan)
     if scored:
         refusal = score_refusal(plan, context)
         if refusal is not None:

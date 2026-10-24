@@ -130,6 +130,19 @@ def test_sql_binds_the_reading_and_rejects_a_bad_one(session):
             "AS features FROM reviews r")
 
 
+def test_features_and_a_score_in_one_query_are_refused(session):
+    query = (session.docs("reviews").alias("r")
+             .ai_sae_features(quail.prompt("{0}\n\nWhat is this about?",
+                                           quail.col("r.body")),
+                              pooling="last", name="features")
+             .ai_score(quail.prompt("Is this positive?\n\n{0}",
+                                    quail.col("r.body")), name="score")
+             .select("r.id", "features", "score"))
+    refusal = query.plan()
+    assert isinstance(refusal, Refusal)
+    assert "does not mix with other AI operators" in refusal.reasons[0]
+
+
 def test_a_model_without_an_sae_refuses_features_and_the_reverse(session):
     with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
                        tokenizer=_tokenize) as full:
