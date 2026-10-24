@@ -10,7 +10,6 @@ from quail.backends.quail.executor.parts import (
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.backends.quail.reranker import filter_scores
 from quail.catalog.selection import group_ids
 from quail.catalog.tokens import (
     DocumentKeys,
@@ -20,6 +19,7 @@ from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
+from quail.execution.runtimes.filter import filter_scores
 from quail.progress import answer_sink
 
 

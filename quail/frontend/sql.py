@@ -33,6 +33,7 @@ from quail.frontend.sql_binding.select import (
     _parse_offset,
     bind_order,
 )
+from quail.frontend.sql_binding.unnest import list_fields, take_unnests
 from quail.logical import (
     Alias,
     ColumnRef,
@@ -83,6 +84,8 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
             replacement = "AI_CLASSIFY("
         elif function == "EXTRACT":
             replacement = "AI_EXTRACT("
+        elif function == "SAE_FEATURES":
+            replacement = "AI_SAE_FEATURES("
         elif function == "IF" and dialect is SQLDialect.BQ:
             replacement = "AI_FILTER("
         if (
@@ -117,10 +120,12 @@ def _reject_forbidden(tree) -> None:
             "AI_FILTER",
             "AI_SCORE",
             "AI_EXTRACT",
+            "AI_SAE_FEATURES",
         }:
             raise CompileError(
                 f"{name} is not supported; supported AI functions are "
-                "AI_FILTER, AI_SCORE, AI_CLASSIFY, and AI_EXTRACT"
+                "AI_FILTER, AI_SCORE, AI_CLASSIFY, AI_EXTRACT, and "
+                "AI_SAE_FEATURES"
             )
     # a subquery is legal in FROM, where it runs as its own stage, and
     # as the EXISTS form, checked structurally; any other is refused
@@ -414,9 +419,9 @@ def _compile_stage(scope: Scope, pool, tables: Catalog, prompts, dialect,
 
 def _scopes(tree) -> list:
     """Return the CTE, FROM subquery, and statement scopes in dependency order."""
-    # an EXISTS body is bound with its query, not as a stage
+    # an EXISTS body and an UNNEST are bound with their query, not as stages
     return [scope for scope in traverse_scope(tree)
-            if scope.scope_type is not ScopeType.SUBQUERY]
+            if scope.scope_type not in (ScopeType.SUBQUERY, ScopeType.UDTF)]
 
 
 AI_FUNCTIONS = {"PROMPT", "AI_FILTER", "AI_SCORE", "AI_EXTRACT"}
@@ -429,7 +434,8 @@ def _staged(scopes) -> list:
 
     A CTE or FROM subquery is a stage when an AI function reads a
     column it computes, so the text does not exist before the model has
-    run, or when two queries read it, so it runs once.
+    run, when two queries read it, so it runs once, or when it reads an
+    UNNEST, which sqlglot's merge drops the alias of.
     """
     readers = Counter()
     forced = set()
@@ -449,6 +455,10 @@ def _staged(scopes) -> list:
                          or str(ancestor.this).upper() in AI_FUNCTIONS)
                     and column.name in _computed(source)):
                 forced.add(id(source))
+    for scope in scopes:
+        if any(isinstance(join.this, exp.Unnest)
+               for join in scope.expression.args.get("joins") or ()):
+            forced.add(id(scope))
     return [scope for scope in scopes if not scope.is_root
             and (readers[id(scope)] > 1 or id(scope) in forced)]
 
@@ -478,27 +488,47 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
                     dialect: SQLDialect, *,
                     allow_relational: bool = False) -> LogicalPlan:
     """Compile one SELECT against the tables in the catalog."""
+    unnests = take_unnests(tree)
     limit = _parse_limit(tree)
     offset = _parse_offset(tree)
     distinct = _parse_distinct(tree)
 
     b = ExpressionBinder(catalog, prompts, dialect=dialect.value)
 
+    for names, _ in unnests:
+        for name in names:
+            if name in b.unnested:
+                raise CompileError(f"two UNNEST lists are named {name!r}")
+            b.unnested[name] = list_fields()
     joins = JoinBinder(b)
     joins.bind_tables(tree)
+    for name in b.unnested:
+        if name in dict(b.tables):
+            raise CompileError(
+                f"{name!r} is both a table alias and an UNNEST list name; "
+                f"rename one")
     bind_where(b, tree, joins)
 
     selection = SelectBinder(b).bind(tree)
     columns, aggregation = selection.columns, selection.aggregation
+    columns = (*columns, *(Alias(b.bind_ai_sae_features(call), name)
+                           for names, calls in unnests
+                           for name, call in zip(names, calls)))
     order = bind_order(tree, b, columns, aggregation, selection.structs,
                        selection.windows)
     _validate_query(b, joins, columns, selection.structs,
                     allow_relational=allow_relational)
     named, labels = _bind_label_names(b, columns)
     extracts = {}
+    feature_columns = {}
     for column in columns:
         if aliased_call(column, "extract") is not None:
             extracts.setdefault(column.expression.aliases()[0], []).append(
+                (column.expression, column.name)
+            )
+        if aliased_call(column, "features") is not None:
+            feature_columns.setdefault(
+                column.expression.aliases()[0], []).append(
                 (column.expression, column.name)
             )
 
@@ -517,6 +547,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
             ),
             extracts=tuple(extracts.get(alias, ())),
             extract_filters=tuple(b.extract_tests.get(alias, ())),
+            sae_features=tuple(feature_columns.get(alias, ())),
             schema=catalog.get(provider).schema(),
         )
     for join in b.joins:
@@ -537,4 +568,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
         structs=selection.structs,
         windows=selection.windows,
         output=selection.output,
+        unnests=tuple(names for names, _ in unnests),
+        unnest_tests=tuple(b.unnest_tests),
+        unnest_aliases=tuple(b.unnest_aliases),
     )

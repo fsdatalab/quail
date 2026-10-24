@@ -20,13 +20,15 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | Qwen3.6 35B-A3B | `"qwen3.6-35b-a3b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | Qwen3.8 27B | `"qwen3.8-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | LFM2 2.6B | `"lfm2-2.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
+| Qwen3.5 2B Base with Qwen-Scope SAE | `"qwen3.5-2b-sae-bf16"` | BF16 | `AI.SAE_FEATURES` |
 
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
 format. All listed models store KV in BF16.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a
-document. See the
+document. `AI.SAE_FEATURES` returns the sparse autoencoder features of a
+prompt. See the
 [SQL reference](/docs/user-guide/sql) for examples.
 
 ## GPUs
@@ -119,6 +121,27 @@ See the vLLM Semantic Router team's
 for the approach. The post covers Decision 1.0; the
 [Kai 2.0 model card](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
 describes the model supported here.
+
+## Qwen3.5 2B Base with Qwen-Scope SAE
+
+The `qwen3.5-2b-sae-bf16` model serves `AI.SAE_FEATURES` only. Quail
+loads layers 0 to 11 of the 24 layers of
+[Qwen3.5-2B-Base](https://huggingface.co/Qwen/Qwen3.5-2B-Base). The
+sparse autoencoder (SAE) is the Qwen-Scope
+[`Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_100`](https://huggingface.co/Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_100)
+SAE for layer 11. The SAE reads the residual stream after layer 11. It
+has 32,768 features and keeps the 100 strongest features of each token.
+
+The model has no layers after layer 11, so it cannot answer `AI.IF`,
+`AI.SCORE`, `AI.CLASSIFY`, or `AI.EXTRACT`. Use another model in a
+separate session for these functions.
+
+```python
+config = quail.EngineConfig(
+    model="qwen3.5-2b-sae-bf16",
+    device="h100-sxm",
+)
+```
 
 ## No local GPU? Use Modal
 

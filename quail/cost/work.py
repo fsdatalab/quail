@@ -25,6 +25,8 @@ class Work:
     sliding_kv_read: float = 0.0
     state_written: float = 0.0
     state_read: float = 0.0
+    # tokens the model's SAE encodes, for AI.SAE_FEATURES
+    sae_encoded: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":
         return Work(
@@ -36,6 +38,7 @@ class Work:
             self.sliding_kv_read + other.sliding_kv_read,
             self.state_written + other.state_written,
             self.state_read + other.state_read,
+            self.sae_encoded + other.sae_encoded,
         )
 
     def __mul__(self, count: float) -> "Work":
@@ -48,6 +51,7 @@ class Work:
             self.sliding_kv_read * count,
             self.state_written * count,
             self.state_read * count,
+            self.sae_encoded * count,
         )
 
     def total(self) -> "Work":
@@ -55,7 +59,7 @@ class Work:
         return Work(*(float(np.sum(value)) for value in (
             self.tokens, self.pairs, self.kv_written, self.kv_read,
             self.sliding_pairs, self.sliding_kv_read, self.state_written,
-            self.state_read)))
+            self.state_read, self.sae_encoded)))
 
     def dominates(self, other: "Work") -> bool:
         """Return whether every count is no larger than the other record."""
@@ -68,6 +72,7 @@ class Work:
             and self.sliding_kv_read <= other.sliding_kv_read
             and self.state_written <= other.state_written
             and self.state_read <= other.state_read
+            and self.sae_encoded <= other.sae_encoded
         )
 
 

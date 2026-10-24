@@ -86,6 +86,12 @@ class ExpressionBinder:
         # alias -> (RegularPredicate on an answer or span, selectivity)
         self.extract_tests: dict[str, list[tuple[RegularPredicate, float | None]]] = {}
         self.joins: list[JoinSpec] = []
+        # the AS name of FROM's UNNEST, and WHERE's tests of its fields
+        # each unnested list's name and its field names
+        self.unnested: dict[str, tuple[str, ...]] = {}
+        # the SELECT names of unnested field columns, as Aliases
+        self.unnest_aliases: list[Alias] = []
+        self.unnest_tests: list[RegularPredicate] = []
 
     # ---- scope ------------------------------------------------------
 
@@ -212,6 +218,8 @@ class ExpressionBinder:
         else:
             if function == "AI_SCORE":
                 kind = "score"
+            elif function == "AI_SAE_FEATURES":
+                kind = "features"
             else:
                 kind = "join" if join else "filter"
             prompt = self.prompts.bind(kind, template, tuple(refs))
@@ -341,6 +349,39 @@ class ExpressionBinder:
         call = ModelCall(prompt, "extract", question=question)
         call.validate()
         return call
+
+    def bind_ai_sae_features(self, node) -> ModelCall:
+        """Parse an AI.SAE_FEATURES call and bind its document reference.
+
+        The call is ``AI.SAE_FEATURES(PROMPT('template', column),
+        pooling => 'last')``; the pooling is 'last' or 'max'.
+        """
+        args = list(node.expressions)
+        pooling = None
+        if len(args) == 2 and isinstance(args[1], exp.Kwarg):
+            kwarg = args.pop()
+            if str(kwarg.this.name).lower() != "pooling":
+                raise CompileError(
+                    f"AI.SAE_FEATURES takes pooling => 'last' or 'max', "
+                    f"got {kwarg.this.name}")
+            value = kwarg.expression
+            if not (isinstance(value, exp.Literal) and value.is_string):
+                raise CompileError(
+                    "AI.SAE_FEATURES pooling must be the string 'last' "
+                    "or 'max'")
+            pooling = str(value.this)
+        if pooling is None:
+            raise CompileError(
+                "AI.SAE_FEATURES takes PROMPT(...) and pooling => "
+                "'last' or 'max'")
+        call = exp.Anonymous(this="AI_SAE_FEATURES", expressions=args)
+        prompt, _, aliases = self.bind_ai_call(
+            call, "AI_SAE_FEATURES", set(), join=False)
+        if len(aliases) != 1:
+            raise CompileError("AI.SAE_FEATURES reads one document column")
+        model_call = ModelCall(prompt, "features", pooling=pooling)
+        model_call.validate()
+        return model_call
 
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:
         """Bind a score or classification to its model call."""

@@ -15,6 +15,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiSaeFeatures,
     AiScore,
     Limit,
     PhysicalGraph,
@@ -325,7 +326,8 @@ class ShouldSharePrefixes(PhysicalRule):
         }
         shared_by_alias = {}
         for node in graph.nodes:
-            if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract, AiScore))
+            if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract,
+                                      AiSaeFeatures, AiScore))
                     or (isinstance(node, AiInference) and node.spec is None)
                     or node.share_prefixes
                     or (isinstance(node, AiScore) and len(node.spec.aliases) != 1)):

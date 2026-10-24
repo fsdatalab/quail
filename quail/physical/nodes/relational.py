@@ -1,4 +1,4 @@
-"""Coordinator nodes: Exchange, Recombine, Project, Aggregate, Sort, Limit."""
+"""Coordinator nodes: Exchange, Recombine, Project, and the result nodes."""
 
 from __future__ import annotations
 
@@ -147,6 +147,31 @@ class Window(PhysicalNode):
     columns: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.window"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
+
+@dataclass(frozen=True)
+class Unnest(PhysicalNode):
+    """Return one row per element of list columns, zipped by position.
+
+    Each list column in ``lists`` holds structs and becomes one column
+    per struct field, named ``<list>.<field>``; the other columns repeat
+    for each element. A row returns as many rows as its longest list,
+    with nulls past the end of a shorter one. Each (field column, name)
+    of ``aliases`` returns the field column again under the name.
+    ``columns`` are the output columns in result order.
+    """
+
+    lists: tuple[str, ...] = ()
+    aliases: tuple[tuple[str, str], ...] = ()
+    columns: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.unnest"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 

@@ -3,7 +3,7 @@ title: AI functions
 ---
 
 Use AI functions to filter and join documents, score answers, assign
-labels, and extract text. The examples use BigQuery syntax. See the
+labels, extract text, and read sparse autoencoder features. The examples use BigQuery syntax. See the
 [SQL reference](/docs/user-guide/sql) for dialect selection and a first query.
 
 ## Functions
@@ -20,6 +20,7 @@ Square brackets mark optional arguments.
 | [`AI.SCORE(prompt[, options])`](#aiscore) | Returns a score from 0 to 1 for a model question. |
 | [`AI.CLASSIFY(input, categories[, options])`](#aiclassify) | Assigns one of the supplied labels. |
 | [`AI.EXTRACT(input, questions)`](#aiextract) | Copies answers from a document and returns their positions. |
+| [`AI.SAE_FEATURES(prompt, pooling)`](#aisae_features) | Returns the sparse autoencoder features of a prompt. |
 | [`HINT(condition, options)`](#planning-hints) | Sets the estimated pass fraction for a label or answer condition. |
 
 </div>
@@ -408,6 +409,102 @@ set the expected fraction of documents that pass, or pass
 
 For the Python form, see
 [`ai_extract()`](/docs/user-guide/python-api/ai-functions#ai_extract).
+
+## AI.SAE_FEATURES
+
+`AI.SAE_FEATURES` returns the sparse autoencoder (SAE) features of a
+prompt. An SAE changes the model's hidden state for one token into many
+values, and most of these values are zero. Each nonzero value is a
+feature, with an ID and a strength. A feature ID has no name. To find
+what a feature means, read the documents where its strength is largest.
+The function does not generate text.
+
+For example, imagine a `tickets` table with the first message of each
+support conversation in `request`. Return the features of each request:
+
+```sql
+SELECT t.id,
+       AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
+                              t.request),
+                       pooling => 'last') AS intent
+FROM tickets t;
+```
+
+The result is a list with one struct for each nonzero feature, from the
+strongest to the weakest. For the request `Hi, I need to cancel one of
+my flights booked on May 17.`, `intent` starts with
+`[{"feature": 7850, "strength": 2.01}, {"feature": 20512, "strength": 1.53}, ...]`.
+
+An `AI.SAE_FEATURES` call in `SELECT` requires a column alias with `AS`.
+The call must be a separate item, rather than part of a larger
+expression.
+
+### Arguments
+
+`AI.SAE_FEATURES(prompt, pooling => 'last' | 'max')`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `prompt` | [`PROMPT`](#prompt) | The question and one document column. Quail puts the document before the question. |
+| `pooling` | `STRING` | The tokens that give the features: `'last'` or `'max'`. |
+
+### Pooling
+
+- `'last'` uses the last token of the prompt. The question follows the
+  document, so the question changes these features. Use `'last'` to
+  read features about the question, e.g., the intent of a request.
+  The list has at most 100 features.
+- `'max'` uses the largest strength of each feature over all tokens of
+  the prompt. Most of these tokens are document tokens, so the features
+  describe the content of the document. The list can have thousands of
+  features.
+
+### Unnest the features
+
+Put the call in `UNNEST` in `FROM` to get one row for each feature. The
+rows have the columns `f.feature` and `f.strength`, where `f` is the
+`AS` name. The other columns repeat for each feature. Use these columns
+in `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates. To give a
+field another name in the result, write `f.feature AS feature_id` in
+`SELECT`. `WHERE` uses the original name.
+
+For example, with the same `tickets` table, count the requests that
+have each feature with a strength above 1:
+
+```sql
+SELECT f.feature, COUNT(*) AS requests
+FROM tickets t,
+     UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
+                                   t.request),
+                            pooling => 'last')) AS f
+WHERE f.strength > 1
+GROUP BY f.feature
+ORDER BY requests DESC;
+```
+
+To read two lists, use one of these forms:
+
+- `UNNEST(a, b) AS u(f, g)` puts the lists side by side. Row `i` has
+  element `i` of each list. If one list is shorter, its fields are null
+  in the rows after its end.
+- `UNNEST(a) AS f, UNNEST(b) AS g` gives each pair of elements, one from
+  each list.
+
+A `WHERE` test of a feature field compares the field with literals.
+
+### Limits
+
+- Use the `qwen3.5-2b-sae-bf16` model. See
+  [Supported models and GPUs](/docs/user-guide/models).
+- A query with `AI.SAE_FEATURES` cannot also use `AI.IF`, `AI.SCORE`,
+  `AI.CLASSIFY`, or `AI.EXTRACT`.
+- `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the feature list.
+  Use the fields of an `UNNEST` instead.
+
+For the Python form, see
+[`ai_sae_features()`](/docs/user-guide/python-api/ai-functions#ai_sae_features).
+For an application, see
+[Find customer intents in support conversations](/docs/demos/support-intents).
 
 ## Planning hints
 

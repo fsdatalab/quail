@@ -8,6 +8,7 @@ from quail.logical.prompts import (
     bind_extract_prompt,
     bind_join_prompt,
     bind_prompt,
+    bind_sae_features_prompt,
     bind_score_prompt,
 )
 from quail.specs import ModelSpec
@@ -46,6 +47,8 @@ class PromptBinder:
         layout = self.layout if self.model is None else self.model.prompt_layout
         if kind == "extract":
             return bind_extract_prompt(args, template, turn)
+        if kind == "features":
+            return bind_sae_features_prompt(template, args, turn)
         if kind == "label":
             return bind_classify_prompt(
                 template, args, labels, descriptions, turn,

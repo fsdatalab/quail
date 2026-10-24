@@ -1,19 +1,33 @@
 """The result nodes a physical plan ends with."""
 
 from quail.logical import Aggregate as LogicalAggregate
+from quail.logical import Filter as LogicalFilter
 from quail.logical import Result as LogicalResult
+from quail.logical import Unnest as LogicalUnnest
 from quail.logical import Window as LogicalWindow
-from quail.logical import packed_columns
-from quail.physical import Aggregate, Limit, PortRef, Project, Sort, Window
+from quail.logical import column_name, packed_columns
+from quail.physical import (
+    Aggregate,
+    Filter,
+    Limit,
+    PortRef,
+    Project,
+    Sort,
+    Unnest,
+    Window,
+)
 from quail.physical.base import input_ports
 
 
 def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
                  columns: tuple[str, ...], structs: tuple = ()) -> tuple:
-    """Return the Project, Aggregate, Window, and Sort or Limit that end a plan.
+    """Return the Project, its unnests, and the nodes ending a plan.
 
     A sort key over a source column the projection does not return is
-    projected as a hidden column, which the Sort drops. A GROUP BY adds
+    projected as a hidden column, which the Sort drops. Each logical
+    Unnest and each Filter above it becomes an Unnest or a Filter
+    after the Project, in plan order; the last of them returns the
+    result columns in SELECT order. A GROUP BY adds
     an Aggregate over the projected columns, whose output the later
     nodes read, and window calls a Window after it. A plan with an
     ORDER BY, DISTINCT, or OFFSET ends in a Sort carrying the limit; a
@@ -28,9 +42,16 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
     """
     window = root.input if isinstance(root.input, LogicalWindow) else None
     below = root.input.input if window is not None else root.input
+    chain = []  # the logical Unnest and Filter nodes, lowest first
+    node = below.input if isinstance(below, LogicalAggregate) else below
+    while isinstance(node, (LogicalUnnest, LogicalFilter)):
+        chain.insert(0, node)
+        node = node.input
+    returned = chain[-1].result_columns() if chain else ()
     # with an aggregation the sort keys name its outputs, not inputs
     hidden = () if isinstance(below, LogicalAggregate) else tuple(dict.fromkeys(
-        key.name for key in root.order if key.name not in columns))
+        key.name for key in root.order
+        if key.name not in columns and key.name not in returned))
     nodes = [Project(
         node_id="project",
         inputs=input_ports(tuple(inputs)),
@@ -39,6 +60,30 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
     )]
     rows = (PortRef("project", "rows"),)
     result = packed_columns(columns, structs)
+    for index, logical in enumerate(chain):
+        result = logical.result_columns()
+        last = index == len(chain) - 1
+        if last and root.output:
+            # a column only ORDER BY reads passes through to the Sort
+            result = tuple(root.output) + tuple(dict.fromkeys(
+                key.name for key in root.order
+                if key.name in result and key.name not in root.output))
+        if isinstance(logical, LogicalUnnest):
+            node_id = f"unnest_{index}"
+            nodes.append(Unnest(node_id=node_id, inputs=input_ports(rows),
+                                lists=tuple(logical.columns),
+                                aliases=tuple(
+                                    (column_name(alias.expression), alias.name)
+                                    for alias in logical.aliases),
+                                columns=result + hidden))
+        else:
+            node_id = f"filter_{index}"
+            nodes.append(Filter(node_id=node_id, inputs=input_ports(rows),
+                                predicate=logical.condition,
+                                columns=result + hidden))
+        rows = (PortRef(node_id, "rows"),)
+        if last and root.output:
+            result = tuple(root.output)
     if isinstance(below, LogicalAggregate):
         aggregation = below
         nodes.append(Aggregate(

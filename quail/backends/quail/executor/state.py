@@ -33,6 +33,8 @@ class LoadedModelState:
     decision_head: Any = None
     # the tokenizer and vocabulary index AI.EXTRACT reads, loaded on first use
     vocabulary: Any = None
+    # the SAE encoder AI.SAE_FEATURES reads, loaded on first use
+    sae: Any = None
 
 
 @dataclass

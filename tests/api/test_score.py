@@ -15,7 +15,6 @@ import quail
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.reranker import (
-    FilterRuntime,
     RerankerBatch,
     RerankerModelExecution,
     ScoreRows,
@@ -30,6 +29,7 @@ from quail.execution.runner import (
     GenericRunner,
     compute_subgraph,
 )
+from quail.execution.runtimes import FilterRuntime
 from quail.frontend.sql import compile_sql
 from quail.logical import ColumnRef, CompileError, RegularPredicate, SemanticJoin
 from quail.physical import (

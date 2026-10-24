@@ -162,7 +162,8 @@ def filters_before_joins(plan: LogicalPlan) -> list:
     A filter above a join thins nothing before the joins, and computes
     no KV its join could reuse.
     """
-    return [node for node in plan.walk()
+    # a Filter above the projection reads result rows, not documents
+    return [node for node in LogicalPlan(plan.projection).walk()
             if isinstance(node, (Filter, SemanticFilter))
             and not any(isinstance(below, SemanticJoin)
                         for below in LogicalPlan(node.input).walk())]

@@ -24,6 +24,8 @@ from quail.logical.expressions import (
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import classifications
 from quail.logical.nodes.extract import extractions
+from quail.logical.nodes.filter import above_unnest
+from quail.logical.nodes.sae_features import FEATURE_LIST
 
 
 def _named_schema(input: LogicalNode, output: tuple[str, ...]) -> tuple:
@@ -116,6 +118,11 @@ class Project:
         return packed_columns(
             (column_name(column) for column in self.columns), self.packing())
 
+    def list_types(self) -> dict:
+        """Return the Arrow type of each list column the projection returns."""
+        return {column.name: FEATURE_LIST for column in self.columns
+                if aliased_call(column, "features") is not None}
+
     def with_children(self, children: tuple[LogicalNode, ...]) -> "Project":
         if len(children) != 1:
             raise CompileError("Project needs one child")
@@ -134,9 +141,9 @@ class Project:
 
 @dataclass(frozen=True)
 class Aggregate:
-    """Group projected rows and compute aggregate outputs."""
+    """Group projected or unnested rows and compute aggregate outputs."""
 
-    input: Project
+    input: LogicalNode
     keys: tuple[str, ...]
     aggregates: tuple[AggregateCall, ...]
     output: tuple[str, ...]
@@ -153,7 +160,7 @@ class Aggregate:
         return _named_schema(self.input, self.output)
 
     def validate(self) -> None:
-        if not isinstance(self.input, Project):
+        if not reads_projection(self.input):
             raise CompileError("Aggregate needs projected input columns")
         self.specification().validate(self.input.result_columns())
 
@@ -210,7 +217,7 @@ class Window:
         return _named_schema(self.input, self.output)
 
     def validate(self) -> None:
-        if not isinstance(self.input, (Project, Aggregate)):
+        if not (reads_projection(self.input) or isinstance(self.input, Aggregate)):
             raise CompileError("Window needs projected or aggregated input columns")
         projected = self.input.result_columns()
         names = list(projected)
@@ -242,13 +249,18 @@ class Window:
 
 @dataclass(frozen=True)
 class Result:
-    """Order result rows, remove duplicates, and apply an offset and limit."""
+    """Order result rows, remove duplicates, and apply an offset and limit.
+
+    ``output`` lists the result columns in SELECT order when it differs
+    from the input's, as over an Unnest; empty keeps the input's.
+    """
 
     input: LogicalNode
     limit: int | None = None
     order: tuple[SortKey, ...] = ()
     offset: int = 0
     distinct: bool = False
+    output: tuple[str, ...] = ()
     type_name: ClassVar[str] = "quail.logical_result"
 
     def children(self) -> tuple[LogicalNode, ...]:
@@ -262,11 +274,17 @@ class Result:
 
     def result_columns(self) -> tuple[str, ...]:
         """Return column names after projection or aggregation."""
-        return self.input.result_columns()
+        return self.output or self.input.result_columns()
 
     def validate(self) -> None:
-        if not isinstance(self.input, (Project, Aggregate, Window)):
+        if not (reads_projection(self.input)
+                or isinstance(self.input, (Aggregate, Window))):
             raise CompileError("Result needs a projection, aggregation, or window")
+        missing = set(self.output) - set(self.input.result_columns())
+        if missing:
+            raise CompileError(
+                f"the result columns {sorted(missing)} are not columns of "
+                f"the rows below")
         if self.limit is not None and self.limit <= 0:
             raise CompileError("LIMIT must be a positive integer")
         if self.offset < 0:
@@ -287,6 +305,7 @@ class Result:
             if (
                 isinstance(key.expression, Alias)
                 and key.expression not in projection.columns
+                and key.name not in projected
             ):
                 raise CompileError(
                     f"ORDER BY {key.name!r} names an expression the "
@@ -312,9 +331,17 @@ class Result:
         return replace(self, order=expressions)
 
     def explain_fields(self) -> dict:
-        return {
+        fields = {
             "order": [str(key) for key in self.order],
             "limit": self.limit,
             "offset": self.offset,
             "distinct": self.distinct,
         }
+        if self.output:
+            fields["output"] = list(self.output)
+        return fields
+
+
+def reads_projection(node) -> bool:
+    """Return whether the node is the Project or an Unnest chain above it."""
+    return isinstance(node, Project) or above_unnest(node)

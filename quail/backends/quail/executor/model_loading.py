@@ -176,9 +176,34 @@ def answer_weights(model, token_ids):
     return model.quail_answer_weights
 
 
+def keep_layers(torch, model, num_layers: int):
+    """Keep the first num_layers decoder layers in the forward pass.
+
+    The whole checkpoint is loaded first, then the module list is cut:
+    vLLM's load_weights maps every checkpoint tensor onto a parameter,
+    so a module list shorter than the checkpoint fails the load. The
+    cut does not release the dropped layers' memory: measured on
+    Qwen3.5-2B-Base, the memory after the cut is the full model's, so
+    something still references their weights.
+
+    Raises:
+        ValueError: The checkpoint has fewer than num_layers layers.
+    """
+    text = getattr(model, "language_model", model)
+    layers = text.model.layers
+    if len(layers) < num_layers:
+        raise ValueError(
+            f"the checkpoint has {len(layers)} layers; cannot keep "
+            f"{num_layers}")
+    if len(layers) == num_layers:
+        return
+    text.model.layers = layers[:num_layers]
+    torch.cuda.empty_cache()
+
+
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids=None, max_batched_tokens=None,
-               moe_backend=None, text_only=False):
+               moe_backend=None, text_only=False, num_layers=None):
     """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
@@ -186,6 +211,8 @@ def load_model(model_name: str, revision: str | None = None, *,
     ignores it. moe_backend is passed through as vLLM's moe_backend
     setting (see ModelSpec.moe_backend); None lets vLLM pick. text_only
     takes no image or video input, for a checkpoint with a vision tower.
+    num_layers keeps only the first decoder layers after the load, for a
+    spec that reads an intermediate layer's residual stream.
     """
     import os
     import tempfile
@@ -224,6 +251,8 @@ def load_model(model_name: str, revision: str | None = None, *,
     # vLLM's fused MoE kernels read the forward context, which is
     # built from this config
     model.quail_vllm_config = config
+    if num_layers is not None:
+        keep_layers(torch, model, num_layers)
     if answer_token_ids is None:
         from gigatoken import Tokenizer
 

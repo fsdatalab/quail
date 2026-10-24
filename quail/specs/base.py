@@ -50,6 +50,30 @@ class AnswerCanvas:
 
 
 @dataclass(frozen=True)
+class SaeSpec:
+    """A sparse autoencoder (SAE) read beside a model, for AI.SAE_FEATURES.
+
+    A model with an SAE returns, from its forward pass, the residual
+    stream after its last loaded layer instead of the final-normed
+    rows, and the SAE encodes that stream. Such a model serves feature
+    calls only.
+
+    Attributes:
+        hf_name: Hugging Face repo of the SAE checkpoints.
+        revision: Pinned hub commit hash.
+        file: The read layer's tensors, W_enc and b_enc.
+        num_features: Encoder rows, one per feature.
+        keep: Features kept per token, the SAE's top k.
+    """
+
+    hf_name: str
+    revision: str
+    file: str
+    num_features: int
+    keep: int
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     name: str
     params: float        # active projection parameters per token
@@ -143,8 +167,16 @@ class ModelSpec:
     gdn_value_dim: int = 0
     gdn_weight_precision: Precision | None = None
     conv_width: int = 0
+    checkpoint_layers: int = 0    # layers in the checkpoint; when larger
+    #                               than layers, the loader keeps the first
+    #                               `layers` and frees the rest
+    sae: SaeSpec | None = None
 
     def __post_init__(self):
+        if self.checkpoint_layers and self.checkpoint_layers < self.layers:
+            raise ValueError(
+                f"{self.name}: checkpoint_layers ({self.checkpoint_layers}) "
+                f"is below layers ({self.layers})")
         if self.layer_kinds and len(self.layer_kinds) != self.layers:
             raise ValueError(
                 f"{self.name}: layer_kinds has {len(self.layer_kinds)} "
