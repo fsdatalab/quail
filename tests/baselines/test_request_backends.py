@@ -617,9 +617,10 @@ def test_a_request_backend_owns_its_engine_from_boot_to_release(monkeypatch):
 def test_an_experiment_can_turn_on_vllm_ngram_drafts(monkeypatch):
     from quail.baselines.vllm import VLLMEngine, speculative_config
 
-    assert "speculative_config" not in VLLMEngine().llm_kwargs(QWEN3_4B_FP8)
+    assert "speculative_config" not in VLLMEngine().llm_kwargs(
+        QWEN3_4B_FP8, H100_SXM)
     monkeypatch.setenv("QUAIL_VLLM_SPECULATIVE", "ngram:5")
-    assert VLLMEngine().llm_kwargs(QWEN3_4B_FP8)["speculative_config"] == {
+    assert VLLMEngine().llm_kwargs(QWEN3_4B_FP8, H100_SXM)["speculative_config"] == {
         "method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 4}
     for value in ("ngram", "ngram:0", "eagle:5"):
         with pytest.raises(ValueError):

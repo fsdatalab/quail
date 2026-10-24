@@ -922,7 +922,9 @@ def test_prefix_sharing_accounts_for_bf16_work_in_an_fp8_model():
     from quail.planner.rules.physical import sharing_pays
     from quail.specs import QWEN3_5_4B_FP8
 
-    slower = replace(H100_SXM, bf16_flops=H100_SXM.bf16_flops / 10)
+    # gemm_flops uses the measured BF16 rate when one is set
+    slower = replace(H100_SXM, bf16_flops=H100_SXM.bf16_flops / 10,
+                     mamf_bf16_flops=H100_SXM.mamf_bf16_flops / 10)
     assert not sharing_pays(
         QWEN3_5_4B_FP8, H100_SXM,
         shared_tokens=100, total_tokens=100_000, writes_pages=False)
