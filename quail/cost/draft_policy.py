@@ -53,6 +53,7 @@ class AnswerLengthCurve:
         self.lengths = np.zeros(max_answer_tokens + 1, dtype=np.int64)
         self.settled = 0
         self._curve = None
+        self._levels = None
 
     def survival(self, written: int) -> np.ndarray:
         """Return P(the answer has more than j tokens left), j = 0.., given written."""
@@ -65,11 +66,24 @@ class AnswerLengthCurve:
         tail = self._curve[written:]
         return tail / tail[0] if tail[0] > 0 else np.ones_like(tail)
 
+    def levels(self) -> list:
+        """Return the whole unnormalized curve as a list, for scalar reads.
+
+        levels()[written + j] / levels()[written] is survival(written)[j];
+        a draft-length loop reads a few scalars per round, so a list
+        beats slicing and renormalizing an array each time.
+        """
+        if self._levels is None:
+            self.survival(0)
+            self._levels = self._curve.tolist()
+        return self._levels
+
     def settle(self, length: int) -> None:
         """Record a settled answer's length."""
         self.lengths[min(length, self.max_answer_tokens)] += 1
         self.settled += 1
         self._curve = None
+        self._levels = None
 
 
 class DraftPolicy:

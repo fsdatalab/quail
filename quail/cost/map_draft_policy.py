@@ -138,16 +138,19 @@ class MapDraftPolicy:
             room = min(room, len(rates))
         if room <= 0:
             return 0
-        # the curve's tail is normalized, so survival[0] is 1
-        survival = self.curve.survival(written)
+        levels = self.curve.levels()
+        base = levels[written]
         writes = 1.0
         chained = 1.0
         best, best_cost = 0, rho + 1.0
         for gamma in range(1, room + 1):
             if rates is not None:
                 chained *= rates[gamma - 1]
-            writes += chained * float(survival[gamma])
-            cost = (rho + 1.0 + max(0.0, gamma - slack)) / writes
+            # survival at gamma tokens past written, 1 past a dead base
+            writes += chained * (levels[written + gamma] / base if base > 0
+                                 else 1.0)
+            extra = gamma - slack
+            cost = (rho + 1.0 + (extra if extra > 0 else 0.0)) / writes
             if cost < best_cost:
                 best, best_cost = gamma, cost
         return best

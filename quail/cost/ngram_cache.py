@@ -49,16 +49,17 @@ class NgramCache:
         """Insert the continuations the tokens show from start on.
 
         Args:
-            tokens: One document's committed answer tokens so far.
+            tokens: One document's committed answer tokens so far, as a
+                list of Python ints; the decoder writes them that way.
             document: The document that wrote them.
             start: The first position not inserted yet.
         """
         for at in range(max(start, MATCH_ORDERS[-1]), len(tokens)):
-            token = int(tokens[at])
+            token = tokens[at]
             for order in MATCH_ORDERS:
                 if at < order:
                     continue
-                key = tuple(int(t) for t in tokens[at - order:at])
+                key = tuple(tokens[at - order:at])
                 found = self.entries.setdefault(key, {})
                 entry = found.get(token)
                 if entry is None:
@@ -73,13 +74,14 @@ class NgramCache:
         """Return the longest match's best continuation, or None.
 
         Args:
-            context: The answer's last tokens, most recent last.
+            context: The answer's last tokens, most recent last, as a
+                list of Python ints.
             document: The drafting document.
         """
         for order in MATCH_ORDERS:
             if len(context) < order:
                 continue
-            key = tuple(int(t) for t in context[-order:])
+            key = tuple(context[-order:])
             found = self.entries.get(key)
             if not found:
                 continue

@@ -245,6 +245,16 @@ class MapDecoder:
                 self.spec.max_answer_tokens - len(answer.written))
         if n <= 0:
             return 0
+        if n == 1:
+            # a one-token draft is the common round; a few scalar reads
+            # beat the vectorized setup
+            values = rows[0]
+            lps = values[-k:]
+            best = int(np.argmax(lps))
+            top = int(values[-2 * k + best])
+            writes = (top == fed[1] and float(lps[best]) > float(values[0])
+                      and not self.vocabulary.is_stop[top])
+            return int(writes)
         values = rows[:n]
         ids = values[:, -2 * k:-k].astype(np.int64)
         lps = values[:, -k:]
