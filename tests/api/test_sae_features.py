@@ -6,7 +6,7 @@ from helpers.oracle import Oracle, finish
 
 import quail
 from quail.backends.quail.executor.operators.sae_features import FEATURE_LIST
-from quail.backends.quail.executor.sae import unpack_features
+from quail.backends.quail.executor.sae import feature_lists_of_rows
 from quail.catalog import DocumentProvider
 from quail.cost.sae_features import SaeFeaturesCost
 from quail.logical import CompileError
@@ -185,10 +185,13 @@ def test_the_cost_model_charges_resident_calls_the_question_only():
     assert resident_seconds < fresh_seconds
 
 
-def test_unpack_features_drops_zero_strengths():
+def test_packed_rows_unpack_without_zero_strengths():
     import numpy as np
 
-    row = np.array([3, 5, 0, 1.5, 0.5, 0.0], dtype=np.float32)
-    indices, strengths = unpack_features(row, 3)
-    assert indices.tolist() == [3, 5]
-    assert strengths.tolist() == [1.5, 0.5]
+    rows = np.array([[3, 5, 0, 1.5, 0.5, 0.0],
+                     [7, 0, 0, 0.0, 0.0, 0.0],
+                     [1, 2, 4, 0.25, 2.0, 1.0]], dtype=np.float32)
+    lengths, indices, strengths = feature_lists_of_rows(rows, 3)
+    assert lengths.tolist() == [2, 0, 3]
+    assert indices.tolist() == [3, 5, 1, 2, 4]
+    assert strengths.tolist() == [1.5, 0.5, 0.25, 2.0, 1.0]

@@ -269,45 +269,111 @@ class SaeFeaturesReadout(_HostReadout):
         return self._copy(self.encoder.packed_top_features(stream))
 
 
-def unpack_features(row, keep: int) -> tuple:
-    """Return one packed readout row as (feature indices, strengths) arrays.
+def feature_lists_of_rows(packed, keep: int) -> tuple:
+    """Return (lengths, indices, strengths) of packed readout rows.
 
-    Zero strengths are left out: the SAE keeps at most ``keep`` features,
-    and a padded row carries zeros past the nonzero ones. Arrays, not
-    mappings: a 'max' document can hold thousands of features, and the
-    Arrow column builds from the arrays without per-feature objects.
+    Each row is a readout's packed vector: keep feature indices, then
+    their strengths, zero past the kept ones. Every row unpacks in one
+    pass, with no per-feature or per-row Python work.
     """
-    indices = row[:keep].astype(np.int32)
-    strengths = row[keep:2 * keep].astype(np.float32)
-    kept = strengths > 0.0
-    return indices[kept], strengths[kept]
+    packed = np.asarray(packed, dtype=np.float32).reshape(-1, 2 * keep)
+    indices = packed[:, :keep]
+    strengths = packed[:, keep:]
+    row_ids, columns = np.nonzero(strengths > 0.0)
+    lengths = np.bincount(row_ids, minlength=packed.shape[0])
+    return (lengths, indices[row_ids, columns].astype(np.int32),
+            strengths[row_ids, columns])
 
 
-class _PinnedRows:
+class _PinnedSlabs:
     """Pinned host rows handed out from slab allocations.
 
     A settle runs on the thread that feeds the GPU, and allocating
     pinned memory there costs milliseconds per call, so one slab serves
-    many settles. Handed-out rows are views that keep their slab alive.
+    many settles. A handle names its slab and row, and the harvest
+    reads a slab's rows in one pass over a view of it.
     """
 
     def __init__(self, torch, width: int, rows_per_slab: int = 256):
         self.torch = torch
         self.width = width
         self.rows_per_slab = rows_per_slab
-        self._slab = None
-        self._next = 0
+        self.slabs = []
+        self._next = rows_per_slab
 
-    def take(self):
-        """Return one pinned (width,) fp32 row."""
-        if self._slab is None or self._next == self.rows_per_slab:
-            self._slab = self.torch.empty(
+    def take(self) -> tuple:
+        """Return (slab, row) of a fresh pinned row."""
+        if self._next == self.rows_per_slab:
+            self.slabs.append(self.torch.empty(
                 (self.rows_per_slab, self.width), dtype=self.torch.float32,
-                pin_memory=True)
+                pin_memory=True))
             self._next = 0
-        row = self._slab[self._next]
         self._next += 1
-        return row
+        return len(self.slabs) - 1, self._next - 1
+
+
+class _Staging:
+    """Pinned host staging for a chunk's index arrays, two buffers deep.
+
+    A pageable host-to-device copy synchronizes; a pinned one does not.
+    A buffer is reused only once its earlier copy's event has completed.
+    """
+
+    def __init__(self, torch):
+        self.torch = torch
+        self._buffers = [None, None]
+        self._events = [None, None]
+        self._turn = 0
+
+    def upload(self, array: np.ndarray):
+        """Copy a one-dimensional int64 array to the GPU asynchronously."""
+        torch = self.torch
+        index = self._turn
+        self._turn ^= 1
+        if self._events[index] is not None:
+            self._events[index].synchronize()
+        buffer = self._buffers[index]
+        if buffer is None or buffer.numel() < array.size:
+            buffer = torch.empty(max(array.size, 1 << 16), dtype=torch.int64,
+                                 pin_memory=True)
+            self._buffers[index] = buffer
+        host = buffer[:array.size]
+        host.numpy()[:] = array
+        device = host.to("cuda", non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._events[index] = event
+        return device
+
+
+class _SlotMatrix:
+    """Per-document maxima as rows (slots) of one GPU matrix.
+
+    One matrix lets a chunk fold every span in one scatter, and lets
+    the slots that settles freed re-zero in one index_fill per chunk.
+    """
+
+    def __init__(self, torch, width: int, capacity: int = 512):
+        self.torch = torch
+        self.width = width
+        self.matrix = torch.zeros((capacity, width), device="cuda",
+                                  dtype=torch.float32)
+        self.free = list(range(capacity - 1, -1, -1))
+        self.dirty = []    # freed slots, zeroed before the next scatter
+
+    def take(self) -> int:
+        if not self.free:
+            capacity = self.matrix.shape[0]
+            grown = self.torch.zeros((2 * capacity, self.width),
+                                     device="cuda", dtype=self.torch.float32)
+            grown[:capacity] = self.matrix
+            self.matrix = grown
+            self.free.extend(range(2 * capacity - 1, capacity - 1, -1))
+        return self.free.pop()
+
+    def release(self, slot: int) -> None:
+        self.free.append(slot)
+        self.dirty.append(slot)
 
 
 class SaeMaxAccumulator:
@@ -315,10 +381,12 @@ class SaeMaxAccumulator:
 
     observe() runs inside forward_chunk over every chunk row. A row
     whose position is inside its document's prefix folds into the
-    document's buffer, which the pipeline's feature calls share; the
-    other rows belong to the running call's question and are consumed
-    when the document's stage settles. The buffers are freed once a
-    document has settled every registered feature call.
+    document's slot, which the pipeline's feature calls share; the
+    other rows belong to the running call's question and fold into a
+    slot consumed when the document's stage settles. A document's slot
+    is freed once it has settled every registered feature call. Every
+    step is one operation over the whole chunk, or over all settled
+    documents, so the host work does not grow with the document count.
     """
 
     def __init__(self, torch, encoder: SaeEncoder, document_tokens):
@@ -333,87 +401,144 @@ class SaeMaxAccumulator:
         self.torch = torch
         self.encoder = encoder
         self.document_tokens = document_tokens
-        self.document_max = {}
-        self.tail_max = {}
+        self.document_slot = {}
+        self.tail_slot = {}
         self.calls = 0        # feature calls registered on this pipeline
         self.settled = {}     # key -> calls settled so far
-        self._buffers = []
-        self._pinned = _PinnedRows(torch, encoder.num_features)
+        self._slots = _SlotMatrix(torch, encoder.num_features)
+        self._staging = _Staging(torch)
+        self._pinned = _PinnedSlabs(torch, encoder.num_features)
 
     def register_call(self) -> None:
         """Count one feature call of the pipeline, before execution."""
         self.calls += 1
 
-    def _buffer(self):
-        if self._buffers:
-            return self._buffers.pop().zero_()
-        return self.torch.zeros(self.encoder.num_features, device="cuda",
-                                dtype=self.torch.float32)
+    def _slot(self, slots: dict, key) -> int:
+        slot = slots.get(key)
+        if slot is None:
+            slot = slots[key] = self._slots.take()
+        return slot
 
     def observe(self, stream, chunk) -> None:
         """Fold one chunk's rows into the document and question maxima.
 
-        The whole chunk encodes in one call, and each span's strengths
-        fold under a mask instead of a boolean-indexed subset: a masked
-        strength contributes 0, which amax over nonnegative strengths
-        ignores. Nothing here reads a data-dependent shape, so the
-        observer never synchronizes with the forward pass.
+        The chunk encodes in one call. numpy builds each row's document
+        and question slot from the spans, one pinned copy carries them
+        to the GPU, and one scatter folds every row's strengths into the
+        slot its position selects. Nothing reads a data-dependent
+        shape, so the observer never synchronizes with the forward pass.
         """
+        spans = [span for span in chunk.row_spans if span[3] > span[1]]
+        if not spans:
+            return
+        torch = self.torch
         indices, strengths = self.encoder.top_features(stream)
-        indices = indices.to(self.torch.int64)
-        positions = chunk.positions
-        for key, row0, _suffix_row, row1 in chunk.row_spans:
-            if row1 == row0:
-                continue
-            inside = (positions[row0:row1]
-                      < self.document_tokens(key)).unsqueeze(1)
-            span_indices = indices[row0:row1].reshape(-1)
-            span_strengths = strengths[row0:row1]
-            for buffers, mask in ((self.document_max, inside),
-                                  (self.tail_max, ~inside)):
-                if key not in buffers:
-                    buffers[key] = self._buffer()
-                buffers[key].scatter_reduce_(
-                    0, span_indices, (span_strengths * mask).reshape(-1),
-                    reduce="amax")
+        count = len(spans)
+        keys = [span[0] for span in spans]
+        row0 = np.fromiter((span[1] for span in spans), np.int64, count)
+        row1 = np.fromiter((span[3] for span in spans), np.int64, count)
+        per_span = np.stack([
+            np.fromiter((self._slot(self.document_slot, key) for key in keys),
+                        np.int64, count),
+            np.fromiter((self._slot(self.tail_slot, key) for key in keys),
+                        np.int64, count),
+            np.fromiter((self.document_tokens(key) for key in keys),
+                        np.int64, count)])
+        lengths = row1 - row0
+        total = int(lengths.sum())
+        per_row = np.repeat(per_span, lengths, axis=1)
+        contiguous = (total == stream.shape[0] and row0[0] == 0
+                      and np.array_equal(row0[1:], row1[:-1]))
+        dirty = np.asarray(self._slots.dirty, dtype=np.int64)
+        self._slots.dirty = []
+        parts = [per_row.reshape(-1), dirty]
+        if not contiguous:
+            parts.insert(0, np.repeat(row0 - np.cumsum(lengths) + lengths,
+                                      lengths) + np.arange(total))
+        block = self._staging.upload(np.concatenate(parts))
+        at = 0
+        if not contiguous:
+            rows = block[:total]
+            at = total
+            indices = indices[rows]
+            strengths = strengths[rows]
+            positions = chunk.positions[rows]
+        else:
+            positions = chunk.positions
+        document_slots = block[at:at + total]
+        tail_slots = block[at + total:at + 2 * total]
+        tokens = block[at + 2 * total:at + 3 * total]
+        matrix = self._slots.matrix
+        if dirty.size:
+            matrix.index_fill_(0, block[at + 3 * total:], 0.0)
+        slot = torch.where(positions < tokens, document_slots, tail_slots)
+        flat = slot.unsqueeze(1) * self._slots.width + indices.long()
+        matrix.view(-1).scatter_reduce_(0, flat.view(-1), strengths.reshape(-1),
+                                        reduce="amax")
 
-    def settle(self, key):
+    def settle(self, key) -> tuple:
         """Return the handle of one document's combined maxima for one call.
 
-        The question's buffer is consumed; the document's stays for the
+        The question's slot is consumed; the document's stays for the
         pipeline's later feature calls and is freed after the last one.
+        The handle names the pinned slab and row the maxima copy into.
         """
         torch = self.torch
-        tail = self.tail_max.pop(key, None)
-        document = self.document_max.get(key)
+        matrix = self._slots.matrix
+        tail = self.tail_slot.pop(key, None)
+        document = self.document_slot.get(key)
+        source = tail if tail is not None else document
         if tail is not None and document is not None:
-            combined = torch.maximum(document, tail)
-        elif tail is not None:
-            combined = tail.clone()
-        elif document is not None:
-            combined = document.clone()
+            torch.maximum(matrix[document], matrix[tail], out=matrix[tail])
+        slab, row = self._pinned.take()
+        host = self._pinned.slabs[slab][row]
+        if source is None:
+            host.zero_()
         else:
-            combined = self._buffer()
-        host = self._pinned.take()
-        host.copy_(combined, non_blocking=True)
+            host.copy_(matrix[source], non_blocking=True)
         event = torch.cuda.Event()
         event.record()
         if tail is not None:
-            self._buffers.append(tail)
-        self._buffers.append(combined)
+            self._slots.release(tail)
         self.settled[key] = self.settled.get(key, 0) + 1
         if self.settled[key] >= self.calls and document is not None:
-            self._buffers.append(self.document_max.pop(key))
-        return event, host
+            self._slots.release(self.document_slot.pop(key))
+        return event, slab, row
 
-    @staticmethod
-    def features_of(handle) -> tuple:
-        """Return a settled handle's nonzero (indices, strengths) arrays."""
-        event, host = handle
-        event.synchronize()
-        values = host.numpy()
-        kept = np.flatnonzero(values > 0.0)
-        return kept.astype(np.int32), values[kept]
+    def harvest(self, handles) -> tuple:
+        """Return (order, lengths, indices, strengths) of settled handles.
+
+        Each slab's rows unpack in one pass over a view of the slab, so
+        the results come out slab by slab: ``order`` lists the handle
+        positions in that sequence, and ``lengths`` gives each one's
+        feature count in the same sequence. Call it once the pipeline
+        is done; a handle whose copy is still in flight is waited on.
+        """
+        count = len(handles)
+        slabs = np.fromiter((handle[1] for handle in handles), np.int64, count)
+        rows = np.fromiter((handle[2] for handle in handles), np.int64, count)
+        for event, _slab, _row in handles:
+            event.synchronize()
+        order = np.lexsort((rows, slabs))
+        slabs, rows = slabs[order], rows[order]
+        lengths = np.zeros(count, dtype=np.int64)
+        indices, strengths = [], []
+        starts = np.flatnonzero(np.diff(slabs, prepend=-1))
+        for start, stop in zip(starts, (*starts[1:], count)):
+            block = self._pinned.slabs[slabs[start]].numpy()
+            group = rows[start:stop]
+            if group[-1] - group[0] == stop - start - 1:
+                view = block[group[0]:group[-1] + 1]
+            else:
+                view = block[group]
+            row_ids, columns = np.nonzero(view > 0.0)
+            lengths[start:stop] = np.bincount(row_ids, minlength=stop - start)
+            indices.append(columns.astype(np.int32))
+            strengths.append(view[row_ids, columns])
+        return (order, lengths,
+                np.concatenate(indices) if indices else np.empty(0, np.int32),
+                np.concatenate(strengths) if strengths
+                else np.empty(0, np.float32))
 
 
 def sae_encoder(state) -> SaeEncoder:

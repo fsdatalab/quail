@@ -7,8 +7,8 @@ from quail.backends.quail.executor.parts import SingleResultPart
 from quail.backends.quail.executor.sae import (
     SaeFeaturesReadout,
     SaeMaxAccumulator,
+    feature_lists_of_rows,
     sae_encoder,
-    unpack_features,
 )
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.reranker import classify_outputs
@@ -22,22 +22,18 @@ FEATURE_LIST = pa.list_(
     pa.struct([("feature", pa.int32()), ("strength", pa.float32())]))
 
 
-def _feature_column(pairs) -> pa.ListArray:
-    """Build the feature-list column from (indices, strengths) pairs.
+def _feature_column(lengths, indices, strengths) -> pa.ListArray:
+    """Build the feature-list column from flat index and strength arrays.
 
-    The column assembles from concatenated arrays: a 'max' document can
-    hold thousands of features, so per-feature Python objects would
-    dominate the harvest.
+    ``lengths`` gives each row's feature count; the arrays hold every
+    row's features in sequence. The Arrow arrays wrap the numpy ones
+    without a copy.
     """
-    lengths = [len(indices) for indices, _strengths in pairs]
-    offsets = np.zeros(len(pairs) + 1, dtype=np.int64)
+    offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
     np.cumsum(lengths, out=offsets[1:])
-    empty = (np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32))
     values = pa.StructArray.from_arrays(
-        [pa.array(np.concatenate([indices for indices, _ in pairs or [empty]]),
-                  pa.int32()),
-         pa.array(np.concatenate([strengths for _, strengths in
-                                  pairs or [empty]]), pa.float32())],
+        [pa.array(np.ascontiguousarray(indices, dtype=np.int32)),
+         pa.array(np.ascontiguousarray(strengths, dtype=np.float32))],
         names=["feature", "strength"])
     return pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), values)
 
@@ -99,6 +95,7 @@ class SaeFeaturesPart(SingleResultPart):
         self.reached = 0
         torch = state.torch
         encoder = sae_encoder(state)
+        self.keep = encoder.keep
         keys = DocumentKeys(alias, self.ids)
         self.accumulator = None
         self._pipeline = None
@@ -124,11 +121,10 @@ class SaeFeaturesPart(SingleResultPart):
                 self.reached += 1
                 return True
         else:
-            keep = encoder.keep
-
+            # the packed readout row (indices, then strengths) stays a
+            # view; every row unpacks at once in result()
             def decide(anchor, row):
-                self.values[anchor] = unpack_features(
-                    np.asarray(row)[-1], keep)
+                self.values[anchor] = np.asarray(row)[-1]
                 self.reached += 1
                 return True
 
@@ -142,30 +138,9 @@ class SaeFeaturesPart(SingleResultPart):
         return ()
 
     def finish(self, every) -> int:
-        """Collect settled maxima and return the suffix token count."""
-        self._harvest(wait=False)
+        """Return the suffix token count; results are read in result()."""
         head, tail = self.node.spec.prompt_token_parts
         return self.reached * len(tail)
-
-    def _harvest(self, *, wait: bool) -> None:
-        """Turn settled handles into feature lists.
-
-        finish() runs while chunks are still in flight, and a handle's
-        copy queues behind them, so waiting there stalls the stream
-        that feeds the GPU: during the run only completed copies are
-        read, and result() waits for the rest once the pipeline is
-        done.
-        """
-        if self.accumulator is None:
-            return
-        for anchor, handle in enumerate(self.handles):
-            if handle is None or self.values[anchor] is not None:
-                continue
-            event, _host = handle
-            if not wait and not event.query():
-                continue
-            self.values[anchor] = SaeMaxAccumulator.features_of(handle)
-            self.handles[anchor] = None
 
     def complete(self, tokens, spans, stats, offset):
         # the part that set the observer releases it once the run ends
@@ -175,16 +150,24 @@ class SaeFeaturesPart(SingleResultPart):
         super().complete(tokens, spans, stats, offset)
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
-        self._harvest(wait=True)
         spec = self.node.spec
-        answered = [index for index, value in enumerate(self.values)
-                    if value is not None]
+        if self.accumulator is not None:
+            answered = [index for index, handle in enumerate(self.handles)
+                        if handle is not None]
+            order, lengths, indices, strengths = self.accumulator.harvest(
+                [self.handles[index] for index in answered])
+            answered = [answered[position] for position in order]
+        else:
+            answered = [index for index, value in enumerate(self.values)
+                        if value is not None]
+            lengths, indices, strengths = feature_lists_of_rows(
+                [self.values[index] for index in answered],
+                self.keep)
         rows = np.asarray([[self.ids[index]] for index in answered],
                           dtype=np.int32).reshape(-1, 1)
         (alias,) = spec.aliases
         listed = Rows({alias: rows[:, 0]}, pa.table({
-            spec.name: _feature_column(
-                [self.values[index] for index in answered])}))
+            spec.name: _feature_column(lengths, indices, strengths)}))
         prior_results = (part.results()[port.node_id].outputs[port.port]
                          for part, port in self.priors)
         for prior in (*self.prior_tables, *prior_results):
