@@ -89,8 +89,7 @@ class StageExecutor:
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
-                 appended_tokens=None, gpu_timing=False, survival=None,
-                 separate_fresh=False):
+                 appended_tokens=None, gpu_timing=False, survival=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -106,7 +105,6 @@ class StageExecutor:
         self.on_answers = on_answers
         self.label = label
         self.gpu_timing = gpu_timing
-        self.separate_fresh = separate_fresh
 
         k = len(self.stages)
         if not self.paged and (
@@ -227,11 +225,6 @@ class StageExecutor:
             reserve=self._reserve if self.paged else None,
             repeats=[stage.repeats for stage in self.stages],
         )
-        # a chunk of rounds alone replays a captured graph; mixed with
-        # a prefill it runs eager
-        self.sched.separate_fresh = bool(
-            separate_fresh and self.mode == "tree"
-            and getattr(self.pipeline, "decode_graphs", None) is not None)
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         # a Gated DeltaNet layer starts a borrower from the parent's state

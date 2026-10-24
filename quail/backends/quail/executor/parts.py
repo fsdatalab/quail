@@ -156,7 +156,7 @@ class SingleResultPart(ExecutionPart):
 
 def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
-                  paged=True, on_answers=None, separate_fresh=False) -> dict:
+                  paged=True, on_answers=None) -> dict:
     """Run prepared operator work together and collect per-node results.
 
     A limit ends the run once that many documents passed every part;
@@ -179,7 +179,7 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
         state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
         stages, prefixes, state.chunk_tokens, anchor_keys=anchor_keys,
         on_settled=settled, prefix_tree=prefix_tree, stats=stats,
-        gpu_timing=state.gpu_timing, separate_fresh=separate_fresh,
+        gpu_timing=state.gpu_timing,
         attention_mode=next((part.attention for part in parts if part.attention),
                             attention),
         staging=input_staging(state), label=label, limit=limit,

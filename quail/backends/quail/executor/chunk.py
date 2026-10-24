@@ -468,8 +468,41 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     node_q, node_k, node_cu_q, node_cu_k = [], [], [0], [0]
     plain_rounds = (not tree_path and not canvas
                     and not getattr(arena, "has_sliding", False))
+    tree_rounds = tree_path and not canvas
     for g in groups:
         sufs0 = g["suffixes"]
+        if (tree_rounds and g.get("prefix") is None and g.get("single")
+                and isinstance(sufs0, Suffixes) and len(sufs0) == 1
+                and g.get("read_all_rows") and g.get("paths") is None
+                and g.get("canvas") is None and g.get("read_rows") is None
+                and g.get("read_mask") is None and g["f"]
+                and arena.is_resident(g["key"])):
+            # a decode round under tree attention: one suffix over the
+            # key's resident rows, every row read in call B and the
+            # kept rows written to the key's pages; the general
+            # bookkeeping below reduces to this
+            f = g["f"]
+            key = g["key"]
+            total = int(sufs0.lengths[0])
+            row0 = num_tokens
+            id_parts.append(sufs0.ids)
+            position.append((f, total))
+            finals.append((row0, total))
+            cu_a.append(row0 + total)
+            rows_per_answer.append(total)
+            multi_row = True
+            kept = g.get("write_suffix_tokens") or 0
+            if kept:
+                kv_writes.append((key, row0, row0 + kept, f))
+            layout.append((key, 1))
+            reader_rows.append((row0, total))
+            cu_q.append(cu_q[-1] + total)
+            read_keys.append(key)
+            read_used.append(f)
+            if total > max_q:
+                max_q = total
+            num_tokens = row0 + total
+            continue
         if (plain_rounds and g.get("prefix") is None
                 and isinstance(sufs0, Suffixes) and len(sufs0) == 1
                 and g.get("read_all_rows") and g.get("paths") is None
@@ -705,9 +738,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     t = _tick(timing, "pack_py", t)
     reads = None
     if read_keys:
-        table, _ = arena.block_table(read_keys)
+        table = arena.block_table_rows(
+            [arena.owned_pages(key) for key in read_keys])
         t = _tick(timing, "pack_blocktable", t)
-        rows = np.concatenate(reader_rows)
+        rows = _join(reader_rows)
         # row -> its index in call B's output, -1 for rows that read
         # nothing resident; the fused merge kernel's map
         source = np.full(num_tokens, -1, dtype=np.int32)
@@ -876,16 +910,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # launch per layer (kv_row_scatter)
     kv_src = kv_dst = None
     if kv_writes:
-        src, dst_parts = [], []
+        dst_parts = []
         for key, r0, r1, dest in kv_writes:
-            src.append(np.arange(r0, r1, dtype=np.int64))
-            rows = arena.capacity_rows(key)[dest:dest + (r1 - r0)]
-            if rows.numel() != r1 - r0:
+            rows = arena.capacity_rows_numpy(key)[dest:dest + (r1 - r0)]
+            if len(rows) != r1 - r0:
                 raise AssertionError("KV write exceeds reserved rows")
             dst_parts.append(rows)
-        kv_src = _staged(torch, np.concatenate(src), torch.int64, pinned)
-        kv_dst = _staged(torch, torch.cat(dst_parts), torch.int64,
-                         pinned)
+        kv_src = _staged(torch, _span_rows([(r0, r1) for _, r0, r1, _ in kv_writes]),
+                         torch.int64, pinned)
+        kv_dst = _staged(torch, np.concatenate(dst_parts), torch.int64, pinned)
     t = _tick(timing, "pack_kv", t)
 
     canvas_meta = None

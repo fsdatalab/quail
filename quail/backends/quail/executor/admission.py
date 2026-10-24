@@ -336,10 +336,6 @@ class JoinAdmission:
         self._true = []
         self._settled = []         # events for anchors that never ran
         self.in_flight = 0         # launched groups not yet reported
-        # whether a chunk holds placed anchors or fresh ones, never
-        # both, so a chunk of decode rounds keeps a replayable shape
-        self.separate_fresh = False
-        self._last_fresh = False
         self.blocked_pages = 0
         self.reserve = reserve
         self.answers = [dict() for _ in range(k)]
@@ -595,23 +591,9 @@ class JoinAdmission:
         continued = []
         deferred = []
         temporary_pages = 0
-        # with separate_fresh, a chunk holds placed anchors or fresh
-        # ones, not both, taking turns while both wait
-        fresh_turn = (self.separate_fresh and not self._last_fresh
-                      and bool(self.pending) and bool(self.ready))
-        if not fresh_turn:
-            room, free_pages, temporary_pages = self._place_ready(
-                room, free_pages, temporary_pages, groups, continued, deferred)
-        placed = len(groups)
-        if not (self.separate_fresh and groups):
-            room, free_pages = self._admit_fresh(
-                room, free_pages, temporary_pages, groups, continued)
-        if fresh_turn and not groups:
-            # nothing fresh fits: the placed anchors run instead
-            room, free_pages, temporary_pages = self._place_ready(
-                room, free_pages, temporary_pages, groups, continued, deferred)
-            placed = len(groups)
-        self._last_fresh = len(groups) > placed
+        room, free_pages, temporary_pages = self._place_ready(
+            room, free_pages, temporary_pages, groups, continued, deferred)
+        self._admit_fresh(room, free_pages, temporary_pages, groups, continued)
         self.ready.extendleft(reversed(continued))
         self.ready.extendleft(reversed(deferred))
         return groups
@@ -709,7 +691,6 @@ class JoinAdmission:
             if self._launch(a, 0, end):
                 continued.append(a)
         self.pending.extendleft(reversed(held))
-        return room, free_pages
 
     # ---- gating --------------------------------------------------------
 
