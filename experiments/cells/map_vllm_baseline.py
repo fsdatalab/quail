@@ -78,8 +78,15 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
         only: Comma-separated configuration names to run; empty runs
             all four.
     """
+    import os
+
     from quail.baselines.vllm import VLLMEngine
     from quail.specs import H100_USD_PER_HOUR, MODELS
+
+    # the engine core runs in process, as the other cells that boot
+    # vLLM directly set it: a spawned core would not see the gigatoken
+    # tokenizer registration
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     spec = MODELS[model]
     directory = _ensure_tables(scale_factor,
