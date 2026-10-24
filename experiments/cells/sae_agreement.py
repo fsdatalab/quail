@@ -83,9 +83,10 @@ def reference() -> dict:
     spec = MODELS[MODEL]
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name,
                                               revision=spec.revision or None)
+    # device_map would need accelerate, which the image does not carry
     model = AutoModelForCausalLM.from_pretrained(
         spec.hf_name, revision=spec.revision or None,
-        torch_dtype=torch.bfloat16, device_map="cuda")
+        torch_dtype=torch.bfloat16).to("cuda")
     model.eval()
     sae_path = hf_hub_download(spec.sae_hf_name, spec.sae_file,
                                revision=spec.sae_revision or None)
