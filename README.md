@@ -8,9 +8,10 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Quail (QUery-Aware Inference Layer) runs language models over large
-datasets, from SQL, on your own GPUs. It optimizes each query and its
-model inference together. Quail is **1.8x faster on average** than well-tuned vLLM baselines, and
-**up to 14x faster** on queries with AI joins
+datasets, from SQL, on your own GPUs. Co-optimized query planning and
+LLM inference make Quail lightning fast: **1.8x faster on average**
+than well-tuned vLLM baselines, and **up to 14x faster** on queries
+with AI joins
 ([details](https://fsdatalab.github.io/blog/introducing-quail/)).
 
 ```sql
@@ -19,17 +20,6 @@ SELECT r.id,
 FROM reviews r
 WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 ```
-
-How Quail is faster:
-
-- **Cheapest work first.** Quail orders the AI functions of a query by
-  cost, so the later functions read fewer rows.
-- **Each document is computed once.** Every AI function in a query
-  reuses the document's KV, and documents that start with the same
-  text share it.
-- **Inference tuned to each function.** For example, `AI.EXTRACT`
-  copies its drafts from the document, and picks a draft length for
-  each request.
 
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
