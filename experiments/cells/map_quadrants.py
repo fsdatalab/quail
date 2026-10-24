@@ -119,7 +119,8 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
               volumes=VOLUMES)
 def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
                   policies: str = "adaptive,fixed", only: str = "",
-                  gpu_timing: bool = True, profile: bool = False) -> str:
+                  gpu_timing: bool = True, profile: bool = False,
+                  graph_rows: str = "", graph_query_tokens: int = 0) -> str:
     """Run the map configurations; return the result JSON's volume path.
 
     Args:
@@ -132,11 +133,21 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
         gpu_timing: Whether to time the forward passes with CUDA
             events and report their sum as gpu_s beside the wall.
         profile: Whether to print a cProfile of each run's host.
+        graph_rows: Comma-separated row buckets for the decode graphs;
+            empty keeps the default.
+        graph_query_tokens: The longest query a captured chunk may
+            hold; 0 keeps the default.
     """
+    import os
+
     import quail
     from bench.quailb import register_tables
     from quail.specs import H100_USD_PER_HOUR
 
+    if graph_rows:
+        os.environ["QUAIL_DECODE_GRAPH_ROWS"] = graph_rows
+    if graph_query_tokens:
+        os.environ["QUAIL_DECODE_GRAPH_QUERY_TOKENS"] = str(graph_query_tokens)
     directory = _ensure_tables(scale_factor,
                                [table for _, table, _, _, _ in CONFIGURATIONS])
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -158,6 +169,8 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
                 print(json.dumps(
                     {run_name: measurements["runs"][run_name]}, default=str),
                     flush=True)
+    measurements["graph_rows"] = graph_rows
+    measurements["graph_query_tokens"] = graph_query_tokens
     out = Path(RESULT_DIR) / f"map_quadrants_{model}_sf{scale_factor}_{stamp}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(measurements, indent=2, default=str))
@@ -169,8 +182,10 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
 @app.local_entrypoint()
 def launch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
            policies: str = "adaptive,fixed", only: str = "",
-           profile: bool = False):
+           profile: bool = False, graph_rows: str = "",
+           graph_query_tokens: int = 0):
     call = map_quadrants.spawn(model=model, scale_factor=sf, policies=policies,
-                               only=only, profile=profile)
+                               only=only, profile=profile, graph_rows=graph_rows,
+                               graph_query_tokens=graph_query_tokens)
     print(f"function call id: {call.object_id}")
     print(call.get())

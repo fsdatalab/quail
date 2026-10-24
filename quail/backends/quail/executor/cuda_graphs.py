@@ -29,6 +29,25 @@ class DecodeGraphConfig:
                 "capture context and query limits must be positive integers")
 
 
+def configured_graphs() -> DecodeGraphConfig:
+    """Return the capture limits, as the environment overrides them.
+
+    QUAIL_DECODE_GRAPH_ROWS lists the row buckets, comma-separated, and
+    QUAIL_DECODE_GRAPH_QUERY_TOKENS the longest query a captured chunk
+    may hold; unset, the defaults apply.
+    """
+    import os
+
+    settings = {}
+    rows = os.environ.get("QUAIL_DECODE_GRAPH_ROWS")
+    if rows:
+        settings["row_buckets"] = tuple(int(part) for part in rows.split(","))
+    query = os.environ.get("QUAIL_DECODE_GRAPH_QUERY_TOKENS")
+    if query:
+        settings["max_query_tokens"] = int(query)
+    return DecodeGraphConfig(**settings)
+
+
 class DecodeBuffers:
     """Fixed GPU inputs for a bounded tree-attention batch.
 
@@ -131,7 +150,7 @@ class DecodeGraphs:
     """
 
     def __init__(self, pipeline, *, config: DecodeGraphConfig | None = None):
-        self._config = DecodeGraphConfig() if config is None else config
+        self._config = configured_graphs() if config is None else config
         self.pipeline = pipeline
         self.enabled = True
         self.graphs = []

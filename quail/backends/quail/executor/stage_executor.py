@@ -271,7 +271,7 @@ class StageExecutor:
         # host seconds per phase of the loop, and the readouts' GPU
         # event pairs, for telling host-bound passes from GPU-bound
         self.host_s = {"admit": 0.0, "launch": 0.0, "wait": 0.0,
-                       "report": 0.0, "submit": 0.0}
+                       "report": 0.0, "decide": 0.0, "submit": 0.0}
         self.readout_spans = []
         self.outstanding = []     # PendingAnswers in launch order
         self.split_answers = any(s.append and s.own_suffixes for s in stages)
@@ -567,8 +567,10 @@ class StageExecutor:
                 anchors, stage_rows = prepared.setdefault(j, ([], []))
                 anchors.append(a)
                 stage_rows.append(rows)
+        started = time.perf_counter()
         for j, (anchors, stage_rows) in prepared.items():
             self.stages[j].prepare(anchors, stage_rows)
+        self.host_s["decide"] += time.perf_counter() - started
         for (a, j, start, end, _), rows in zip(groups, group_rows):
             if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
                 # the request was packed; a repeating stage asks anew
