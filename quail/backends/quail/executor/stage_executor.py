@@ -674,27 +674,27 @@ class StageExecutor:
             self.spans.append((by_stage, chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
             self.arena.trim_window(key)
-        # the earlier passes' readouts finished before this forward pass
-        # started, so their answers are decided while the GPU runs it;
-        # a readout of many rows launches enough kernels to fill the
-        # launch queue, and a host blocked there could not decide them
+        # the readout is queued right behind the pass, so the stream
+        # never waits for the host; the earlier passes' readouts are
+        # done by now, so their answers are decided while the GPU runs
+        # this pass and its readout
         started = time.perf_counter()
-        while self.outstanding:
-            self._report_next()
-        reported = time.perf_counter()
-        self.host_s["report"] += reported - started
         if self.gpu_timing:
             e2 = self.torch.cuda.Event(enable_timing=True)
             e2.record()
         handles = self.readouts.submit(
             normed, entries, chunk.rows_per_answer)
-        self.host_s["submit"] += time.perf_counter() - reported
+        submitted = time.perf_counter()
+        self.host_s["submit"] += submitted - started
         if self.gpu_timing:
             e3 = self.torch.cuda.Event(enable_timing=True)
             e3.record()
             # e1 to e2 is the stream idle until the host submits the
             # readout; e2 to e3 is the readout
             self.readout_spans.append((e1, e2, e3))
+        while self.outstanding:
+            self._report_next()
+        self.host_s["report"] += time.perf_counter() - submitted
         self.outstanding.append(PendingAnswers(part, handles))
 
     def run(self):
