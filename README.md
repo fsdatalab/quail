@@ -12,7 +12,7 @@ from SQL, on your own GPUs. Quail's secret sauce is to optimize LLM
 inference and memory management for each query as a whole. This makes
 Quail lightning fast: **1.8x faster on average** than well-tuned vLLM
 baselines, and **up to 14x faster** on queries with AI joins
-([details](https://fsdatalab.github.io/blog/introducing-quail/)).
+([details](https://fsdatalab.github.io/blog/introducing-quail/))!
 
 ```sql
 SELECT r.id,
