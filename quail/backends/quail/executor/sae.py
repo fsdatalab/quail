@@ -412,11 +412,17 @@ class SaeMaxAccumulator:
 
 
 def sae_encoder(state) -> SaeEncoder:
-    """Return the loaded model's SAE encoder, loading it on first use."""
+    """Return the loaded model's SAE encoder, loading it on first use.
+
+    The engine encodes on the blocked torch path: measured on 4,096-row
+    chunks, the fused path takes 8.7 ms per chunk against torch's
+    4.4 ms (the emit pass recomputes a compute-bound GEMM), and its
+    overflow check reads the GPU, which stalls the forward pass. The
+    fused kernels stay available through kernels="quail".
+    """
     loaded = state.loaded_model
     if getattr(loaded, "sae", None) is None:
         import torch.nn.functional as F
 
-        loaded.sae = SaeEncoder.load(state.torch, F, loaded.model_spec,
-                                     engine=loaded.pipeline.engine)
+        loaded.sae = SaeEncoder.load(state.torch, F, loaded.model_spec)
     return loaded.sae
