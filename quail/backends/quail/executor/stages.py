@@ -211,7 +211,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
                on_answers=None, stop_groups=None, appended_tokens=None,
-               gpu_timing=False, survival=None):
+               gpu_timing=False, survival=None, separate_fresh=False):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -241,6 +241,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             idle between a pass and its readout).
         limit: Stop admitting documents once this many survived the
             last stage; the rest never run.
+        separate_fresh: Whether a chunk holds placed documents or fresh
+            ones, never both, taking turns while both wait, so a chunk
+            of decode rounds keeps the shape a captured graph replays.
+            Takes effect when the pipeline has decode graphs.
         survival: The fraction of documents expected to survive every
             stage, or None. Under a limit, documents are admitted only
             while the ones in flight are expected to fall short of it.
@@ -287,6 +291,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,
         appended_tokens=appended_tokens, gpu_timing=gpu_timing,
+        separate_fresh=separate_fresh,
     ).run()
 
 

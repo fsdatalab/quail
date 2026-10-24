@@ -336,6 +336,10 @@ class JoinAdmission:
         self._true = []
         self._settled = []         # events for anchors that never ran
         self.in_flight = 0         # launched groups not yet reported
+        # whether a chunk holds placed anchors or fresh ones, never
+        # both, so a chunk of decode rounds keeps a replayable shape
+        self.separate_fresh = False
+        self._last_fresh = False
         self.blocked_pages = 0
         self.reserve = reserve
         self.answers = [dict() for _ in range(k)]
@@ -591,7 +595,30 @@ class JoinAdmission:
         continued = []
         deferred = []
         temporary_pages = 0
-        # 1) placed anchors: cut streams (front) and next-stage starts
+        # with separate_fresh, a chunk holds placed anchors or fresh
+        # ones, not both, taking turns while both wait
+        fresh_turn = (self.separate_fresh and not self._last_fresh
+                      and bool(self.pending) and bool(self.ready))
+        if not fresh_turn:
+            room, free_pages, temporary_pages = self._place_ready(
+                room, free_pages, temporary_pages, groups, continued, deferred)
+        placed = len(groups)
+        if not (self.separate_fresh and groups):
+            room, free_pages = self._admit_fresh(
+                room, free_pages, temporary_pages, groups, continued)
+        if fresh_turn and not groups:
+            # nothing fresh fits: the placed anchors run instead
+            room, free_pages, temporary_pages = self._place_ready(
+                room, free_pages, temporary_pages, groups, continued, deferred)
+            placed = len(groups)
+        self._last_fresh = len(groups) > placed
+        self.ready.extendleft(reversed(continued))
+        self.ready.extendleft(reversed(deferred))
+        return groups
+
+    def _place_ready(self, room, free_pages, temporary_pages, groups, continued,
+                     deferred):
+        """Add the placed anchors' next groups: cut streams and next-stage starts."""
         for _ in range(len(self.ready)):
             if room == 0:
                 break
@@ -611,7 +638,10 @@ class JoinAdmission:
             room -= tokens
             if self._launch(a, j, end):
                 continued.append(a)
-        # 2) fresh anchors: pages in queue order, chunk room may skip
+        return room, free_pages, temporary_pages
+
+    def _admit_fresh(self, room, free_pages, temporary_pages, groups, continued):
+        """Add fresh anchors: pages in queue order, chunk room may skip."""
         held = []
         blocked = False
         admitted = set()
@@ -679,9 +709,7 @@ class JoinAdmission:
             if self._launch(a, 0, end):
                 continued.append(a)
         self.pending.extendleft(reversed(held))
-        self.ready.extendleft(reversed(continued))
-        self.ready.extendleft(reversed(deferred))
-        return groups
+        return room, free_pages
 
     # ---- gating --------------------------------------------------------
 

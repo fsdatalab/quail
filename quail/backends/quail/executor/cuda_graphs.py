@@ -11,7 +11,7 @@ from quail.progress import logger
 class DecodeGraphConfig:
     """Capture shapes owned by one worker's decode graphs."""
 
-    row_buckets: tuple[int, ...] = (32, 64, 128, 256, 512)
+    row_buckets: tuple[int, ...] = (32, 64, 128, 256, 512, 1024, 2048)
     max_context_tokens: int = 65536
     max_query_tokens: int = 32
 

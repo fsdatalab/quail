@@ -597,3 +597,24 @@ def test_a_repeating_stage_asks_the_anchor_again_until_its_callback_passes_it_on
     assert list(report.settlements) == [Settlement("finished", 0, True)]
     assert sched.done() and sched.survivors == 1
     assert rounds == [1, 1, 1, 1]
+
+
+def test_separate_fresh_chunks_take_turns_between_rounds_and_prefills():
+    # four anchors of two stages; with separate_fresh a chunk holds
+    # fresh anchors or placed ones, never both, and they alternate
+    sched = JoinAdmission([50, 50, 50, 50], [[10], [10]], 120, arena_pages=400,
+                          page_tokens=16)
+    sched.separate_fresh = True
+    first = sched.next_chunk(400)
+    assert [a for a, *_ in first] == [0, 1] and all(g[4] for g in first)
+    for a, *_ in first:
+        sched.report(a, 0, 0, 1, [1])
+    # anchors 0 and 1 wait at stage 1 and anchors 2 and 3 are fresh:
+    # the placed ones go first, then the fresh ones, then the placed
+    rounds = sched.next_chunk(400)
+    assert [(a, j) for a, j, *_ in rounds] == [(0, 1), (1, 1)]
+    for a, *_ in rounds:
+        sched.report(a, 1, 0, 1, [1])
+    fresh = sched.next_chunk(400)
+    assert [(a, j, carried) for a, j, _, _, carried in fresh] == [
+        (2, 0, True), (3, 0, True)]
