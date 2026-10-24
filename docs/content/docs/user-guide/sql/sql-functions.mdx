@@ -7,7 +7,7 @@ Use SQL functions and clauses to process rows alongside
 expressions, conditions, grouping, sorting, and windows. Every query
 must include an AI function.
 
-Examples use BigQuery syntax unless a different dialect is named.
+Examples use BigQuery syntax unless the example specifies another dialect.
 See the [SQL reference](/docs/user-guide/sql) for dialect selection.
 
 ## Functions and query clauses
@@ -75,9 +75,9 @@ Quail supports these SQL clauses with the following limits:
 
 ### WITH
 
-`WITH` names a query result so that a later query in the same
-statement can read it as a table. The named result is a common table
-expression (CTE). A subquery in `FROM` works the same way.
+`WITH` defines a common table expression (CTE), which a later query
+in the same statement can read as a table. A subquery in `FROM`
+works the same way.
 
 For example, imagine a `contracts` table with columns `id` and `text`.
 This query scores whether each contract's termination clause lets the
@@ -461,7 +461,7 @@ ORDER BY s.run_id, s.step_index;
 The first step in each run has a null `previous` value. Later steps use
 the label already computed for the preceding row. The window calculation
 does not call the model again. A window can read a source column or an
-AI output named earlier in `SELECT`.
+AI output defined earlier in `SELECT`.
 
 ### Supported functions
 

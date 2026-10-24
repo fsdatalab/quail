@@ -53,15 +53,15 @@ CI runs these on every pull request. Run them before pushing:
   `logical`, and so on down to `specs`. Put shared code in the lower
   package rather than importing upward.
 - `tools/check_long_strings.py` flags string literals over 200
-  characters. Long content is allowed when named as content (a name
-  containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
+  characters. Long content is allowed when its name identifies content
+  (a name containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
   prompts module or folder, or plainly HTML or SQL. Docstrings are
   exempt. Shorten long messages and log lines.
 - `tools/check_names.py` reports two names for one concept or one
   name for two: duplicate function bodies, a parameter passed on
   under another keyword, identifiers that differ by a synonym, and a
-  variable named for a type it does not hold. `--inventory` lists
-  what the code defines, for finding such names by hand.
+  variable whose name describes a type it does not hold. `--inventory`
+  lists what the code defines, for finding such names by hand.
 
 ## Tests
 
@@ -118,7 +118,7 @@ one. `tools/check_names.py` enforces the chosen words:
 - Every document operator emits one `rows:<alias>` port carrying
   `Rows`, and a pair operator emits `rows`. Read ids from `Rows` with
   `document_ids()`; do not keep a separate ids port.
-- A variable named for a type holds that type: `rows`, `scored`,
+- A variable with a type's name holds that type: `rows`, `scored`,
   `labels`, and `answers` hold `Rows`; `table`, `batch`, and
   `relation` hold Arrow tables.
 
@@ -160,7 +160,7 @@ features: their APIs, their code layout, their tests, their docs, and
 how they release and explain changes.
 
 - **Apache Spark**: the model for Quail as a whole.
-  - Catalyst, for logical and physical plans rewritten by named rules
+  - Catalyst, for logical and physical plans rewritten by rules
     (Quail's planner rules).
   - The DataFrame and SQL APIs, for Quail's builder and `sql()`.
   - Spark Connect, for a thin client talking to a remote server
