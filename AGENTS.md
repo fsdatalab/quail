@@ -215,7 +215,7 @@ how they release and explain changes.
       queries=IMDB-1,IMDB-2,IMDB-4,FEV-9,IMDB-11,AGENT-5,IMDB-15
       queries=$queries,CUAD-1,CUAD-4,CUAD-10,CUAD-15,CUAD-11,SALES-5
       uv run modal run --detach -m bench.quailb_parallel \
-        --model qwen3-4b-fp8 --sf 0.1 --query "$queries" \
+        --model qwen3-4b-fp8 --scale-factor 0.1 --query "$queries" \
         --no-include-baselines --no-include-sglang \
         2>&1 | tee "$run_log"
 
