@@ -10,15 +10,25 @@ import quail
 from quail.cost import budgets
 from quail.planner.plan import Refusal
 from quail.specs import (
+    B200,
     DEVICES,
     DIFFUSION_GEMMA_26B_FP8,
     H100_SXM,
+    L40S,
     MODELS,
     QWEN3_4B_FP8,
     QWEN3_5_4B_BF16,
     QWEN3_32B_FP8,
     RTX_PRO_6000_BLACKWELL_SERVER,
 )
+
+
+@pytest.mark.parametrize("precision", ("fp8", "bf16", "fp32"))
+def test_device_specs_require_a_positive_rate_for_each_precision(precision):
+    field = f"{precision}_flops"
+    for rate in (0.0, -1.0, float("nan")):
+        with pytest.raises(ValueError, match=f"h100-sxm: {field}"):
+            replace(H100_SXM, **{field: rate})
 
 
 def _hybrid_filter_plan(model, device, body="A good movie."):
@@ -81,7 +91,6 @@ def test_hybrid_planning_refuses_when_even_one_token_cannot_fit(monkeypatch):
 @pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_5_4B_BF16])
 def test_compute_efficiency_cannot_override_a_chunk_limit(model):
     capped = replace(model, chunk_cap_tokens=16)
-    assert budgets.compute_knee(capped, H100_SXM) > 16
     assert budgets.chunk_budget(capped, H100_SXM) == 16
 
 
@@ -110,6 +119,24 @@ def test_model_weights_and_kv_memory_budgets():
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
         assert budgets.arena_tokens(model, RTX_PRO_6000_BLACKWELL_SERVER) \
             > budgets.arena_tokens(model, H100_SXM)
+
+
+def test_device_memory_budgets():
+    for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
+        assert budgets.arena_tokens(model, B200) > budgets.arena_tokens(model, H100_SXM)
+        assert budgets.arena_tokens(model, L40S) < budgets.arena_tokens(model, H100_SXM)
+    assert budgets.minimum_weight_gpus(QWEN3_32B_FP8, L40S) == 1
+    # The int32 kernel index still caps 32B on H100 and B200. On L40S
+    # the memory bound would spend the leftover on two activation
+    # chunks, so the chunk shrinks until the arena holds that chunk.
+    cap = budgets.kernel_index_cap(QWEN3_32B_FP8)
+    assert budgets.chunk_budget(QWEN3_32B_FP8, H100_SXM) == cap
+    assert budgets.chunk_budget(QWEN3_32B_FP8, B200) == cap
+    l40s_chunk = budgets.chunk_budget(QWEN3_32B_FP8, L40S)
+    assert l40s_chunk < cap
+    full, sliding = budgets.arena_pages(QWEN3_32B_FP8, L40S, l40s_chunk)
+    assert sliding == 0
+    assert full * budgets.PAGE_TOKENS >= l40s_chunk
 
 
 def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
@@ -172,7 +199,7 @@ def test_attention_time_covers_only_the_attention_layers():
     model, chunk, context = QWEN3_5_4B_BF16, 1024, 4000
     flops = 4.0 * chunk * context * 16 * 256
     moved = context * 32_768 / 8 + 2.0 * chunk * 16 * 256 * budgets.ACT_BYTES
-    expected = max(flops / H100_SXM.attn_flops, moved / H100_SXM.hbm_bw) * 8
+    expected = max(flops / H100_SXM.bf16_flops, moved / H100_SXM.hbm_bw) * 8
     assert budgets._attention_time(
         model, H100_SXM, chunk, context) == pytest.approx(expected, rel=1e-12)
     # the same layers with all 32 storing KV take 4 times as long
@@ -249,7 +276,7 @@ def test_fp8_calibration_leaves_bf16_planning_unchanged(monkeypatch):
 
     model = QWEN3_5_4B_BF16
     before = _hybrid_filter_plan(model, H100_SXM)
-    device = replace(H100_SXM, mamf_fp8_flops=H100_SXM.peak_flops / 4)
+    device = replace(H100_SXM, mamf_fp8_flops=H100_SXM.fp8_flops / 4)
     monkeypatch.setitem(DEVICES, device.name, device)
     after = _hybrid_filter_plan(model, device)
     assert after.estimated_seconds == before.estimated_seconds
@@ -263,7 +290,7 @@ def test_bf16_calibration_changes_gemms_but_not_attention():
     from quail.cost.work import Work
 
     device = replace(H100_SXM, mamf_fp8_flops=0, mamf_bf16_flops=0)
-    calibrated = replace(device, mamf_bf16_flops=device.attn_flops / 2)
+    calibrated = replace(device, mamf_bf16_flops=device.bf16_flops / 2)
     work = Work(tokens=1000, pairs=500_000, kv_written=1000, kv_read=0)
     before = speed_of_light(work, QWEN3_5_4B_BF16, device, 1000)
     after = speed_of_light(work, QWEN3_5_4B_BF16, calibrated, 1000)

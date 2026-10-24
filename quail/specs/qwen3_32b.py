@@ -21,6 +21,7 @@ QWEN3_32B_FP8 = ModelSpec(
     #                        for AI.CLASSIFY: about 5,900 KV tokens.
     vocab=151_936,
     tied_head=False,       # separate lm_head, kept for AI.CLASSIFY
+    vllm_reserve_bytes=10 * 1024**3,
     turn_prefix=QWEN3_TURN_PREFIX,
     turn_suffix=QWEN3_TURN_SUFFIX,
     prompt_format=QWEN3_PROMPT_FORMAT,

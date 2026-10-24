@@ -918,6 +918,21 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     assert not plan.graph.nodes_by_type(AiJoin.type_name)[0].share_prefixes
 
 
+def test_prefix_sharing_accounts_for_bf16_work_in_an_fp8_model():
+    from quail.planner.rules.physical import sharing_pays
+    from quail.specs import QWEN3_5_4B_FP8
+
+    # gemm_flops uses the measured BF16 rate when one is set
+    slower = replace(H100_SXM, bf16_flops=H100_SXM.bf16_flops / 10,
+                     mamf_bf16_flops=H100_SXM.mamf_bf16_flops / 10)
+    assert not sharing_pays(
+        QWEN3_5_4B_FP8, H100_SXM,
+        shared_tokens=100, total_tokens=100_000, writes_pages=False)
+    assert sharing_pays(
+        QWEN3_5_4B_FP8, slower,
+        shared_tokens=100, total_tokens=100_000, writes_pages=False)
+
+
 def test_attention_setting_forces_every_filter_and_join(catalog):
     filters = _five_filter_plan(catalog, (0.5,))
     joins = _join_sequence(catalog)

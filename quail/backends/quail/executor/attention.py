@@ -28,6 +28,10 @@ GROUP = 128            # fp8 quant group size, matches the engine
 # FlashAttention 3's widest head; wider heads run FlashAttention 4,
 # whose Hopper build takes heads up to 512, over arena pages.
 FA_MAX_HEAD_DIM = 256
+# Blackwell's dedicated head-256 kernel reads paged KV one 128-token
+# tile at a time. The arena page stays 16 tokens.
+FA4_HEAD_DIM = 256
+FA4_PAGE_TOKENS = 128
 
 # The two attention paths a chunk can run. "unified" is one causal
 # paged call in which every row reads the KV its own document needs.
@@ -39,12 +43,90 @@ ATTENTION_PATHS = ("unified", "tree")
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:
-    """Select the attention implementation for a supported CUDA architecture."""
+    """Select the attention implementation for a supported CUDA architecture.
+
+    FlashAttention 3 is Hopper 9.x only. FlashAttention 4 covers 9.x,
+    10.x, and 11.x. FlashAttention 2 covers 8.0 and up. L40S (8.9)
+    uses 2; B200 (10.x) uses 4; H100 stays on 3; RTX PRO 6000 (12.0)
+    stays on 2.
+    """
+    major, _minor = capability
+    if capability == (8, 9):
+        return 2
     if capability == (9, 0):
         return 3
+    if major == 10:
+        return 4
     if capability == (12, 0):
         return 2
     raise ValueError(f"Quail does not support CUDA capability {capability}")
+
+
+def regroup_block_pages(block_pages, used, page_tokens,
+                        target=FA4_PAGE_TOKENS):
+    """Group block-table pages into pages of `target` tokens.
+
+    Args:
+        block_pages: Page ids per sequence, in logical order.
+        used: Resident tokens per sequence.
+        page_tokens: Tokens in each page of block_pages.
+        target: Tokens in each returned page.
+
+    Returns:
+        A tuple (pages, copies, num_pages, max_k). pages is the new
+        block table, every row padded to max_k // target entries.
+        copies is (destination page, source page, group index), the
+        source page's place inside that destination page. max_k is a
+        multiple of target.
+
+    Raises:
+        ValueError: page_tokens does not divide target, or a sequence
+            names fewer pages than its token count needs.
+    """
+    if target % page_tokens:
+        raise ValueError(
+            f"FlashAttention 4 head {FA4_HEAD_DIM} pages are {target} "
+            f"tokens; {page_tokens}-token pages do not divide that")
+    group = target // page_tokens
+    copies = []
+    pages = []
+    next_page = 0
+    max_tokens = 0
+    for row, tokens in zip(block_pages, used, strict=True):
+        tokens = int(tokens)
+        max_tokens = max(max_tokens, tokens)
+        if tokens <= 0:
+            pages.append([])
+            continue
+        src_used = (tokens + page_tokens - 1) // page_tokens
+        if src_used > len(row):
+            raise ValueError(
+                f"a sequence of {tokens} tokens needs {src_used} pages, "
+                f"and the block table has {len(row)}")
+        row_pages = []
+        for block in range((tokens + target - 1) // target):
+            row_pages.append(next_page)
+            for group_index in range(group):
+                src_index = block * group + group_index
+                if src_index >= src_used:
+                    break
+                copies.append((next_page, int(row[src_index]), group_index))
+            next_page += 1
+        pages.append(row_pages)
+    max_k = target if max_tokens == 0 else (
+        (max_tokens + target - 1) // target) * target
+    width = max_k // target
+    padded = [row + [0] * (width - len(row)) for row in pages]
+    return padded, copies, next_page, max_k
+
+
+def deep_gemm_supported(capability: tuple[int, int]) -> bool:
+    """Whether vLLM 0.29.0 enables DeepGEMM on this CUDA capability.
+
+    Matches CudaPlatform.support_deep_gemm: 9.0, 10.x, and 12.x.
+    """
+    major, _minor = capability
+    return capability == (9, 0) or major in (10, 12)
 
 
 def merge_partial(out, lse, index, out_c, lse_c) -> None:
@@ -96,7 +178,9 @@ class Engine:
                              f"got {kernels!r}")
         self.kernels = kernels
 
-        self.fa_version = flash_attention_version(torch.cuda.get_device_capability())
+        capability = torch.cuda.get_device_capability()
+        self.fa_version = flash_attention_version(capability)
+        self.use_deep_gemm = deep_gemm_supported(capability)
         self.torch = torch
         self.arena = arena
         self.rotary = rotary
@@ -120,16 +204,40 @@ class Engine:
     def gemm(self, q_input, input_scale, linear):
         if not self.is_fp8:
             return self.torch.nn.functional.linear(q_input, linear.weight)
-        # all linear projections (QKV, O, gate-up, down) run vLLM's
-        # DeepGEMM fp8 matmul; weights and scales are vLLM's layout
-        from vllm.utils.deep_gemm import fp8_gemm_nt
-        out = self.torch.empty(
-            (q_input.shape[0], linear.weight.shape[0]),
-            dtype=self.torch.bfloat16, device=q_input.device)
-        fp8_gemm_nt((q_input, input_scale),
-                    (linear.weight, self.weight_scale(linear)),
-                    out, is_deep_gemm_e8m0_used=self.use_ue8m0)
-        return out
+        weight_scale = self.weight_scale(linear)
+        if self.use_deep_gemm:
+            from vllm.utils.deep_gemm import fp8_gemm_nt
+            out = self.torch.empty(
+                (q_input.shape[0], linear.weight.shape[0]),
+                dtype=self.torch.bfloat16, device=q_input.device)
+            fp8_gemm_nt((q_input, input_scale),
+                        (linear.weight, weight_scale),
+                        out, is_deep_gemm_e8m0_used=self.use_ue8m0)
+            return out
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            w8a8_triton_block_scaled_mm,
+        )
+        return w8a8_triton_block_scaled_mm(
+            q_input, linear.weight,
+            self._triton_activation_scales(q_input, input_scale),
+            weight_scale, [GROUP, GROUP],
+            output_dtype=self.torch.bfloat16)
+
+    def _triton_activation_scales(self, q_input, input_scale):
+        """Return activation scales in the (tokens, groups) layout Triton wants.
+
+        Engine.quant writes column-major scales whose view is already
+        (tokens, K/128). A (groups, tokens) tensor is transposed.
+        """
+        groups = q_input.shape[-1] // GROUP
+        tokens = q_input.shape[0]
+        if input_scale.shape == (tokens, groups):
+            return input_scale
+        if input_scale.shape == (groups, tokens):
+            return input_scale.transpose(0, 1)
+        raise ValueError(
+            f"activation scales {tuple(input_scale.shape)} do not match "
+            f"tokens={tokens} groups={groups}")
 
     def quant(self, x):
         if not self.is_fp8:
@@ -843,31 +951,149 @@ class Engine:
 
     # ---- attention: the two workload paths --------------------------
 
+    def _fa4_hd256_pages(self, k, version, block_table) -> bool:
+        """Whether this paged call is the head-256 FlashAttention 4 kernel."""
+        shape = getattr(k, "shape", None)
+        return (block_table is not None and version == 4
+                and shape is not None and len(shape) == 4
+                and shape[-1] == FA4_HEAD_DIM
+                and shape[1] != FA4_PAGE_TOKENS)
+
+    def _pack_fa4_hd256_kv(self, k, v, block_table, seqused_k):
+        """Gather 16-token arena pages into the 128-token pages FA4 reads.
+
+        Arena pages are not contiguous, so one kernel page is a copy of
+        eight arena pages in block-table order. seqused_k stays in tokens.
+
+        Args:
+            k: Key pool, (pages, page tokens, KV heads, head dim).
+            v: Value pool, same shape as k.
+            block_table: Page ids per sequence.
+            seqused_k: Resident tokens per sequence.
+
+        Returns:
+            Packed keys, packed values, the 128-token block table, and
+            max_k rounded up to a multiple of 128.
+        """
+        torch = self.torch
+        page_tokens = k.shape[1]
+        block_pages = block_table.detach().to("cpu").tolist()
+        used = [int(tokens) for tokens
+                in seqused_k.detach().to("cpu").tolist()]
+        pages, copies, num_pages, max_k = regroup_block_pages(
+            block_pages, used, page_tokens)
+        if num_pages == 0:
+            num_pages = 1
+        heads, dim = k.shape[2], k.shape[3]
+        packed_k = torch.zeros(
+            (num_pages, FA4_PAGE_TOKENS, heads, dim),
+            dtype=k.dtype, device=k.device)
+        packed_v = torch.zeros(
+            (num_pages, FA4_PAGE_TOKENS, heads, dim),
+            dtype=v.dtype, device=v.device)
+        if copies:
+            destination = torch.tensor(
+                [item[0] for item in copies], dtype=torch.long,
+                device=k.device)
+            source = torch.tensor(
+                [item[1] for item in copies], dtype=torch.long,
+                device=k.device)
+            group_index = torch.tensor(
+                [item[2] for item in copies], dtype=torch.long,
+                device=k.device)
+            for index in range(FA4_PAGE_TOKENS // page_tokens):
+                pick = group_index == index
+                if not pick.any():
+                    continue
+                start = index * page_tokens
+                chosen = destination[pick]
+                packed_k[chosen, start:start + page_tokens] = k[source[pick]]
+                packed_v[chosen, start:start + page_tokens] = v[source[pick]]
+        width = max_k // FA4_PAGE_TOKENS
+        flat = [page_id for row in pages for page_id in row]
+        packed_table = torch.tensor(
+            flat, dtype=torch.int32, device=block_table.device).view(
+                len(pages), width)
+        return packed_k, packed_v, packed_table, max_k
+
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None, softmax_scale=None,
             window=None, version=None):
-        # vLLM's FA2 and FA3 both accept 16-token pages and return
-        # LSE as [heads, total_queries] for the merge kernel.
+        # LSE comes back as [heads, total_queries] for the merge kernel.
+        # The head-256 FA4 kernel is the one call that cannot read a
+        # 16-token arena page. num_splits=0 asks vLLM's heuristic, and
+        # that kernel rejects the SplitKV the heuristic can select.
         from vllm.vllm_flash_attn import flash_attn_varlen_func
+        version = version or self.fa_version
+        if self._fa4_hd256_pages(k, version, block_table):
+            k, v, block_table, max_k = self._pack_fa4_hd256_kv(
+                k, v, block_table, seqused_k)
         extra = {}
         if softmax_scale is not None:
             extra["softmax_scale"] = softmax_scale
         if window is not None:
             extra["window_size"] = list(window)
+        shape = getattr(k, "shape", None)
+        if version == 4 and shape is not None and shape[-1] == FA4_HEAD_DIM:
+            extra["num_splits"] = 1
         return flash_attn_varlen_func(
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
             max_seqlen_k=max_k, cu_seqlens_k=cu_k,
             block_table=block_table, seqused_k=seqused_k,
-            causal=causal, fa_version=version or self.fa_version,
+            causal=causal, fa_version=version,
             return_softmax_lse=True, **extra)
+
+    def _triton_paged(self, q3, kp, vp, cu_q, max_q, seqused_k,
+                      max_seqused_k, block_table, *, causal,
+                      softmax_scale, window):
+        """One paged attention call through Triton unified attention.
+
+        Args:
+            q3: Queries, (rows, heads, dim).
+            kp: Key pages, (pages, page tokens, KV heads, dim).
+            vp: Value pages, same shape as kp.
+            cu_q: Cumulative query lengths.
+            max_q: Longest query.
+            seqused_k: Resident tokens per sequence.
+            max_seqused_k: Longest resident sequence.
+            block_table: Page ids per sequence.
+            causal: Whether each query sees only keys at or before it.
+            softmax_scale: Logit scale. None uses 1/sqrt(dim).
+            window: Sliding window pair, or None for full attention.
+
+        Returns:
+            Attention output, (rows, heads, dim).
+        """
+        from vllm.v1.attention.ops.triton_unified_attention import (
+            unified_attention,
+        )
+
+        q = q3.contiguous()
+        out = self.torch.empty_like(q)
+        scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        unified_attention(
+            q=q, k=kp, v=vp, out=out,
+            cu_seqlens_q=cu_q, max_seqlen_q=max_q,
+            seqused_k=seqused_k, max_seqlen_k=max_seqused_k,
+            softmax_scale=scale, causal=causal,
+            window_size=(-1, -1) if window is None else window,
+            block_table=block_table, softcap=0,
+            q_descale=None, k_descale=None, v_descale=None)
+        return out
 
     def _paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table, *,
                causal, softmax_scale=None, window=None):
         """One paged attention call.
 
         FlashAttention 3, or FlashAttention 4 when the head is wider
-        than it takes.
+        than it takes. A 512-wide head on a GPU that selects
+        FlashAttention 4 runs through Triton unified attention.
         """
+        if self.fa_version == 4 and q3.shape[-1] == 512:
+            return self._triton_paged(
+                q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
+                block_table, causal=causal, softmax_scale=softmax_scale,
+                window=window)
         wide = q3.shape[-1] > FA_MAX_HEAD_DIM
         out, _ = self._fa(
             q3, kp, vp, cu_q, None, max_q, max_seqused_k, causal=causal,

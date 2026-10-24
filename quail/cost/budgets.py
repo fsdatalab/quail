@@ -73,7 +73,49 @@ def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
     if model.chunk_cap_tokens:
         b = min(b, model.chunk_cap_tokens)
-    return b
+    return _chunk_leaving_kv(model, device, b)
+
+
+def _chunk_leaving_kv(model: ModelSpec, device: DeviceSpec, chunk: int) -> int:
+    """Shrink a chunk until its activation reserve leaves its own KV.
+
+    Args:
+        model: The model being budgeted.
+        device: The device it runs on.
+        chunk: The budget before the KV check.
+
+    Returns:
+        ``chunk`` when it already leaves one chunk of KV, or a smaller
+        one. A sliding-window model is unchanged; its arena check is
+        ``arena_pages``.
+    """
+    if model.sliding_window or chunk < 1:
+        return chunk
+    free = device.mem_bytes * POOL_FRACTION - model.W_resident
+    per = ACT_RESERVE_CHUNKS * model.act_per_token + model.kappa_full
+    if per > 0:
+        chunk = min(chunk, max(1, int(free // per)))
+    full, _ = arena_pages(model, device, chunk)
+    while chunk > 1 and full * PAGE_TOKENS < chunk:
+        chunk -= 1
+        full, _ = arena_pages(model, device, chunk)
+    return chunk
+
+
+def sliding_kv_fits(model: ModelSpec, device: DeviceSpec,
+                    chunk_tokens: int | None = None) -> bool:
+    """Whether the leftover arena holds one chunk's sliding KV.
+
+    Models without a sliding window always fit. The default chunk is
+    the budget; DiffusionGemma's 65536-token cap does not fit L40S.
+    """
+    if not model.sliding_window:
+        return True
+    try:
+        arena_pages(model, device, chunk_tokens)
+    except ValueError:
+        return False
+    return True
 
 
 def arena_bytes(model: ModelSpec, device: DeviceSpec,
