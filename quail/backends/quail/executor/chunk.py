@@ -93,6 +93,44 @@ def _concatenate(parts):
     return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
 
 
+def _join(parts):
+    """Join int64 arrays, (start, length) ranges, and single values, in order.
+
+    A decode round's rows are a range, so a chunk of rounds is joined
+    without an array per round.
+    """
+    if not parts:
+        return np.empty(0, dtype=np.int64)
+    kinds = np.fromiter((2 if type(part) is tuple else 1 if type(part) is int
+                         else 0 for part in parts), dtype=np.int64,
+                        count=len(parts))
+    if not kinds.any():
+        return np.concatenate(parts)
+    lengths = np.fromiter(
+        (part[1] if type(part) is tuple else 1 if type(part) is int
+         else len(part) for part in parts), dtype=np.int64, count=len(parts))
+    ends = np.cumsum(lengths)
+    offsets = ends - lengths
+    out = np.empty(int(ends[-1]), dtype=np.int64)
+    ranges = np.flatnonzero(kinds == 2)
+    if len(ranges):
+        starts = np.fromiter((parts[i][0] for i in ranges), dtype=np.int64,
+                             count=len(ranges))
+        span = lengths[ranges]
+        total = int(span.sum())
+        within = (np.arange(total, dtype=np.int64)
+                  - np.repeat(np.cumsum(span) - span, span))
+        out[np.repeat(offsets[ranges], span) + within] = (
+            np.repeat(starts, span) + within)
+    singles = np.flatnonzero(kinds == 1)
+    if len(singles):
+        out[offsets[singles]] = np.fromiter((parts[i] for i in singles),
+                                            dtype=np.int64, count=len(singles))
+    for i in np.flatnonzero(kinds == 0):
+        out[offsets[i]:ends[i]] = parts[i]
+    return out
+
+
 def _staged(torch, data, dtype, pinned=True):
     """Copy host data to the device.
 
@@ -444,11 +482,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             total = int(sufs0.lengths[0])
             row0 = num_tokens
             id_parts.append(sufs0.ids)
-            rows = np.arange(total, dtype=np.int64)
-            position.append(f + rows)
-            finals.append(row0 + rows)
-            cu_a.append(np.array([row0 + total], dtype=np.int64))
-            rows_per_answer.append(sufs0.lengths)
+            position.append((f, total))
+            finals.append((row0, total))
+            cu_a.append(row0 + total)
+            rows_per_answer.append(total)
             multi_row = True
             num_tokens = row0 + total
             layout.append((g["key"], 1))
@@ -663,7 +700,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 raise ValueError(
                     "unified attention requires pages for a kept "
                     "group - an unpaged kept group has no KV to read")
-    cu_a = np.concatenate(cu_a)
+    cu_a = _join(cu_a)
 
     t = _tick(timing, "pack_py", t)
     reads = None
@@ -721,7 +758,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     # contiguous rows scattered straight into its key's
                     # capacity rows
                     key, f, r0, count = spec
-                    rows_np = arena.capacity_rows(key).numpy()
+                    rows_np = arena.capacity_rows_numpy(key)
                     end = f + count
                     if end > len(rows_np):
                         raise ValueError(
@@ -900,12 +937,12 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     out = Chunk(
         input_ids=_staged_token_parts(
             torch, id_parts, num_tokens, pinned, staging),
-        positions=stage("positions", _concatenate(position), torch.int64),
-        final_indices=stage("finals", _concatenate(finals), torch.int64),
+        positions=stage("positions", _join(position), torch.int64),
+        final_indices=stage("finals", _join(finals), torch.int64),
         meta=meta, attention_mode=attention_mode, tokens=num_tokens,
         layout=layout, temporary_keys=tuple(temporary_keys),
         fresh_keys=tuple(fresh_keys),
-        rows_per_answer=(np.concatenate(rows_per_answer) if multi_row else None))
+        rows_per_answer=_join(rows_per_answer) if multi_row else None)
     _tick(timing, "pack_h2d", t)
     return out
 

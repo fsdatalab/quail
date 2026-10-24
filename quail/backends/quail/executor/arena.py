@@ -113,6 +113,7 @@ class KVArena:
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU
         self._capacity_rows = {}  # key -> every row in the claimed pages
+        self._capacity_rows_numpy = {}  # the same rows as numpy views
         self._sliding_rows = {}   # key -> every row in its sliding pages
         self._base = {}       # key -> tokens the window is anchored below
         self._sliding_start = {}  # key -> logical row of its first sliding page
@@ -396,6 +397,7 @@ class KVArena:
         if cap is None or cap.numel() != capacity:
             cap = self._page_rows(self.accounting, key, capacity)
         self._capacity_rows[key] = cap
+        self._capacity_rows_numpy[key] = cap.numpy()
         self._rows[key] = cap[:logical]
         if self.sliding is not None:
             capacity_s = len(self.sliding.table_pages(key)) * self.page_tokens
@@ -669,6 +671,7 @@ class KVArena:
         self._trimmed.discard(key)
         self._rows.pop(key)
         self._capacity_rows.pop(key)
+        self._capacity_rows_numpy.pop(key, None)
         self._sliding_rows.pop(key, None)
         self._base.pop(key, None)
         self._sliding_start.pop(key, None)
@@ -797,6 +800,13 @@ class KVArena:
     def capacity_rows(self, key):
         """Row index tensor (CPU) over every row in the key's pages."""
         return self._capacity_rows[key]
+
+    def capacity_rows_numpy(self, key) -> np.ndarray:
+        """The key's capacity rows as a numpy view, kept beside the tensor."""
+        rows = self._capacity_rows_numpy.get(key)
+        if rows is None:
+            rows = self._capacity_rows_numpy[key] = self._capacity_rows[key].numpy()
+        return rows
 
     def capacity_rows_sliding(self, key):
         """Row index tensor (CPU) over every row in the key's sliding pages."""

@@ -61,8 +61,14 @@ def _ensure_tables(scale_factor: float, names) -> Path:
 
 
 def _run_one(session, table, column, instruction, cap, draft_policy,
-             usd_per_hour) -> dict:
-    """Run one map configuration and return its measurements."""
+             usd_per_hour, profile=False) -> dict:
+    """Run one map configuration and return its measurements.
+
+    With profile, the run is traced with cProfile and the functions
+    with the most own time are printed.
+    """
+    import cProfile
+    import pstats
     from dataclasses import replace
 
     from quail.physical import AiMap
@@ -76,9 +82,18 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
                            draft_policy=draft_policy))
         if isinstance(node, AiMap) else node for node in plan.nodes)
     plan = replace(plan, nodes=nodes)
+    profiler = cProfile.Profile() if profile else None
     started = time.perf_counter()
+    if profiler is not None:
+        profiler.enable()
     result = query.run(plan=plan)
+    if profiler is not None:
+        profiler.disable()
     wall = time.perf_counter() - started
+    if profiler is not None:
+        stats = pstats.Stats(profiler)
+        stats.sort_stats("tottime").print_stats(60)
+        stats.sort_stats("cumtime").print_stats("quail/", 60)
     report = result.report
     inference = report.get("backend_metrics", {}).get("inferences", [{}])
     answers = result.collect().column("answer").to_pylist()
@@ -104,7 +119,7 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
               volumes=VOLUMES)
 def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
                   policies: str = "adaptive,fixed", only: str = "",
-                  gpu_timing: bool = True) -> str:
+                  gpu_timing: bool = True, profile: bool = False) -> str:
     """Run the map configurations; return the result JSON's volume path.
 
     Args:
@@ -116,6 +131,7 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
             all four.
         gpu_timing: Whether to time the forward passes with CUDA
             events and report their sum as gpu_s beside the wall.
+        profile: Whether to print a cProfile of each run's host.
     """
     import quail
     from bench.quailb import register_tables
@@ -138,7 +154,7 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
                 print(f"running {run_name}", flush=True)
                 measurements["runs"][run_name] = _run_one(
                     session, table, column, instruction, cap, policy,
-                    H100_USD_PER_HOUR)
+                    H100_USD_PER_HOUR, profile=profile)
                 print(json.dumps(
                     {run_name: measurements["runs"][run_name]}, default=str),
                     flush=True)
@@ -152,8 +168,9 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
 
 @app.local_entrypoint()
 def launch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
-           policies: str = "adaptive,fixed", only: str = ""):
+           policies: str = "adaptive,fixed", only: str = "",
+           profile: bool = False):
     call = map_quadrants.spawn(model=model, scale_factor=sf, policies=policies,
-                               only=only)
+                               only=only, profile=profile)
     print(f"function call id: {call.object_id}")
     print(call.get())
