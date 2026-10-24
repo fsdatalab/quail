@@ -246,6 +246,9 @@ query = (
 )
 ```
 
+`unnest("f", "g")` puts two lists side by side, as `UNNEST(a, b)` does
+in SQL. `unnest("f").unnest("g")` gives each pair of elements.
+
 See [`AI.SAE_FEATURES`](/docs/user-guide/sql/ai-functions#aisae_features)
 for the two poolings and the limits.
 

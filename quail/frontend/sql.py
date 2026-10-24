@@ -22,14 +22,13 @@ from quail.frontend.sql_binding.select import (
     _parse_offset,
     bind_order,
 )
-from quail.frontend.sql_binding.unnest import take_unnest
+from quail.frontend.sql_binding.unnest import list_fields, take_unnests
 from quail.logical import (
     Alias,
     ColumnRef,
     CompileError,
     LogicalPlan,
     LogicalPlanBuilder,
-    Unnest,
     column_name,
     is_score,
 )
@@ -264,7 +263,7 @@ def compile_sql(
     if not isinstance(tree, exp.Select):
         raise CompileError("the query must be a single SELECT")
     _reject_forbidden(tree)
-    unnested = take_unnest(tree)
+    unnests = take_unnests(tree)
 
     limit = _parse_limit(tree)
     offset = _parse_offset(tree)
@@ -273,24 +272,25 @@ def compile_sql(
     b = ExpressionBinder(catalog, prompts or PromptBinder(
         turn=turn, layout=layout), dialect=dialect.value)
 
-    if unnested is not None:
-        b.unnest_alias = unnested[0]
+    for names, _ in unnests:
+        for name in names:
+            if name in b.unnested:
+                raise CompileError(f"two UNNEST lists are named {name!r}")
+            b.unnested[name] = list_fields()
     joins = JoinBinder(b)
     joins.bind_tables(tree)
-    if b.unnest_alias is not None and b.unnest_alias in dict(b.tables):
-        raise CompileError(
-            f"{b.unnest_alias!r} is both a table alias and the UNNEST's AS "
-            f"name; rename one")
+    for name in b.unnested:
+        if name in dict(b.tables):
+            raise CompileError(
+                f"{name!r} is both a table alias and an UNNEST list name; "
+                f"rename one")
     bind_where(b, tree, joins)
 
     selection = SelectBinder(b).bind(tree)
     columns, aggregation = selection.columns, selection.aggregation
-    unnest = None
-    if unnested is not None:
-        alias, call = unnested
-        columns = (*columns, Alias(b.bind_ai_sae_features(call), alias))
-        unnest = Unnest(alias, tuple(b.unnest_tests),
-                        () if aggregation is not None else tuple(selection.output))
+    columns = (*columns, *(Alias(b.bind_ai_sae_features(call), name)
+                           for names, calls in unnests
+                           for name, call in zip(names, calls)))
     order = bind_order(tree, b, columns, aggregation, selection.structs,
                        selection.windows)
     _validate_query(b, joins, columns, selection.structs)
@@ -343,5 +343,6 @@ def compile_sql(
         structs=selection.structs,
         windows=selection.windows,
         output=selection.output,
-        unnest=unnest,
+        unnests=tuple(names for names, _ in unnests),
+        unnest_tests=tuple(b.unnest_tests),
     )

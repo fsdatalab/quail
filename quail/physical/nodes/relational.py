@@ -1,4 +1,4 @@
-"""Coordinator nodes: Exchange, Recombine, Project, Unnest, Aggregate, Sort, Limit."""
+"""Coordinator nodes: Exchange, Recombine, Project, and the result nodes."""
 
 from __future__ import annotations
 
@@ -157,19 +157,39 @@ class Window(PhysicalNode):
 
 @dataclass(frozen=True)
 class Unnest(PhysicalNode):
-    """Return one row per element of an AI.SAE_FEATURES list column.
+    """Return one row per element of list columns, zipped by position.
 
-    The list ``column`` becomes the columns ``column.feature`` and
-    ``column.strength``, and the other columns repeat for each element.
-    ``tests`` read those two columns and keep the elements they accept.
-    ``columns`` are the output columns in result order.
+    Each list column in ``lists`` holds structs and becomes one column
+    per struct field, named ``<list>.<field>``; the other columns repeat
+    for each element. A row returns as many rows as its longest list,
+    with nulls past the end of a shorter one. ``columns`` are the output
+    columns in result order.
     """
 
-    column: str = ""
-    tests: tuple[RegularPredicate, ...] = ()
+    lists: tuple[str, ...] = ()
     columns: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.unnest"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
+
+@dataclass(frozen=True)
+class ResultFilter(PhysicalNode):
+    """Keep the result rows whose condition holds.
+
+    The condition tests a column of the rows, such as an unnested field
+    column. ``columns`` are the output columns in result order.
+    """
+
+    condition: RegularPredicate | None = None
+    columns: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.result_filter"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 

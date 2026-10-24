@@ -15,11 +15,8 @@ from quail.backends.quail.reranker import classify_outputs
 from quail.catalog.tokens import DocumentKeys
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
+from quail.logical import FEATURE_LIST
 from quail.physical import ValueType
-
-# the Arrow type of one feature list
-FEATURE_LIST = pa.list_(
-    pa.struct([("feature", pa.int32()), ("strength", pa.float32())]))
 
 
 def _feature_column(lengths, indices, strengths) -> pa.ListArray:
@@ -34,7 +31,7 @@ def _feature_column(lengths, indices, strengths) -> pa.ListArray:
     values = pa.StructArray.from_arrays(
         [pa.array(np.ascontiguousarray(indices, dtype=np.int32)),
          pa.array(np.ascontiguousarray(strengths, dtype=np.float32))],
-        names=["feature", "strength"])
+        names=FEATURE_LIST.value_type.names)
     return pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), values)
 
 

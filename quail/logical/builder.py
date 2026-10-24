@@ -14,6 +14,7 @@ from quail.logical.expressions import (
     Prompt,
     RegularPredicate,
     aliased_call,
+    column_name,
     model_call,
 )
 from quail.logical.nodes import (
@@ -29,6 +30,7 @@ from quail.logical.nodes import (
     SemanticFilter,
     SemanticJoin,
     SemanticSaeFeatures,
+    Unnest,
     Window,
 )
 from quail.logical.plan import (
@@ -258,7 +260,8 @@ class LogicalPlanBuilder:
         structs: tuple = (),
         windows: tuple = (),
         output: tuple = (),
-        unnest=None,
+        unnests: tuple = (),
+        unnest_tests: tuple = (),
     ) -> LogicalPlan:
         """Build the plan's result nodes over the projected columns.
 
@@ -272,8 +275,12 @@ class LogicalPlanBuilder:
             structs: The AI.EXTRACT struct columns the projection packs.
             windows: The WindowCalls over the projected or grouped rows.
             output: The result columns in SELECT order when windows
-                are present.
-            unnest: The Unnest of one AI.SAE_FEATURES column, or None.
+                or unnested lists are present.
+            unnests: The list columns of each Unnest, lowest first; the
+                lists of one Unnest are zipped.
+            unnest_tests: RegularPredicates on unnested field columns.
+                Each becomes a Filter above the Unnest that adds its
+                column.
         """
         if self._root is None:
             raise CompileError("a logical plan needs an input table")
@@ -287,8 +294,10 @@ class LogicalPlanBuilder:
             raise CompileError(
                 "DISTINCT does not compare AI.EXTRACT struct columns; extract "
                 "each field as its own column")
-        _check_feature_lists(columns, order, distinct, aggregation, unnest)
-        node = Project(self._root, tuple(columns), tuple(structs), unnest)
+        unnested = {name for lists in unnests for name in lists}
+        _check_feature_lists(columns, order, distinct, aggregation, unnested)
+        node = _unnested(Project(self._root, tuple(columns), tuple(structs)),
+                         unnests, unnest_tests)
         if aggregation is not None:
             node = Aggregate(
                 node,
@@ -299,15 +308,39 @@ class LogicalPlanBuilder:
             )
         if windows:
             node = Window(node, tuple(windows), tuple(output))
-        if limit is not None or order or offset or distinct:
-            node = Result(node, limit, tuple(order), offset, distinct)
+        # over an Unnest, the result puts its columns in SELECT order
+        selected = (tuple(output) if unnests and not windows
+                    and aggregation is None else ())
+        if limit is not None or order or offset or distinct or selected:
+            node = Result(node, limit, tuple(order), offset, distinct, selected)
         plan = LogicalPlan(node)
         plan.validate()
         return plan
 
 
+def _unnested(node, unnests, tests):
+    """Return the node under its Unnests, each test above its field's Unnest.
+
+    Raises:
+        CompileError: An Unnest names no list column below it, or a test
+            reads no unnested field.
+    """
+    tests = list(tests)
+    for lists in unnests:
+        node = Unnest(node, tuple(lists))
+        node.validate()
+        fields = {name for names in node.fields().values() for name in names}
+        for test in [test for test in tests if column_name(test.column) in fields]:
+            node = Filter(node, test)
+            tests.remove(test)
+    if tests:
+        raise CompileError(
+            f"{tests[0]} tests no field of an unnested list")
+    return node
+
+
 def _check_feature_lists(columns, order, distinct, aggregation,
-                         unnest) -> None:
+                         unnested) -> None:
     """Refuse an AI.SAE_FEATURES list where the query compares values.
 
     An unnested list is compared by its scalar fields, so it is exempt.
@@ -318,7 +351,7 @@ def _check_feature_lists(columns, order, distinct, aggregation,
     """
     names = {column.name for column in columns
              if aliased_call(column, "features") is not None
-             and (unnest is None or column.name != unnest.column)}
+             and column.name not in unnested}
     if not names:
         return
     if aggregation is not None or distinct:

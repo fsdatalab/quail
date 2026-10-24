@@ -10,12 +10,14 @@ from quail.logical.expressions import (
     CompileError,
     RegularPredicate,
     _explain,
+    column_name,
     model_call,
     validate_predicate,
 )
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import classifications
 from quail.logical.nodes.extract import extractions
+from quail.logical.nodes.unnest import Unnest
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,8 @@ class Filter:
 
     The condition tests a column a one-table SemanticClassify or a
     SemanticExtract below adds: a label, an answer, or an answer's span.
+    Above an Unnest, it tests a column the rows below return, such as a
+    field column of an unnested list.
     """
 
     input: LogicalNode
@@ -98,12 +102,26 @@ class Filter:
     def validate(self) -> None:
         self.condition.validate()
         column = self.condition.column
+        if above_unnest(self.input):
+            if column_name(column) not in self.input.result_columns():
+                raise CompileError(
+                    f"a Filter above an Unnest tests a column the rows below "
+                    f"return, got {column_name(column)}")
+            return
         if (column.alias, column.column) not in computed_columns(self.input):
             raise CompileError(
                 f"a Filter tests a column a one-table classification or "
                 f"an extraction below it computes; nothing below computes "
                 f"{column.alias}.{column.column}"
             )
+
+    def result_columns(self) -> tuple[str, ...]:
+        """Return the columns of the rows below, above an Unnest."""
+        return self.input.result_columns()
+
+    def list_types(self) -> dict:
+        """Return the list columns of the rows below, above an Unnest."""
+        return self.input.list_types()
 
     def with_children(self, children: tuple[LogicalNode, ...]):
         if len(children) != 1:
@@ -133,3 +151,10 @@ def computed_columns(node) -> frozenset:
     for found in extractions(node):
         columns.update({(found.alias, found.name), (found.alias, found.span_name)})
     return frozenset(columns)
+
+
+def above_unnest(node) -> bool:
+    """Return whether the node is an Unnest or a Filter above one."""
+    while isinstance(node, Filter):
+        node = node.input
+    return isinstance(node, Unnest)

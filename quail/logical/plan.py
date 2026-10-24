@@ -27,6 +27,7 @@ from quail.logical.nodes import (
     SemanticFilter,
     SemanticJoin,
     SemanticSaeFeatures,
+    Unnest,
     Window,
 )
 
@@ -102,7 +103,7 @@ class LogicalPlan:
     def projection(self) -> Project:
         """Return the projection that supplies result columns."""
         node = self.root
-        while isinstance(node, (Result, Aggregate, Window)):
+        while isinstance(node, (Result, Aggregate, Window, Unnest, Filter)):
             node = node.input
         if not isinstance(node, Project):
             raise CompileError("a query plan needs a projection")
@@ -138,7 +139,8 @@ class LogicalPlan:
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, applies, classifies = [], {}, [], [], []
         extracts, feature_calls, tested, aliases = [], [], {}, []
-        nodes = self.walk()
+        # the nodes above the projection read result rows, not documents
+        nodes = LogicalPlan(self.projection).walk()
         for node in nodes:
             if isinstance(node, Scan):
                 scans.append(node)

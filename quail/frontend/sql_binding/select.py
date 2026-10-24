@@ -101,9 +101,9 @@ def bind_order(
             raise CompileError(
                 f"ORDER BY does not compare the AI.EXTRACT struct column "
                 f"{bare!r}; extract the field as its own column")
-        element = unnest_field(target, b.unnest_alias)
-        if element is not None:
-            expression = ColumnRef(b.unnest_alias, "", element)
+        field = unnest_field(target, b.unnested)
+        if field is not None:
+            expression = ColumnRef(target.table, "", target.name)
         else:
             expression = named[bare] if bare in named else b.resolve_value(target)
         keys.append(
@@ -164,9 +164,9 @@ class SelectBinder:
         """
         b, columns = self.binder, self.columns
         names = {column_name(column): column for column in columns}
-        element = unnest_field(node, b.unnest_alias)
-        if element is not None:
-            return f"{b.unnest_alias}.{element}"
+        field = unnest_field(node, b.unnested)
+        if field is not None:
+            return field
         if isinstance(node, COLUMN_NODES):
             if isinstance(node, exp.Column) and not node.table and node.name in names:
                 return node.name
@@ -255,9 +255,8 @@ class SelectBinder:
                     "an aggregate in SELECT is a direct COUNT, SUM, AVG, MIN, "
                     "or MAX call with an AS name"
                 )
-            element = unnest_field(node, b.unnest_alias)
-            if element is not None:
-                name = f"{b.unnest_alias}.{element}"
+            name = unnest_field(node, b.unnested)
+            if name is not None:
                 if isinstance(e, exp.Alias) and e.alias and e.alias != name:
                     raise CompileError(
                         f"an UNNEST field keeps its name {name}; drop "

@@ -1,8 +1,8 @@
-"""Runtimes for the relational nodes: scan, project, unnest, limit, aggregate, sort."""
+"""Runtimes for the relational nodes: scan, project, filter, limit, aggregate, sort."""
 
 from __future__ import annotations
 
-from collections.abc import Sized
+from collections.abc import Iterator, Sized
 
 import numpy as np
 import pyarrow as pa
@@ -15,9 +15,9 @@ from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.rows import Rows, as_table
-from quail.logical.expressions import UNNEST_FIELDS
+from quail.logical.expressions import column_name
 from quail.logical.predicates import compare_literal
-from quail.physical import Aggregate, Limit, Project, Scan, Sort, Unnest, Window
+from quail.physical import Aggregate, Limit, Project, ResultFilter, Scan, Sort, Window
 
 
 class ScanRuntime:
@@ -81,40 +81,54 @@ class ProjectRuntime:
             input_rows=rows, output_rows=rows if output_rows is None else output_rows))
 
 
-class UnnestRuntime:
-    """Return one row per element of a list column."""
+class ResultFilterRuntime:
+    """Keep the result rows whose condition holds, one batch at a time."""
 
     def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, Unnest):
+        if not isinstance(node, ResultFilter):
             raise TypeError(type(node).__name__)
         if len(inputs) != 1:
-            raise ValueError("Unnest needs one input")
-        table = _rows_table(next(iter(inputs.values())))
-        result = unnest_table(table, node)
-        return NodeResult({"rows": QueryResult.from_table(result)}, NodeMetrics(
-            input_rows=table.num_rows, output_rows=result.num_rows))
+            raise ValueError("ResultFilter needs one input")
+        name = column_name(node.condition.column)
+        num_rows, batches = 0, []
+        for batch in row_batches(next(iter(inputs.values()))):
+            num_rows += batch.num_rows
+            # the condition reads its column by the bare column name
+            tested = pa.RecordBatch.from_arrays(
+                [batch.column(name)], names=[node.condition.column.column])
+            batches.append(batch.filter(node.condition.accepts(tested))
+                           .select(list(node.columns)))
+        table = pa.Table.from_batches(batches)
+        return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
+            input_rows=num_rows, output_rows=table.num_rows))
 
 
-def unnest_table(table: pa.Table, node) -> pa.Table:
-    """Flatten the node's list column and keep the elements its tests accept.
+def row_batches(value) -> Iterator[pa.RecordBatch]:
+    """Yield a node's rows input one record batch at a time.
 
-    The other columns are repeated with one take over the parent row of
-    each element.
+    An empty input yields one empty batch, which carries the schema.
     """
-    lists = table.column(node.column).combine_chunks()
-    pairs = pc.list_flatten(lists)
-    parents = pc.list_parent_indices(lists)
-    fields = pa.table({field: pairs.field(field) for field in UNNEST_FIELDS})
-    if node.tests:
-        keep = node.tests[0].accepts(fields)
-        for test in node.tests[1:]:
-            keep = pc.and_(keep, test.accepts(fields))
-        fields, parents = fields.filter(keep), parents.filter(keep)
-    repeated = table.drop_columns([node.column]).take(parents)
-    columns = {name: repeated.column(name) for name in repeated.column_names}
-    for field in UNNEST_FIELDS:
-        columns[f"{node.column}.{field}"] = fields.column(field)
-    return pa.table({name: columns[name] for name in node.columns})
+    value = as_table(value)
+    if isinstance(value, QueryResult):
+        reader = value.execute_stream()
+        schema = reader.schema
+        batches = iter(reader)
+    elif isinstance(value, pa.RecordBatch):
+        schema, batches, reader = value.schema, iter([value]), None
+    elif isinstance(value, pa.Table):
+        schema, batches, reader = value.schema, iter(value.to_batches()), None
+    else:
+        raise TypeError(f"expected rows, got {type(value).__name__}")
+    try:
+        empty = True
+        for batch in batches:
+            empty = False
+            yield batch
+        if empty:
+            yield pa.RecordBatch.from_pylist([], schema=schema)
+    finally:
+        if reader is not None:
+            reader.close()
 
 
 class LimitRuntime:

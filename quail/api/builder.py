@@ -47,8 +47,8 @@ class BoundBuilder:
         self._inner.ai_sae_features(p, pooling=pooling, name=name)
         return self
 
-    def unnest(self, name):
-        self._inner.unnest(name)
+    def unnest(self, *names):
+        self._inner.unnest(*names)
         return self
 
     def label_in(self, name, labels, selectivity=None):

@@ -19,6 +19,7 @@ from quail.frontend.expressions import (
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
+from quail.frontend.sql_binding.unnest import list_fields
 from quail.logical import (
     AggregateCall,
     Aggregation,
@@ -35,12 +36,10 @@ from quail.logical import (
     ModelCall,
     RegularPredicate,
     SortKey,
-    Unnest,
     WindowCall,
 )
 from quail.logical.expressions import (
     SPAN_SUFFIX,
-    UNNEST_FIELDS,
     aliased_call,
     column_expression,
     column_name,
@@ -71,8 +70,8 @@ class Query:
         # name -> an AI.EXTRACT's ExtractStruct and its fields' Aliases
         self._extracts = {}
         self._features = {}          # name -> Alias of an AI.SAE_FEATURES call
-        self._unnest = None          # the unnested feature list's name
-        self._unnest_tests = []      # RegularPredicate on its fields
+        self._unnests = []           # the list names of each unnest()
+        self._unnest_tests = []      # RegularPredicate on their fields
         self._regular_predicates = {}  # alias -> [RegularPredicate]
         # alias -> [(RegularPredicate on an answer or span, selectivity)]
         self._extract_filters = {}
@@ -214,38 +213,46 @@ class Query:
         self._features[name] = Alias(call, name)
         return self
 
-    def unnest(self, name: str) -> "Query":
-        """Return one row per element of an ai_sae_features() column.
+    def unnest(self, *names: str) -> "Query":
+        """Return one row per element of ai_sae_features() columns.
 
-        The column ``name`` becomes ``name.feature`` and
+        Each column ``name`` becomes ``name.feature`` and
         ``name.strength``, which select(), where(), group_by(), agg(),
         and order_by() read like other columns; the other selected
-        columns repeat for each element.
+        columns repeat for each element. The lists of one call are
+        zipped: a row returns as many rows as its longest list, with
+        nulls past the end of a shorter one. A second call unnests
+        each row of the first, so two calls return the product.
         """
-        if name not in self._features:
-            raise CompileError(
-                f"unnest() names an ai_sae_features() column, got {name!r}")
-        if self._unnest is not None:
-            raise CompileError("a query unnests at most one column")
-        self._unnest = name
+        if not names:
+            raise CompileError("unnest() names at least one column")
+        unnested = {name for lists in self._unnests for name in lists}
+        for name in names:
+            if name not in self._features:
+                raise CompileError(
+                    f"unnest() names an ai_sae_features() column, got {name!r}")
+            if name in unnested or names.count(name) > 1:
+                raise CompileError(f"unnest() reads {name!r} twice")
+        self._unnests.append(tuple(names))
         return self
 
     def _unnest_field(self, c) -> Optional[str]:
-        """Return the name of the unnested field ``c`` reads, or None.
+        """Return the name of the unnested field column ``c`` reads, or None.
 
         Raises:
-            CompileError: ``c`` reads the unnested column but names no
-                field.
+            CompileError: ``c`` reads an unnested column but names no
+                field of it.
         """
         spec = col(c) if isinstance(c, str) else c
-        if (self._unnest is None or not isinstance(spec, ColSpec)
-                or spec.alias != self._unnest):
+        if not isinstance(spec, ColSpec) or not any(
+                spec.alias in lists for lists in self._unnests):
             return None
-        if spec.column not in UNNEST_FIELDS or spec.path or spec.function:
+        fields = list_fields()
+        if spec.column not in fields or spec.path or spec.function:
             raise CompileError(
-                f"unnest {self._unnest!r} has the fields "
-                f"{self._unnest}.feature and {self._unnest}.strength, got "
-                f"{spec.alias}.{spec.column}")
+                f"the unnested column {spec.alias!r} has the fields "
+                f"{', '.join(f'{spec.alias}.{field}' for field in fields)}, "
+                f"got {spec.alias}.{spec.column}")
         return f"{spec.alias}.{spec.column}"
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
@@ -854,36 +861,36 @@ class Query:
                     "supported")
             columns, aggregation = self._aggregation(cols)
         windows, output = self._windowing(columns, cols)
-        # (position among columns, name) of each selected unnested field
-        fields = []
+        selected = []                # the result column names, in order
         for c in () if aggregation is not None or windows else cols:
             unnested = self._unnest_field(c)
             if unnested is not None:
-                fields.append((len(columns), unnested))
+                selected.append(unnested)
                 continue
             if isinstance(c, str) and c in self._labels:
                 columns.append(self._labels[c])
-                continue
-            if isinstance(c, str) and c in self._scores:
+            elif isinstance(c, str) and c in self._scores:
                 columns.append(self._scores[c])
-                continue
-            if isinstance(c, str) and c in self._features:
+            elif isinstance(c, str) and c in self._features:
                 columns.append(self._features[c])
-                continue
-            if isinstance(c, str) and c in self._extracts:
+            elif isinstance(c, str) and c in self._extracts:
                 struct, members = self._extracts[c]
                 structs.append(struct)
                 columns.extend(members)
+                selected.append(struct.name)
                 continue
-            if isinstance(c, str) and c == "*":
+            elif isinstance(c, str) and c == "*":
                 for alias, provider in self._tables:
                     for name in self._catalog.get(provider).columns:
                         columns.append(ColumnRef(alias=alias,
                                                  provider=provider,
                                                  column=name))
+                        selected.append(column_name(columns[-1]))
                 continue
-            columns.append(self._resolve_value(col(c) if isinstance(c, str) else c,
-                                               named=True))
+            else:
+                columns.append(self._resolve_value(
+                    col(c) if isinstance(c, str) else c, named=True))
+            selected.append(column_name(columns[-1]))
         # a classification is planned when the query returns or tests
         # its label
         tested = {name for tests in self._label_filters.values()
@@ -893,16 +900,11 @@ class Query:
         # an extraction is planned when the query returns its answer
         extracted = [column for column in columns
                      if aliased_call(column, "extract") is not None]
-        unnest = None
-        if self._unnest is not None:
-            result = [column_name(column) for column in columns]
-            for position, name in reversed(fields):
-                result.insert(position, name)
-            listed = self._features[self._unnest]
-            if listed not in columns:
-                columns.append(listed)
-            unnest = Unnest(self._unnest, tuple(self._unnest_tests),
-                            () if aggregation is not None else tuple(result))
+        for lists in self._unnests:
+            columns.extend(self._features[name] for name in lists
+                           if self._features[name] not in columns)
+        if self._unnests and aggregation is None and not windows:
+            output = tuple(selected)
         # a feature call is planned when the query returns its list
         featured = [column for column in columns
                     if aliased_call(column, "features") is not None]
@@ -953,7 +955,9 @@ class Query:
         return logical.project(tuple(columns), self._limit, order=tuple(order),
                                offset=self._offset, distinct=self._distinct,
                                aggregation=aggregation, structs=tuple(structs),
-                               windows=windows, output=output, unnest=unnest)
+                               windows=windows, output=output,
+                               unnests=tuple(self._unnests),
+                               unnest_tests=tuple(self._unnest_tests))
 
     def _project(self, columns: list, c) -> str:
         """Add the column or named output ``c`` to ``columns``; return its name."""

@@ -24,7 +24,6 @@ from quail.logical.expressions import (
     RegularPredicate,
     ScalarFunction,
     SortKey,
-    Unnest,
     WindowCall,
     column_name,
     effective_selectivity,
@@ -34,6 +33,7 @@ from quail.logical.expressions import (
     packed_columns,
 )
 from quail.logical.nodes import (
+    FEATURE_LIST,
     Aggregate,
     Apply,
     Filter,
@@ -47,7 +47,9 @@ from quail.logical.nodes import (
     SemanticFilter,
     SemanticJoin,
     SemanticSaeFeatures,
+    Unnest,
     Window,
+    above_unnest,
     classified_above_joins,
     extracted_above_joins,
 )
@@ -90,6 +92,7 @@ __all__ = [
     "COLUMN_COMPARISONS",
     "DEFAULT_SELECTIVITY",
     "Equality",
+    "FEATURE_LIST",
     "GetField",
     "ExtractStruct",
     "Filter",
@@ -121,6 +124,7 @@ __all__ = [
     "SemanticSaeFeatures",
     "SortKey",
     "WindowCall",
+    "above_unnest",
     "bind_classify_prompt",
     "bind_join_prompt",
     "bind_prompt",

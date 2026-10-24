@@ -25,6 +25,7 @@ from quail.physical import (
     PortRef,
     Project,
     Recombine,
+    ResultFilter,
     Scan,
     Sort,
     Unnest,
@@ -83,6 +84,9 @@ def logical_tree(logical):
             if node.distinct:
                 lines.append(f"{'  ' * depth}Distinct")
                 depth += 1
+            if node.output:
+                lines.append(f"{'  ' * depth}Output: {', '.join(node.output)}")
+                depth += 1
             visit(node.input, depth)
             return
         if isinstance(node, logical_nodes.Aggregate):
@@ -94,10 +98,8 @@ def logical_tree(logical):
             title = f"Project: {', '.join(fields['columns'])}"
             details = [f"{name} = struct({', '.join(members)})"
                        for name, members in fields.get("structs", {}).items()]
-            if "unnest" in fields:
-                column, *tests = fields["unnest"]
-                details.append(f"unnest {column}" + (
-                    " where " + " and ".join(tests) if tests else ""))
+        elif isinstance(node, logical_nodes.Unnest):
+            title = f"Unnest: {', '.join(node.columns)}"
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
             columns = ", ".join(dict.fromkeys(
@@ -114,8 +116,9 @@ def logical_tree(logical):
             if node.stop_key:
                 title += " stop_key=" + ",".join(node.stop_key)
         elif isinstance(node, logical_nodes.Filter):
-            title = (f"Filter: {node.explain_fields()['condition']} "
-                     f"(selectivity={_selectivity(node.selectivity)})")
+            title = f"Filter: {node.explain_fields()['condition']}"
+            if not logical_nodes.above_unnest(node.input):
+                title += f" (selectivity={_selectivity(node.selectivity)})"
         elif isinstance(node, logical_nodes.SemanticJoin):
             title = f"SemanticJoin ({node.semantics})"
             details = [f"{_prompt(node.prompt)} "
@@ -390,11 +393,10 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title += ": " + ", ".join(node.columns)
             details.extend(str(call) for call in node.calls)
         elif isinstance(node, Unnest):
-            title += ": " + ", ".join(node.columns)
-            details.append(f"unnest {node.column}")
-            if node.tests:
-                details.append("where " + " and ".join(
-                    str(test) for test in node.tests))
+            title += ": " + ", ".join(node.lists)
+            details.append("returns " + ", ".join(node.columns))
+        elif isinstance(node, ResultFilter):
+            title += f": {node.condition}"
         elif isinstance(node, Sort):
             title += ": " + ", ".join(
                 f"{column} {'DESC' if descending else 'ASC'} "

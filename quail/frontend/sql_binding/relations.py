@@ -242,7 +242,7 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
     selected = ai_aliases(tree)
     for term in _conjuncts(where.this) if where else []:
         term, hint = unwrap_hint(b, term)
-        tested = bind_unnest_test(b, term, b.unnest_alias)
+        tested = bind_unnest_test(b, term)
         if tested is not None:
             if hint is not None:
                 raise CompileError(

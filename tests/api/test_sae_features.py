@@ -260,10 +260,71 @@ def test_unnest_groups_rows_by_feature(session):
     assert sorted(row["f.feature"] for row in rows.to_pylist()) == [0, 1, 2, 100]
 
 
-def test_unnest_needs_one_feature_call_and_its_two_fields(session):
+def _two_lists_oracle():
+    # document d's list f has features d and 100; its list g has feature d
+    return Oracle(features=lambda spec, document: [
+        {"feature": document, "strength": float(document + 1)},
+        {"feature": 100, "strength": 0.5}][:2 if spec.name == "f" else 1])
+
+
+def _two_calls(session):
+    return (session.docs("reviews").alias("r")
+            .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
+                             pooling="last", name="f")
+            .ai_sae_features(quail.prompt("{0}\n\nWho wrote it?",
+                                          quail.col("r.body")),
+                             pooling="max", name="g"))
+
+
+TWO_CALLS = ("AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this review about?', "
+             "r.body), pooling => 'last'), AI.SAE_FEATURES(PROMPT('{0}\\n\\n"
+             "Who wrote it?', r.body), pooling => 'max')")
+
+
+def test_two_lists_in_one_unnest_zip_and_pad_the_shorter_with_nulls(session):
+    sql = session.sql(
+        f"SELECT r.id, f.feature, g.feature FROM reviews r, "
+        f"UNNEST({TWO_CALLS}) AS u(f, g) WHERE r.id = 9")
+    built = (_two_calls(session).where(quail.col("r.id") == 9).unnest("f", "g")
+             .select("r.id", "f.feature", "g.feature"))
+    for query in (sql, built):
+        rows = finish(query, _two_lists_oracle()).collect()
+        assert rows.to_pylist() == [
+            {"r.id": 9, "f.feature": 1, "g.feature": 1},
+            {"r.id": 9, "f.feature": 100, "g.feature": None}]
+
+
+def test_two_unnests_return_the_product_and_filter_above_their_own_list(session):
+    sql = session.sql(
+        f"SELECT r.id, f.feature, g.feature FROM reviews r, "
+        f"{UNNEST}, {UNNEST.replace('this review about', 'its author')[:-4]} AS g "
+        f"WHERE f.strength > 1 ORDER BY r.id, f.feature, g.feature")
+    built = (session.docs("reviews").alias("r")
+             .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
+                              pooling="last", name="f")
+             .ai_sae_features(quail.prompt("{0}\n\nWhat is its author about?",
+                                           quail.col("r.body")),
+                              pooling="last", name="g")
+             .unnest("f").unnest("g").where(quail.col("f.strength") > 1)
+             .order_by("r.id", "f.feature", "g.feature")
+             .select("r.id", "f.feature", "g.feature"))
+    for query in (sql, built):
+        nodes = [type(node).__name__ for node in query.plan().nodes]
+        start = nodes.index("Project")
+        assert nodes[start:start + 4] == ["Project", "Unnest", "ResultFilter",
+                                          "Unnest"]
+        rows = finish(query, _unnest_oracle()).collect()
+        assert rows.to_pylist() == [
+            {"r.id": 9, "f.feature": 1, "g.feature": 1},
+            {"r.id": 9, "f.feature": 1, "g.feature": 100},
+            {"r.id": 11, "f.feature": 2, "g.feature": 2},
+            {"r.id": 11, "f.feature": 2, "g.feature": 100}]
+
+
+def test_unnest_needs_named_feature_lists_and_their_fields(session):
     bad = {
-        "two unnests": f"SELECT f.feature FROM reviews r, {UNNEST}, "
-                       f"{UNNEST.replace(' AS f', ' AS g')}",
+        "unnamed lists": f"SELECT r.id FROM reviews r, UNNEST({TWO_CALLS}) AS u",
+        "a list named twice": f"SELECT r.id FROM reviews r, {UNNEST}, {UNNEST}",
         "no feature call": "SELECT f.feature FROM reviews r, UNNEST(r.body) AS f",
         "unknown field": f"SELECT f.weight FROM reviews r, {UNNEST}",
         "mixed test": f"SELECT f.feature FROM reviews r, {UNNEST} "

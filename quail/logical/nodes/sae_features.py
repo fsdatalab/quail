@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
+import pyarrow as pa
+
 from quail.logical.expressions import (
     ColumnRef,
     CompileError,
@@ -12,14 +14,17 @@ from quail.logical.expressions import (
 )
 from quail.logical.nodes.base import LogicalNode, _subtree
 
+# the Arrow type of one feature list
+FEATURE_LIST = pa.list_(
+    pa.struct([("feature", pa.int32()), ("strength", pa.float32())]))
+
 
 @dataclass(frozen=True)
 class SemanticSaeFeatures:
     """One AI.SAE_FEATURES call over its input rows, adding the list column.
 
     Every input row passes through with its sparse autoencoder (SAE)
-    features in the column named ``name``, a
-    ``list<struct<feature: int32, strength: float32>>`` holding the
+    features in the column named ``name``, a FEATURE_LIST holding the
     nonzero features. The call reads one table and generates no text.
     The root Project returns the column through an Alias of the same
     call.

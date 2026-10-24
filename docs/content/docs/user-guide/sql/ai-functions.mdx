@@ -480,8 +480,15 @@ GROUP BY f.feature
 ORDER BY requests DESC;
 ```
 
-A query has at most one `UNNEST`. A `WHERE` test of a feature field
-compares the field with literals.
+To read two lists, use one of these forms:
+
+- `UNNEST(a, b) AS u(f, g)` puts the lists side by side. Row `i` has
+  element `i` of each list. If one list is shorter, its fields are null
+  in the rows after its end.
+- `UNNEST(a) AS f, UNNEST(b) AS g` gives each pair of elements, one from
+  each list.
+
+A `WHERE` test of a feature field compares the field with literals.
 
 ### Limits
 

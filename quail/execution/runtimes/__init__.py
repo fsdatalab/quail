@@ -13,11 +13,12 @@ from quail.execution.runtimes.relational import (
     AggregateRuntime,
     LimitRuntime,
     ProjectRuntime,
+    ResultFilterRuntime,
     ScanRuntime,
     SortRuntime,
-    UnnestRuntime,
     WindowRuntime,
 )
+from quail.execution.runtimes.unnest import UnnestRuntime
 from quail.physical import (
     Aggregate,
     Barrier,
@@ -27,6 +28,7 @@ from quail.physical import (
     Limit,
     Project,
     Recombine,
+    ResultFilter,
     Scan,
     Sort,
     Unnest,
@@ -44,6 +46,7 @@ __all__ = [
     "ModelNodeRuntime",
     "ProjectRuntime",
     "RecombineRuntime",
+    "ResultFilterRuntime",
     "ScanRuntime",
     "SortRuntime",
     "WindowRuntime",
@@ -66,4 +69,5 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
         Window.runtime_key: WindowRuntime(),
         Limit.runtime_key: LimitRuntime(),
         Unnest.runtime_key: UnnestRuntime(),
+        ResultFilter.runtime_key: ResultFilterRuntime(),
     }
