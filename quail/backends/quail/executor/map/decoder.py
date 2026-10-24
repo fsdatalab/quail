@@ -339,11 +339,24 @@ class MapDecoder:
 
     def _cache(self, state: AnswerState, index: np.ndarray) -> None:
         """Insert the documents' newly written tokens into the n-gram cache."""
-        for document in index[state.num_written[index] > state.cached[index]]:
-            count = int(state.num_written[document])
-            self.cache.add(state.written[document, :count].tolist(), int(document),
-                           start=int(state.cached[document]))
-            state.cached[document] = count
+        written = state.num_written[index]
+        first = np.maximum(state.cached[index], MATCH_ORDERS[-1])
+        count = np.maximum(written - first, 0)
+        if not count.any():
+            return
+        # every (document, position) pair written since the last insert
+        document = np.repeat(index, count)
+        at = np.repeat(first, count) + (np.arange(int(count.sum()))
+                                        - np.repeat(np.cumsum(count) - count, count))
+        tokens = state.written[document, at]
+        for order in MATCH_ORDERS:
+            keyed = at >= order
+            if not keyed.any():
+                continue
+            columns = at[keyed, None] - order + np.arange(order)[None, :]
+            self.cache.add_many(order, state.written[document[keyed, None], columns],
+                                tokens[keyed], document[keyed])
+        state.cached[index] = written
 
     def _draft(self, q: int, index: np.ndarray, slack: float) -> None:
         """Set the next round's fed tokens: the chosen token, then a draft.
@@ -385,42 +398,67 @@ class MapDecoder:
             state.cells[index[:, None], hop[None, :]] = np.where(taking, COPY_CELL,
                                                                  NO_CELL)
         if policy is not None:
-            for position in np.flatnonzero(~copying & (room > 0)):
-                length[position] = self._chain(
-                    state, int(index[position]), policy, int(room[position]),
-                    float(rho[position]), slack)
+            chaining = np.flatnonzero(~copying & (room > 0))
+            if len(chaining):
+                length[chaining] = self._chain(
+                    state, index[chaining], policy, room[chaining], rho[chaining],
+                    slack)
         state.fed_len[index] = 1 + length
 
-    def _chain(self, state: AnswerState, document: int, policy: MapDraftPolicy,
-               room: int, rho: float, slack: float) -> int:
-        """Fill one document's draft from the cache; return its length.
+    def _chain(self, state: AnswerState, index: np.ndarray,
+               policy: MapDraftPolicy, room: np.ndarray, rho: np.ndarray,
+               slack: float) -> np.ndarray:
+        """Fill the documents' drafts from the cache; return their lengths.
 
-        The chain stops once the hops' combined odds fall below the
-        cutoff: tokens past that point add under 0.02 expected writes,
-        so the policy would not keep them, and each hop costs a cache
-        lookup.
+        Each hop looks up every still-chaining document at once. A
+        chain stops at a miss, at its room, or once its hops' combined
+        odds fall below the cutoff: tokens past that point add under
+        0.02 expected writes, so the policy would not keep them.
         """
-        count = int(state.num_written[document])
-        context = state.written[document, max(0, count - max(MATCH_ORDERS)):count
-                                ].tolist()
-        tokens, cells, rates = [], [], []
-        combined = 1.0
-        for _ in range(room):
-            match = self.cache.lookup(context, document)
-            if match is None:
+        width = max(MATCH_ORDERS)
+        count = state.num_written[index]
+        # each answer's last tokens, most recent last, left-padded
+        columns = count[:, None] - width + np.arange(width)[None, :]
+        context = np.where(columns >= 0,
+                           state.written[index[:, None], np.maximum(columns, 0)],
+                           -1)
+        lengths = np.minimum(count, width)
+        cap = self.spec.draft_tokens
+        tokens = np.zeros((len(index), cap), dtype=np.int64)
+        cells = np.full((len(index), cap), NO_CELL, dtype=np.int64)
+        rates = np.zeros((len(index), cap), dtype=np.float64)
+        combined = np.ones(len(index))
+        hops = np.zeros(len(index), dtype=np.int64)
+        active = np.arange(len(index))
+        for hop in range(int(room.max())):
+            active = active[hops[active] < room[active]]
+            if not len(active):
                 break
-            cell, rate = policy.odds(match)
-            combined *= rate
-            if combined < CHAIN_CUTOFF:
-                break
-            tokens.append(match.token)
-            cells.append(cell)
-            rates.append(rate)
-            context.append(match.token)
-        length = policy.chain_length(rho, count, rates, slack)
-        if length:
-            state.fed[document, 1:1 + length] = tokens[:length]
-            state.cells[document, :length] = cells[:length]
+            found = self.cache.lookup_many(context[active], lengths[active],
+                                           index[active])
+            hit = active[found.found]
+            cell, rate = policy.odds_many(found.order[found.found],
+                                          found.fan_out[found.found],
+                                          found.own[found.found],
+                                          found.share[found.found])
+            combined[hit] *= rate
+            kept = hit[combined[hit] >= CHAIN_CUTOFF]
+            token = found.token[found.found][combined[hit] >= CHAIN_CUTOFF]
+            tokens[kept, hop] = token
+            cells[kept, hop] = cell[combined[hit] >= CHAIN_CUTOFF]
+            rates[kept, hop] = rate[combined[hit] >= CHAIN_CUTOFF]
+            hops[kept] += 1
+            context[kept, :-1] = context[kept, 1:]
+            context[kept, -1] = token
+            lengths[kept] = np.minimum(lengths[kept] + 1, width)
+            active = kept
+        length = policy.chain_lengths(rho, count, rates, slack,
+                                      np.minimum(room, hops))
+        taking = np.arange(cap)[None, :] < length[:, None]
+        state.fed[index[:, None], 1 + np.arange(cap)[None, :]] = np.where(
+            taking, tokens, state.fed[index[:, None], 1 + np.arange(cap)[None, :]])
+        state.cells[index[:, None], np.arange(cap)[None, :]] = np.where(
+            taking, cells, NO_CELL)
         return length
 
     def settle(self, document: MapDocument, q: int) -> None:

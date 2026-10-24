@@ -215,7 +215,7 @@ def test_a_sibling_answer_seeds_the_cache_draft(monkeypatch):
     stages.finish()
     answers = [document.answers[0] for document in stages.documents]
     assert [answer.answer for answer in answers] == [gold, gold]
-    assert stages.decoder.cache.entries
+    assert len(stages.decoder.cache)
     # the cache drafts were verified, so the policy recorded trials
     assert stages.decoder.policies[0].trials.sum() > 0
 

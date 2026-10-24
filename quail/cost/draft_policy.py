@@ -195,6 +195,11 @@ _CELLS = {
     for index, order in enumerate(MATCH_ORDERS)
     for fan_out in range(0, MAX_CONTINUATIONS + 1)
     for own in (False, True)}
+# the same table indexed by (order, fan-out, own) arrays
+_CELL_TABLE = np.zeros((max(MATCH_ORDERS) + 1, MAX_CONTINUATIONS + 1, 2),
+                       dtype=np.int64)
+for (_order, _fan_out, _own), _cell in _CELLS.items():
+    _CELL_TABLE[_order, _fan_out, int(_own)] = _cell
 
 
 class MapDraftPolicy:
@@ -267,6 +272,14 @@ class MapDraftPolicy:
         """
         return self._best_length(rho, written, self.copy_rate(), slack)
 
+    def odds_many(self, order: np.ndarray, fan_out: np.ndarray, own: np.ndarray,
+                  share: np.ndarray) -> tuple:
+        """Return many cache matches' cells and hit rates at once."""
+        cells = _CELL_TABLE[order, fan_out, own.astype(np.int64)]
+        rates = ((PRIOR_WEIGHT * share + self.accepts[cells])
+                 / (PRIOR_WEIGHT + self.trials[cells]))
+        return cells, rates
+
     def copy_lengths(self, rho: np.ndarray, written: np.ndarray, slack: float,
                      room: np.ndarray) -> np.ndarray:
         """Return copy_length for many rounds at once.
@@ -274,6 +287,21 @@ class MapDraftPolicy:
         Args:
             rho: Each round's KV read, in fed tokens.
             written: Each answer's tokens so far.
+            slack: Fed tokens the current passes carry for free.
+            room: The most tokens each draft may have.
+        """
+        rates = np.full((len(rho), self.cap), self.copy_rate())
+        return self.chain_lengths(rho, written, rates, slack, room)
+
+    def chain_lengths(self, rho: np.ndarray, written: np.ndarray,
+                      rates: np.ndarray, slack: float, room: np.ndarray) -> np.ndarray:
+        """Return chain_length for many rounds at once.
+
+        Args:
+            rho: Each round's KV read, in fed tokens.
+            written: Each answer's tokens so far.
+            rates: (rounds, cap) acceptance odds per hop, in hop order;
+                a hop past the draft's end has odds 0.
             slack: Fed tokens the current passes carry for free.
             room: The most tokens each draft may have.
 
@@ -288,8 +316,8 @@ class MapDraftPolicy:
                                   self.max_answer_tokens)]
         ratio = np.where(base[:, None] > 0, ahead / np.where(base > 0, base, 1.0)
                          [:, None], 1.0)
-        chained = self.copy_rate() ** gamma
-        writes = 1.0 + np.cumsum(chained[None, :] * ratio, axis=1)
+        chained = np.cumprod(rates, axis=1)
+        writes = 1.0 + np.cumsum(chained * ratio, axis=1)
         extra = np.maximum(gamma - slack, 0.0)
         cost = (rho[:, None] + 1.0 + extra[None, :]) / writes
         cost[gamma[None, :] > room[:, None]] = np.inf
