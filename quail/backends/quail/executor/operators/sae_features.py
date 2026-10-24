@@ -123,14 +123,29 @@ class SaeFeaturesPart(SingleResultPart):
 
     def finish(self, every) -> int:
         """Collect settled maxima and return the suffix token count."""
-        if self.accumulator is not None:
-            for anchor, handle in enumerate(self.handles):
-                if handle is not None and self.values[anchor] is None:
-                    self.values[anchor] = (
-                        SaeMaxAccumulator.features_of(handle))
-            self.handles = [None] * len(self.ids)
+        self._harvest(wait=False)
         head, tail = self.node.spec.prompt_token_parts
         return self.reached * len(tail)
+
+    def _harvest(self, *, wait: bool) -> None:
+        """Turn settled handles into feature lists.
+
+        finish() runs while chunks are still in flight, and a handle's
+        copy queues behind them, so waiting there stalls the stream
+        that feeds the GPU: during the run only completed copies are
+        read, and result() waits for the rest once the pipeline is
+        done.
+        """
+        if self.accumulator is None:
+            return
+        for anchor, handle in enumerate(self.handles):
+            if handle is None or self.values[anchor] is not None:
+                continue
+            event, _host = handle
+            if not wait and not event.query():
+                continue
+            self.values[anchor] = SaeMaxAccumulator.features_of(handle)
+            self.handles[anchor] = None
 
     def complete(self, tokens, spans, stats, offset):
         # the part that set the observer releases it once the run ends
@@ -140,6 +155,7 @@ class SaeFeaturesPart(SingleResultPart):
         super().complete(tokens, spans, stats, offset)
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
+        self._harvest(wait=True)
         spec = self.node.spec
         answered = [index for index, value in enumerate(self.values)
                     if value is not None]
