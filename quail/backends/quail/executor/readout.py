@@ -289,15 +289,22 @@ class AsyncTopLogprobs(_HostReadout):
         n = len(self.groups)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
-            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
-            logits -= torch.logsumexp(logits, dim=1, keepdim=True)
+            # the logits stay in the head's dtype: every pass over the
+            # vocabulary reads them once, and the normalizer, reduced
+            # in fp32 and rounded to that dtype, shifts a row's values
+            # alike
+            logits = self.F.linear(block.to(self.head.dtype), self.head)
+            norm = torch.logsumexp(logits, dim=1, keepdim=True).float()
             rows = slice(start, start + block.shape[0])
-            picked = logits.index_select(1, self.extras)
+            picked = logits.index_select(1, self.extras).float() - norm
             for column, group in enumerate(self.groups):
                 out[rows, column] = torch.logsumexp(picked[:, group], dim=1)
-            top, ids = torch.topk(logits, self.k, dim=1)
+            if self.k == 1:
+                top, ids = logits.max(dim=1, keepdim=True)
+            else:
+                top, ids = torch.topk(logits, self.k, dim=1)
             out[rows, n:n + self.k] = ids.float()
-            out[rows, n + self.k:] = top
+            out[rows, n + self.k:] = top.float() - norm
         return out
 
     def submit(self, normed, rows_per_answer=None):

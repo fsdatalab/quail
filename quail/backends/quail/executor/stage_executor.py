@@ -259,6 +259,11 @@ class StageExecutor:
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
+        # host seconds per phase of the loop, and the readouts' GPU
+        # event pairs, for telling host-bound passes from GPU-bound
+        self.host_s = {"admit": 0.0, "launch": 0.0, "report": 0.0,
+                       "submit": 0.0}
+        self.readout_spans = []
         self.outstanding = []     # PendingAnswers in launch order
         self.split_answers = any(s.append and s.own_suffixes for s in stages)
 
@@ -632,7 +637,9 @@ class StageExecutor:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
             e0.record()
+        started = time.perf_counter()
         normed = forward_chunk(self.pipeline, self.arena, chunk)
+        self.host_s["launch"] += time.perf_counter() - started
         if self.gpu_timing:
             e1.record()
             by_stage = {}
@@ -646,10 +653,18 @@ class StageExecutor:
         # started, so their answers are decided while the GPU runs it;
         # a readout of many rows launches enough kernels to fill the
         # launch queue, and a host blocked there could not decide them
+        started = time.perf_counter()
         while self.outstanding:
             self._report_next()
+        reported = time.perf_counter()
+        self.host_s["report"] += reported - started
         handles = self.readouts.submit(
             normed, entries, chunk.rows_per_answer)
+        self.host_s["submit"] += time.perf_counter() - reported
+        if self.gpu_timing:
+            e2 = self.torch.cuda.Event(enable_timing=True)
+            e2.record()
+            self.readout_spans.append((e1, e2))
         self.outstanding.append(PendingAnswers(part, handles))
 
     def run(self):
@@ -666,8 +681,10 @@ class StageExecutor:
                 # the free list is short for the next fresh document:
                 # retained KV nothing here reads makes room
                 self.arena.evict_retained(self.sched.blocked_pages)
+            started = time.perf_counter()
             groups = self.sched.next_chunk(
                 self.arena.free_pages if self.paged else 1 << 62)
+            self.host_s["admit"] += time.perf_counter() - started
             if not groups:
                 if self.outstanding:
                     self._report_next(partial=True)
@@ -701,6 +718,12 @@ class StageExecutor:
         if self.stats is not None:
             self.stats["borrowed_tokens"] = self.borrowing.borrowed_tokens
             self.stats["pack_s"] = self.pack_s
+            self.stats["host_s"] = {
+                key: round(value, 3) for key, value in self.host_s.items()}
         if self.spans:
             self.torch.cuda.synchronize()
+            if self.stats is not None:
+                self.stats["readout_gpu_s"] = round(sum(
+                    e1.elapsed_time(e2) for e1, e2 in self.readout_spans)
+                    / 1000.0, 3)
         return self.sched.answers, self.spans, self.tokens

@@ -225,8 +225,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         prefix_tree: A PrefixTree over anchor_prefixes, or None.
         gpu_timing: Record forward-pass CUDA events and synchronize them once
             at the end of the run. False returns no timing spans.
-        stats: When given, receives borrowed_tokens and pack_s, the
-            host seconds spent building chunks.
+        stats: When given, receives borrowed_tokens, pack_s (the host
+            seconds spent building chunks), host_s (host seconds per
+            loop phase), and, with gpu_timing, readout_gpu_s.
         limit: Stop admitting documents once this many survived the
             last stage; the rest never run.
         survival: The fraction of documents expected to survive every

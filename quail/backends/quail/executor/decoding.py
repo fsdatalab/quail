@@ -345,7 +345,10 @@ class AnswerPart(DocumentAnswerPart):
                         "borrowed_prefix_tokens": (
                             stats.get("borrowed_tokens", 0) if first else 0),
                         "pack_s": (round(stats.get("pack_s", 0.0), 3)
-                                   if first else 0.0)}))
+                                   if first else 0.0),
+                        "host_s": stats.get("host_s") if first else None,
+                        "readout_gpu_s": (stats.get("readout_gpu_s")
+                                          if first else None)}))
         self._results = results
         self.result_value = self._results[self.node.node_id]
 
