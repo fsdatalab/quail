@@ -107,9 +107,12 @@ def test_a_save_costs_the_host_little_while_a_pass_runs():
     for _ in range(20):
         activations = activations @ weight
     started = time.perf_counter()
-    for index, key in enumerate(keys):
-        assert arena.reserve(key, tokens, capacity_tokens=tokens + 64)
-        assert host.restore(key, host._keys[key][0])
+    # a burst of restores past the blocks is a miss, computed instead;
+    # patient, each waits for the block the compute stream has read
+    with host.patient():
+        for index, key in enumerate(keys):
+            assert arena.reserve(key, tokens, capacity_tokens=tokens + 64)
+            assert host.restore(key, host._keys[key][0])
     host_s = time.perf_counter() - started
     torch.cuda.synchronize()
     total_s = time.perf_counter() - started
