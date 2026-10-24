@@ -157,10 +157,6 @@ class ExtractDraftPolicy:
         self.accepts[b] += accepted
 
 
-# a round's own cost when the pass is compute bound, in fed tokens:
-# the KV read rides other rows' compute there, so saving a round saves
-# only its dispatch and readout, not the read rho prices
-BUSY_ROUND_TOKENS = 4.0
 # the seed of the copy acceptance rate: a model that is quoting tends
 # to keep quoting, and the rate is corrected from verified rounds
 COPY_RATE_SEED = 0.8

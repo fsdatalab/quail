@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from quail.backends.quail.executor.vocabulary import Vocabulary
-from quail.cost.draft_policy import BUSY_ROUND_TOKENS, MapDraftPolicy
+from quail.cost.draft_policy import MapDraftPolicy
 from quail.cost.ngram_cache import MATCH_ORDERS, NgramCache
 from quail.physical import MapSpec
 
@@ -30,9 +30,6 @@ COPY_CELL = -1
 NO_CELL = -2
 # the chain stops once the hops' combined odds fall below this
 CHAIN_CUTOFF = 0.02
-# the most hops a chain feeds in a full pass, where a round is priced
-# at its dispatch and a long chain cannot pay for itself
-BUSY_CHAIN_HOPS = 4
 
 
 class AnswerState:
@@ -356,8 +353,10 @@ class MapDecoder:
         document does not continue the answer, chains continuations
         from the n-gram cache. The adaptive policy sizes each draft
         from its acceptance odds, the document's KV read, and the
-        pass's slack; the fixed policy copies up to draft_tokens from
-        the document.
+        pass's slack, and drafts nothing in a full pass: there every
+        fed token costs a token of compute and writes at most one, and
+        a round's host work is off the critical path, so no draft pays.
+        The fixed policy copies up to draft_tokens from the document.
         """
         state = self.states[q]
         cap = self.spec.max_answer_tokens
@@ -365,14 +364,14 @@ class MapDecoder:
         written = state.num_written[index]
         state.fed[index, 0] = state.written[index, np.maximum(written - 1, 0)]
         room = np.minimum(self.spec.draft_tokens, cap - written - 1)
-        at = self._source_positions(index, state)
-        at[room <= 0] = -1
-        # in a full pass the KV read rides other rows' compute, so a
-        # round's own cost is its dispatch, not the read
-        rho = self.rho[index] if slack > 0 else np.full(len(index),
-                                                        BUSY_ROUND_TOKENS)
         policy = None if self.policies is None else self.policies[q]
         length = np.zeros(len(index), dtype=np.int64)
+        if policy is not None and slack <= 0:
+            state.fed_len[index] = 1
+            return
+        at = self._source_positions(index, state)
+        at[room <= 0] = -1
+        rho = self.rho[index]
         copying = at >= 0
         if copying.any():
             length[copying] = (room[copying] if policy is None
@@ -405,8 +404,6 @@ class MapDecoder:
         so the policy would not keep them, and each hop costs a cache
         lookup.
         """
-        if slack <= 0:
-            room = min(room, BUSY_CHAIN_HOPS)
         count = int(state.num_written[document])
         context = state.written[document, max(0, count - max(MATCH_ORDERS)):count
                                 ].tolist()

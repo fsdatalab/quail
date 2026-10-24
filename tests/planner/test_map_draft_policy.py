@@ -51,8 +51,8 @@ def test_hit_rates_blend_the_count_share_with_observed_accepts():
 def test_chained_drafts_shrink_with_the_hit_rate():
     policy = MapDraftPolicy(cap=15, max_answer_tokens=64,
                             expected_answer_tokens=16)
-    sure = policy.chain_length(5.0, 1, [0.95] * 15, slack=0.0)
-    doubtful = policy.chain_length(5.0, 1, [0.3] * 15, slack=0.0)
+    sure = policy.chain_length(5.0, 1, [0.95] * 15, slack=3.0)
+    doubtful = policy.chain_length(5.0, 1, [0.3] * 15, slack=3.0)
     assert doubtful < sure
 
 
@@ -79,12 +79,12 @@ def test_copy_misses_shrink_the_copied_draft():
     assert seeded > 1
 
 
-def test_a_full_pass_prices_a_round_at_its_dispatch():
-    # with the KV read riding other rows' compute, long drafts no
-    # longer pay for themselves at middling odds
+def test_a_round_without_a_price_or_slack_drafts_nothing():
+    # a fed token costs a token and writes at most one, so without a
+    # round price to amortize or free tokens below the ridge, no draft
+    # pays, whatever the odds
     policy = MapDraftPolicy(cap=15, max_answer_tokens=256,
                             expected_answer_tokens=64)
-    busy = policy.chain_length(4.0, 10, [0.5] * 15, slack=0.0)
-    tail = policy.chain_length(17.0, 10, [0.5] * 15, slack=15.0)
-    assert busy <= 2
-    assert tail > busy
+    assert policy.chain_length(0.0, 10, [0.95] * 15, slack=0.0) == 0
+    assert policy.copy_length(0.0, 10, slack=0.0) == 0
+    assert policy.chain_length(17.0, 10, [0.5] * 15, slack=15.0) > 0
