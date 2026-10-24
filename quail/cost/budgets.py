@@ -294,6 +294,56 @@ def arena_tokens(model: ModelSpec, device: DeviceSpec,
 
 # ---- roofline arithmetic
 
+def _projection_shapes(model: ModelSpec):
+    """Return (in_dim, out_dim, layers, precision) of each dense projection.
+
+    `layers` counts the layers that have the projection: the attention
+    projections sit in the layers that store KV, the Gated DeltaNet
+    projections in its layers, and the MLP in every layer.
+    """
+    query_width = 2 if model.attn_output_gate else 1
+    qkv_out = (query_width * model.num_q_heads + 2 * model.num_kv_heads) * model.d_head
+    inter = model.intermediate
+    attention = len(model.attention_layers)
+    shapes = [(model.hidden, qkv_out, attention, model.weight_precision),
+              (model.num_q_heads * model.d_head, model.hidden, attention,
+               model.weight_precision),
+              (model.hidden, model.ffn_width, model.layers, model.weight_precision),
+              (inter, model.hidden, model.layers, model.weight_precision)]
+    if model.gdn_layers:
+        key_width = model.gdn_key_heads * model.gdn_key_dim
+        value_width = model.gdn_value_heads * model.gdn_value_dim
+        gdn = len(model.gdn_layers)
+        precision = model.gdn_weight_precision or model.weight_precision
+        shapes += [(model.hidden,
+                    2 * key_width + 2 * value_width + 2 * model.gdn_value_heads,
+                    gdn, precision),
+                   (value_width, model.hidden, gdn, precision)]
+    if model.short_conv_layers:
+        short = len(model.short_conv_layers)
+        shapes += [(model.hidden, 3 * model.hidden, short, model.weight_precision),
+                   (model.hidden, model.hidden, short, model.weight_precision)]
+    return tuple(shapes)
+
+
+def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
+    """Chunk size (tokens) where the dense projections become compute-bound.
+
+    That is where they cross the roofline ridge.
+    """
+    compute_seconds = weight_bytes = activation_bytes = 0.0
+    for din, dout, layers, precision in _projection_shapes(model):
+        share = layers / model.layers
+        params = share * din * dout
+        compute_seconds += 2 * params / device.gemm_flops(precision)
+        weight_bytes += params * {"fp8": 1, "bf16": 2, "fp32": 4}[precision]
+        activation_bytes += share * (din + dout) * ACT_BYTES
+    denom = compute_seconds * device.hbm_bw - activation_bytes
+    if denom <= 0:
+        raise ValueError("projections never cross the ridge")
+    return weight_bytes / denom
+
+
 def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
     """Ideal seconds for the attention kernels in one chunk, all layers."""

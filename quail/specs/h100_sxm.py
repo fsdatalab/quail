@@ -14,6 +14,10 @@ H100_SXM = DeviceSpec(
     price_source="https://modal.com/pricing",
     cuda_name="H100 80GB HBM3",
     modal_gpu="H100!",
+    # Validated mamf-finder runs on quail-results, under
+    # /results/calibrate/h100-sxm/gemm/. FP8 keeps the earlier higher rate.
+    mamf_fp8_flops=1.629e15,  # 20261013T221653Z/published_fp8.txt
+    mamf_bf16_flops=857e12,   # 20261021T003022688120Z-g0/bf16.txt
 )
 
 H100_USD_PER_HOUR = H100_SXM.usd_per_hour

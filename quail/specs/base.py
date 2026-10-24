@@ -339,6 +339,13 @@ class DeviceSpec:
     price_source: str = ""       # where usd_per_hour was read from
     cuda_name: str = ""          # substring of torch.cuda.get_device_name
     modal_gpu: str = ""          # Modal gpu= string, such as "H100!"
+    mamf_fp8_flops: float = 0.0    # 0 uses the specification rate
+    mamf_bf16_flops: float = 0.0
+
+    def gemm_flops(self, precision: Precision) -> float:
+        """Return measured GEMM throughput, or the specification rate."""
+        measured = {"fp8": self.mamf_fp8_flops, "bf16": self.mamf_bf16_flops}
+        return measured.get(precision, 0.0) or self.arithmetic_bandwidth(precision)
 
     def __post_init__(self):
         for precision in get_args(Precision):

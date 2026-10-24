@@ -46,16 +46,13 @@ class OperatorOrder:
 def choose_operator_order(plan, operators, model, device, document_tokens, order,
                 pair_fractions, context, scan_fractions):
     """Choose operator order and estimate work without constructing graph nodes."""
-    scans, filters, joins = operators.scans, operators.filters, operators.joins
+    joins = operators.joins
     statistics = cached_statistics(
         plan, {} if context is None else context.memo, model=model,
         device=device, document_tokens=document_tokens, pair_fractions=pair_fractions,
         scan_fractions=scan_fractions, context=context)
     stats, chunk, pre = statistics.stats, statistics.chunk, statistics.pre
     specs = statistics.specs
-    asks = statistics.asks
-    ask_filters = {alias: [filters[alias][position] for position in positions]
-                   for alias, positions in asks.items() if positions}
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(operators.all_filters(), joins)
     steps = choose_step_orders(operators, statistics, rule=rule, context=context)
@@ -73,19 +70,8 @@ def choose_operator_order(plan, operators, model, device, document_tokens, order
         seq, live0, statistics.lengths, filtered_before_joins(plan), pre,
         model, device)
     anchors = {spec.written_position: anchor for spec, anchor in seq}
-    for s in scans:
-        fq = max((question_tokens(context.lowered(p.prompt), model.canvas_tokens)
-                  for p in ask_filters.get(s.alias, ())), default=None)
-        if fq is None:
-            continue
-        need = pre + stats[s.alias].max_document_tokens + fq
-        if need > chunk:
-            return Refusal(
-                reasons=(f"a document in {s.alias!r} needs {need} tokens "
-                         f"with its prompt, but the forward pass budget "
-                         f"is {chunk} tokens",),
-                constraint="suffix_over_chunk",
-                needed=need, available=chunk, unit="tokens")
+    # a document too long for one forward pass with its question is
+    # skipped at execution, so only a join pair is refused here
     for spec in specs:
         if spec.cost is not None:
             continue

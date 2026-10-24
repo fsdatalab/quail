@@ -22,4 +22,8 @@ RTX_PRO_6000_BLACKWELL_SERVER = DeviceSpec(
     price_source="https://modal.com/pricing",
     cuda_name="RTX PRO 6000 Blackwell",
     modal_gpu="RTX-PRO-6000",
+    # quail-results: /results/calibrate/rtx-pro-6000-blackwell-server/gemm/
+    # 20261021T003022688120Z-g0/{fp8,bf16}.txt
+    mamf_fp8_flops=860e12,
+    mamf_bf16_flops=450e12,
 )

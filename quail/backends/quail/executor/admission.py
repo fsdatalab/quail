@@ -311,6 +311,7 @@ class JoinAdmission:
         self._next = []            # next partner index at the stage
         self._true = []
         self._settled = []         # events for anchors that never ran
+        self.oversized = []        # anchors too long for a chunk or the arena
         self.in_flight = 0         # launched groups not yet reported
         self.blocked_pages = 0
         self.reserve = reserve
@@ -440,12 +441,21 @@ class JoinAdmission:
                 cums.append(cum)
         self._lazy.append(lazy)
         need = self.page_cost(prefix + self._extra)
+        oversized = False
         if resident_pages is not None:
             need = max(0, need - resident_pages)
         elif need > self.arena_pages:
-            raise ValueError(
-                f"anchor {a} needs {need} KV pages; the arena "
-                f"holds {self.arena_pages}")
+            oversized = True
+        cum = self._cum[0] if lists[0] is None else cums[0]
+        if not oversized and resident_pages is None and len(cum) > 1:
+            first = self.frame_rows[0] + int(cum[1] - cum[0])
+            oversized = prefix + first > self.chunk_budget
+        if oversized:
+            # a document that cannot fit one chunk or the arena is
+            # skipped: it settles unanswered, like one with nothing to ask
+            self.oversized.append(a)
+            need = 0
+            lists[0], cums[0] = self._partner_list(a, 0, [])
         carried = 0 if resident_pages is not None else prefix
         self.prefix.append(prefix)
         self._lists.append(lists)
@@ -464,11 +474,6 @@ class JoinAdmission:
             self.borrowing.skip(a)
             return a
         first = self.frame_rows[0] + self._suffix(a, 0, 0)
-        if resident_pages is None and prefix + first > self.chunk_budget:
-            raise ValueError(
-                f"anchor {a}: prefix {prefix} tokens leaves no "
-                f"room for a partner in a {self.chunk_budget}-token "
-                f"chunk")
         if self.temporary_suffix_pages:
             # a lazy anchor's later stages are bounded by the stage's
             # largest suffix

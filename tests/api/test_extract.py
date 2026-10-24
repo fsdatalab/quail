@@ -79,6 +79,28 @@ def test_extract_prefix_sharing_is_planned_from_exact_document_tokens():
         assert node.spec.share_prefixes
 
 
+
+def test_offsets_are_computed_up_front_only_for_a_scan_of_every_row(
+        session, monkeypatch):
+    requested = []
+    for name in ("tokenize", "tokenize_async"):
+        original = getattr(session.inputs, name)
+
+        def record(*args, original=original, **kwargs):
+            requested.append(kwargs.get("with_offsets", False))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(session.inputs, name, record)
+    head = (f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+            f"FROM contracts c")
+    for where, expected in (("", True), (" WHERE c.id > 1", False)):
+        requested.clear()
+        query = session.sql(head + where, dialect="bq")
+        query.plan()
+        query.wait_for_tokens()
+        # a WHERE leaves the offsets to the extraction, for the rows it keeps
+        assert requested and set(requested) == {expected}
+
 def test_sql_and_builder_extract_the_same_answer_columns(session):
     built = _ends(session)
     for dialect in ('snowflake', 'bq'):
@@ -290,10 +312,9 @@ def test_extract_errors_and_refusals(session):
 
 
 def test_span_helpers_read_locate_and_widen_an_answer():
-    assert read_phrase('March 3, 2027" and more') == "March 3, 2027"
+    assert read_phrase(' the "Premises" ') == 'the "Premises"'
     assert read_phrase("March 3, 2027") == "March 3, 2027"
-    assert read_phrase(" five years\"") == "five years"
-    for empty in ("", '"', "none", "None.", ' none"'):
+    for empty in ("", " ", "\n"):
         assert read_phrase(empty) is None
     assert locate_span(LEASE, "March 3, 2027") == (14, 27)
     # case and runs of whitespace are forgiven; the first occurrence wins
@@ -348,7 +369,8 @@ class _PhraseClient(request_tests._Client):
             elif "absent" in text:
                 answer, tokens = "a phrase the document lacks", [1, 2, 3]
             else:
-                answer, tokens = "none", [1]
+                # an empty phrase: the model ends its turn at once
+                answer, tokens = "", [1]
             outputs.append(SimpleNamespace(
                 prompt_token_ids=ids, num_cached_tokens=0,
                 outputs=[SimpleNamespace(text=answer, token_ids=tokens)]))
@@ -386,7 +408,7 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     execution = request_tests._execution(
         documents, client=client, document_texts={"c": TEXTS})
     result = execution.execute(node, {"input:0": [0, 1, 2, 3]})
-    assert client.params == [(limit, ['"'])]
+    assert client.params == [(limit, None)]
     answers = result.outputs["extract_answers:ends"].to_pydict()
     assert answers == {
         "c": [0, 1, 2, 3],
@@ -413,14 +435,55 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     # the tail's text, tokenized by the engine itself
     texted = _TextPhraseClient()
     node = replace(node, preamble_text="DOCUMENT:\n",
-                   extracts=(replace(specs[0], tail_text="\nQ?\nPhrase: \""),))
+                   extracts=(replace(specs[0], tail_text="\nQ?\nPhrase:"),))
     result = request_tests._execution(
         documents, client=texted, document_texts={"c": TEXTS}).execute(node, {})
-    assert texted.prompts == ["DOCUMENT:\n" + text + "\nQ?\nPhrase: \""
+    assert texted.prompts == ["DOCUMENT:\n" + text + "\nQ?\nPhrase:"
                               for text in TEXTS]
     assert result.outputs["extract_answers:ends"].to_pydict()["ends"] == [
         "March 3, 2027", None, "five years", "a phrase the document lacks"]
 
+
+
+class _FieldsClient(_PhraseClient):
+    """Runs the fields of each document together, as the vLLM client does."""
+
+    def __init__(self):
+        super().__init__()
+        self.runs = []
+
+    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
+                           answer_tokens, body_texts=None, tail_texts=None):
+        self.runs.append((tail_ids, answer_tokens))
+        return {"wall": 1.5, "outputs": [
+            self.generate([{"prompt_token_ids": body + tail}
+                           for body in body_ids], sampling_params)
+            for tail in tail_ids]}
+
+
+def test_request_backend_runs_the_fields_of_a_document_together():
+    documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
+    specs = tuple(
+        RequestExtractSpec(alias="c", output=output, question=QUESTION,
+                           tail_token_ids=(tail,), max_answer_tokens=limit)
+        for output, tail, limit in (("ends", 90, 7), ("term", 91, 9)))
+    node = RequestExecution(
+        node_id="request-model", backend_name="stock_vllm", aliases=("c",),
+        preamble_token_ids=(3,), extracts=specs)
+    client = _FieldsClient()
+    result = request_tests._execution(
+        documents, client=client, document_texts={"c": TEXTS}).execute(
+            node, {"input:0": [0, 1, 2, 3]})
+    # one run decodes both fields, up to the longer answer limit
+    assert client.runs == [([[90], [91]], 9)]
+    expected = ["March 3, 2027", None, "five years",
+                "a phrase the document lacks"]
+    for output in ("ends", "term"):
+        answers = result.outputs[f"extract_answers:{output}"].to_pydict()
+        assert answers[output] == expected
+    steps = result.metrics.extension["steps"]
+    assert [(step["output"], step["requests"], step["wall_s"])
+            for step in steps] == [("ends", 4, 1.5), ("term", 4, 1.5)]
 
 def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     session = request_tests._session(

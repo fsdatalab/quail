@@ -243,7 +243,7 @@ def classification_rows(spec, columns, labels) -> Rows:
 def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
     """Decode one answer per prompt body and locate it in the document's text.
 
-    Generation stops at the quote that closes the phrase. An answer
+    Generation stops where the model ends its turn. An answer
     the document holds is returned as the document's own text at its
     span; "none" gives nulls;
     an answer the document does not hold is returned as written, with
@@ -263,14 +263,51 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
         counts, and the generation seconds.
     """
     tail = token_list(spec.tail_token_ids)
-    params = client.decode_params(spec.max_answer_tokens, stop=['"'])
+    params = client.decode_params(spec.max_answer_tokens)
     if body_texts is not None:
         prompts = [body_text + spec.tail_text for body_text in body_texts]
     else:
         prompts = [{"prompt_token_ids": body + tail} for body in bodies]
     started = time.perf_counter()
     outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
-    wall_s = time.perf_counter() - started
+    return read_extractions(outputs, texts, time.perf_counter() - started)
+
+
+def extract_fields(client, specs, bodies, texts, body_texts=None) -> list[dict]:
+    """Decode the answers of several fields over the same prompt bodies.
+
+    A client with run_extract_fields decodes every field of a document
+    while the document's KV is live, so each body is computed about
+    once. Otherwise each field is a separate generate call.
+
+    Args:
+        client: The engine client.
+        specs: The RequestExtractSpecs, which share their preamble.
+        bodies: Token ids for each prompt before the tail, preamble included.
+        texts: The document text of each body.
+        body_texts: The text of each prompt before the tail, for an
+            engine that tokenizes the prompt itself; None sends token ids.
+
+    Returns:
+        One extract_documents result per spec. The fields run together,
+        so each result reports the wall seconds of the whole run.
+    """
+    if (len(specs) < 2 or not bodies
+            or not hasattr(client, "run_extract_fields")):
+        return [extract_documents(client, spec, bodies, texts, body_texts)
+                for spec in specs]
+    answer_tokens = max(spec.max_answer_tokens for spec in specs)
+    run = client.run_extract_fields(
+        client.decode_params(answer_tokens), bodies,
+        [token_list(spec.tail_token_ids) for spec in specs],
+        answer_tokens=answer_tokens, body_texts=body_texts,
+        tail_texts=[spec.tail_text for spec in specs])
+    return [read_extractions(outputs, texts, run["wall"])
+            for outputs in run["outputs"]]
+
+
+def read_extractions(outputs, texts, wall_s: float) -> dict:
+    """Read each output's phrase and locate it in its document's text."""
     answers, spans = [], []
     unanswered = unaligned = 0
     for output, document in zip(outputs, texts):
@@ -286,7 +323,7 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
         "answers": answers,
         "spans": spans,
         "wall_s": wall_s,
-        "requests": len(prompts),
+        "requests": len(outputs),
         **_generation_counts(outputs),
         "unanswered": unanswered,
         "unaligned": unaligned,

@@ -124,9 +124,8 @@ def test_gpu_copies_and_memory_refusals(catalog):
         assert result.constraint == "weights_need_more_cards"
         assert result.needed > result.available
 
-    r = _plan(logical, {"r": [150_000]})
-    assert isinstance(r, Refusal)
-    assert r.constraint == "suffix_over_chunk"
+    # a document too long for one pass is skipped at execution, not refused
+    assert not isinstance(_plan(logical, {"r": [150_000]}), Refusal)
 
 
 def test_filter_ordering_and_kv_writes(catalog):
@@ -786,8 +785,8 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
                if "seconds" in entry}
     assert set(seconds) == {"ai_filter:r", "ai_join:r"}
     # each node priced alone: the parts add up to at least the packed
-    # whole, and to no more than three times it
-    assert plan.estimated_seconds <= sum(seconds.values()) \
+    # whole, up to float rounding, and to no more than three times it
+    assert plan.estimated_seconds * (1 - 1e-12) <= sum(seconds.values()) \
         <= 3 * plan.estimated_seconds
     # 10,000 expected survivors of 400 tokens do not fit the retention
     # pool, so releasing the sequence's KV would recompute most of them

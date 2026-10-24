@@ -1,7 +1,8 @@
 """Request scheduling shared by the vLLM and SGLang backends.
 
 Filter sequences advance on individual request completions under a shared
-KV admission calculation. Joins submit one request per document pair.
+KV admission calculation. The fields of an extraction share each
+document's KV the same way. Joins submit one request per document pair.
 """
 
 from __future__ import annotations
@@ -195,6 +196,122 @@ def run_filter_sequence(
                         max_num_seqs),
     )
 
+
+
+def extract_document_cap(
+    body_ids,
+    tail_ids,
+    answer_tokens: int,
+    budget_tokens: int,
+    *,
+    block_size: int = 1,
+    max_num_seqs: int | None = None,
+) -> int:
+    """Return how many documents the KV budget keeps live at once.
+
+    Each live document holds its body once and, for every field, the
+    field's tail and its longest answer, each rounded up to whole KV
+    blocks. Each field is one sequence.
+    """
+    if not body_ids:
+        return 0
+
+    def blocks(tokens):
+        return (tokens + block_size - 1) // block_size * block_size
+
+    fields = sum(blocks(len(tail) + answer_tokens + block_size)
+                 for tail in tail_ids)
+    sizes = [blocks(len(body)) + fields for body in body_ids]
+    document_cap = max(1, budget_tokens // (sum(sizes) // len(sizes)))
+    if max_num_seqs is not None:
+        document_cap = min(document_cap, max(1, max_num_seqs // len(tail_ids)))
+    return document_cap
+
+
+def run_extract_fields(
+    engine,
+    sampling_params,
+    body_ids,
+    tail_ids,
+    budget_tokens,
+    *,
+    tag="x",
+    answer_tokens=0,
+    block_size=1,
+    max_num_seqs=None,
+    body_texts=None,
+    tail_texts=None,
+    render_prompt=None,
+):
+    """Decode every field of each document, the first field before the rest.
+
+    A document's first field computes the body's KV. The other fields
+    enter the queue once that request has written a token, so they read
+    the body from the prefix cache instead of computing it again. The
+    engine exposes add_request and step, as vLLM's LLMEngine does.
+
+    Returns:
+        A dict with the outputs of each field in document order, the
+        wall seconds, and the admission settings.
+    """
+    fields = len(tail_ids)
+    document_cap = extract_document_cap(
+        body_ids, tail_ids, answer_tokens, budget_tokens,
+        block_size=block_size, max_num_seqs=max_num_seqs,
+    )
+    outputs = [[None] * len(body_ids) for _ in range(fields)]
+    inflight = {}
+    released = set()
+    left = {}
+
+    def submit(document, field):
+        request_id = f"{tag}-{document}-{field}"
+        inflight[request_id] = (document, field)
+        if body_texts is not None and tail_texts is not None:
+            prompt = body_texts[document] + tail_texts[field]
+            if render_prompt is not None:
+                prompt = render_prompt(prompt)
+        else:
+            prompt = {
+                "prompt_token_ids": body_ids[document] + tail_ids[field]
+            }
+        engine.add_request(request_id, prompt, sampling_params)
+
+    started = time.perf_counter()
+    expected_rows = next_document = 0
+    try:
+        while next_document < len(body_ids) or inflight:
+            while next_document < len(body_ids) and expected_rows < document_cap:
+                left[next_document] = fields
+                submit(next_document, 0)
+                expected_rows += 1
+                next_document += 1
+            for output in engine.step():
+                if output.request_id not in inflight:
+                    continue
+                document, field = inflight[output.request_id]
+                if field == 0 and document not in released:
+                    # the body's KV is computed, so the other fields hit it
+                    released.add(document)
+                    for later in range(1, fields):
+                        submit(document, later)
+                if not output.finished:
+                    continue
+                del inflight[output.request_id]
+                outputs[field][document] = output
+                left[document] -= 1
+                if not left[document]:
+                    expected_rows -= 1
+    finally:
+        if inflight:
+            # the engine is reused by the next query; a request left
+            # queued would run there and take KV from it
+            engine.abort_request(list(inflight))
+    return {
+        "outputs": outputs,
+        "wall": time.perf_counter() - started,
+        **_cap_settings(document_cap, budget_tokens, block_size, max_num_seqs),
+    }
 
 async def run_filter_sequence_async(
     generate,

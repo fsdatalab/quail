@@ -10,6 +10,7 @@ from quail.baselines.request import RequestBackend
 from quail.baselines.request_scheduling import (
     MAX_BATCHED_TOKENS,
     MAX_SEQUENCES,
+    run_extract_fields,
     run_filter_sequence,
 )
 from quail.specs.base import DeviceSpec, ModelSpec
@@ -248,6 +249,25 @@ class VLLMClient:
             render_prompt=self.llm._preprocess_cmpl_one,
         )
 
+    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
+                           answer_tokens, tag="x", body_texts=None,
+                           tail_texts=None):
+        """Decode the fields of each document through the engine's step loop."""
+        return run_extract_fields(
+            self.llm.llm_engine,
+            sampling_params,
+            body_ids,
+            tail_ids,
+            self.capacity["kv_cache_size_tokens"],
+            tag=tag,
+            answer_tokens=answer_tokens,
+            block_size=self.capacity["block_size"],
+            max_num_seqs=self.capacity["max_num_seqs"],
+            body_texts=body_texts,
+            tail_texts=tail_texts,
+            render_prompt=self.llm._preprocess_cmpl_one,
+        )
+
 
 class VLLMEngine:
     """Boot vLLM for a request backend, with Quail's tuned engine settings."""
@@ -297,6 +317,9 @@ class VLLMEngine:
         }
         if spec.moe_backend is not None:
             kwargs["moe_backend"] = spec.moe_backend
+        speculative = os.environ.get("QUAIL_VLLM_SPECULATIVE")
+        if speculative:
+            kwargs["speculative_config"] = speculative_config(speculative)
         kwargs.update(diffusion_kwargs(spec))
         kwargs.update(text_only_kwargs(spec))
         return kwargs
@@ -385,6 +408,25 @@ class DefaultVLLMEngine(VLLMEngine):
 
     def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
         return {**diffusion_kwargs(spec), **text_only_kwargs(spec)}
+
+
+def speculative_config(value: str) -> dict:
+    """Return the vLLM speculation an experiment turns on.
+
+    Args:
+        value: "ngram:<tokens>", vLLM's n-gram drafts from the prompt
+            with that many draft tokens, from QUAIL_VLLM_SPECULATIVE.
+
+    Raises:
+        ValueError: The value is not ngram:<tokens>.
+    """
+    method, _, tokens = value.partition(":")
+    if method != "ngram" or not tokens.isdigit() or int(tokens) < 1:
+        raise ValueError(
+            f"QUAIL_VLLM_SPECULATIVE={value!r} is not ngram:<tokens>")
+    # the lookup length is vLLM's documented example
+    return {"method": "ngram", "num_speculative_tokens": int(tokens),
+            "prompt_lookup_max": 4}
 
 
 def stock_vllm_backend() -> RequestBackend:

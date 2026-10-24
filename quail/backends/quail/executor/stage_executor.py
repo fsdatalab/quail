@@ -672,9 +672,14 @@ class StageExecutor:
                 self.arena.free_key(self.keys[anchor])
         self.progress.finish(f"{self.label} done", f"{self.tokens:,} fresh tokens")
         self.arena.drop_holds(self.held)
+        if self.sched.oversized:
+            logger.warning(
+                "%s: skipped %d documents too long for one forward pass; "
+                "they get no answer", self.label, len(self.sched.oversized))
         if self.stats is not None:
             self.stats["borrowed_tokens"] = self.borrowing.borrowed_tokens
             self.stats["pack_s"] = self.pack_s
+            self.stats["skipped_documents"] = len(self.sched.oversized)
         if self.spans:
             self.torch.cuda.synchronize()
         return self.sched.answers, self.spans, self.tokens
