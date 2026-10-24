@@ -64,6 +64,21 @@ def pages(tokens: int) -> int:
     return -(-tokens // PAGE_TOKENS)
 
 
+def ridge_tokens(model: ModelSpec, device: DeviceSpec) -> float:
+    """Fed tokens per forward pass at which the weight work turns compute bound.
+
+    A pass of T tokens does 2 flops per weight per token and reads each
+    weight's bytes once, so compute passes memory at T = GEMM flops
+    times the weight's bytes over twice the HBM bytes per second; the
+    weight count cancels. For a mixture-of-experts model each token
+    reads a fraction of the weights, so the true ridge is higher; the
+    estimate stays a safe lower bound for pricing a marginal token.
+    """
+    weight_bytes = 1.0 if model.weight_precision == "fp8" else 2.0
+    return device.gemm_flops(model.weight_precision) * weight_bytes / (
+        2.0 * device.hbm_bw)
+
+
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     """Return the chunk budget allowed by the model and device.
 

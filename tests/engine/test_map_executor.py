@@ -58,7 +58,8 @@ def test_a_draft_copied_from_the_document_settles_in_few_rounds(monkeypatch):
     # the answer is a run of document text: after its first token the
     # draft copies the rest, so one round verifies the whole run
     gold = "March 3, 2027 at noon"
-    asked, _, _ = _map_one(monkeypatch, LEASE, gold, draft_tokens=15)
+    asked, _, _ = _map_one(monkeypatch, LEASE, gold, draft_tokens=15,
+                           draft_policy="fixed")
     assert asked.answer == gold
     written = len(asked.written)
     # the cue chooses the first token; one round copies the rest; one
@@ -84,7 +85,8 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
     # and the model chooses " years": the round ends there, and the
     # next round feeds " years" in the draft's place
     text = "or five days or five years"
-    asked, model, key = _map_one(monkeypatch, text, "five years")
+    asked, model, key = _map_one(monkeypatch, text, "five years",
+                                 draft_policy="fixed")
     assert asked.answer == "five years"
     tables = model.tables
     five, days, years = (tables.encode_ids(w)[0] for w in (" five", " days", " years"))
@@ -167,3 +169,46 @@ def test_readout_rows_unwrap_object_arrays():
     values = np.empty(1, dtype=object)
     values[0] = np.arange(18, dtype=np.float32)
     assert readout_rows(values, 9).shape == (2, 9)
+
+
+def test_an_adaptive_copy_draft_runs_long_below_the_ridge(monkeypatch):
+    # with the pass below the ridge, a marginal draft token is free:
+    # the policy copies the whole run and the answer settles in a few
+    # rounds, as the fixed policy would
+    gold = "March 3, 2027 at noon"
+    asked, _, _ = _map_one(monkeypatch, LEASE, gold, draft_tokens=15,
+                           ridge_tokens=4096.0)
+    assert asked.answer == gold
+    assert asked.steps <= 3
+
+
+def test_a_sibling_answer_seeds_the_cache_draft(monkeypatch):
+    # two documents share one gold answer the second document's text
+    # does not contain: the first answer fills the cache, and the
+    # second drafts from it
+    gold = "March 3, 2027 at noon"
+    text_without_gold = "No dates here."
+    tables = make_vocabulary(LEASE, text_without_gold, gold)
+    spec = make_map_spec(tables, draft_tokens=15, ridge_tokens=4096.0)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
+    state = _state(model, chunk_tokens=120)
+    state.loaded_model.vocabulary = tables
+    stages = MapStages(state, [spec], tables, [0, 1],
+                       [tables.encode_ids(LEASE),
+                        tables.encode_ids(text_without_gold)])
+    for document, text in zip(stages.documents, (LEASE, text_without_gold)):
+        model.documents[document.key] = text
+        model.gold[document.key] = gold
+    run_stages(state.torch, state.loaded_model.arena,
+               state.loaded_model.pipeline, stages.stages, stages.prefixes,
+               state.chunk_tokens, anchor_keys=stages.keys,
+               appended_tokens=stages.appended_tokens)
+    stages.finish()
+    answers = [document.answers[0] for document in stages.documents]
+    assert [answer.answer for answer in answers] == [gold, gold]
+    assert stages.decoder.cache.entries
+    # the cache drafts were verified, so the policy recorded trials
+    assert stages.decoder.policies[0].trials.sum() > 0

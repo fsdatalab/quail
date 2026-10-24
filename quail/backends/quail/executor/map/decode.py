@@ -1,11 +1,13 @@
 """The decode of a map answer: the greedy choice at each readout row.
 
 The answer is decoded after the answer cue, one round at a time. Each
-round feeds the chosen token and a draft copied from the document
-where the last written tokens occur, and the rows after them verify
-it: a draft token is written exactly when the model would have chosen
-it one token at a time. The answer ends where the model ends its
-turn, or at the configured answer limit.
+round feeds the chosen token and a draft, and the rows after them
+verify it: a draft token is written exactly when the model would have
+chosen it one token at a time. A draft is copied from the document
+where the last written tokens occur, or chained from the n-gram cache
+of the answers written so far; the adaptive policy sizes it from the
+acceptance odds and the forward pass's slack. The answer ends where
+the model ends its turn, or at the configured answer limit.
 """
 
 from collections.abc import Sequence
@@ -14,6 +16,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
+from quail.cost.map_draft_policy import MapDraftPolicy
+from quail.cost.ngram_cache import MATCH_ORDERS, NgramCache
 from quail.physical import MapSpec
 
 
@@ -29,6 +33,8 @@ class MapAnswer:
     steps: int = 0
     fed_tokens: int = 0
     answer: str | None = None
+    cells: list = field(default_factory=list)  # the last draft's policy cells
+    cached: int = 0     # written tokens inserted into the cache
 
 
 @dataclass
@@ -41,6 +47,8 @@ class MapDocument:
     key: tuple
     answers: list       # one MapAnswer per instruction
     positions: dict | None = None   # token id -> its positions, built lazily
+    rho: float = 0.0    # the document's KV read per round, in fed tokens
+    counted: bool = False   # taken off the live count after its last answer
 
 
 class MapDecoder:
@@ -51,34 +59,76 @@ class MapDecoder:
         k: How many likeliest tokens each readout row carries.
         width: The values in each readout row: the stop, then k ids
             and k log probabilities.
+        questions: How many instructions the pipeline puts.
         spec: Map plan carrying the execution settings.
     """
 
-    def __init__(self, vocabulary: Vocabulary, k: int, width: int, spec: MapSpec):
+    def __init__(self, vocabulary: Vocabulary, k: int, width: int, questions: int,
+                 spec: MapSpec):
         self.spec = spec
         self.vocabulary = vocabulary
         self.k = k
         self.width = width
+        self.cache = NgramCache()
+        # one acceptance table and answer-length curve per instruction
+        self.policies = ([MapDraftPolicy(spec.draft_tokens, spec.max_answer_tokens,
+                                         spec.expected_answer_tokens)
+                          for _ in range(questions)]
+                         if spec.draft_policy == "adaptive" else None)
 
-    def draft(self, answer: MapAnswer, document: MapDocument) -> list:
+    def draft(self, answer: MapAnswer, document: MapDocument, q: int = 0,
+              slack: float = 0.0) -> list:
         """Return the tokens the next round feeds: the chosen token, then a draft.
 
         The draft copies the document's next tokens from the position
-        where the answer's last written tokens occur; the rows after
-        them verify it, so a round writes as many tokens as the model
-        would have chosen one at a time. A token the document does not
-        hold gets no draft.
+        where the answer's last written tokens occur, or, when the
+        document does not continue the answer, chains continuations
+        from the n-gram cache. The rows after them verify it, so a
+        round writes as many tokens as the model would have chosen one
+        at a time. The adaptive policy sizes each draft from its
+        acceptance odds, the document's KV read, and the pass's slack;
+        the fixed policy copies up to draft_tokens from the document.
+
+        Args:
+            answer: The answer's state.
+            document: The document.
+            q: The instruction's index.
+            slack: Fed tokens the current passes carry for free.
         """
-        draft = []
-        length = min(self.spec.draft_tokens,
-                     self.spec.max_answer_tokens - len(answer.written) - 1)
-        if length > 0:
+        draft, cells = [], []
+        policy = None if self.policies is None else self.policies[q]
+        room = min(self.spec.draft_tokens,
+                   self.spec.max_answer_tokens - len(answer.written) - 1)
+        if room > 0:
             at = self._source_position(answer, document)
             if at is not None:
+                length = room if policy is None else policy.copy_length(
+                    document.rho, len(answer.written), slack)
                 draft = [int(token)
                          for token in document.tokens[at + 1:at + 1 + length]]
+                cells = [None] * len(draft)
+            elif policy is not None:
+                draft, cells = self._chain(answer, document, policy, room, slack)
         answer.fed = [answer.written[-1], *draft]
+        answer.cells = cells
         return answer.fed
+
+    def _chain(self, answer: MapAnswer, document: MapDocument,
+               policy: MapDraftPolicy, room: int, slack: float) -> tuple:
+        """Return a draft chained from the cache, and each hop's cell."""
+        context = list(answer.written[-max(MATCH_ORDERS):])
+        tokens, cells, rates = [], [], []
+        for _ in range(room):
+            match = self.cache.lookup(context, document.index)
+            if match is None:
+                break
+            tokens.append(match.token)
+            cells.append(policy.cell(match))
+            rates.append(policy.hit_rate(match))
+            context.append(match.token)
+        length = policy.chain_length(document.rho, len(answer.written), rates,
+                                     slack)
+        return tokens[:length], cells[:length]
 
     def _source_position(self, answer: MapAnswer,
                          document: MapDocument) -> int | None:
@@ -127,20 +177,48 @@ class MapDecoder:
         if answer.written and len(fed) > 1:
             accepted = self.accepted(answer, rows, fed)
             rows = rows[accepted:]
+        hits, missed = accepted, False
         if accepted:
             written = min(accepted, self.spec.max_answer_tokens - len(answer.written))
             answer.written.extend(fed[1:written + 1])
             if len(answer.written) >= self.spec.max_answer_tokens:
+                self._close_round(document, q, hits, missed)
                 self.settle(document, q)
                 return
         for i, values in enumerate(rows):
             token = self.choose(document, q, values)
             if answer.done:
-                return
+                break
             after = accepted + i + 1
-            if after < len(fed) and token != fed[after]:
-                answer.discard = len(fed) - after
-                return
+            if after < len(fed):
+                if token == fed[after]:
+                    hits += 1
+                else:
+                    answer.discard = len(fed) - after
+                    missed = True
+                    break
+        self._close_round(document, q, hits, missed)
+
+    def _close_round(self, document: MapDocument, q: int, hits: int,
+                     missed: bool) -> None:
+        """Record the round's draft outcomes and cache its written tokens.
+
+        A chained draft token is a trial for its cell: written while
+        every token before it was, or the round's first miss. Tokens
+        past a miss were fed off the answer's path, so they teach the
+        policy nothing.
+        """
+        answer = document.answers[q]
+        if self.policies is not None:
+            policy = self.policies[q]
+            for j, cell in enumerate(answer.cells):
+                if j > hits or (j == hits and not missed):
+                    break
+                if cell is not None:
+                    policy.observe(cell, j < hits)
+        answer.cells = []
+        self.cache.add(answer.written, document.index, start=answer.cached)
+        answer.cached = len(answer.written)
 
     def accepted(self, answer: MapAnswer, rows: np.ndarray, fed) -> int:
         """Return how many leading rows write the draft token fed after them.
@@ -198,6 +276,10 @@ class MapDecoder:
     def settle(self, document: MapDocument, q: int) -> None:
         """Set the instruction's answer for the document: its written text."""
         answer = document.answers[q]
+        if answer.done:
+            return
         answer.done = True
+        if self.policies is not None:
+            self.policies[q].curve.settle(len(answer.written))
         answer.answer = self.vocabulary.tokenizer.decode(
             answer.written, skip_special_tokens=True).strip()

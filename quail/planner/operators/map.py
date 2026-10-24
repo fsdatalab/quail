@@ -44,7 +44,8 @@ def map_spec(context, call, name, expected_rows, resident=False) -> MapSpec:
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
         instruction=call.instruction,
-        round_cost_per_token=round_cost_per_token)
+        round_cost_per_token=round_cost_per_token,
+        ridge_tokens=budgets.ridge_tokens(model, device))
     cost = extract_cost.estimate(
         expected_rows,
         lengths,

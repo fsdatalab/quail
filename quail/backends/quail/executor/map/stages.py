@@ -64,7 +64,11 @@ class MapStages(AnswerStages):
         self._order_documents(document_ids)
         self.readout = self._readout(state) if readout is None else readout
         self.decoder = MapDecoder(vocabulary, self.readout.k, self.readout.width,
-                                  self.spec)
+                                  len(self.specs), self.spec)
+        # documents not asked yet, and documents between their first ask
+        # and their last settled answer, for the draft policy's slack
+        self.num_queued_documents = len(self.documents)
+        self.num_decoding_documents = 0
         self._build()
 
     def _prepare(self, index, document_id, stored, text) -> MapDocument:
@@ -89,12 +93,52 @@ class MapStages(AnswerStages):
         if self.head == self.pipeline_head:
             key = (alias, int(document_id))
         prefix = concat_tokens(self.head, stored)
+        # the round's KV read covers the prompt through the first tail
+        rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
         return MapDocument(index=index, prefix=prefix, tokens=tokens, key=key,
-                           answers=[MapAnswer() for _ in self.specs])
+                           answers=[MapAnswer() for _ in self.specs], rho=rho)
 
     def _draft(self, document, answer, q) -> list:
-        """Return the chosen token, then the document's next tokens as a draft."""
-        return self.decoder.draft(answer, document)
+        """Return the chosen token, then the draft the policy sizes."""
+        return self.decoder.draft(answer, document, q, self._slack())
+
+    def _slack(self) -> float:
+        """Fed tokens one document's round can add below the ridge, for free.
+
+        While documents wait for their first ask, their prefills fill
+        the passes, so no token is free. Afterwards the live documents'
+        rounds are the passes' work: what is left under the ridge is
+        split across them. This reads the pipeline's own queue, not the
+        whole batch, so it understates the pass when other operators
+        share it.
+        """
+        ridge = self.spec.ridge_tokens
+        decoding = self.num_decoding_documents
+        if not ridge or self.num_queued_documents > 0 or decoding <= 0:
+            return 0.0
+        return max(0.0, ridge - decoding) / decoding
+
+    def _tail_decide(self, q, anchor, row):
+        answer = self.documents[anchor].answers[q]
+        newly_asked = not answer.asked
+        advanced = super()._tail_decide(q, anchor, row)
+        if q == 0 and newly_asked:
+            self.num_queued_documents -= 1
+            self.num_decoding_documents += 1
+        self._note_done(anchor)
+        return advanced
+
+    def _step_decide(self, q, anchor, row):
+        advanced = super()._step_decide(q, anchor, row)
+        self._note_done(anchor)
+        return advanced
+
+    def _note_done(self, anchor) -> None:
+        """Take a document off the live count once its last answer settles."""
+        document = self.documents[anchor]
+        if document.answers[-1].done and not document.counted:
+            document.counted = True
+            self.num_decoding_documents -= 1
 
     def answers(self, q: int, kept=None) -> list:
         """Return each document's answer for instruction q.

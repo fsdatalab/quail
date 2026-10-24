@@ -35,6 +35,43 @@ def _bucket(num_streams: int) -> int:
     return i if _LIVE_LOGS[i] - x < x - _LIVE_LOGS[i - 1] else i - 1
 
 
+class AnswerLengthCurve:
+    """P(the answer has more than j tokens left), learned from settled answers.
+
+    The planner's geometric guess and the settled answers' lengths are
+    blended by count, so the guess fades as answers settle.
+
+    Args:
+        max_answer_tokens: The answer limit.
+        expected_answer_tokens: The planner's guess at the mean answer
+            length, the seed of the curve until answers settle.
+    """
+
+    def __init__(self, max_answer_tokens: int, expected_answer_tokens: int):
+        self.max_answer_tokens = max_answer_tokens
+        self.q = 1.0 - 1.0 / max(1, expected_answer_tokens)
+        self.lengths = np.zeros(max_answer_tokens + 1, dtype=np.int64)
+        self.settled = 0
+        self._curve = None
+
+    def survival(self, written: int) -> np.ndarray:
+        """Return P(the answer has more than j tokens left), j = 0.., given written."""
+        if self._curve is None:
+            j = np.arange(self.max_answer_tokens + 1)
+            prior = PRIOR_WEIGHT * self.q ** j
+            # answers longer than j, from the histogram of settled lengths
+            longer = self.settled - np.cumsum(self.lengths)
+            self._curve = (prior + longer) / (PRIOR_WEIGHT + self.settled)
+        tail = self._curve[written:]
+        return tail / tail[0] if tail[0] > 0 else np.ones_like(tail)
+
+    def settle(self, length: int) -> None:
+        """Record a settled answer's length."""
+        self.lengths[min(length, self.max_answer_tokens)] += 1
+        self.settled += 1
+        self._curve = None
+
+
 class DraftPolicy:
     """Chooses each round's draft length for one question.
 
@@ -49,29 +86,12 @@ class DraftPolicy:
     def __init__(self, cap: int, max_answer_tokens: int, expected_answer_tokens: int):
         self.cap = cap
         self.max_answer_tokens = max_answer_tokens
-        self.q = 1.0 - 1.0 / max(1, expected_answer_tokens)
-        self.lengths = np.zeros(max_answer_tokens + 1, dtype=np.int64)
-        self.settled = 0
+        self.curve = AnswerLengthCurve(max_answer_tokens, expected_answer_tokens)
         # drafted rounds and the ones whose first draft token was written,
         # by range of live positions
         self.trials = np.zeros(len(LIVE_BUCKETS), dtype=np.int64)
         self.accepts = np.zeros(len(LIVE_BUCKETS), dtype=np.int64)
-        self._curve = None
 
-    def survival(self, written: int) -> np.ndarray:
-        """Return P(the answer has more than j tokens left), j = 0.., given written.
-
-        The planner's geometric guess and the settled answers' lengths
-        are blended by count, so the guess fades as answers settle.
-        """
-        if self._curve is None:
-            j = np.arange(self.max_answer_tokens + 1)
-            prior = PRIOR_WEIGHT * self.q ** j
-            # answers longer than j, from the histogram of settled lengths
-            longer = self.settled - np.cumsum(self.lengths)
-            self._curve = (prior + longer) / (PRIOR_WEIGHT + self.settled)
-        tail = self._curve[written:]
-        return tail / tail[0] if tail[0] > 0 else np.ones_like(tail)
 
     def source_odds(self, num_streams: int) -> float:
         """Return P(the position followed is the answer's source) given live positions.
@@ -97,7 +117,7 @@ class DraftPolicy:
         if room <= 0:
             return 0
         gammas = np.arange(room + 1)
-        survival = self.survival(written)[:room + 1]
+        survival = self.curve.survival(written)[:room + 1]
         # the chosen token, then each draft token while the answer goes
         # on and the position followed is its source
         writes = survival[0] + self.source_odds(num_streams) * np.cumsum(
@@ -106,9 +126,7 @@ class DraftPolicy:
 
     def settle(self, length: int) -> None:
         """Record a settled answer's length."""
-        self.lengths[min(length, self.max_answer_tokens)] += 1
-        self.settled += 1
-        self._curve = None
+        self.curve.settle(length)
 
     def observe(self, num_streams: int, accepted: bool) -> None:
         """Record whether a drafted round's first draft token was written.

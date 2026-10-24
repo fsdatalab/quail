@@ -36,7 +36,7 @@ def test_settled_answers_replace_the_planner_guess():
     for _ in range(64):
         policy.settle(64)       # every answer runs to the cap
     assert policy.draft_length(5, 1, num_streams=1) > before
-    assert policy.survival(0)[0] == 1.0
+    assert policy.curve.survival(0)[0] == 1.0
 
 
 def test_drafted_rounds_replace_the_even_odds_seed():
