@@ -69,7 +69,8 @@ def _run_one(client, prompts, cap) -> dict:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=14400,
               volumes=VOLUMES)
 def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
-                      only: str = "", speculative: str = "") -> str:
+                      only: str = "", speculative: str = "",
+                      capture_sizes: str = "8192") -> str:
     """Run the map configurations on stock vLLM; return the result's path.
 
     Args:
@@ -79,10 +80,14 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
             all four.
         speculative: vLLM speculation to turn on, as "ngram:<tokens>"
             (QUAIL_VLLM_SPECULATIVE); empty runs without speculation.
+        capture_sizes: The CUDA graph capture sizes, as
+            quail.baselines.vllm.parse_capture_sizes reads them: "8192"
+            for the baseline's one graph, "vllm" for vLLM's own default,
+            or "vllm-spacing:8192" for vLLM's spacing up to 8,192.
     """
     import os
 
-    from quail.baselines.vllm import VLLMEngine
+    from quail.baselines.vllm import VLLMEngine, parse_capture_sizes
     from quail.specs import H100_USD_PER_HOUR, MODELS
 
     # the engine core runs in process, as the other cells that boot
@@ -102,10 +107,11 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
     measurements = {
         "engine": "stock vLLM, operator-at-a-time submission",
         "speculative": speculative or None,
+        "capture_sizes": capture_sizes,
         "model": model, "scale_factor": scale_factor, "runs": {},
     }
     with ExitStack() as resources:
-        engine = VLLMEngine()
+        engine = VLLMEngine(capture_sizes=parse_capture_sizes(capture_sizes))
         settings, boot = engine.boot(spec, [0], resources=resources)
         measurements["boot"] = boot
         measurements["engine_settings"] = {
@@ -122,6 +128,8 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
             measurements["runs"][name] = run
             print(json.dumps({name: run}, default=str), flush=True)
     tag = f"_{speculative.replace(':', '')}" if speculative else ""
+    if capture_sizes != "8192":
+        tag += "_graphs-" + capture_sizes.replace(":", "").replace(",", "-")
     out = Path(RESULT_DIR) / f"map_vllm{tag}_{model}_sf{scale_factor}_{stamp}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(measurements, indent=2, default=str))
@@ -132,8 +140,10 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
 
 @app.local_entrypoint()
 def launch_baseline(model: str = "qwen3-4b-fp8", sf: float = 0.1,
-                    only: str = "", speculative: str = ""):
+                    only: str = "", speculative: str = "",
+                    capture_sizes: str = "8192"):
     call = map_vllm_baseline.spawn(model=model, scale_factor=sf, only=only,
-                                   speculative=speculative)
+                                   speculative=speculative,
+                                   capture_sizes=capture_sizes)
     print(f"function call id: {call.object_id}")
     print(call.get())

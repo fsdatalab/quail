@@ -17,6 +17,9 @@ from quail.specs.files import resolve_model_path
 
 GPU_MEMORY_UTILIZATION = 0.91
 CUDA_GRAPH_CAPTURE_SIZE = 8_192
+# the capture sizes the stock vLLM baseline has run with: one graph,
+# so vLLM pads every step of up to 8,192 tokens to 8,192
+SINGLE_CUDA_GRAPH = (CUDA_GRAPH_CAPTURE_SIZE,)
 # vLLM caps a diffusion model at 8 sequences per step whenever the
 # setting is 128 or more, sized for its 256-row canvas; one row needs
 # no cap, so stay just under the trigger.
@@ -236,8 +239,56 @@ class VLLMClient:
         )
 
 
+def vllm_capture_sizes(largest: int) -> tuple[int, ...]:
+    """Return vLLM's own spacing of CUDA graph capture sizes, up to largest.
+
+    1, 2, and 4, then every 8 tokens to 256, then every 16: a step is
+    padded by at most 16 tokens. vLLM builds the same list when it is
+    given only its largest size.
+
+    Args:
+        largest: The largest capture size.
+    """
+    sizes = (1, 2, 4, *range(8, 256, 8), *range(256, largest + 1, 16))
+    return tuple(size for size in sizes if size <= largest)
+
+
+def parse_capture_sizes(value: str) -> tuple[int, ...] | None:
+    """Return the capture sizes an experiment names.
+
+    Args:
+        value: "vllm" for vLLM's own default, which captures sizes up
+            to 512; "vllm-spacing:<largest>" for vLLM's spacing up to
+            largest; or comma-separated sizes, such as "8192".
+
+    Returns:
+        The sizes, increasing, or None for vLLM's own default.
+
+    Raises:
+        ValueError: The value names no sizes.
+    """
+    if value == "vllm":
+        return None
+    method, _, largest = value.partition(":")
+    if method == "vllm-spacing" and largest.isdigit() and int(largest) > 0:
+        return vllm_capture_sizes(int(largest))
+    parts = value.split(",")
+    if not all(part.strip().isdigit() and int(part) > 0 for part in parts):
+        raise ValueError(
+            f"capture sizes {value!r} are not 'vllm', "
+            "'vllm-spacing:<largest>', or comma-separated sizes")
+    return tuple(sorted({int(part) for part in parts}))
+
+
 class VLLMEngine:
-    """Boot vLLM for a request backend, with Quail's tuned engine settings."""
+    """Boot vLLM for a request backend, with Quail's tuned engine settings.
+
+    Args:
+        capture_sizes: The batch sizes, in tokens, vLLM captures CUDA
+            graphs for; a step pads to the smallest size that holds it
+            and runs without graphs past the largest. None keeps vLLM's
+            own default.
+    """
 
     kind = "vllm"
     label = "vLLM"
@@ -250,6 +301,16 @@ class VLLMEngine:
     reads_logprobs = True
     # a decision model runs on the pooling runner
     roles = frozenset({"generative", "decision"})
+
+    def __init__(self, capture_sizes: tuple[int, ...] | None = SINGLE_CUDA_GRAPH):
+        self.capture_sizes = (None if capture_sizes is None
+                              else tuple(capture_sizes))
+        if self.capture_sizes != SINGLE_CUDA_GRAPH:
+            # vLLM fixes its graphs when the engine is built, so an
+            # engine with other graphs never shares a loaded model
+            shown = ("vllm-default" if self.capture_sizes is None
+                     else f"{len(self.capture_sizes)}-to-{self.capture_sizes[-1]}")
+            self.kind = f"{type(self).kind}-graphs-{shown}"
 
     def llm_kwargs(self, spec) -> dict:
         """Return the LLM constructor arguments beyond the model name.
@@ -266,13 +327,13 @@ class VLLMEngine:
             "enable_prefix_caching": True,
             "disable_log_stats": True,
             "tokenizer_mode": "gigatoken",
-            "compilation_config": {
-                "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
-            },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
                              else min(MAX_SEQUENCES,
                                       spec.max_num_seqs or MAX_SEQUENCES)),
         }
+        if self.capture_sizes is not None:
+            kwargs["compilation_config"] = {
+                "cudagraph_capture_sizes": list(self.capture_sizes)}
         if spec.moe_backend is not None:
             kwargs["moe_backend"] = spec.moe_backend
         speculative = os.environ.get("QUAIL_VLLM_SPECULATIVE")
