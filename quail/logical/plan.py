@@ -469,12 +469,10 @@ class Cte:
     Attributes:
         name: The name later queries read the result under.
         plan: The query that computes the result.
-        reads: The names of the earlier CTEs its scans read.
     """
 
     name: str
     plan: LogicalPlan
-    reads: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -486,9 +484,7 @@ class WithPlan:
             and earlier CTEs only, and each is read by the query or by
             a later CTE.
         query: The final SELECT.
-        reads: The names of the CTEs the final SELECT's scans read.
     """
 
     ctes: tuple[Cte, ...]
     query: LogicalPlan
-    reads: tuple[str, ...]

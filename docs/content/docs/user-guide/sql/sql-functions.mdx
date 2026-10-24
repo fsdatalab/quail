@@ -77,12 +77,11 @@ Quail supports these SQL clauses with the following limits:
 
 `WITH` names a query result so that a later query in the same
 statement can read it as a table. The named result is a common table
-expression (CTE). A subquery in `FROM` works the same way. Use a CTE
-to send the output of one AI function to another AI function.
+expression (CTE). A subquery in `FROM` works the same way.
 
 For example, imagine a `contracts` table with columns `id` and `text`.
-This query extracts the termination clause of each contract, then
-scores the clause:
+This query scores whether each contract's termination clause lets the
+tenant terminate early:
 
 ```sql
 WITH clauses AS (
@@ -95,32 +94,19 @@ SELECT x.id,
 FROM clauses x
 ```
 
-`AI.SCORE` reads the extracted clause, not the contract text.
+In this example, the CTE `clauses` first extracts the termination
+clause of each contract. Then the main query scores each extracted
+clause, so the model reads the clause instead of the full contract.
 
-A later query reads a CTE column by its name:
+The main query reads the clause as `x.clause.terms`. `clause` is the
+struct that `AI.EXTRACT` returns, and `terms` is its field. When a
+contract has no termination clause, `AI.SCORE` reads empty text.
 
-- A selected column keeps its column name. For example, `SELECT c.id`
-  gives the column `id`.
-- Every other expression needs an `AS` name.
-- `AI.EXTRACT(...) AS clause` gives the struct `clause`. Read one
-  answer as `x.clause.terms`.
+In a CTE, give each computed column an `AS` name so that a later
+query can read it.
 
-When an extraction finds no answer, the next AI function reads empty
-text.
-
-Quail merges a CTE into the query that reads it, so the statement
-runs as one plan. A CTE runs as a separate stage, before the queries
-that read it, in two cases:
-
-- An AI function reads a column the CTE computes, as in the example
-  above. The text does not exist before the model has run.
-- Two queries read the CTE. It runs once.
-
-`explain()` shows the plan of each stage and does not run them. A
-stage that runs separately must use an AI function.
-
-Limits: `WITH RECURSIVE` is not supported, and a CTE can read
-registered tables and the CTEs defined before it.
+Limits: `WITH RECURSIVE` is not supported. A CTE can read registered
+tables and the CTEs defined before it.
 
 ### Joins
 

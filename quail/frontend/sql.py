@@ -293,7 +293,7 @@ def compile_sql(
                            dialect, ctes)
     if not ctes:
         return plan
-    return WithPlan(tuple(ctes), plan, _cte_reads(plan, ctes))
+    return WithPlan(tuple(ctes), plan)
 
 
 def _qualified(tree: exp.Select, catalog: Catalog, dialect: SQLDialect) -> exp.Select:
@@ -372,7 +372,7 @@ def _compile_stage(scope: Scope, pool, tables: Catalog, prompts, dialect,
     body.set("with_", exp.With(expressions=[cte.copy() for cte in pool])
              if pool else None)
     plan = _compile_stages(body, tables, prompts, dialect, ctes)
-    ctes.append(Cte(name, plan, _cte_reads(plan, ctes)))
+    ctes.append(Cte(name, plan))
     tables.register(name, MemoryTableProvider(
         cte_schema(plan).empty_table(), id_col="", identity=f"cte:{name}"))
 
@@ -431,13 +431,6 @@ def _computed(scope: Scope) -> set:
             if isinstance(source, Scope) and value.name in _computed(source):
                 names.add(item.alias_or_name)
     return names
-
-
-def _cte_reads(plan: LogicalPlan, ctes: list) -> tuple:
-    """Return the names of the stages the plan scans."""
-    names = {cte.name for cte in ctes}
-    return tuple(dict.fromkeys(
-        scan.provider for scan in plan.operators().scans if scan.provider in names))
 
 
 def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,

@@ -22,11 +22,8 @@ from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import estimated_rows, explain
 from quail.logical import (
-    ColumnRef,
     LogicalPlan,
     WithPlan,
-    column_name,
-    cte_column_names,
     cte_schema,
     join_conditions,
     oriented_join_conditions,
@@ -507,8 +504,7 @@ class Query:
         return result
 
 
-# tokens assumed per row for a CTE column the model computes, such as an
-# extraction answer or a label, when the CTE has not run yet
+# tokens assumed per row of a CTE's column when the CTE has not run yet
 ASSUMED_ANSWER_TOKENS = 32
 
 # report fields added up over the CTEs and the final SELECT
@@ -602,25 +598,15 @@ class WithQuery:
     def _assumption(self, name: str, column) -> tuple[int, int]:
         """Return the rows and tokens per row assumed for a CTE's column.
 
-        The rows are the planner's estimate for the CTE, at least one.
-        A column the CTE passes through from a registered table keeps
-        that table's mean estimated token count; a column the model
-        computes is assumed to hold ASSUMED_ANSWER_TOKENS.
+        The rows are the planner's estimate for the CTE, at least one,
+        and each row is assumed to hold ASSUMED_ANSWER_TOKENS.
         """
         physical = self._stage(name).plan()
         rows = None if isinstance(physical, Refusal) else estimated_rows(physical)
         if rows is None:
             rows = sum(len(lengths) for lengths in self._stage(name)._document_tokens
                        .values())
-        cte = self.ctes[name]
-        names = dict(zip(cte_column_names(cte.plan), cte.plan.root.result_columns()))
-        projected = {column_name(c): c for c in cte.plan.projection.columns}
-        source = projected.get(names.get(column_references(column)[0].column))
-        tokens = ASSUMED_ANSWER_TOKENS
-        if isinstance(source, ColumnRef):
-            lengths = self._view.inputs.estimate_lengths(source.provider, source)
-            tokens = round(sum(lengths) / len(lengths)) if len(lengths) else 0
-        return max(1, round(rows)), tokens
+        return max(1, round(rows)), ASSUMED_ANSWER_TOKENS
 
     def _assumed_lengths(self, name: str, column) -> TokenLengths:
         rows, tokens = self._assumption(name, column)
@@ -654,10 +640,7 @@ class WithQuery:
             results = self._results
         parts = []
         for name, plan in self._stages():
-            reads = self.logical.reads if name == "" else self.ctes[name].reads
             title = "query" if name == "" else f"with {name}"
-            if reads:
-                title += " (reads " + ", ".join(reads) + ")"
             pending = {scan.alias: scan for scan in plan.operators().scans
                        if scan.provider in self.ctes
                        and scan.provider not in self._results}

@@ -112,8 +112,6 @@ def test_a_label_feeds_a_later_filter_and_dependent_ctes_run_in_order(session):
         WHERE AI.IF(PROMPT('kept: {0}', l.kind))
     """, dialect="bq")
     assert [cte.name for cte in query.logical.ctes] == ["kinds", "leases"]
-    assert query.logical.ctes[1].reads == ("kinds",)
-    assert query.logical.reads == ("leases",)
     oracle = Oracle(
         labels=["lease", "deed", "lease"],
         filters=lambda alias, document, position: {
@@ -176,8 +174,6 @@ def test_a_subquery_in_from_and_a_nested_with_are_stages_too(session):
         WHERE AI.IF(PROMPT('kept: {0}', s.clause.terms))
     """, dialect="bq")
     assert [cte.name for cte in query.logical.ctes] == ["clauses", "scored", "s"]
-    assert [cte.reads for cte in query.logical.ctes] == [(), ("clauses",), ("scored",)]
-    assert query.logical.reads == ("s",)
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     scores=lambda spec, ids: 0.9 if ids[0] == 0 else 0.1,
                     filters=lambda alias, document, position: {
@@ -237,7 +233,7 @@ def test_an_empty_cte_result_gives_an_empty_result(session):
 def test_explain_plans_later_stages_on_named_assumptions(session, monkeypatch):
     query = session.sql(EXTRACT_THEN_SCORE)
     planned = query.explain()
-    assert planned.index("with clauses:") < planned.index("query (reads clauses):")
+    assert planned.index("with clauses:") < planned.index("query:")
     assert ("'x' reads the CTE 'clauses', which has not run; planned on 3 rows "
             f"of {ASSUMED_ANSWER_TOKENS} tokens each") in planned
     assert "run:" not in planned
@@ -246,7 +242,7 @@ def test_explain_plans_later_stages_on_named_assumptions(session, monkeypatch):
     assert plan.estimated_seconds == sum(
         stage.estimated_seconds for stage in plan.plans)
     assert set(plan.to_envelope(session.registry.codecs)) == {"ctes", "query"}
-    # a passed-through document column keeps the source table's lengths
+    # a CTE read twice runs as a stage
     passthrough = session.sql("""
         WITH kept AS (
             SELECT c.id, c.text FROM contracts c
@@ -255,7 +251,8 @@ def test_explain_plans_later_stages_on_named_assumptions(session, monkeypatch):
         SELECT a.id FROM kept a JOIN kept b
           ON AI.IF(PROMPT('alike: {0} {1}', a.text, b.text))
     """, dialect="bq")
-    assert "planned on 1 rows of 8 tokens each" in passthrough.explain()
+    assert (f"planned on 1 rows of {ASSUMED_ANSWER_TOKENS} tokens each"
+            in passthrough.explain())
 
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     scores=lambda spec, ids: 0.5)
@@ -350,7 +347,7 @@ def test_with_rejects_what_the_stages_cannot_express(session):
     assert renamed.logical.ctes[0].plan.schema().names == ["a", "b", "b_span"]
     unnamed = session.sql(
         f"SELECT id FROM ({extract}) WHERE AI_FILTER(PROMPT('k {{0}}', clause.terms))")
-    assert [cte.name for cte in unnamed.logical.ctes] == list(unnamed.logical.reads)
+    assert len(unnamed.logical.ctes) == 1
     with pytest.raises(RuntimeError, match="edited plans"):
         session.sql(f"WITH clauses AS ({extract}) {read}").run(plan=object())
     assert isinstance(compile_sql(
