@@ -751,7 +751,8 @@ def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
 
     run_stages(state.torch, state.loaded_model.arena,
                state.loaded_model.pipeline, stages.stages, stages.prefixes,
-               state.chunk_tokens, anchor_keys=stages.keys)
+               state.chunk_tokens, anchor_keys=stages.keys,
+               appended_tokens=stages.appended_tokens)
     stages.finish()
     asked = stages.documents[0].answers[0]
     assert asked.done and len(asked.written) == stages.spec.max_answer_tokens

@@ -161,12 +161,20 @@ class StageExecutor:
                                    self.canvas_rows)
                                if stage.single])
         appended = sorted(
-            (tuple(frame), int(suffixes.lengths.max()))
+            (tuple(frame), int(suffixes.lengths.max()), stage.repeats)
             for frame, suffixes, stage in zip(self.frames, self.suffixes, self.stages)
             if stage.append)
         for frame, group in groupby(appended, key=lambda entry: entry[0]):
-            kept = sum(tokens for _, tokens in group)
-            if appended_tokens is not None:
+            entries = list(group)
+            kept = sum(tokens for _, tokens, _ in entries)
+            if any(repeats for _, _, repeats in entries):
+                # a repeating stage appends its suffix every round, so
+                # only the caller's bound says what it leaves in KV
+                if appended_tokens is None:
+                    raise ValueError("a repeating append stage needs "
+                                     "appended_tokens")
+                kept = max(kept, int(appended_tokens))
+            elif appended_tokens is not None:
                 kept = min(kept, int(appended_tokens))
             self.capacity_extra = max(self.capacity_extra, len(frame) + kept)
         # append-stage tokens each document holds after its frame

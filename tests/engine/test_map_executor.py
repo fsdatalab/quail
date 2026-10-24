@@ -23,8 +23,12 @@ def make_map_spec(tables, **settings) -> MapSpec:
         instruction="Summarize the document.", **settings)
 
 
-def _map_one(monkeypatch, text, gold, *extra, recurrent=False, **settings):
-    """Put one instruction to one document; return its settled answer."""
+def _map_one(monkeypatch, text, gold, *extra, recurrent=False, on_state=None,
+             **settings):
+    """Put one instruction to one document; return its settled answer.
+
+    on_state, when given, is called with the state before the run.
+    """
     tables = make_vocabulary(text, *([gold] if gold else []), *extra)
     spec = make_map_spec(tables, **settings)
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
@@ -33,6 +37,8 @@ def _map_one(monkeypatch, text, gold, *extra, recurrent=False, **settings):
     monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
     state = _state(model, recurrent=recurrent)
     state.loaded_model.vocabulary = tables
+    if on_state is not None:
+        on_state(state)
     stages = MapStages(state, [spec], tables, [0], [tables.encode_ids(text)])
     key = stages.documents[0].key
     model.documents[key] = text
@@ -224,3 +230,27 @@ def test_rejected_copies_teach_the_policy_to_stop_drafting(monkeypatch):
                            max_answer_tokens=24)
     # each round feeds the chosen token and at most a few draft tokens
     assert asked.fed_tokens <= 3 * asked.steps + 24
+
+
+def test_a_document_reserves_kv_for_the_whole_answer_and_a_draft(monkeypatch):
+    # the rounds repeat one stage, so the reservation comes from the
+    # answer cap, not from the stages' suffixes summed
+    reserved = {}
+
+    def record(state):
+        arena = state.loaded_model.arena
+        reserve = arena.reserve
+
+        def recording(key, tokens, *, capacity_tokens, **kw):
+            reserved[key] = (tokens, capacity_tokens)
+            return reserve(key, tokens, capacity_tokens=capacity_tokens, **kw)
+
+        arena.reserve = recording
+
+    gold = "The lease ends March 3 2027 at noon and rent is due"
+    asked, _, key = _map_one(monkeypatch, LEASE, gold, on_state=record,
+                             max_answer_tokens=12, draft_tokens=3)
+    assert asked.answer and len(asked.written) == 12
+    tokens, capacity = reserved[key]
+    # the prompt, then the tail's frame and cue, the answer, and a draft
+    assert capacity - tokens >= len(TAIL.split()) + 12 + 3
