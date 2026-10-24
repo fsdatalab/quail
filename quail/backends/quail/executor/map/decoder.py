@@ -245,16 +245,17 @@ class MapDecoder:
                 self.spec.max_answer_tokens - len(answer.written))
         if n <= 0:
             return 0
-        if n == 1:
-            # a one-token draft is the common round; a few scalar reads
-            # beat the vectorized setup
-            values = rows[0]
-            lps = values[-k:]
-            best = int(np.argmax(lps))
-            top = int(values[-2 * k + best])
-            writes = (top == fed[1] and float(lps[best]) > float(values[0])
-                      and not self.vocabulary.is_stop[top])
-            return int(writes)
+        if n == 1 or k == 1:
+            # a one-token draft is the common round, and the top-1
+            # readout decides a row with three scalar reads
+            written = 0
+            for values in rows[:n]:
+                top, lp_top = self._top(values)
+                if (top != fed[1 + written] or float(values[0]) >= lp_top
+                        or self.vocabulary.is_stop[top]):
+                    break
+                written += 1
+            return written
         values = rows[:n]
         ids = values[:, -2 * k:-k].astype(np.int64)
         lps = values[:, -k:]
@@ -266,6 +267,15 @@ class MapDecoder:
         writes = ((top == draft) & (lp_top > stop)
                   & ~self.vocabulary.is_stop[top])
         return int(np.argmin(writes)) if not writes.all() else n
+
+    def _top(self, values) -> tuple:
+        """Return a row's likeliest token and its log probability."""
+        k = self.k
+        if k == 1:
+            return int(values[1]), float(values[2])
+        lps = values[-k:]
+        best = int(np.argmax(lps))
+        return int(values[-2 * k + best]), float(lps[best])
 
     def choose(self, document: MapDocument, q: int, values):
         """Choose the answer's next token: the model's likeliest.
@@ -279,11 +289,7 @@ class MapDecoder:
         """
         answer = document.answers[q]
         values = np.asarray(values, dtype=np.float32).reshape(-1)
-        k = self.k
-        ids = values[-2 * k:-k].astype(np.int64)
-        lps = values[-k:]
-        best = int(np.argmax(lps))
-        token, lp_top = int(ids[best]), float(lps[best])
+        token, lp_top = self._top(values)
         stop_lp = float(values[0])
         if stop_lp >= lp_top or self.vocabulary.is_stop[token]:
             self.settle(document, q)

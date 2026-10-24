@@ -35,6 +35,9 @@ class MapSpec(InferenceSpec):
             model and device. Below it a marginal draft token is close
             to free.
         top_tokens: Vocabulary candidates returned by each GPU readout.
+            Greedy decoding needs the likeliest token alone, so each
+            row carries three values: the stop, the token, and its log
+            probability.
     """
 
     instruction: str = ""
@@ -44,7 +47,7 @@ class MapSpec(InferenceSpec):
     expected_answer_tokens: int = 64
     round_cost_per_token: float = 0.0
     ridge_tokens: float = 0.0
-    top_tokens: int = 16
+    top_tokens: int = 1
 
     def __post_init__(self):
         for name in ("max_answer_tokens", "expected_answer_tokens", "top_tokens"):
