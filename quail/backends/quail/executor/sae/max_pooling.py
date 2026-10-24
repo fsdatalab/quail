@@ -157,7 +157,7 @@ class SaeMaxAccumulator:
         and question slot from the spans, one pinned copy carries them
         to the GPU, and one scatter folds every row's strengths into the
         slot its position selects. Nothing reads a data-dependent
-        shape, so the observer never synchronizes with the forward pass.
+        shape, so the hook never synchronizes with the forward pass.
         """
         spans = [span for span in chunk.row_spans if span[3] > span[1]]
         if not spans:

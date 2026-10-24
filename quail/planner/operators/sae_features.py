@@ -21,12 +21,12 @@ def sae_features_spec(context, call, name, expected_rows, resident=False):
             step of the same pipeline before this one.
     """
     model = context.model
-    if not model.sae_hf_name or not model.residual_readout:
+    if model.sae is None:
         raise SaeFeaturesRefusedError(Refusal(
-            reasons=(f"AI.SAE_FEATURES needs a model with an SAE; "
+            reasons=(f"AI.SAE_FEATURES needs a model loaded with an SAE; "
                      f"{model.name!r} has none",),
-            constraint="model_without_sae", needed=1, available=0,
-            unit="sae"))
+            constraint="unsupported_sae_features_query", needed=1,
+            available=0, unit="queries"))
     prompt = context.lowered(call.prompt)
     (ref,) = call.prompt.args
     summary = summarize_alias(

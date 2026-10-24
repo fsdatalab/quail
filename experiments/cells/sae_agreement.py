@@ -88,8 +88,8 @@ def reference() -> dict:
         spec.hf_name, revision=spec.revision or None,
         torch_dtype=torch.bfloat16).to("cuda")
     model.eval()
-    sae_path = hf_hub_download(spec.sae_hf_name, spec.sae_file,
-                               revision=spec.sae_revision or None)
+    sae_path = hf_hub_download(spec.sae.hf_name, spec.sae.file,
+                               revision=spec.sae.revision or None)
     sae = torch.load(sae_path, map_location="cuda", weights_only=True)
     captured = {}
 
@@ -108,7 +108,7 @@ def reference() -> dict:
             last = captured["residual"][0, -1].float()
             pre = last @ sae["W_enc"].T.float().cuda() + sae["b_enc"].float(
             ).cuda()
-            values, index = torch.topk(pre.clamp(min=0.0), spec.sae_keep)
+            values, index = torch.topk(pre.clamp(min=0.0), spec.sae.keep)
             record["hidden"].append(last.cpu().tolist())
             record["features"].append(sorted(
                 int(feature) for feature, value in

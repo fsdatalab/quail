@@ -56,9 +56,8 @@ def test_the_spec_loads_the_sae_and_stops_at_layer_11():
     assert spec.layers == 12 and spec.checkpoint_layers == 24
     # layers 0 to 11 hold 9 Gated DeltaNet layers and 3 attention layers
     assert len(spec.gdn_layers) == 9 and len(spec.attention_layers) == 3
-    assert spec.residual_readout
-    assert spec.sae_num_features == 32_768 and spec.sae_keep == 100
-    assert spec.sae_file == "layer11.sae.pt"
+    assert spec.sae.num_features == 32_768 and spec.sae.keep == 100
+    assert spec.sae.file == "layer11.sae.pt"
     # half the checkpoint's attention layers, so half the KV per token
     full = MODELS["qwen3.5-4b-bf16"]
     assert len(spec.attention_layers) == len(full.attention_layers) * 12 // 32

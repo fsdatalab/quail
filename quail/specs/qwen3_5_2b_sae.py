@@ -1,4 +1,4 @@
-from .base import ModelSpec
+from .base import ModelSpec, SaeSpec
 
 # Every fourth layer is attention; the others are Gated DeltaNet. The
 # checkpoint has 24 layers; this spec loads layers 0 to 11 (9 Gated
@@ -46,12 +46,11 @@ QWEN3_5_2B_SAE_BF16 = ModelSpec(
     gdn_key_dim=128,
     gdn_value_dim=128,
     conv_width=4,
-    # a base checkpoint: prompts are raw text with no chat turn, as the
-    # quail-bench feature questions are rendered
-    residual_readout=True,
-    sae_hf_name="Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_100",
-    sae_revision="027267657257a8d490296286e8fab41e1c1a1a3d",
-    sae_file="layer11.sae.pt",
-    sae_num_features=32_768,
-    sae_keep=100,
+    sae=SaeSpec(
+        hf_name="Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_100",
+        revision="027267657257a8d490296286e8fab41e1c1a1a3d",
+        file="layer11.sae.pt",
+        num_features=32_768,
+        keep=100,
+    ),
 )

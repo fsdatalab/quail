@@ -13,6 +13,7 @@ from .base import (
     ModelSpec,
     Precision,
     Role,
+    SaeSpec,
 )
 from .decision_2_kai_0_6b import DECISION_2_KAI_0_6B_BF16
 from .diffusion_gemma_26b import DIFFUSION_GEMMA_26B_FP8
@@ -52,7 +53,7 @@ MODAL_GPU_USD_PER_HOUR = {
 
 __all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "LayerKind",
            "ModelSpec",
-           "Precision", "Role", "MODELS", "DEVICES", "QWEN3_4B_FP8",
+           "Precision", "Role", "SaeSpec", "MODELS", "DEVICES", "QWEN3_4B_FP8",
            "QWEN3_5_2B_SAE_BF16", "QWEN3_5_4B_BF16",
            "QWEN3_5_4B_FP8", "QWEN3_5_27B_FP8", "QWEN3_8_27B_FP8", "LFM2_2_6B_BF16",
            "QWEN3_32B_FP8", "QWEN3_6_35B_A3B_FP8",

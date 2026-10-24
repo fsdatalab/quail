@@ -113,7 +113,7 @@ class SaeFeaturesPart(SingleResultPart):
                 accumulator = SaeMaxAccumulator(torch, encoder,
                                                 document_tokens)
                 self._pipeline = state.loaded_model.pipeline
-                self._pipeline.row_observer = accumulator.observe
+                self._pipeline.forward_hook = accumulator.observe
             self.accumulator = accumulator
             self.accumulator.register_call()
 
@@ -165,9 +165,9 @@ class SaeFeaturesPart(SingleResultPart):
             del self.pending[anchor]
 
     def complete(self, tokens, spans, stats, offset):
-        # the part that set the observer releases it once the run ends
+        # the part that set the hook releases it once the run ends
         if self._pipeline is not None:
-            self._pipeline.row_observer = None
+            self._pipeline.forward_hook = None
             self._pipeline = None
         super().complete(tokens, spans, stats, offset)
 

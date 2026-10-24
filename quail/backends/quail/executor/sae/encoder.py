@@ -20,8 +20,8 @@ class SaeEncoder:
     def __init__(self, torch, F, weight, bias, keep: int):
         self.torch = torch
         self.F = F
-        self.weight = weight    # (sae_num_features, hidden) bf16
-        self.bias = bias        # (sae_num_features,) fp32
+        self.weight = weight    # (num_features, hidden) bf16
+        self.bias = bias        # (num_features,) fp32
         self.keep = keep
         self.num_features = weight.shape[0]
 
@@ -33,21 +33,22 @@ class SaeEncoder:
             ValueError: The spec names no SAE, or the tensors do not
                 match its width.
         """
-        if not spec.sae_hf_name or not spec.sae_file:
+        sae = spec.sae
+        if sae is None:
             raise ValueError(f"{spec.name!r} names no SAE checkpoint")
         from huggingface_hub import hf_hub_download
 
-        path = hf_hub_download(spec.sae_hf_name, spec.sae_file,
-                               revision=spec.sae_revision or None)
+        path = hf_hub_download(sae.hf_name, sae.file,
+                               revision=sae.revision or None)
         tensors = torch.load(path, map_location="cpu", weights_only=True)
         weight = tensors["W_enc"]
         bias = tensors["b_enc"]
-        if tuple(weight.shape) != (spec.sae_num_features, spec.hidden):
+        if tuple(weight.shape) != (sae.num_features, spec.hidden):
             raise ValueError(
-                f"{spec.sae_file} W_enc is {tuple(weight.shape)}, expected "
-                f"({spec.sae_num_features}, {spec.hidden})")
+                f"{sae.file} W_enc is {tuple(weight.shape)}, expected "
+                f"({sae.num_features}, {spec.hidden})")
         return cls(torch, F, weight.to(device="cuda", dtype=torch.bfloat16),
-                   bias.to(device="cuda", dtype=torch.float32), spec.sae_keep)
+                   bias.to(device="cuda", dtype=torch.float32), sae.keep)
 
     def top_features(self, rows):
         """Return (indices int32, strengths fp32), the keep largest per row."""

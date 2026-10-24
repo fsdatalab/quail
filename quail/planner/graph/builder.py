@@ -62,7 +62,7 @@ from quail.planner.search.table_steps import (
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import (
     ClassifyRefusedError,
-    ScoreRefusedError,
+    RefusedError,
     score_projections,
     validate_query,
 )
@@ -194,8 +194,7 @@ class GraphBuilder:
             score_pairs = self._emit_pair_scores(port_by_alias, joins)
         except ClassifyRefusedError as refused:
             return refused.refusal()
-        except ScoreRefusedError as refused:
-            # SaeFeaturesRefusedError carries its refusal the same way
+        except RefusedError as refused:
             return refused.refusal
         self._emit_result(port_by_alias, row_ports, joins, score_pairs)
         return self._finish()

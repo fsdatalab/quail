@@ -30,7 +30,7 @@ class Chunk:
         tokens: Rows in the chunk.
         layout: (arena key, suffix count) per group in chunk order.
         row_spans: (arena key, first row, first suffix row, end row) per
-            group in chunk order; a pipeline's row observer reads them.
+            group in chunk order; a pipeline's forward hook reads them.
         temporary_keys: Arena keys the loop frees after the forward pass.
         fresh_keys: Keys whose prefix this chunk computes; the loop
             trims their sliding pages after the pass.

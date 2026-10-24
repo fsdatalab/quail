@@ -177,13 +177,17 @@ def answer_weights(model, token_ids):
 
 
 def keep_layers(torch, model, num_layers: int):
-    """Keep the first num_layers decoder layers and free the rest.
+    """Keep the first num_layers decoder layers in the forward pass.
 
-    The whole checkpoint is loaded first, then the tail layers are
-    dropped: vLLM's load_weights maps every checkpoint tensor onto a
-    parameter, so a module list shorter than the checkpoint fails the
-    load. The peak is the full model's memory, which an H100 holds for
-    the models this is used with.
+    The whole checkpoint is loaded first, then the module list is cut:
+    vLLM's load_weights maps every checkpoint tensor onto a parameter,
+    so a module list shorter than the checkpoint fails the load. The
+    cut does not release the dropped layers' memory: measured on
+    Qwen3.5-2B-Base, the memory after the cut is the full model's, so
+    something still references their weights.
+
+    Raises:
+        ValueError: The checkpoint has fewer than num_layers layers.
     """
     text = getattr(model, "language_model", model)
     layers = text.model.layers

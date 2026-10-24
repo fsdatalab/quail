@@ -29,7 +29,7 @@ def _refusal(reason: str, constraint: str = "unsupported_score_query"):
     )
 
 
-class ScoreRefusedError(Exception):
+class RefusedError(Exception):
     """Carries a Refusal out of the plan builder."""
 
     def __init__(self, refusal: Refusal):
@@ -37,7 +37,11 @@ class ScoreRefusedError(Exception):
         self.refusal = refusal
 
 
-class SaeFeaturesRefusedError(ScoreRefusedError):
+class ScoreRefusedError(RefusedError):
+    """Carries an AI.SCORE Refusal out of the plan builder."""
+
+
+class SaeFeaturesRefusedError(RefusedError):
     """Carries an AI.SAE_FEATURES Refusal out of the plan builder."""
 
 
@@ -57,10 +61,10 @@ def sae_features_refusal(operators, context, scored: bool) -> Refusal | None:
     features = bool(operators.sae_features)
     others = bool(operators.filters or operators.joins or scored
                   or operators.labels.calls or operators.extracts)
-    if features and (not model.sae_hf_name or not model.residual_readout):
+    if features and model.sae is None:
         return Refusal(
-            reasons=(f"AI.SAE_FEATURES needs a model loaded with an SAE "
-                     f"and a residual readout; {model.name!r} has neither",),
+            reasons=(f"AI.SAE_FEATURES needs a model loaded with an SAE; "
+                     f"{model.name!r} has none",),
             constraint="unsupported_sae_features_query",
             needed=1, available=0, unit="queries")
     if features and others:
@@ -70,7 +74,7 @@ def sae_features_refusal(operators, context, scored: bool) -> Refusal | None:
                      "so its KV cannot serve a full-depth operator",),
             constraint="unsupported_sae_features_query",
             needed=1, available=0, unit="queries")
-    if not features and model.residual_readout:
+    if not features and model.sae is not None:
         return Refusal(
             reasons=(f"{model.name!r} reads the residual stream for "
                      f"AI.SAE_FEATURES only; run other operators on a "
@@ -274,7 +278,7 @@ def validate_query(plan, operators, context, model, device, gpus):
     labels, applies = operators.labels, operators.applies
     scored = has_score(plan)
     if operators.sae_features or (
-            context is not None and context.model.residual_readout):
+            context is not None and context.model.sae is not None):
         refusal = sae_features_refusal(operators, context, scored)
         if refusal is not None:
             return refusal
