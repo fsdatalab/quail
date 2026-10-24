@@ -4,6 +4,7 @@
     "index",
     "imdb-filter",
     "civil-comments",
-    "agent-trace-compaction"
+    "agent-trace-compaction",
+    "support-intents"
   ]
 }

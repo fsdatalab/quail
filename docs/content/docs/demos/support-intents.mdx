@@ -1,0 +1,155 @@
+---
+title: Support intents
+description: Find customer intents in support conversations with SAE features.
+---
+
+The support intents demo shows how you can use `AI.SAE_FEATURES` to find
+what customers ask for, without a list of intents to start from.
+
+With `AI.CLASSIFY`, you choose the labels before you read the data. With
+SAE features, you read the data first. Quail returns the features of
+each request. You count the features, then read the requests where each
+feature is strongest to find what it means.
+
+## Data
+
+The demo uses the 1,320 conversations of the QUAIL-B `support_traces`
+table. The conversations come from
+[τ-bench](https://github.com/sierra-research/tau-bench). Two models act
+as the support agent for simulated customers of an airline and a retail
+store. Each row contains these columns:
+
+| Column | Contents |
+| --- | --- |
+| `request` | The customer's first message. |
+| `task_id` | The customer task. Each of the 165 tasks has 8 conversations. |
+| `domain` | `airline` or `retail`. |
+| `reward` | 1 when the agent completed the task, and 0 when it failed. |
+
+The agent completed 778 tasks and failed 542.
+
+## Query
+
+The query reads the features of each request:
+
+```python
+query = (
+    session.docs("conversations").alias("t")
+    .ai_sae_features(
+        prompt("{0}\n\nWhat is the customer asking for?", col("t.request")),
+        pooling="last", name="intent")
+    .select("t.id", "intent")
+)
+features = query.collect()
+```
+
+The `last` pooling uses the last token of the prompt. The question comes
+after the request, so the question changes these features toward the
+customer's intent. Each request gets its 100 strongest features.
+
+## Model
+
+Quail runs `qwen3.5-2b-sae-bf16` on one H100. See
+[Qwen3.5 2B Base with Qwen-Scope SAE](/docs/user-guide/models#qwen35-2b-base-with-qwen-scope-sae).
+
+## Read the features
+
+The demo uses numpy and pyarrow for the steps after the query.
+
+1. **Flatten the lists.** `list_flatten` gives one entry for each
+   (request, feature) pair, and `list_parent_indices` gives the request
+   of each entry:
+
+   ```python
+   lists = features.column("intent").combine_chunks()
+   pairs = pc.list_flatten(lists)
+   rows = pc.list_parent_indices(lists).to_numpy()
+   feature = pairs.field("feature").to_numpy()
+   strength = pairs.field("strength").to_numpy()
+   ```
+
+2. **Weight each feature by how rare it is.** Some features occur in
+   almost every request. These features describe the form of a support
+   request, not one intent. The demo multiplies each strength by
+   `log(requests / requests with the feature)`, the same weight that
+   TF-IDF gives a word. A rare feature keeps more of its strength.
+
+3. **Keep the 3 features with the largest weight in each request.**
+   Then count how many requests keep each feature.
+
+4. **Read the examples.** For each frequent feature, the demo prints the
+   requests where the feature has the largest weight, one request for
+   each task.
+
+## Results
+
+The 8 most frequent features occur in 36 to 50 requests each. This table
+shows 4 of them, with the first sentence of the request where each
+feature has the largest weight. The last column is our reading of the
+first three examples.
+
+| Feature | Requests | Strongest request | Reading |
+| ---: | ---: | --- | --- |
+| 24933 | 50 | Hi, I need to cancel one of my flights booked on May 17. | Cancel a flight. |
+| 30532 | 37 | Hi, I recently purchased a 500ml water bottle, but I'm having second thoughts. | Exchange a product for another model. |
+| 9464 | 36 | Hi there! I need to make some changes to my upcoming roundtrip flights between Detroit and New York. | Change a flight booking. |
+| 4561 | 37 | Hi, I received a bicycle that was damaged during delivery, and I'm really frustrated. | Mixed: damaged or worn deliveries, and a flight cancellation for a family emergency. |
+
+Not every feature is one intent. Feature 4561 occurs in requests about
+two different problems. Read several examples before you name a
+feature.
+
+Then the demo compares how often each feature occurs in failed and in
+completed conversations. It keeps features that occur in at least 20
+requests.
+
+| Feature | Failed conversations | Completed conversations | Reading |
+| ---: | ---: | ---: | --- |
+| 14888 | 3.5% | 0.6% | Book, change, or upgrade a flight. |
+| 9464 | 4.1% | 1.8% | Change a flight booking. |
+| 30532 | 3.9% | 2.1% | Exchange a product for another model. |
+
+Requests to change a flight or to exchange a product occur more often
+when the agent fails. These features occur in 24 to 37 requests, and
+each task has 8 conversations, so the requests are not independent. Use a result like this to choose conversations to read,
+not as a measurement.
+
+## Other uses
+
+- **Compare two groups.** Count the features in each group, e.g., the
+  conversations of two products, and read the features whose shares
+  differ most.
+- **Find documents with one feature.** After you name a feature, keep the
+  rows whose list contains it.
+- **Watch agent traces.** Read the features of each step of an agent
+  trace to find a behavior that repeats, e.g., the same failed command.
+
+## Run
+
+The source is
+[`demos/support_intents.py`](https://github.com/fsdatalab/quail/tree/main/demos/support_intents.py).
+It loads the table with the QUAIL-B package.
+
+<Tabs items={['Local H100', 'Modal']}>
+<Tab>
+
+```bash
+uv run python demos/support_intents.py --output-dir /tmp/support-intents
+```
+
+The demo writes `features.parquet` and `report.json` to the output
+directory.
+
+</Tab>
+<Tab>
+
+```bash
+uv run modal run --detach demos/support_intents_modal.py
+```
+
+The Modal wrapper mounts the `quail-results` volume and writes the same
+files under `demos/support-intents/` inside the volume. The wrapper
+prints the Modal function call id before waiting for the query.
+
+</Tab>
+</Tabs>
