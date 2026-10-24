@@ -162,6 +162,8 @@ class Suffixes:
     @classmethod
     def of(cls, sequences):
         """Flatten token sequences, each possibly made of parts."""
+        if isinstance(sequences, Suffixes):
+            return sequences
         if (len(sequences) == 1 and isinstance(sequences[0], list)
                 and len(sequences[0]) < 64):
             # a decode round's one short suffix skips the parts walk

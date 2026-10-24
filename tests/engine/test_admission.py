@@ -567,3 +567,33 @@ def test_a_limit_paces_admission_by_the_parts_survival():
     sched.report(1, 0, 0, 1, [1])
     sched.report(2, 0, 0, 1, [1])
     assert sched.limit_reached() and sched.next_chunk(500) == []
+
+
+def test_a_repeating_stage_asks_the_anchor_again_until_its_callback_passes_it_on():
+    # one anchor; stage 0 is a plain stage and stage 1 repeats: its
+    # callback hands out one request per round, then SKIP after three
+    rounds = []
+
+    def partners(stage):
+        if stage == 0:
+            return [0]
+        rounds.append(stage)
+        return SKIP if len(rounds) > 3 else [0]
+
+    sched = JoinAdmission([50], [[10], [10]], 250, arena_pages=100,
+                          page_tokens=16, anchor_partners={0: partners},
+                          repeats=[False, True])
+    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
+    report = sched.report(0, 0, 0, 1, [1])
+    assert list(report.transitions) == [(0, 0, True)]
+    assert not report.settlements
+    for _ in range(2):
+        assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+        report = sched.report(0, 1, 0, 1, [1])
+        assert not report.transitions and not report.settlements
+        assert not sched.done()
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+    report = sched.report(0, 1, 0, 1, [1])
+    assert list(report.settlements) == [Settlement("finished", 0, True)]
+    assert sched.done() and sched.survivors == 1
+    assert rounds == [1, 1, 1, 1]

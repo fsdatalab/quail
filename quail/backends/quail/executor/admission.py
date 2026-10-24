@@ -215,6 +215,10 @@ class JoinAdmission:
             before packs no frame rows. None writes every frame.
         limit: Stop admitting anchors once this many survived the last
             stage; None runs every anchor.
+        repeats: Per stage, whether an anchor whose decision is true is
+            asked again at the same stage, with its answers dropped,
+            until its callable partner request passes it on with SKIP
+            or SkipTo, or drops it.
         survival: The fraction of anchors expected to survive every
             stage, or None. Under a limit, anchors are admitted only
             while the ones in flight are expected to fall short of it;
@@ -252,8 +256,11 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
-                 stop_groups=None, stop_width=1, reserve=None):
+                 stop_groups=None, stop_width=1, reserve=None, repeats=None):
         k = len(stage_suffixes)
+        self.repeats = [False] * k if repeats is None else list(repeats)
+        if len(self.repeats) != k:
+            raise ValueError("repeats must match stage_suffixes")
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
         if len(self.answer_dtypes) != k:
@@ -716,7 +723,19 @@ class JoinAdmission:
             self._true[a][j] = True
         settlements = []
         transitions = []
-        if j == self._stage[a] and j + 1 < k:
+        if (j == self._stage[a] and complete and self.repeats[j]
+                and self._true[a][j]):
+            # the stage asks the anchor again; its answers were read
+            self.answers[j].pop(a, None)
+            self._answer_counts[j].pop(a, None)
+            settled = self._enter(a, j)
+            if settled is None:
+                self.ready.append(a)
+            else:
+                transitions.append((a, j, True))
+                settlements.append(Settlement(
+                    settled, a, bool(self._true[a][-1])))
+        elif j == self._stage[a] and j + 1 < k:
             if self._true[a][j] and self._next[a] == num_partners:
                 # the whole stream is launched, so every later chunk
                 # is behind it on the stream and the next stage's
@@ -732,7 +751,8 @@ class JoinAdmission:
                 self._stage[a] = _DONE
                 transitions.append((a, j, False))
                 settlements.append(Settlement("dropped", a, False))
-        if j == k - 1 and complete:
+        if j == k - 1 and complete and not (
+                self.repeats[j] and self._true[a][j]):
             self._stage[a] = _DONE
             if self._true[a][j]:
                 self.survivors += 1

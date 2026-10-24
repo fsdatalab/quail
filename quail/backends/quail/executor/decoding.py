@@ -22,6 +22,7 @@ from functools import partial
 
 import numpy as np
 
+from quail.backends.quail.executor.chunk import Suffixes
 from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.parts import (
     DocumentAnswerPart,
@@ -92,26 +93,26 @@ class AnswerStages:
     def _question_stages(self, q: int, name: str, tail: list) -> list:
         """Build one question's stages: its tail, then the answer's rounds.
 
-        The tail but its last token is the frame of every stage, so
+        The tail but its last token is the frame of both stages, so
         the scheduler writes it once after the document; the first
         stage rewinds past what the question before appended. The
         last token of the tail, the cue, is the stage's suffix, whose
-        row chooses the answer's first token.
+        row chooses the answer's first token. The second stage repeats
+        a round, feeding the chosen token and a draft, until the answer
+        is done and its callback passes the document on.
         """
         frame, last = tail[:-1], tail[-1]
-        stages = [Stage(
-            suffixes=[[last]], frame=frame, rewind=True,
-            readout=self.readout, decide=partial(self._tail_decide, q),
-            single=True, append=True, label=f"{name} tail")]
-        stages.extend(
+        return [
+            Stage(suffixes=[[last]], frame=frame, rewind=True,
+                  readout=self.readout, decide=partial(self._tail_decide, q),
+                  single=True, append=True, label=f"{name} tail"),
             Stage(suffixes=partial(self._step_suffix, q),
                   suffix_tokens=(1 + self.spec.draft_tokens)
                   * (2 if self.recurrent else 1), frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
-                  read_all_rows=True,
-                  single=True, append=True, label=f"{name} round {t}")
-            for t in range(1, self.spec.max_answer_tokens + 1))
-        return stages
+                  read_all_rows=True, single=True, append=True, repeats=True,
+                  label=f"{name} rounds"),
+        ]
 
     @property
     def appended_tokens(self) -> int:
@@ -164,7 +165,6 @@ class AnswerStages:
         document = self._document(key)
         answer = document.answers[q]
         if answer.done:
-            # the rest of this question's rounds pass in one step
             return Stage.SkipTo(self.question_starts[q + 1])
         accepted = answer.fed[:len(answer.fed) - answer.discard]
         tokens = self._draft(document, answer, q)
@@ -173,7 +173,9 @@ class AnswerStages:
             return StageRequests([accepted + tokens],
                                  write_suffix_tokens=len(accepted),
                                  read_rows=[len(tokens)])
-        return StageRequests([tokens], discard=answer.discard)
+        return StageRequests(
+            Suffixes(np.array(tokens, dtype=np.int64), [len(tokens)]),
+            discard=answer.discard)
 
     def _draft(self, document, answer, q) -> list:
         """Return the tokens the next round feeds: the chosen token, then a draft."""

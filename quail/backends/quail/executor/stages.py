@@ -90,6 +90,9 @@ class Stage:
         rewind: Whether the request's tokens follow the frame directly,
             in place of the tokens earlier append stages added, as the
             first stage of a new question over the same document does.
+        repeats: Whether a document whose decision is true is asked
+            again at this stage, until its suffixes callback passes it
+            on with SKIP or SkipTo, or drops it.
         label: Name displayed in progress messages.
         paths: Optional trie paths and ancestor references from trie_paths().
         read_mask: Optional mask of the rows read in the sole paths
@@ -114,6 +117,7 @@ class Stage:
     single: bool = False
     rewind: bool = False
     append: bool = False
+    repeats: bool = False
     label: str = ""
     paths: list | None = None
     read_mask: Any = None

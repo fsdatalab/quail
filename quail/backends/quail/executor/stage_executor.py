@@ -215,6 +215,7 @@ class StageExecutor:
             stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
             reserve=self._reserve if self.paged else None,
+            repeats=[stage.repeats for stage in self.stages],
         )
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
@@ -547,9 +548,10 @@ class StageExecutor:
                 position[key] += 1        # the frame entry's answer means nothing
             count = end - start
             rows = values[key][position[key]:position[key] + count]
-            result = self.sched.report(a, j, start, end, rows)
             if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
+                # the request was packed; a repeating stage asks anew
                 del self.own[(j, a)]
+            result = self.sched.report(a, j, start, end, rows)
             if self.on_answers is not None:
                 self.on_answers(a, j, start, end, rows)
             for settlement in result.settlements:
