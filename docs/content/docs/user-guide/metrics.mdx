@@ -61,6 +61,23 @@ read from saved KV. Computing the same position again counts again.
 `fresh_tokens` counts model computation. It does not count every token
 in every prompt when the model reuses KV.
 
+### KV kept between queries
+
+With `host_kv_bytes` set (see
+[Sessions](/docs/user-guide/sessions#keeping-kv-between-queries)),
+`report["kv_manager"]` also counts the host store's work for the query.
+
+| Field | Meaning |
+| --- | --- |
+| `host_kv_hits` | Documents whose prefix KV was copied back from the host instead of computed. |
+| `host_kv_restored_tokens` | Token positions those copies covered. They are not fresh tokens. |
+| `host_kv_saved_keys` | Documents whose prefix KV was copied to the host when the GPU freed it. |
+| `host_kv_saved_tokens` | Token positions those copies covered. |
+| `host_kv_skipped_keys` | Documents not saved because the store was full of this query's own documents. |
+| `host_kv_s` | Host seconds spent hashing prefixes and starting the copies. The copies themselves run beside the model. |
+| `host_kv_wait_s` | The part of `host_kv_s` spent waiting for the device to finish reading a row index, when saves outran the link. |
+| `host_kv_entries` | Documents the store holds at the end of the query. |
+
 ## Operator metrics
 
 `report["node_metrics"]` contains measurements for each physical operator.

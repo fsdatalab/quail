@@ -72,9 +72,10 @@ def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
         invalidate=lambda: calls.append("invalidate")))
     gpu.arena = SimpleNamespace(
         num_pages=8, num_sliding_pages=0, k=[], v=[], gdn_state=None,
-        conv_state=None, resize=lambda *a, **kw: calls.append("resize"))
+        conv_state=None, host=None, resize=lambda *a, **kw: calls.append("resize"))
     gpu.model = gpu.F = None
     gpu.decision_head = None
+    gpu.host_kv_bytes = 0
     # a dense model keeps no checkpoint slots, so resize gets no state pool
     gpu.spec = MODELS["qwen3-4b-fp8"]
     gpu.device = H100_SXM
@@ -84,6 +85,44 @@ def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
     calls.clear()
     gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
     assert calls == ["synchronize", "invalidate", "resize"]
+
+
+def test_bind_query_starts_the_host_store_at_the_configured_size(
+        booted, monkeypatch):
+    stores = []
+
+    class FakeStore:
+        def __init__(self, arena, capacity_bytes, torch):
+            self.num_rows = capacity_bytes // 10
+            self.bytes = capacity_bytes
+            self.flushed = False
+            stores.append(self)
+
+        def flush(self):
+            self.flushed = True
+
+    monkeypatch.setattr(worker, "HostKV", FakeStore)
+    gpu = LoadedGpu.__new__(LoadedGpu)
+    gpu.torch = sys.modules["torch"]
+    gpu.pipeline = SimpleNamespace(decode_graphs=None)
+    gpu.arena = SimpleNamespace(
+        num_pages=8, num_sliding_pages=0, k=[], v=[], gdn_state=None,
+        conv_state=None, host=None, resize=lambda *a, **kw: None)
+    gpu.model = gpu.F = None
+    gpu.decision_head = None
+    gpu.spec = MODELS["qwen3-4b-fp8"]
+    gpu.device = H100_SXM
+    gpu.host_kv_bytes = 0
+    gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
+    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
+    assert gpu.arena.host is None and not stores
+    gpu.bind_query([1], [2], 32, arena_pages=(8, 0), host_kv_bytes=1000)
+    assert gpu.arena.host is stores[0] and stores[0].bytes == 1000
+    # the same size keeps the store and its entries for the next query
+    gpu.bind_query([1], [2], 32, arena_pages=(8, 0), host_kv_bytes=1000)
+    assert gpu.arena.host is stores[0] and len(stores) == 1
+    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
+    assert gpu.arena.host is None and stores[0].flushed
 
 
 def test_prepared_boot_is_handed_to_the_query_and_used_once(

@@ -39,6 +39,7 @@ def run_backend_group(
     gpu_timing: bool = False,
     suite_name: str | None = None,
     canvas_draws: str | None = None,
+    host_kv_bytes: int = 0,
 ) -> dict:
     """Run backend methods in one process, sharing a model when possible.
 
@@ -58,6 +59,8 @@ def run_backend_group(
         canvas_draws: Comma-separated maximum diffusion draw counts, or None
             to keep the default. Each count runs its own Quail suite, named
             ``quail-draws<count>`` when there is more than one.
+        host_kv_bytes: Host bytes of document KV Quail keeps between
+            queries; 0 keeps none.
 
     Returns:
         A dictionary containing the family, queries, collection ID, GPU IDs,
@@ -97,6 +100,7 @@ def run_backend_group(
                     device="h100-sxm",
                     attention=attention,
                     gpu_timing=gpu_timing,
+                    host_kv_bytes=host_kv_bytes,
                     **({} if draws is None else {"canvas_draws": draws}),
                 ),
                 data_dir=Path(data_dir) / f"sf{scale_factor}",

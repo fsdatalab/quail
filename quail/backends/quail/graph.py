@@ -85,7 +85,10 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     arena = state["gpu"].arena
     for key in arena.resident_keys():
         arena.free_key(key)
+    arena.reclaim(wait=True)
     arena.reset_stats()
+    if arena.host is not None:
+        arena.host.begin_query()
     # the peak memory reported is this query's, not the process's
     state["gpu"].torch.cuda.reset_peak_memory_stats()
     retention = payload.get("retention", {})
@@ -137,6 +140,7 @@ def execution_measurements(context: ExecutionContext) -> dict:
             "evicted_keys": arena.evicted_keys,
             "evicted_pages": arena.evicted_pages,
             "evicted_prefix_tokens": arena.evicted_prefix_tokens,
+            **(arena.host.report() if arena.host is not None else {}),
         },
         "memory": memory_report(gpu),
     }
@@ -154,6 +158,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     wall = time.perf_counter() - started
     for key in arena.resident_keys():
         arena.free_key(key)
+    arena.reclaim(wait=True)
     report = graph_report(graph, result, wall, state["device"],
                           gpu_timing=state.get("gpu_timing", False))
     measurements = execution_measurements(context)

@@ -206,6 +206,8 @@ class Query:
             extra = {}
             if config.gpu_timing:
                 extra["gpu_timing"] = True
+            if config.host_kv_bytes:
+                extra["host_kv_bytes"] = int(config.host_kv_bytes)
             if extra and not isinstance(self._plan, Refusal):
                 self._plan = replace(self._plan, settings={
                     **self._plan.settings, **extra})
@@ -350,9 +352,16 @@ class Query:
             else:
                 # Explicit physical edits must survive exact tokenization.
                 self._plan = refine_plan(self._plan, **options)
-            if self.session.config.gpu_timing and not isinstance(self._plan, Refusal):
-                self._plan = replace(self._plan, settings={
-                    **self._plan.settings, "gpu_timing": True})
+            config = self.session.config
+            if not isinstance(self._plan, Refusal):
+                extra = {}
+                if config.gpu_timing:
+                    extra["gpu_timing"] = True
+                if config.host_kv_bytes:
+                    extra["host_kv_bytes"] = int(config.host_kv_bytes)
+                if extra:
+                    self._plan = replace(self._plan, settings={
+                        **self._plan.settings, **extra})
             self._replanning_s += time.perf_counter() - started
             self._estimated = ()
 
