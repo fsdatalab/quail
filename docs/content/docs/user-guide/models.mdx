@@ -144,7 +144,7 @@ image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
-    .uv_pip_install("quail-engine==0.1.0")
+    .uv_pip_install("quail-engine==0.2.0")
     .env({
         "HF_HOME": "/model-cache",
         "QUAIL_CACHE_DIR": "/kernel-cache/quail",
@@ -187,7 +187,7 @@ def main():
     print(report)
 ```
 
-The example installs Quail 0.1.0 in the GPU image.
+The example installs Quail 0.2.0 in the GPU image.
 Collect the rows inside the session before returning from the function.
 
 ### Run and retrieve the result
