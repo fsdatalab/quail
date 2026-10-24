@@ -21,6 +21,7 @@ from quail.logical.prompts import (
     bind_classify_prompt,
     bind_join_prompt,
     bind_prompt,
+    comparison_text,
     label_text,
     letter_candidates,
     render_qwen3_reranker_input,
@@ -247,6 +248,22 @@ def render_join_prompt_ids(lowered: LoweredPrompt, documents,
         if index != anchor:
             out += list(pieces[index][0]) + list(document_ids)
     return out + list(lowered.tail_token_ids)
+
+
+def rank_token_parts(prompt, model, tokenizer) -> tuple[tuple[int, ...], ...]:
+    """Tokenize the three pieces of a pairwise comparison prompt.
+
+    Args:
+        prompt: The bound AI.RANK prompt.
+        model: The model the comparison is laid out for.
+        tokenizer: Maps text to token ids.
+
+    Returns:
+        Token ids before the pivot, between the documents, and after
+        the second document.
+    """
+    return tuple(
+        tuple(tokenizer(part)) for part in comparison_text(prompt.template, model))
 
 
 def score_token_parts(prompt, model, tokenizer) -> tuple[tuple[int, ...], ...]:

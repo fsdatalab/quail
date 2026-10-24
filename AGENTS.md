@@ -131,6 +131,8 @@ one. `tools/check_names.py` enforces the chosen words:
   sharding.
 - `AI.MAP` is on the roadmap.
   Open-ended generation, speculation, and forking are not supported.
+- `AI.RANK` ranks rows by pairwise model comparisons and returns the
+  top k.
 
 # What Quail builds on and learns from
 

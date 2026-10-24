@@ -14,6 +14,7 @@ from quail.frontend.expressions import (
     PromptSpec,
     SortSpec,
     WindowSpec,
+    ai_rank,
     col,
 )
 from quail.frontend.label_tables import read_label_table
@@ -79,6 +80,7 @@ class Query:
         self._aggs = {}              # name -> AggSpec
         self._having = []            # HavingSpec
         self._windows = {}           # name -> WindowSpec
+        self._rank_bounds = {}       # AI.RANK name -> (< or <=, k)
 
     # ---- scope -------------------------------------------------------
 
@@ -610,9 +612,31 @@ class Query:
 
     filter = where
 
+    def ai_topk(self, p: PromptSpec, k: int = 25, partition_by=()) -> "Query":
+        """Keep the k rows AI.RANK places first in each partition.
+
+        Args:
+            p: The criterion, over one document column.
+            k: How many rows to keep in each partition.
+            partition_by: Columns that are ranked separately, as
+                ``over(partition_by=...)`` takes them.
+
+        Returns:
+            This query builder.
+        """
+        if type(k) is not int or k <= 0:
+            raise CompileError("AI.RANK keeps a positive number of rows")
+        if "__rank" in self._windows:
+            raise CompileError("ai_topk() ranks once")
+        self.window(__rank=ai_rank(p).over(partition_by=partition_by))
+        return self.where(col("__rank") <= k)
+
     def _where_test(self, test: PredicateSpec) -> None:
         """Route one test to the scan, a label filter, or an answer filter."""
         spec = test.col
+        if spec.alias is None and spec.column in self._windows:
+            self._rank_filter(spec.column, test)
+            return
         if spec.alias is None and spec.column in self._labels:
             if test.comparison not in ("=", "in"):
                 raise CompileError(
@@ -721,8 +745,9 @@ class Query:
         for name, spec in calls.items():
             if not isinstance(spec, WindowSpec):
                 raise CompileError(
-                    f"window() takes row_number(), lag(), lead(), sum_(), or "
-                    f"count() with .over(...), got {spec!r} for {name!r}")
+                    f"window() takes row_number(), lag(), lead(), sum_(), "
+                    f"count(), or ai_rank() with .over(...), got {spec!r} "
+                    f"for {name!r}")
             self._windows[name] = spec
         return self
 
@@ -751,8 +776,9 @@ class Query:
                 f"join() of {self._pending_join[0]} has no AI predicate "
                 f"over its pairs; a plain join belongs in the database "
                 f"the ids came from")
+        ranked = any(spec.function == "ai_rank" for spec in self._windows.values())
         if not (self._joins or self._filters or self._labels or self._scores
-                or self._extracts):
+                or self._extracts or ranked):
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "
                                "came from")
@@ -877,6 +903,9 @@ class Query:
                        else self._project(columns, c) for c in cols)
         windows = []
         for name, spec in self._windows.items():
+            if spec.function == "ai_rank":
+                windows.append(self._rank_call(columns, name, spec))
+                continue
             argument = None if spec.col is None else self._project(columns, spec.col)
             windows.append(WindowCall(
                 spec.function, argument,
@@ -885,6 +914,44 @@ class Query:
                       for key, descending, nulls_first in _sort_keys(spec.order)),
                 name))
         return tuple(windows), output
+
+    def _rank_filter(self, name: str, test: PredicateSpec) -> None:
+        """Record the one < or <= bound on an AI.RANK column."""
+        if self._windows[name].function != "ai_rank":
+            raise CompileError(
+                f"where() does not filter the window {name!r}")
+        if test.comparison not in ("<", "<="):
+            raise CompileError("AI.RANK is filtered with < or <=")
+        if type(test.value) is not int or test.value <= 0:
+            raise CompileError("AI.RANK is filtered by a positive integer")
+        if name in self._rank_bounds:
+            raise CompileError("AI.RANK takes one < or <= filter")
+        self._rank_bounds[name] = (test.comparison, test.value)
+
+    def _rank_call(self, columns: list, name: str, spec: WindowSpec) -> WindowCall:
+        """Bind one ai_rank() window, including its id column."""
+        if not isinstance(spec.col, PromptSpec):
+            raise CompileError("ai_rank() takes a prompt()")
+        if spec.order:
+            raise CompileError(
+                "AI.RANK takes no ORDER BY; filter its rank with < or <=")
+        refs = tuple(self._resolve_value(c) for c in spec.col.cols)
+        bound = self._prompts.bind("rank", spec.col.template, refs)
+        for ref in refs:
+            self._note_document_column(ref)
+        if len(refs) != 1:
+            raise CompileError("AI.RANK reads one document column")
+        (ref,) = refs
+        provider = self._scope()[ref.alias]
+        id_ref = ColumnRef(
+            ref.alias, provider, self._catalog.get(provider).id_col)
+        if column_name(id_ref) not in {column_name(column) for column in columns}:
+            columns.append(id_ref)
+        comparison, k = self._rank_bounds.get(name, ("", 0))
+        return WindowCall(
+            "ai_rank", None,
+            tuple(self._project(columns, column) for column in spec.partition),
+            (), name, prompt=bound, rank_comparison=comparison, rank_k=k)
 
     def _aggregation(self, cols) -> tuple:
         """Bind group_by(), agg(), and having() to the selected names.

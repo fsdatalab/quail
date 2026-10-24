@@ -483,6 +483,59 @@ def _bind_choice_classify_prompt(template, args, labels, descriptions,
                   tail_segments=segments, **recipe)
 
 
+def bind_rank_prompt(template: str, args: tuple,
+                     turn: tuple[str, str] = ("", ""),
+                     layout: str = "ai-if") -> Prompt:
+    """Build an AI.RANK prompt that keeps the criterion as written.
+
+    The comparison text that shows two rows is built later, so the
+    template stays the criterion the query named.
+
+    Args:
+        template: Prompt template with one ``{0}``.
+        args: The one document column the criterion reads.
+        turn: Unused; the comparison layout carries its own text.
+        layout: Unused; AI.RANK comparisons are laid out by the planner.
+
+    Returns:
+        A prompt of kind ``rank``.
+
+    Raises:
+        CompileError: The template placeholders do not match the column.
+    """
+    _check_placeholders(template, len(args))
+    if len(args) != 1:
+        raise CompileError("AI.RANK reads one document column")
+    return Prompt(template=template, args=tuple(args), preamble="", tail="",
+                  kind="rank")
+
+
+def comparison_text(template: str, model) -> tuple[str, str, str]:
+    """Return the text before, between, and after the two compared documents.
+
+    The first document is the pivot. It comes first so a round computes
+    its KV once and reuses it for every other row.
+
+    Args:
+        template: The criterion template, with one ``{0}``.
+        model: The model the comparison is laid out for.
+
+    Returns:
+        The pivot's prefix, the text between the documents, and the
+        text after the second document.
+    """
+    criterion = _without_document(template, "{0}")
+    if getattr(model, "role", None) == "reranker":
+        rendered = render_qwen3_reranker_input(criterion, "{document}")
+        before, after = rendered.split("{document}")
+        return before, "\n", after
+    return (
+        "Criterion: " + criterion + "\n\nDocument A:\n",
+        "\n\nDocument B:\n",
+        "\n\nDoes document A fit the criterion better than document B?",
+    )
+
+
 def bind_score_prompt(template: str, args: tuple,
                       turn: tuple[str, str] = ("", ""),
                       layout: str = "ai-if") -> Prompt:

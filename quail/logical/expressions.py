@@ -248,7 +248,7 @@ class Prompt:
         frame: The text after the anchor document that every pair shares.
         frame_text: The text whose token count is the frame's; empty
             when the prompt has no frame.
-        kind: filter, join, label, extract, or score.
+        kind: filter, join, label, extract, score, or rank.
         layout: The PROMPT_LAYOUTS name the text was built with.
         tail_segments: The tail after the placeholder, one entry per
             separately tokenized segment; empty means one segment.
@@ -809,6 +809,11 @@ class WindowCall:
     the rows, and ``order`` the (column, descending, nulls_first) keys
     that order each partition. sum and count run from the partition's
     first row to the current one.
+
+    An ``ai_rank`` call carries the comparison prompt instead of an
+    argument. ``rank_comparison`` and ``rank_k`` are the ``<`` or
+    ``<=`` filter on that rank; both stay empty until the query
+    filters it.
     """
 
     function: str
@@ -816,15 +821,21 @@ class WindowCall:
     partition: tuple[str, ...]
     order: tuple[tuple[str, bool, bool], ...]
     name: str
+    prompt: Optional["Prompt"] = None
+    rank_comparison: str = ""
+    rank_k: int = 0
 
     type_name: ClassVar[str] = "quail.window_call"
 
     def validate(self, projected: tuple) -> None:
         """Check the function and that every column it reads is projected."""
+        if self.function == "ai_rank":
+            self._validate_rank(projected)
+            return
         if self.function not in WINDOW_FUNCTIONS:
             raise CompileError(
                 f"unsupported window function {self.function!r}; supported: "
-                f"{', '.join(WINDOW_FUNCTIONS)}")
+                f"{', '.join(WINDOW_FUNCTIONS)}, ai_rank")
         if self.function == "row_number" and self.argument is not None:
             raise CompileError("row_number() takes no column")
         if self.function in ("lag", "lead", "sum") and self.argument is None:
@@ -838,6 +849,24 @@ class WindowCall:
                     f"the window {self.name!r} reads {column!r}, which is not "
                     f"a projected column")
 
+    def _validate_rank(self, projected: tuple) -> None:
+        if self.prompt is None or self.prompt.kind != "rank":
+            raise CompileError("AI.RANK needs a prompt over one document column")
+        if len(self.prompt.args) != 1:
+            raise CompileError("AI.RANK reads one document column")
+        if self.argument is not None or self.order:
+            raise CompileError("AI.RANK takes no argument and no ORDER BY")
+        if self.rank_comparison not in ("", "<", "<="):
+            raise CompileError("AI.RANK is filtered with < or <=")
+        if self.rank_comparison and (
+                type(self.rank_k) is not int or self.rank_k <= 0):
+            raise CompileError("AI.RANK is filtered by a positive integer")
+        for column in self.partition:
+            if column not in projected:
+                raise CompileError(
+                    f"the window {self.name!r} reads {column!r}, which is not "
+                    f"a projected column")
+
     def __str__(self) -> str:
         clauses = []
         if self.partition:
@@ -846,6 +875,10 @@ class WindowCall:
             clauses.append("order by " + ", ".join(
                 f"{name}{' desc' if descending else ''}"
                 for name, descending, _ in self.order))
+        if self.function == "ai_rank":
+            filt = (f" {self.rank_comparison} {self.rank_k}"
+                    if self.rank_comparison else "")
+            return (f"{self.name} = AI.RANK over ({' '.join(clauses)}){filt}")
         return (f"{self.name} = {self.function}({self.argument or ''}) "
                 f"over ({' '.join(clauses)})")
 

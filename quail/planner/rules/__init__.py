@@ -11,6 +11,7 @@ from quail.planner.rules.physical import (
     ChooseAttentionAlgorithm,
     ChooseClassifyImplementation,
     ShouldEliminateWindowSort,
+    ShouldPlanAiTopK,
     ShouldPushDownLimit,
     ShouldPushDownLimitThroughWindow,
     ShouldRetainKv,
@@ -27,7 +28,8 @@ def built_in_rules() -> tuple:
     """
     return (
         ShouldEliminateDistinct(), ShouldPushDownDistinct(), ShouldPushDownProjection(),
-        ShouldPushDownFilters(), ShouldLiftMaps(), ShouldEliminateWindowSort(),
+        ShouldPushDownFilters(), ShouldLiftMaps(), ShouldPlanAiTopK(),
+        ShouldEliminateWindowSort(),
         ShouldPushDownLimitThroughWindow(), ShouldPushDownLimit(),
         ChooseClassifyImplementation(), ShouldRetainKv(), ShouldSharePrefixes(),
         ChooseAttentionAlgorithm(),

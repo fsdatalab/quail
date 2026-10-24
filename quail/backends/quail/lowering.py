@@ -8,7 +8,11 @@ from quail.planner.graph.builder import build_physical_plan
 from quail.planner.optimizer.candidates import PhysicalCandidate
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import answer_ids
-from quail.planner.validation import has_label, joined_classification_refusal
+from quail.planner.validation import (
+    has_label,
+    has_rank,
+    joined_classification_refusal,
+)
 
 
 def plan_region(region, context) -> tuple[PhysicalCandidate, ...]:
@@ -20,8 +24,9 @@ def plan_region(region, context) -> tuple[PhysicalCandidate, ...]:
                 constraint="reranker_only_scores", needed=1, available=0,
                 unit="AI.CLASSIFY expressions"), float("inf")),)
     scored = has_score(region.logical_plan)
+    ranked = has_rank(region.logical_plan)
     if context.model.role == "reranker":
-        if not scored:
+        if not scored and not ranked:
             refusal = Refusal(
                 reasons=("a reranker model can only be used with AI.SCORE",),
                 constraint="reranker_only_scores",

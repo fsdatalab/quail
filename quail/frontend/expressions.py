@@ -308,6 +308,18 @@ def count(c=None) -> AggSpec:
     return AggSpec("count", c)
 
 
+def ai_rank(p: PromptSpec) -> AggSpec:
+    """Rank rows by pairwise comparisons of one document column.
+
+    Filter the rank with ``<`` or ``<=`` to keep the top rows. ``over()``
+    takes the partition, the same way as the other window functions.
+
+    Args:
+        p: The criterion, with one document column.
+    """
+    return AggSpec("ai_rank", p)
+
+
 def row_number() -> AggSpec:
     """The row's position in its partition, from 1; needs ``over()``."""
     return AggSpec("row_number", None)

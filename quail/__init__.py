@@ -4,7 +4,7 @@ from quail.api import Query, RefusalError, Session
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
 from quail.execution.result import QueryResult
 from quail.extensions import ExtensionRegistry
-from quail.frontend.expressions import col, prompt
+from quail.frontend.expressions import ai_rank, col, prompt
 from quail.frontend.sql import SQLDialect
 from quail.logical import (
     SHARED_PRE,
@@ -39,6 +39,7 @@ __all__ = [
     "Session",
     "SpeedOfLightEstimate",
     "SQLDialect",
+    "ai_rank",
     "TableProvider",
     "bind_join_prompt",
     "bind_prompt",
