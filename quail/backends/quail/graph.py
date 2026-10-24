@@ -163,6 +163,10 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
                           gpu_timing=state.get("gpu_timing", False))
     measurements = execution_measurements(context)
     report.update(kv_manager=measurements["kv_manager"], **measurements["memory"])
+    # positions read from KV kept from an earlier query count toward
+    # quail-b's minimum beside the fresh ones
+    report["restored_tokens"] = measurements["kv_manager"].get(
+        "host_kv_restored_tokens", 0)
     return report
 
 

@@ -154,4 +154,5 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpus: int,
     report = graph_report(graph, result, time.perf_counter() - started, device,
                           gpus=gpus, gpu_timing=payload.get("gpu_timing", False))
     report.update(execution.report())
+    report["restored_tokens"] = report["kv_manager"].get("host_kv_restored_tokens", 0)
     return report

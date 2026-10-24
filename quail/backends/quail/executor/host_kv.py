@@ -13,13 +13,20 @@ way. The host pool is a ring over token rows: a new entry takes the
 rows after the newest one and drops the oldest entries in its way.
 Every entry is one contiguous run of rows in each pool.
 
-A save is one kernel launch per layer group on the store's stream,
-reading the scattered pages and writing the host rows directly over
-PCIe (host_copy). The key's rows are complete, since a key is freed
-once its answers were read, and the arena keeps the pages until the
-save's event has fired (KVArena.reclaim), so nothing waits: not the
-host, not the next pass. A restore is the same launch the other way,
-on the compute stream, into pages the arena reserved.
+A save gathers the key's scattered rows into one staging block on
+the device with one launch per layer group, then hands the block to
+the copy engine, both on the store's stream. The key's rows are
+complete, since a key is freed once its answers were read, and the
+arena keeps the pages until the gather has read them
+(KVArena.reclaim), so nothing waits: not the host, not the next pass.
+A restore is the reverse: the copy engine fills a staging block on
+the store's stream and the compute stream scatters it into the pages
+the arena reserved, ahead of the pass that reads them. A kernel
+writing host memory directly would need no staging, but it holds the
+SMs for the whole transfer and slowed the passes beside it; the copy
+engine does not. Staging blocks are few and reused once their copy
+has landed; when none is free, a save is skipped and a restore
+becomes a miss, so the store never paces the query.
 
 A key's rows are saved only once an operator computed or restored them
 (mark_written); pages reserved for a chunk that never ran hold nothing.
@@ -31,15 +38,16 @@ from collections import deque
 
 import numpy as np
 
-from quail.backends.quail.executor.host_copy import copy_rows
 from quail.catalog.tokens import token_array
 
 # pinned slots for row indices on their way to the device, and the
 # longest prefix a slot holds; a longer one pins its own buffer. A
-# save in flight holds its slot, so a burst of saves past the slots
-# waits at the link's speed; 4096 slots of 4096 rows are 128 MB
+# save in flight holds its slot; 4096 slots of 4096 rows are 128 MB
 INDEX_SLOTS = 4096
 INDEX_TOKENS = 4096
+# staging blocks per layer group and direction; a 300-token document
+# of a 4B model takes about 45 MB, so 8 each way is about 720 MB
+MAX_STAGING = 8
 
 
 def prefix_hash(prefix) -> bytes:
@@ -122,16 +130,16 @@ class HostKV:
     group's pool is (rows, layers in the group, 2, heads * d_head), so
     an entry's rows hold every layer of the group as one block. When
     the group's layers sit at aligned offsets of the arena's storage,
-    the block moves in one launch; otherwise one per layer.
+    the block gathers in one launch; otherwise one per layer.
 
     Args:
         arena: The KVArena whose layers the pools mirror.
         capacity_bytes: Host bytes for KV rows and checkpoints.
         torch: The torch module.
         pinned: Allocate pinned (page-locked) host memory, which the
-            kernels read and write directly, and queue saves on a side
-            stream. None pins on a CUDA arena; False for CPU tests,
-            where every copy runs at once.
+            copy engine reads and writes directly, and queue saves on
+            a side stream. None pins on a CUDA arena; False for CPU
+            tests, where every copy runs at once.
     """
 
     def __init__(self, arena, capacity_bytes: int, torch, *, pinned=None):
@@ -182,6 +190,7 @@ class HostKV:
         self._fresh = set()     # hashes saved during this query
         self._flat = [self._flat_view(layers, width)
                       for layers, width, _ in self._groups]
+        self._staging = {}      # (direction, group) -> [[tensor, event], ...]
         self.stream = (torch.cuda.Stream(device=self.device)
                        if self.pinned else None)
         self._index_slots = None
@@ -251,6 +260,7 @@ class HostKV:
         self.restored_keys = 0
         self.restored_tokens = 0
         self.skipped_keys = 0
+        self.busy_keys = 0
         self.host_s = 0.0
         self.wait_s = 0.0
 
@@ -264,6 +274,7 @@ class HostKV:
             "host_kv_restored_keys": self.restored_keys,
             "host_kv_restored_tokens": self.restored_tokens,
             "host_kv_skipped_keys": self.skipped_keys,
+            "host_kv_busy_keys": self.busy_keys,
             "host_kv_s": round(self.host_s, 4),
             "host_kv_wait_s": round(self.wait_s, 4),
             "host_kv_entries": len(self.entries),
@@ -307,8 +318,8 @@ class HostKV:
     def before_free(self, key):
         """Save a registered key's prefix rows before the arena frees them.
 
-        The key must be resident. Returns the event the save's copies
-        record, which the arena waits on before it reuses the pages,
+        The key must be resident. Returns the event the save's gather
+        records, which the arena waits on before it reuses the pages,
         or None when nothing was saved or the copies ran at once.
         """
         named = self._keys.get(key)
@@ -322,10 +333,15 @@ class HostKV:
         if self.num_slots and arena.checkpoint_tokens(key) != prefix_tokens:
             return None
         started = time.perf_counter()
+        if not self._staging_free("save"):
+            # every staging block is still on its way to the host: the
+            # document is saved the next time it is freed
+            self.busy_keys += 1
+            return None
         start, evicted = self.ring.plan(prefix_tokens)
         # a store smaller than the query's documents keeps the first
         # ones it saved: a save that would drop one of them would move
-        # the rows for nothing
+        # the rows over PCIe for nothing
         if start is None or any(self._by_start[old_start] in self._fresh
                                 for old_start, _ in evicted):
             self.skipped_keys += 1
@@ -410,58 +426,119 @@ class HostKV:
         event.synchronize()
         self.wait_s += time.perf_counter() - started
 
-    def _move(self, key, start, tokens, slot, stream, to_host: bool):
-        """Move the key's prefix rows between its pages and the entry's rows.
+    # ---- staging blocks on the device ------------------------------------
 
-        One launch per layer group, on `stream`; the checkpoint, when
-        the key has one, as two plain copies.
-        """
-        arena = self.arena
-        for (layers, width, sliding), pool, flat in zip(
-                self._groups, self.pools, self._flat):
-            rows, origin = self._entry_rows(key, tokens, sliding, stream)
-            block = pool[start + origin:start + tokens]
-            if flat is not None:
-                view, bases = flat
-                index = (rows[:, None] + bases[None, :]).reshape(-1)
-                if to_host:
-                    copy_rows(view, block.view(-1, width), source_rows=index)
-                else:
-                    copy_rows(block.view(-1, width), view, destination_rows=index)
+    def _staging_free(self, direction) -> bool:
+        """Whether every layer group has a staging block free to use."""
+        if not self.pinned:
+            return True
+        for group in range(len(self._groups)):
+            blocks = self._staging.setdefault((direction, group), [])
+            if len(blocks) < MAX_STAGING:
                 continue
+            if not any(block[1] is None or block[1].query() for block in blocks):
+                return False
+        return True
+
+    def _staging_block(self, direction, group, shape):
+        """A device block of `shape` whose last use has finished.
+
+        Blocks are reused once their event has fired and allocated
+        while fewer than MAX_STAGING exist; _staging_free checked that
+        one is free. On the CPU a block is allocated per call and the
+        entry is None.
+        """
+        torch = self.torch
+        numel = 1
+        for size in shape:
+            numel *= size
+        if not self.pinned:
+            return torch.empty(shape, dtype=self.arena.dtype), None
+        blocks = self._staging[(direction, group)]
+        block = next((block for block in blocks
+                      if block[1] is None or block[1].query()), None)
+        if block is None:
+            block = [None, None]
+            blocks.append(block)
+        if block[0] is None or block[0].numel() < numel:
+            block[0] = torch.empty(numel, dtype=self.arena.dtype, device=self.device)
+        return block[0][:numel].view(shape), block
+
+    def _mark(self, block, stream):
+        """Record on `stream` that the block's queued use is complete after it."""
+        if block is not None:
+            block[1] = self.torch.cuda.Event()
+            block[1].record(stream)
+
+    def _gather(self, key, tokens, group, stream):
+        """Gather the key's prefix rows of one layer group into a staging block."""
+        torch = self.torch
+        arena = self.arena
+        layers, width, sliding = self._groups[group]
+        rows, origin = self._entry_rows(key, tokens, sliding, stream)
+        staging, block = self._staging_block(
+            "save", group, (len(rows), len(layers), 2, width))
+        flat = self._flat[group]
+        if flat is not None:
+            view, bases = flat
+            index = (rows[:, None] + bases[None, :]).reshape(-1)
+            torch.index_select(view, 0, index, out=staging.view(-1, width))
+        else:
             for place, layer in enumerate(layers):
                 for side, tensor in enumerate(arena.layer_kv(layer)):
-                    if to_host:
-                        copy_rows(tensor.view(-1, width), block[:, place, side],
-                                  source_rows=rows)
-                    else:
-                        copy_rows(block[:, place, side], tensor.view(-1, width),
-                                  destination_rows=rows)
-        if slot is not None:
-            device_slot = arena.accounting.slots[key]
-            for host_pool, device_pool in ((self.gdn_state, arena.gdn_state),
-                                           (self.conv_state, arena.conv_state)):
-                if to_host:
-                    host_pool[slot].copy_(device_pool[device_slot],
-                                          non_blocking=self.pinned)
-                else:
-                    device_pool[device_slot].copy_(host_pool[slot],
-                                                   non_blocking=self.pinned)
+                    staging[:, place, side] = tensor.view(-1, width)[rows]
+        return staging, block, origin
+
+    def _scatter(self, key, tokens, group, staging, rows):
+        """Scatter a staging block into the key's prefix rows of one layer group."""
+        arena = self.arena
+        layers, width, _ = self._groups[group]
+        flat = self._flat[group]
+        if flat is not None:
+            view, bases = flat
+            index = (rows[:, None] + bases[None, :]).reshape(-1)
+            view.index_copy_(0, index, staging.view(-1, width))
+            return
+        for place, layer in enumerate(layers):
+            for side, tensor in enumerate(arena.layer_kv(layer)):
+                tensor.view(-1, width).index_copy_(0, rows, staging[:, place, side])
 
     def _save_rows(self, key, start, tokens, slot):
-        """Queue the key's save on the store's stream; returns its event."""
-        if not self.pinned:
-            self._move(key, start, tokens, slot, None, to_host=True)
-            return None
+        """Queue the key's save on the store's stream; returns the gather's event.
+
+        The gather and the checkpoint copies read the key's pages and
+        slot; the copies to the host read only the staging blocks.
+        """
         torch = self.torch
-        with torch.cuda.stream(self.stream):
-            self._move(key, start, tokens, slot, self.stream, to_host=True)
-            event = torch.cuda.Event()
-            event.record(self.stream)
-        return event
+        arena = self.arena
+        if not self.pinned:
+            for group, pool in enumerate(self.pools):
+                staging, _, origin = self._gather(key, tokens, group, None)
+                pool[start + origin:start + tokens].copy_(staging)
+            if slot is not None:
+                device_slot = arena.accounting.slots[key]
+                self.gdn_state[slot].copy_(arena.gdn_state[device_slot])
+                self.conv_state[slot].copy_(arena.conv_state[device_slot])
+            return None
+        stream = self.stream
+        with torch.cuda.stream(stream):
+            gathered = [self._gather(key, tokens, group, stream)
+                        for group in range(len(self.pools))]
+            if slot is not None:
+                device_slot = arena.accounting.slots[key]
+                self.gdn_state[slot].copy_(arena.gdn_state[device_slot],
+                                           non_blocking=True)
+                self.conv_state[slot].copy_(arena.conv_state[device_slot],
+                                            non_blocking=True)
+            read = torch.cuda.Event()
+            read.record(stream)
+            for pool, (staging, block, origin) in zip(self.pools, gathered):
+                pool[start + origin:start + tokens].copy_(staging, non_blocking=True)
+                self._mark(block, stream)
+        return read
 
     def flush(self) -> None:
-        """Wait for every save in flight."""
+        """Wait for every copy in flight."""
         if self.stream is not None:
             self.stream.synchronize()
 
@@ -472,12 +549,17 @@ class HostKV:
 
         The key holds pages for the prefix; under a sliding pool its
         window is trimmed here, as a computed key's is after its pass.
-        The copy is queued on the compute stream, ahead of the pass
-        that reads it. Returns False, leaving the pages as they were,
-        when the entry is gone.
+        The copy is queued on the store's stream and the scatter on the
+        compute stream, ahead of the pass that reads it. Returns False,
+        leaving the pages as they were, when the entry is gone or no
+        staging block is free.
         """
         entry = self.entries.get(digest)
         if entry is None:
+            self.misses += 1
+            return False
+        if not self._staging_free("restore"):
+            self.busy_keys += 1
             self.misses += 1
             return False
         start, tokens, slot = entry
@@ -487,11 +569,30 @@ class HostKV:
                 f"{key!r} holds {arena.accounting.tokens[key]} tokens; the "
                 f"saved prefix has {tokens}")
         started = time.perf_counter()
-        compute = self.torch.cuda.current_stream() if self.pinned else None
+        torch = self.torch
+        compute = torch.cuda.current_stream() if self.pinned else None
         if arena.has_sliding:
             arena.trim_window(key)
-        self._move(key, start, tokens, slot, compute, to_host=False)
+        for group, ((layers, width, sliding), pool) in enumerate(
+                zip(self._groups, self.pools)):
+            rows, origin = self._entry_rows(key, tokens, sliding, compute)
+            staging, block = self._staging_block(
+                "restore", group, (len(rows), len(layers), 2, width))
+            source = pool[start + origin:start + tokens]
+            if compute is None:
+                staging.copy_(source)
+            else:
+                with torch.cuda.stream(self.stream):
+                    staging.copy_(source, non_blocking=True)
+                compute.wait_stream(self.stream)
+            self._scatter(key, tokens, group, staging, rows)
+            self._mark(block, compute)
         if slot is not None:
+            device_slot = arena.accounting.slots[key]
+            arena.gdn_state[device_slot].copy_(self.gdn_state[slot],
+                                               non_blocking=self.pinned)
+            arena.conv_state[device_slot].copy_(self.conv_state[slot],
+                                                non_blocking=self.pinned)
             arena.record_checkpoint(key, tokens)
         self._written.add(key)
         self.hits += 1
