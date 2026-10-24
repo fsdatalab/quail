@@ -45,13 +45,13 @@ class _Entry:
     one that reached that count first keeps the place.
     """
 
-    __slots__ = ("continuations", "total", "best", "best_count")
+    __slots__ = ("continuations", "total", "best", "best_seen")
 
     def __init__(self):
         self.continuations = {}    # token -> [count, last inserting document]
         self.total = 0
         self.best = None
-        self.best_count = 0
+        self.best_seen = 0
 
     def __len__(self):
         return len(self.continuations)
@@ -93,8 +93,8 @@ class NgramCache:
                     count = found[0] = found[0] + 1
                     found[1] = document
                 entry.total += 1
-                if count > entry.best_count:
-                    entry.best, entry.best_count = token, count
+                if count > entry.best_seen:
+                    entry.best, entry.best_seen = token, count
 
     def lookup(self, context, document: int) -> NgramMatch | None:
         """Return the longest match's best continuation, or None.
@@ -114,6 +114,6 @@ class NgramCache:
             token = entry.best
             return NgramMatch(token=token, order=order,
                               fan_out=len(entry.continuations),
-                              share=entry.best_count / entry.total,
+                              share=entry.best_seen / entry.total,
                               own=entry.continuations[token][1] == document)
         return None
