@@ -7,7 +7,7 @@ Use SQL functions and clauses to process rows alongside
 expressions, conditions, grouping, sorting, and windows. Every query
 must include an AI function.
 
-Examples use BigQuery syntax unless a different dialect is named.
+Examples use BigQuery syntax unless the example specifies another dialect.
 See the [SQL reference](/docs/user-guide/sql) for dialect selection.
 
 ## Functions and query clauses
@@ -67,10 +67,42 @@ Quail supports these SQL clauses with the following limits:
   [window functions](#window-functions). Use `AS` to name a result
   column. AI outputs and window functions require a name. `*` expands
   to all table columns.
-- **`FROM`** names a registered table, with an optional alias.
+- **`FROM`** names a registered table or a [CTE](#with), with an
+  optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.
 - **`LIMIT`** takes a positive integer.
+
+### WITH
+
+`WITH` defines a common table expression (CTE), which a later query
+in the same statement can read as a table. A subquery in `FROM`
+works the same way.
+
+For example, imagine a `contracts` table with columns `id` and `text`.
+This query scores whether each contract's termination clause lets the
+tenant terminate early:
+
+```sql
+WITH clauses AS (
+    SELECT c.id,
+           AI.EXTRACT(c.text, {'terms': 'What is the termination clause?'}) AS clause
+    FROM contracts c
+)
+SELECT x.id,
+       AI.SCORE(PROMPT('Can the tenant terminate early? {0}', x.clause.terms)) AS score
+FROM clauses x
+```
+
+In this example, the CTE `clauses` first extracts the termination
+clause of each contract. Then the main query scores each extracted
+clause, so the model reads the clause instead of the full contract.
+
+In a CTE, give each computed column an `AS` name so that a later
+query can read it.
+
+Limits: `WITH RECURSIVE` is not supported. A CTE can read registered
+tables and the CTEs defined before it.
 
 ### Joins
 
@@ -429,7 +461,7 @@ ORDER BY s.run_id, s.step_index;
 The first step in each run has a null `previous` value. Later steps use
 the label already computed for the preceding row. The window calculation
 does not call the model again. A window can read a source column or an
-AI output named earlier in `SELECT`.
+AI output defined earlier in `SELECT`.
 
 ### Supported functions
 
@@ -514,6 +546,7 @@ sort reuse and limit placement.
 
 - `QUALIFY` and window functions outside the [supported list](#supported-functions)
 - `UNION`, `EXCEPT`, `INTERSECT`
+- `WITH RECURSIVE`
 - `OR` between conditions
 - `BETWEEN` and arithmetic in column comparisons
 - Queries with no AI function

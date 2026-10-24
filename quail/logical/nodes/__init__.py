@@ -16,6 +16,7 @@ from quail.logical.nodes.filter import Filter, SemanticFilter
 from quail.logical.nodes.join import Join, SemanticJoin
 from quail.logical.nodes.relational import Aggregate, Project, Result, Window
 from quail.logical.nodes.scan import Scan
+from quail.logical.nodes.with_cte import WithCTE
 
 __all__ = [
     "APPLY_IDS",
@@ -29,6 +30,7 @@ __all__ = [
     "Project",
     "Result",
     "Scan",
+    "WithCTE",
     "SemanticClassify",
     "SemanticExtract",
     "SemanticFilter",

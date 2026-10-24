@@ -7,6 +7,7 @@ from .inference import AiInference, AiScore, InferenceSpec, ScoreSpec
 from .join import AiJoin, Barrier, Foreign, HashJoin
 from .relational import Aggregate, Exchange, Limit, Project, Recombine, Sort, Window
 from .scan import Scan
+from .stage import QueryStage
 
 __all__ = [
     "Aggregate",
@@ -28,6 +29,7 @@ __all__ = [
     "Project",
     "Recombine",
     "Scan",
+    "QueryStage",
     "ScoreSpec",
     "Sort",
     "Window",

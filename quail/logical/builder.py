@@ -73,6 +73,7 @@ class LogicalPlanBuilder:
         regular_predicates: tuple = (),
         extracts: tuple = (),
         extract_filters: tuple = (),
+        schema=None,
     ) -> None:
         """Add one table with its filters, applies, classifications, and extractions.
 
@@ -80,6 +81,7 @@ class LogicalPlanBuilder:
             alias: The table's alias in the query.
             provider: The registered provider name.
             column: The document column.
+            schema: The provider's Arrow schema, for typing the result.
             predicates: The table's AI.IF predicates in written order.
             regular_predicates: RegularPredicate tests the scan applies
                 before any operator reads a document.
@@ -108,6 +110,7 @@ class LogicalPlanBuilder:
             alias=alias,
             column=column,
             predicates=tuple(regular_predicates),
+            schema=schema,
         )
         if predicates:
             node = SemanticFilter(node, tuple(predicates))

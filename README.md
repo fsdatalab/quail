@@ -37,7 +37,7 @@ WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 ## Install
 
 Install [quail-engine from PyPI](https://pypi.org/project/quail-engine/).
-The package is named `quail-engine`; in Python, import `quail`.
+In Python, import `quail`.
 
 ```bash
 uv pip install quail-engine
