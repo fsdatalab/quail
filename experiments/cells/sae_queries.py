@@ -41,12 +41,11 @@ SCALE_FACTOR = 0.1
               volumes=VOLUMES)
 def run() -> dict:
     """Each draft feature query's time, tokens, regret, and cost."""
-    from quail_b.benchmark import load_benchmark
-    from quail_b.minimum import token_metrics
-
     import quail
     from bench.quailb import run_query
     from quail.specs import H100_USD_PER_HOUR
+    from quail_b.benchmark import load_benchmark
+    from quail_b.minimum import token_metrics
 
     suite = load_benchmark(list(QUERIES), scale_factor=SCALE_FACTOR,
                            accuracy=False)
