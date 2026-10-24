@@ -143,8 +143,26 @@ class ModelSpec:
     gdn_value_dim: int = 0
     gdn_weight_precision: Precision | None = None
     conv_width: int = 0
+    checkpoint_layers: int = 0    # layers in the checkpoint; when larger
+    #                               than layers, the loader keeps the first
+    #                               `layers` and frees the rest
+    residual_readout: bool = False    # forward_chunk returns the residual
+    #                                   stream after the last loaded layer,
+    #                                   without the final norm; the SAE
+    #                                   encoder reads it
+    # The sparse autoencoder (SAE) read beside this model, for
+    # AI.SAE_FEATURES. Empty means the model serves no feature calls.
+    sae_hf_name: str = ""      # Hugging Face repo of the SAE checkpoints
+    sae_revision: str = ""     # pinned hub commit hash
+    sae_file: str = ""         # the readout layer's tensors, W_enc and b_enc
+    sae_num_features: int = 0    # encoder rows: one per feature
+    sae_keep: int = 0          # features kept per token (the SAE's top k)
 
     def __post_init__(self):
+        if self.checkpoint_layers and self.checkpoint_layers < self.layers:
+            raise ValueError(
+                f"{self.name}: checkpoint_layers ({self.checkpoint_layers}) "
+                f"is below layers ({self.layers})")
         if self.layer_kinds and len(self.layer_kinds) != self.layers:
             raise ValueError(
                 f"{self.name}: layer_kinds has {len(self.layer_kinds)} "

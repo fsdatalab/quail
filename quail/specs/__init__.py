@@ -20,6 +20,7 @@ from .h100_sxm import H100_PRICE_SOURCE, H100_SXM, H100_USD_PER_HOUR
 from .lfm2_2_6b import LFM2_2_6B_BF16
 from .qwen3 import qwen3_spec
 from .qwen3_4b import QWEN3_4B_FP8
+from .qwen3_5_2b_sae import QWEN3_5_2B_SAE_BF16
 from .qwen3_5_4b import QWEN3_5_4B_BF16, QWEN3_5_4B_FP8
 from .qwen3_5_27b import QWEN3_5_27B_FP8
 from .qwen3_6_35b import QWEN3_6_35B_A3B_FP8
@@ -30,6 +31,7 @@ from .qwen3_reranker_4b import QWEN3_RERANKER_4B_BF16
 from .rtx_pro_6000_blackwell_server import RTX_PRO_6000_BLACKWELL_SERVER
 
 MODELS = {QWEN3_4B_FP8.name: QWEN3_4B_FP8,
+         QWEN3_5_2B_SAE_BF16.name: QWEN3_5_2B_SAE_BF16,
          QWEN3_5_4B_BF16.name: QWEN3_5_4B_BF16,
          QWEN3_5_4B_FP8.name: QWEN3_5_4B_FP8,
          QWEN3_5_27B_FP8.name: QWEN3_5_27B_FP8,
@@ -50,7 +52,8 @@ MODAL_GPU_USD_PER_HOUR = {
 
 __all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "LayerKind",
            "ModelSpec",
-           "Precision", "Role", "MODELS", "DEVICES", "QWEN3_4B_FP8", "QWEN3_5_4B_BF16",
+           "Precision", "Role", "MODELS", "DEVICES", "QWEN3_4B_FP8",
+           "QWEN3_5_2B_SAE_BF16", "QWEN3_5_4B_BF16",
            "QWEN3_5_4B_FP8", "QWEN3_5_27B_FP8", "QWEN3_8_27B_FP8", "LFM2_2_6B_BF16",
            "QWEN3_32B_FP8", "QWEN3_6_35B_A3B_FP8",
            "QWEN3_RERANKER_0_6B_BF16",

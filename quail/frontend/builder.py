@@ -68,6 +68,7 @@ class Query:
         self._scores = {}            # name -> Alias of an AI.SCORE call
         # name -> an AI.EXTRACT's ExtractStruct and its fields' Aliases
         self._extracts = {}
+        self._features = {}          # name -> Alias of an AI.SAE_FEATURES call
         self._regular_predicates = {}  # alias -> [RegularPredicate]
         # alias -> [(RegularPredicate on an answer or span, selectivity)]
         self._extract_filters = {}
@@ -174,6 +175,39 @@ class Query:
         call = ModelCall(bound, "score")
         call.validate()
         self._scores[name] = Alias(call, name)
+        return self
+
+    def ai_sae_features(self, p: PromptSpec, *, reading: str,
+                        name: str) -> "Query":
+        """Add a named column of the prompt's sparse autoencoder features.
+
+        The call generates no text: the engine runs the prompt and
+        returns the nonzero features as a list of (feature, strength)
+        pairs, one list per document. Use select() to return the column.
+
+        Args:
+            p: A prompt over one document column.
+            reading: Which tokens become a row's list: "last" reads the
+                final prompt token; "max" takes each feature's largest
+                strength over every prompt token.
+            name: The feature list column's name, without a dot.
+        """
+        if self._pending_join is not None:
+            raise CompileError(
+                "join() is waiting for the ai_filter over its pairs; "
+                "read features before joining")
+        if not name or "." in name:
+            raise CompileError(
+                f"a feature call needs a column name without a dot, "
+                f"got {name!r}")
+        self._claim_name(name)
+        refs = tuple(self._resolve_value(c) for c in p.cols)
+        bound = self._prompts.bind("features", p.template, refs)
+        for ref in refs:
+            self._note_document_column(ref)
+        call = ModelCall(bound, "features", reading=reading)
+        call.validate()
+        self._features[name] = Alias(call, name)
         return self
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
@@ -298,7 +332,7 @@ class Query:
     def _claim_name(self, name: str) -> None:
         """Check that no earlier call, table alias, or source column uses the name."""
         if (name in self._labels or name in self._scores
-                or name in self._extracts
+                or name in self._extracts or name in self._features
                 or any(name == n + SPAN_SUFFIX for n in self._extracts)
                 or name in self._scope()):
             raise CompileError(f"the name {name!r} is already used")
@@ -478,11 +512,13 @@ class Query:
             if alias in self._scope():
                 raise CompileError(f"duplicate table alias {alias!r}")
             self._claim_name(alias)
-            for name in (*other._labels, *other._scores, *other._extracts):
+            for name in (*other._labels, *other._scores, *other._extracts,
+                         *other._features):
                 self._claim_name(name)
             self._labels.update(other._labels)
             self._scores.update(other._scores)
             self._extracts.update(other._extracts)
+            self._features.update(other._features)
             self._scope_.add_table(alias, provider)
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
@@ -752,7 +788,7 @@ class Query:
                 f"over its pairs; a plain join belongs in the database "
                 f"the ids came from")
         if not (self._joins or self._filters or self._labels or self._scores
-                or self._extracts):
+                or self._extracts or self._features):
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "
                                "came from")
@@ -777,6 +813,9 @@ class Query:
             if isinstance(c, str) and c in self._scores:
                 columns.append(self._scores[c])
                 continue
+            if isinstance(c, str) and c in self._features:
+                columns.append(self._features[c])
+                continue
             if isinstance(c, str) and c in self._extracts:
                 struct, members = self._extracts[c]
                 structs.append(struct)
@@ -800,6 +839,9 @@ class Query:
         # an extraction is planned when the query returns its answer
         extracted = [column for column in columns
                      if aliased_call(column, "extract") is not None]
+        # a feature call is planned when the query returns its list
+        featured = [column for column in columns
+                    if aliased_call(column, "features") is not None]
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(
@@ -817,6 +859,9 @@ class Query:
                                for column in extracted
                                if column.expression.aliases() == (alias,)),
                 extract_filters=tuple(self._extract_filters.get(alias, ())),
+                sae_features=tuple((column.expression, column.name)
+                                   for column in featured
+                                   if column.expression.aliases() == (alias,)),
             )
         for join in self._joins:
             logical.add_join(join)

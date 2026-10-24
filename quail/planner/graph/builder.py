@@ -40,6 +40,7 @@ from quail.planner.operators.classify import (
 from quail.planner.operators.extract import emit_extract
 from quail.planner.operators.filter import emit_filter
 from quail.planner.operators.join import emit_join
+from quail.planner.operators.sae_features import emit_sae_features
 from quail.planner.operators.score import (
     ScoreLowering,
     emit_projected_scores,
@@ -51,7 +52,13 @@ from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal
 from quail.planner.search.operator_order import choose_operator_order
 from quail.planner.search.statistics import filter_stop_keys
-from quail.planner.search.table_steps import ASK, CLASSIFY, EXTRACT, resident_after
+from quail.planner.search.table_steps import (
+    ASK,
+    CLASSIFY,
+    EXTRACT,
+    FEATURES,
+    resident_after,
+)
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import (
     ClassifyRefusedError,
@@ -188,6 +195,7 @@ class GraphBuilder:
         except ClassifyRefusedError as refused:
             return refused.refusal()
         except ScoreRefusedError as refused:
+            # SaeFeaturesRefusedError carries its refusal the same way
             return refused.refusal
         self._emit_result(port_by_alias, row_ports, joins, score_pairs)
         return self._finish()
@@ -270,7 +278,7 @@ class GraphBuilder:
         for s in self.operators.scans:
             # a classification or extraction the planner lifted
             # above the joins is emitted after them
-            kinds = {ASK}
+            kinds = {ASK, FEATURES}
             if s.alias not in self.after_joins:
                 kinds.add(CLASSIFY)
             if s.alias not in self.extract_after:
@@ -325,6 +333,11 @@ class GraphBuilder:
                 port, rows = emit_classify(
                     self, alias, expected_rows, positions, port
                 )
+                row_ports += rows
+            elif kind == FEATURES:
+                port, rows = emit_sae_features(
+                    self, alias, expected_rows, positions, port,
+                    resident=resident)
                 row_ports += rows
             else:
                 port, rows = emit_extract(self, alias, expected_rows, positions, port,

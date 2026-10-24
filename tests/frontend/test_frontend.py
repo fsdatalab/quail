@@ -569,7 +569,8 @@ def test_model_chat_turns_share_the_document_across_operators():
     refs = (ColumnRef("a", "documents", "text"),
             ColumnRef("b", "documents", "text"))
     for model in MODELS.values():
-        if model.role != "generative":
+        if model.role != "generative" or not model.turn_prefix:
+            # a base model, such as the SAE readout model, has no chat turn
             continue
         gemma = model.arch == "diffusion_gemma"
         start, end = ("<|turn>", "<turn|>") if gemma else (

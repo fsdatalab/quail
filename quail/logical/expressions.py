@@ -290,7 +290,9 @@ DEFAULT_SELECTIVITY = 0.2
 SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 
-MODEL_CALL_KINDS = ("boolean", "score", "label", "extract")
+MODEL_CALL_KINDS = ("boolean", "score", "label", "extract", "features")
+# the token readings of an AI.SAE_FEATURES call
+SAE_READINGS = ("last", "max")
 
 
 def effective_selectivity(selectivity: Optional[float]) -> float:
@@ -324,6 +326,9 @@ class ModelCall:
     probabilities: bool = False
     # an "extract" call only: the question the answer is copied for
     question: str = ""
+    # a "features" call only: which tokens become the row's feature
+    # list, "last" or "max"
+    reading: str = ""
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -342,10 +347,16 @@ class ModelCall:
             raise CompileError("only an AI.CLASSIFY call has labels")
         if self.kind != "extract" and self.question:
             raise CompileError("only an AI.EXTRACT call has a question")
+        if self.kind != "features" and self.reading:
+            raise CompileError("only an AI.SAE_FEATURES call has a reading")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)
         elif self.kind == "extract":
             validate_question(self.question)
+        elif self.kind == "features" and self.reading not in SAE_READINGS:
+            raise CompileError(
+                f"AI.SAE_FEATURES reading must be one of {SAE_READINGS}, "
+                f"got {self.reading!r}")
 
 
 def validate_question(question: str) -> None:
@@ -706,6 +717,10 @@ def validate_predicate(expression) -> None:
             raise CompileError(
                 "an AI.EXTRACT answer is a result column, not a predicate"
             )
+        if expression.kind == "features":
+            raise CompileError(
+                "an AI.SAE_FEATURES list is a result column, not a predicate"
+            )
         return
     raise CompileError(
         f"a predicate is a model call or a comparison of an AI.SCORE call, "
@@ -763,6 +778,9 @@ def _explain(expression) -> str:
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"
     if expression.kind == "extract":
         return f"AI.EXTRACT({expression.prompt.template!r}, {expression.question!r})"
+    if expression.kind == "features":
+        return (f"AI.SAE_FEATURES({expression.prompt.template!r}, "
+                f"reading={expression.reading!r})")
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
     return f"{function}({expression.prompt.template!r})"
 

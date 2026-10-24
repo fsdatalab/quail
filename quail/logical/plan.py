@@ -26,6 +26,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticSaeFeatures,
     Window,
 )
 
@@ -136,7 +137,7 @@ class LogicalPlan:
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, applies, classifies = [], {}, [], [], []
-        extracts, tested, aliases = [], {}, []
+        extracts, feature_calls, tested, aliases = [], [], {}, []
         nodes = self.walk()
         for node in nodes:
             if isinstance(node, Scan):
@@ -160,6 +161,8 @@ class LogicalPlan:
                 classifies.append(node)
             elif isinstance(node, SemanticExtract):
                 extracts.append(node)
+            elif isinstance(node, SemanticSaeFeatures):
+                feature_calls.append(node)
         calls = {
             (node.alias, node.name): node.call
             for node in classifies
@@ -213,6 +216,7 @@ class LogicalPlan:
             labels=_label_work(classifies, columns, label_filters),
             classifies=tuple(classifies),
             extracts=tuple(extracts),
+            sae_features=tuple(feature_calls),
         )
 
 
@@ -234,6 +238,7 @@ class Operators:
     projections: tuple = ()  # named model calls in SELECT order
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
     extracts: tuple = ()  # tuple[SemanticExtract, ...]
+    sae_features: tuple = ()  # tuple[SemanticSaeFeatures, ...]
     label_filters: dict = field(default_factory=dict)
     #                     alias -> tuple[ColumnTest, ...] on labels
     extract_filters: dict = field(default_factory=dict)

@@ -37,6 +37,49 @@ class ScoreRefusedError(Exception):
         self.refusal = refusal
 
 
+class SaeFeaturesRefusedError(ScoreRefusedError):
+    """Carries an AI.SAE_FEATURES Refusal out of the plan builder."""
+
+
+def sae_features_refusal(operators, context) -> Refusal | None:
+    """Check whether the model supports feature-call planning.
+
+    A feature call needs a model loaded with an SAE and a residual
+    readout, and such a model answers no other AI operator: its layers
+    stop where the SAE reads, so it writes no usable logits.
+    """
+    if context is None:
+        return Refusal(
+            reasons=("AI.SAE_FEATURES planning needs a planning context",),
+            constraint="unsupported_sae_features_query",
+            needed=1, available=0, unit="queries")
+    model = context.model
+    features = bool(operators.sae_features)
+    others = bool(operators.filters or operators.joins
+                  or operators.labels.calls or operators.extracts)
+    if features and (not model.sae_hf_name or not model.residual_readout):
+        return Refusal(
+            reasons=(f"AI.SAE_FEATURES needs a model loaded with an SAE "
+                     f"and a residual readout; {model.name!r} has neither",),
+            constraint="unsupported_sae_features_query",
+            needed=1, available=0, unit="queries")
+    if features and others:
+        return Refusal(
+            reasons=("AI.SAE_FEATURES does not mix with other AI operators "
+                     "in one session: the model stops at the SAE's layer, "
+                     "so its KV cannot serve a full-depth operator",),
+            constraint="unsupported_sae_features_query",
+            needed=1, available=0, unit="queries")
+    if not features and model.residual_readout:
+        return Refusal(
+            reasons=(f"{model.name!r} reads the residual stream for "
+                     f"AI.SAE_FEATURES only; run other operators on a "
+                     f"full-depth model",),
+            constraint="unsupported_sae_features_query",
+            needed=1, available=0, unit="queries")
+    return None
+
+
 def score_projections(logical) -> tuple[Alias, ...]:
     return tuple(
         expression
@@ -229,6 +272,11 @@ def score_input_tokens(spec, context) -> tuple[int, int]:
 def validate_query(plan, operators, context, model, device, gpus):
     """Return a refusal for unsupported inference or hardware requirements."""
     labels, applies = operators.labels, operators.applies
+    if operators.sae_features or (
+            context is not None and context.model.residual_readout):
+        refusal = sae_features_refusal(operators, context)
+        if refusal is not None:
+            return refusal
     scored = has_score(plan)
     if scored:
         refusal = score_refusal(plan, context)

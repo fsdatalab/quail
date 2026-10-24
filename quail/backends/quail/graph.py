@@ -23,6 +23,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiSaeFeatures,
     AiScore,
     Filter,
     PhysicalGraph,
@@ -39,6 +40,7 @@ def quail_runtimes() -> dict:
         AiScore.runtime_key: model_runtime,
         AiClassify.runtime_key: model_runtime,
         AiExtract.runtime_key: model_runtime,
+        AiSaeFeatures.runtime_key: model_runtime,
         Filter.runtime_key: FilterRuntime(),
     }
 
@@ -86,6 +88,8 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
+    # a crashed query may leave a row observer on the pipeline
+    state["gpu"].pipeline.row_observer = None
     # the peak memory reported is this query's, not the process's
     state["gpu"].torch.cuda.reset_peak_memory_stats()
     retention = payload.get("retention", {})

@@ -483,6 +483,36 @@ def _bind_choice_classify_prompt(template, args, labels, descriptions,
                   tail_segments=segments, **recipe)
 
 
+def bind_sae_features_prompt(template: str, args: tuple,
+                             turn: tuple[str, str] = ("", "")) -> Prompt:
+    """Bind an AI.SAE_FEATURES prompt over one document column.
+
+    The prompt is the document label, the document, then the question
+    as written, with no instruction and no answer cue: the call
+    generates no text, and the engine reads the prompt's SAE features
+    instead. Text before the placeholder moves after the document, so
+    the document's KV stays query independent.
+
+    Args:
+        template: Prompt template with {0}.
+        args: One column reference.
+        turn: Chat text around the prompt; empty for a base model.
+
+    Raises:
+        CompileError: The prompt reads more than one column.
+    """
+    if len(args) != 1:
+        raise CompileError("AI.SAE_FEATURES reads one document column")
+    _check_placeholders(template, len(args))
+    canonical = canonicalize_template(template)
+    frame, template = split_frame(template, SHARED_PRE)
+    preamble, tail = split_template(template)
+    return Prompt(template=canonical, args=tuple(args),
+                  preamble=turn[0] + preamble, tail=tail + turn[1],
+                  frame=frame, frame_text=f"\n\n{frame}" if frame else "",
+                  kind="features")
+
+
 def bind_score_prompt(template: str, args: tuple,
                       turn: tuple[str, str] = ("", ""),
                       layout: str = "ai-if") -> Prompt:

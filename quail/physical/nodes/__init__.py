@@ -6,6 +6,7 @@ from .filter import AiFilter, Filter
 from .inference import AiInference, AiScore, InferenceSpec, ScoreSpec
 from .join import AiJoin, Barrier, Foreign, HashJoin
 from .relational import Aggregate, Exchange, Limit, Project, Recombine, Sort, Window
+from .sae_features import AiSaeFeatures, SaeFeaturesSpec
 from .scan import Scan
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "AiFilter",
     "AiInference",
     "AiJoin",
+    "AiSaeFeatures",
     "AiScore",
     "Barrier",
     "ClassifySpec",
@@ -28,6 +30,7 @@ __all__ = [
     "Project",
     "Recombine",
     "Scan",
+    "SaeFeaturesSpec",
     "ScoreSpec",
     "Sort",
     "Window",

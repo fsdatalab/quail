@@ -21,6 +21,7 @@ from quail_b.substrait import (
     Having,
     InList,
     PlanInfo,
+    SaeFeatures,
     Score,
     Sort,
 )
@@ -45,13 +46,14 @@ def build_query(session, info: PlanInfo, selectivity=None,
         if isinstance(item, Classify) and item.partner is not None:
             continue    # labels a join's rows, so it follows the joins
         if isinstance(item, (Filter, Classify, InList, ColumnTest, Score,
-                             Extract)):
+                             Extract, SaeFeatures)):
             per_alias.setdefault(item.relation, []).append(item)
     prompts = {(item.relation, item.output): item.prompt
                for item in info.classifies}
     # a label, score, or answer struct is a named output of the builder
     named = {f"{item.relation}.{item.output}": item.output
-             for item in (*info.classifies, *info.scores)}
+             for item in (*info.classifies, *info.scores,
+                          *info.sae_features)}
     named.update({name: struct.name for struct in info.structs
                   for name in struct.fields})
 
@@ -83,6 +85,10 @@ def build_query(session, info: PlanInfo, selectivity=None,
                 query = query.ai_extract(
                     f"{alias}.{info.relation(alias).text_column}",
                     questions, name=struct.name)
+            elif isinstance(item, SaeFeatures):
+                query = query.ai_sae_features(
+                    quail.prompt(item.prompt, document(alias)),
+                    reading=item.reading, name=item.output)
             elif isinstance(item, Filter):
                 query = query.ai_filter(
                     quail.prompt(item.prompt, document(alias)),

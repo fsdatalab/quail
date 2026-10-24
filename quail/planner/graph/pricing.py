@@ -22,6 +22,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiSaeFeatures,
     AiScore,
     PhysicalGraph,
 )
@@ -104,7 +105,8 @@ class PlanPricer:
                     work=self.stage_works.get(node.written_position, Work())
                 )
                 entry["seconds"] = self._seconds(price.work)
-            elif isinstance(node, (AiScore, AiClassify, AiExtract)) \
+            elif isinstance(node, (AiScore, AiClassify, AiExtract,
+                                   AiSaeFeatures)) \
                     and node.spec is not None:
                 price = NodePrice(seconds=self._inference_seconds(node, resident))
                 entry["seconds"] = price.seconds
@@ -196,6 +198,15 @@ class PlanPricer:
 
             whole = seconds(())
             return seconds(shared) / whole if whole else 1.0
+        if isinstance(node, AiSaeFeatures):
+            # a feature call's time is taken as proportional to the
+            # tokens it computes, like a score's
+            summary = summarize_alias(context.document_tokens[alias],
+                                      context.model.sliding_window,
+                                      memo=context.memo)
+            fixed = sum(map(len, spec.prompt_token_parts))
+            total = summary.total + summary.count * fixed
+            return max(0.0, 1.0 - sum(shared) / total) if total else 1.0
         # a score's time is taken as proportional to the tokens it
         # computes, its documents borrowing the table's share of theirs
         summary = summarize_alias(context.document_tokens[alias],

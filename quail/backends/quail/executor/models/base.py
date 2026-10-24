@@ -36,12 +36,20 @@ class ModelPipeline:
     warm_row_classes = True    # row-count classes keep one KV row per reader
     warm_joins = True          # join and classification chunks borrow prefixes
     decode_graphs = None
+    # With the spec's residual_readout, forward_chunk returns the
+    # residual stream after the last loaded layer instead of the
+    # final-normed rows, and row_observer, when a query sets it, is
+    # called with (stream, chunk) over every row of each chunk before
+    # the final_indices select. The SAE feature readings use both.
+    residual_readout = False
+    row_observer = None
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.
 
-        The loop owns the chunk's pages, temporaries included; this
-        only computes.
+        With residual_readout, return the residual stream of those rows
+        instead, without the final norm. The loop owns the chunk's
+        pages, temporaries included; this only computes.
         """
         raise NotImplementedError
 

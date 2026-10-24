@@ -18,9 +18,11 @@ from quail.logical import effective_selectivity
 from quail.planner.operators.classify import classify_builder, classify_scoring
 from quail.planner.operators.extract import extract_spec
 from quail.planner.operators.filter import prepare_filter_costs
+from quail.planner.operators.sae_features import sae_features_spec
 from quail.planner.validation import ClassifyRefusedError
 
 ASK, CLASSIFY, EXTRACT = "ask", "classify", "extract"
+FEATURES = "features"
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,11 @@ class PlanPricing:
         return tuple(partial(_extract_seconds, self.context, node, resident)
                      for resident in (False, True))
 
+    def features(self, node) -> tuple:
+        """Return a feature call's (first, later) costs at a live count."""
+        return tuple(partial(_features_seconds, self.context, node, resident)
+                     for resident in (False, True))
+
     def document_head(self, prompt):
         """Return the token ids a prompt shows the document under."""
         return tuple(self.context.lowered(prompt).preamble_token_ids)
@@ -135,6 +142,13 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
         steps.append(TableStep(EXTRACT, node.name, _survival(tests.get(node.name, ())),
                                first, later,
                                document_head=pricing.document_head(node.call.prompt)))
+    for node in operators.sae_features:
+        if node.alias != alias:
+            continue
+        first, later = pricing.features(node)
+        steps.append(TableStep(
+            FEATURES, node.name, 1.0, first, later,
+            document_head=pricing.document_head(node.call.prompt)))
     return steps
 
 
@@ -165,4 +179,10 @@ def _extract_seconds(context, node, resident, expected_rows) -> float:
     """Price an extraction at a live count."""
     return extract_spec(context, node.call, node.name, expected_rows,
                         resident=resident).estimated_seconds
+
+
+def _features_seconds(context, node, resident, expected_rows) -> float:
+    """Price a feature call at a live count."""
+    return sae_features_spec(context, node.call, node.name, expected_rows,
+                             resident=resident).estimated_seconds
 

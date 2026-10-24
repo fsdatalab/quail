@@ -60,6 +60,11 @@ class Qwen35Pipeline(ModelPipeline):
             self.warm_tokens += (4096, 8192, 16384)
             self.warm_row_classes = True
         self.max_chunk_tokens = kernel_index_cap(spec)
+        # residual_readout returns the residual stream after the last
+        # loaded layer instead of the final-normed rows; row_observer,
+        # when a query sets it, sees every row of each chunk there
+        self.residual_readout = spec.residual_readout
+        self.row_observer = None
 
     def convolutions(self):
         """Return the convolution weights and activation used by this model."""
@@ -163,6 +168,15 @@ class Qwen35Pipeline(ModelPipeline):
                                      residual)
             hidden = feed_forward(x)
         final = chunk.final_indices
+        if self.residual_readout:
+            # the residual stream after the last layer is the MLP output
+            # not yet added (hidden) plus the running residual
+            if self.row_observer is not None:
+                stream = hidden + residual
+                self.row_observer(stream, chunk)
+                return stream.index_select(0, final)
+            return (hidden.index_select(0, final)
+                    + residual.index_select(0, final))
         normed, _ = self._norm(self.final_norm, hidden.index_select(0, final),
                                residual.index_select(0, final))
         return normed
