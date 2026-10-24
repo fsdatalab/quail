@@ -352,10 +352,9 @@ class MapDecoder:
         where the answer's last written tokens occur, or, when the
         document does not continue the answer, chains continuations
         from the n-gram cache. The adaptive policy sizes each draft
-        from its acceptance odds, the document's KV read, and the
-        pass's slack, and drafts nothing in a full pass: there every
-        fed token costs a token of compute and writes at most one, and
-        a round's host work is off the critical path, so no draft pays.
+        from its acceptance odds, the pass's slack, and the round's
+        price: the document's KV read, which every round pays however
+        many tokens it feeds, so a draft that saves rounds saves reads.
         The fixed policy copies up to draft_tokens from the document.
         """
         state = self.states[q]
@@ -366,9 +365,6 @@ class MapDecoder:
         room = np.minimum(self.spec.draft_tokens, cap - written - 1)
         policy = None if self.policies is None else self.policies[q]
         length = np.zeros(len(index), dtype=np.int64)
-        if policy is not None and slack <= 0:
-            state.fed_len[index] = 1
-            return
         at = self._source_positions(index, state)
         at[room <= 0] = -1
         rho = self.rho[index]

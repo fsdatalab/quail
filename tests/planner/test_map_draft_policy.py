@@ -79,12 +79,13 @@ def test_copy_misses_shrink_the_copied_draft():
     assert seeded > 1
 
 
-def test_a_round_without_a_price_or_slack_drafts_nothing():
-    # a fed token costs a token and writes at most one, so without a
-    # round price to amortize or free tokens below the ridge, no draft
-    # pays, whatever the odds
+def test_the_kv_read_is_what_a_draft_amortizes():
+    # a fed token costs a token and writes at most one, so a draft pays
+    # only against the round's price, the KV read every round pays:
+    # with no read to save and no slack, no odds justify a draft
     policy = MapDraftPolicy(cap=15, max_answer_tokens=256,
                             expected_answer_tokens=64)
     assert policy.chain_length(0.0, 10, [0.95] * 15, slack=0.0) == 0
     assert policy.copy_length(0.0, 10, slack=0.0) == 0
-    assert policy.chain_length(17.0, 10, [0.5] * 15, slack=15.0) > 0
+    assert policy.chain_length(3.6, 10, [0.5] * 15, slack=0.0) >= 1
+    assert policy.chain_length(3.6, 10, [0.1] * 15, slack=0.0) == 0
