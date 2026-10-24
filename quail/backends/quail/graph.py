@@ -85,6 +85,7 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     arena = state["gpu"].arena
     for key in arena.resident_keys():
         arena.free_key(key)
+    arena.reclaim(wait=True)
     arena.reset_stats()
     if arena.host is not None:
         arena.host.begin_query()
@@ -157,6 +158,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     wall = time.perf_counter() - started
     for key in arena.resident_keys():
         arena.free_key(key)
+    arena.reclaim(wait=True)
     report = graph_report(graph, result, wall, state["device"],
                           gpu_timing=state.get("gpu_timing", False))
     measurements = execution_measurements(context)

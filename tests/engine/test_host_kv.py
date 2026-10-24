@@ -201,3 +201,47 @@ def test_the_hash_names_the_tokens_and_their_count():
     assert prefix_hash([1, 2, 3]) == prefix_hash([1, 2, 3])
     assert prefix_hash([1, 2, 3]) != prefix_hash([1, 2, 4])
     assert prefix_hash([1, 2, 3]) != prefix_hash([1, 2, 3, 0])
+
+
+class _Event:
+    """A save's event: fired when the test says so."""
+
+    def __init__(self):
+        self.fired = False
+        self.waited = False
+
+    def query(self):
+        return self.fired
+
+    def synchronize(self):
+        self.waited = True
+        self.fired = True
+
+
+def test_a_freed_key_keeps_its_pages_until_its_save_has_landed():
+    arena = make_arena()
+    events = []
+
+    class Store:
+        def before_free(self, key):
+            events.append(_Event())
+            return events[-1]
+
+    arena.host = Store()
+    key = ("d", 0)
+    assert arena.reserve(key, 6, capacity_tokens=8)
+    assert arena.free_key(key) == 0
+    assert arena.is_resident(key) and arena.free_pages == 6
+    # a second free is a no-op; the pages go once the save has read them
+    assert arena.free_key(key) == 0 and arena.reclaim() == 0
+    events[0].fired = True
+    assert arena.reclaim() == 2 and not arena.is_resident(key)
+    assert arena.free_pages == 8
+    # the key used again keeps its pages: the arena waits for the save
+    assert arena.reserve(key, 6, capacity_tokens=8)
+    arena.free_key(key)
+    assert arena.reserve(key, 6, capacity_tokens=8)
+    assert events[1].waited and not arena._draining
+    assert arena.free_key(key) == 0
+    # with wait, reclaim waits for the oldest save itself
+    assert arena.reclaim(wait=True) == 2 and events[2].waited

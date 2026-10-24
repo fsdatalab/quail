@@ -628,10 +628,6 @@ class StageExecutor:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
             e0.record()
-        if self.host is not None and self.arena.pinned:
-            # pages freed since the last pass may still be read by a
-            # save: the pass waits for those gathers
-            self.host.fence(self.torch.cuda.current_stream())
         normed = forward_chunk(self.pipeline, self.arena, chunk)
         if self.gpu_timing:
             e1.record()
@@ -662,6 +658,9 @@ class StageExecutor:
                 self._event(settlement)
             if self.sched.done():
                 break
+            if self.paged:
+                # pages of freed keys whose save to the host has landed
+                self.arena.reclaim()
             if len(self.outstanding) > 1:
                 self._report_next()
             if self.sched.blocked_pages:
@@ -683,6 +682,8 @@ class StageExecutor:
                     continue
                 if self._readmit:
                     self._readmit = False
+                    continue
+                if self.paged and self.arena.reclaim(wait=True):
                     continue
                 raise AssertionError("nothing buildable and nothing in flight")
             self._run_part(groups)

@@ -51,6 +51,9 @@ def test_a_saved_prefix_restores_bit_for_bit_on_cuda():
     before = snapshot(arena, key, tokens)
     arena.free_key(key)
     assert host.holds(digest)
+    # the pages stay the key's until the save has read them
+    assert arena.is_resident(key) and arena.reclaim(wait=True)
+    assert not arena.is_resident(key)
     for layer in range(LAYERS):
         for tensor in arena.layer_kv(layer):
             tensor.zero_()
@@ -83,12 +86,12 @@ def test_a_save_costs_the_host_little_while_a_pass_runs():
     for key in keys:
         arena.free_key(key)
     host_s = time.perf_counter() - started
-    torch.cuda.synchronize()
+    arena.reclaim(wait=True)
     total_s = time.perf_counter() - started
     print(f"\n{count} saves of {tokens} tokens: host {host_s * 1e3 / count:.2f} ms "
           f"per save, {total_s:.2f} s until the copies landed, "
           f"store host_s {host.host_s:.3f} s")
-    assert host.saved_keys == count
+    assert host.saved_keys == count and arena.free_pages == 8192
     # restores: the same keys, pages reserved again
     for _ in range(20):
         activations = activations @ weight
@@ -102,6 +105,6 @@ def test_a_save_costs_the_host_little_while_a_pass_runs():
     print(f"{count} restores: host {host_s * 1e3 / count:.2f} ms per restore, "
           f"{total_s:.2f} s until landed")
     assert activations.shape == weight.shape
-    # a burst past the staging buffers waits at the copy engine's pace,
-    # about 1.6 ms per 45 MB document over PCIe
-    assert host_s / count < 0.003
+    # a save is one launch per layer group and a restore the same, so
+    # the host never waits for the link
+    assert host_s / count < 0.001

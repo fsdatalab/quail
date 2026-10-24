@@ -57,6 +57,7 @@ def bare_arena(arena, pages):
     arena._holds = {}
     arena._reading = {}
     arena._deferred = set()
+    arena._draining = {}
     arena._window_floor = {}
     arena._trimmed = set()
     arena.host = None
@@ -382,6 +383,9 @@ class FakeArena:
         self.host = None
         self.owned = set()
         self.retained = set()
+
+    def reclaim(self, wait=False):
+        return 0
 
     @property
     def retained_pages(self):

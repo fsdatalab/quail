@@ -23,7 +23,8 @@ the same methods:
 - counters: reset_stats, evicted_keys, evicted_pages,
   evicted_prefix_tokens
 - the host store: host, a HostKV that free_key hands a key's prefix
-  rows before they go, or None
+  rows before they go, or None; reclaim frees the pages of keys whose
+  save has landed
 """
 
 import math
@@ -123,6 +124,7 @@ class KVArena:
         self._holds = {}      # key -> queued keys that will borrow from it
         self._reading = {}    # key -> groups of the planned chunk reading it
         self._deferred = set()    # held keys freed by their operator
+        self._draining = {}       # key -> event of the save reading its pages
         self._window_floor = {}   # key -> lowest sliding row a borrower reads
         self._trimmed = set()     # keys past their own pass's trim_window
 
@@ -137,15 +139,13 @@ class KVArena:
             self.drop_holds()
             for key in self.resident_keys():
                 self.free_key(key)
+            self.reclaim(wait=True)
         if self.accounting.owned:
             raise RuntimeError("the arena holds keys; free them before resizing")
         if (num_pages, num_sliding_pages, num_state_slots) == (
                 self.num_pages, self.num_sliding_pages, self.num_state_slots):
             return
         page_tokens = self.page_tokens
-        if self.host is not None:
-            # saves still reading the pools finish before they go
-            self.host.flush()
         self.k = self.v = None
         self.gdn_state = self.conv_state = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
@@ -419,7 +419,32 @@ class KVArena:
                 + sum(1 for point in held.share_slots if point[0] in keys))
 
     def pin(self, key):
+        self._undrain(key)
         self.accounting.pin(key)
+
+    def _undrain(self, key):
+        """A draining key is used again: it keeps its pages, once its save read them."""
+        event = self._draining.pop(key, None)
+        if event is not None:
+            event.synchronize()
+
+    def reclaim(self, wait: bool = False) -> int:
+        """Free the pages of draining keys whose save has landed.
+
+        A freed key whose save is still reading its pages keeps them
+        until the save's event fires. With wait, the oldest such save
+        is waited for first. Returns the pages freed.
+        """
+        freed = 0
+        for key, event in list(self._draining.items()):
+            if not event.query():
+                if not wait:
+                    break
+                event.synchronize()
+                wait = False
+            del self._draining[key]
+            freed += self._free_now(key)
+        return freed
 
     def retain(self, key, tokens: int, priority=None):
         """Rewind a prefix and make it available for a later operator.
@@ -466,12 +491,19 @@ class KVArena:
         """
         keys = []
         keep = set(self._holds) | set(self._reading)
+        self.reclaim()
         while not satisfied():
             victim = self.accounting.pop_retained_victim(keep=keep)
             if victim is None:
-                break
+                if not self._draining or not self.reclaim(wait=True):
+                    break
+                continue
             keys.append(victim[0])
             self.evict_key(victim[0])
+            # an evicted key saving to the host keeps its pages until
+            # the save has read them: wait for that before evicting more
+            if not satisfied() and victim[0] in self._draining:
+                self.reclaim(wait=True)
         return tuple(keys)
 
     def _evict_for_pages(self, need, need_sliding):
@@ -512,6 +544,7 @@ class KVArena:
         """
         capacity = tokens if capacity_tokens is None else capacity_tokens
         if key in self.accounting.owned:
+            self._undrain(key)
             self.accounting.pin(key)
             need = max(0, self.accounting.pages_needed(capacity)
                        - len(self.accounting.table_pages(key)))
@@ -674,8 +707,16 @@ class KVArena:
         if key in self._holds or key in self._reading:
             self._deferred.add(key)
             return 0
+        if key in self._draining:
+            return 0
         if self.host is not None and key in self.accounting.owned:
-            self.host.before_free(key)
+            event = self.host.before_free(key)
+            if event is not None:
+                self._draining[key] = event
+                return 0
+        return self._free_now(key)
+
+    def _free_now(self, key):
         self._window_floor.pop(key, None)
         self._trimmed.discard(key)
         self._rows.pop(key)

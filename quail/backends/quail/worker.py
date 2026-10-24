@@ -516,6 +516,7 @@ def _child_execute(state, sub) -> dict:
     if sub["final"]:
         for key in gpu.arena.resident_keys():
             gpu.arena.free_key(key)
+        gpu.arena.reclaim(wait=True)
     return {"results": results, "retained": tuple(gpu.arena.retained_keys()),
             **execution_measurements(context)}
 

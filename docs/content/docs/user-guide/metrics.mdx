@@ -75,7 +75,7 @@ With `host_kv_bytes` set (see
 | `host_kv_saved_tokens` | Token positions those copies covered. |
 | `host_kv_skipped_keys` | Documents not saved because the store was full of this query's own documents. |
 | `host_kv_s` | Host seconds spent hashing prefixes and starting the copies. The copies themselves run beside the model. |
-| `host_kv_wait_s` | The part of `host_kv_s` spent waiting for a staging buffer, when saves outran the copy engine. |
+| `host_kv_wait_s` | The part of `host_kv_s` spent waiting for the device to finish reading a row index, when saves outran the link. |
 | `host_kv_entries` | Documents the store holds at the end of the query. |
 
 ## Operator metrics

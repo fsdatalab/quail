@@ -322,6 +322,7 @@ def run_all(
     label_root: str = "",
     canvas_draws: str = "",
     host_kv_bytes: int = 0,
+    memory_mb: int = 0,
 ):
     from quail_b import select_queries
 
@@ -343,6 +344,7 @@ def run_all(
         "attention": attention or None,
         "canvas_draws": canvas_draws or None,
         "host_kv_bytes": host_kv_bytes,
+        "memory_mb": memory_mb or None,
         "query_ids": list(query_ids),
         "summaries": {},
         "function_call_ids": {},
@@ -364,7 +366,11 @@ def run_all(
         call_ids = manifest["function_call_ids"]
         for group, family_ids, result_name in _query_groups(query_ids):
             if include_quail or include_baselines or include_dumb_vllm:
-                family_call = run_query_family.spawn(
+                # a host KV store larger than the default container's
+                # memory asks for a bigger one
+                family = (run_query_family.with_options(memory=memory_mb)
+                          if memory_mb else run_query_family)
+                family_call = family.spawn(
                     model=model,
                     scale_factor=scale_factor,
                     query_ids_csv=",".join(family_ids),
@@ -543,6 +549,7 @@ def main(
     finish: str = "",
     canvas_draws: str = "",
     host_kv_bytes: int = 0,
+    memory_mb: int = 0,
 ):
     if finish:
         # finish an earlier run whose orchestrator died
@@ -572,6 +579,7 @@ def main(
         label_root=label_root,
         canvas_draws=canvas_draws,
         host_kv_bytes=host_kv_bytes,
+        memory_mb=memory_mb,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

@@ -72,9 +72,11 @@ documents. `sql()` returns a [`Query`](/docs/user-guide/results#read-the-results
 
 Set `host_kv_bytes` to keep document KV in host memory after the
 query that computed it. When the GPU frees a document's KV, Quail
-copies its prefix, the prompt head and the document, into pinned host
-memory first. The next query that reads the same document copies it
-back instead of computing it again. The setting is the host memory
+writes its prefix, the prompt head and the document, into pinned host
+memory first, with one kernel launch that reads the document's pages
+and writes the host rows over PCIe. The pages stay the document's
+until that write has landed. The next query that reads the same
+document copies it back the same way instead of computing it again. The setting is the host memory
 the store may use, in bytes; the default of 0 keeps nothing.
 
 ```python
