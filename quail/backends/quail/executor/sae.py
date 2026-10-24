@@ -8,7 +8,6 @@ the pipeline's row observer and keeps each document's per-feature
 maxima across the pipeline's feature calls.
 """
 
-from collections import deque
 
 import numpy as np
 
@@ -290,6 +289,33 @@ def unpack_features(row, keep: int) -> list:
             for feature, strength in zip(indices[kept], strengths[kept])]
 
 
+class _PinnedRows:
+    """Pinned host rows handed out from slab allocations.
+
+    A settle runs on the thread that feeds the GPU, and allocating
+    pinned memory there costs milliseconds per call, so one slab serves
+    many settles. Handed-out rows are views that keep their slab alive.
+    """
+
+    def __init__(self, torch, width: int, rows_per_slab: int = 256):
+        self.torch = torch
+        self.width = width
+        self.rows_per_slab = rows_per_slab
+        self._slab = None
+        self._next = 0
+
+    def take(self):
+        """Return one pinned (width,) fp32 row."""
+        if self._slab is None or self._next == self.rows_per_slab:
+            self._slab = self.torch.empty(
+                (self.rows_per_slab, self.width), dtype=self.torch.float32,
+                pin_memory=True)
+            self._next = 0
+        row = self._slab[self._next]
+        self._next += 1
+        return row
+
+
 class SaeMaxAccumulator:
     """Per-document maxima of per-token top-k strengths, for the pooling 'max'.
 
@@ -317,8 +343,8 @@ class SaeMaxAccumulator:
         self.tail_max = {}
         self.calls = 0        # feature calls registered on this pipeline
         self.settled = {}     # key -> calls settled so far
-        self._pending = deque()
         self._buffers = []
+        self._pinned = _PinnedRows(torch, encoder.num_features)
 
     def register_call(self) -> None:
         """Count one feature call of the pipeline, before execution."""
@@ -366,8 +392,7 @@ class SaeMaxAccumulator:
             combined = document.clone()
         else:
             combined = self._buffer()
-        host = torch.empty(combined.shape[0], dtype=torch.float32,
-                           pin_memory=True)
+        host = self._pinned.take()
         host.copy_(combined, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
