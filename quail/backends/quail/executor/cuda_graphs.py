@@ -60,9 +60,10 @@ class DecodeGraphConfig:
 def configured_graphs() -> DecodeGraphConfig:
     """Return the capture limits, as the environment overrides them.
 
-    QUAIL_DECODE_GRAPH_ROWS lists the row buckets, comma-separated, and
-    QUAIL_DECODE_GRAPH_QUERY_TOKENS the longest query a captured chunk
-    may hold; unset, the defaults apply.
+    QUAIL_DECODE_GRAPH_ROWS lists the row buckets, comma-separated;
+    QUAIL_DECODE_GRAPH_QUERY_TOKENS is the longest query a captured
+    chunk may hold, and QUAIL_DECODE_GRAPH_CONTEXT_TOKENS the most
+    resident tokens a sequence reads; unset, the defaults apply.
     """
     import os
 
@@ -73,6 +74,9 @@ def configured_graphs() -> DecodeGraphConfig:
     query = os.environ.get("QUAIL_DECODE_GRAPH_QUERY_TOKENS")
     if query:
         settings["max_query_tokens"] = int(query)
+    context = os.environ.get("QUAIL_DECODE_GRAPH_CONTEXT_TOKENS")
+    if context:
+        settings["max_context_tokens"] = int(context)
     return DecodeGraphConfig(**settings)
 
 
