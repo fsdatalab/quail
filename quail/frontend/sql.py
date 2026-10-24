@@ -36,7 +36,6 @@ from quail.logical import (
     Alias,
     ColumnRef,
     CompileError,
-    Cte,
     LogicalPlan,
     LogicalPlanBuilder,
     WithPlan,
@@ -372,7 +371,7 @@ def _compile_stage(scope: Scope, pool, tables: Catalog, prompts, dialect,
     body.set("with_", exp.With(expressions=[cte.copy() for cte in pool])
              if pool else None)
     plan = _compile_stages(body, tables, prompts, dialect, ctes)
-    ctes.append(Cte(name, plan))
+    ctes.append((name, plan))
     tables.register(name, MemoryTableProvider(
         cte_schema(plan).empty_table(), id_col="", identity=f"cte:{name}"))
 

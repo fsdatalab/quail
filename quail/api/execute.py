@@ -117,7 +117,9 @@ def execute_query(query, physical_executor=None, plan=None,
 
     if isinstance(query, WithQuery):
         if plan is not None:
-            raise TypeError("a WITH query runs the planner's plan for each stage")
+            raise RuntimeError(
+                "a WITH query runs the planner's plan for each stage; edited "
+                "plans are not supported")
         return query.execute(physical_executor, on_backend_ready,
                              on_execution_ready)
     total_started = time.perf_counter()

@@ -565,14 +565,14 @@ class WithQuery:
         self.session = session
         self.logical = logical
         self.order = order
-        self.ctes = {cte.name: cte for cte in logical.ctes}
-        self._schemas = {cte.name: cte_schema(cte.plan) for cte in logical.ctes}
+        self.ctes = dict(logical.ctes)
+        self._schemas = {name: cte_schema(plan) for name, plan in logical.ctes}
         self._queries = {}     # stage name -> its Query; "" is the SELECT
         self._results = {}     # stage name -> its QueryResult, once run
         # the stages run on a view of the session whose catalog also
         # holds each CTE's result, a placeholder until the CTE has run
         self._assumptions = {
-            name: (lambda column, name=name: self._assumed_lengths(name, column))
+            name: (lambda _column, name=name: self._assumed_lengths(name))
             for name in self.ctes}
         self._view = copy.copy(session)
         self._view.catalog = Catalog({
@@ -585,32 +585,27 @@ class WithQuery:
 
     def _stages(self) -> tuple:
         """Return (name, LogicalPlan) of every stage in execution order."""
-        return (*((name, cte.plan) for name, cte in self.ctes.items()),
-                ("", self.logical.query))
+        return (*self.ctes.items(), ("", self.logical.query))
 
     def _stage(self, name: str, fresh: bool = False) -> Query:
         """Return the Query running one stage over the tables it has now."""
         if fresh or name not in self._queries:
-            plan = self.logical.query if name == "" else self.ctes[name].plan
+            plan = self.logical.query if name == "" else self.ctes[name]
             self._queries[name] = Query(self._view, plan, order=self.order)
         return self._queries[name]
 
-    def _assumption(self, name: str, column) -> tuple[int, int]:
-        """Return the rows and tokens per row assumed for a CTE's column.
+    def _assumed_lengths(self, name: str) -> TokenLengths:
+        """Return the lengths a CTE that has not run is planned on.
 
-        The rows are the planner's estimate for the CTE, at least one,
-        and each row is assumed to hold ASSUMED_ANSWER_TOKENS.
+        The rows are the planner's estimate for the CTE, or its input
+        documents when it has none, at least one; each row is assumed
+        to hold ASSUMED_ANSWER_TOKENS.
         """
         physical = self._stage(name).plan()
         rows = None if isinstance(physical, Refusal) else estimated_rows(physical)
         if rows is None:
-            rows = sum(len(lengths) for lengths in self._stage(name)._document_tokens
-                       .values())
-        return max(1, round(rows)), ASSUMED_ANSWER_TOKENS
-
-    def _assumed_lengths(self, name: str, column) -> TokenLengths:
-        rows, tokens = self._assumption(name, column)
-        return TokenLengths([tokens] * rows)
+            rows = sum(map(len, self._stage(name)._document_tokens.values()))
+        return TokenLengths([ASSUMED_ANSWER_TOKENS] * max(1, round(rows)))
 
     def plan(self):
         """Plan every stage and return the plans, or the first Refusal.
@@ -648,11 +643,11 @@ class WithQuery:
             lines = [title + ":",
                      query._explain(results.get(name), verbose, assumed=pending)]
             for alias, scan in pending.items():
-                rows, tokens = self._assumption(scan.provider, scan.column)
+                rows = len(self._assumed_lengths(scan.provider))
                 lines.append(
                     f"\n  note: {alias!r} reads the CTE {scan.provider!r}, "
                     f"which has not run; planned on {rows:,} rows of "
-                    f"{tokens:,} tokens each")
+                    f"{ASSUMED_ANSWER_TOKENS:,} tokens each")
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
 
@@ -691,11 +686,7 @@ class WithQuery:
         Args:
             plan: Must be None; a WITH query runs the planner's plans.
         """
-        if plan is not None:
-            raise RuntimeError(
-                "a WITH query runs the planner's plan for each stage; "
-                "edited plans are not supported")
-        return execute_query(self)
+        return execute_query(self, plan=plan)
 
     def submit(self, **_options):
         """Submitting needs Quail Server; local queries use run()."""
@@ -728,8 +719,7 @@ def cte_table(result: pa.Table, schema: pa.Schema) -> pa.Table:
         column.cast(column.type.value_type)
         if pa.types.is_dictionary(column.type) else column
         for column in result.columns]
-    if len(columns) != len(schema) or [
-            column.type for column in columns] != [field.type for field in schema]:
+    if [column.type for column in columns] != schema.types:
         raise ValueError(
             f"the CTE's result has types {[c.type for c in columns]}, but "
             f"the query reading it was compiled for {schema.types}")

@@ -6,8 +6,6 @@ from dataclasses import dataclass, replace
 from typing import ClassVar
 
 from quail.logical.expressions import (
-    PROBABILITIES_SUFFIX,
-    SPAN_SUFFIX,
     AggregateCall,
     Aggregation,
     Alias,
@@ -113,25 +111,10 @@ class Project:
         """Return every struct column and its member columns, answers and spans."""
         return tuple(entry for struct in self.structs for entry in struct.packing())
 
-    def column_names(self) -> tuple[str, ...]:
-        """Return the result's columns before packing.
-
-        Each projected name is followed by the probabilities column of
-        a classification that asks for them and by the span column of
-        an extraction.
-        """
-        names = []
-        for column in self.columns:
-            names.append(column_name(column))
-            if getattr(aliased_call(column), "probabilities", False):
-                names.append(column.name + PROBABILITIES_SUFFIX)
-            if aliased_call(column, "extract") is not None:
-                names.append(column.name + SPAN_SUFFIX)
-        return tuple(names)
-
     def result_columns(self) -> tuple[str, ...]:
         """Return the selected column names, with struct fields packed."""
-        return packed_columns(self.column_names(), self.packing())
+        return packed_columns(
+            (column_name(column) for column in self.columns), self.packing())
 
     def with_children(self, children: tuple[LogicalNode, ...]) -> "Project":
         if len(children) != 1:

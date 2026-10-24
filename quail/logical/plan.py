@@ -425,66 +425,46 @@ def _windowed_fields(node: Window, fields: dict) -> dict:
 
 
 def cte_schema(plan: LogicalPlan) -> pa.Schema:
-    """Return the schema of a plan's result, named as a CTE's columns."""
-    return pa.schema([
-        pa.field(name, field.type)
-        for name, field in zip(cte_column_names(plan), plan.schema())])
-
-
-def cte_column_names(plan: LogicalPlan) -> tuple[str, ...]:
-    """Return the column names a CTE gives its result, as SQL names them.
+    """Return the schema of a plan's result, named as a CTE's columns.
 
     A projected column reference is named by its column alone, so
-    ``SELECT c.id`` gives ``id``; an AS name, a struct column, an
-    aggregate, and a window keep their names.
+    ``SELECT c.id`` gives ``id``; every other column keeps its name.
 
     Raises:
         CompileError: A projected expression has no AS name, or two
             columns would share one name.
     """
-    expressions = {column_name(column): column
-                   for column in plan.projection.columns}
-    names = []
-    for name in plan.root.result_columns():
-        column = expressions.get(name)
+    expressions = {column_name(column): column for column in plan.projection.columns}
+    fields = []
+    for result in plan.schema():
+        column = expressions.get(result.name)
         if isinstance(column, ColumnRef):
-            name = column.column
+            result = result.with_name(column.column)
         elif column is not None and not isinstance(column, Alias):
             raise CompileError(
-                f"{name} in a CTE needs an AS name; a later query reads "
+                f"{result.name} in a CTE needs an AS name; a later query reads "
                 f"the column by that name")
-        names.append(name)
-    if len(set(names)) != len(names):
+        fields.append(result)
+    schema = pa.schema(fields)
+    if len(set(schema.names)) != len(schema.names):
         raise CompileError(
-            f"the CTE returns a column name twice: {names}; give one an AS name")
-    return tuple(names)
-
-
-@dataclass(frozen=True)
-class Cte:
-    """A common table expression: a named query result defined with WITH.
-
-    A subquery in FROM is a Cte too, named by its alias.
-
-    Attributes:
-        name: The name later queries read the result under.
-        plan: The query that computes the result.
-    """
-
-    name: str
-    plan: LogicalPlan
+            f"the CTE returns a column name twice: {schema.names}; give one an "
+            f"AS name")
+    return schema
 
 
 @dataclass(frozen=True)
 class WithPlan:
     """A query with CTEs; each CTE runs before the queries that read it.
 
+    A subquery in FROM is a CTE too, named by its alias.
+
     Attributes:
-        ctes: The CTEs in dependency order. Each reads registered tables
-            and earlier CTEs only, and each is read by the query or by
-            a later CTE.
+        ctes: (name, LogicalPlan) of each CTE in dependency order. Each
+            reads registered tables and earlier CTEs only, and each is
+            read by the query or by a later CTE.
         query: The final SELECT.
     """
 
-    ctes: tuple[Cte, ...]
+    ctes: tuple[tuple[str, LogicalPlan], ...]
     query: LogicalPlan

@@ -111,7 +111,7 @@ def test_a_label_feeds_a_later_filter_and_dependent_ctes_run_in_order(session):
         SELECT l.id FROM leases l
         WHERE AI.IF(PROMPT('kept: {0}', l.kind))
     """, dialect="bq")
-    assert [cte.name for cte in query.logical.ctes] == ["kinds", "leases"]
+    assert [name for name, _ in query.logical.ctes] == ["kinds", "leases"]
     oracle = Oracle(
         labels=["lease", "deed", "lease"],
         filters=lambda alias, document, position: {
@@ -142,7 +142,7 @@ def test_a_cte_runs_once_however_many_times_it_is_read(session):
           ON AI.IF(PROMPT('same clause? {0} {1}', a.clause.terms, b.clause.terms))
     """, dialect="bq")
     # a CTE nothing reads is left out
-    assert [cte.name for cte in query.logical.ctes] == ["clauses"]
+    assert [name for name, _ in query.logical.ctes] == ["clauses"]
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     joins=lambda node, assignment: (
                         assignment["a"] == assignment["b"]))
@@ -173,7 +173,7 @@ def test_a_subquery_in_from_and_a_nested_with_are_stages_too(session):
               WHERE AI.IF(PROMPT('high: {0}', y.clause.terms))) s
         WHERE AI.IF(PROMPT('kept: {0}', s.clause.terms))
     """, dialect="bq")
-    assert [cte.name for cte in query.logical.ctes] == ["clauses", "scored", "s"]
+    assert [name for name, _ in query.logical.ctes] == ["clauses", "scored", "s"]
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     scores=lambda spec, ids: 0.9 if ids[0] == 0 else 0.1,
                     filters=lambda alias, document, position: {
@@ -344,7 +344,7 @@ def test_with_rejects_what_the_stages_cannot_express(session):
     renamed = session.sql(
         f"WITH clauses (a, b) AS ({extract}) SELECT x.a FROM clauses x "
         f"WHERE AI_FILTER(PROMPT('k {{0}}', x.b.terms))")
-    assert renamed.logical.ctes[0].plan.schema().names == ["a", "b", "b_span"]
+    assert cte_schema(renamed.logical.ctes[0][1]).names == ["a", "b", "b_span"]
     unnamed = session.sql(
         f"SELECT id FROM ({extract}) WHERE AI_FILTER(PROMPT('k {{0}}', clause.terms))")
     assert len(unnamed.logical.ctes) == 1
