@@ -24,12 +24,14 @@ QWEN3_5_2B_SAE_BF16 = ModelSpec(
     hf_name="Qwen/Qwen3.5-2B-Base",
     revision="b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
     kv_bytes=2.0,
-    w_mem_bytes=2_600_000_000,    # estimated: the config's tensors for
-    #                               layers 0 to 11 plus the embedding and
-    #                               the SAE encoder, with vLLM's 1.6
-    #                               percent loading overhead; replace
-    #                               with the measured number from the
-    #                               first load
+    w_mem_bytes=4_040_000_000,    # measured: torch.cuda.memory_allocated
+    #                               after load_model in
+    #                               experiments/cells/sae_agreement.py
+    #                               (3,897,935,872) plus the SAE encoder
+    #                               (138,682,368). Near the full 24-layer
+    #                               size: the dropped tail layers appear
+    #                               to stay referenced, so budgets assume
+    #                               they are resident
     vocab=248_320,
     tied_head=True,
     weight_precision="bf16",
