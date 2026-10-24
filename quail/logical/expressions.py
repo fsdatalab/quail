@@ -642,6 +642,45 @@ class RegularPredicate:
         return f"{self.name} {self.comparison} {self.value!r}"
 
 
+# the fields of one element of an AI.SAE_FEATURES list
+UNNEST_FIELDS = ("feature", "strength")
+
+
+@dataclass(frozen=True)
+class Unnest:
+    """One row per element of an AI.SAE_FEATURES list column.
+
+    The list column ``column`` becomes the columns ``column.feature`` and
+    ``column.strength``; the other projected columns repeat for each
+    element, and a row with an empty list returns no rows. Each test
+    reads one of the two fields, as a ColumnRef with ``column`` as its
+    alias, and keeps the elements it accepts. ``output`` lists the
+    result columns in SELECT order; empty keeps every projected column,
+    with the list as its two fields.
+    """
+
+    column: str
+    tests: tuple[RegularPredicate, ...] = ()
+    output: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.unnest"
+
+    @property
+    def fields(self) -> tuple[str, ...]:
+        """Return the names of the columns the list becomes."""
+        return tuple(f"{self.column}.{field}" for field in UNNEST_FIELDS)
+
+    def validate(self) -> None:
+        for test in self.tests:
+            test.validate()
+            column = test.column
+            if column.alias != self.column or column.column not in UNNEST_FIELDS:
+                raise CompileError(
+                    f"a test of UNNEST {self.column!r} reads "
+                    f"{self.column}.feature or {self.column}.strength, "
+                    f"got {column_name(column)}")
+
+
 @dataclass(frozen=True)
 class Alias:
     """An expression returned under a name: a model call or a value expression."""

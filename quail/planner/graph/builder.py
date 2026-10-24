@@ -484,7 +484,8 @@ class GraphBuilder:
                          *(port for port in score_ports if port not in sink_inputs),
                          *row_ports)
         self.nodes.extend(result_nodes(self.plan.result, result_inputs, tuple(columns),
-                                       self.plan.projection.packing()))
+                                       self.plan.projection.packing(),
+                                       self.plan.projection.unnest))
 
     def _finish(self):
         """Build the plan and bind its pricer."""

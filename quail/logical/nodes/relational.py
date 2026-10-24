@@ -14,6 +14,7 @@ from quail.logical.expressions import (
     ExtractStruct,
     HavingTest,
     SortKey,
+    Unnest,
     WindowCall,
     _explain,
     aliased_call,
@@ -38,11 +39,14 @@ class Project:
 
     The fields of each ExtractStruct are extraction Aliases among the
     columns; the result returns them packed into the struct's columns.
+    With ``unnest``, the result returns one row per element of one
+    AI.SAE_FEATURES list column, as Unnest describes.
     """
 
     input: LogicalNode
     columns: tuple  # value expressions and Aliases
     structs: tuple[ExtractStruct, ...] = ()
+    unnest: Unnest | None = None
     type_name: ClassVar[str] = "quail.logical_project"
 
     def children(self) -> tuple[LogicalNode, ...]:
@@ -78,6 +82,14 @@ class Project:
         if len(names) != len(set(names)):
             raise CompileError(f"projection names must be unique, got {names}")
         self._validate_structs()
+        if self.unnest is not None:
+            self.unnest.validate()
+            if not any(column_name(column) == self.unnest.column
+                       and aliased_call(column, "features") is not None
+                       for column in self.columns):
+                raise CompileError(
+                    f"UNNEST reads an AI.SAE_FEATURES column of the "
+                    f"projection, got {self.unnest.column!r}")
 
     def _validate_structs(self) -> None:
         extracted = {column.name: column for column in self.columns
@@ -112,9 +124,16 @@ class Project:
         return tuple(entry for struct in self.structs for entry in struct.packing())
 
     def result_columns(self) -> tuple[str, ...]:
-        """Return the selected column names, with struct fields packed."""
-        return packed_columns(
+        """Return the selected column names, with struct fields packed.
+
+        An unnested list column is returned as its two field columns.
+        """
+        names = packed_columns(
             (column_name(column) for column in self.columns), self.packing())
+        if self.unnest is None:
+            return names
+        return self.unnest.output or tuple(name for column in names for name in (
+            self.unnest.fields if column == self.unnest.column else (column,)))
 
     def with_children(self, children: tuple[LogicalNode, ...]) -> "Project":
         if len(children) != 1:
@@ -129,6 +148,9 @@ class Project:
         if self.structs:
             fields["structs"] = {struct.name: list(struct.members)
                                  for struct in self.structs}
+        if self.unnest is not None:
+            fields["unnest"] = [self.unnest.column,
+                                *(str(test) for test in self.unnest.tests)]
         return fields
 
 

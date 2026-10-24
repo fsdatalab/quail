@@ -86,6 +86,9 @@ class ExpressionBinder:
         # alias -> (RegularPredicate on an answer or span, selectivity)
         self.extract_tests: dict[str, list[tuple[RegularPredicate, float | None]]] = {}
         self.joins: list[JoinSpec] = []
+        # the AS name of FROM's UNNEST, and WHERE's tests of its fields
+        self.unnest_alias: str | None = None
+        self.unnest_tests: list[RegularPredicate] = []
 
     # ---- scope ------------------------------------------------------
 

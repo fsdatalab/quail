@@ -459,6 +459,30 @@ expression.
   describe the content of the document. The list can have thousands of
   features.
 
+### Unnest the features
+
+Put the call in `UNNEST` in `FROM` to get one row for each feature. The
+rows have the columns `f.feature` and `f.strength`, where `f` is the
+`AS` name. The other columns repeat for each feature. Use these columns
+in `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates.
+
+For example, with the same `tickets` table, count the requests that
+have each feature with a strength above 1:
+
+```sql
+SELECT f.feature, COUNT(*) AS requests
+FROM tickets t,
+     UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
+                                   t.request),
+                            pooling => 'last')) AS f
+WHERE f.strength > 1
+GROUP BY f.feature
+ORDER BY requests DESC;
+```
+
+A query has at most one `UNNEST`. A `WHERE` test of a feature field
+compares the field with literals.
+
 ### Limits
 
 - Use the `qwen3.5-2b-sae-bf16` model. See
@@ -466,9 +490,7 @@ expression.
 - A query with `AI.SAE_FEATURES` cannot also use `AI.IF`, `AI.SCORE`,
   `AI.CLASSIFY`, or `AI.EXTRACT`.
 - `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the feature list.
-- `UNNEST` is not supported yet. To count features, collect the result
-  and flatten the lists in Python, e.g., with
-  `pyarrow.compute.list_flatten`.
+  Use the fields of an `UNNEST` instead.
 
 For the Python form, see
 [`ai_sae_features()`](/docs/user-guide/python-api/ai-functions#ai_sae_features).

@@ -258,6 +258,7 @@ class LogicalPlanBuilder:
         structs: tuple = (),
         windows: tuple = (),
         output: tuple = (),
+        unnest=None,
     ) -> LogicalPlan:
         """Build the plan's result nodes over the projected columns.
 
@@ -272,6 +273,7 @@ class LogicalPlanBuilder:
             windows: The WindowCalls over the projected or grouped rows.
             output: The result columns in SELECT order when windows
                 are present.
+            unnest: The Unnest of one AI.SAE_FEATURES column, or None.
         """
         if self._root is None:
             raise CompileError("a logical plan needs an input table")
@@ -285,8 +287,8 @@ class LogicalPlanBuilder:
             raise CompileError(
                 "DISTINCT does not compare AI.EXTRACT struct columns; extract "
                 "each field as its own column")
-        _check_feature_lists(columns, order, distinct, aggregation)
-        node = Project(self._root, tuple(columns), tuple(structs))
+        _check_feature_lists(columns, order, distinct, aggregation, unnest)
+        node = Project(self._root, tuple(columns), tuple(structs), unnest)
         if aggregation is not None:
             node = Aggregate(
                 node,
@@ -304,15 +306,19 @@ class LogicalPlanBuilder:
         return plan
 
 
-def _check_feature_lists(columns, order, distinct, aggregation) -> None:
+def _check_feature_lists(columns, order, distinct, aggregation,
+                         unnest) -> None:
     """Refuse an AI.SAE_FEATURES list where the query compares values.
+
+    An unnested list is compared by its scalar fields, so it is exempt.
 
     Raises:
         CompileError: ORDER BY, GROUP BY, or DISTINCT reads a feature
             list column.
     """
     names = {column.name for column in columns
-             if aliased_call(column, "features") is not None}
+             if aliased_call(column, "features") is not None
+             and (unnest is None or column.name != unnest.column)}
     if not names:
         return
     if aggregation is not None or distinct:

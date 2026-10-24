@@ -14,6 +14,7 @@ from quail.frontend.sql_binding.predicates import (
     _PLAIN_COMPARISONS,
     COLUMN_NODES,
 )
+from quail.frontend.sql_binding.unnest import unnest_field
 from quail.logical import (
     AggregateCall,
     Aggregation,
@@ -100,7 +101,11 @@ def bind_order(
             raise CompileError(
                 f"ORDER BY does not compare the AI.EXTRACT struct column "
                 f"{bare!r}; extract the field as its own column")
-        expression = named[bare] if bare in named else b.resolve_value(target)
+        element = unnest_field(target, b.unnest_alias)
+        if element is not None:
+            expression = ColumnRef(b.unnest_alias, "", element)
+        else:
+            expression = named[bare] if bare in named else b.resolve_value(target)
         keys.append(
             SortKey(
                 expression,
@@ -159,6 +164,9 @@ class SelectBinder:
         """
         b, columns = self.binder, self.columns
         names = {column_name(column): column for column in columns}
+        element = unnest_field(node, b.unnest_alias)
+        if element is not None:
+            return f"{b.unnest_alias}.{element}"
         if isinstance(node, COLUMN_NODES):
             if isinstance(node, exp.Column) and not node.table and node.name in names:
                 return node.name
@@ -247,6 +255,16 @@ class SelectBinder:
                     "an aggregate in SELECT is a direct COUNT, SUM, AVG, MIN, "
                     "or MAX call with an AS name"
                 )
+            element = unnest_field(node, b.unnest_alias)
+            if element is not None:
+                name = f"{b.unnest_alias}.{element}"
+                if isinstance(e, exp.Alias) and e.alias and e.alias != name:
+                    raise CompileError(
+                        f"an UNNEST field keeps its name {name}; drop "
+                        f"AS {e.alias}")
+                self.plain.append(name)
+                self.output.append(name)
+                continue
             selected = _compile_projection(b, [e], self.structs)
             for column in selected:
                 if column not in columns:

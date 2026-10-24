@@ -1,11 +1,11 @@
-"""Coordinator nodes: Exchange, Recombine, Project, Aggregate, Sort, Limit."""
+"""Coordinator nodes: Exchange, Recombine, Project, Unnest, Aggregate, Sort, Limit."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.logical.expressions import WindowCall, packed_columns
+from quail.logical.expressions import RegularPredicate, WindowCall, packed_columns
 
 from ..base import (
     ExecutionLocation,
@@ -147,6 +147,29 @@ class Window(PhysicalNode):
     columns: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.window"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
+
+@dataclass(frozen=True)
+class Unnest(PhysicalNode):
+    """Return one row per element of an AI.SAE_FEATURES list column.
+
+    The list ``column`` becomes the columns ``column.feature`` and
+    ``column.strength``, and the other columns repeat for each element.
+    ``tests`` read those two columns and keep the elements they accept.
+    ``columns`` are the output columns in result order.
+    """
+
+    column: str = ""
+    tests: tuple[RegularPredicate, ...] = ()
+    columns: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.unnest"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 

@@ -37,6 +37,7 @@ from .nodes import (
     Recombine,
     Scan,
     Sort,
+    Unnest,
     Window,
 )
 
@@ -250,6 +251,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         Sort,
         Window,
         Limit,
+        Unnest,
     ))
 
 

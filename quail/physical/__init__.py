@@ -43,6 +43,7 @@ from .nodes import (
     Scan,
     ScoreSpec,
     Sort,
+    Unnest,
     Window,
 )
 
@@ -71,6 +72,7 @@ __all__ = [
     "ScoreSpec",
     "InputPort",
     "Limit",
+    "Unnest",
     "Sort",
     "Window",
     "NodeCodec",

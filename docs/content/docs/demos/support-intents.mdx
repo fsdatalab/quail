@@ -120,7 +120,9 @@ not as a measurement.
   conversations of two products, and read the features whose shares
   differ most.
 - **Find documents with one feature.** After you name a feature, keep the
-  rows whose list contains it.
+  rows that have it with
+  [`UNNEST`](/docs/user-guide/sql/ai-functions#unnest-the-features), e.g.,
+  `WHERE f.feature = 24933`.
 - **Watch agent traces.** Read the features of each step of an agent
   trace to find a behavior that repeats, e.g., the same failed command.
 

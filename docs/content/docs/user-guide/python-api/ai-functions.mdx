@@ -223,8 +223,28 @@ table = query.collect()
 ```
 
 `collect()` returns an Arrow table. Its `intent` column has the type
-`list<struct<feature: int32, strength: float>>`. To count features over
-all rows, flatten the column with `pyarrow.compute.list_flatten`.
+`list<struct<feature: int32, strength: float>>`.
+
+Call `unnest("intent")` to get one row for each feature, with the columns
+`intent.feature` and `intent.strength`. For example, count the requests
+that have each feature with a strength above 1:
+
+```python
+from quail.frontend.expressions import count
+
+query = (
+    session.docs("tickets").alias("t")
+    .ai_sae_features(
+        prompt("{0}\n\nWhat is the customer asking for?", col("t.request")),
+        pooling="last", name="intent")
+    .unnest("intent")
+    .where(col("intent.strength") > 1)
+    .group_by("intent.feature")
+    .agg(requests=count())
+    .order_by(col("requests").desc())
+    .select("intent.feature", "requests")
+)
+```
 
 See [`AI.SAE_FEATURES`](/docs/user-guide/sql/ai-functions#aisae_features)
 for the two poolings and the limits.

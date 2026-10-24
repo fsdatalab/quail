@@ -15,6 +15,7 @@ from quail.execution.runtimes.relational import (
     ProjectRuntime,
     ScanRuntime,
     SortRuntime,
+    UnnestRuntime,
     WindowRuntime,
 )
 from quail.physical import (
@@ -28,6 +29,7 @@ from quail.physical import (
     Recombine,
     Scan,
     Sort,
+    Unnest,
     Window,
 )
 
@@ -38,6 +40,7 @@ __all__ = [
     "ForeignRuntime",
     "HashJoinRuntime",
     "LimitRuntime",
+    "UnnestRuntime",
     "ModelNodeRuntime",
     "ProjectRuntime",
     "RecombineRuntime",
@@ -62,4 +65,5 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
         Sort.runtime_key: SortRuntime(),
         Window.runtime_key: WindowRuntime(),
         Limit.runtime_key: LimitRuntime(),
+        Unnest.runtime_key: UnnestRuntime(),
     }

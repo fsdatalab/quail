@@ -219,3 +219,58 @@ def test_packed_rows_unpack_without_zero_strengths():
     assert lengths.tolist() == [2, 0, 3]
     assert indices.tolist() == [3, 5, 1, 2, 4]
     assert strengths.tolist() == [1.5, 0.5, 0.25, 2.0, 1.0]
+
+
+UNNEST = ("UNNEST(AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this review about?', "
+          "r.body), pooling => 'last')) AS f")
+
+
+def _unnest_oracle():
+    # document d has feature d at strength d + 1, and feature 100 at 0.5
+    return Oracle(features=lambda spec, document: [
+        {"feature": document, "strength": float(document + 1)},
+        {"feature": 100, "strength": 0.5}])
+
+
+def test_unnest_returns_a_row_per_feature_and_where_keeps_strong_ones(session):
+    sql = session.sql(
+        f"SELECT r.id, f.feature FROM reviews r, {UNNEST} "
+        f"WHERE f.strength > 1 ORDER BY f.strength DESC")
+    built = (session.docs("reviews").alias("r")
+             .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
+                              pooling="last", name="f")
+             .unnest("f").where(quail.col("f.strength") > 1)
+             .order_by(quail.col("f.strength").desc())
+             .select("r.id", "f.feature"))
+    for query in (sql, built):
+        rows = finish(query, _unnest_oracle()).collect()
+        assert rows.to_pylist() == [{"r.id": 11, "f.feature": 2},
+                                    {"r.id": 9, "f.feature": 1}]
+
+
+def test_unnest_groups_rows_by_feature(session):
+    query = session.sql(
+        f"SELECT f.feature, COUNT(*) AS n, MAX(f.strength) AS top "
+        f"FROM reviews r, {UNNEST} GROUP BY f.feature ORDER BY n DESC")
+    codecs = session.registry.codecs
+    plan = query.plan()
+    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
+    rows = finish(query, _unnest_oracle()).collect()
+    assert rows.to_pylist()[0] == {"f.feature": 100, "n": 3, "top": 0.5}
+    assert sorted(row["f.feature"] for row in rows.to_pylist()) == [0, 1, 2, 100]
+
+
+def test_unnest_needs_one_feature_call_and_its_two_fields(session):
+    bad = {
+        "two unnests": f"SELECT f.feature FROM reviews r, {UNNEST}, "
+                       f"{UNNEST.replace(' AS f', ' AS g')}",
+        "no feature call": "SELECT f.feature FROM reviews r, UNNEST(r.body) AS f",
+        "unknown field": f"SELECT f.weight FROM reviews r, {UNNEST}",
+        "mixed test": f"SELECT f.feature FROM reviews r, {UNNEST} "
+                      f"WHERE f.strength > r.id",
+        "alias taken": f"SELECT f.feature FROM reviews f, "
+                       f"{UNNEST.replace('r.body', 'f.body')}",
+    }
+    for name, sql in bad.items():
+        with pytest.raises(CompileError):
+            session.sql(sql)

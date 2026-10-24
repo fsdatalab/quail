@@ -27,6 +27,7 @@ from quail.physical import (
     Recombine,
     Scan,
     Sort,
+    Unnest,
     Window,
 )
 from quail.physical.pipelines import build_pipelines
@@ -93,6 +94,10 @@ def logical_tree(logical):
             title = f"Project: {', '.join(fields['columns'])}"
             details = [f"{name} = struct({', '.join(members)})"
                        for name, members in fields.get("structs", {}).items()]
+            if "unnest" in fields:
+                column, *tests = fields["unnest"]
+                details.append(f"unnest {column}" + (
+                    " where " + " and ".join(tests) if tests else ""))
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
             columns = ", ".join(dict.fromkeys(
@@ -384,6 +389,12 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         elif isinstance(node, Window):
             title += ": " + ", ".join(node.columns)
             details.extend(str(call) for call in node.calls)
+        elif isinstance(node, Unnest):
+            title += ": " + ", ".join(node.columns)
+            details.append(f"unnest {node.column}")
+            if node.tests:
+                details.append("where " + " and ".join(
+                    str(test) for test in node.tests))
         elif isinstance(node, Sort):
             title += ": " + ", ".join(
                 f"{column} {'DESC' if descending else 'ASC'} "

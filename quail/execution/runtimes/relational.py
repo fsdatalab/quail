@@ -1,4 +1,4 @@
-"""Runtimes for the relational nodes: scan, project, limit, aggregate, and sort."""
+"""Runtimes for the relational nodes: scan, project, unnest, limit, aggregate, sort."""
 
 from __future__ import annotations
 
@@ -15,8 +15,9 @@ from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.rows import Rows, as_table
+from quail.logical.expressions import UNNEST_FIELDS
 from quail.logical.predicates import compare_literal
-from quail.physical import Aggregate, Limit, Project, Scan, Sort, Window
+from quail.physical import Aggregate, Limit, Project, Scan, Sort, Unnest, Window
 
 
 class ScanRuntime:
@@ -78,6 +79,42 @@ class ProjectRuntime:
         output_rows = _num_rows(value)
         return NodeResult({"rows": value}, NodeMetrics(
             input_rows=rows, output_rows=rows if output_rows is None else output_rows))
+
+
+class UnnestRuntime:
+    """Return one row per element of a list column."""
+
+    def execute(self, node, inputs, context) -> NodeResult:
+        if not isinstance(node, Unnest):
+            raise TypeError(type(node).__name__)
+        if len(inputs) != 1:
+            raise ValueError("Unnest needs one input")
+        table = _rows_table(next(iter(inputs.values())))
+        result = unnest_table(table, node)
+        return NodeResult({"rows": QueryResult.from_table(result)}, NodeMetrics(
+            input_rows=table.num_rows, output_rows=result.num_rows))
+
+
+def unnest_table(table: pa.Table, node) -> pa.Table:
+    """Flatten the node's list column and keep the elements its tests accept.
+
+    The other columns are repeated with one take over the parent row of
+    each element.
+    """
+    lists = table.column(node.column).combine_chunks()
+    pairs = pc.list_flatten(lists)
+    parents = pc.list_parent_indices(lists)
+    fields = pa.table({field: pairs.field(field) for field in UNNEST_FIELDS})
+    if node.tests:
+        keep = node.tests[0].accepts(fields)
+        for test in node.tests[1:]:
+            keep = pc.and_(keep, test.accepts(fields))
+        fields, parents = fields.filter(keep), parents.filter(keep)
+    repeated = table.drop_columns([node.column]).take(parents)
+    columns = {name: repeated.column(name) for name in repeated.column_names}
+    for field in UNNEST_FIELDS:
+        columns[f"{node.column}.{field}"] = fields.column(field)
+    return pa.table({name: columns[name] for name in node.columns})
 
 
 class LimitRuntime:

@@ -4,13 +4,14 @@ from quail.logical import Aggregate as LogicalAggregate
 from quail.logical import Result as LogicalResult
 from quail.logical import Window as LogicalWindow
 from quail.logical import packed_columns
-from quail.physical import Aggregate, Limit, PortRef, Project, Sort, Window
+from quail.physical import Aggregate, Limit, PortRef, Project, Sort, Unnest, Window
 from quail.physical.base import input_ports
 
 
 def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
-                 columns: tuple[str, ...], structs: tuple = ()) -> tuple:
-    """Return the Project, Aggregate, Window, and Sort or Limit that end a plan.
+                 columns: tuple[str, ...], structs: tuple = (),
+                 unnest=None) -> tuple:
+    """Return the Project, Unnest, Aggregate, Window, and Sort or Limit ending a plan.
 
     A sort key over a source column the projection does not return is
     projected as a hidden column, which the Sort drops. A GROUP BY adds
@@ -25,12 +26,17 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
         columns: The result column names, in the projection's order.
         structs: The struct columns the Project packs, as
             Project.structs names them.
+        unnest: The logical Unnest of one feature list column, or None.
+            Its node follows the Project, so the later nodes read one
+            row per element.
     """
     window = root.input if isinstance(root.input, LogicalWindow) else None
     below = root.input.input if window is not None else root.input
     # with an aggregation the sort keys name its outputs, not inputs
+    unnested = () if unnest is None else unnest.fields
     hidden = () if isinstance(below, LogicalAggregate) else tuple(dict.fromkeys(
-        key.name for key in root.order if key.name not in columns))
+        key.name for key in root.order
+        if key.name not in columns and key.name not in unnested))
     nodes = [Project(
         node_id="project",
         inputs=input_ports(tuple(inputs)),
@@ -39,6 +45,22 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
     )]
     rows = (PortRef("project", "rows"),)
     result = packed_columns(columns, structs)
+    if unnest is not None:
+        result = tuple(unnest.output) or tuple(
+            name for column in result for name in (
+                unnested if column == unnest.column else (column,)))
+        # a field only ORDER BY reads passes through to the Sort
+        sorted_fields = tuple(dict.fromkeys(
+            key.name for key in root.order
+            if key.name in unnested and key.name not in result))
+        nodes.append(Unnest(
+            node_id="unnest",
+            inputs=input_ports(rows),
+            column=unnest.column,
+            tests=tuple(unnest.tests),
+            columns=result + sorted_fields + hidden,
+        ))
+        rows = (PortRef("unnest", "rows"),)
     if isinstance(below, LogicalAggregate):
         aggregation = below
         nodes.append(Aggregate(
