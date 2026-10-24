@@ -63,7 +63,7 @@ def test_the_spec_loads_the_sae_and_stops_at_layer_11():
     assert len(spec.attention_layers) == len(full.attention_layers) * 12 // 32
 
 
-def test_features_plan_names_the_reading_and_round_trips(session):
+def test_features_plan_names_the_pooling_and_round_trips(session):
     query = _features_query(session, pooling="max")
     plan = query.plan()
     (node,) = [n for n in plan.nodes if isinstance(n, AiSaeFeatures)]
@@ -112,7 +112,7 @@ def test_three_feature_calls_share_the_documents(session):
         "second_features").to_pylist()
 
 
-def test_sql_binds_the_reading_and_rejects_a_bad_one(session):
+def test_sql_binds_the_pooling_and_rejects_a_bad_one(session):
     query = session.sql(
         "SELECT r.id, AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this review "
         "about?', r.body), pooling => 'max') AS features FROM reviews r")
@@ -127,6 +127,18 @@ def test_sql_binds_the_reading_and_rejects_a_bad_one(session):
         session.sql(
             "SELECT r.id, AI.SAE_FEATURES(PROMPT('{0} topic', r.body)) "
             "AS features FROM reviews r")
+
+
+def test_a_feature_list_cannot_be_sorted_grouped_or_deduplicated(session):
+    call = ("AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this about?', r.body), "
+            "pooling => 'last')")
+    for sql in (f"SELECT r.id, {call} AS features FROM reviews r "
+                f"ORDER BY features",
+                f"SELECT {call} AS features, COUNT(*) AS n FROM reviews r "
+                f"GROUP BY features",
+                f"SELECT DISTINCT {call} AS features FROM reviews r"):
+        with pytest.raises(CompileError, match="AI.SAE_FEATURES list"):
+            session.sql(sql)
 
 
 def test_features_and_a_score_in_one_query_are_refused(session):

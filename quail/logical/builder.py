@@ -13,6 +13,7 @@ from quail.logical.expressions import (
     ModelCall,
     Prompt,
     RegularPredicate,
+    aliased_call,
     model_call,
 )
 from quail.logical.nodes import (
@@ -284,6 +285,7 @@ class LogicalPlanBuilder:
             raise CompileError(
                 "DISTINCT does not compare AI.EXTRACT struct columns; extract "
                 "each field as its own column")
+        _check_feature_lists(columns, order, distinct, aggregation)
         node = Project(self._root, tuple(columns), tuple(structs))
         if aggregation is not None:
             node = Aggregate(
@@ -300,3 +302,28 @@ class LogicalPlanBuilder:
         plan = LogicalPlan(node)
         plan.validate()
         return plan
+
+
+def _check_feature_lists(columns, order, distinct, aggregation) -> None:
+    """Refuse an AI.SAE_FEATURES list where the query compares values.
+
+    Raises:
+        CompileError: ORDER BY, GROUP BY, or DISTINCT reads a feature
+            list column.
+    """
+    names = {column.name for column in columns
+             if aliased_call(column, "features") is not None}
+    if not names:
+        return
+    if aggregation is not None or distinct:
+        raise CompileError(
+            "GROUP BY and DISTINCT do not compare AI.SAE_FEATURES list "
+            "columns")
+    for key in order:
+        expression = key.expression
+        if (getattr(expression, "name", None) in names
+                or aliased_call(expression, "features") is not None
+                or (isinstance(expression, ModelCall)
+                    and expression.kind == "features")):
+            raise CompileError(
+                "ORDER BY does not compare AI.SAE_FEATURES list columns")
