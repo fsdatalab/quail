@@ -17,7 +17,7 @@ import math
 
 import numpy as np
 
-from quail.cost.ngram_cache import MATCH_ORDERS, NgramMatch
+from quail.cost.ngram_cache import MATCH_ORDERS, MAX_CONTINUATIONS, NgramMatch
 
 # how many observations the seed of each curve weighs
 PRIOR_WEIGHT = 8
@@ -191,6 +191,16 @@ def _fan_bucket(fan_out: int) -> int:
     return _nearest_bucket(fan_out)
 
 
+# (match order, fan-out, own) -> the acceptance table's cell; the
+# fan-out is at most MAX_CONTINUATIONS
+_CELLS = {
+    (order, fan_out, own): (
+        (index * len(FAN_BUCKETS) + _fan_bucket(fan_out)) * _SOURCES + int(own))
+    for index, order in enumerate(MATCH_ORDERS)
+    for fan_out in range(0, MAX_CONTINUATIONS + 1)
+    for own in (False, True)}
+
+
 class MapDraftPolicy:
     """Chooses each round's draft length for one instruction.
 
@@ -218,9 +228,7 @@ class MapDraftPolicy:
 
     def cell(self, match: NgramMatch) -> int:
         """Return the acceptance table's cell for one cache match."""
-        order = MATCH_ORDERS.index(match.order)
-        return ((order * len(FAN_BUCKETS) + _fan_bucket(match.fan_out)) * _SOURCES
-                + int(match.own))
+        return _CELLS[match.order, match.fan_out, match.own]
 
     def hit_rate(self, match: NgramMatch) -> float:
         """Return P(the model writes the match's token).

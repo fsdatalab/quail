@@ -38,11 +38,30 @@ class NgramMatch:
     own: bool
 
 
+class _Entry:
+    """One key's continuations, with the best one kept up to date.
+
+    The best continuation is the one seen most often; on a tie the
+    one that reached that count first keeps the place.
+    """
+
+    __slots__ = ("continuations", "total", "best", "best_count")
+
+    def __init__(self):
+        self.continuations = {}    # token -> [count, last inserting document]
+        self.total = 0
+        self.best = None
+        self.best_count = 0
+
+    def __len__(self):
+        return len(self.continuations)
+
+
 class NgramCache:
     """Continuation counts for one query run, shared across documents."""
 
     def __init__(self):
-        # key -> {continuation token: [count, last inserting document]}
+        # key -> its entry
         self.entries = {}
 
     def add(self, tokens, document: int, start: int = 0) -> None:
@@ -54,21 +73,28 @@ class NgramCache:
             document: The document that wrote them.
             start: The first position not inserted yet.
         """
+        entries = self.entries
         for at in range(max(start, MATCH_ORDERS[-1]), len(tokens)):
             token = tokens[at]
             for order in MATCH_ORDERS:
                 if at < order:
                     continue
                 key = tuple(tokens[at - order:at])
-                found = self.entries.setdefault(key, {})
-                entry = found.get(token)
+                entry = entries.get(key)
                 if entry is None:
-                    if len(found) >= MAX_CONTINUATIONS:
+                    entry = entries[key] = _Entry()
+                found = entry.continuations.get(token)
+                if found is None:
+                    if len(entry.continuations) >= MAX_CONTINUATIONS:
                         continue
-                    found[token] = [1, document]
+                    found = entry.continuations[token] = [1, document]
+                    count = 1
                 else:
-                    entry[0] += 1
-                    entry[1] = document
+                    count = found[0] = found[0] + 1
+                    found[1] = document
+                entry.total += 1
+                if count > entry.best_count:
+                    entry.best, entry.best_count = token, count
 
     def lookup(self, context, document: int) -> NgramMatch | None:
         """Return the longest match's best continuation, or None.
@@ -78,15 +104,16 @@ class NgramCache:
                 list of Python ints.
             document: The drafting document.
         """
+        entries = self.entries
         for order in MATCH_ORDERS:
             if len(context) < order:
                 continue
-            key = tuple(context[-order:])
-            found = self.entries.get(key)
-            if not found:
+            entry = entries.get(tuple(context[-order:]))
+            if entry is None:
                 continue
-            token, (count, last) = max(found.items(), key=lambda item: item[1][0])
-            total = sum(entry[0] for entry in found.values())
-            return NgramMatch(token=token, order=order, fan_out=len(found),
-                              share=count / total, own=last == document)
+            token = entry.best
+            return NgramMatch(token=token, order=order,
+                              fan_out=len(entry.continuations),
+                              share=entry.best_count / entry.total,
+                              own=entry.continuations[token][1] == document)
         return None

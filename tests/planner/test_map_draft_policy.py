@@ -33,7 +33,7 @@ def test_the_cache_caps_continuations_per_key():
     for token in range(10):
         cache.add([1, 2, token + 100], document=0)
     (key,) = [k for k in cache.entries if k == (1, 2)]
-    assert len(cache.entries[key]) == MAX_CONTINUATIONS
+    assert len(cache.entries[key].continuations) == MAX_CONTINUATIONS
 
 
 def test_hit_rates_blend_the_count_share_with_observed_accepts():
