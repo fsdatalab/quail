@@ -68,9 +68,10 @@ def test_a_draft_copied_from_the_document_settles_in_few_rounds(monkeypatch):
                            draft_policy="fixed")
     assert asked.answer == gold
     written = len(asked.written)
-    # the cue chooses the first token; one round copies the rest; one
+    # the cue chooses the first token; the round launched before that
+    # choice is decided feeds it alone; one round copies the rest; one
     # round reads the stop
-    assert asked.steps <= 3, (asked.steps, written)
+    assert asked.steps <= 4, (asked.steps, written)
 
 
 def test_without_a_draft_each_round_writes_one_token(monkeypatch):
@@ -87,18 +88,25 @@ def test_an_immediate_turn_end_writes_an_empty_answer(monkeypatch):
 
 
 def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
-    # " five" occurs twice; the draft copies " days" after the first,
-    # and the model chooses " years": the round ends there, and the
-    # next round feeds " years" in the draft's place
+    # " five" occurs twice. The round launched before the cue's choice
+    # is decided feeds that choice, " five", alone. The round after is
+    # drafted once " five" is known: the document continues it with
+    # " days or five years", the GPU's choice is expected to be
+    # " days", and the draft is what follows. The model chooses
+    # " years" instead, so the round feeds it with a draft the choice
+    # refutes, and the answer ends at its row.
     text = "or five days or five years"
     asked, model, key = _map_one(monkeypatch, text, "five years",
                                  draft_policy="fixed")
     assert asked.answer == "five years"
     tables = model.tables
-    five, days, years = (tables.encode_ids(w)[0] for w in (" five", " days", " years"))
+    five, or_, years = (tables.encode_ids(w)[0] for w in (" five", " or", " years"))
     fed = [suffix for k, suffix, _, _, _ in model.packed if k == key]
-    assert fed[1][:2] == [five, days]
-    assert fed[2][:1] == [years]
+    assert fed[1] == [five]
+    assert fed[2][:2] == [years, or_]
+    # one more round was launched before the end was decided; its
+    # rows decide nothing
+    assert len(fed) == 4 and len(fed[3]) == 1
 
 
 def test_the_answer_stops_at_the_limit(monkeypatch):
@@ -185,7 +193,7 @@ def test_an_adaptive_copy_draft_runs_long_below_the_ridge(monkeypatch):
     asked, _, _ = _map_one(monkeypatch, LEASE, gold, draft_tokens=15,
                            ridge_tokens=4096.0)
     assert asked.answer == gold
-    assert asked.steps <= 3
+    assert asked.steps <= 4
 
 
 def test_a_sibling_answer_seeds_the_cache_draft(monkeypatch):
@@ -290,3 +298,68 @@ def test_a_long_document_is_prefilled_in_slices_and_answers_the_same(monkeypatch
     final = [spec for spec in packed
              if spec["prefix"] is not None and len(spec["suffixes"])]
     assert final and final[0]["start"] == sum(len(s["prefix"]) for s in slices)
+
+
+def test_the_round_feed_applies_the_decoders_rule_on_the_gpu():
+    # two answers: the first fed a chosen token and a two-token draft,
+    # and its rows choose the first draft token, then another token;
+    # the second's one row prefers the stop. The feed says how many
+    # draft tokens each accepted and the token its next row chose.
+    import torch
+
+    from quail.backends.quail.executor.readout import round_feed
+
+    stop_mask = torch.zeros(100, dtype=torch.bool)
+    stop_mask[99] = True
+    # each row: the stop value, then its likeliest id and value (k = 1)
+    values = torch.tensor([[-5.0, 11.0, -0.1],
+                           [-5.0, 30.0, -0.2],
+                           [-5.0, 12.0, -0.3],
+                           [-0.1, 99.0, -0.1]])
+    following = np.array([11, 12, -1, -1])
+    feed = round_feed(torch, values, following, [3, 1], stop_mask, 1, 1)
+    assert feed.accepted.tolist() == [1, 0]
+    assert feed.chosen.tolist() == [30, 99]
+
+
+def test_a_live_document_runs_in_every_pass(monkeypatch):
+    # two documents decoding answers of different lengths: once a
+    # document's tail is packed, it is in every pass until the pass
+    # after its answer ends, as its next round is launched before the
+    # one before it is decided
+    from helpers.extract_fakes import TERM
+
+    golds = ["March 3, 2027 at noon", "five years"]
+    tables = make_vocabulary(LEASE, TERM, *golds)
+    spec = make_map_spec(tables, draft_tokens=0)
+    passes = []
+
+    def recording(torch, arena, specs, **kw):
+        passes.append([spec["key"] for spec in specs])
+        return fake_pack(torch, arena, specs, **kw)
+
+    monkeypatch.setattr(chunk_mod, "pack_chunk", recording)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
+    state = _state(model)
+    state.loaded_model.vocabulary = tables
+    stages = MapStages(state, [spec], tables, [0, 1],
+                       [tables.encode_ids(LEASE), tables.encode_ids(TERM)])
+    for document, text, gold in zip(stages.documents, (LEASE, TERM), golds):
+        model.documents[document.key] = text
+        model.gold[document.key] = gold
+    run_stages(state.torch, state.loaded_model.arena,
+               state.loaded_model.pipeline, stages.stages, stages.prefixes,
+               state.chunk_tokens, anchor_keys=stages.keys,
+               appended_tokens=stages.appended_tokens)
+    stages.finish()
+    answers = [document.answers[0] for document in stages.documents]
+    assert [answer.answer for answer in answers] == golds
+    for document, answer in zip(stages.documents, answers):
+        in_passes = [index for index, keys in enumerate(passes)
+                     if document.key in keys]
+        # the tail, one round per answer token (the last reads the
+        # stop), and the round launched before the end was decided
+        assert len(in_passes) == len(answer.written) + 2
+        assert in_passes == list(range(in_passes[0], in_passes[-1] + 1))

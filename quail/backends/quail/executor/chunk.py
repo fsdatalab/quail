@@ -48,6 +48,45 @@ class Chunk:
     fresh_keys: tuple = ()
     rows_per_answer: np.ndarray | None = None
 
+    def apply_feed(self, torch, feed, source, page_tokens):
+        """Fill the device-fed rounds from the answers they follow, on the GPU.
+
+        Each device-fed round's first token becomes the token its
+        source answer chose, its rows move past the draft tokens that
+        answer accepted, and its KV reads and writes follow: the rows
+        read one more resident token per accepted token, and the kept
+        rows are written at their moved positions.
+
+        Args:
+            torch: The torch module.
+            feed: The RoundFeed of the pass holding the source answers.
+            source: Per device-fed round, in chunk order, the index of
+                its source answer in that pass.
+            page_tokens: Rows per KV page.
+        """
+        plan = self.meta["feed"]
+        device = self.input_ids.device
+
+        def to_device(array):
+            return device_array(torch, array, device)
+
+        source = to_device(np.asarray(source, dtype=np.int64))
+        shift = feed.accepted.index_select(0, source) + 1
+        self.input_ids.index_copy_(0, to_device(plan["first"]),
+                                   feed.chosen.index_select(0, source))
+        rows = to_device(plan["rows"])
+        self.positions.index_add_(0, rows,
+                                  shift.index_select(0, to_device(plan["entry"])))
+        reads = self.meta["reads"]
+        sequence = to_device(plan["sequence"])
+        reads["used"].index_add_(0, sequence, shift.to(reads["used"].dtype))
+        positions = self.positions.index_select(0, rows)
+        pages = reads["table"][sequence.index_select(0, to_device(plan["entry"])),
+                               positions // page_tokens]
+        self.meta["kv_dst"].index_copy_(
+            0, to_device(plan["kv_rows"]),
+            pages.to(torch.int64) * page_tokens + positions % page_tokens)
+
 
 class ArenaFullError(RuntimeError):
     """The KV arena has too few free pages to pack the chunk."""
@@ -129,6 +168,11 @@ def _join(parts):
     for i in np.flatnonzero(kinds == 0):
         out[offsets[i]:ends[i]] = parts[i]
     return out
+
+
+def device_array(torch, array, device):
+    """Copy a host array to the device without waiting for the stream."""
+    return torch.from_numpy(np.ascontiguousarray(array)).to(device, non_blocking=True)
 
 
 def _staged(torch, data, dtype, pinned=True):
@@ -305,6 +349,26 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
     return host.to("cuda", non_blocking=pinned)
 
 
+def _feed_plan(fed_rounds, kv_writes) -> dict:
+    """Lay out the device-fed rounds' rows for Chunk.apply_feed(), on the host.
+
+    Returns:
+        first: Each round's first row. rows: Every row of the rounds.
+        entry: Each such row's round. sequence: Each round's sequence
+        among the resident reads. kv_rows: Each such row's index among
+        the KV writes.
+    """
+    first, counts, sequence, write = (np.array(column, dtype=np.int64)
+                                      for column in zip(*fed_rounds))
+    offsets = np.cumsum([r1 - r0 for _, r0, r1, _ in kv_writes])
+    offsets = np.concatenate(([0], offsets[:-1]))
+    entry = np.repeat(np.arange(len(first)), counts)
+    within = np.arange(int(counts.sum())) - np.repeat(
+        np.cumsum(counts) - counts, counts)
+    return dict(first=first, rows=first[entry] + within, entry=entry,
+                sequence=sequence, kv_rows=offsets[write][entry] + within)
+
+
 # ------------------------------------------------------- chunk packing
 
 class _PoolView:
@@ -403,6 +467,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     * paths: Trie paths and ancestor rows from trie_paths(). The document
       KV must already be resident.
     * canvas: Per-group answer canvas tokens, overriding the default canvas.
+    * device_fed: Whether the group is a decode round whose first token
+      and positions Chunk.apply_feed() sets on the GPU from the answer
+      before it; f is that answer's first position, and feed_bound the
+      most rows it could have accepted plus one, bounding the KV read.
 
     Fresh groups without arena pages must have at most one suffix. Unified
     attention cannot mix paged and unpaged groups. Canvas rows use unified
@@ -469,6 +537,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     plain_rounds = (not tree_path and not canvas
                     and not getattr(arena, "has_sliding", False))
     tree_rounds = tree_path and not canvas
+    # the device-fed rounds: (first row, rows, read sequence, index
+    # among the KV writes), and the most resident tokens one reads
+    fed_rounds = []
+    fed_used = 0
     for g in groups:
         sufs0 = g["suffixes"]
         if (tree_rounds and g.get("prefix") is None and g.get("single")
@@ -502,6 +574,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if total > max_q:
                 max_q = total
             num_tokens = row0 + total
+            if g.get("device_fed"):
+                if kept != total:
+                    raise ValueError(
+                        f"group {key!r}: a device-fed round keeps every row")
+                fed_rounds.append((row0, total, len(read_keys) - 1,
+                                   len(kv_writes) - 1))
+                fed_used = max(fed_used, f + int(g["feed_bound"]))
             continue
         if (plain_rounds and g.get("prefix") is None
                 and isinstance(sufs0, Suffixes) and len(sufs0) == 1
@@ -524,6 +603,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             layout.append((g["key"], 1))
             unified_groups.append((g["key"], f, row0, total))
             continue
+        if g.get("device_fed"):
+            raise ValueError(
+                f"group {g['key']!r}: a device-fed round is one kept suffix "
+                f"over a resident document on the tree path")
         fresh = g.get("prefix") is not None
         f = g["f"]
         key = g["key"]
@@ -750,7 +833,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             rows=_staged(torch, rows, torch.int64, pinned),
             cu_q=stage("unified_cu_q", cu_q, torch.int32),
             max_q=max_q, used=_staged(torch, read_used, torch.int32, pinned),
-            max_used=max(read_used), table=table,
+            max_used=max(max(read_used), fed_used), table=table,
             source=_staged(torch, source, torch.int32, pinned))
         if node_q:
             q_rows = np.concatenate(node_q)
@@ -909,6 +992,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # row pairs: the attention pass scatters them with a single kernel
     # launch per layer (kv_row_scatter)
     kv_src = kv_dst = None
+    feed = None
     if kv_writes:
         dst_parts = []
         for key, r0, r1, dest in kv_writes:
@@ -919,6 +1003,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         kv_src = _staged(torch, _span_rows([(r0, r1) for _, r0, r1, _ in kv_writes]),
                          torch.int64, pinned)
         kv_dst = _staged(torch, np.concatenate(dst_parts), torch.int64, pinned)
+    if fed_rounds:
+        feed = _feed_plan(fed_rounds, kv_writes)
     t = _tick(timing, "pack_kv", t)
 
     canvas_meta = None
@@ -963,7 +1049,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 arena.free_key(key)
             raise
     meta = dict(
-        layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
+        layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads, feed=feed,
         unified=unified, canvas=canvas_meta, gdn=gdn,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)

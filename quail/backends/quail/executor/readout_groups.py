@@ -41,6 +41,12 @@ class ReadoutGroups:
             values[key] = self.readout_of[key].result(handle)
         return values
 
+    def feed(self, handles, following, counts):
+        """Return the chunk's RoundFeed from its one readout's handle."""
+        if not self.shared_readout:
+            raise ValueError("device-fed rounds need one readout for every stage")
+        return self.readout_of[0].feed(handles[0][1], following, counts)
+
     def _select_rows(self, normed, spans_j):
         index = np.concatenate([np.arange(start, end, dtype=np.int64)
                                 for start, end in spans_j])

@@ -370,7 +370,16 @@ def _fake_readout(tables, k):
         values = np.asarray(rows, dtype=np.float32)[:, :width]
         return split_rows(values, rows_per_answer)
 
-    value.submit, value.result = submit, lambda handle: handle
+    def feed(handle, following, counts):
+        import torch
+
+        from quail.backends.quail.executor.readout import round_feed
+
+        values = torch.as_tensor(np.concatenate(list(handle)))
+        return round_feed(torch, values, following, counts,
+                          torch.as_tensor(tables.is_stop), 1, k)
+
+    value.submit, value.result, value.feed = submit, lambda handle: handle, feed
     return value
 
 

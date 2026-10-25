@@ -9,10 +9,20 @@ of the answers written so far; the adaptive policy sizes it from the
 acceptance odds and the forward pass's slack. The answer ends where
 the model ends its turn, or at the configured answer limit.
 
+A round is launched before the round before it is decided, so a
+document runs in every pass: the GPU puts the token the earlier round
+chose first, and the host decides that round one pass later. The host
+therefore keeps two rounds per document: the oldest launched round
+whose rows it has not decided, and the draft of the round after it.
+When it decides a round, it drafts the round after next from the
+answer so far: the ideal draft continues the answer, the launched
+draft consumes the part of it they agree on, one token is left for
+the GPU's choice, and the rest is the new draft. A launched draft the
+model rejects then costs one round, not every round after it.
+
 The state of every document's answer lives in arrays over the
 documents, and a chunk's rounds are verified, written, and drafted
-together in a few array passes; only the n-gram chain, which walks a
-dictionary, runs per document.
+together in a few array passes.
 """
 
 from collections.abc import Sequence
@@ -50,13 +60,26 @@ class AnswerState:
         self.asked = np.zeros(shape, dtype=bool)
         self.steps = np.zeros(shape, dtype=np.int64)
         self.fed_tokens = np.zeros(shape, dtype=np.int64)
-        # the last round's fed tokens, its unverified tail, and each
-        # draft token's policy cell
+        # the oldest launched round whose rows are not decided: its
+        # tokens, the first known once the round before it was decided,
+        # and its draft tokens' policy cells
         self.fed = np.zeros((num_documents, 1 + draft_tokens), dtype=np.int64)
         self.fed_len = np.zeros(shape, dtype=np.int64)
-        self.discard = np.zeros(shape, dtype=np.int64)
         self.cells = np.full((num_documents, max(1, draft_tokens)), NO_CELL,
                              dtype=np.int64)
+        # the round after it, launched or next: its draft and cells
+        self.draft = np.zeros((num_documents, draft_tokens), dtype=np.int64)
+        self.draft_len = np.zeros(shape, dtype=np.int64)
+        self.draft_cells = np.full((num_documents, max(1, draft_tokens)), NO_CELL,
+                                   dtype=np.int64)
+        # whether the tail is launched; the launched rounds, the tail
+        # among them, whose rows are not decided; and the position of
+        # the oldest such round's first token, or the next round's
+        self.started = np.zeros(shape, dtype=bool)
+        self.unreported = np.zeros(shape, dtype=np.int64)
+        self.base = np.zeros(shape, dtype=np.int64)
+        # the last decided round's tokens fed off the answer's path
+        self.discard = np.zeros(shape, dtype=np.int64)
         self.cached = np.zeros(shape, dtype=np.int64)
         self.answers = [None] * num_documents
 
@@ -151,6 +174,9 @@ class MapDecoder:
                                 for state in self.states]
         self.rho = np.array([document.rho for document in documents],
                             dtype=np.float64)
+        # the ideal draft reaches past a launched round's draft and the
+        # token the model chooses after it, to the draft after
+        self.reach = 2 * spec.draft_tokens + 1
         self._index_documents()
 
     # ---- the documents, indexed for copying -------------------------------
@@ -220,17 +246,37 @@ class MapDecoder:
         found = keys[clipped] == wanted
         return np.where(found, positions[clipped], -1)
 
-    # ---- a chunk's rounds, verified and drafted together --------------------
+    # ---- launches, and a chunk's rounds verified and drafted together --------
+
+    def launch(self, q: int, index: np.ndarray, tail: bool,
+               positions: np.ndarray) -> None:
+        """Record that the documents' tail or next round is on the stream.
+
+        Args:
+            q: The instruction's index.
+            index: The documents launched.
+            tail: Whether the tail was launched, rather than a round.
+            positions: Per document in index, its cue's position; a
+                tail launched first starts the answer there.
+        """
+        state = self.states[q]
+        if tail:
+            new = ~state.started[index]
+            state.started[index[new]] = True
+            state.base[index[new]] = np.asarray(positions)[new]
+        state.unreported[index] += 1
 
     def round(self, q: int, index: np.ndarray, rows: np.ndarray,
               num_rows: np.ndarray, slack: float) -> int:
-        """Verify a chunk's rounds for instruction q and draft the next ones.
+        """Decide a chunk's oldest launched rounds for instruction q.
 
         Row i of a document follows token i of the round's fed tokens,
         so the token chosen from it is written and, when it is not the
-        token fed next, the rest of the round is discarded: the next
-        round feeds the chosen token in its place. The tail stage's one
-        row, after the cue, chooses the answer's first token.
+        token fed next, the rest of the round is discarded: the round
+        after feeds the chosen token in its place. The tail stage's one
+        row, after the cue, chooses the answer's first token. The
+        round after, launched or next, gets its first token, and the
+        round after that its draft.
 
         Args:
             q: The instruction's index.
@@ -289,6 +335,9 @@ class MapDecoder:
         # a draft token past the chosen row was fed off the answer's path
         missed_round = fresh.astype(bool) & (accepted + 1 < num_rows)
         state.discard[index] = np.where(missed_round, num_rows - accepted - 1, 0)
+        # the round after starts past the accepted tokens and the chosen
+        state.unreported[index] -= 1
+        state.base[index] += accepted + 1
         if self.policies is not None:
             self._observe(q, index, accepted, missed_round)
         newly = np.flatnonzero(ended & ~state.done[index])
@@ -296,7 +345,7 @@ class MapDecoder:
             self.settle(self.documents[index[position]], q)
         if self.policies is not None:
             self._cache(state, index)
-        self._draft(q, index[np.flatnonzero(~ended)], slack)
+        self._plan(q, index[np.flatnonzero(~ended)], slack)
         return len(newly)
 
     def _top(self, rows: np.ndarray) -> tuple:
@@ -358,62 +407,117 @@ class MapDecoder:
                                 tokens[keyed], document[keyed])
         state.cached[index] = written
 
-    def _draft(self, q: int, index: np.ndarray, slack: float) -> None:
-        """Set the next round's fed tokens: the chosen token, then a draft.
+    def _plan(self, q: int, index: np.ndarray, slack: float) -> None:
+        """Set the documents' next round's tokens and the draft of the one after.
 
-        The draft copies the document's next tokens from the position
-        where the answer's last written tokens occur, or, when the
-        document does not continue the answer, chains continuations
-        from the n-gram cache. The adaptive policy sizes each draft
-        from its acceptance odds, the pass's slack, and the round's
-        price: the document's KV read, which every round pays however
-        many tokens it feeds, so a draft that saves rounds saves reads.
-        The fixed policy copies up to draft_tokens from the document.
+        The next round feeds the chosen token, then the launched draft
+        if the round is on the stream, else a fresh draft. The ideal
+        draft continues the answer so far: the document's next tokens
+        from where the answer's last written tokens occur, or chained
+        continuations from the n-gram cache. The round after next
+        drafts the ideal draft past the tokens the next round's draft
+        agrees with and the one the model chooses after them. The
+        adaptive policy sizes each draft from its acceptance odds, the
+        pass's slack, and the round's price: the document's KV read,
+        which every round pays however many tokens it feeds.
         """
+        if not len(index):
+            return
         state = self.states[q]
         cap = self.spec.max_answer_tokens
-        state.cells[index] = NO_CELL
-        written = state.num_written[index]
-        state.fed[index, 0] = state.written[index, np.maximum(written - 1, 0)]
-        room = np.minimum(self.spec.draft_tokens, cap - written - 1)
+        span = self.spec.draft_tokens
         policy = None if self.policies is None else self.policies[q]
-        length = np.zeros(len(index), dtype=np.int64)
-        at = self._source_positions(index, state)
-        at[room <= 0] = -1
+        written = state.num_written[index]
         rho = self.rho[index]
-        copying = at >= 0
-        if copying.any():
-            length[copying] = (room[copying] if policy is None
-                               else policy.copy_lengths(rho[copying],
-                                                        written[copying], slack,
-                                                        room[copying]))
-            length = np.minimum(length, self.document_lengths[index] - at - 1)
-            hop = np.arange(self.spec.draft_tokens)
-            source = (self.document_starts[index][:, None] + at[:, None] + 1
-                      + hop[None, :])
-            taking = hop[None, :] < length[:, None]
+        hop = np.arange(span)
+        tokens, cells, rates, length = self._ideal(state, index, policy)
+        # the next round's draft: launched already, or the ideal one
+        pending = state.draft[index].copy()
+        pending_cells = state.draft_cells[index][:, :span].copy()
+        pending_len = state.draft_len[index].copy()
+        fresh = np.flatnonzero(state.unreported[index] == 0)
+        if len(fresh):
+            room = np.clip(np.minimum(span, cap - written[fresh] - 1), 0,
+                           length[fresh])
+            pending_len[fresh] = self._lengths(policy, rho[fresh], written[fresh],
+                                               rates[fresh, :span], slack, room)
+            pending[fresh] = tokens[fresh, :span]
+            pending_cells[fresh] = cells[fresh, :span]
+        state.fed[index, 0] = state.written[index, written - 1]
+        state.fed[index, 1:] = pending
+        state.fed_len[index] = 1 + pending_len
+        state.cells[index, :span] = np.where(hop[None, :] < pending_len[:, None],
+                                             pending_cells, NO_CELL)
+        # the round after: past the agreed tokens and the model's choice
+        agree = ((pending == tokens[:, :span]) & (hop[None, :] < pending_len[:, None])
+                 & (hop[None, :] < length[:, None]))
+        disagree = ~agree & (hop[None, :] < pending_len[:, None])
+        skip = pending_len + 1
+        if span:
+            skip = np.where(disagree.any(axis=1), disagree.argmax(axis=1) + 1, skip)
+        room = np.clip(np.minimum(span, cap - written - skip - 1), 0,
+                       np.maximum(length - skip, 0))
+        columns = np.minimum(skip[:, None] + hop[None, :], self.reach - 1)
+        rows = np.arange(len(index))[:, None]
+        take = self._lengths(policy, rho, np.minimum(written + skip, cap),
+                             rates[rows, columns], slack, room)
+        state.draft[index] = tokens[rows, columns]
+        state.draft_len[index] = take
+        state.draft_cells[index, :span] = np.where(hop[None, :] < take[:, None],
+                                                   cells[rows, columns], NO_CELL)
+
+    def _lengths(self, policy, rho, written, rates, slack, room) -> np.ndarray:
+        """Return each draft's length: all its room, or what the policy keeps."""
+        if policy is None or not rates.shape[1]:
+            return room
+        return policy.chain_lengths(rho, written, rates, slack, room)
+
+    def _ideal(self, state: AnswerState, index: np.ndarray, policy) -> tuple:
+        """Return the ideal drafts: the answer's continuation, up to the reach.
+
+        Returns:
+            (tokens, cells, rates, length): (documents, reach) arrays of
+            the draft tokens, their policy cells, and their acceptance
+            odds, and each draft's length.
+        """
+        reach = self.reach
+        num_documents = len(index)
+        tokens = np.zeros((num_documents, reach), dtype=np.int64)
+        cells = np.full((num_documents, reach), NO_CELL, dtype=np.int64)
+        rates = np.zeros((num_documents, reach), dtype=np.float64)
+        length = np.zeros(num_documents, dtype=np.int64)
+        at = self._source_positions(index, state)
+        copying = np.flatnonzero(at >= 0)
+        if len(copying):
+            length[copying] = np.minimum(
+                reach, self.document_lengths[index[copying]] - at[copying] - 1)
+            hop = np.arange(reach)
+            source = (self.document_starts[index[copying]][:, None]
+                      + at[copying][:, None] + 1 + hop[None, :])
+            taking = hop[None, :] < length[copying][:, None]
             source = np.minimum(source, max(len(self.document_tokens) - 1, 0))
-            state.fed[index[:, None], 1 + hop[None, :]] = np.where(
-                taking, self.document_tokens[source], 0)
-            state.cells[index[:, None], hop[None, :]] = np.where(taking, COPY_CELL,
-                                                                 NO_CELL)
+            tokens[copying] = np.where(taking, self.document_tokens[source], 0)
+            cells[copying] = np.where(taking, COPY_CELL, NO_CELL)
+            rates[copying] = np.where(
+                taking, 1.0 if policy is None else policy.copy_rate(), 0.0)
         if policy is not None:
-            chaining = np.flatnonzero(~copying & (room > 0))
+            chaining = np.flatnonzero(at < 0)
             if len(chaining):
-                length[chaining] = self._chain(
-                    state, index[chaining], policy, room[chaining], rho[chaining],
-                    slack)
-        state.fed_len[index] = 1 + length
+                (tokens[chaining], cells[chaining], rates[chaining],
+                 length[chaining]) = self._chain(state, index[chaining], policy)
+        return tokens, cells, rates, length
 
     def _chain(self, state: AnswerState, index: np.ndarray,
-               policy: MapDraftPolicy, room: np.ndarray, rho: np.ndarray,
-               slack: float) -> np.ndarray:
-        """Fill the documents' drafts from the cache; return their lengths.
+               policy: MapDraftPolicy) -> tuple:
+        """Chain the documents' drafts from the cache, up to the reach.
 
         Each hop looks up every still-chaining document at once. A
-        chain stops at a miss, at its room, or once its hops' combined
-        odds fall below the cutoff: tokens past that point add under
-        0.02 expected writes, so the policy would not keep them.
+        chain stops at a miss or once its hops' combined odds fall
+        below the cutoff: tokens past that point add under 0.02
+        expected writes, so the policy would not keep them.
+
+        Returns:
+            (tokens, cells, rates, length) as _ideal returns them.
         """
         width = max(MATCH_ORDERS)
         count = state.num_written[index]
@@ -423,15 +527,14 @@ class MapDecoder:
                            state.written[index[:, None], np.maximum(columns, 0)],
                            -1)
         lengths = np.minimum(count, width)
-        cap = self.spec.draft_tokens
-        tokens = np.zeros((len(index), cap), dtype=np.int64)
-        cells = np.full((len(index), cap), NO_CELL, dtype=np.int64)
-        rates = np.zeros((len(index), cap), dtype=np.float64)
+        reach = self.reach
+        tokens = np.zeros((len(index), reach), dtype=np.int64)
+        cells = np.full((len(index), reach), NO_CELL, dtype=np.int64)
+        rates = np.zeros((len(index), reach), dtype=np.float64)
         combined = np.ones(len(index))
         hops = np.zeros(len(index), dtype=np.int64)
         active = np.arange(len(index))
-        for hop in range(int(room.max())):
-            active = active[hops[active] < room[active]]
+        for hop in range(reach):
             if not len(active):
                 break
             found = self.cache.lookup_many(context[active], lengths[active],
@@ -442,24 +545,18 @@ class MapDecoder:
                                           found.own[found.found],
                                           found.share[found.found])
             combined[hit] *= rate
-            kept = hit[combined[hit] >= CHAIN_CUTOFF]
-            token = found.token[found.found][combined[hit] >= CHAIN_CUTOFF]
+            keeping = combined[hit] >= CHAIN_CUTOFF
+            kept = hit[keeping]
+            token = found.token[found.found][keeping]
             tokens[kept, hop] = token
-            cells[kept, hop] = cell[combined[hit] >= CHAIN_CUTOFF]
-            rates[kept, hop] = rate[combined[hit] >= CHAIN_CUTOFF]
+            cells[kept, hop] = cell[keeping]
+            rates[kept, hop] = rate[keeping]
             hops[kept] += 1
             context[kept, :-1] = context[kept, 1:]
             context[kept, -1] = token
             lengths[kept] = np.minimum(lengths[kept] + 1, width)
             active = kept
-        length = policy.chain_lengths(rho, count, rates, slack,
-                                      np.minimum(room, hops))
-        taking = np.arange(cap)[None, :] < length[:, None]
-        state.fed[index[:, None], 1 + np.arange(cap)[None, :]] = np.where(
-            taking, tokens, state.fed[index[:, None], 1 + np.arange(cap)[None, :]])
-        state.cells[index[:, None], np.arange(cap)[None, :]] = np.where(
-            taking, cells, NO_CELL)
-        return length
+        return tokens, cells, rates, hops
 
     def settle(self, document: MapDocument, q: int) -> None:
         """Set the instruction's answer for the document: its written text."""

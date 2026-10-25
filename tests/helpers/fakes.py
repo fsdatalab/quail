@@ -188,7 +188,8 @@ def fake_pack(torch, arena, specs, **kw):
         rows_per_answer = None
     else:
         rows_per_answer = np.asarray(rows_per_answer, dtype=np.int64)
-    meta = {}
+    meta = {"feed": [index for index, spec in enumerate(specs)
+                     if spec.get("device_fed")] or None}
     if arena.num_state_slots:
         from quail.backends.quail.executor.gdn import plan_phases
 
@@ -209,9 +210,24 @@ def fake_pack(torch, arena, specs, **kw):
             offset = int(ends[-1])
         meta["gdn"] = plan_phases(
             arena, groups, lambda name, values, dtype: np.asarray(values))
-    return SimpleNamespace(specs=specs, tokens=tokens, layout=[], temporary_keys=(),
-                           fresh_keys=(), rows_per_answer=rows_per_answer,
-                           meta=meta)
+    chunk = SimpleNamespace(specs=specs, tokens=tokens, layout=[], temporary_keys=(),
+                            fresh_keys=(), rows_per_answer=rows_per_answer,
+                            meta=meta)
+
+    def apply_feed(torch, feed, source, page_tokens):
+        """Fill the device-fed rounds as Chunk.apply_feed does, on the specs."""
+        from quail.backends.quail.executor.chunk import Suffixes
+
+        for index, at in zip(meta["feed"], source):
+            spec = specs[index]
+            accepted = int(feed.accepted[at])
+            ids = spec["suffixes"].ids.copy()
+            ids[0] = int(feed.chosen[at])
+            spec["suffixes"] = Suffixes(ids, [len(ids)])
+            spec["f"] += accepted + 1
+
+    chunk.apply_feed = apply_feed
+    return chunk
 
 
 def expected_filter_rows(filter_truth):

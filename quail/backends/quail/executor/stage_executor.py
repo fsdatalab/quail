@@ -22,6 +22,10 @@ from quail.backends.quail.executor.stages import (
 )
 from quail.progress import Progress, logger
 
+# the draft token fed after a readout row, where there is none
+_NO_FOLLOWING = np.full(1 << 16, -1, dtype=np.int64)
+_NO_FOLLOWING.setflags(write=False)
+
 
 def attention_path(pipeline, requested, default_attention="unified") -> str:
     """The path a filter stream or join runs: the plan's request where the model has it.
@@ -147,6 +151,10 @@ class StageExecutor:
         # a prefix longer than a pass's room is packed over several
         # passes, so a document's length never bounds the budget
         self.slice_prefill = bool(paged and self.mode == "tree")
+        # a stage that runs ahead of its answers feeds its rounds from
+        # the GPU, which the tree path's packed rounds allow
+        self.ahead = [bool(stage.ahead) and self.slice_prefill for stage in stages]
+        self.feeding = any(self.ahead)
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
@@ -227,7 +235,7 @@ class StageExecutor:
             extra_tokens=self.capacity_extra,
             reserve=self._reserve if self.paged else None,
             repeats=[stage.repeats for stage in self.stages],
-            slice_prefill=self.slice_prefill,
+            slice_prefill=self.slice_prefill, ahead=self.ahead,
         )
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
@@ -278,6 +286,10 @@ class StageExecutor:
                        "report": 0.0, "decide": 0.0, "submit": 0.0}
         self.readout_spans = []
         self.outstanding = []     # PendingAnswers in launch order
+        self.passes = 0
+        # per anchor, the pass and answer index of its latest launched
+        # request: the source of its next device-fed round
+        self.latest = {}
         self.split_answers = any(s.append and s.own_suffixes for s in stages)
 
         if self.label is None:
@@ -418,12 +430,31 @@ class StageExecutor:
         return self.stages[j].single and end - start == 1
 
     def _build(self, chunk_groups):
-        """Pack a chunk and identify each entry's stage and answer row count."""
+        """Pack a chunk and identify each entry's stage and answer row count.
+
+        Returns:
+            The chunk; its entries, (stage, answer rows) per readout
+            answer in order; per answer row, the draft token fed after
+            it, or -1; per group, the index of its answer, or None for
+            a prefix slice; and per device-fed round, in chunk order,
+            the pass and answer index of the answer it follows.
+        """
         from quail.backends.quail.executor.chunk import Suffixes, pack_chunk
 
         specs = []
         entries = []
+        following = []
+        group_entries = []
+        sources = []
         appended = {}
+
+        def entry(j, rows, fed=None):
+            entries.append((j, rows))
+            if fed is None:
+                fed = (_NO_FOLLOWING[:rows] if rows <= len(_NO_FOLLOWING)
+                       else np.full(rows, -1, dtype=np.int64))
+            following.append(fed)
+
         for a, j, start, end, carried in chunk_groups:
             key = self.keys[a]
             f = self.prefix_lengths[a]
@@ -439,6 +470,7 @@ class StageExecutor:
                 specs.append(dict(
                     key=key, prefix=self.prefixes[a][first:last], start=first,
                     f=first, suffixes=Suffixes.of([])))
+                group_entries.append(None)
                 continue
             request = self.own.get((j, a))
             if (request is not None and not carried and append
@@ -451,17 +483,27 @@ class StageExecutor:
                 # a decode round: the document's own one suffix, kept
                 # after the path earlier rounds appended; the general
                 # bookkeeping below reduces to this
-                path = max(0, self.appended[a] - request.discard)
+                base = f + len(frame)
+                position = request.position
+                if position is None:
+                    position = base + max(0, self.appended[a] - request.discard)
                 sufs = request.suffixes
                 total = int(sufs.lengths[0])
                 kept = (total if request.write_suffix_tokens is None
                         else request.write_suffix_tokens)
-                appended[a] = path + kept
-                specs.append(dict(
-                    key=key, prefix=None, f=f + len(frame) + path,
+                appended[a] = position - base + kept
+                spec = dict(
+                    key=key, prefix=None, f=position,
                     suffixes=sufs, read_all_rows=True,
-                    write_suffix_tokens=kept, single=True))
-                entries.append((j, total))
+                    write_suffix_tokens=kept, single=True)
+                if request.device_fed:
+                    # the round before it had at most the stage's most
+                    # tokens, so its accepted rows are bounded by them
+                    spec.update(device_fed=True, feed_bound=stage.suffix_tokens)
+                    sources.append(self.latest[a])
+                specs.append(spec)
+                entry(j, total, np.concatenate((sufs.ids[1:], _NO_FOLLOWING[:1])))
+                group_entries.append(len(entries) - 1)
                 continue
             # a written frame, or a rewinding stage, replaces any path
             # an earlier stage kept
@@ -469,6 +511,8 @@ class StageExecutor:
             path = 0 if rewinds and start == 0 else self.appended[a]
             if request is not None:
                 path = max(0, path - request.discard)
+                if request.position is not None:
+                    path = request.position - f - len(frame)
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
             prefix = None
@@ -529,7 +573,7 @@ class StageExecutor:
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f, suffixes=Suffixes(self.frame_ids[j], [len(frame)]),
                     write_suffix_tokens=len(frame), **carry))
-                entries.append((j, 1))
+                entry(j, 1)
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
@@ -543,13 +587,14 @@ class StageExecutor:
                     write_suffix_tokens=kept,
                     single=self.stages[j].single and end - start == 1,
                     paths=self.stages[j].paths, **carry, **own))
-            entries.append((j, rows))
+            entry(j, rows)
+            group_entries.append(len(entries) - 1)
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
             staging=self.staging, canvas=self.canvas, answer_row=self.answer_row)
         for a, tokens in appended.items():
             self.appended[a] = tokens
-        return chunk, entries
+        return chunk, entries, following, group_entries, sources
 
     def _settle(self, settlement):
         anchor = settlement.anchor
@@ -602,8 +647,10 @@ class StageExecutor:
         for (a, j, start, end, _), rows in zip(groups, group_rows):
             if end == start:
                 continue        # a prefix slice: nothing was asked
-            if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
-                # the request was packed; a repeating stage asks anew
+            if (self.stages[j].own_suffixes and not self.ahead[j]
+                    and end == self.sched.num_partners(a, j)):
+                # the request was packed; a repeating stage asks anew,
+                # and an ahead stage has asked already
                 del self.own[(j, a)]
             result = self.sched.report(a, j, start, end, rows)
             if self.on_answers is not None:
@@ -683,9 +730,28 @@ class StageExecutor:
             self._run_part(part[:half])
             self._run_part(part[half:])
 
+    def _launched(self, part):
+        """Tell each stage with a launched callback which documents it launched."""
+        by_stage = {}
+        for a, j, start, end, _ in part:
+            if end > start and self.stages[j].launched is not None:
+                by_stage.setdefault(j, []).append(a)
+        for j, anchors in by_stage.items():
+            self.stages[j].launched(anchors)
+
     def _run_one(self, part):
         started = time.perf_counter()
-        chunk, entries = self._build(part)
+        chunk, entries, following, group_entries, sources = self._build(part)
+        if sources:
+            # the rounds follow answers of the pass before, whose
+            # readout is still on the stream
+            previous = self.outstanding[-1] if self.outstanding else None
+            if previous is None or any(
+                    pass_index != previous.pass_index for pass_index, _ in sources):
+                raise AssertionError(
+                    "a device-fed round follows an answer already decided")
+            chunk.apply_feed(self.torch, previous.feed,
+                             [index for _, index in sources], self.arena.page_tokens)
         self.pack_s += time.perf_counter() - started
         self.tokens += chunk.tokens
         if self.gpu_timing:
@@ -714,6 +780,14 @@ class StageExecutor:
             e2.record()
         handles = self.readouts.submit(
             normed, entries, chunk.rows_per_answer)
+        feed = None
+        if self.feeding and entries:
+            feed = self.readouts.feed(handles, np.concatenate(following),
+                                      [rows for _, rows in entries])
+        for (a, _, _, _, _), index in zip(part, group_entries):
+            if index is not None:
+                self.latest[a] = (self.passes, index)
+        self._launched(part)
         submitted = time.perf_counter()
         self.host_s["submit"] += submitted - started
         if self.gpu_timing:
@@ -725,7 +799,8 @@ class StageExecutor:
         while self.outstanding:
             self._report_next()
         self.host_s["report"] += time.perf_counter() - submitted
-        self.outstanding.append(PendingAnswers(part, handles))
+        self.outstanding.append(PendingAnswers(part, handles, self.passes, feed))
+        self.passes += 1
 
     def run(self):
         """Drive admission and drain the launched answer handles in order."""
@@ -758,6 +833,9 @@ class StageExecutor:
                     continue
                 raise AssertionError("nothing buildable and nothing in flight")
             self._run_part(groups)
+            # the chunk is built, so the anchors launched ahead of
+            # their answers can be asked for their next request
+            self.sched.advance_ahead()
             # the packed children hold their parents' pages now
             for a, _, start, _, carried in groups:
                 parent = (self.borrowing.tree_parent[a]

@@ -11,10 +11,13 @@ stalling the stream; result() waits on that copy.
 """
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
+from quail.backends.quail.executor.chunk import device_array
 from quail.backends.quail.executor.model_loading import answer_weights
 from quail.planner.prompt_lowering import true_false_ids
 
@@ -241,6 +244,70 @@ class AsyncLabelLogprobs(_HostReadout):
         return self._copy(values)
 
 
+@dataclass
+class RoundFeed:
+    """What a pass's answers chose, on the GPU, for the rounds fed from it.
+
+    Attributes:
+        accepted: Per answer, how many of its draft tokens the model
+            chose in turn: the row after the last of them chooses the
+            next token.
+        chosen: Per answer, the token that row chose.
+    """
+
+    accepted: Any
+    chosen: Any
+
+
+def round_feed(torch, values, following, counts, stop_mask, num_extras, k):
+    """Return each answer's accepted draft tokens and chosen token.
+
+    Mirrors the map decoder's rule on the host: a row's token is its
+    likeliest, chosen when it beats the stop group and is not a stop
+    token, and a draft token is accepted when the row before it chose
+    it.
+
+    Args:
+        torch: The torch module.
+        values: (rows, width) readout values of every answer row, in
+            answer order, on the device the feed is computed on.
+        following: Per row, the draft token fed after it, or -1 after
+            an answer's last row; a host array.
+        counts: Per answer, its rows; a host array.
+        stop_mask: A device bool tensor over the vocabulary, True at
+            the stop tokens.
+        num_extras: The extra columns before the k token ids.
+        k: How many likeliest tokens a row carries.
+    """
+    device = values.device
+    ids = values[:, num_extras:num_extras + k]
+    lps = values[:, num_extras + k:num_extras + 2 * k]
+    if k == 1:
+        top, lp_top = ids[:, 0], lps[:, 0]
+    else:
+        best = lps.argmax(dim=1, keepdim=True)
+        top, lp_top = ids.gather(1, best)[:, 0], lps.gather(1, best)[:, 0]
+    top = top.long()
+    ok = (lp_top > values[:, 0]) & ~stop_mask[top]
+    counts = np.asarray(counts, dtype=np.int64)
+    starts = np.cumsum(counts) - counts
+    segment = np.repeat(np.arange(len(counts)), counts)
+    within = np.arange(int(counts.sum())) - np.repeat(starts, counts)
+
+    def to_device(array):
+        return device_array(torch, array, device)
+
+    match = ok & (top == to_device(following))
+    # the first row that did not choose the draft token after it ends
+    # the accepted run; the last row has no following token
+    accepted = to_device(counts.copy())
+    missed = ~match
+    accepted.scatter_reduce_(0, to_device(segment)[missed],
+                             to_device(within)[missed], reduce="amin")
+    chosen = top.index_select(0, to_device(starts) + accepted)
+    return RoundFeed(accepted=accepted, chosen=chosen)
+
+
 class AsyncTopLogprobs(_HostReadout):
     """Asynchronous readout of each row's likeliest tokens' log probabilities.
 
@@ -280,6 +347,7 @@ class AsyncTopLogprobs(_HostReadout):
         self.ragged = ragged
         self.dtype = (np.dtype(object) if ragged
                       else np.dtype((np.float32, (self.width,))))
+        self.stop_mask = None
 
     def values(self, normed):
         """Compute each row's values from normalized hidden states."""
@@ -308,12 +376,30 @@ class AsyncTopLogprobs(_HostReadout):
         return out
 
     def submit(self, normed, rows_per_answer=None):
-        return (*self._copy(self.values(normed)), rows_per_answer)
+        values = self.values(normed)
+        # the device values stay in the handle for feed()
+        return (*self._copy(values), rows_per_answer, values)
 
     def result(self, handle):
-        *transfer, rows_per_answer = handle
+        *transfer, rows_per_answer, _ = handle
         values = super().result(transfer)
         return split_rows(values, rows_per_answer) if self.ragged else values
+
+    def feed(self, handle, following, counts) -> RoundFeed:
+        """Return the submitted answers' chosen tokens and accepted drafts.
+
+        Args:
+            handle: A submit() handle.
+            following: Per row, the draft token fed after it, or -1.
+            counts: Per answer, its rows.
+        """
+        values = handle[-1]
+        if self.stop_mask is None:
+            self.stop_mask = self.torch.zeros(self.head.shape[0], dtype=self.torch.bool,
+                                              device=values.device)
+            self.stop_mask[self.extras[self.groups[0]]] = True
+        return round_feed(self.torch, values, following, counts, self.stop_mask,
+                          len(self.groups), self.k)
 
 
 def split_rows(values, rows_per_answer):

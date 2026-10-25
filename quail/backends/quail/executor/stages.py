@@ -40,12 +40,21 @@ class StageRequests:
             stage's readout settings.
         discard: Tokens to remove from the previously appended KV before
             processing these suffixes.
+        position: The position of the first suffix token in the
+            document's sequence, or None to place it after what the
+            earlier stages appended, less discard.
+        device_fed: Whether the first suffix token is a placeholder the
+            GPU replaces with the token the document's launched round
+            chose, placing the suffix after the tokens that round
+            accepted; position is then that round's first position.
     """
 
     suffixes: Any
     write_suffix_tokens: int | None = None
     read_rows: list[int] | None = None
     discard: int = 0
+    position: int | None = None
+    device_fed: bool = False
 
     def __post_init__(self):
         from quail.backends.quail.executor.chunk import Suffixes
@@ -97,6 +106,14 @@ class Stage:
         repeats: Whether a document whose decision is true is asked
             again at this stage, until its suffixes callback passes it
             on with SKIP or SkipTo, or drops it.
+        ahead: Whether a document launched at this stage is asked for
+            its next request, at this stage again or the next, before
+            its answer arrives, so it runs in every pass; the request
+            may be device_fed. Its answer re-asks a request still
+            queued. Runs on the tree attention path only.
+        launched: Optional callback from the document indices of a
+            chunk's groups at this stage, called once the chunk is
+            launched and before any earlier chunk's answers are read.
         label: Name displayed in progress messages.
         paths: Optional trie paths and ancestor references from trie_paths().
         read_mask: Optional mask of the rows read in the sole paths
@@ -123,6 +140,8 @@ class Stage:
     rewind: bool = False
     append: bool = False
     repeats: bool = False
+    ahead: bool = False
+    launched: Callable | None = None
     label: str = ""
     paths: list | None = None
     read_mask: Any = None
@@ -317,10 +336,17 @@ def state_share_points(parents, shared, limit=None):
 
 @dataclass
 class PendingAnswers:
-    """One launched chunk's readout and progress through its document decisions."""
+    """One launched chunk's readout and progress through its document decisions.
+
+    feed is the chunk's RoundFeed, the token each answer chose and
+    how many draft tokens it accepted, on the GPU, for the device-fed
+    requests of the chunk after it.
+    """
 
     groups: list
     handles: list
+    pass_index: int = 0
+    feed: Any = None
     values: list | None = None
     positions: np.ndarray | None = None
     at: int = 0

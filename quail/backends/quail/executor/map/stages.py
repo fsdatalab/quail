@@ -6,7 +6,10 @@ quail.backends.quail.executor.decoding: each instruction is the tail
 stage, whose row chooses the answer's first token, then rounds that
 feed the chosen token and a draft and verify them. A chunk's rounds
 are decided together, in arrays over its documents, before the
-admission asks about each document.
+admission asks about each document. On the tree attention path the
+stages run ahead of their answers: a document's next round is
+launched before the one before it is decided, and the GPU puts the
+token that round chose first.
 """
 
 import numpy as np
@@ -17,6 +20,10 @@ from quail.backends.quail.executor.map.decoder import MapDecoder, MapDocument
 from quail.backends.quail.executor.stages import Stage, StageRequests
 from quail.backends.quail.executor.vocabulary import Vocabulary
 from quail.catalog.tokens import concat_tokens
+
+# the first token of a device-fed round, which the GPU replaces
+_CHOSEN_ON_GPU = np.zeros(1, dtype=np.int64)
+_CHOSEN_ON_GPU.setflags(write=False)
 
 
 class MapStages(AnswerStages):
@@ -65,6 +72,14 @@ class MapStages(AnswerStages):
         self.readout = self._readout(state) if readout is None else readout
         self.decoder = MapDecoder(vocabulary, self.readout.k, self.readout.width,
                                   len(self.specs), self.spec, self.documents)
+        # per instruction, each document's cue position: the first
+        # round's token follows it
+        prefix_lengths = np.array([len(document.prefix) for document in self.documents],
+                                  dtype=np.int64)
+        self.cue_positions = [prefix_lengths + len(tail) - 1 for tail in self.tails]
+        # a recurrent model replays each round's accepted tokens, so
+        # its rounds wait for their answers
+        self.ahead = not self.recurrent
         # documents not asked yet, and documents between their first ask
         # and their last settled answer, for the draft policy's slack
         self.num_queued_documents = len(self.documents)
@@ -100,10 +115,25 @@ class MapStages(AnswerStages):
 
     # ---- a chunk's rounds, decided together ---------------------------------
 
+    @property
+    def appended_tokens(self) -> int:
+        """The most tokens an instruction leaves in KV after its frame.
+
+        The cue, the answer, a round's draft past it, and the round
+        launched before the answer's end was decided.
+        """
+        return 1 + self.spec.max_answer_tokens + 2 * self.spec.draft_tokens
+
     def _stage_prepare(self, q: int, tail: bool):
         def prepare(anchors, rows):
             self._prepare_rounds(q, tail, anchors, rows)
         return prepare
+
+    def _stage_launched(self, q: int, tail: bool):
+        def launched(anchors):
+            index = np.asarray(anchors, dtype=np.int64)
+            self.decoder.launch(q, index, tail, self.cue_positions[q][index])
+        return launched
 
     def _prepare_rounds(self, q: int, tail: bool, anchors, rows) -> None:
         """Verify a chunk's rounds for instruction q and draft the next ones.
@@ -136,6 +166,15 @@ class MapStages(AnswerStages):
                 self.num_decoding_documents += len(index)
         else:
             state.fed_tokens[index] += num_rows
+        keep = ~state.done[index]
+        if not keep.all():
+            # a round launched for an answer that ended with the round
+            # before it: its rows decide nothing
+            index = index[keep]
+            if not len(index):
+                return
+            stacked = stacked[np.repeat(keep, num_rows)]
+            num_rows = num_rows[keep]
         ended = self.decoder.round(q, index, stacked, num_rows, self._slack())
         if q == len(self.specs) - 1:
             self.num_decoding_documents -= ended
@@ -166,26 +205,35 @@ class MapStages(AnswerStages):
     def _step_suffix(self, q, key):
         """Feed the chosen token, then the draft the chunk's prepare chose.
 
-        A recurrent model replays the accepted tokens to advance its
-        checkpoint, so they are fed again and written as the suffix.
+        While the round before is on the stream, the GPU puts the
+        token it chooses first and the request carries the draft of
+        the round after it. A recurrent model replays the accepted
+        tokens to advance its checkpoint, so they are fed again and
+        written as the suffix.
         """
         document = self._document(key)
         state = self.decoder.states[q]
         index = document.index
         if state.done[index]:
             return Stage.SkipTo(self.question_starts[q + 1])
-        fed = state.fed[index, :state.fed_len[index]]
-        discard = int(state.discard[index])
+        position = int(state.base[index])
+        if state.unreported[index]:
+            draft = state.draft[index, :state.draft_len[index]]
+            return StageRequests(
+                Suffixes(np.concatenate((_CHOSEN_ON_GPU, draft)), [1 + len(draft)]),
+                position=position, device_fed=True)
+        fed = state.fed[index, :state.fed_len[index]].copy()
         if self.recurrent:
             previous = self.previous_fed[q].get(index, [])
-            accepted = previous[:len(previous) - discard]
+            accepted = previous[:len(previous) - int(state.discard[index])]
             tokens = fed.tolist()
             self.previous_fed[q][index] = tokens
             state.fed_tokens[index] += len(accepted)
             return StageRequests([accepted + tokens],
                                  write_suffix_tokens=len(accepted),
-                                 read_rows=[len(tokens)])
-        return StageRequests(Suffixes(fed, [len(fed)]), discard=discard)
+                                 read_rows=[len(tokens)],
+                                 position=position - len(accepted))
+        return StageRequests(Suffixes(fed, [len(fed)]), position=position)
 
     def _build(self) -> None:
         # a recurrent model's replay needs each document's previous

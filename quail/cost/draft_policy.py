@@ -280,19 +280,6 @@ class MapDraftPolicy:
                  / (PRIOR_WEIGHT + self.trials[cells]))
         return cells, rates
 
-    def copy_lengths(self, rho: np.ndarray, written: np.ndarray, slack: float,
-                     room: np.ndarray) -> np.ndarray:
-        """Return copy_length for many rounds at once.
-
-        Args:
-            rho: Each round's KV read, in fed tokens.
-            written: Each answer's tokens so far.
-            slack: Fed tokens the current passes carry for free.
-            room: The most tokens each draft may have.
-        """
-        rates = np.full((len(rho), self.cap), self.copy_rate())
-        return self.chain_lengths(rho, written, rates, slack, room)
-
     def chain_lengths(self, rho: np.ndarray, written: np.ndarray,
                       rates: np.ndarray, slack: float, room: np.ndarray) -> np.ndarray:
         """Return chain_length for many rounds at once.

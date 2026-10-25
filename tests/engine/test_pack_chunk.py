@@ -194,3 +194,43 @@ def test_a_prefix_slice_reads_the_slices_before_it_and_writes_after_them(
     assert final.meta["reads"]["used"].tolist() == [32, 40]
     assert final.meta["cu_a"].tolist() == [0, 8, 9]
     assert final.final_indices.tolist() == [8]
+
+
+def test_a_device_fed_round_follows_the_answer_before_it(monkeypatch):
+    from quail.backends.quail.executor.readout import RoundFeed
+
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    first, second = ("d", 1), ("d", 2)
+    for key in (first, second):
+        arena.activate(key, 3, capacity_tokens=16, base_tokens=3)
+    rows = {key: arena.capacity_rows(key) for key in (first, second)}
+    # each round is packed at the first position of the round before
+    # it, whose rows the GPU has not read out yet: a placeholder, then
+    # the draft; the round before had at most three rows
+    chunk = chunk_mod.pack_chunk(
+        torch, arena,
+        [dict(key=first, prefix=None, f=6, suffixes=Suffixes.of([[0, 51, 52]]),
+              write_suffix_tokens=3, single=True, read_all_rows=True,
+              device_fed=True, feed_bound=3),
+         dict(key=second, prefix=None, f=9, suffixes=Suffixes.of([[0]]),
+              write_suffix_tokens=1, single=True, read_all_rows=True,
+              device_fed=True, feed_bound=3)],
+        attention_mode="tree")
+    plan = chunk.meta["feed"]
+    assert plan["first"].tolist() == [0, 3]
+    assert plan["rows"].tolist() == [0, 1, 2, 3]
+    assert plan["entry"].tolist() == [0, 0, 0, 1]
+    assert plan["sequence"].tolist() == [0, 1]
+    assert plan["kv_rows"].tolist() == [0, 1, 2, 3]
+    # the KV read is bounded by the rows the round before could accept
+    assert chunk.meta["reads"]["max_used"] == 12
+    # the first round's source accepted one draft token and chose 50
+    # at the row after it; the second's accepted none and chose 60
+    feed = RoundFeed(accepted=torch.tensor([0, 1]), chosen=torch.tensor([60, 50]))
+    chunk.apply_feed(torch, feed, [1, 0], arena.page_tokens)
+    assert chunk.input_ids.tolist() == [50, 51, 52, 60]
+    assert chunk.positions.tolist() == [8, 9, 10, 10]
+    assert chunk.meta["reads"]["used"].tolist() == [8, 10]
+    assert chunk.meta["kv_dst"].tolist() == (rows[first][8:11].tolist()
+                                             + rows[second][10:11].tolist())
