@@ -306,6 +306,77 @@ def round_feed(torch, values, following, counts, stop_mask, num_extras, k):
     return RoundFeed(accepted=accepted, chosen=chosen)
 
 
+_ROW_TOP = None
+
+
+def row_top_kernel():
+    """Return the fused row reduction kernel, compiled once: lse, top id, top value.
+
+    Returns None where Triton is not available.
+    """
+    global _ROW_TOP
+    if _ROW_TOP is None:
+        try:
+            import triton
+            import triton.language as tl
+        except ImportError:
+            _ROW_TOP = False
+            return None
+
+        @triton.jit
+        def row_lse_top(x_ptr, lse_ptr, top_ptr, value_ptr, stride, width,
+                        BLOCK: tl.constexpr):
+            row = tl.program_id(0)
+            base = x_ptr + row * stride
+            running_max = tl.full((), float("-inf"), tl.float32)
+            running_sum = tl.zeros((), tl.float32)
+            best = tl.full((), float("-inf"), tl.float32)
+            best_id = tl.zeros((), tl.int32)
+            for start in range(0, width, BLOCK):
+                offs = start + tl.arange(0, BLOCK)
+                x = tl.load(base + offs, mask=offs < width,
+                            other=float("-inf")).to(tl.float32)
+                block_max = tl.max(x, axis=0)
+                new_max = tl.maximum(running_max, block_max)
+                running_sum = (running_sum * tl.exp(running_max - new_max)
+                               + tl.sum(tl.exp(x - new_max), axis=0))
+                running_max = new_max
+                # the earliest row of the largest value, as the ties fall
+                take = block_max > best
+                best_id = tl.where(take, start + tl.argmax(x, axis=0), best_id)
+                best = tl.where(take, block_max, best)
+            tl.store(lse_ptr + row, running_max + tl.log(running_sum))
+            tl.store(top_ptr + row, best_id)
+            tl.store(value_ptr + row, best)
+
+        _ROW_TOP = row_lse_top
+    return _ROW_TOP or None
+
+
+def row_top(torch, logits):
+    """Return each row's log-sum-exp, likeliest token, and its logit, in one read.
+
+    Args:
+        torch: The torch module.
+        logits: (rows, vocabulary) logits on the GPU, rows contiguous.
+
+    Returns:
+        (lse, top, value): float32, int32, and float32 tensors of one
+        value per row, or None when the fused kernel is unavailable.
+    """
+    kernel = row_top_kernel()
+    if kernel is None or not logits.is_cuda:
+        return None
+    rows, width = logits.shape
+    lse = torch.empty(rows, dtype=torch.float32, device=logits.device)
+    top = torch.empty(rows, dtype=torch.int32, device=logits.device)
+    value = torch.empty(rows, dtype=torch.float32, device=logits.device)
+    if rows:
+        kernel[(rows,)](logits, lse, top, value, logits.stride(0), width,
+                        BLOCK=4096)
+    return lse, top, value
+
+
 class AsyncTopLogprobs(_HostReadout):
     """Asynchronous readout of each row's likeliest tokens' log probabilities.
 
@@ -328,7 +399,10 @@ class AsyncTopLogprobs(_HostReadout):
             array per answer, in an object array.
     """
 
-    BLOCK_ROWS = AsyncLabelLogprobs.BLOCK_ROWS
+    # rows per head block: every block reads the whole head once, and
+    # a pass's rows mostly fit one block; 1024 x 151,936 bf16 logits
+    # are 311 MiB
+    BLOCK_ROWS = 1024
 
     def __init__(self, torch, F, head, k, extras, ragged=False):
         super().__init__(torch)
@@ -356,19 +430,26 @@ class AsyncTopLogprobs(_HostReadout):
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
             # the logits stay in the head's dtype: every pass over the
-            # vocabulary reads them once, and the normalizer, reduced
-            # in fp32 and rounded to that dtype, shifts a row's values
-            # alike
+            # vocabulary reads them once, and the normalizer shifts a
+            # row's values alike
             logits = self.F.linear(block.to(self.head.dtype), self.head)
-            norm = torch.logsumexp(logits, dim=1, keepdim=True).float()
             rows = slice(start, start + block.shape[0])
+            fused = row_top(torch, logits) if self.k == 1 else None
+            if fused is not None:
+                # one read of the logits gives the normalizer and the
+                # likeliest token
+                lse, ids, top = fused
+                norm = lse[:, None]
+                ids, top = ids[:, None], top[:, None]
+            else:
+                norm = torch.logsumexp(logits, dim=1, keepdim=True).float()
+                if self.k == 1:
+                    top, ids = logits.max(dim=1, keepdim=True)
+                else:
+                    top, ids = torch.topk(logits, self.k, dim=1)
             picked = logits.index_select(1, self.extras).float() - norm
             for column, group in enumerate(self.groups):
                 out[rows, column] = torch.logsumexp(picked[:, group], dim=1)
-            if self.k == 1:
-                top, ids = logits.max(dim=1, keepdim=True)
-            else:
-                top, ids = torch.topk(logits, self.k, dim=1)
             out[rows, n:n + self.k] = ids.float()
             out[rows, n + self.k:] = top.float() - norm
         return out
