@@ -26,10 +26,16 @@ across requests, but they have no topic labels attached to them.
 For example, an illustrative vector `{17: 0.8, 24933: 2.1}` activates
 features 17 and 24933. All other entries are zero.
 
-Dense embeddings are useful for comparing documents, but a single vector
-[may miss details when a document covers several topics](https://arxiv.org/abs/2005.09069).
-Their individual coordinates also usually have no clear meaning. Sparse
-features offer a chance to inspect individual topics. Requests that
+Dense embeddings are useful for comparing documents, but have limitations
+for exploratory analysis:
+
+1. Embeddings from a small encoder model, such as
+   [`all-MiniLM-L6-v2`](https://sbert.net/docs/sentence_transformer/pretrained_models.html),
+   may not capture all the topics and details in a document.
+2. Individual coordinates are difficult to interpret. A coordinate does
+   not usually correspond to a topic or a property of the document.
+
+Sparse features offer a chance to inspect individual topics. Requests that
 strongly activate one feature may share a recognizable topic. Research on
 [interpretable sparse features](https://www.transformer-circuits.pub/2023/monosemantic-features/index.html)
 provides the basis for this approach. Sparse features can miss details too.
