@@ -142,43 +142,37 @@ def test_unified_padding_reads_one_row_and_writes_no_kv():
     assert view.meta["unified"]["used"].data_ptr() == buffers.used.data_ptr()
 
 
-def test_split_padding_reads_nothing_and_merges_into_the_padding_entry():
+def test_shared_padding_reads_nothing_and_no_row_merges_it():
     from quail.backends.quail.executor.chunk import Chunk
 
-    # two split rounds of two rows and one row: call B reads their
-    # shared page in one sequence, and each reads its own pages
+    # two rounds of two rows and one row: their unified sequences read
+    # their own pages, and one stacked read covers their shared page
+    unified = dict(src=torch.arange(3), dst=torch.tensor([40, 41, 60]),
+                   tail_src=None, tail_dst=None,
+                   used=torch.tensor([8, 11], dtype=torch.int32),
+                   table=torch.tensor([[2], [3]], dtype=torch.int32), max_used=11,
+                   cu_q=torch.tensor([0, 2, 3], dtype=torch.int32), max_q=2,
+                   shared=dict(rows=torch.arange(3),
+                               cu_q=torch.tensor([0, 3], dtype=torch.int32),
+                               max_q=3, used=torch.tensor([16], dtype=torch.int32),
+                               max_used=16,
+                               table=torch.tensor([[1]], dtype=torch.int32),
+                               source=torch.arange(3, dtype=torch.int32)))
     source = Chunk(
         input_ids=torch.tensor([12, 13, 14]), positions=torch.tensor([20, 21, 25]),
         final_indices=torch.tensor([0, 1, 2]),
-        meta=dict(layer=0, canvas=None, unified=None, kv_src=torch.arange(3),
-                  kv_dst=torch.tensor([40, 41, 60]),
-                  cu_a=torch.tensor([0, 2, 3], dtype=torch.int32), max_a=2,
-                  reads=dict(rows=torch.arange(3),
-                             cu_q=torch.tensor([0, 3], dtype=torch.int32),
-                             max_q=3, used=torch.tensor([16], dtype=torch.int32),
-                             max_used=16, table=torch.tensor([[1]], dtype=torch.int32),
-                             source=torch.arange(3, dtype=torch.int32),
-                             own=dict(rows=torch.arange(3),
-                                      cu_q=torch.tensor([0, 2, 3], dtype=torch.int32),
-                                      max_q=2,
-                                      used=torch.tensor([6, 10], dtype=torch.int32),
-                                      max_used=10,
-                                      table=torch.tensor([[2], [3]], dtype=torch.int32),
-                                      b_index=torch.arange(3)))),
-        attention_mode="tree", tokens=3, layout=[])
+        meta=dict(layer=0, canvas=None, gdn=None, reads=None, kv_src=None,
+                  kv_dst=None, cu_a=torch.tensor([0, 2, 3], dtype=torch.int32),
+                  max_a=2, unified=unified),
+        attention_mode="unified", tokens=3, layout=[])
     buffers = DecodeBuffers(torch, 8, 16, device="cpu")
     buffers.synthetic(7)
     rows = 4
     buffers.copy(source, rows)
-    view = buffers.view_split(rows)
-    reads = view.meta["reads"]
-    # call B has a padding entry past the rows; its padding reads
-    # nothing, and the empty sequences after it hold no rows
-    assert reads["cu_q"].tolist() == [0, 3, 4, 5, 5, 5]
-    assert reads["used"].tolist() == [16, 0, 0, 0, 0]
-    own = reads["own"]
-    assert own["cu_q"].tolist() == [0, 2, 3, 4, 4]
-    assert own["used"].tolist() == [6, 10, 0, 0]
-    # the padded second read merges into call B's padding entry
-    assert own["b_index"].tolist() == [0, 1, 2, rows]
-    assert own["table"][:2, 0].tolist() == [2, 3]
+    shared = buffers.view_shared(rows).meta["unified"]["shared"]
+    # the padding sequence reads no keys, and the padding row merges
+    # nothing from the shared read
+    assert shared["cu_q"].tolist() == [0, 3, 4, 4, 4]
+    assert shared["used"].tolist() == [16, 0, 0, 0]
+    assert shared["source"].tolist() == [0, 1, 2, -1]
+    assert shared["table"][0, 0] == 1

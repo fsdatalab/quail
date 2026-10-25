@@ -78,8 +78,6 @@ class Chunk:
                 used, table, dst = unified["used"], unified["table"], unified["dst"]
             else:
                 reads = self.meta["reads"]
-                if target == "own":
-                    reads = reads["own"]
                 used, table, dst = reads["used"], reads["table"], self.meta["kv_dst"]
             chosen = source.index_select(0, order)
             shift = feed.accepted.index_select(0, chosen) + 1
@@ -374,8 +372,7 @@ def _feed_plan(fed_rounds, span_lengths) -> list:
         fed_rounds: Per round, in chunk order, (first row, rows, the
             reads it is a sequence of, its sequence there, its index
             among the KV write spans, the logical row its table's first
-            page holds). The reads are "reads" (call B), "own" (a
-            split round's own pages), or "unified".
+            page holds). The reads are "reads" (call B) or "unified".
         span_lengths: The rows of each KV write span, in order.
 
     Returns:
@@ -388,7 +385,7 @@ def _feed_plan(fed_rounds, span_lengths) -> list:
     offsets = np.cumsum(span_lengths)
     offsets = np.concatenate(([0], offsets[:-1]))
     parts = []
-    for target in ("reads", "own", "unified"):
+    for target in ("reads", "unified"):
         order = [index for index, entry in enumerate(fed_rounds)
                  if entry[2] == target]
         if not order:
@@ -408,35 +405,27 @@ def _feed_plan(fed_rounds, span_lengths) -> list:
     return parts
 
 
-def _split_reads(keys, starts, counts, positions, shared, share_groups,
-                 fed, bound, first_write, reader_rows, cu_q, read_keys, read_used,
-                 own, fed_rounds, max_q, fed_used):
-    """Lay out rounds whose documents share leading pages, on the tree path.
+def _shared_reads(keys, starts, counts, shared, share_groups, out) -> None:
+    """Lay out the stacked reads of rounds whose documents share leading pages.
 
     Consecutive rounds of one share group read the shared pages as one
-    stacked sequence of call B, so the pages are read once for all of
-    them; each round reads its own pages past them in a second call,
-    merged into its rows. A round that shares nothing reads its whole
-    table in call B.
+    sequence, so the pages are read once for all of them; each round's
+    unified sequence then reads its table from its first own page, and
+    the two are merged. A round that shares nothing reads its whole
+    table in the unified call alone.
 
-    Returns:
-        The updated call B max_q and fed bound, and the most rows a
-        round's own read covers after a device-fed shift.
+    Args:
+        keys: Each round's key.
+        starts: Each round's first row.
+        counts: Each round's rows.
+        shared: Each round's shared tokens, a whole number of pages.
+        share_groups: Each round's share group.
+        out: The shared reads: rows, cu_q, keys, used, and max_q.
     """
-    own_bound = 0
     index, count = 0, len(keys)
     while index < count:
         share = shared[index]
         if not share:
-            reader_rows.append((starts[index], counts[index]))
-            cu_q.append(cu_q[-1] + counts[index])
-            read_keys.append(keys[index])
-            read_used.append(positions[index])
-            max_q = max(max_q, counts[index])
-            if index in fed:
-                fed_rounds.append((starts[index], counts[index], "reads",
-                                   len(read_keys) - 1, first_write + index, 0))
-                fed_used = max(fed_used, positions[index] + bound)
             index += 1
             continue
         end = index + 1
@@ -446,24 +435,12 @@ def _split_reads(keys, starts, counts, positions, shared, share_groups,
         rows = sum(counts[index:end])
         # the group's rows are contiguous; any member's table starts
         # with the shared pages
-        reader_rows.append((starts[index], rows))
-        cu_q.append(cu_q[-1] + rows)
-        read_keys.append(keys[index])
-        read_used.append(share)
-        max_q = max(max_q, rows)
-        for member in range(index, end):
-            own["rows"].append((starts[member], counts[member]))
-            own["cu_q"].append(own["cu_q"][-1] + counts[member])
-            own["tables"].append((keys[member], share))
-            own["used"].append(positions[member] - share)
-            own["max_q"] = max(own["max_q"], counts[member])
-            if member in fed:
-                fed_rounds.append((starts[member], counts[member], "own",
-                                   len(own["tables"]) - 1, first_write + member,
-                                   share))
-                own_bound = max(own_bound, positions[member] - share + bound)
+        out["rows"].append((starts[index], rows))
+        out["cu_q"].append(out["cu_q"][-1] + rows)
+        out["keys"].append(keys[index])
+        out["used"].append(share)
+        out["max_q"] = max(out["max_q"], rows)
         index = end
-    return max_q, fed_used, own_bound
 
 
 # ------------------------------------------------------- chunk packing
@@ -571,10 +548,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     * rounds: A RoundRequests of many documents' decode rounds packed as
       one group, with keys naming each one's document and feed_bound as
       above; every row is read and kept. Not with a canvas or a
-      sliding pool. Under tree attention, shared and share_groups give
+      sliding pool. On the unified path, shared and share_groups give
       each round the leading pages its document shares with others and
       the group it shares them with: consecutive rounds of one group
-      read those pages once (see _split_reads).
+      read those pages once (see _shared_reads).
 
     Fresh groups without arena pages must have at most one suffix. Unified
     attention cannot mix paged and unpaged groups. Canvas rows use unified
@@ -648,10 +625,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     fed_rounds = []
     fed_used = 0
     unified_fed = {}
-    # split rounds' reads of their own pages past the shared ones, and
-    # the most rows one reads after a device-fed shift
-    split = dict(rows=[], cu_q=[0], tables=[], used=[], max_q=0)
-    split_bound = 0
+    # on the unified path, rounds of one share group read the pages
+    # their documents share once more, stacked (see _shared_reads)
+    shared_reads = dict(rows=[], cu_q=[0], keys=[], used=[], max_q=0)
     for g in groups:
         rounds = g.get("rounds")
         if rounds is not None:
@@ -681,33 +657,33 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if tree_path:
                 first_write = len(kv_writes)
                 kv_writes.extend(zip(keys, starts, (row0 + ends).tolist(), positions))
-                shared = g.get("shared")
-                if shared is None or not np.any(shared):
-                    reader_rows.append((row0, total))
-                    cu_q.extend((cu_q[-1] + ends).tolist())
-                    read_keys.extend(keys)
-                    read_used.extend(positions)
-                    if len(lengths) and int(lengths.max()) > max_q:
-                        max_q = int(lengths.max())
-                    first_sequence = len(read_keys) - len(keys)
-                    for index in fed:
-                        fed_rounds.append((starts[index], counts[index], "reads",
-                                           first_sequence + index,
-                                           first_write + index, 0))
-                        fed_used = max(fed_used, positions[index] + bound)
-                else:
-                    max_q, fed_used, own_used_bound = _split_reads(
-                        keys, starts, counts, positions, shared.tolist(),
-                        g["share_groups"].tolist(), set(fed), bound, first_write,
-                        reader_rows, cu_q, read_keys, read_used, split, fed_rounds,
-                        max_q, fed_used)
-                    split_bound = max(split_bound, own_used_bound)
+                reader_rows.append((row0, total))
+                cu_q.extend((cu_q[-1] + ends).tolist())
+                read_keys.extend(keys)
+                read_used.extend(positions)
+                if len(lengths) and int(lengths.max()) > max_q:
+                    max_q = int(lengths.max())
+                first_sequence = len(read_keys) - len(keys)
+                for index in fed:
+                    fed_rounds.append((starts[index], counts[index], "reads",
+                                       first_sequence + index,
+                                       first_write + index, 0))
+                    fed_used = max(fed_used, positions[index] + bound)
             else:
+                shared = g.get("shared")
+                offsets = [0] * len(keys) if shared is None else shared.tolist()
+                if shared is not None and np.any(shared):
+                    _shared_reads(keys, starts, counts, offsets,
+                                  g["share_groups"].tolist(), shared_reads)
                 for index, (key, start, f, count) in enumerate(
                         zip(keys, starts, positions, counts)):
+                    offset = offsets[index]
                     if rounds.device_fed[index]:
-                        unified_fed[len(unified_groups)] = (start, count, f + bound)
-                    unified_groups.append((key, f, start, count))
+                        # a shifted round reads up to its draft's bound
+                        # past its rows
+                        unified_fed[len(unified_groups)] = (
+                            start, count, f + count + bound - offset)
+                    unified_groups.append((key, f, start, count, offset))
             num_tokens = row0 + total
             continue
         sufs0 = g["suffixes"]
@@ -771,8 +747,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             layout.append((g["key"], 1))
             if g.get("device_fed"):
                 unified_fed[len(unified_groups)] = (row0, total,
-                                                    f + int(g["feed_bound"]))
-            unified_groups.append((g["key"], f, row0, total))
+                                                    f + total + int(g["feed_bound"]))
+            unified_groups.append((g["key"], f, row0, total, 0))
             continue
         if g.get("device_fed"):
             raise ValueError(
@@ -1006,21 +982,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             max_q=max_q, used=_staged(torch, read_used, torch.int32, pinned),
             max_used=max(max(read_used), fed_used), table=table,
             source=_staged(torch, source, torch.int32, pinned))
-        if split["tables"]:
-            # each split round's own pages, past the shared ones: a
-            # second read merged into its row of call B
-            own_rows = _join(split["rows"])
-            reads["own"] = dict(
-                rows=_staged(torch, own_rows, torch.int64, pinned),
-                cu_q=_staged(torch, split["cu_q"], torch.int32, pinned),
-                max_q=split["max_q"],
-                used=_staged(torch, split["used"], torch.int32, pinned),
-                max_used=max(max(split["used"]), split_bound),
-                table=arena.block_table_rows(
-                    [arena.owned_pages(key)[shared // arena.page_tokens:]
-                     for key, shared in split["tables"]]),
-                b_index=_staged(torch, source[own_rows].astype(np.int64),
-                                torch.int64, pinned))
         if node_q:
             q_rows = np.concatenate(node_q)
             reads["nodes"] = dict(
@@ -1061,7 +1022,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     # a decode round packed by the fast path above:
                     # contiguous rows scattered straight into its key's
                     # capacity rows
-                    key, f, r0, count = spec
+                    key, f, r0, count, offset = spec
                     rows_np = arena.capacity_rows_numpy(key)
                     end = f + count
                     if end > len(rows_np):
@@ -1072,11 +1033,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     waiting = unified_fed.get(group_index)
                     if waiting is not None:
                         fed_rounds.append((waiting[0], waiting[1], "unified",
-                                           len(cu_q) - 1, len(pool.src_spans), 0))
+                                           len(cu_q) - 1, len(pool.src_spans),
+                                           offset))
                         fed_used = max(fed_used, waiting[2])
                     pool.src_spans.append((r0, r0 + count))
                     pool.dst.append(rows_np[f:end])
-                    pool.add_sequence(arena.owned_pages(key), end)
+                    # a round whose shared pages another read covers
+                    # reads its table from its first own page
+                    pool.add_sequence(
+                        arena.owned_pages(key)[offset // page_tokens:], end - offset)
                     cu_q.append(cu_q[-1] + count)
                     continue
                 key = spec["key"]
@@ -1174,6 +1139,23 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 cu_q=stage("unified_cu_q", cu_q, torch.int32),
                 max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])))
             unified["max_used"] = max(unified["max_used"], fed_used)
+            if shared_reads["keys"]:
+                if sliding:
+                    raise ValueError("shared reads run without a sliding pool")
+                rows = _join(shared_reads["rows"])
+                # row -> its index in the shared read, -1 for rows that
+                # read no shared pages; the fused merge kernel's map
+                source = np.full(num_tokens, -1, dtype=np.int32)
+                source[rows] = np.arange(len(rows), dtype=np.int32)
+                unified["shared"] = dict(
+                    rows=_staged(torch, rows, torch.int64, pinned),
+                    cu_q=_staged(torch, shared_reads["cu_q"], torch.int32, pinned),
+                    max_q=shared_reads["max_q"],
+                    used=_staged(torch, shared_reads["used"], torch.int32, pinned),
+                    max_used=max(shared_reads["used"]),
+                    table=arena.block_table_rows(
+                        [arena.owned_pages(key) for key in shared_reads["keys"]]),
+                    source=_staged(torch, source, torch.int32, pinned))
             if sliding:
                 unified["sliding"] = built[1]
             if fed_rounds:

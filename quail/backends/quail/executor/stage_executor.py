@@ -645,7 +645,7 @@ class StageExecutor:
             # a round's position replaces the appended-token bookkeeping
             spec = dict(rounds=requests, keys=[self.keys[a] for a in anchors],
                         feed_bound=self.stages[j].suffix_tokens)
-            if self.mode == "tree":
+            if self.mode == "unified" and self.lowest_borrow:
                 groups, shared = self._shares(anchors)
                 if shared.any():
                     spec.update(shared=shared, share_groups=groups)
@@ -685,7 +685,7 @@ class StageExecutor:
     def _ordered(self, part):
         """Return the groups with the bulk stages' rounds last.
 
-        On the tree path the rounds of one share group are placed
+        On the unified path the rounds of one share group are placed
         together, so their shared pages are read once.
         """
         if not any(self.bulk):
@@ -693,7 +693,7 @@ class StageExecutor:
         rounds = [g for g in part if self.bulk[g[1]] and not g[4]]
         if not rounds:
             return part
-        if self.mode == "tree" and self.lowest_borrow:
+        if self.mode == "unified" and self.lowest_borrow:
             groups, _ = self._shares([g[0] for g in rounds])
             order = np.argsort(groups, kind="stable")
             rounds = [rounds[index] for index in order.tolist()]

@@ -261,7 +261,8 @@ def test_rounds_packed_together_on_the_unified_path_follow_their_answers(monkeyp
     # reads the document with them
     assert unified["cu_q"].tolist() == [0, 3, 4]
     assert unified["used"].tolist() == [9, 10]
-    assert unified["max_used"] == 12
+    # a shifted round reads its rows and up to its bound past them
+    assert unified["max_used"] == 13
     assert unified["dst"].tolist() == (rows[first][6:9].tolist()
                                        + rows[second][9:10].tolist())
     plan = dict(chunk.meta["feed"])["unified"]
@@ -297,23 +298,24 @@ def test_sibling_rounds_read_their_shared_pages_once(monkeypatch):
         torch, arena, [dict(rounds=requests, keys=[parent, child], feed_bound=3,
                             shared=np.array([16, 16]),
                             share_groups=np.array([0, 0]))],
-        attention_mode="tree")
-    reads = chunk.meta["reads"]
-    # call B reads the shared page once for both rounds' rows
-    assert reads["cu_q"].tolist() == [0, 3]
-    assert reads["used"].tolist() == [16]
-    own = reads["own"]
-    # each round reads its own pages past the shared one
-    assert own["cu_q"].tolist() == [0, 2, 3]
-    assert own["used"].tolist() == [9, 14]
-    assert own["table"][0, 0] == arena.owned_pages(parent)[1]
-    assert own["table"][1, 0] == arena.owned_pages(child)[1]
-    assert own["b_index"].tolist() == [0, 1, 2]
+        attention_mode="unified")
+    unified = chunk.meta["unified"]
+    # each round's unified sequence reads its table from its first own
+    # page, rows included
+    assert unified["cu_q"].tolist() == [0, 2, 3]
+    assert unified["used"].tolist() == [11, 15]
+    assert unified["table"][0, 0] == arena.owned_pages(parent)[1]
+    assert unified["table"][1, 0] == arena.owned_pages(child)[1]
+    # the shared page is read once for both rounds' rows
+    shared = unified["shared"]
+    assert shared["cu_q"].tolist() == [0, 3]
+    assert shared["used"].tolist() == [16]
+    assert shared["source"].tolist() == [0, 1, 2]
     feed = RoundFeed(accepted=torch.tensor([1, 0]), chosen=torch.tensor([70, 80]))
     chunk.apply_feed(torch, feed, [0, 1], arena.page_tokens)
     assert chunk.input_ids.tolist() == [70, 51, 80]
     assert chunk.positions.tolist() == [27, 28, 31]
-    assert reads["used"].tolist() == [16]
-    assert own["used"].tolist() == [11, 15]
-    assert chunk.meta["kv_dst"].tolist() == (rows[parent][27:29].tolist()
-                                             + rows[child][31:32].tolist())
+    assert shared["used"].tolist() == [16]
+    assert unified["used"].tolist() == [13, 16]
+    assert unified["dst"].tolist() == (rows[parent][27:29].tolist()
+                                       + rows[child][31:32].tolist())

@@ -839,6 +839,9 @@ class Engine:
         v3 = v.contiguous().view(n, KH, D)
         if chunk.attention_mode == "tree":
             return self.attention_tree(q3, k3, v3, chunk.meta)
+        unified = chunk.meta["unified"]
+        if unified is not None and unified.get("shared") is not None:
+            return self.attention_shared(q3, k3, v3, chunk.meta)
         return self.quant(self.attention_unified(q3, k3, v3, chunk.meta))
 
     # ---- attention: the two workload paths --------------------------
@@ -875,6 +878,40 @@ class Engine:
             softmax_scale=softmax_scale, window=window,
             version=4 if wide else None)
         return out
+
+    def attention_shared(self, q3, k3, v3, meta):
+        """The unified call, with rounds that share leading pages reading them once.
+
+        Every row's own KV, its sequence's rows included, is read in
+        one causal paged call over tables that start past the shared
+        pages; the rounds of each share group read those pages in one
+        stacked call; the fused merge combines the two and writes the
+        o_proj input. Takes (rows, heads, dim) tensors.
+        """
+        n, H, D = q3.shape
+        layer = meta["layer"]
+        unified = meta["unified"]
+        shared = unified["shared"]
+        if unified["src"].numel():
+            self.kv_row_scatter(k3, v3, unified["src"], unified["dst"], layer)
+        if unified["tail_src"] is not None:
+            k_pool, v_pool = self.arena.layer_kv(layer)
+            self.kv_row_scatter(k_pool, v_pool, unified["tail_src"],
+                                unified["tail_dst"], layer)
+        kp, vp = self.arena.paged_kv(layer)
+        out_u, lse_u = self._fa(
+            q3, kp, vp, unified["cu_q"], None, unified["max_q"],
+            unified["max_used"], causal=True, block_table=unified["table"],
+            seqused_k=unified["used"])
+        out_s, lse_s = self._fa(
+            q3.index_select(0, shared["rows"]), kp, vp, shared["cu_q"], None,
+            shared["max_q"], shared["max_used"], causal=False,
+            block_table=shared["table"], seqused_k=shared["used"])
+        q_out, scales = self.merge_attn_quant(
+            out_u, lse_u.transpose(0, 1), out_s, lse_s.transpose(0, 1),
+            shared["source"])
+        meta["layer"] += 1
+        return q_out, scales
 
     def attention_tree(self, q3, k3, v3, meta):
         """The tree attention path: two calls, then one fused merge.
@@ -917,15 +954,6 @@ class Engine:
                 nodes["cu_q"], nodes["cu_k"], nodes["max_q"], nodes["max_k"],
                 causal=False)
             merge_partial(out_b, lse_b, nodes["b_index"], out_c, lse_c)
-        own = reads.get("own")
-        if own is not None:
-            # split rounds: call B read the pages their documents
-            # share, stacked; each round's own pages past them merge in
-            out_o, lse_o = self._fa(
-                q3.index_select(0, own["rows"]), kp, vp, own["cu_q"], None,
-                own["max_q"], own["max_used"], causal=False,
-                block_table=own["table"], seqused_k=own["used"])
-            merge_partial(out_b, lse_b, own["b_index"], out_o, lse_o)
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(
