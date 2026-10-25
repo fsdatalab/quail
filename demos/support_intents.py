@@ -1,4 +1,4 @@
-"""Find customer intents in support conversations with SAE features.
+"""Discover topics in support requests with sparse feature vectors.
 
 Run locally on a machine with one H100 GPU:
 
@@ -9,15 +9,11 @@ Or run on Modal with the companion script:
     uv run modal run --detach demos/support_intents_modal.py \
       2>&1 | tee /tmp/quail-support-intents.log
 
-The input is the QUAIL-B support_traces table: customer-support
-conversations from tau-bench, with each conversation's opening request,
-its domain (airline or retail), and whether the agent completed the task.
-The query reads the SAE features of each opening request and unnests
-them into one row per (request, feature). The analysis
-weights each feature by how rare it is, keeps each request's strongest
-weighted features, counts them, prints the requests where each one weighs
-most, and compares how often each one occurs in failed and completed
-conversations.
+The input is the QUAIL-B support_traces table of customer-support
+conversations from tau-bench. The query returns sparse features of each
+opening request and unnests them into one row per (request, feature).
+The analysis counts features after weighting them by frequency and
+selects representative requests for interpreting each feature.
 
 The unnested features are saved as features.parquet and the report as
 report.json under the output directory.
@@ -39,8 +35,6 @@ DEVICE = "h100-sxm"
 QUESTION = "{0}\n\nWhat is the customer asking for?"
 # Features kept per request after weighting.
 TOP_PER_REQUEST = 3
-# A comparison needs this many requests with the feature.
-MINIMUM_REQUESTS = 20
 
 
 def load_conversations(scale_factor: float = 1.0) -> pa.Table:
@@ -48,7 +42,7 @@ def load_conversations(scale_factor: float = 1.0) -> pa.Table:
     from quail_b import load_table
 
     table = load_table("support_traces", scale_factor=scale_factor)
-    return table.select(["id", "request", "task_id", "domain", "reward"])
+    return table.select(["id", "request", "task_id", "domain"])
 
 
 def read_features(conversations: pa.Table) -> pa.Table:
@@ -105,7 +99,7 @@ def examples(entries, rows, features, weights, conversations, feature,
 
 def analyze(conversations: pa.Table, intents: pa.Table, *,
             num_features: int = 32_768, top: int = 8) -> dict:
-    """Return the most frequent intent features and the failure comparison."""
+    """Return frequent features and representative requests for each one."""
     # the query selects the id, then the feature and its strength
     rows = pc.index_in(intents.column(0), conversations.column("id")).to_numpy()
     features = intents.column(1).to_numpy()
@@ -115,32 +109,13 @@ def analyze(conversations: pa.Table, intents: pa.Table, *,
                                     num_features=num_features,
                                     num_requests=total)
 
-    def described(feature, **counts):
-        return {"feature": feature, **counts,
-                "examples": examples(entries, rows, features, weights,
-                                     conversations, feature)}
-
     requests_with = np.bincount(features[entries], minlength=num_features)
-    intents_found = [described(feature, requests=int(requests_with[feature]))
-                     for feature in np.argsort(-requests_with)[:top].tolist()]
-    failed = (conversations.column("reward").to_numpy() < 1.0)
-    in_failed = failed[rows[entries]]
-    failed_share = np.bincount(features[entries][in_failed],
-                               minlength=num_features) / max(failed.sum(), 1)
-    completed_share = np.bincount(features[entries][~in_failed],
-                                  minlength=num_features) / max(
-                                      (~failed).sum(), 1)
-    difference = np.where(requests_with >= MINIMUM_REQUESTS,
-                          failed_share - completed_share, 0.0)
-    more_often_failed = [
-        described(feature,
-                  share_of_failed=round(float(failed_share[feature]), 3),
-                  share_of_completed=round(float(completed_share[feature]), 3))
-        for feature in np.argsort(-difference)[:5].tolist()]
-    return {"conversations": total,
-            "failed": int(failed.sum()),
-            "intents": intents_found,
-            "more_often_in_failed": more_often_failed}
+    intents_found = [
+        {"feature": feature, "requests": int(requests_with[feature]),
+         "examples": examples(entries, rows, features, weights,
+                              conversations, feature)}
+        for feature in np.argsort(-requests_with)[:top].tolist()]
+    return {"conversations": total, "intents": intents_found}
 
 
 def run(output_dir: Path, scale_factor: float = 1.0) -> dict:
