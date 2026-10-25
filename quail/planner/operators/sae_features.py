@@ -33,11 +33,15 @@ def sae_features_spec(context, call, name, expected_rows, resident=False):
         context.document_tokens[ref.alias], model.sliding_window,
         memo=context.memo)
     chunk = budgets.chunk_budget(model, context.device)
+    max_pooling = (context.logical_plan is not None and any(
+        node.alias == ref.alias and node.pooling == "max"
+        for node in context.logical_plan.operators().sae_features))
     cost = SaeFeaturesCost(
         token_lengths=(len(prompt.preamble_token_ids),
                        len(prompt.tail_token_ids)),
         summary=summary, pooling=call.pooling, model=model,
-        device=context.device, chunk_tokens=chunk, gpus=context.gpus)
+        device=context.device, chunk_tokens=chunk, gpus=context.gpus,
+        max_pooling=max_pooling)
     _work, seconds = cost.estimate(expected_rows, resident=resident)
     from quail.physical import SaeFeaturesSpec
 

@@ -5,6 +5,28 @@ import numpy as np
 from quail.backends.quail.executor.sae.encoder import SaeEncoder
 
 
+class SaeMaxReadout:
+    """Wait for the forward hook's maxima without encoding the final token again."""
+
+    dtype = None
+    trailing_rows = 1
+    normalize = False
+
+    def __init__(self, torch):
+        self.torch = torch
+
+    def submit(self, stream):
+        event = self.torch.cuda.Event()
+        event.record()
+        return event, stream.shape[0]
+
+    @staticmethod
+    def result(handle):
+        event, num_rows = handle
+        event.synchronize()
+        return [True] * num_rows
+
+
 class _PinnedSlabs:
     """Pinned host rows handed out from slab allocations.
 
@@ -207,35 +229,43 @@ class SaeMaxAccumulator:
         matrix.view(-1).scatter_reduce_(0, flat.view(-1), strengths.reshape(-1),
                                         reduce="amax")
 
-    def settle(self, key) -> tuple:
+    def settle(self, key, *, collect: bool = True) -> tuple | None:
         """Return the handle of one document's combined maxima for one call.
 
         The question's slot is consumed; the document's stays for the
         pipeline's later feature calls and is freed after the last one.
         The handle names the pinned slab and row the maxima copy into.
+
+        Args:
+            key: The document's arena key.
+            collect: Whether this call reads maxima. False discards the
+                question's maxima after a call with last-token pooling.
         """
         torch = self.torch
         matrix = self._slots.matrix
         tail = self.tail_slot.pop(key, None)
         document = self.document_slot.get(key)
-        source = tail if tail is not None else document
-        if tail is not None and document is not None:
-            torch.maximum(matrix[document], matrix[tail], out=matrix[tail])
-        slab, row = self._pinned.take()
-        host = self._pinned.slabs[slab][row]
-        if source is None:
-            host.zero_()
-        else:
-            host.copy_(matrix[source], non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        self._pinned.last_event[slab] = event
+        handle = None
+        if collect:
+            source = tail if tail is not None else document
+            if tail is not None and document is not None:
+                torch.maximum(matrix[document], matrix[tail], out=matrix[tail])
+            slab, row = self._pinned.take()
+            host = self._pinned.slabs[slab][row]
+            if source is None:
+                host.zero_()
+            else:
+                host.copy_(matrix[source], non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            self._pinned.last_event[slab] = event
+            handle = event, slab, row
         if tail is not None:
             self._slots.release(tail)
         self.settled[key] = self.settled.get(key, 0) + 1
         if self.settled[key] >= self.calls and document is not None:
             self._slots.release(self.document_slot.pop(key))
-        return event, slab, row
+        return handle
 
     def harvest(self, handles, *, completed_only: bool) -> tuple:
         """Return (taken, lengths, indices, strengths) of settled handles.

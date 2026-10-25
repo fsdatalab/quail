@@ -453,13 +453,13 @@ class Search:
         """
         tail = self.lower(node.call.prompt).tail_tokens
         stage_work = self.question_work(alias, rows, tail, first)
-        if node.pooling == "last":
-            encoded = float(len(rows))
-        else:
+        encoded = float(len(rows)) if node.pooling == "last" else 0.0
+        if any(call.alias == alias and call.pooling == "max"
+               for call in self.sae_features):
             tokens = self.aliases[alias].tokens
             documents = (0.0 if not first
                          else float(sum(tokens[row] for row in rows)))
-            encoded = documents + len(rows) * (
+            encoded += documents + len(rows) * (
                 tail + (self.pre if first else 0))
         stage_work = stage_work + Work(sae_encoded=encoded)
         stages.append(_stage(

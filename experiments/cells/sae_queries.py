@@ -10,10 +10,11 @@ $/query, the same token accounting the benchmark report uses.
     uv run modal run --detach -m experiments.cells.sae_queries \
         2>&1 | tee /tmp/sae_queries.log
 
-Records: /results/ablations/sae-queries-sf01.json.
+Records: /results/ablations/sae-queries-sf01-<timestamp>.json.
 """
 
 import json
+from datetime import datetime, timezone
 
 import modal
 
@@ -39,7 +40,7 @@ SCALE_FACTOR = 0.1
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
-def run() -> dict:
+def run(output_path: str) -> dict:
     """Each draft feature query's time, tokens, regret, and cost."""
     import quail
     from bench.quailb import run_query
@@ -71,7 +72,7 @@ def run() -> dict:
             record["queries"][spec.id] = metrics
             print(spec.id, json.dumps(metrics), flush=True)
     results.reload()
-    with open("/results/ablations/sae-queries-sf01.json", "w") as out:
+    with open(output_path, "w") as out:
         json.dump(record, out, indent=2)
     results.commit()
     return record
@@ -79,4 +80,9 @@ def run() -> dict:
 
 @app.local_entrypoint()
 def main():
-    print(json.dumps(run.remote(), indent=2))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_path = f"/results/ablations/sae-queries-sf01-{stamp}.json"
+    call = run.spawn(output_path)
+    print(f"function call id: {call.object_id}", flush=True)
+    print(f"results: {output_path}", flush=True)
+    print(json.dumps(call.get(), indent=2))

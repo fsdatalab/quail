@@ -325,6 +325,10 @@ class ShouldSharePrefixes(PhysicalRule):
             for alias, lengths in context.document_tokens.items()
         }
         shared_by_alias = {}
+        max_pooling_aliases = {
+            node.document_aliases[0] for node in graph.nodes
+            if isinstance(node, AiSaeFeatures) and node.spec.pooling == "max"
+        }
         for node in graph.nodes:
             if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract,
                                       AiSaeFeatures, AiScore))
@@ -335,6 +339,10 @@ class ShouldSharePrefixes(PhysicalRule):
                 continue
             alias = (node.spec.aliases[0] if isinstance(node, AiScore)
                      else node.document_aliases[0])
+            # Borrowed KV has no residual rows from which to recover SAE maxima.
+            if alias in max_pooling_aliases:
+                nodes.append(node)
+                continue
             lengths = context.document_tokens.get(alias)
             store = None if lengths is None else lengths.store
             if store is None:

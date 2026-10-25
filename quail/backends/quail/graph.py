@@ -85,8 +85,6 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
-    # a crashed query may leave a forward hook on the pipeline
-    state["gpu"].pipeline.forward_hook = None
     # the peak memory reported is this query's, not the process's
     state["gpu"].torch.cuda.reset_peak_memory_stats()
     retention = payload.get("retention", {})
