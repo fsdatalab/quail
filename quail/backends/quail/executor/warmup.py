@@ -187,11 +187,18 @@ def warm_label_readout(torch, head):
         torch: The torch module.
         head: The model's whole output head.
     """
-    from quail.backends.quail.executor.readout import AsyncLabelLogprobs
+    from quail.backends.quail.executor.readout import (
+        AsyncLabelLogprobs,
+        AsyncTopLogprobs,
+    )
 
     block = AsyncLabelLogprobs.BLOCK_ROWS
     hidden = torch.zeros((block + 300, head.shape[1]), dtype=torch.bfloat16,
                          device=head.device)
+    # the top-token readout's fused reduction compiles on first use
+    top = AsyncTopLogprobs(torch, torch.nn.functional, head, 1, [(0, 1)],
+                           ragged=True)
+    top.result(top.submit(hidden[:37], rows_per_answer=[37]))
     # a kernel's first launch waits for the GPU's queued work, which in
     # a query is a whole forward pass; PyTorch selects up to 16 indices
     # with one kernel and more with another
