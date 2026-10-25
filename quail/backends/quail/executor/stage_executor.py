@@ -369,6 +369,21 @@ class StageExecutor:
             rows += len(self.frames[j]) + len(self.canvas)
         return rows
 
+    def _rows_by_stage(self, part):
+        """Return the rows each stage packs into a chunk, pricing rounds together."""
+        by_stage = {}
+        rounds = {}
+        for entry in part:
+            j = entry[1]
+            if self.bulk[j] and not entry[4]:
+                rounds.setdefault(j, []).append(entry[0])
+            else:
+                by_stage[j] = by_stage.get(j, 0) + self._entry_rows(*entry)
+        for j, anchors in rounds.items():
+            costs = self.stages[j].costs(np.asarray(anchors, dtype=np.int64))
+            by_stage[j] = by_stage.get(j, 0) + int(np.maximum(costs, 0).sum())
+        return by_stage
+
     def _held_pages(self, key, prefix_tokens):
         # the admission prices a document at page_cost(prefix + extra)
         # less what it holds; a trimmed window holds fewer sliding
@@ -871,11 +886,7 @@ class StageExecutor:
         self.host_s["launch"] += time.perf_counter() - started
         if self.gpu_timing:
             e1.record()
-            by_stage = {}
-            for entry in part:
-                stage = entry[1]
-                by_stage[stage] = by_stage.get(stage, 0) + self._entry_rows(*entry)
-            self.spans.append((by_stage, chunk.tokens, e0, e1))
+            self.spans.append((self._rows_by_stage(part), chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
             self.arena.trim_window(key)
         # the readout is queued right behind the pass, so the stream
