@@ -65,27 +65,19 @@ class Chunk:
             page_tokens: Rows per KV page.
         """
         plan = self.meta["feed"]
-        device = self.input_ids.device
-
-        def to_device(array):
-            return device_array(torch, array, device)
-
-        source = to_device(np.asarray(source, dtype=np.int64))
+        source, first, entry, sequence, rows, kv_rows = device_arrays(
+            torch, [source, plan["first"], plan["entry"], plan["sequence"],
+                    plan["rows"], plan["kv_rows"]], self.input_ids.device)
         shift = feed.accepted.index_select(0, source) + 1
-        self.input_ids.index_copy_(0, to_device(plan["first"]),
-                                   feed.chosen.index_select(0, source))
-        rows = to_device(plan["rows"])
-        self.positions.index_add_(0, rows,
-                                  shift.index_select(0, to_device(plan["entry"])))
+        self.input_ids.index_copy_(0, first, feed.chosen.index_select(0, source))
+        self.positions.index_add_(0, rows, shift.index_select(0, entry))
         reads = self.meta["reads"]
-        sequence = to_device(plan["sequence"])
         reads["used"].index_add_(0, sequence, shift.to(reads["used"].dtype))
         positions = self.positions.index_select(0, rows)
-        pages = reads["table"][sequence.index_select(0, to_device(plan["entry"])),
+        pages = reads["table"][sequence.index_select(0, entry),
                                positions // page_tokens]
         self.meta["kv_dst"].index_copy_(
-            0, to_device(plan["kv_rows"]),
-            pages.to(torch.int64) * page_tokens + positions % page_tokens)
+            0, kv_rows, pages.to(torch.int64) * page_tokens + positions % page_tokens)
 
 
 class ArenaFullError(RuntimeError):
@@ -170,9 +162,21 @@ def _join(parts):
     return out
 
 
-def device_array(torch, array, device):
-    """Copy a host array to the device without waiting for the stream."""
-    return torch.from_numpy(np.ascontiguousarray(array)).to(device, non_blocking=True)
+def device_arrays(torch, arrays, device):
+    """Copy int64 host arrays to the device in one transfer; return device views.
+
+    The copy goes through pinned memory, so the host does not wait for
+    the stream to reach it: a pageable copy would wait for every
+    forward pass queued ahead of it.
+    """
+    lengths = [len(array) for array in arrays]
+    joined = torch.from_numpy(np.concatenate(
+        [np.asarray(array, dtype=np.int64).reshape(-1) for array in arrays]))
+    if device.type == "cuda":
+        joined = joined.pin_memory()
+    joined = joined.to(device, non_blocking=True)
+    bounds = np.cumsum([0, *lengths])
+    return [joined[start:end] for start, end in zip(bounds, bounds[1:])]
 
 
 def _staged(torch, data, dtype, pinned=True):

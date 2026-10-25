@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 
-from quail.backends.quail.executor.chunk import device_array
+from quail.backends.quail.executor.chunk import device_arrays
 from quail.backends.quail.executor.model_loading import answer_weights
 from quail.planner.prompt_lowering import true_false_ids
 
@@ -293,18 +293,15 @@ def round_feed(torch, values, following, counts, stop_mask, num_extras, k):
     starts = np.cumsum(counts) - counts
     segment = np.repeat(np.arange(len(counts)), counts)
     within = np.arange(int(counts.sum())) - np.repeat(starts, counts)
-
-    def to_device(array):
-        return device_array(torch, array, device)
-
-    match = ok & (top == to_device(following))
+    following, counts, starts, segment, within = device_arrays(
+        torch, [following, counts, starts, segment, within], device)
+    match = ok & (top == following)
     # the first row that did not choose the draft token after it ends
     # the accepted run; the last row has no following token
-    accepted = to_device(counts.copy())
+    accepted = counts.clone()
     missed = ~match
-    accepted.scatter_reduce_(0, to_device(segment)[missed],
-                             to_device(within)[missed], reduce="amin")
-    chosen = top.index_select(0, to_device(starts) + accepted)
+    accepted.scatter_reduce_(0, segment[missed], within[missed], reduce="amin")
+    chosen = top.index_select(0, starts + accepted)
     return RoundFeed(accepted=accepted, chosen=chosen)
 
 
