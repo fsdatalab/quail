@@ -35,12 +35,15 @@ def unnest_batch(batch: pa.RecordBatch, node) -> pa.RecordBatch:
     Each row repeats as many times as its longest list, with one take of
     the other columns. A list as long as the longest is its flattened
     values, without a copy; a shorter one is taken with a null past its
-    end. An alias is the same array as its field column.
+    end. With ``outer``, a row with no elements counts as one null
+    element. An alias is the same array as its field column.
     """
     lists = [batch.column(name) for name in node.lists]
     lengths = [pc.fill_null(pc.list_value_length(values), 0).to_numpy()
                for values in lists]
     longest = np.maximum.reduce(lengths)
+    if node.outer:
+        longest = np.maximum(longest, 1)
     parents = np.repeat(np.arange(batch.num_rows), longest)
     columns = {name: values.take(parents) for name, values in zip(
         batch.schema.names, batch.columns) if name not in node.lists}

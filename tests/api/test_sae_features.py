@@ -264,7 +264,8 @@ def test_unnest_returns_a_row_per_feature_and_where_keeps_strong_ones(session):
 
 @pytest.mark.parametrize("join,condition", [
     ("JOIN", "ON FALSE"),
-    ("LEFT JOIN", "ON TRUE"),
+    ("LEFT JOIN", "ON FALSE"),
+    ("RIGHT JOIN", "ON TRUE"),
     ("JOIN", "USING (id)"),
     ("NATURAL JOIN", ""),
 ])
@@ -453,3 +454,24 @@ def test_the_speed_of_light_prices_an_unnest_like_the_query_without_it(session):
     estimates = [quail.speed_of_light_estimate(query, answer=lambda *_: True)
                  for query in (plain, unnested)]
     assert estimates[1].latency.seconds == estimates[0].latency.seconds > 0
+
+
+def test_left_join_unnest_keeps_a_row_with_no_features_as_nulls(session):
+    # document 0 has no features; document d > 0 has feature d
+    oracle = Oracle(features=lambda spec, document: [
+        {"feature": document, "strength": 1.0}] if document else [])
+    sql = session.sql(
+        f"SELECT r.id, f.feature FROM reviews r LEFT JOIN {UNNEST} ON TRUE "
+        f"ORDER BY r.id")
+    built = (session.docs("reviews").alias("r")
+             .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
+                              pooling="last", name="f")
+             .unnest("f", outer=True).order_by("r.id")
+             .select("r.id", "f.feature"))
+    for query in (sql, built):
+        assert finish(query, oracle).collect().to_pylist() == [
+            {"r.id": 7, "f.feature": None}, {"r.id": 9, "f.feature": 1},
+            {"r.id": 11, "f.feature": 2}]
+    inner = session.sql(f"SELECT r.id, f.feature FROM reviews r, {UNNEST}")
+    assert sorted(finish(inner, oracle).collect().column("r.id").to_pylist()) == [
+        9, 11]

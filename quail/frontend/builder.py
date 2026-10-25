@@ -71,6 +71,7 @@ class Query:
         self._extracts = {}
         self._features = {}          # name -> Alias of an AI.SAE_FEATURES call
         self._unnests = []           # the list names of each unnest()
+        self._unnest_outer = []      # whether each unnest() keeps empty rows
         self._unnest_tests = []      # RegularPredicate on their fields
         self._unnest_aliases = []    # Aliases naming unnested fields
         self._regular_predicates = {}  # alias -> [RegularPredicate]
@@ -214,7 +215,7 @@ class Query:
         self._features[name] = Alias(call, name)
         return self
 
-    def unnest(self, *names: str) -> "Query":
+    def unnest(self, *names: str, outer: bool = False) -> "Query":
         """Return one row per element of ai_sae_features() columns.
 
         Each column ``name`` becomes ``name.feature`` and
@@ -222,8 +223,10 @@ class Query:
         and order_by() read like other columns; the other selected
         columns repeat for each element. The lists of one call are
         zipped: a row returns as many rows as its longest list, with
-        nulls past the end of a shorter one. A second call unnests
-        each row of the first, so two calls return the product.
+        nulls past the end of a shorter one. A row with no elements
+        returns no rows, or one row of nulls with ``outer=True``, as
+        LEFT JOIN UNNEST does. A second call unnests each row of the
+        first, so two calls return the product.
         """
         if not names:
             raise CompileError("unnest() names at least one column")
@@ -235,6 +238,7 @@ class Query:
             if name in unnested or names.count(name) > 1:
                 raise CompileError(f"unnest() reads {name!r} twice")
         self._unnests.append(tuple(names))
+        self._unnest_outer.append(outer)
         return self
 
     def _unnest_field(self, c) -> Optional[str]:
@@ -978,6 +982,7 @@ class Query:
                                aggregation=aggregation, structs=tuple(structs),
                                windows=windows, output=output,
                                unnests=tuple(self._unnests),
+                               unnest_outer=tuple(self._unnest_outer),
                                unnest_tests=tuple(self._unnest_tests),
                                unnest_aliases=tuple(self._unnest_aliases))
 

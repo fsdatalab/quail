@@ -266,6 +266,7 @@ class LogicalPlanBuilder:
         unnests: tuple = (),
         unnest_tests: tuple = (),
         unnest_aliases: tuple = (),
+        unnest_outer: tuple = (),
     ) -> LogicalPlan:
         """Build the plan's result nodes over the projected columns.
 
@@ -287,6 +288,8 @@ class LogicalPlanBuilder:
                 column.
             unnest_aliases: The Aliases that name unnested field
                 columns, each on the Unnest that adds its column.
+            unnest_outer: For each Unnest, whether a row with no
+                elements returns one row of nulls; empty means none do.
         """
         if self._root is None:
             raise CompileError("a logical plan needs an input table")
@@ -303,7 +306,8 @@ class LogicalPlanBuilder:
         unnested = {name for lists in unnests for name in lists}
         _check_feature_lists(columns, order, distinct, aggregation, unnested)
         node = _unnested(Project(self._root, tuple(columns), tuple(structs)),
-                         unnests, unnest_tests, unnest_aliases)
+                         unnests, unnest_tests, unnest_aliases,
+                         unnest_outer or (False,) * len(unnests))
         if aggregation is not None:
             node = Aggregate(
                 node,
@@ -324,7 +328,7 @@ class LogicalPlanBuilder:
         return plan
 
 
-def _unnested(node, unnests, tests, aliases):
+def _unnested(node, unnests, tests, aliases, outer):
     """Return the node under its Unnests, each test above its field's Unnest.
 
     Each Alias goes on the Unnest that adds the column it names.
@@ -334,8 +338,8 @@ def _unnested(node, unnests, tests, aliases):
             or an Alias reads no unnested field.
     """
     tests, aliases = list(tests), list(aliases)
-    for lists in unnests:
-        node = Unnest(node, tuple(lists))
+    for lists, keep_empty in zip(unnests, outer, strict=True):
+        node = Unnest(node, tuple(lists), outer=keep_empty)
         node.validate()
         fields = {name for names in node.fields().values() for name in names}
         named = [alias for alias in aliases

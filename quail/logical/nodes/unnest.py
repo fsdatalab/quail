@@ -18,8 +18,9 @@ class Unnest:
     The other columns repeat for each element. A row returns as many
     rows as its longest list; a shorter list gives nulls in the rows
     past its end, and a row whose lists are all empty or null returns
-    no rows. Two Unnest nodes over each other return the product of
-    their lists.
+    no rows; with ``outer``, it returns one row with null fields, as
+    LEFT JOIN UNNEST and Spark's explode_outer do. Two Unnest nodes over
+    each other return the product of their lists.
 
     Each of ``aliases`` returns one of the node's field columns again
     under its name, as ``SELECT f.feature AS feature_id`` does. The
@@ -33,6 +34,7 @@ class Unnest:
     input: LogicalNode
     columns: tuple[str, ...]
     aliases: tuple[Alias, ...] = ()
+    outer: bool = False
     type_name: ClassVar[str] = "quail.logical_unnest"
 
     def children(self) -> tuple[LogicalNode, ...]:
@@ -99,6 +101,8 @@ class Unnest:
 
     def explain_fields(self) -> dict:
         fields = {"columns": list(self.columns)}
+        if self.outer:
+            fields["outer"] = True
         if self.aliases:
             fields["aliases"] = {alias.name: column_name(alias.expression)
                                  for alias in self.aliases}

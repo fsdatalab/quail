@@ -162,13 +162,15 @@ class Unnest(PhysicalNode):
     Each list column in ``lists`` holds structs and becomes one column
     per struct field, named ``<list>.<field>``; the other columns repeat
     for each element. A row returns as many rows as its longest list,
-    with nulls past the end of a shorter one. Each (field column, name)
+    with nulls past the end of a shorter one; with ``outer``, a row
+    with no elements returns one row of nulls. Each (field column, name)
     of ``aliases`` returns the field column again under the name.
     ``columns`` are the output columns in result order.
     """
 
     lists: tuple[str, ...] = ()
     aliases: tuple[tuple[str, str], ...] = ()
+    outer: bool = False
     columns: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.unnest"

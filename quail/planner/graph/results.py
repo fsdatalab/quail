@@ -75,6 +75,7 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
                                 aliases=tuple(
                                     (column_name(alias.expression), alias.name)
                                     for alias in logical.aliases),
+                                outer=logical.outer,
                                 columns=result + hidden))
         else:
             node_id = f"filter_{index}"

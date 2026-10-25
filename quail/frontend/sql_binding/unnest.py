@@ -22,12 +22,15 @@ from quail.logical import (
 )
 
 
-def take_unnests(tree: exp.Select) -> tuple[tuple[tuple[str, ...], tuple], ...]:
+def take_unnests(tree: exp.Select) -> tuple[tuple[tuple[str, ...], tuple, bool], ...]:
     """Remove each UNNEST from FROM and return its list names and calls.
 
+    ``LEFT JOIN UNNEST(...) AS f``, with no ON or with ON TRUE, keeps a
+    row with no elements as one row of nulls.
+
     Returns:
-        One (names, AI.SAE_FEATURES calls) pair per UNNEST, in FROM
-        order.
+        One (names, AI.SAE_FEATURES calls, outer) triple per UNNEST, in
+        FROM order; outer is whether the UNNEST is a LEFT JOIN.
 
     Raises:
         CompileError: An UNNEST reads anything but AI.SAE_FEATURES
@@ -36,10 +39,15 @@ def take_unnests(tree: exp.Select) -> tuple[tuple[tuple[str, ...], tuple], ...]:
     taken = []
     for join in [join for join in tree.args.get("joins") or ()
                  if isinstance(join.this, exp.Unnest)]:
-        if (join.side or join.kind not in ("", "CROSS")
-                or any(join.args.get(key) for key in ("on", "using", "method"))):
+        outer = join.side == "LEFT"
+        on = join.args.get("on")
+        if (join.side not in ("", "LEFT")
+                or join.kind not in (("", "OUTER") if outer else ("", "CROSS"))
+                or (on is not None and not (outer and on == exp.true()))
+                or any(join.args.get(key) for key in ("using", "method"))):
             raise CompileError(
-                "UNNEST supports comma joins and CROSS JOIN without ON or USING")
+                "UNNEST supports comma joins, CROSS JOIN, and LEFT JOIN with "
+                "no ON or ON TRUE")
         unnest = join.this
         if unnest.args.get("offset"):
             raise CompileError("UNNEST does not support WITH ORDINALITY or OFFSET")
@@ -58,7 +66,7 @@ def take_unnests(tree: exp.Select) -> tuple[tuple[tuple[str, ...], tuple], ...]:
                 f"UNNEST names each list it reads: AS f for one list, or "
                 f"AS u(x, y) for two; got {unnest.sql()}")
         join.pop()
-        taken.append((tuple(columns), calls))
+        taken.append((tuple(columns), calls, outer))
     return tuple(taken)
 
 

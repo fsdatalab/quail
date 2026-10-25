@@ -495,7 +495,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
 
     b = ExpressionBinder(catalog, prompts, dialect=dialect.value)
 
-    for names, _ in unnests:
+    for names, _, _ in unnests:
         for name in names:
             if name in b.unnested:
                 raise CompileError(f"two UNNEST lists are named {name!r}")
@@ -512,7 +512,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
     selection = SelectBinder(b).bind(tree)
     columns, aggregation = selection.columns, selection.aggregation
     columns = (*columns, *(Alias(b.bind_ai_sae_features(call), name)
-                           for names, calls in unnests
+                           for names, calls, _ in unnests
                            for name, call in zip(names, calls)))
     order = bind_order(tree, b, columns, aggregation, selection.structs,
                        selection.windows)
@@ -568,7 +568,8 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
         structs=selection.structs,
         windows=selection.windows,
         output=selection.output,
-        unnests=tuple(names for names, _ in unnests),
+        unnests=tuple(names for names, _, _ in unnests),
+        unnest_outer=tuple(outer for _, _, outer in unnests),
         unnest_tests=tuple(b.unnest_tests),
         unnest_aliases=tuple(b.unnest_aliases),
     )

@@ -248,6 +248,8 @@ query = (
 
 `unnest("f", "g")` puts two lists side by side, as `UNNEST(a, b)` does
 in SQL. `unnest("f").unnest("g")` gives each pair of elements.
+`unnest("f", outer=True)` keeps a row with no features, with null fields,
+as `LEFT JOIN UNNEST` does in SQL.
 
 See [`AI.SAE_FEATURES`](/docs/user-guide/sql/ai-functions#aisae_features)
 for the two poolings and the limits.

@@ -491,8 +491,10 @@ To read two lists, use one of these forms:
   each list.
 
 A `WHERE` test of a feature field compares the field with literals.
-Use a comma or `CROSS JOIN` before `UNNEST`. Other joins, `ON`, `USING`,
-and `WITH ORDINALITY` are not supported.
+Use a comma or `CROSS JOIN` before `UNNEST`. A row with no features
+then gives no rows. To keep that row with null fields, write
+`LEFT JOIN UNNEST(...) AS f ON TRUE`. Other joins, other `ON` conditions,
+`USING`, and `WITH ORDINALITY` are not supported.
 
 ### Limits
 
