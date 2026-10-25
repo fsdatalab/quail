@@ -13,14 +13,6 @@ from quail.backends.quail.executor.attention import (
 )
 
 
-@pytest.mark.parametrize(
-    ("capability", "version"),
-    [((8, 9), 2), ((9, 0), 3), ((10, 0), 4), ((12, 0), 2)],
-)
-def test_flash_attention_version(capability, version):
-    assert flash_attention_version(capability) == version
-
-
 def test_flash_attention_version_rejects_unknown():
     with pytest.raises(ValueError, match=r"\(7, 5\)"):
         flash_attention_version((7, 5))
@@ -33,40 +25,17 @@ def test_deep_gemm_supported_matches_vllm_allow_list():
     assert not deep_gemm_supported((8, 9))
 
 
-def test_attention_dispatch_covers_l40s_and_b200(monkeypatch):
-    for capability, version in [((8, 9), 2), ((10, 0), 4)]:
-        recorded = {}
-        expected = object()
-
-        def fake_attention(*args, **kwargs):
-            recorded.update(kwargs)
-            return expected
-
-        module = ModuleType("vllm.vllm_flash_attn")
-        module.flash_attn_varlen_func = fake_attention
-        monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", module)
-        pipeline = Engine.__new__(Engine)
-        pipeline.fa_version = flash_attention_version(capability)
-        table, lengths = object(), object()
-        result = pipeline._fa(
-            None, None, None, None, None, 16, 32, True,
-            block_table=table, seqused_k=lengths,
-        )
-        assert result is expected
-        assert recorded["fa_version"] == version
-        assert recorded["block_table"] is table
-        assert recorded["seqused_k"] is lengths
-
-
-class _Rows:
-    def __init__(self, head_dim):
-        self.shape = (4, 16, head_dim)
-
-    def contiguous(self):
-        return self
-
-
-def test_only_b200_512_wide_heads_use_flashinfer(monkeypatch):
+@pytest.mark.parametrize("capability,head_dim,backend,version", [
+    ((8, 9), 128, "fa", 2),
+    ((9, 0), 128, "fa", 3),
+    ((10, 0), 128, "fa", 4),
+    ((12, 0), 128, "fa", 2),
+    ((10, 0), 512, "flashinfer", None),
+    ((9, 0), 512, "fa", 4),
+    ((10, 0), 256, "fa", 4),
+])
+def test_attention_dispatch_preserves_each_device_path(
+        monkeypatch, capability, head_dim, backend, version):
     calls = []
 
     def fake_attention(*args, **kwargs):
@@ -82,20 +51,21 @@ def test_only_b200_512_wide_heads_use_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", flash)
     monkeypatch.setattr(Engine, "_flashinfer_paged", fake_flashinfer)
     engine = Engine.__new__(Engine)
+    engine.fa_version = flash_attention_version(capability)
     metadata = object()
-    for version, head_dim, expected in (
-            (4, 512, "flashinfer"), (3, 512, "fa"), (4, 256, "fa")):
-        engine.fa_version = version
-        result = engine._paged(
-            _Rows(head_dim), "k", "v", "cu", 8, "used", 32, "table",
-            causal=True, softmax_scale=1.0, metadata=metadata)
-        assert result == f"{expected}-out"
-        backend, args = calls.pop()
-        assert backend == expected
-        if backend == "flashinfer":
-            assert args is metadata
-        else:
-            assert args["fa_version"] == 4
+    query = SimpleNamespace(shape=(4, 16, head_dim))
+    result = engine._paged(
+        query, "k", "v", "cu", 8, "used", 32, "table",
+        causal=True, softmax_scale=1.0, metadata=metadata)
+    assert result == f"{backend}-out"
+    actual, args = calls.pop()
+    assert actual == backend
+    if backend == "flashinfer":
+        assert args is metadata
+    else:
+        assert args["fa_version"] == version
+        assert args["block_table"] == "table"
+        assert args["seqused_k"] == "used"
 
 
 def test_b200_head_256_requests_a_single_split(monkeypatch):
@@ -127,7 +97,8 @@ def test_b200_head_256_requests_a_single_split(monkeypatch):
     assert "num_splits" not in recorded
 
 
-def test_fp8_gemm_uses_triton_block_mm_without_deep_gemm(monkeypatch):
+@pytest.mark.parametrize("transposed", (False, True))
+def test_fp8_gemm_passes_token_major_scales_to_triton(monkeypatch, transposed):
     recorded = {}
 
     def fake_mm(a, b, as_, bs, block_size, output_dtype=None):
@@ -148,39 +119,17 @@ def test_fp8_gemm_uses_triton_block_mm_without_deep_gemm(monkeypatch):
     engine.torch = SimpleNamespace(bfloat16="bf16")
     q_input = SimpleNamespace(shape=(4, 256))
     scales = SimpleNamespace(shape=(4, 256 // GROUP))
+    transposed_scales = SimpleNamespace(shape=(256 // GROUP, 4),
+                                        transpose=lambda a, b: scales)
+    input_scales = transposed_scales if transposed else scales
     linear = SimpleNamespace(weight="W", weight_scale="Ws")
-    assert engine.gemm(q_input, scales, linear) == "triton"
+    assert engine.gemm(q_input, input_scales, linear) == "triton"
     assert recorded["a"] is q_input
     assert recorded["b"] == "W"
     assert recorded["scales"] is scales
     assert recorded["weight_scale"] == "Ws"
     assert recorded["block_size"] == [GROUP, GROUP]
     assert recorded["output_dtype"] == "bf16"
-
-
-def test_fp8_gemm_transposes_group_major_scales_for_triton(monkeypatch):
-    recorded = {}
-
-    def fake_mm(a, b, as_, bs, block_size, output_dtype=None):
-        recorded["scales"] = as_
-        return "triton"
-
-    module = ModuleType(
-        "vllm.model_executor.layers.quantization.utils.fp8_utils")
-    module.w8a8_triton_block_scaled_mm = fake_mm
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.model_executor.layers.quantization.utils.fp8_utils",
-        module)
-    engine = Engine.__new__(Engine)
-    engine.is_fp8 = True
-    engine.use_deep_gemm = False
-    engine.torch = SimpleNamespace(bfloat16="bf16")
-    q_input = SimpleNamespace(shape=(4, 256))
-    scales = SimpleNamespace(shape=(256 // GROUP, 4), transpose=lambda a, b: "T")
-    linear = SimpleNamespace(weight="W", weight_scale="Ws")
-    assert engine.gemm(q_input, scales, linear) == "triton"
-    assert recorded["scales"] == "T"
 
 
 def test_fp8_gemm_keeps_deep_gemm_when_supported(monkeypatch):

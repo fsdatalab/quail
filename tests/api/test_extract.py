@@ -495,7 +495,7 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
             "capacity": request_tests.CAPACITY}
     monkeypatch.setattr(
         "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids, *, resources: (
+        lambda self, spec, allowed_ids, *, device, resources: (
             boot, {"kind": "cold", "boot_s": 0.1}))
     result = request_tests._run_stock_vllm(session, query)
     rows = result.collect()

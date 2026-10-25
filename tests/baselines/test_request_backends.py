@@ -79,7 +79,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     boot = {"client": _Client(), "sampling_params": object(), "capacity": CAPACITY}
     monkeypatch.setattr(
         "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids, *, resources: (
+        lambda self, spec, allowed_ids, *, device, resources: (
             boot, {"kind": "cold", "boot_s": 0.1}))
     session = _session(
         "stock_vllm",
@@ -578,7 +578,8 @@ class _Adapter:
         self.live = []
         self.fail = True
 
-    def boot(self, spec, allowed_ids, *, resources):
+    def boot(self, spec, allowed_ids, *, device, resources):
+        self.device = device
         client = SimpleNamespace(close=lambda: self.live.remove(client))
         self.live.append(client)
         resources.callback(client.close)
@@ -597,11 +598,12 @@ def test_a_request_backend_owns_its_engine_from_boot_to_release(monkeypatch):
     context = SimpleNamespace(
         registry=built_in_registry(), runtime_state={},
         request=SimpleNamespace(plan={
-            "model": "qwen3-4b-fp8",
+            "model": "qwen3-4b-fp8", "device": "b200",
             "settings": {"true_ids": [1], "false_ids": [2]}}))
     with pytest.raises(RuntimeError, match="warmup failed"):
         backend.prepare_request(context)
     assert adapter.live == [] and context.runtime_state == {}
+    assert adapter.device is B200
 
     adapter.fail = False
     backend.prepare_request(context)

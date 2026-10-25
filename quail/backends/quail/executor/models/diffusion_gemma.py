@@ -28,8 +28,8 @@ def canvas_token_ids(vocab: int, tokens: int, seed: int = CANVAS_SEED) -> tuple:
 class DiffusionGemmaPipeline(ModelPipeline):
     """Forward passes for DiffusionGemma checkpoints loaded by vLLM.
 
-    The full-attention layers' 512-wide heads run FlashAttention 4
-    over arena pages, so every chunk carries pages.
+    The full-attention layers read paged KV through FlashAttention 4
+    on H100 and FlashInfer on B200, so every chunk carries pages.
 
     Args:
         model: vLLM's DiffusionGemmaForConditionalGeneration module.

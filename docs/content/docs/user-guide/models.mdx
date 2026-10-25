@@ -31,24 +31,18 @@ document. See the
 
 ## GPUs
 
-| GPU | `device` value | Modal `gpu=` |
-| --- | --- | --- |
-| NVIDIA H100 SXM | `"h100-sxm"` | `H100!` |
-| NVIDIA L40S | `"l40s"` | `L40S` |
-| NVIDIA B200 | `"b200"` | `B200` |
-| NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` | `RTX-PRO-6000` |
+| GPU | `device` value |
+| --- | --- |
+| NVIDIA H100 SXM | `"h100-sxm"` |
+| NVIDIA L40S | `"l40s"` |
+| NVIDIA B200 | `"b200"` |
+| NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` |
 
-`device` is Quail's name. Modal's `gpu=` string can differ; use
-`modal_gpu_type(device)` from `quail.specs`. See
-[Configuration](/docs/user-guide/configuration).
-
-L40S does not support DiffusionGemma, Qwen3.5, or Qwen3.8. Quail rejects
-these model and GPU combinations during planning.
+L40S does not support DiffusionGemma, Qwen3.5, or Qwen3.8.
 
 ## Configure a session
 
-For example, this session runs Qwen3 4B on one H100 SXM. Use
-`device="l40s"` or `device="b200"` for those GPUs.
+For example, to run Qwen3 4B on one H100 SXM:
 
 ```python
 import quail

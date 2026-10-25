@@ -17,7 +17,7 @@ from quail.specs.base import DeviceSpec, ModelSpec
 from quail.specs.files import resolve_model_path
 
 GPU_MEMORY_UTILIZATION = 0.91
-# -1 tells vLLM 0.26 to keep the model's context length when the
+# -1 tells vLLM to keep the model's context length when the
 # leftover KV holds it, and otherwise the longest length that fits.
 MAX_MODEL_LEN = -1
 
