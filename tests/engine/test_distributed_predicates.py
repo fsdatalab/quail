@@ -153,3 +153,16 @@ def test_a_stop_key_keeps_its_group_on_one_worker_and_sums_the_counters(session)
     assert sorted(workers.filtered) == [0, 1]
     assert result.report["kv_manager"]["evicted_keys"] == 2 * session.config.gpus
     assert result.report["peak_gib"] == 1.0
+
+
+def test_a_filter_on_several_gpus_asks_each_text_once_and_returns_every_copy(
+        session):
+    query = (session.docs("contracts").alias("c")
+             .ai_filter(quail.prompt("Is {0} relevant?", quail.col("c.text")))
+             .select("c.id"))
+    workers = FixedWorkers(session)
+    result = execute_query(query, physical_executor=workers.execute)
+    # the coordinator asks the key documents before it shards them; the
+    # two "No date" contracts are one text
+    assert sorted(workers.filtered) == [0, 1, 3]
+    assert result.to_rows() == [(0,), (1,), (2,), (3,)]

@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
+from quail.execution.ask_once import asked_once
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.physical import (
     ExecutionLocation,
@@ -60,6 +61,9 @@ class ExecutionContext:
     functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
     gpus: int = 1
     run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
+    # alias -> the value column holding each document's key document;
+    # empty leaves every model operator asking per row
+    ask_once: Mapping[str, str] = field(default_factory=dict)
 
 def _check_ports(node, result) -> None:
     expected = {output.name for output in node.outputs}
@@ -121,8 +125,12 @@ class GenericRunner:
                         for port in member.inputs
                         if port.source.node_id not in inside}
                     for member in pipeline}
+                asked = asked_once(graph, pipeline, inputs, context)
                 started = time.perf_counter()
-                results = context.run_pipeline(pipeline, inputs, context)
+                results = context.run_pipeline(
+                    pipeline, inputs if asked is None else asked.inputs, context)
+                if asked is not None:
+                    results = asked.expanded(results)
                 # a pipeline's wall is charged once, to its first member
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
@@ -150,10 +158,13 @@ class GenericRunner:
                     ]
                     for input_port in node.inputs
                 }
+                asked = asked_once(graph, (node,), {node.node_id: inputs}, context)
                 started = time.perf_counter()
                 result = context.runtimes[node.runtime_key].execute(
-                    node, inputs, context
-                )
+                    node, inputs if asked is None else asked.inputs[node.node_id],
+                    context)
+                if asked is not None:
+                    result = asked.expanded({node.node_id: result})[node.node_id]
                 record(node, result, started)
                 continue
             record(node, result)
