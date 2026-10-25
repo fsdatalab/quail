@@ -297,10 +297,11 @@ def round_feed(torch, values, following, counts, stop_mask, num_extras, k):
         torch, [following, counts, starts, segment, within], device)
     match = ok & (top == following)
     # the first row that did not choose the draft token after it ends
-    # the accepted run; the last row has no following token
+    # the accepted run; the last row has no following token. Every row
+    # takes part, as selecting the missed rows would wait for the GPU
     accepted = counts.clone()
-    missed = ~match
-    accepted.scatter_reduce_(0, segment[missed], within[missed], reduce="amin")
+    accepted.scatter_reduce_(0, segment, torch.where(match, counts[segment], within),
+                             reduce="amin")
     chosen = top.index_select(0, starts + accepted)
     return RoundFeed(accepted=accepted, chosen=chosen)
 
