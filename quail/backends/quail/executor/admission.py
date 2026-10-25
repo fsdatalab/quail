@@ -234,6 +234,10 @@ class JoinAdmission:
             request still queued and is otherwise ignored; a request
             launched for an anchor that has since left the stage is
             dropped.
+        costs: Per stage, a callable from an array of anchors to each
+            one's next request's tokens, -1 where its partner callable
+            would pass it on, or None; an ahead stage with one asks it
+            for its anchors at once in place of their partner callable.
         survival: The fraction of anchors expected to survive every
             stage, or None. Under a limit, anchors are admitted only
             while the ones in flight are expected to fall short of it;
@@ -272,11 +276,14 @@ class JoinAdmission:
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
                  stop_groups=None, stop_width=1, reserve=None, repeats=None,
-                 slice_prefill=False, ahead=None):
+                 slice_prefill=False, ahead=None, costs=None):
         k = len(stage_suffixes)
         self.ahead = [False] * k if ahead is None else list(ahead)
         if len(self.ahead) != k:
             raise ValueError("ahead must match stage_suffixes")
+        self.costs = [None] * k if costs is None else list(costs)
+        if len(self.costs) != k:
+            raise ValueError("costs must match stage_suffixes")
         # anchors launched at an ahead stage, with the stage, until
         # advance_ahead() asks their next request
         self._ahead = {}
@@ -623,6 +630,7 @@ class JoinAdmission:
         """
         launched, self._ahead = self._ahead, {}
         k = len(self.stages)
+        targets = {}
         for a, j in launched.items():
             if self._stage[a] != j:
                 continue        # skipped by its group's survivor
@@ -633,12 +641,41 @@ class JoinAdmission:
                 target = j + 1
                 if target >= k:
                     continue    # its answer settles it
-            settled = self._enter(a, target)
-            if settled is None:
-                self.ready.append(a)
+            targets.setdefault(target, []).append(a)
+        for target, anchors in targets.items():
+            for a, settled in self._enter_many(anchors, target):
+                if settled is None:
+                    self.ready.append(a)
+                else:
+                    self._settled.append(Settlement(
+                        settled, a, bool(self._true[a][-1])))
+
+    def _enter_many(self, anchors, j):
+        """Enter anchors at stage j; yield (anchor, _enter's result) for each.
+
+        A stage with a costs callable prices every anchor's one request
+        in one call, so entering costs no per-anchor callback; the
+        anchors it passes on go through the partner callable as usual.
+        """
+        costs = self.costs[j]
+        if costs is None:
+            for a in anchors:
+                yield a, self._enter(a, j)
+            return
+        priced = costs(np.asarray(anchors, dtype=np.int64)).tolist()
+        for a, cost in zip(anchors, priced):
+            if cost < 0:
+                yield a, self._enter(a, j)
+                continue
+            self._stage[a] = j
+            self._next[a] = 0
+            self._lists[a][j] = _ONE_PARTNER
+            cum = self._cums[a][j]
+            if cum is None or cum is self._cum[j] or len(cum) != 2:
+                self._cums[a][j] = np.array([0, cost], dtype=np.int64)
             else:
-                self._settled.append(Settlement(
-                    settled, a, bool(self._true[a][-1])))
+                cum[1] = cost
+            yield a, None
 
     def next_chunk(self, free_pages):
         """Groups for the next chunk: [(anchor, stage, start, end, carried)].
@@ -918,7 +955,7 @@ class JoinAdmission:
         if j != self._stage[a] or a in self._ahead:
             return AdmissionReport()
         self.ready.remove(a)
-        settled = self._enter(a, j if self.repeats[j] else j + 1)
+        (_, settled), = self._enter_many([a], j if self.repeats[j] else j + 1)
         if settled is None:
             self.ready.append(a)
             return AdmissionReport()

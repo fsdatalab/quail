@@ -288,7 +288,7 @@ def test_a_long_document_is_prefilled_in_slices_and_answers_the_same(monkeypatch
     sliced, _, _ = _map_one(monkeypatch, LEASE, gold, on_state=budget)
     assert sliced.answer == whole.answer == gold
     slices = [spec for spec in packed
-              if spec["prefix"] is not None and not len(spec["suffixes"])]
+              if spec.get("prefix") is not None and not len(spec["suffixes"])]
     assert slices
     assert all(spec["start"] == spec["f"] for spec in slices)
     starts = [spec["start"] for spec in slices]
@@ -296,7 +296,7 @@ def test_a_long_document_is_prefilled_in_slices_and_answers_the_same(monkeypatch
                       for i in range(len(slices))]
     # the slice that completes the prefix carries the cue
     final = [spec for spec in packed
-             if spec["prefix"] is not None and len(spec["suffixes"])]
+             if spec.get("prefix") is not None and len(spec["suffixes"])]
     assert final and final[0]["start"] == sum(len(s["prefix"]) for s in slices)
 
 
@@ -335,7 +335,9 @@ def test_a_live_document_runs_in_every_pass(monkeypatch):
     passes = []
 
     def recording(torch, arena, specs, **kw):
-        passes.append([spec["key"] for spec in specs])
+        # rounds are packed together, under their documents' keys
+        passes.append([key for spec in specs
+                       for key in spec.get("keys", [spec.get("key")])])
         return fake_pack(torch, arena, specs, **kw)
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", recording)

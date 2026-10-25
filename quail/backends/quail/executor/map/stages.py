@@ -17,7 +17,7 @@ import numpy as np
 from quail.backends.quail.executor.chunk import Suffixes
 from quail.backends.quail.executor.decoding import AnswerStages
 from quail.backends.quail.executor.map.decoder import MapDecoder, MapDocument
-from quail.backends.quail.executor.stages import Stage, StageRequests
+from quail.backends.quail.executor.stages import RoundRequests, Stage, StageRequests
 from quail.backends.quail.executor.vocabulary import Vocabulary
 from quail.catalog.tokens import concat_tokens
 
@@ -134,6 +134,43 @@ class MapStages(AnswerStages):
             index = np.asarray(anchors, dtype=np.int64)
             self.decoder.launch(q, index, tail, self.cue_positions[q][index])
         return launched
+
+    def _round_lengths(self, q: int, index: np.ndarray) -> tuple:
+        """Return (device_fed, lengths) of the documents' next rounds."""
+        state = self.decoder.states[q]
+        device_fed = state.unreported[index] > 0
+        return device_fed, np.where(device_fed, 1 + state.draft_len[index],
+                                    state.fed_len[index])
+
+    def _stage_costs(self, q: int):
+        if self.recurrent:
+            return None
+
+        def costs(index):
+            state = self.decoder.states[q]
+            _, lengths = self._round_lengths(q, index)
+            return np.where(state.done[index], -1, lengths)
+        return costs
+
+    def _stage_rounds(self, q: int):
+        """The rounds of many documents at once, as _step_suffix builds one."""
+        if self.recurrent:
+            return None
+
+        def rounds(index):
+            state = self.decoder.states[q]
+            device_fed, lengths = self._round_lengths(q, index)
+            width = state.fed.shape[1]
+            hop = np.arange(width)
+            # a device-fed round: the placeholder, then the pending
+            # draft; otherwise the round's known tokens
+            ahead = np.concatenate((np.zeros((len(index), 1), dtype=np.int64),
+                                    state.draft[index]), axis=1)
+            tokens = np.where(device_fed[:, None], ahead, state.fed[index])
+            return RoundRequests(ids=tokens[hop[None, :] < lengths[:, None]],
+                                lengths=lengths, positions=state.base[index].copy(),
+                                device_fed=device_fed)
+        return rounds
 
     def _prepare_rounds(self, q: int, tail: bool, anchors, rows) -> None:
         """Verify a chunk's rounds for instruction q and draft the next ones.

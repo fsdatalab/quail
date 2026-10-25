@@ -63,6 +63,25 @@ class StageRequests:
 
 
 @dataclass
+class RoundRequests:
+    """Many documents' one-request rounds at once, for an ahead stage.
+
+    Attributes:
+        ids: Every request's tokens back to back, in document order.
+        lengths: Each request's tokens.
+        positions: Each request's first position in its document's
+            sequence, as StageRequests.position.
+        device_fed: Per request, whether its first token is a
+            placeholder the GPU replaces, as StageRequests.device_fed.
+    """
+
+    ids: np.ndarray
+    lengths: np.ndarray
+    positions: np.ndarray
+    device_fed: np.ndarray
+
+
+@dataclass
 class Stage:
     """Token requests, answer readout, and advancement condition for one step.
 
@@ -114,6 +133,14 @@ class Stage:
         launched: Optional callback from the document indices of a
             chunk's groups at this stage, called once the chunk is
             launched and before any earlier chunk's answers are read.
+        costs: For an ahead stage whose suffixes are each document's
+            own, a callback from document indices to each one's next
+            request's tokens, or -1 where suffixes would pass the
+            document on; the admission asks it in place of suffixes.
+        rounds: With costs, a callback from document indices to their
+            RoundRequests, asked when the chunk is built in place of
+            suffixes; suffixes is still asked for a document costs
+            passed on.
         label: Name displayed in progress messages.
         paths: Optional trie paths and ancestor references from trie_paths().
         read_mask: Optional mask of the rows read in the sole paths
@@ -142,6 +169,8 @@ class Stage:
     repeats: bool = False
     ahead: bool = False
     launched: Callable | None = None
+    costs: Callable | None = None
+    rounds: Callable | None = None
     label: str = ""
     paths: list | None = None
     read_mask: Any = None
@@ -150,6 +179,10 @@ class Stage:
     suffix_tokens: int = 0
 
     def __post_init__(self):
+        if (self.costs is None) != (self.rounds is None) or (
+                self.costs is not None and not (self.ahead and self.own_suffixes)):
+            raise ValueError("costs and rounds come together, on an ahead "
+                             "stage whose suffixes are a callback")
         if self.own_suffixes:
             if self.suffix_tokens < 1:
                 raise ValueError("a stage whose suffixes come from a callback "

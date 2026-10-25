@@ -116,6 +116,7 @@ class AnswerStages:
                   readout=self.readout, decide=partial(self._step_decide, q),
                   prepare=self._stage_prepare(q, tail=False),
                   launched=self._stage_launched(q, tail=False), ahead=self.ahead,
+                  costs=self._stage_costs(q), rounds=self._stage_rounds(q),
                   read_all_rows=True, single=True, append=True, repeats=True,
                   label=f"{name} rounds"),
         ]
@@ -126,6 +127,14 @@ class AnswerStages:
 
     def _stage_launched(self, q: int, tail: bool):
         """Return a stage's launched callback, or None when none is needed."""
+        return None
+
+    def _stage_costs(self, q: int):
+        """Return the rounds stage's costs callback, or None to ask per document."""
+        return None
+
+    def _stage_rounds(self, q: int):
+        """Return the rounds stage's rounds callback, or None to ask per document."""
         return None
 
     @property

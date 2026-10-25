@@ -475,6 +475,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
       and positions Chunk.apply_feed() sets on the GPU from the answer
       before it; f is that answer's first position, and feed_bound the
       most rows it could have accepted plus one, bounding the KV read.
+    * rounds: A RoundRequests of many documents' decode rounds packed as
+      one group, with keys naming each one's document and feed_bound as
+      above; every row is read and kept. Tree attention only.
 
     Fresh groups without arena pages must have at most one suffix. Unified
     attention cannot mix paged and unpaged groups. Canvas rows use unified
@@ -546,6 +549,44 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     fed_rounds = []
     fed_used = 0
     for g in groups:
+        rounds = g.get("rounds")
+        if rounds is not None:
+            if not tree_rounds:
+                raise ValueError("rounds packed together run the tree path")
+            keys = g["keys"]
+            lengths = rounds.lengths
+            ends = np.cumsum(lengths)
+            begins = ends - lengths
+            total = int(ends[-1]) if len(ends) else 0
+            row0 = num_tokens
+            id_parts.append(rounds.ids)
+            position.append(np.repeat(rounds.positions, lengths)
+                            + (np.arange(total, dtype=np.int64)
+                               - np.repeat(begins, lengths)))
+            finals.append((row0, total))
+            cu_a.append(row0 + ends)
+            rows_per_answer.append(lengths)
+            multi_row = True
+            reader_rows.append((row0, total))
+            cu_q.extend((cu_q[-1] + ends).tolist())
+            read_keys.extend(keys)
+            read_used.extend(rounds.positions.tolist())
+            if len(lengths) and int(lengths.max()) > max_q:
+                max_q = int(lengths.max())
+            first_write = len(kv_writes)
+            first_sequence = len(read_keys) - len(keys)
+            for key, start, end, f in zip(keys, (row0 + begins).tolist(),
+                                          (row0 + ends).tolist(),
+                                          rounds.positions.tolist()):
+                kv_writes.append((key, start, end, f))
+                layout.append((key, 1))
+            for index in np.flatnonzero(rounds.device_fed).tolist():
+                fed_rounds.append((row0 + int(begins[index]), int(lengths[index]),
+                                   first_sequence + index, first_write + index))
+                fed_used = max(fed_used,
+                               int(rounds.positions[index]) + int(g["feed_bound"]))
+            num_tokens = row0 + total
+            continue
         sufs0 = g["suffixes"]
         if (tree_rounds and g.get("prefix") is None and g.get("single")
                 and isinstance(sufs0, Suffixes) and len(sufs0) == 1

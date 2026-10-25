@@ -236,7 +236,12 @@ class StageExecutor:
             reserve=self._reserve if self.paged else None,
             repeats=[stage.repeats for stage in self.stages],
             slice_prefill=self.slice_prefill, ahead=self.ahead,
+            costs=[stage.costs if ahead else None
+                   for stage, ahead in zip(self.stages, self.ahead)],
         )
+        # the stages whose rounds are packed many at once, from arrays
+        self.bulk = [bool(ahead and stage.rounds is not None)
+                     for stage, ahead in zip(self.stages, self.ahead)]
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         # a Gated DeltaNet layer starts a borrower from the parent's state
@@ -325,6 +330,8 @@ class StageExecutor:
                 else self.suffixes[j])
 
     def _entry_rows(self, a, j, start, end, carried):
+        if self.bulk[j] and not carried:
+            return max(0, int(self.stages[j].costs(np.array([a]))[0]))
         f = self.prefix_lengths[a]
         sliced = self.sched.slices.get(a) if carried else None
         if sliced is not None:
@@ -455,12 +462,19 @@ class StageExecutor:
                        else np.full(rows, -1, dtype=np.int64))
             following.append(fed)
 
+        bulk = {}
         for a, j, start, end, carried in chunk_groups:
             key = self.keys[a]
             f = self.prefix_lengths[a]
             frame = self.frames[j]
             stage = self.stages[j]
             append = stage.append
+            if self.bulk[j] and not carried:
+                # the rounds of this stage are packed together, after
+                # every other group; _run_one orders the groups so
+                bulk.setdefault(j, []).append(a)
+                group_entries.append(("bulk", j, len(bulk[j]) - 1))
+                continue
             sliced = self.sched.slices.get(a) if carried else None
             if sliced is not None and end == start:
                 # a slice of the prefix alone: its rows read the slices
@@ -589,12 +603,39 @@ class StageExecutor:
                     paths=self.stages[j].paths, **carry, **own))
             entry(j, rows)
             group_entries.append(len(entries) - 1)
+        firsts = {}
+        for j, anchors in bulk.items():
+            firsts[j] = len(entries)
+            requests = self.stages[j].rounds(np.asarray(anchors, dtype=np.int64))
+            lengths = requests.lengths
+            ends = np.cumsum(lengths)
+            entries.extend((j, int(length)) for length in lengths.tolist())
+            fed = np.concatenate((requests.ids[1:], _NO_FOLLOWING[:1]))
+            fed[ends - 1] = -1
+            following.append(fed)
+            # a round's position replaces the appended-token bookkeeping
+            specs.append(dict(rounds=requests, keys=[self.keys[a] for a in anchors],
+                              feed_bound=self.stages[j].suffix_tokens))
+            sources.extend(self.latest[anchors[index]]
+                           for index in np.flatnonzero(requests.device_fed))
+        if bulk:
+            group_entries = [firsts[e[1]] + e[2] if isinstance(e, tuple) else e
+                             for e in group_entries]
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
             staging=self.staging, canvas=self.canvas, answer_row=self.answer_row)
         for a, tokens in appended.items():
             self.appended[a] = tokens
         return chunk, entries, following, group_entries, sources
+
+    def _ordered(self, part):
+        """Return the groups with the bulk stages' rounds last, in their order."""
+        if not any(self.bulk):
+            return part
+        rounds = [g for g in part if self.bulk[g[1]] and not g[4]]
+        if not rounds:
+            return part
+        return [g for g in part if not (self.bulk[g[1]] and not g[4])] + rounds
 
     def _settle(self, settlement):
         anchor = settlement.anchor
@@ -741,6 +782,7 @@ class StageExecutor:
 
     def _run_one(self, part):
         started = time.perf_counter()
+        part = self._ordered(part)
         chunk, entries, following, group_entries, sources = self._build(part)
         if sources:
             # the rounds follow answers of the pass before, whose
