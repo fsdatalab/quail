@@ -70,7 +70,7 @@ def _run_one(client, prompts, cap) -> dict:
               volumes=VOLUMES)
 def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
                       only: str = "", speculative: str = "",
-                      capture_sizes: str = "vllm") -> str:
+                      capture_sizes: str = "vllm", profile_gpu: bool = False) -> str:
     """Run the map configurations on stock vLLM; return the result's path.
 
     Args:
@@ -84,6 +84,8 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
             quail.baselines.vllm.parse_capture_sizes reads them: "vllm"
             for vLLM's own default, sizes up to 512; "8192" for the
             quail-b baseline's one graph; or "vllm-spacing:<largest>".
+        profile_gpu: Whether to trace each run with the torch profiler
+            and print the kernels with the most GPU time.
     """
     import os
 
@@ -122,8 +124,24 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
             if chosen and name not in chosen:
                 continue
             print(f"running {name}", flush=True)
+            # each configuration prefills its documents itself, as
+            # Quail does: the KV an earlier one cached is dropped
+            if client.reset_prefix_cache() is False:
+                raise RuntimeError("vLLM did not reset its prefix cache")
             prompts = _prompts(directory, table, column, instruction, spec)
-            run = _run_one(client, prompts, cap)
+            if profile_gpu:
+                import torch
+                from torch.profiler import ProfilerActivity
+
+                with torch.profiler.profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                ) as trace:
+                    run = _run_one(client, prompts, cap)
+                print(trace.key_averages().table(
+                    sort_by="self_device_time_total", row_limit=40,
+                    max_name_column_width=90), flush=True)
+            else:
+                run = _run_one(client, prompts, cap)
             run["usd_per_query"] = run["wall_s"] / 3600 * H100_USD_PER_HOUR
             measurements["runs"][name] = run
             print(json.dumps({name: run}, default=str), flush=True)
@@ -141,9 +159,10 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
 @app.local_entrypoint()
 def launch_baseline(model: str = "qwen3-4b-fp8", sf: float = 0.1,
                     only: str = "", speculative: str = "",
-                    capture_sizes: str = "vllm"):
+                    capture_sizes: str = "vllm", profile_gpu: bool = False):
     call = map_vllm_baseline.spawn(model=model, scale_factor=sf, only=only,
                                    speculative=speculative,
-                                   capture_sizes=capture_sizes)
+                                   capture_sizes=capture_sizes,
+                                   profile_gpu=profile_gpu)
     print(f"function call id: {call.object_id}")
     print(call.get())

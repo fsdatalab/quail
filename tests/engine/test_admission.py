@@ -598,3 +598,28 @@ def test_a_repeating_stage_asks_the_anchor_again_until_its_callback_passes_it_on
     assert sched.done() and sched.survivors == 1
     assert rounds == [1, 1, 1, 1]
 
+
+
+def test_a_long_prefix_is_packed_over_several_chunks():
+    # a 1,500-token prefix in 600-token chunks: two slices alone, then
+    # the rest with the first request; nothing is reported for a slice
+    sched = JoinAdmission([1500, 50], [[10]], 600, arena_pages=400,
+                          page_tokens=16, slice_prefill=True)
+    assert sched.next_chunk(400) == [(0, 0, 0, 0, True)]
+    assert sched.slices == {0: (0, 600)} and not sched.done()
+    # the next chunk continues the slice, which fills the room
+    assert sched.next_chunk(400) == [(0, 0, 0, 0, True)]
+    assert sched.slices == {0: (600, 1200)}
+    # the rest fits with the first request, and the room left admits
+    # the short anchor whole
+    assert sched.next_chunk(400) == [(0, 0, 0, 1, True), (1, 0, 0, 1, True)]
+    assert sched.slices == {0: (1200, 1500)}
+    assert not sched.done()
+    sched.report(0, 0, 0, 1, [1])
+    sched.report(1, 0, 0, 1, [1])
+    assert sched.done() and sched.survivors == 2
+
+
+def test_without_slicing_a_prefix_longer_than_the_chunk_is_refused():
+    with pytest.raises(ValueError, match="leaves no room"):
+        JoinAdmission([1500], [[10]], 600, arena_pages=400, page_tokens=16)

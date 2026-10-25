@@ -254,3 +254,39 @@ def test_a_document_reserves_kv_for_the_whole_answer_and_a_draft(monkeypatch):
     tokens, capacity = reserved[key]
     # the prompt, then the tail's frame and cue, the answer, and a draft
     assert capacity - tokens >= len(TAIL.split()) + 12 + 3
+
+
+def test_a_long_document_is_prefilled_in_slices_and_answers_the_same(monkeypatch):
+    # with room for 24 tokens a pass and slices of 8, the lease is
+    # packed over several passes before its first round; the answer
+    # is the one a whole prefill gives
+    from quail.backends.quail.executor import admission as admission_mod
+
+    gold = "The lease ends March 3"
+    whole, _, _ = _map_one(monkeypatch, LEASE, gold)
+    monkeypatch.setattr(admission_mod, "SLICE_MIN_TOKENS", 8)
+    packed = []
+    original = fake_pack
+
+    def recording(torch, arena, specs, **kw):
+        packed.extend(specs)
+        return original(torch, arena, specs, **kw)
+
+    def budget(state):
+        state.chunk_tokens = 24
+
+    # _map_one installs this module's fake_pack as the packer
+    monkeypatch.setitem(globals(), "fake_pack", recording)
+    sliced, _, _ = _map_one(monkeypatch, LEASE, gold, on_state=budget)
+    assert sliced.answer == whole.answer == gold
+    slices = [spec for spec in packed
+              if spec["prefix"] is not None and not len(spec["suffixes"])]
+    assert slices
+    assert all(spec["start"] == spec["f"] for spec in slices)
+    starts = [spec["start"] for spec in slices]
+    assert starts == [sum(len(s["prefix"]) for s in slices[:i])
+                      for i in range(len(slices))]
+    # the slice that completes the prefix carries the cue
+    final = [spec for spec in packed
+             if spec["prefix"] is not None and len(spec["suffixes"])]
+    assert final and final[0]["start"] == sum(len(s["prefix"]) for s in slices)

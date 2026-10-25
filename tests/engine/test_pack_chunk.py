@@ -159,3 +159,38 @@ def test_warmup_runs_every_row_count_class(monkeypatch, mode):
         assert [n for n, _ in shapes[1:]] == [n for n, _ in warmup.ROW_CLASSES]
     # every key the pass made is freed
     assert arena.accounting.free_pages == 256
+
+
+def test_a_prefix_slice_reads_the_slices_before_it_and_writes_after_them(
+        monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    key = ("d", 5)
+    arena.activate(key, 40, capacity_tokens=48, base_tokens=40)
+    rows = arena.capacity_rows(key).tolist()
+    # the first slice reads nothing resident
+    first = chunk_mod.pack_chunk(
+        torch, arena, [dict(key=key, prefix=list(range(16)), start=0, f=0,
+                            suffixes=Suffixes.of([]))], attention_mode="tree")
+    assert first.meta["kv_dst"].tolist() == rows[:16]
+    assert first.meta["reads"] is None
+    assert first.meta["cu_a"].tolist() == [0, 16]
+    # the second reads the first from the key's pages
+    second = chunk_mod.pack_chunk(
+        torch, arena, [dict(key=key, prefix=list(range(16, 32)), start=16, f=16,
+                            suffixes=Suffixes.of([]))], attention_mode="tree")
+    assert second.positions.tolist() == list(range(16, 32))
+    assert second.meta["kv_dst"].tolist() == rows[16:32]
+    assert second.meta["reads"]["used"].tolist() == [16]
+    assert second.meta["reads"]["rows"].tolist() == list(range(16))
+    assert second.rows_per_answer is None
+    # the last slice carries the first request, which reads the whole prefix
+    final = chunk_mod.pack_chunk(
+        torch, arena, [dict(key=key, prefix=list(range(32, 40)), start=32, f=40,
+                            suffixes=[[91]], write_suffix_tokens=1, single=True)],
+        attention_mode="tree")
+    assert final.positions.tolist() == list(range(32, 41))
+    assert final.meta["kv_dst"].tolist() == rows[32:41]
+    assert final.meta["reads"]["used"].tolist() == [32, 40]
+    assert final.meta["cu_a"].tolist() == [0, 8, 9]
+    assert final.final_indices.tolist() == [8]

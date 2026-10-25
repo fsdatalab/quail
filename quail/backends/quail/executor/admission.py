@@ -34,6 +34,8 @@ def pages_for(tokens: int, page_tokens: int) -> int:
 # --------------------------------------------- join admission
 
 _DONE = -2      # the anchor's last stage answered, or it failed a gate
+# the fewest prefix tokens a chunk packs as a slice of a longer prefix
+SLICE_MIN_TOKENS = 512
 
 
 def partner_pages(page_cost, page_tokens, prefix_tokens, frame_tokens,
@@ -219,6 +221,11 @@ class JoinAdmission:
             asked again at the same stage, with its answers dropped,
             until its callable partner request passes it on with SKIP
             or SkipTo, or drops it.
+        slice_prefill: Whether an anchor whose prefix and first request
+            do not fit a chunk's room is admitted anyway, packing a
+            slice of its prefix per chunk, with no request until the
+            slice that completes it. Its KV pages are reserved at the
+            first slice. A borrowing anchor packs whole.
         survival: The fraction of anchors expected to survive every
             stage, or None. Under a limit, anchors are admitted only
             while the ones in flight are expected to fall short of it;
@@ -256,8 +263,17 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
-                 stop_groups=None, stop_width=1, reserve=None, repeats=None):
+                 stop_groups=None, stop_width=1, reserve=None, repeats=None,
+                 slice_prefill=False):
         k = len(stage_suffixes)
+        # a prefix longer than the room is packed over several chunks,
+        # its KV written slice by slice; prefilling holds the anchors
+        # between their first slice and their last, and slices the
+        # (first, end) prefix tokens each anchor packs in this chunk
+        self.slice_prefill = slice_prefill
+        self.prefilling = deque()
+        self._prefilled = []
+        self.slices = {}
         self.repeats = [False] * k if repeats is None else list(repeats)
         if len(self.repeats) != k:
             raise ValueError("repeats must match stage_suffixes")
@@ -482,6 +498,7 @@ class JoinAdmission:
         self._cums.append(cums)
         self._page_cost.append(need)
         self._carried.append(carried)
+        self._prefilled.append(0)
         self._stage.append(-1)
         self._next.append(0)
         self._true.append([False] * k)
@@ -494,7 +511,8 @@ class JoinAdmission:
             self.borrowing.skip(a)
             return a
         first = self.frame_rows[0] + self._suffix(a, 0, 0)
-        if resident_pages is None and prefix + first > self.chunk_budget:
+        whole = prefix if resident_pages is None and not self.slice_prefill else 0
+        if whole + first > self.chunk_budget:
             raise ValueError(
                 f"anchor {a}: prefix {prefix} tokens leaves no "
                 f"room for a partner in a {self.chunk_budget}-token "
@@ -591,12 +609,62 @@ class JoinAdmission:
         continued = []
         deferred = []
         temporary_pages = 0
+        self.slices = {}
+        room, free_pages, temporary_pages = self._continue_prefill(
+            room, free_pages, temporary_pages, groups, continued)
         room, free_pages, temporary_pages = self._place_ready(
             room, free_pages, temporary_pages, groups, continued, deferred)
         self._admit_fresh(room, free_pages, temporary_pages, groups, continued)
         self.ready.extendleft(reversed(continued))
         self.ready.extendleft(reversed(deferred))
         return groups
+
+    def _continue_prefill(self, room, free_pages, temporary_pages, groups,
+                          continued):
+        """Pack the next slice of each anchor mid-prefill, oldest first.
+
+        An anchor whose remaining prefix and first request fit the room
+        packs them and launches; otherwise it packs a slice of the room
+        and stays in prefilling.
+        """
+        for _ in range(len(self.prefilling)):
+            if room < SLICE_MIN_TOKENS:
+                break
+            a = self.prefilling.popleft()
+            first = self._prefilled[a]
+            remaining = self._carried[a] - first
+            if remaining + self._first[a] <= room:
+                end, tokens, pages = self._take(a, 0, 0, room - remaining, free_pages)
+                if end == 0:
+                    self.blocked_pages = self._suffix_page_cost(a, 0, 0) - free_pages
+                    self.prefilling.appendleft(a)
+                    break
+                self.slices[a] = (first, self._carried[a])
+                self._prefilled[a] = self._carried[a]
+                groups.append((a, 0, 0, end, True))
+                room -= remaining + tokens
+                free_pages -= pages
+                temporary_pages += pages
+                if self._launch(a, 0, end):
+                    continued.append(a)
+                continue
+            taken = min(remaining, room)
+            self.slices[a] = (first, first + taken)
+            self._prefilled[a] = first + taken
+            groups.append((a, 0, 0, 0, True))
+            room -= taken
+            self.prefilling.append(a)
+        return room, free_pages, temporary_pages
+
+    def _slice_fresh(self, a, room) -> bool:
+        """Admit a fresh anchor by its first prefix slice; False when it cannot."""
+        if (not self.slice_prefill or room < SLICE_MIN_TOKENS
+                or self._first[a] > self.chunk_budget):
+            return False
+        self.slices[a] = (0, room)
+        self._prefilled[a] = room
+        self.prefilling.append(a)
+        return True
 
     def _place_ready(self, room, free_pages, temporary_pages, groups, continued,
                      deferred):
@@ -629,7 +697,10 @@ class JoinAdmission:
         admitted = set()
         paced = self.limit is not None and self.survival is not None
         expected_rows = self._live() if paced else 0
-        while self.pending and room >= self._min_fresh:
+        # a sliced prefix packs as little as a slice
+        least = (min(self._min_fresh, SLICE_MIN_TOKENS) if self.slice_prefill
+                 else self._min_fresh)
+        while self.pending and room >= least:
             if paced and self.survivors + expected_rows * self.survival >= self.limit:
                 break       # the anchors in flight should reach the limit
             a = self.pending.popleft()
@@ -641,8 +712,9 @@ class JoinAdmission:
                 held.append(a)      # the group's anchors in flight are enough
                 continue
             borrow = self.borrowing.decide(a, admitted)
-            if borrow == Borrowing.WAIT:
-                held.append(a)      # its parent is still queued
+            if borrow == Borrowing.WAIT or (
+                    borrow is not None and borrow[0] in self.prefilling):
+                held.append(a)      # its parent is still queued or mid-prefill
                 continue
             need = (self._page_cost[a] if borrow is None
                     else self.page_cost(self.prefix[a] - borrow[1] + self._extra))
@@ -661,22 +733,31 @@ class JoinAdmission:
                 continue
             carried = (self._carried[a] if borrow is None
                        else self.prefix[a] - borrow[1])
+            sliced = False
             if carried + self._first[a] > room:
-                held.append(a)      # chunk room only; retry next chunk
-                continue
-            end, tokens, pages = self._take(
-                a, 0, 0, room - carried, free_pages - need)
-            if end == 0:
-                held.append(a)
-                self.blocked_pages = (
-                    need + self._suffix_page_cost(a, 0, 0) - free_pages)
-                break
+                sliced = borrow is None and carried > room
+                if not sliced or not self._slice_fresh(a, room):
+                    held.append(a)      # chunk room only; retry next chunk
+                    continue
+                end, tokens, pages = 0, 0, 0
+            else:
+                end, tokens, pages = self._take(
+                    a, 0, 0, room - carried, free_pages - need)
+                if end == 0:
+                    held.append(a)
+                    self.blocked_pages = (
+                        need + self._suffix_page_cost(a, 0, 0) - free_pages)
+                    break
             if self.reserve is not None and not self.reserve(a, borrow):
+                if sliced:
+                    self.prefilling.pop()
+                    self.slices.pop(a)
+                    self._prefilled[a] = 0
                 held.append(a)
                 break
             temporary_pages += pages
             groups.append((a, 0, 0, end, carried > 0))
-            room -= carried + tokens
+            room -= (carried + tokens) if not sliced else room
             free_pages -= need + pages
             if not self._page_cost[a]:
                 self._zero_cost -= 1
@@ -688,7 +769,7 @@ class JoinAdmission:
                 self._group_busy[group] = self._group_busy.get(group, 0) + 1
                 self._group_members[group].discard(a)
             self.borrowing.record(a, borrow)
-            if self._launch(a, 0, end):
+            if not sliced and self._launch(a, 0, end):
                 continued.append(a)
         self.pending.extendleft(reversed(held))
 
@@ -818,10 +899,12 @@ class JoinAdmission:
             have not run through the remaining stages.
         """
         out = [a for a in self.ready if self._stage[a] != _DONE]
+        out.extend(a for a in self.prefilling)
         out.extend(a for a in self.pending if self._stage[a] != -1)
         for a in out:
             self._stage[a] = _DONE
         self.ready.clear()
+        self.prefilling.clear()
         self.pending.clear()
         self._dead = 0
         return out
@@ -832,4 +915,4 @@ class JoinAdmission:
         if self.limit_reached():
             return not self.in_flight and not self._settled
         return len(self.pending) == self._dead and not self.ready \
-            and not self.in_flight and not self._settled
+            and not self.prefilling and not self.in_flight and not self._settled

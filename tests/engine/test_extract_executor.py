@@ -300,7 +300,8 @@ class ScriptedModel:
                 # rewinding stage, or a discarding one drops what an
                 # earlier stage appended
                 if spec.get("prefix") is not None:
-                    self.prefix_len[key] = len(spec["prefix"])
+                    # a prefix slice continues from where the one before ended
+                    self.prefix_len[key] = spec.get("start", 0) + len(spec["prefix"])
                     self.reads[key] += 1
                 held = self.kv.get(key, [])
                 if spec.get("f") is not None and key in self.prefix_len:
@@ -314,6 +315,8 @@ class ScriptedModel:
                     rows.append(self._row_after(key, path[:end]))
                 if spec.get("write_suffix_tokens", 0):
                     self.kv[key] = path
+        if not rows:
+            return np.zeros((0, self.width), dtype=np.float32)
         return np.stack(rows)
 
     def _row_after(self, key, path):

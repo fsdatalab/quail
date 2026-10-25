@@ -144,6 +144,9 @@ class StageExecutor:
             attention_mode = "tree"
         self.mode = attention_path(
             self.pipeline, attention_mode, default_attention=default_attention)
+        # a prefix longer than a pass's room is packed over several
+        # passes, so a document's length never bounds the budget
+        self.slice_prefill = bool(paged and self.mode == "tree")
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
@@ -224,6 +227,7 @@ class StageExecutor:
             extra_tokens=self.capacity_extra,
             reserve=self._reserve if self.paged else None,
             repeats=[stage.repeats for stage in self.stages],
+            slice_prefill=self.slice_prefill,
         )
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
@@ -310,6 +314,12 @@ class StageExecutor:
 
     def _entry_rows(self, a, j, start, end, carried):
         f = self.prefix_lengths[a]
+        sliced = self.sched.slices.get(a) if carried else None
+        if sliced is not None:
+            first, last = sliced
+            if end == start:
+                return last - first
+            f = last - first
         indices = self.sched.partner_indices(a, j, start, end)
         lengths = self._suffixes_of(j, a).lengths_at(indices)
         rows = ((f if carried else 0) + int(lengths.sum())
@@ -420,6 +430,16 @@ class StageExecutor:
             frame = self.frames[j]
             stage = self.stages[j]
             append = stage.append
+            sliced = self.sched.slices.get(a) if carried else None
+            if sliced is not None and end == start:
+                # a slice of the prefix alone: its rows read the slices
+                # before it from the key's pages and are written after
+                # them; nothing is asked of it yet
+                first, last = sliced
+                specs.append(dict(
+                    key=key, prefix=self.prefixes[a][first:last], start=first,
+                    f=first, suffixes=Suffixes.of([])))
+                continue
             request = self.own.get((j, a))
             if (request is not None and not carried and append
                     and stage.single and end - start == 1
@@ -452,7 +472,11 @@ class StageExecutor:
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
             prefix = None
-            if carried:
+            if sliced is not None:
+                # the rest of a prefix whose first slices are resident
+                shared = sliced[0]
+                prefix = self.prefixes[a][shared:]
+            elif carried:
                 prefix = self.prefixes[a][shared:] if shared else self.prefixes[a]
             indices = self.sched.partner_indices(a, j, start, end)
             sufs = self._suffixes_of(j, a).take(indices)
@@ -476,11 +500,12 @@ class StageExecutor:
                     rows = self.stages[j].canvas_rows * len(sufs)
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
-            read_key = self.keys[parent] if shared and self.stages[j].single else None
+            borrowed = shared and parent is not None
+            read_key = self.keys[parent] if borrowed and self.stages[j].single else None
             carry = {}
             if prefix is not None:
                 carry = dict(
-                    borrow_key=self.keys[parent] if shared else None,
+                    borrow_key=self.keys[parent] if borrowed else None,
                     share_points=self.share_points[a])
             kept = int(sufs.lengths.sum()) if append else 0
             if request is not None and request.write_suffix_tokens is not None:
@@ -556,6 +581,9 @@ class StageExecutor:
         group_rows = []
         prepared = {}
         for a, j, start, end, _ in groups:
+            if end == start:
+                group_rows.append(None)     # a prefix slice has no answer
+                continue
             key = self.readouts.group_key[j]
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
                 position[key] += 1        # the frame entry's answer means nothing
@@ -572,6 +600,8 @@ class StageExecutor:
             self.stages[j].prepare(anchors, stage_rows)
         self.host_s["decide"] += time.perf_counter() - started
         for (a, j, start, end, _), rows in zip(groups, group_rows):
+            if end == start:
+                continue        # a prefix slice: nothing was asked
             if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
                 # the request was packed; a repeating stage asks anew
                 del self.own[(j, a)]
