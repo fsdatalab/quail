@@ -234,3 +234,43 @@ def test_a_device_fed_round_follows_the_answer_before_it(monkeypatch):
     assert chunk.meta["reads"]["used"].tolist() == [8, 10]
     assert chunk.meta["kv_dst"].tolist() == (rows[first][8:11].tolist()
                                              + rows[second][10:11].tolist())
+
+
+def test_rounds_packed_together_on_the_unified_path_follow_their_answers(monkeypatch):
+    import numpy as np
+
+    from quail.backends.quail.executor.readout import RoundFeed
+    from quail.backends.quail.executor.stages import RoundRequests
+
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    first, second = ("d", 1), ("d", 2)
+    for key in (first, second):
+        arena.activate(key, 3, capacity_tokens=16, base_tokens=3)
+    rows = {key: arena.capacity_rows(key) for key in (first, second)}
+    requests = RoundRequests(
+        ids=np.array([0, 51, 52, 0]), lengths=np.array([3, 1]),
+        positions=np.array([6, 9]), device_fed=np.array([True, True]))
+    chunk = chunk_mod.pack_chunk(
+        torch, arena, [dict(rounds=requests, keys=[first, second], feed_bound=3)],
+        attention_mode="unified")
+    unified = chunk.meta["unified"]
+    assert chunk.positions.tolist() == [6, 7, 8, 9]
+    assert chunk.rows_per_answer.tolist() == [3, 1]
+    # each round's rows join its document's pages and one causal call
+    # reads the document with them
+    assert unified["cu_q"].tolist() == [0, 3, 4]
+    assert unified["used"].tolist() == [9, 10]
+    assert unified["max_used"] == 12
+    assert unified["dst"].tolist() == (rows[first][6:9].tolist()
+                                       + rows[second][9:10].tolist())
+    plan = chunk.meta["feed"]
+    assert plan["sequence"].tolist() == [0, 1]
+    assert plan["kv_rows"].tolist() == [0, 1, 2, 3]
+    feed = RoundFeed(accepted=torch.tensor([0, 1]), chosen=torch.tensor([60, 50]))
+    chunk.apply_feed(torch, feed, [1, 0], arena.page_tokens)
+    assert chunk.input_ids.tolist() == [50, 51, 52, 60]
+    assert chunk.positions.tolist() == [8, 9, 10, 10]
+    assert unified["used"].tolist() == [11, 11]
+    assert unified["dst"].tolist() == (rows[first][8:11].tolist()
+                                       + rows[second][10:11].tolist())

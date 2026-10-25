@@ -98,12 +98,45 @@ def test_replay_returns_independent_output_storage():
     graphs.buffers = DecodeBuffers(torch, 8, 16, config=config, device="cpu")
     output = torch.arange(8 * 3).reshape(8, 3)
     graphs.output = output
-    graphs.graphs = {8: SimpleNamespace(replay=lambda: None)}
+    graphs.graphs["tree"] = {8: SimpleNamespace(replay=lambda: None)}
     actual = graphs.forward(source)
     expected = output[[2, 4]].clone()
     output.zero_()
     assert actual.equal(expected)
     assert graphs.replays == 1
     graphs.invalidate()
-    assert not graphs.graphs
+    assert not graphs.graphs["tree"]
     assert graphs.storage is None
+
+
+def test_unified_padding_reads_one_row_and_writes_no_kv():
+    from quail.backends.quail.executor.chunk import Chunk
+
+    source = Chunk(
+        input_ids=torch.tensor([12, 13, 14, 15, 16]),
+        positions=torch.tensor([4, 5, 6, 9, 10]), final_indices=torch.tensor([2, 4]),
+        meta=dict(layer=0, canvas=None, gdn=None, reads=None, kv_src=None,
+                  kv_dst=None, cu_a=torch.tensor([0, 3, 5], dtype=torch.int32),
+                  max_a=3,
+                  unified=dict(src=torch.arange(5),
+                               dst=torch.tensor([20, 21, 22, 41, 42]),
+                               tail_src=None, tail_dst=None,
+                               used=torch.tensor([7, 11], dtype=torch.int32),
+                               table=torch.tensor([[1], [2]], dtype=torch.int32),
+                               max_used=11,
+                               cu_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+                               max_q=3)),
+        attention_mode="unified", tokens=5, layout=[])
+    buffers = DecodeBuffers(torch, 8, 16, device="cpu")
+    buffers.synthetic(7)
+    buffers.copy(source)
+    assert buffers.ids.tolist() == [12, 13, 14, 15, 16, 0, 0, 0]
+    assert buffers.cu_q.tolist() == [0, 3, 5, 6, 7, 8, 8, 8, 8]
+    # a padded sequence reads one row of the scratch page and writes none
+    assert buffers.used.tolist() == [7, 11, 1, 1, 1, 1, 1, 1]
+    assert buffers.dst.tolist() == [20, 21, 22, 41, 42, -1, -1, -1]
+    assert buffers.table[:2, :1].equal(source.meta["unified"]["table"])
+    assert buffers.table[2:, 0].tolist() == [7] * 6
+    view = buffers.view_unified(8)
+    assert view.attention_mode == "unified"
+    assert view.meta["unified"]["used"].data_ptr() == buffers.used.data_ptr()

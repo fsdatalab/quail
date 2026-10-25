@@ -14,6 +14,10 @@ class MapPart(AnswerPart):
     node_type = AiMap
     stages_type = MapStages
     operator = "AI.MAP"
+    # a round's rows join their document's pages and one causal paged
+    # call reads them with the document, so each layer makes one
+    # attention call rather than the tree path's two and a merge
+    attention = "unified"
 
     def _answer_rows(self, node, q: int, kept, document_ids):
         """Return one map's written answers."""

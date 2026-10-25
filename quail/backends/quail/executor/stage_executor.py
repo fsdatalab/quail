@@ -148,12 +148,19 @@ class StageExecutor:
             attention_mode = "tree"
         self.mode = attention_path(
             self.pipeline, attention_mode, default_attention=default_attention)
+        # rounds and prefix slices are laid out as plain rows over the
+        # document's pages: on the tree path, or on the unified path
+        # of a model with one KV pool and no recurrent state
+        plain = bool(paged and (
+            self.mode == "tree"
+            or not (getattr(self.arena, "has_sliding", False)
+                    or getattr(self.arena, "num_state_slots", 0))))
         # a prefix longer than a pass's room is packed over several
         # passes, so a document's length never bounds the budget
-        self.slice_prefill = bool(paged and self.mode == "tree")
+        self.slice_prefill = plain
         # a stage that runs ahead of its answers feeds its rounds from
-        # the GPU, which the tree path's packed rounds allow
-        self.ahead = [bool(stage.ahead) and self.slice_prefill for stage in stages]
+        # the GPU
+        self.ahead = [bool(stage.ahead) and plain for stage in stages]
         self.feeding = any(self.ahead)
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
@@ -481,9 +488,12 @@ class StageExecutor:
                 # before it from the key's pages and are written after
                 # them; nothing is asked of it yet
                 first, last = sliced
+                # the tree path's f is the resident rows the slice
+                # reads; the unified path's is the sequence's length
                 specs.append(dict(
                     key=key, prefix=self.prefixes[a][first:last], start=first,
-                    f=first, suffixes=Suffixes.of([])))
+                    f=first if self.mode == "tree" else last,
+                    suffixes=Suffixes.of([])))
                 group_entries.append(None)
                 continue
             request = self.own.get((j, a))
