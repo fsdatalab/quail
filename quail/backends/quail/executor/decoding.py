@@ -385,6 +385,7 @@ class AnswerPart(DocumentAnswerPart):
                         "pack_s": (round(stats.get("pack_s", 0.0), 3)
                                    if first else 0.0),
                         "host_s": stats.get("host_s") if first else None,
+                        "run_s": stats.get("run_s") if first else None,
                         "readout_gpu_s": (stats.get("readout_gpu_s")
                                           if first else None),
                         "idle_gpu_s": (stats.get("idle_gpu_s")

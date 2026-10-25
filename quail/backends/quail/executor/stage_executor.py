@@ -309,7 +309,7 @@ class StageExecutor:
         self.pack_s = 0.0
         # host seconds per phase of the loop, and the readouts' GPU
         # event pairs, for telling host-bound passes from GPU-bound
-        self.host_s = {"admit": 0.0, "launch": 0.0, "wait": 0.0,
+        self.host_s = {"admit": 0.0, "advance": 0.0, "launch": 0.0, "wait": 0.0,
                        "report": 0.0, "decide": 0.0, "submit": 0.0}
         self.readout_spans = []
         self.outstanding = []     # PendingAnswers in launch order
@@ -912,6 +912,7 @@ class StageExecutor:
 
     def run(self):
         """Drive admission and drain the launched answer handles in order."""
+        run_started = time.perf_counter()
         while True:
             # documents with nothing to send at their first stage never run
             for settlement in self.sched.take_settled():
@@ -919,7 +920,9 @@ class StageExecutor:
             if self.sched.done():
                 break
             if len(self.outstanding) > 1:
+                started = time.perf_counter()
                 self._report_next()
+                self.host_s["report"] += time.perf_counter() - started
             if self.sched.blocked_pages:
                 # the free list is short for the next fresh document:
                 # retained KV nothing here reads makes room
@@ -935,7 +938,9 @@ class StageExecutor:
             self.host_s["admit"] += time.perf_counter() - started
             if not groups:
                 if self.outstanding:
+                    started = time.perf_counter()
                     self._report_next(partial=True)
+                    self.host_s["report"] += time.perf_counter() - started
                     continue
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):
@@ -948,6 +953,7 @@ class StageExecutor:
                     f"nothing buildable and nothing in flight; "
                     f"{len(self.sched.stalled)} documents wait for KV pages")
             self._run_part(groups)
+            started = time.perf_counter()
             # the chunk is built, so the anchors launched ahead of
             # their answers can be asked for their next request
             self.sched.advance_ahead()
@@ -959,6 +965,7 @@ class StageExecutor:
                     self.arena.release(self.keys[parent])
                 if a in self._reserved_parents:
                     self.arena.done_reading((self._reserved_parents.pop(a),))
+            self.host_s["advance"] += time.perf_counter() - started
         while self.outstanding:
             self._report_next()
         self._release_skipped()
@@ -975,6 +982,7 @@ class StageExecutor:
             self.stats["pack_s"] = self.pack_s
             self.stats["host_s"] = {
                 key: round(value, 3) for key, value in self.host_s.items()}
+            self.stats["run_s"] = round(time.perf_counter() - run_started, 3)
             if self.growth is not None:
                 self.stats["kv_growth"] = self.growth.stats()
         if self.spans:
