@@ -64,19 +64,43 @@ def pages(tokens: int) -> int:
     return -(-tokens // PAGE_TOKENS)
 
 
+# The fraction of the device's measured GEMM peak a decode pass's
+# GEMMs reach. The peak is measured at large row counts; a pass of a
+# few hundred to a few thousand rows runs DeepGEMM at 0.66 PFLOP/s
+# against the H100's 1.63 PFLOP/s peak (IMDB long's 760-row passes in
+# the kernel profile
+# /results/ablations/map_quadrants_qwen3-4b-fp8_sf0.1_20261025T021238Z.json).
+DECODE_GEMM_EFFICIENCY = 0.4
+
+
 def ridge_tokens(model: ModelSpec, device: DeviceSpec) -> float:
     """Fed tokens per forward pass at which the weight work turns compute bound.
 
     A pass of T tokens does 2 flops per weight per token and reads each
     weight's bytes once, so compute passes memory at T = GEMM flops
     times the weight's bytes over twice the HBM bytes per second; the
-    weight count cancels. For a mixture-of-experts model each token
-    reads a fraction of the weights, so the true ridge is higher; the
-    estimate stays a safe lower bound for pricing a marginal token.
+    weight count cancels. The flops are the decode passes' achieved
+    rate. For a mixture-of-experts model each token reads a fraction
+    of the weights, so the true ridge is higher; the estimate stays a
+    safe lower bound for pricing a marginal token.
     """
     weight_bytes = 1.0 if model.weight_precision == "fp8" else 2.0
-    return device.gemm_flops(model.weight_precision) * weight_bytes / (
-        2.0 * device.hbm_bw)
+    return (device.gemm_flops(model.weight_precision) * DECODE_GEMM_EFFICIENCY
+            * weight_bytes / (2.0 * device.hbm_bw))
+
+
+def round_cost_per_token(model: ModelSpec, device: DeviceSpec) -> float:
+    """One document token's KV read per decode round, in fed tokens.
+
+    A round reads the document's KV at HBM speed and pays its fed
+    tokens' dense FLOPs at the decode passes' achieved GEMM rate, so
+    the ratio prices a token of KV in tokens fed.
+    """
+    from quail.cost.retention import coefficients
+
+    token_seconds = (coefficients(model, device)["linear_seconds"]
+                     / DECODE_GEMM_EFFICIENCY)
+    return model.kappa / device.hbm_bw / token_seconds
 
 
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:

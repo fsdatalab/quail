@@ -4,7 +4,6 @@ from dataclasses import replace
 
 from quail.cost import budgets
 from quail.cost import extract as extract_cost
-from quail.cost.retention import coefficients
 from quail.physical import AiMap, MapSpec, PortRef
 from quail.planner.operators.common import (
     bind_inference,
@@ -34,10 +33,7 @@ def map_spec(context, call, name, expected_rows, resident=False) -> MapSpec:
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
     model, device = context.model, context.device
-    # one document token's KV read per round, in tokens of compute: the
-    # pass is compute-bound, so a fed token costs its dense FLOPs
-    token_seconds = coefficients(model, device)["linear_seconds"]
-    round_cost_per_token = model.kappa / device.hbm_bw / token_seconds
+    round_cost_per_token = budgets.round_cost_per_token(model, device)
     spec = bind_inference(
         MapSpec, call.prompt, name=name,
         expected_rows=expected_rows, estimated_seconds=0.0,
