@@ -122,10 +122,6 @@ requests = conversations.take(positions).select(["id", "request"])
 print(requests.slice(0, 10).to_pylist())
 ```
 
-Requests with weaker activations help check whether the interpretation
-still holds beyond the strongest examples. Repeat the inspection for
-other frequent features to build a list of topics supported by the data.
-
 ## Run the demo
 
 The complete analysis is in
