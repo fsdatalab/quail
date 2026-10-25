@@ -9,9 +9,12 @@ not yet know whether they are useful for topic discovery.
 </Callout>
 
 Quail can help discover recurring topics in text without a predefined
-list of labels. For example, a support team has 1,320 conversations about
-airline bookings and retail orders. The analysis below identifies common
-kinds of requests and retrieves examples of each.
+list of labels.
+
+In this tutorial, we use 1,320 support conversations from
+[τ-bench](https://github.com/sierra-research/tau-bench) to explore topics
+in airline bookings and retail orders. We'll look for common types of
+requests and retrieve examples of each.
 
 ## Sparse feature vectors
 
@@ -32,8 +35,8 @@ provides the basis for this approach.
 
 ## Get features for each request
 
-The input is the QUAIL-B `support_traces` table, from
-[τ-bench](https://github.com/sierra-research/tau-bench). Each row contains
+The conversations are loaded from the QUAIL-B `support_traces` table.
+Each row contains
 one conversation's `id`, its opening `request`, and a `task_id`. Several
 conversations can come from the same customer task.
 
