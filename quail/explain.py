@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
+from quail.catalog.tokens import first_document_columns
 from quail.logical import (
     DEFAULT_SELECTIVITY,
     LogicalPlan,
@@ -43,6 +44,12 @@ def _number(value):
 def _prompt(prompt):
     args = ", ".join(column_name(arg) for arg in prompt.args)
     return f"PROMPT({prompt.template!r}, {args})"
+
+
+def _grouping(key: str) -> str:
+    """What a key document column keeps one document per: the text and row columns."""
+    columns = first_document_columns(key) or ()
+    return " and ".join(("text", *columns))
 
 
 def _fields(fields, depth):
@@ -646,6 +653,8 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
+        for alias, key in sorted(physical.settings.get("ask_once", {}).items()):
+            lines.append(f"  ask once per text: {alias} (by {_grouping(key)})")
         lines.extend("  " + line for line in architecture_lines(
             physical.model))
     lines.append("")

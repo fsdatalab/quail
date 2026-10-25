@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from quail.catalog.tokens import first_document_column
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
 from quail.physical import (
@@ -433,3 +434,64 @@ class ChooseAttentionAlgorithm(PhysicalRule):
         if not changed:
             return None
         return PhysicalGraph(tuple(nodes), graph.root)
+
+
+# the share of a table's documents that must copy another's tokens
+# before asking once per text is worth a key column
+MIN_COPIES = 0.01
+
+
+class ShouldAskOncePerText(PhysicalRule):
+    """Ask model operators once per text: record each table's key column.
+
+    The ``ask_once`` setting maps each alias the model operators read
+    to the value column holding every document's key document: the
+    first document with the same tokens and the same values in the
+    columns the operators read beside the tokens, today a filter's
+    stop key. The executor asks a group of operators about the key
+    documents only and gives each document, or pair, the answers of
+    its key documents. The rule leaves the request backends, diffusion
+    models, whose answers depend on a document's row as well as its
+    tokens, and tables where fewer than MIN_COPIES of the documents
+    copy another's tokens.
+    """
+
+    name = "should_ask_once_per_text"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None:
+            return None
+        context.settings.pop("ask_once", None)
+        model = context.model
+        if context.backend != "quail" or model is None or model.canvas_tokens:
+            return None
+        stop_keys = {node.alias: node.stop_key for node in graph.nodes
+                     if isinstance(node, AiFilter)}
+        chosen = {alias: first_document_column(stop_keys.get(alias, ()))
+                  for alias in sorted(_model_aliases(graph))
+                  if _copied(context, alias)}
+        if chosen:
+            context.settings["ask_once"] = chosen
+        return None
+
+
+def _model_aliases(graph) -> set[str]:
+    """The tables the graph's model operators read documents of."""
+    aliases = set()
+    for node in graph.nodes:
+        if isinstance(node, AiFilter):
+            aliases.add(node.alias)
+        elif isinstance(node, AiJoin):
+            aliases.update((node.anchor, *node.partners))
+        elif isinstance(node, AiInference) and node.spec is not None:
+            aliases.update(node.spec.aliases)
+    return aliases
+
+
+def _copied(context, alias: str) -> bool:
+    """Whether enough of an alias's documents copy another's tokens."""
+    lengths = context.document_tokens.get(alias)
+    store = None if lengths is None else lengths.store
+    if store is None or not len(store):
+        return False
+    return store.num_copies >= MIN_COPIES * len(store)
