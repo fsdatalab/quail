@@ -907,9 +907,8 @@ class Engine:
         if version == 4 and shape is not None and shape[-1] == 256:
             extra["num_splits"] = 1
             if block_table is not None:
-                # FA4 requires a page-aligned bound; seqused_k masks padding.
-                page_tokens = k.shape[1]
-                max_k = -(-max_k // page_tokens) * page_tokens
+                # FA4 requires the table capacity; seqused_k masks padding.
+                max_k = block_table.shape[1] * k.shape[1]
         return flash_attn_varlen_func(
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
             max_seqlen_k=max_k, cu_seqlens_k=cu_k,
