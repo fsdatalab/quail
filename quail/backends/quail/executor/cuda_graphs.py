@@ -84,13 +84,16 @@ def configured_graphs() -> DecodeGraphConfig:
 
 
 class DecodeBuffers:
-    """Fixed GPU inputs for decode batches of up to rows rows, in either layout.
+    """Fixed GPU inputs for decode batches of up to rows rows, in any layout.
 
     A graph captured over the first n rows reads views of these
-    buffers, so one set serves every bucket, and the two layouts share
+    buffers, so one set serves every bucket, and the layouts share
     them. Padding has no KV writes and no resident context. Every
     padded query forms a separate sequence so it cannot affect real
-    rows.
+    rows. The split layout's second read pads with sequences that read
+    no keys, whose results merge into a call B entry kept for padding:
+    an empty read's log-sum-exp is minus infinity, so the merge leaves
+    that entry's value aside.
     """
 
     def __init__(self, torch, rows, page_tokens, *,
@@ -98,22 +101,30 @@ class DecodeBuffers:
         config = DecodeGraphConfig() if config is None else config
         self.rows = rows
         self.config = config
-        self.indices = torch.arange(rows + 1, dtype=torch.int32, device=device)
+        self.indices = torch.arange(rows + 2, dtype=torch.int32, device=device)
 
         def zeros(shape, dtype=torch.int64):
             return torch.zeros(shape, dtype=dtype, device=device)
 
+        width = (config.max_context_tokens + page_tokens - 1) // page_tokens
         self.ids = zeros(rows)
         self.positions = zeros(rows)
         self.src = zeros(rows)
         self.dst = zeros(rows)
         self.cu_a = self.indices.clone()
-        self.read_rows = self.indices[:-1].to(torch.int64)
+        # call B's inputs hold one entry more than the rows: the split
+        # layout's padding merges into it
+        self.read_rows = zeros(rows + 1)
         self.cu_q = self.indices.clone()
-        self.used = zeros(rows, torch.int32)
-        self.table = zeros((rows, (config.max_context_tokens + page_tokens - 1)
-                            // page_tokens), torch.int32)
+        self.used = zeros(rows + 1, torch.int32)
+        self.table = zeros((rows + 1, width), torch.int32)
         self.source = zeros(rows, torch.int32)
+        # the split layout's second read: each round's own pages
+        self.own_rows = zeros(rows)
+        self.own_cu = self.indices[:rows + 1].clone()
+        self.own_used = zeros(rows, torch.int32)
+        self.own_table = zeros((rows, width), torch.int32)
+        self.own_index = zeros(rows)
         self.chunk = self.view(rows)
 
     def view(self, rows) -> Chunk:
@@ -148,6 +159,22 @@ class DecodeBuffers:
                                    max_q=config.max_query_tokens)),
             attention_mode="unified", tokens=rows, layout=[])
 
+    def view_split(self, rows) -> Chunk:
+        """A split-layout chunk over the first rows rows of the buffers.
+
+        Call B has rows + 1 entries, the last always padding.
+        """
+        config = self.config
+        chunk = self.view(rows)
+        chunk.meta["reads"].update(
+            rows=self.read_rows[:rows + 1], cu_q=self.cu_q[:rows + 2],
+            used=self.used[:rows + 1], table=self.table[:rows + 1],
+            own=dict(rows=self.own_rows[:rows], cu_q=self.own_cu[:rows + 1],
+                     max_q=config.max_query_tokens, used=self.own_used[:rows],
+                     max_used=config.max_context_tokens,
+                     table=self.own_table[:rows], b_index=self.own_index[:rows]))
+        return chunk
+
     def synthetic(self, page):
         """Set independent one-token sequences reading one scratch KV row."""
         self.ids.fill_(10)
@@ -156,7 +183,11 @@ class DecodeBuffers:
         self.dst.fill_(-1)
         self.used.fill_(1)
         self.table.fill_(page)
-        self.source.copy_(self.indices[:-1])
+        self.source.copy_(self.indices[:self.rows])
+        self.own_rows.copy_(self.indices[:self.rows])
+        self.own_used.fill_(1)
+        self.own_table.fill_(page)
+        self.own_index.copy_(self.indices[:self.rows])
 
     def _bounds(self, target, source, count, rows):
         sequences = source.numel() - 1
@@ -175,18 +206,22 @@ class DecodeBuffers:
             return
         n = chunk.tokens
         reads = chunk.meta["reads"]
+        own = reads.get("own")
         m = reads["rows"].numel()
         sequences = reads["used"].numel()
+        entries = rows if own is None else rows + 1
         self.ids[:rows].zero_()
         self.ids[:n].copy_(chunk.input_ids)
         self.positions[:rows].zero_()
         self.positions[:n].copy_(chunk.positions)
         self._bounds(self.cu_a, chunk.meta["cu_a"], n, rows)
-        self._bounds(self.cu_q, reads["cu_q"], m, rows)
-        self.read_rows[:rows].zero_()
+        self._bounds(self.cu_q, reads["cu_q"], m, entries)
+        self.read_rows[:entries].zero_()
         self.read_rows[:m].copy_(reads["rows"])
-        self.used[:rows].zero_()
+        self.used[:entries].zero_()
         self.used[:sequences].copy_(reads["used"])
+        if own is not None:
+            self._copy_own(own, rows)
         # Entries beyond used/page_tokens are never read by FlashAttention.
         self.table[:sequences, :reads["table"].shape[1]].copy_(reads["table"])
         self.source[:rows].fill_(-1)
@@ -197,6 +232,19 @@ class DecodeBuffers:
             writes = chunk.meta["kv_src"].numel()
             self.src[:writes].copy_(chunk.meta["kv_src"])
             self.dst[:writes].copy_(chunk.meta["kv_dst"])
+
+    def _copy_own(self, own, rows):
+        """Copy a split chunk's second read; padding reads nothing into entry rows."""
+        m = own["rows"].numel()
+        sequences = own["used"].numel()
+        self._bounds(self.own_cu, own["cu_q"], m, rows)
+        self.own_rows[:rows].zero_()
+        self.own_rows[:m].copy_(own["rows"])
+        self.own_used[:rows].zero_()
+        self.own_used[:sequences].copy_(own["used"])
+        self.own_table[:sequences, :own["table"].shape[1]].copy_(own["table"])
+        self.own_index[:rows].fill_(rows)
+        self.own_index[:m].copy_(own["b_index"])
 
     def _copy_unified(self, chunk, rows):
         """Copy a unified-layout chunk; padding reads one row of its page."""
@@ -234,8 +282,8 @@ class DecodeGraphs:
         self.enabled = True
         # per layout, bucket rows -> its captured graph, and the chunk
         # its graph reads
-        self.graphs = {"tree": {}, "unified": {}}
-        self.views = {"tree": {}, "unified": {}}
+        self.graphs = {"tree": {}, "split": {}, "unified": {}}
+        self.views = {"tree": {}, "split": {}, "unified": {}}
         self.buffers = None
         self.output = None      # every graph writes its rows here
         self.pool = None
@@ -250,8 +298,8 @@ class DecodeGraphs:
 
     def invalidate(self):
         """Release graphs before replacing their KV allocation."""
-        self.graphs = {"tree": {}, "unified": {}}
-        self.views = {"tree": {}, "unified": {}}
+        self.graphs = {"tree": {}, "split": {}, "unified": {}}
+        self.views = {"tree": {}, "split": {}, "unified": {}}
         self.buffers = None
         self.output = None
         self.pool = None
@@ -263,7 +311,7 @@ class DecodeGraphs:
         arena = engine.arena
         if not self.enabled or engine.fa_version != 3 or arena.has_sliding:
             return ()
-        layouts = ("tree",) if self.pipeline.tree_attention else ()
+        layouts = ("tree", "split") if self.pipeline.tree_attention else ()
         if not getattr(arena, "num_state_slots", 0):
             layouts += ("unified",)
         return layouts
@@ -298,8 +346,8 @@ class DecodeGraphs:
                 self.buffers.synthetic(page)
                 self.pool = torch.cuda.graph_pool_handle()
                 for layout in layouts:
-                    view = (self.buffers.view if layout == "tree"
-                            else self.buffers.view_unified)
+                    view = {"tree": self.buffers.view, "split": self.buffers.view_split,
+                            "unified": self.buffers.view_unified}[layout]
                     for index, rows in enumerate(self.config.row_buckets):
                         # the graph reads the view's tensors by address,
                         # so the view lives as long as the graph
@@ -345,9 +393,15 @@ class DecodeGraphs:
                        // arena.page_tokens)
         if chunk.attention_mode == "tree":
             reads = chunk.meta["reads"]
-            return not (reads is None or reads.get("nodes") is not None
-                        or reads.get("own") is not None
-                        or reads["max_q"] > self.config.max_query_tokens
+            if reads is None or reads.get("nodes") is not None:
+                return False
+            own = reads.get("own")
+            if own is not None and (
+                    own["max_q"] > self.config.max_query_tokens
+                    or own["max_used"] > self.config.max_context_tokens
+                    or own["table"].shape[1] > table_width):
+                return False
+            return not (reads["max_q"] > self.config.max_query_tokens
                         or reads["max_used"] > self.config.max_context_tokens
                         or reads["table"].shape[1] > table_width)
         unified = chunk.meta["unified"]
@@ -361,7 +415,10 @@ class DecodeGraphs:
         """Replay a matching graph, falling back to the ordinary forward."""
         if self.supports(chunk):
             rows = self.config.bucket(chunk.tokens)
-            graph = self.graphs[chunk.attention_mode].get(rows)
+            layout = chunk.attention_mode
+            if layout == "tree" and chunk.meta["reads"].get("own") is not None:
+                layout = "split"
+            graph = self.graphs[layout].get(rows)
             if graph is not None:
                 self.buffers.copy(chunk, rows)
                 graph.replay()

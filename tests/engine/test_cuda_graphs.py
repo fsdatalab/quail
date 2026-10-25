@@ -37,9 +37,9 @@ def test_padding_preserves_attention_and_only_real_rows_write_kv():
     buffers.synthetic(7)
     buffers.copy(source)
     assert buffers.ids.tolist() == [12, 13, 14, 15, 16, 0, 0, 0]
-    assert buffers.cu_a.tolist() == [0, 3, 5, 6, 7, 8, 8, 8, 8]
-    assert buffers.cu_q.tolist() == buffers.cu_a.tolist()
-    assert buffers.used.tolist() == [4, 9, 0, 0, 0, 0, 0, 0]
+    assert buffers.cu_a[:9].tolist() == [0, 3, 5, 6, 7, 8, 8, 8, 8]
+    assert buffers.cu_q[:9].tolist() == buffers.cu_a[:9].tolist()
+    assert buffers.used[:8].tolist() == [4, 9, 0, 0, 0, 0, 0, 0]
     assert buffers.source.tolist() == [0, 1, 2, 3, 4, -1, -1, -1]
     assert buffers.dst.tolist() == [20, 21, 22, 41, 42, -1, -1, -1]
     assert buffers.table[:2, :1].equal(source.meta["reads"]["table"])
@@ -57,9 +57,9 @@ def test_padding_preserves_attention_and_only_real_rows_write_kv():
     reads["table"] = reads["table"][:1]
     reads["source"] = torch.tensor([-1, 0], dtype=torch.int32)
     buffers.copy(source)
-    assert buffers.cu_a.tolist() == [0, 2, 3, 4, 5, 6, 7, 8, 8]
-    assert buffers.cu_q.tolist() == list(range(9))
-    assert buffers.used.tolist() == [4, 0, 0, 0, 0, 0, 0, 0]
+    assert buffers.cu_a[:9].tolist() == [0, 2, 3, 4, 5, 6, 7, 8, 8]
+    assert buffers.cu_q[:9].tolist() == list(range(9))
+    assert buffers.used[:8].tolist() == [4, 0, 0, 0, 0, 0, 0, 0]
     assert buffers.source.tolist() == [-1, 0, -1, -1, -1, -1, -1, -1]
     assert (buffers.dst == -1).all()
 
@@ -131,12 +131,54 @@ def test_unified_padding_reads_one_row_and_writes_no_kv():
     buffers.synthetic(7)
     buffers.copy(source)
     assert buffers.ids.tolist() == [12, 13, 14, 15, 16, 0, 0, 0]
-    assert buffers.cu_q.tolist() == [0, 3, 5, 6, 7, 8, 8, 8, 8]
+    assert buffers.cu_q[:9].tolist() == [0, 3, 5, 6, 7, 8, 8, 8, 8]
     # a padded sequence reads one row of the scratch page and writes none
-    assert buffers.used.tolist() == [7, 11, 1, 1, 1, 1, 1, 1]
+    assert buffers.used[:8].tolist() == [7, 11, 1, 1, 1, 1, 1, 1]
     assert buffers.dst.tolist() == [20, 21, 22, 41, 42, -1, -1, -1]
     assert buffers.table[:2, :1].equal(source.meta["unified"]["table"])
-    assert buffers.table[2:, 0].tolist() == [7] * 6
+    assert buffers.table[2:8, 0].tolist() == [7] * 6
     view = buffers.view_unified(8)
     assert view.attention_mode == "unified"
     assert view.meta["unified"]["used"].data_ptr() == buffers.used.data_ptr()
+
+
+def test_split_padding_reads_nothing_and_merges_into_the_padding_entry():
+    from quail.backends.quail.executor.chunk import Chunk
+
+    # two split rounds of two rows and one row: call B reads their
+    # shared page in one sequence, and each reads its own pages
+    source = Chunk(
+        input_ids=torch.tensor([12, 13, 14]), positions=torch.tensor([20, 21, 25]),
+        final_indices=torch.tensor([0, 1, 2]),
+        meta=dict(layer=0, canvas=None, unified=None, kv_src=torch.arange(3),
+                  kv_dst=torch.tensor([40, 41, 60]),
+                  cu_a=torch.tensor([0, 2, 3], dtype=torch.int32), max_a=2,
+                  reads=dict(rows=torch.arange(3),
+                             cu_q=torch.tensor([0, 3], dtype=torch.int32),
+                             max_q=3, used=torch.tensor([16], dtype=torch.int32),
+                             max_used=16, table=torch.tensor([[1]], dtype=torch.int32),
+                             source=torch.arange(3, dtype=torch.int32),
+                             own=dict(rows=torch.arange(3),
+                                      cu_q=torch.tensor([0, 2, 3], dtype=torch.int32),
+                                      max_q=2,
+                                      used=torch.tensor([6, 10], dtype=torch.int32),
+                                      max_used=10,
+                                      table=torch.tensor([[2], [3]], dtype=torch.int32),
+                                      b_index=torch.arange(3)))),
+        attention_mode="tree", tokens=3, layout=[])
+    buffers = DecodeBuffers(torch, 8, 16, device="cpu")
+    buffers.synthetic(7)
+    rows = 4
+    buffers.copy(source, rows)
+    view = buffers.view_split(rows)
+    reads = view.meta["reads"]
+    # call B has a padding entry past the rows; its padding reads
+    # nothing, and the empty sequences after it hold no rows
+    assert reads["cu_q"].tolist() == [0, 3, 4, 5, 5, 5]
+    assert reads["used"].tolist() == [16, 0, 0, 0, 0]
+    own = reads["own"]
+    assert own["cu_q"].tolist() == [0, 2, 3, 4, 4]
+    assert own["used"].tolist() == [6, 10, 0, 0]
+    # the padded second read merges into call B's padding entry
+    assert own["b_index"].tolist() == [0, 1, 2, rows]
+    assert own["table"][:2, 0].tolist() == [2, 3]
