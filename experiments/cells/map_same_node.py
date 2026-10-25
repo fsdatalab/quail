@@ -78,8 +78,12 @@ def _chosen(only: str) -> tuple:
                  if not names or config[0] in names)
 
 
-def _quail(model: str, directory: Path, configurations) -> dict:
-    """Run the configurations on Quail; return the GPU, startup, and runs."""
+def _quail(model: str, directory: Path, configurations, profile_gpu=False) -> dict:
+    """Run the configurations on Quail; return the GPU, startup, and runs.
+
+    profile_gpu prints each configuration's kernel table and its passes
+    by size, as map_quadrants does.
+    """
     import quail
     from bench.quailb import register_tables
     from quail.specs import H100_USD_PER_HOUR
@@ -93,7 +97,7 @@ def _quail(model: str, directory: Path, configurations) -> dict:
         for name, table, column, maps in configurations:
             print(f"quail: running {name}", flush=True)
             run = _run_one(session, table, column, maps, "adaptive",
-                           H100_USD_PER_HOUR)
+                           H100_USD_PER_HOUR, profile_gpu=profile_gpu)
             # the session boots the engine in its first query; the
             # engine's own wall time excludes that startup
             run["startup_s"] = round(run["wall_s"] - (run["engine_wall_s"] or 0.0), 2)
@@ -154,13 +158,16 @@ def _vllm(model: str, directory: Path, configurations) -> dict:
 _ENGINES = {"quail": _quail, "vllm": _vllm}
 
 
-def _child(engine: str, model: str, directory: str, only: str, out: str) -> None:
+def _child(engine: str, model: str, directory: str, only: str, out: str,
+           profile_gpu: str = "") -> None:
     """Run one engine in this process and write its result JSON to out."""
-    result = _ENGINES[engine](model, Path(directory), _chosen(only))
+    options = {"profile_gpu": True} if profile_gpu and engine == "quail" else {}
+    result = _ENGINES[engine](model, Path(directory), _chosen(only), **options)
     Path(out).write_text(json.dumps(result, default=str))
 
 
-def _run_child(engine: str, model: str, directory: Path, only: str) -> dict:
+def _run_child(engine: str, model: str, directory: Path, only: str,
+               profile_gpu: bool = False) -> dict:
     """Run one engine in a fresh interpreter on this GPU; return its result."""
     with tempfile.TemporaryDirectory() as scratch:
         out = Path(scratch) / f"{engine}.json"
@@ -169,7 +176,7 @@ def _run_child(engine: str, model: str, directory: Path, only: str) -> dict:
         started = time.perf_counter()
         subprocess.run(
             [sys.executable, "-m", "experiments.cells.map_same_node", engine,
-             model, str(directory), only, str(out)],
+             model, str(directory), only, str(out), "1" if profile_gpu else ""],
             check=True, env=environment)
         result = json.loads(out.read_text())
     result["process_s"] = round(time.perf_counter() - started, 2)
@@ -179,7 +186,8 @@ def _run_child(engine: str, model: str, directory: Path, only: str) -> dict:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=14400,
               volumes=VOLUMES)
 def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
-                  only: str = "", engines: str = "quail,vllm") -> str:
+                  only: str = "", engines: str = "quail,vllm",
+                  profile_gpu: bool = False) -> str:
     """Run the engines one after the other on this GPU; return the result's path.
 
     Args:
@@ -189,6 +197,8 @@ def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
             all six.
         engines: Comma-separated engines to run, from "quail" and
             "vllm"; they run in that order.
+        profile_gpu: Print Quail's kernel table and passes by size per
+            configuration.
 
     Raises:
         RuntimeError: The engines ran on different GPUs.
@@ -206,7 +216,8 @@ def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
                     "engines": {}}
     for engine in chosen_engines:
         print(f"starting {engine}", flush=True)
-        measurements["engines"][engine] = _run_child(engine, model, directory, only)
+        measurements["engines"][engine] = _run_child(engine, model, directory, only,
+                                                     profile_gpu)
     gpus = {engine: result["gpu"]
             for engine, result in measurements["engines"].items()}
     uuids = {gpu.split(",")[0] for gpu in gpus.values()}
@@ -224,12 +235,13 @@ def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
 
 @app.local_entrypoint()
 def launch_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
-                     only: str = "", engines: str = "quail,vllm"):
+                     only: str = "", engines: str = "quail,vllm",
+                     profile_gpu: bool = False):
     call = map_same_node.spawn(model=model, scale_factor=scale_factor, only=only,
-                               engines=engines)
+                               engines=engines, profile_gpu=profile_gpu)
     print(f"function call id: {call.object_id}")
     print(call.get())
 
 
 if __name__ == "__main__":
-    _child(*sys.argv[1:6])
+    _child(*sys.argv[1:7])
