@@ -50,6 +50,7 @@ from quail.logical import (
     SemanticFilter,
     SemanticJoin,
     SemanticSaeFeatures,
+    Unnest,
     Window,
 )
 from quail.planner.sol.search import (
@@ -66,7 +67,7 @@ from quail.specs import DeviceSpec, ModelSpec
 
 _PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, SemanticExtract,
                  SemanticSaeFeatures, Filter, Join, SemanticJoin, Project,
-                 Aggregate, Window, Result)
+                 Unnest, Aggregate, Window, Result)
 
 
 @dataclass(frozen=True)

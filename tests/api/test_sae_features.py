@@ -442,3 +442,14 @@ def test_every_plan_the_rules_offer_keeps_each_filter_on_a_field(session):
     rows = finish(query, _unnest_oracle()).collect()
     assert rows.to_pylist() == [{"r.id": 7, "f.feature": 0},
                                 {"r.id": 9, "f.feature": 1}]
+
+
+def test_the_speed_of_light_prices_an_unnest_like_the_query_without_it(session):
+    call = UNNEST.removeprefix("UNNEST(").removesuffix(") AS f")
+    plain = session.sql(f"SELECT r.id, {call} AS f FROM reviews r")
+    unnested = session.sql(
+        f"SELECT f.feature, COUNT(*) AS n FROM reviews r, {UNNEST} "
+        f"WHERE f.strength > 1 GROUP BY f.feature")
+    estimates = [quail.speed_of_light_estimate(query, answer=lambda *_: True)
+                 for query in (plain, unnested)]
+    assert estimates[1].latency.seconds == estimates[0].latency.seconds > 0
