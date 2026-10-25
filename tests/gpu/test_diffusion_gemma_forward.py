@@ -343,5 +343,60 @@ def test_b200_attention_keeps_shared_kv_within_the_memory_budget():
     torch.testing.assert_close(out[suffix - 1].float(), expected, atol=0.003, rtol=0.02)
 
 
+def test_b200_full_attention_reads_shared_and_partial_pages():
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires B200 FlashInfer")
+    from quail.backends.quail.executor.attention import Engine
+
+    torch.manual_seed(15)
+    k = torch.randn(5, 128, 2, 512, device="cuda", dtype=torch.bfloat16) * 0.2
+    v = torch.randn_like(k)
+    q = torch.randn(50, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.2
+    engine = Engine.__new__(Engine)
+    engine.torch, engine.fa_version = torch, 4
+    cases = []
+    for causal in (True, False):
+        for lengths in ([50], [17, 33], [33, 17], [1, 49]) * 2:
+            metadata = dict(
+                cu_q_host=[0, *torch.tensor(lengths).cumsum(0).tolist()],
+                used_host=[256 + length for length in lengths],
+                page_rows=[[1, 0, 2 + row, 4] for row in range(len(lengths))])
+            table = torch.tensor(metadata["page_rows"], dtype=torch.int32,
+                                 device="cuda")
+            used = torch.tensor(metadata["used_host"], dtype=torch.int32,
+                                device="cuda")
+            cu_q = torch.tensor(metadata["cu_q_host"], dtype=torch.int32,
+                                device="cuda")
+            cases.append((metadata, table, used, cu_q, causal, max(lengths)))
+    pending = []
+    for delayed in (False, True):
+        for metadata, table, used, cu_q, causal, max_q in cases:
+            # Delay uploads so the next batch can plan before they finish.
+            if delayed:
+                torch.cuda._sleep(20_000_000)
+            actual = engine._paged(
+                q, k, v, cu_q, max_q, used, max(metadata["used_host"]), table,
+                causal=causal, softmax_scale=1.0, metadata=metadata)
+            if delayed:
+                pending.append((actual, metadata, table, causal))
+        torch.cuda.synchronize()
+    for actual, metadata, table, causal in pending:
+        expected = []
+        offsets = metadata["cu_q_host"]
+        for row, (start, end) in enumerate(zip(offsets, offsets[1:])):
+            length = metadata["used_host"][row]
+            keys = k[table[row].long()].flatten(0, 1)[:length].float()
+            values = v[table[row].long()].flatten(0, 1)[:length].float()
+            keys, values = (x.repeat_interleave(8, dim=1) for x in (keys, values))
+            scores = torch.einsum("qhd,khd->hqk", q[start:end].float(), keys)
+            if causal:
+                positions = 256 + torch.arange(end - start, device="cuda")
+                mask = torch.arange(length, device="cuda")[None, :] > positions[:, None]
+                scores.masked_fill_(mask[None], -torch.inf)
+            expected.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), values))
+        torch.testing.assert_close(actual.float(), torch.cat(expected),
+                                   atol=0.003, rtol=0.02)
+
+
 if __name__ == "__main__":
     stock_rows_main(sys.argv[1], every_layer=len(sys.argv) > 2)

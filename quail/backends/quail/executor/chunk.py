@@ -310,7 +310,7 @@ class _PoolBuilder:
             tail_dst=(stage(f"tail_dst{tag}", _concatenate(self.tail_dst),
                             torch.int64) if self.tail_dst else None),
             used=stage(f"unified_lengths{tag}", self.lengths, torch.int32),
-            table=table,
+            table=table, page_rows=self.page_rows, used_host=self.lengths,
             max_used=max(self.lengths))
 
 
@@ -733,6 +733,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             unified = dict(
                 built[0],
                 cu_q=stage("unified_cu_q", cu_q, torch.int32),
+                cu_q_host=cu_q,
                 max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])))
             if sliding:
                 unified["sliding"] = built[1]
@@ -781,8 +782,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             seq = stage("canvas_seq", canvas_seq, torch.int64)
             canvas_meta["table"] = unified["table"].index_select(0, seq)
             canvas_meta["used"] = unified["used"].index_select(0, seq)
-            canvas_meta["max_used"] = max(
-                pools[0].lengths[i] for i in canvas_seq)
+            canvas_meta["used_host"] = [pools[0].lengths[i] for i in canvas_seq]
+            canvas_meta["page_rows"] = [pools[0].page_rows[i] for i in canvas_seq]
+            canvas_meta["max_used"] = max(canvas_meta["used_host"])
             if "sliding" in unified:
                 canvas_meta["sliding"] = dict(
                     table=unified["sliding"]["table"].index_select(0, seq),

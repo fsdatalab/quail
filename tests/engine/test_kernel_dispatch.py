@@ -66,66 +66,36 @@ class _Rows:
         return self
 
 
-def test_b200_sends_a_512_wide_head_to_triton(monkeypatch):
-    calls = {"fa": [], "triton": []}
+def test_only_b200_512_wide_heads_use_flashinfer(monkeypatch):
+    calls = []
 
     def fake_attention(*args, **kwargs):
-        calls["fa"].append(kwargs)
+        calls.append(("fa", kwargs))
         return "fa-out", None
 
-    def fake_triton(**kwargs):
-        calls["triton"].append(kwargs)
+    def fake_flashinfer(self, query, keys, values, metadata, **kwargs):
+        calls.append(("flashinfer", metadata))
+        return "flashinfer-out"
 
     flash = ModuleType("vllm.vllm_flash_attn")
     flash.flash_attn_varlen_func = fake_attention
-    triton = ModuleType("vllm.v1.attention.ops.triton_unified_attention")
-    triton.unified_attention = fake_triton
     monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", flash)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.v1.attention.ops.triton_unified_attention",
-        triton)
-    out = object()
+    monkeypatch.setattr(Engine, "_flashinfer_paged", fake_flashinfer)
     engine = Engine.__new__(Engine)
-    engine.torch = SimpleNamespace(empty_like=lambda query: out)
-    engine.fa_version = 4
-    table, lengths = object(), object()
-    result = engine._paged(
-        _Rows(512), "k", "v", "cu", 8, lengths, 32, table,
-        causal=True, softmax_scale=1.0, window=None)
-    assert result is out
-    assert calls["fa"] == []
-    recorded = calls["triton"][0]
-    assert recorded["k"] == "k"
-    assert recorded["v"] == "v"
-    assert recorded["out"] is out
-    assert recorded["block_table"] is table
-    assert recorded["seqused_k"] is lengths
-    assert recorded["cu_seqlens_q"] == "cu"
-    assert recorded["max_seqlen_q"] == 8
-    assert recorded["max_seqlen_k"] == 32
-    assert recorded["causal"] is True
-    assert recorded["softmax_scale"] == 1.0
-    assert recorded["window_size"] == (-1, -1)
-    assert recorded["softcap"] == 0
-    assert recorded["q_descale"] is None
-
-    calls["fa"].clear()
-    calls["triton"].clear()
-    engine.fa_version = 3
-    assert engine._paged(
-        _Rows(512), "k", "v", "cu", 8, lengths, 32, table,
-        causal=True, softmax_scale=1.0, window=None) == "fa-out"
-    assert calls["triton"] == []
-    assert calls["fa"][0]["fa_version"] == 4
-
-    calls["fa"].clear()
-    engine.fa_version = 4
-    assert engine._paged(
-        _Rows(256), "k", "v", "cu", 8, lengths, 32, table,
-        causal=True, softmax_scale=1.0, window=None) == "fa-out"
-    assert calls["triton"] == []
-    assert calls["fa"][0]["fa_version"] == 4
+    metadata = object()
+    for version, head_dim, expected in (
+            (4, 512, "flashinfer"), (3, 512, "fa"), (4, 256, "fa")):
+        engine.fa_version = version
+        result = engine._paged(
+            _Rows(head_dim), "k", "v", "cu", 8, "used", 32, "table",
+            causal=True, softmax_scale=1.0, metadata=metadata)
+        assert result == f"{expected}-out"
+        backend, args = calls.pop()
+        assert backend == expected
+        if backend == "flashinfer":
+            assert args is metadata
+        else:
+            assert args["fa_version"] == 4
 
 
 def test_b200_head_256_requests_a_single_split(monkeypatch):

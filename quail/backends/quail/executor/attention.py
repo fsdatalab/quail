@@ -916,57 +916,60 @@ class Engine:
             causal=causal, fa_version=version,
             return_softmax_lse=True, **extra)
 
-    def _triton_paged(self, q3, kp, vp, cu_q, max_q, seqused_k,
-                      max_seqused_k, block_table, *, causal,
-                      softmax_scale, window):
-        """One paged attention call through Triton unified attention.
+    def _flashinfer_paged(self, q3, kp, vp, metadata, *, causal,
+                          softmax_scale, window):
+        """Run paged attention with a FlashInfer plan shared across layers."""
+        import numpy as np
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 
-        Args:
-            q3: Queries, (rows, heads, dim).
-            kp: Key pages, (pages, page tokens, KV heads, dim).
-            vp: Value pages, same shape as kp.
-            cu_q: Cumulative query lengths.
-            max_q: Longest query.
-            seqused_k: Resident tokens per sequence.
-            max_seqused_k: Longest resident sequence.
-            block_table: Page ids per sequence.
-            causal: Whether each query sees only keys at or before it.
-            softmax_scale: Logit scale. None uses 1/sqrt(dim).
-            window: Sliding window pair, or None for full attention.
-
-        Returns:
-            Attention output, (rows, heads, dim).
-        """
-        from vllm.v1.attention.ops.triton_unified_attention import (
-            unified_attention,
-        )
-
-        q = q3.contiguous()
-        out = self.torch.empty_like(q)
-        scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
-        unified_attention(
-            q=q, k=kp, v=vp, out=out,
-            cu_seqlens_q=cu_q, max_seqlen_q=max_q,
-            seqused_k=seqused_k, max_seqlen_k=max_seqused_k,
-            softmax_scale=scale, causal=causal,
-            window_size=(-1, -1) if window is None else window,
-            block_table=block_table, softcap=0,
-            q_descale=None, k_descale=None, v_descale=None)
-        return out
+        if not hasattr(self, "_flashinfer_plans"):
+            self._flashinfer_plans = {}
+            # Head-512 split-KV plans exceed the usual 128 MiB workspace.
+            self._flashinfer_workspace = self.torch.empty(
+                256 * 1024 * 1024, dtype=self.torch.uint8, device=q3.device)
+        key = (causal, softmax_scale, window, q3.shape[1:], kp.shape[1:],
+               q3.dtype, kp.dtype)
+        previous, wrapper, uploaded = self._flashinfer_plans.get(
+            key, (None, None, None))
+        if wrapper is None:
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._flashinfer_workspace, kv_layout="NHD", backend="fa2")
+            uploaded = self.torch.cuda.Event()
+        if metadata is not previous:
+            page_tokens = kp.shape[1]
+            used = np.asarray(metadata["used_host"], dtype=np.int32)
+            counts = -(-used // page_tokens)
+            indptr = np.concatenate(([0], counts.cumsum())).astype(np.int32)
+            indices = np.concatenate([
+                pages[:count] for pages, count in zip(metadata["page_rows"], counts)
+            ]).astype(np.int32)
+            options = dict(
+                causal=causal, sm_scale=softmax_scale,
+                window_left=-1 if window is None else window[0],
+                q_data_type=q3.dtype, kv_data_type=kp.dtype)
+            # FlashInfer rewrites pinned host memory before its asynchronous upload.
+            uploaded.synchronize()
+            wrapper.plan(
+                self.torch.as_tensor(metadata["cu_q_host"], dtype=self.torch.int32),
+                self.torch.from_numpy(indptr), self.torch.from_numpy(indices),
+                self.torch.from_numpy((used - 1) % page_tokens + 1),
+                q3.shape[1], kp.shape[2], q3.shape[2], page_tokens, **options)
+            uploaded.record()
+            self._flashinfer_plans[key] = metadata, wrapper, uploaded
+        return wrapper.run(q3, (kp, vp))
 
     def _paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table, *,
-               causal, softmax_scale=None, window=None):
+               causal, softmax_scale=None, window=None, metadata=None):
         """One paged attention call.
 
         FlashAttention 3, or FlashAttention 4 when the head is wider
         than it takes. A 512-wide head on a GPU that selects
-        FlashAttention 4 runs through Triton unified attention.
+        FlashAttention 4 runs through FlashInfer CUDA attention.
         """
         if self.fa_version == 4 and q3.shape[-1] == 512:
-            return self._triton_paged(
-                q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
-                block_table, causal=causal, softmax_scale=softmax_scale,
-                window=window)
+            return self._flashinfer_paged(
+                q3, kp, vp, metadata, causal=causal,
+                softmax_scale=softmax_scale, window=window)
         wide = q3.shape[-1] > FA_MAX_HEAD_DIM
         out, _ = self._fa(
             q3, kp, vp, cu_q, None, max_q, max_seqused_k, causal=causal,
@@ -1094,14 +1097,14 @@ class Engine:
         out = self._paged(
             q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
             pool["max_used"], pool["table"], causal=True,
-            softmax_scale=softmax_scale, window=behind)
+            softmax_scale=softmax_scale, window=behind, metadata=pool)
         if canvas is not None:
             q_c = q3.index_select(0, canvas["rows"])
             out_c = self._paged(
                 q_c, kp, vp, canvas["cu_q"], canvas["max_q"],
                 canvas_pool["used"], canvas_pool["max_used"],
                 canvas_pool["table"], causal=False,
-                softmax_scale=softmax_scale, window=around)
+                softmax_scale=softmax_scale, window=around, metadata=canvas_pool)
             out.index_copy_(0, canvas["rows"], out_c)
         meta["layer"] += 1
         return out.view(n, -1)
