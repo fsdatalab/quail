@@ -1,5 +1,7 @@
 """AI.SAE_FEATURES through the shared document scheduler."""
 
+from contextlib import contextmanager
+
 import numpy as np
 import pyarrow as pa
 
@@ -7,6 +9,7 @@ from quail.backends.quail.executor.parts import SingleResultPart
 from quail.backends.quail.executor.sae import (
     SaeFeaturesReadout,
     SaeMaxAccumulator,
+    SaeMaxReadout,
     feature_lists_of_rows,
     sae_encoder,
 )
@@ -75,6 +78,29 @@ class SaeFeaturesPart(SingleResultPart):
                 if port.value_type is ValueType.ROWS
                 and port.source.node_id in by_node]
 
+    @staticmethod
+    def prepare_group(parts):
+        """Clear each question's maxima when its call finishes, for either pooling."""
+        accumulator = next((part.accumulator for part in parts
+                            if part.accumulator is not None), None)
+        if accumulator is not None:
+            for part in parts:
+                part.accumulator = accumulator
+                accumulator.register_call()
+
+    @contextmanager
+    def execution_context(self):
+        """Attach the forward hook for the scheduler's lifetime."""
+        if self._pipeline is None:
+            yield
+            return
+        previous = self._pipeline.forward_hook
+        self._pipeline.forward_hook = self.accumulator.observe
+        try:
+            yield
+        finally:
+            self._pipeline.forward_hook = previous
+
     def __init__(self, state, node, ids, documents, *, accumulator=None,
                  priors=(), prior_tables=()):
         spec = node.spec
@@ -110,9 +136,7 @@ class SaeFeaturesPart(SingleResultPart):
                 accumulator = SaeMaxAccumulator(torch, encoder,
                                                 document_tokens)
                 self._pipeline = state.loaded_model.pipeline
-                self._pipeline.forward_hook = accumulator.observe
             self.accumulator = accumulator
-            self.accumulator.register_call()
 
             def decide(anchor, row):
                 self.pending[anchor] = self.accumulator.settle(keys[anchor])
@@ -122,13 +146,17 @@ class SaeFeaturesPart(SingleResultPart):
             # the packed readout row (indices, then strengths) stays a
             # view; every row unpacks at once in result()
             def decide(anchor, row):
+                if self.accumulator is not None:
+                    self.accumulator.settle(keys[anchor], collect=False)
                 self.values[anchor] = np.asarray(row)[-1]
                 self.reached += 1
                 return True
 
         self.stages = [Stage(
-            suffixes=[[tail[-1]]], readout=SaeFeaturesReadout(torch, encoder),
-            frame=list(tail[:-1]), decide=decide, single=True,
+            # A reused frame has KV but no residual rows for this call's maxima.
+            suffixes=[list(tail)], readout=(SaeMaxReadout(torch)
+                if spec.pooling == "max" else SaeFeaturesReadout(torch, encoder)),
+            decide=decide, single=True,
             label=f"sae features {spec.name}")]
 
     @property
@@ -161,16 +189,9 @@ class SaeFeaturesPart(SingleResultPart):
         for anchor in read.tolist():
             del self.pending[anchor]
 
-    def complete(self, tokens, spans, stats, offset):
-        # the part that set the hook releases it once the run ends
-        if self._pipeline is not None:
-            self._pipeline.forward_hook = None
-            self._pipeline = None
-        super().complete(tokens, spans, stats, offset)
-
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec
-        if self.accumulator is not None:
+        if spec.pooling == "max":
             self._harvest(completed_only=False)
             batches = self.harvested or [(np.empty(0, np.int64),) * 2 + (
                 np.empty(0, np.int32), np.empty(0, np.float32))]

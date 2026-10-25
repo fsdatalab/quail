@@ -36,7 +36,13 @@ def take_unnests(tree: exp.Select) -> tuple[tuple[tuple[str, ...], tuple], ...]:
     taken = []
     for join in [join for join in tree.args.get("joins") or ()
                  if isinstance(join.this, exp.Unnest)]:
+        if (join.side or join.kind not in ("", "CROSS")
+                or any(join.args.get(key) for key in ("on", "using", "method"))):
+            raise CompileError(
+                "UNNEST supports comma joins and CROSS JOIN without ON or USING")
         unnest = join.this
+        if unnest.args.get("offset"):
+            raise CompileError("UNNEST does not support WITH ORDINALITY or OFFSET")
         calls = tuple(unnest.expressions)
         if not calls or not all(
                 isinstance(call, exp.Anonymous)

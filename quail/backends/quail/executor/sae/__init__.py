@@ -15,12 +15,16 @@ from quail.backends.quail.executor.sae.encoder import (
     feature_lists_of_rows,
     sae_encoder,
 )
-from quail.backends.quail.executor.sae.max_pooling import SaeMaxAccumulator
+from quail.backends.quail.executor.sae.max_pooling import (
+    SaeMaxAccumulator,
+    SaeMaxReadout,
+)
 
 __all__ = [
     "SaeEncoder",
     "SaeFeaturesReadout",
     "SaeMaxAccumulator",
+    "SaeMaxReadout",
     "feature_lists_of_rows",
     "sae_encoder",
 ]

@@ -29,6 +29,7 @@ class SaeFeaturesCost:
         device: The device spec.
         chunk_tokens: The chunk budget.
         gpus: GPU copies the documents are split over.
+        max_pooling: Whether another call in the pipeline needs all token rows.
     """
 
     token_lengths: tuple[int, ...]
@@ -38,6 +39,7 @@ class SaeFeaturesCost:
     device: DeviceSpec
     chunk_tokens: int
     gpus: int
+    max_pooling: bool = False
 
     def estimate(self, expected_rows: float,
                  resident: bool = False) -> tuple[Work, float]:
@@ -62,10 +64,10 @@ class SaeFeaturesCost:
             variance=self.summary.variance if not resident else 0.0,
             prefix_tokens=prefix, groups=groups,
             shared_tokens=shared, copies=self.gpus)
-        if self.pooling == "last":
-            encoded = expected_rows
-        else:
-            encoded = expected_rows * (fixed + (0.0 if resident else mean))
+        encoded = expected_rows if self.pooling == "last" else 0.0
+        if self.pooling == "max" or self.max_pooling:
+            encoded += expected_rows * (
+                self.token_lengths[1] if resident else fixed + mean)
         work = replace(work, sae_encoded=encoded)
         copies = parallel_copies(self.gpus, min(expected_rows,
                                                 self.summary.count))

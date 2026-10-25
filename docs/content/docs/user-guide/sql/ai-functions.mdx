@@ -491,6 +491,8 @@ To read two lists, use one of these forms:
   each list.
 
 A `WHERE` test of a feature field compares the field with literals.
+Use a comma or `CROSS JOIN` before `UNNEST`. Other joins, `ON`, `USING`,
+and `WITH ORDINALITY` are not supported.
 
 ### Limits
 
@@ -500,6 +502,11 @@ A `WHERE` test of a feature field compares the field with literals.
   `AI.CLASSIFY`, or `AI.EXTRACT`.
 - `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the feature list.
   Use the fields of an `UNNEST` instead.
+- Calls over the same documents share their KV. If any call uses
+  `'max'`, Quail also keeps the document features for the later calls.
+  It reads each question in full and does not share prefixes between
+  different documents, because KV does not contain the residual values
+  that `'max'` needs.
 
 For the Python form, see
 [`ai_sae_features()`](/docs/user-guide/python-api/ai-functions#ai_sae_features).

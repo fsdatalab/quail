@@ -109,3 +109,147 @@ def test_the_accumulator_splits_document_and_question_rows():
     assert taken.tolist() == [0] and lengths.tolist() == [len(indices)]
     expected = _maxima(encoder, stream[:8])
     assert set(indices.tolist()) == set(expected.nonzero().flatten().tolist())
+
+
+@pytest.mark.parametrize("poolings,questions", [
+    (("last", "max"), ((1,), (2,))),
+    (("max", "last", "max"), ((1,), (2,), (3,))),
+    (("max", "last"), ((1,), (2,))),
+    (("max", "max"), ((1, 2), (1, 2))),
+])
+def test_max_pooling_reads_its_own_question_tokens(poolings, questions):
+    from contextlib import ExitStack
+    from types import SimpleNamespace
+
+    import torch.nn.functional as functional
+
+    from quail.backends.quail.executor.operators.sae_features import SaeFeaturesPart
+    from quail.backends.quail.executor.parts import gated_stages
+    from quail.backends.quail.executor.sae import SaeEncoder
+    from quail.backends.quail.executor.stages import frame_writes
+    from quail.physical import AiSaeFeatures, SaeFeaturesSpec
+
+    width = len(poolings) + 1
+    encoder = SaeEncoder(
+        torch, functional, torch.eye(width, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(width, device="cuda"), 1)
+    pipeline = SimpleNamespace(forward_hook=None)
+    state = SimpleNamespace(
+        torch=torch, loaded_model=SimpleNamespace(pipeline=pipeline, sae=encoder))
+    parts = []
+    for index, pooling in enumerate(poolings):
+        node = AiSaeFeatures(
+            node_id=f"features{index}", spec=SaeFeaturesSpec(
+                aliases=("r",), name=f"features{index}", pooling=pooling,
+                query_template="{0}?", arguments=(("r", "body"),),
+                expected_rows=1, estimated_seconds=0,
+                prompt_token_parts=((), questions[index])))
+        accumulator = next((part.accumulator for part in parts
+                            if part.accumulator is not None), None)
+        parts.append(SaeFeaturesPart(state, node, [0], {"r": [[0]]},
+                                     accumulator=accumulator))
+    stages = gated_stages(parts)
+    with ExitStack() as resources:
+        for part in parts:
+            resources.enter_context(part.execution_context())
+        for index, (stage, writes_frame) in enumerate(zip(stages,
+                                                         frame_writes(stages))):
+            rows = ([0] if index == 0 else [])
+            rows += stage.frame if writes_frame else []
+            rows += stage.suffixes[0]
+            stream = encoder.weight[rows] * 3
+            chunk = SimpleNamespace(
+                positions=torch.arange(index != 0, len(rows) + (index != 0),
+                                       device="cuda"),
+                row_spans=((("r", 0), 0, int(index == 0), len(rows)),))
+            pipeline.forward_hook(stream, chunk)
+            stage.decide(0, stage.readout.result(stage.readout.submit(stream[-1:])))
+    assert pipeline.forward_hook is None
+    for index, part in enumerate(parts):
+        result = part.result(0, 0, 0, {})
+        listed = result.outputs[part.node.rows_port]
+        features = listed.values.column(part.node.spec.name)[0].as_py()
+        expected = ({0, *questions[index]} if poolings[index] == "max"
+                    else {questions[index][-1]})
+        assert {item["feature"] for item in features} == expected
+        assert all(item["strength"] == 3 for item in features)
+    assert not parts[0].accumulator.document_slot
+    assert not parts[0].accumulator.tail_slot
+
+
+def test_a_failed_feature_run_removes_its_forward_hook():
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.operators.sae_features import SaeFeaturesPart
+    from quail.physical import AiSaeFeatures, SaeFeaturesSpec
+
+    pipeline = SimpleNamespace(forward_hook=None)
+    state = SimpleNamespace(
+        torch=torch, loaded_model=SimpleNamespace(pipeline=pipeline, sae=_encoder()))
+    node = AiSaeFeatures(
+        node_id="features", spec=SaeFeaturesSpec(
+            aliases=("r",), name="features", pooling="max",
+            query_template="{0}?", arguments=(("r", "body"),),
+            expected_rows=1, estimated_seconds=0,
+            prompt_token_parts=((), (1,))))
+    part = SaeFeaturesPart(state, node, [0], {"r": [[0]]})
+    SaeFeaturesPart.prepare_group([part])
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with part.execution_context():
+            raise RuntimeError("interrupted")
+    assert pipeline.forward_hook is None
+
+
+def test_repeated_questions_match_separate_feature_queries():
+    import numpy as np
+    import pyarrow as pa
+
+    import quail
+
+    config = quail.EngineConfig(model="qwen3.5-2b-sae-bf16", device="h100-sxm")
+    with quail.Session(config) as session:
+        session.register("reviews", quail.DocumentProvider.from_table(pa.table({
+            "id": [0, 1],
+            "body": ["This camera takes clear photos. " * 40 + ending
+                     for ending in ("But the battery broke.", "I love it.")],
+        }), id_col="id"))
+
+        def collect(poolings):
+            query = session.docs("reviews").alias("r")
+            names = []
+            for index, pooling in enumerate(poolings):
+                name = f"features{index}"
+                names.append(name)
+                query = query.ai_sae_features(
+                    quail.prompt("{0}\n\nWhat does the reviewer think of the "
+                                 "battery, the photos, and the camera?",
+                                 quail.col("r.body")), pooling=pooling, name=name)
+            return query.select("r.id", *names).collect().sort_by("r.id")
+
+        expected = {pooling: collect([pooling]).column("features0").to_pylist()
+                    for pooling in ("last", "max")}
+        comparisons = []
+        for poolings in (("max", "max"), ("last", "max", "last", "max")):
+            table = collect(poolings)
+            assert table.column("r.id").to_pylist() == [0, 1]
+            for index, pooling in enumerate(poolings):
+                for actual, reference in zip(
+                        table.column(f"features{index}").to_pylist(),
+                        expected[pooling]):
+                    actual = {item["feature"]: item["strength"] for item in actual}
+                    reference = {item["feature"]: item["strength"]
+                                 for item in reference}
+                    common = actual.keys() & reference.keys()
+                    features = actual.keys() | reference.keys()
+                    overlap = len(common) / len(features)
+                    expected_values = np.array([reference.get(key, 0)
+                                                for key in features])
+                    actual_values = np.array([actual.get(key, 0) for key in features])
+                    relative_error = (np.linalg.norm(actual_values - expected_values)
+                                      / np.linalg.norm(expected_values))
+                    comparisons.append((poolings, index, overlap, relative_error))
+        minimum_overlap = min(overlap for _, _, overlap, _ in comparisons)
+        maximum_error = max(error for _, _, _, error in comparisons)
+        # Prefill and retained-state paths round bf16 differently.
+        assert minimum_overlap > .95 and maximum_error < .05, (
+            minimum_overlap, maximum_error)

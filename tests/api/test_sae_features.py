@@ -204,9 +204,22 @@ def test_the_cost_model_charges_resident_calls_the_question_only():
     # a resident call feeds and encodes only its question tokens; the
     # documents' maxima are kept from the call before it
     assert resident_work.tokens < fresh_work.tokens
-    assert resident_work.sae_encoded == 2 * 30
+    assert resident_work.sae_encoded == 2 * 20
     assert fresh_work.sae_encoded == 2 * 30 + 400 + 600
     assert resident_seconds < fresh_seconds
+
+
+def test_mixed_pooling_prices_the_document_encode_before_the_first_max_call(session):
+    def estimate(first):
+        query = (session.docs("reviews").alias("r")
+                 .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
+                                  pooling=first, name="first_features")
+                 .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
+                                  pooling="max", name="second_features")
+                 .select("first_features", "second_features"))
+        return quail.speed_of_light_estimate(query, answer=lambda *_: True)
+
+    assert estimate("last").work.sae_encoded == estimate("max").work.sae_encoded + 3
 
 
 def test_packed_rows_unpack_without_zero_strengths():
@@ -246,6 +259,18 @@ def test_unnest_returns_a_row_per_feature_and_where_keeps_strong_ones(session):
         rows = finish(query, _unnest_oracle()).collect()
         assert rows.to_pylist() == [{"r.id": 11, "f.feature": 2},
                                     {"r.id": 9, "f.feature": 1}]
+
+
+@pytest.mark.parametrize("join,condition", [
+    ("JOIN", "ON FALSE"),
+    ("LEFT JOIN", "ON TRUE"),
+    ("JOIN", "USING (id)"),
+    ("NATURAL JOIN", ""),
+])
+def test_unnest_rejects_join_semantics_it_cannot_execute(session, join, condition):
+    with pytest.raises(CompileError, match="UNNEST supports comma joins"):
+        session.sql(
+            f"SELECT r.id, f.feature FROM reviews r {join} {UNNEST} {condition}")
 
 
 def test_unnest_groups_rows_by_feature(session):
@@ -294,6 +319,27 @@ def test_two_lists_in_one_unnest_zip_and_pad_the_shorter_with_nulls(session):
             {"r.id": 9, "f.feature": 100, "g.feature": None}]
 
 
+def test_max_pooling_keeps_every_documents_residual_rows(session):
+    session.register("repeated", DocumentProvider.from_table(pa.table({
+        "id": list(range(50)),
+        "body": ["a review repeated " * 200 + str(index) for index in range(50)],
+    }), id_col="id"))
+    for poolings in (("last",), ("max",), ("last", "max")):
+        query = session.docs("repeated").alias("r")
+        names = []
+        for index, pooling in enumerate(poolings):
+            name = f"features{index}"
+            names.append(name)
+            query = query.ai_sae_features(
+                quail.prompt(QUESTION, quail.col("r.body")),
+                pooling=pooling, name=name)
+        query = query.select("r.id", *names)
+        query.token_inputs()
+        nodes = [node for node in query.plan().nodes
+                 if isinstance(node, AiSaeFeatures)]
+        assert all(node.share_prefixes == ("max" not in poolings) for node in nodes)
+
+
 def test_two_unnests_return_the_product_and_filter_above_their_own_list(session):
     sql = session.sql(
         f"SELECT r.id, f.feature, g.feature FROM reviews r, "
@@ -322,6 +368,8 @@ def test_two_unnests_return_the_product_and_filter_above_their_own_list(session)
 
 def test_unnest_needs_named_feature_lists_and_their_fields(session):
     bad = {
+        "ordinality": f"SELECT f.feature FROM reviews r, "
+                      f"{UNNEST.replace(' AS f', ' WITH ORDINALITY AS f')}",
         "unnamed lists": f"SELECT r.id FROM reviews r, UNNEST({TWO_CALLS}) AS u",
         "a list named twice": f"SELECT r.id FROM reviews r, {UNNEST}, {UNNEST}",
         "no feature call": "SELECT f.feature FROM reviews r, UNNEST(r.body) AS f",

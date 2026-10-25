@@ -3,6 +3,7 @@
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from itertools import groupby
 from typing import Any, ClassVar
@@ -97,6 +98,10 @@ class ExecutionPart(ABC):
     def prepare_group(parts):
         """Prepare stages shared by consecutive parts of the same type."""
 
+    def execution_context(self):
+        """Hold resources needed while the scheduler runs this part."""
+        return nullcontext()
+
     @abstractmethod
     def finish(self, every) -> int | None:
         """Finalize answers and return this part's suffix token count."""
@@ -156,18 +161,21 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
         settled = settle_documents(state.loaded_model.arena, anchor_keys, prefixes,
                                    keep_kv, state.chunk_tokens)
     stats = {}
-    every, spans, tokens = run_stages(
-        state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-        stages, prefixes, state.chunk_tokens, anchor_keys=anchor_keys,
-        on_settled=settled, prefix_tree=prefix_tree, stats=stats,
-        gpu_timing=state.gpu_timing,
-        attention_mode=next((part.attention for part in parts if part.attention),
-                            attention),
-        staging=input_staging(state), label=label, limit=limit,
-        survival=survival(parts),
-        stop_groups=stop_groups, paged=paged,
-        on_chunk=transition_reporter(parts), on_answers=on_answers,
-        appended_tokens=max(part.appended_tokens for part in parts) or None)
+    with ExitStack() as resources:
+        for part in parts:
+            resources.enter_context(part.execution_context())
+        every, spans, tokens = run_stages(
+            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+            stages, prefixes, state.chunk_tokens, anchor_keys=anchor_keys,
+            on_settled=settled, prefix_tree=prefix_tree, stats=stats,
+            gpu_timing=state.gpu_timing,
+            attention_mode=next((part.attention for part in parts if part.attention),
+                                attention),
+            staging=input_staging(state), label=label, limit=limit,
+            survival=survival(parts),
+            stop_groups=stop_groups, paged=paged,
+            on_chunk=transition_reporter(parts), on_answers=on_answers,
+            appended_tokens=max(part.appended_tokens for part in parts) or None)
     complete_parts(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
             for node_id, result in part.results().items()}
