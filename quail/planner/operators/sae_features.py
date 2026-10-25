@@ -9,7 +9,8 @@ from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import SaeFeaturesRefusedError
 
 
-def sae_features_spec(context, call, name, expected_rows, resident=False):
+def sae_features_spec(context, call, name, expected_rows, resident=False,
+                      max_pooling=False):
     """Build a feature call's specification and price it.
 
     Args:
@@ -19,6 +20,7 @@ def sae_features_spec(context, call, name, expected_rows, resident=False):
         expected_rows: Expected number of documents to read.
         resident: Whether the documents' KV is already read, by a
             step of the same pipeline before this one.
+        max_pooling: Whether another call requires all token rows.
     """
     model = context.model
     if model.sae is None:
@@ -33,9 +35,6 @@ def sae_features_spec(context, call, name, expected_rows, resident=False):
         context.document_tokens[ref.alias], model.sliding_window,
         memo=context.memo)
     chunk = budgets.chunk_budget(model, context.device)
-    max_pooling = (context.logical_plan is not None and any(
-        node.alias == ref.alias and node.pooling == "max"
-        for node in context.logical_plan.operators().sae_features))
     cost = SaeFeaturesCost(
         token_lengths=(len(prompt.preamble_token_ids),
                        len(prompt.tail_token_ids)),
@@ -78,11 +77,13 @@ def emit_sae_features(builder, alias, expected_rows, names, port,
                      for node in builder.operators.sae_features
                      if node.alias == alias}
     calls = [feature_calls[name] for name in names]
+    max_pooling = any(node.pooling == "max" for node in calls)
     row_ports = []
     for index, logical_node in enumerate(calls):
         spec = sae_features_spec(
             builder.context, logical_node.call, logical_node.name,
-            expected_rows, resident=resident or index > 0)
+            expected_rows, resident=resident or index > 0,
+            max_pooling=max_pooling)
         node = inference_node(
             AiSaeFeatures, spec, (port,),
             index=sum(isinstance(n, AiSaeFeatures) for n in builder.nodes),

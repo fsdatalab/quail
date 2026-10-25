@@ -84,9 +84,6 @@ def logical_tree(logical):
             if node.distinct:
                 lines.append(f"{'  ' * depth}Distinct")
                 depth += 1
-            if node.output:
-                lines.append(f"{'  ' * depth}Output: {', '.join(node.output)}")
-                depth += 1
             visit(node.input, depth)
             return
         if isinstance(node, logical_nodes.Aggregate):

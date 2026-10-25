@@ -21,7 +21,6 @@ from quail.frontend.sql_binding.predicates import (
     parse_plain_test,
     unwrap_hint,
 )
-from quail.frontend.sql_binding.unnest import bind_unnest_test
 from quail.logical import (
     Alias,
     CompileError,
@@ -232,7 +231,10 @@ def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
                 f"HINT estimates a test of a label or an answer; "
                 f"{term.sql()} tests a source column, applied at the scan")
         plain = bind_plain_test(b, test)
-        b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
+        if plain.column.alias in b.scope.relations:
+            b.unnest_tests.append(plain)
+        else:
+            b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
     return True
 
 
@@ -242,14 +244,6 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
     selected = ai_aliases(tree)
     for term in _conjuncts(where.this) if where else []:
         term, hint = unwrap_hint(b, term)
-        tested = bind_unnest_test(b, term)
-        if tested is not None:
-            if hint is not None:
-                raise CompileError(
-                    f"HINT estimates a test of a label or an answer; "
-                    f"{term.sql()} tests an UNNEST field")
-            b.unnest_tests.append(tested)
-            continue
         term = _name_select_labels(b, term, selected)
         if _bind_plain_term(b, term, selected, hint):
             continue

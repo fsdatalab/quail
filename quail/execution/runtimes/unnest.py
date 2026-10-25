@@ -36,7 +36,7 @@ def unnest_batch(batch: pa.RecordBatch, node) -> pa.RecordBatch:
     the other columns. A list as long as the longest is its flattened
     values, without a copy; a shorter one is taken with a null past its
     end. With ``outer``, a row with no elements counts as one null
-    element. An alias is the same array as its field column.
+    element.
     """
     lists = [batch.column(name) for name in node.lists]
     lengths = [pc.fill_null(pc.list_value_length(values), 0).to_numpy()
@@ -60,7 +60,5 @@ def unnest_batch(batch: pa.RecordBatch, node) -> pa.RecordBatch:
                 starts[parents] + position, mask=position >= length[parents]))
         for field, column in zip(elements.type.names, elements.flatten()):
             columns[f"{name}.{field}"] = column
-    for field, name in node.aliases:
-        columns[name] = columns[field]
     return pa.RecordBatch.from_arrays(
         [columns[name] for name in node.columns], names=list(node.columns))

@@ -95,7 +95,11 @@ class PlanPricing:
 
     def features(self, node) -> tuple:
         """Return a feature call's (first, later) costs at a live count."""
-        return tuple(partial(_features_seconds, self.context, node, resident)
+        max_pooling = (self.context.logical_plan is not None and any(
+            call.alias == node.alias and call.pooling == "max"
+            for call in self.context.logical_plan.operators().sae_features))
+        return tuple(partial(_features_seconds, self.context, node, resident,
+                             max_pooling=max_pooling)
                      for resident in (False, True))
 
     def document_head(self, prompt):
@@ -181,8 +185,10 @@ def _extract_seconds(context, node, resident, expected_rows) -> float:
                         resident=resident).estimated_seconds
 
 
-def _features_seconds(context, node, resident, expected_rows) -> float:
+def _features_seconds(context, node, resident, expected_rows,
+                      max_pooling=False) -> float:
     """Price a feature call at a live count."""
     return sae_features_spec(context, node.call, node.name, expected_rows,
-                             resident=resident).estimated_seconds
+                             resident=resident,
+                             max_pooling=max_pooling).estimated_seconds
 

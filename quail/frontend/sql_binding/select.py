@@ -14,7 +14,6 @@ from quail.frontend.sql_binding.predicates import (
     _PLAIN_COMPARISONS,
     COLUMN_NODES,
 )
-from quail.frontend.sql_binding.unnest import field_reference, unnest_field
 from quail.logical import (
     AggregateCall,
     Aggregation,
@@ -82,7 +81,6 @@ def bind_order(
         return ()
     struct_names = {struct.name for struct in structs}
     named = {column_name(column): column for column in columns}
-    renamed = {alias.name: alias for alias in b.unnest_aliases}
     if aggregation is not None:
         named.update(
             {aggregate.name: aggregate for aggregate in aggregation.aggregates}
@@ -102,13 +100,7 @@ def bind_order(
             raise CompileError(
                 f"ORDER BY does not compare the AI.EXTRACT struct column "
                 f"{bare!r}; extract the field as its own column")
-        field = field_reference(b, target)
-        if field is not None:
-            expression = field
-        elif bare in renamed:
-            expression = renamed[bare]
-        else:
-            expression = named[bare] if bare in named else b.resolve_value(target)
+        expression = named[bare] if bare in named else b.resolve_value(target)
         keys.append(
             SortKey(
                 expression,
@@ -167,9 +159,6 @@ class SelectBinder:
         """
         b, columns = self.binder, self.columns
         names = {column_name(column): column for column in columns}
-        field = field_reference(b, node)
-        if field is not None:
-            return column_name(field)
         if isinstance(node, COLUMN_NODES):
             if isinstance(node, exp.Column) and not node.table and node.name in names:
                 return node.name
@@ -258,15 +247,6 @@ class SelectBinder:
                     "an aggregate in SELECT is a direct COUNT, SUM, AVG, MIN, "
                     "or MAX call with an AS name"
                 )
-            name = unnest_field(node, b.unnested)
-            if name is not None:
-                if isinstance(e, exp.Alias) and e.alias and e.alias != name:
-                    b.unnest_aliases.append(Alias(
-                        ColumnRef(node.table, "", node.name), e.alias))
-                    name = e.alias
-                self.plain.append(name)
-                self.output.append(name)
-                continue
             selected = _compile_projection(b, [e], self.structs)
             for column in selected:
                 if column not in columns:

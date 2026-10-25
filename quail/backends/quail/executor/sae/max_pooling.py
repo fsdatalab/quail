@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.sae.encoder import SaeEncoder
 
 
@@ -65,40 +66,6 @@ class _PinnedSlabs:
         return full and self.last_event[slab].query()
 
 
-class _Staging:
-    """Pinned host staging for a chunk's index arrays, two buffers deep.
-
-    A pageable host-to-device copy synchronizes; a pinned one does not.
-    A buffer is reused only once its earlier copy's event has completed.
-    """
-
-    def __init__(self, torch):
-        self.torch = torch
-        self._buffers = [None, None]
-        self._events = [None, None]
-        self._turn = 0
-
-    def upload(self, array: np.ndarray):
-        """Copy a one-dimensional int64 array to the GPU asynchronously."""
-        torch = self.torch
-        index = self._turn
-        self._turn ^= 1
-        if self._events[index] is not None:
-            self._events[index].synchronize()
-        buffer = self._buffers[index]
-        if buffer is None or buffer.numel() < array.size:
-            buffer = torch.empty(max(array.size, 1 << 16), dtype=torch.int64,
-                                 pin_memory=True)
-            self._buffers[index] = buffer
-        host = buffer[:array.size]
-        host.numpy()[:] = array
-        device = host.to("cuda", non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        self._events[index] = event
-        return device
-
-
 class _SlotMatrix:
     """Per-document maxima as rows (slots) of one GPU matrix.
 
@@ -159,7 +126,8 @@ class SaeMaxAccumulator:
         self.calls = 0        # feature calls registered on this pipeline
         self.settled = {}     # key -> calls settled so far
         self._slots = _SlotMatrix(torch, encoder.num_features)
-        self._staging = _Staging(torch)
+        self._staging = InputStaging(torch)
+        self._staging_index = 0
         self._pinned = _PinnedSlabs(torch, encoder.num_features)
 
     def register_call(self) -> None:
@@ -208,7 +176,13 @@ class SaeMaxAccumulator:
         if not contiguous:
             parts.insert(0, np.repeat(row0 - np.cumsum(lengths) + lengths,
                                       lengths) + np.arange(total))
-        block = self._staging.upload(np.concatenate(parts))
+        array = np.concatenate(parts)
+        index = self._staging_index
+        self._staging_index ^= 1
+        host = self._staging.host(index, max(array.size, 1 << 16),
+                                  self.torch.int64)
+        host[:array.size].numpy()[:] = array
+        block = self._staging.upload(index, array.size)
         at = 0
         if not contiguous:
             rows = block[:total]

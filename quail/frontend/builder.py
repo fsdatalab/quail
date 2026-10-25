@@ -3,6 +3,8 @@
 from collections.abc import Mapping
 from typing import Optional
 
+import pyarrow as pa
+
 from quail.catalog import Catalog
 from quail.frontend.expressions import (
     AggSpec,
@@ -19,8 +21,8 @@ from quail.frontend.expressions import (
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
-from quail.frontend.sql_binding.unnest import list_fields
 from quail.logical import (
+    FEATURE_LIST,
     AggregateCall,
     Aggregation,
     Alias,
@@ -73,7 +75,6 @@ class Query:
         self._unnests = []           # the list names of each unnest()
         self._unnest_outer = []      # whether each unnest() keeps empty rows
         self._unnest_tests = []      # RegularPredicate on their fields
-        self._unnest_aliases = []    # Aliases naming unnested fields
         self._regular_predicates = {}  # alias -> [RegularPredicate]
         # alias -> [(RegularPredicate on an answer or span, selectivity)]
         self._extract_filters = {}
@@ -237,43 +238,11 @@ class Query:
                     f"unnest() names an ai_sae_features() column, got {name!r}")
             if name in unnested or names.count(name) > 1:
                 raise CompileError(f"unnest() reads {name!r} twice")
+        for name in names:
+            self._scope_.add_relation(name, pa.schema(FEATURE_LIST.value_type))
         self._unnests.append(tuple(names))
         self._unnest_outer.append(outer)
         return self
-
-    def _unnest_field(self, c) -> Optional[str]:
-        """Return the name of the unnested field column ``c`` reads, or None.
-
-        Raises:
-            CompileError: ``c`` reads an unnested column but names no
-                field of it.
-        """
-        spec = col(c) if isinstance(c, str) else c
-        if not isinstance(spec, ColSpec) or not any(
-                spec.alias in lists for lists in self._unnests):
-            return None
-        fields = list_fields()
-        if spec.column not in fields or spec.path or spec.function:
-            raise CompileError(
-                f"the unnested column {spec.alias!r} has the fields "
-                f"{', '.join(f'{spec.alias}.{field}' for field in fields)}, "
-                f"got {spec.alias}.{spec.column}")
-        return f"{spec.alias}.{spec.column}"
-
-    def _unnest_name(self, c) -> Optional[str]:
-        """Return the result name of the unnested field ``c`` reads, or None.
-
-        A field read under ``named()`` is returned under that name.
-        """
-        field = self._unnest_field(c)
-        spec = col(c) if isinstance(c, str) else c
-        if field is None or spec.name is None or spec.name == field:
-            return field
-        alias = Alias(ColumnRef(spec.alias, "", spec.column), spec.name)
-        if alias not in self._unnest_aliases:
-            self._claim_name(spec.name)
-            self._unnest_aliases.append(alias)
-        return spec.name
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
                     descriptions=None,
@@ -714,16 +683,6 @@ class Query:
     def _where_test(self, test: PredicateSpec) -> None:
         """Route one test to the scan, a label, an answer, or an unnest filter."""
         spec = test.col
-        if self._unnest_field(spec) is not None:
-            if test.selectivity is not None:
-                raise CompileError(
-                    "a hint estimates a test of a label or an answer, not "
-                    "of an unnested field")
-            predicate = RegularPredicate(ColumnRef(spec.alias, "", spec.column),
-                                         test.comparison, test.value)
-            predicate.validate()
-            self._unnest_tests.append(predicate)
-            return
         if spec.alias is None and spec.column in self._labels:
             if test.comparison not in ("=", "in"):
                 raise CompileError(
@@ -751,8 +710,11 @@ class Query:
         predicate = RegularPredicate(self._resolve_value(spec), test.comparison,
                                      test.value)
         predicate.validate()
-        self._regular_predicates.setdefault(predicate.column.alias, []).append(
-            predicate)
+        if predicate.column.alias in self._scope_.relations:
+            self._unnest_tests.append(predicate)
+        else:
+            self._regular_predicates.setdefault(predicate.column.alias, []).append(
+                predicate)
 
     def _extract_column(self, spec: ColSpec) -> Optional[ColumnRef]:
         """Resolve a col() naming an extraction's answer or span, or None.
@@ -883,10 +845,6 @@ class Query:
         windows, output = self._windowing(columns, cols)
         selected = []                # the result column names, in order
         for c in () if aggregation is not None or windows else cols:
-            unnested = self._unnest_name(c)
-            if unnested is not None:
-                selected.append(unnested)
-                continue
             if isinstance(c, str) and c in self._labels:
                 columns.append(self._labels[c])
             elif isinstance(c, str) and c in self._scores:
@@ -959,22 +917,15 @@ class Query:
         if aggregation is not None:
             named.update({a.name: a for a in aggregation.aggregates})
         named.update({window.name: window for window in windows})
-        named.update({alias.name: alias for alias in self._unnest_aliases})
         order = []
         for spec, descending, nulls_first in self._order:
             if spec.alias is None and spec.column in self._extracts:
                 raise CompileError(
                     f"ORDER BY does not compare the AI.EXTRACT struct column "
                     f"{spec.column!r}; extract the field as its own column")
-            if self._unnest_field(spec) is not None:
-                field = ColumnRef(spec.alias, "", spec.column)
-                # a renamed field is sorted by its name
-                expression = next((alias for alias in self._unnest_aliases
-                                   if alias.expression == field), field)
-            else:
-                expression = (named[spec.column]
-                              if spec.alias is None and spec.column in named
-                              else self._resolve_value(spec, named=True))
+            expression = (named[spec.column]
+                          if spec.alias is None and spec.column in named
+                          else self._resolve_value(spec, named=True))
             order.append(SortKey(expression, descending=descending,
                                  nulls_first=nulls_first))
         return logical.project(tuple(columns), self._limit, order=tuple(order),
@@ -983,14 +934,10 @@ class Query:
                                windows=windows, output=output,
                                unnests=tuple(self._unnests),
                                unnest_outer=tuple(self._unnest_outer),
-                               unnest_tests=tuple(self._unnest_tests),
-                               unnest_aliases=tuple(self._unnest_aliases))
+                               unnest_tests=tuple(self._unnest_tests))
 
     def _project(self, columns: list, c) -> str:
         """Add the column or named output ``c`` to ``columns``; return its name."""
-        unnested = self._unnest_name(c)
-        if unnested is not None:
-            return unnested
         if isinstance(c, str) and c in self._labels:
             column = self._labels[c]
         elif isinstance(c, str) and c in self._scores:

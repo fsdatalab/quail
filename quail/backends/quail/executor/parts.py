@@ -14,8 +14,9 @@ from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.stages import Stage, frame_writes, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import prefix_tree
+from quail.execution.rows import Rows
 from quail.logical import effective_selectivity
-from quail.physical import AiFilter, AiJoin, Filter
+from quail.physical import AiFilter, AiJoin, Filter, ValueType
 from quail.progress import logger
 
 
@@ -45,6 +46,28 @@ def input_staging(state: QueryExecutionState):
         state.loaded_model.input_staging = InputStaging(state.torch)
     state.loaded_model.input_staging.fixed_tokens.clear()
     return state.loaded_model.input_staging
+
+
+def prior_inputs(node, parts, inputs):
+    """Return preceding parts and external row tables read by a node."""
+    by_node = {member.node_id: part for part in parts for member in part.nodes}
+    priors, prior_tables = [], []
+    for port in node.inputs:
+        if port.value_type is ValueType.ROWS:
+            if port.source.node_id in by_node:
+                priors.append((by_node[port.source.node_id], port.source))
+            else:
+                prior_tables.append(inputs[port.name])
+    return priors, prior_tables
+
+
+def join_prior_rows(rows: Rows, alias, priors, prior_tables) -> Rows:
+    """Join columns from preceding operators onto the surviving documents."""
+    prior_results = (part.results()[port.node_id].outputs[port.port]
+                     for part, port in priors)
+    for prior in (*prior_tables, *prior_results):
+        rows = rows.joined(prior, alias)
+    return rows
 
 
 class ExecutionPart(ABC):

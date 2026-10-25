@@ -475,3 +475,42 @@ def test_left_join_unnest_keeps_a_row_with_no_features_as_nulls(session):
     inner = session.sql(f"SELECT r.id, f.feature FROM reviews r, {UNNEST}")
     assert sorted(finish(inner, oracle).collect().column("r.id").to_pylist()) == [
         9, 11]
+
+
+def test_unnested_fields_resolve_without_qualifiers_when_unambiguous(session):
+    sql = session.sql(
+        f"SELECT feature AS feature_id FROM reviews r, {UNNEST} "
+        f"WHERE strength > 1 ORDER BY strength DESC")
+    built = (session.docs("reviews").alias("r")
+             .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
+                              pooling="last", name="f")
+             .unnest("f").where(quail.col("strength") > 1)
+             .order_by(quail.col("strength").desc())
+             .select(quail.col("feature").named("feature_id")))
+    for query in (sql, built):
+        assert [str(ref) for ref in query.logical.output_schema()] == ["feature_id"]
+        assert query.logical.schema() == pa.schema([("feature_id", pa.int32())])
+        result = finish(query, _unnest_oracle()).collect()
+        assert result.to_pylist() == [{"feature_id": 2}, {"feature_id": 1}]
+    with pytest.raises(CompileError, match="ambiguous"):
+        session.sql(f"SELECT feature FROM reviews r, "
+                    f"UNNEST({TWO_CALLS}) AS u(f, g)")
+
+
+@pytest.mark.parametrize("threshold, expected", [(1, 2), (3, 0)])
+def test_count_star_counts_unnested_rows_without_selecting_a_field(
+        session, threshold, expected):
+    query = session.sql(
+        f"SELECT COUNT(*) AS n FROM reviews r, {UNNEST} "
+        f"WHERE f.strength > {threshold}")
+    assert finish(query, _unnest_oracle()).collect().to_pylist() == [{"n": expected}]
+
+
+def test_a_window_reads_unnested_fields_after_projection(session):
+    query = session.sql(
+        f"SELECT f.feature AS feature_id, "
+        f"ROW_NUMBER() OVER (ORDER BY f.strength DESC) AS rank "
+        f"FROM reviews r, {UNNEST} ORDER BY rank LIMIT 2")
+    result = finish(query, _unnest_oracle()).collect()
+    assert result.to_pylist() == [{"feature_id": 2, "rank": 1},
+                                  {"feature_id": 1, "rank": 2}]

@@ -5,7 +5,11 @@ from contextlib import contextmanager
 import numpy as np
 import pyarrow as pa
 
-from quail.backends.quail.executor.parts import SingleResultPart
+from quail.backends.quail.executor.parts import (
+    SingleResultPart,
+    join_prior_rows,
+    prior_inputs,
+)
 from quail.backends.quail.executor.sae import (
     SaeFeaturesReadout,
     SaeMaxAccumulator,
@@ -19,7 +23,6 @@ from quail.catalog.tokens import DocumentKeys
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
 from quail.logical import FEATURE_LIST
-from quail.physical import ValueType
 
 
 def _feature_column(lengths, indices, strengths) -> pa.ListArray:
@@ -60,23 +63,10 @@ class SaeFeaturesPart(SingleResultPart):
             (part.accumulator for part in parts
              if isinstance(part, SaeFeaturesPart)
              and part.accumulator is not None), None)
-        priors = cls._priors(node, parts)
-        prior_tables = [inputs[node.node_id][port.name] for port in node.inputs
-                        if port.value_type is ValueType.ROWS
-                        and all(port.source.node_id != member.node_id
-                                for part in parts for member in part.nodes)]
+        priors, prior_tables = prior_inputs(node, parts, inputs[node.node_id])
         return cls(state, node, ids, context.state["documents"],
                    accumulator=accumulator, priors=priors,
                    prior_tables=prior_tables)
-
-    @staticmethod
-    def _priors(node, parts):
-        by_node = {member.node_id: part for part in parts
-                   for member in part.nodes}
-        return [(by_node[port.source.node_id], port.source)
-                for port in node.inputs
-                if port.value_type is ValueType.ROWS
-                and port.source.node_id in by_node]
 
     @staticmethod
     def prepare_group(parts):
@@ -209,10 +199,7 @@ class SaeFeaturesPart(SingleResultPart):
         (alias,) = spec.aliases
         listed = Rows({alias: rows[:, 0]}, pa.table({
             spec.name: _feature_column(lengths, indices, strengths)}))
-        prior_results = (part.results()[port.node_id].outputs[port.port]
-                         for part, port in self.priors)
-        for prior in (*self.prior_tables, *prior_results):
-            listed = listed.joined(prior, spec.aliases[0])
+        listed = join_prior_rows(listed, alias, self.priors, self.prior_tables)
         return NodeResult(classify_outputs(self.node, listed), NodeMetrics(
             input_rows=self.reached, output_rows=len(answered),
             evaluated_documents=self.reached, fresh_tokens=tokens,

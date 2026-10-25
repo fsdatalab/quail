@@ -112,13 +112,13 @@ class LogicalPlan:
 
     @property
     def projection(self) -> Project:
-        """Return the projection that supplies result columns."""
+        """Return the first projection over source columns and model answers."""
         node = self.root.input if isinstance(self.root, WithCTE) else self.root
-        while isinstance(node, (Result, Aggregate, Window, Unnest, Filter)):
-            node = node.input
-        if not isinstance(node, Project):
+        projection = next((found for found in LogicalPlan(node).walk()
+                           if isinstance(found, Project)), None)
+        if projection is None:
             raise CompileError("a query plan needs a projection")
-        return node
+        return projection
 
     @property
     def result(self) -> Result:
@@ -174,16 +174,19 @@ class LogicalPlan:
                 raise CompileError(
                     f"the Scan of {scan.alias!r} carries no schema; the result "
                     f"cannot be typed")
-        fields = _projected_fields(self.projection, scans)
+        projection = self.projection
+        fields = _projected_fields(projection, scans)
         for node in self.walk():
-            if isinstance(node, Unnest):
+            if isinstance(node, Project) and node is not projection:
+                table = pa.schema(fields).empty_table()
+                fields = {column_name(column): evaluate_expression(
+                    column, table, qualified=True).type for column in node.columns}
+            elif isinstance(node, Unnest):
                 fields = _unnested_fields(node, fields)
             elif isinstance(node, Aggregate):
                 fields = _aggregated_fields(node, fields)
             elif isinstance(node, Window):
                 fields = _windowed_fields(node, fields)
-        if isinstance(self.root, Result) and self.root.output:
-            fields = {name: fields[name] for name in self.root.output}
         return pa.schema(fields)
 
     def operators(self) -> "Operators":
@@ -432,8 +435,6 @@ def _unnested_fields(node: Unnest, fields: dict) -> dict:
                           for field in value_type.value_type})
         else:
             types[name] = value_type
-    for alias in node.aliases:
-        types[alias.name] = types[column_name(alias.expression)]
     return types
 
 

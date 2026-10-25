@@ -17,6 +17,13 @@ from quail.cost.work import Work
 from quail.specs import DeviceSpec, ModelSpec
 
 
+def sae_encoded_tokens(pooling: str, expected_rows: float, prompt_tokens: float,
+                       max_pooling: bool = False) -> float:
+    """Count encoded rows, including a shared max hook in a mixed pipeline."""
+    return ((expected_rows if pooling == "last" else 0.0)
+            + (prompt_tokens if pooling == "max" or max_pooling else 0.0))
+
+
 @dataclass(frozen=True)
 class SaeFeaturesCost:
     """Prepared numeric inputs for one feature call's cost at any count.
@@ -64,11 +71,10 @@ class SaeFeaturesCost:
             variance=self.summary.variance if not resident else 0.0,
             prefix_tokens=prefix, groups=groups,
             shared_tokens=shared, copies=self.gpus)
-        encoded = expected_rows if self.pooling == "last" else 0.0
-        if self.pooling == "max" or self.max_pooling:
-            encoded += expected_rows * (
-                self.token_lengths[1] if resident else fixed + mean)
-        work = replace(work, sae_encoded=encoded)
+        work = replace(work, sae_encoded=sae_encoded_tokens(
+            self.pooling, expected_rows, expected_rows * (
+                self.token_lengths[1] if resident else fixed + mean),
+            self.max_pooling))
         copies = parallel_copies(self.gpus, min(expected_rows,
                                                 self.summary.count))
         seconds = speed_of_light(

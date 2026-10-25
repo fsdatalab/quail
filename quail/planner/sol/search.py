@@ -14,6 +14,7 @@ import pyarrow as pa
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
 from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
+from quail.cost.sae_features import sae_encoded_tokens
 from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan
 from quail.logical import oriented_join_conditions
@@ -145,6 +146,8 @@ class Search:
         self.extracts = operators.extracts
         self.extract_filters = operators.extract_filters
         self.sae_features = operators.sae_features
+        self.max_pooling = {node.alias for node in self.sae_features
+                            if node.pooling == "max"}
         if self.labels.calls and label is None:
             raise ValueError(
                 "the query classifies documents; pass label=(prompt, "
@@ -453,14 +456,12 @@ class Search:
         """
         tail = self.lower(node.call.prompt).tail_tokens
         stage_work = self.question_work(alias, rows, tail, first)
-        encoded = float(len(rows)) if node.pooling == "last" else 0.0
-        if any(call.alias == alias and call.pooling == "max"
-               for call in self.sae_features):
-            tokens = self.aliases[alias].tokens
-            documents = (0.0 if not first
-                         else float(sum(tokens[row] for row in rows)))
-            encoded += documents + len(rows) * (
-                tail + (self.pre if first else 0))
+        tokens = self.aliases[alias].tokens
+        documents = float(sum(tokens[row] for row in rows)) if first else 0.0
+        encoded = sae_encoded_tokens(
+            node.pooling, len(rows), documents + len(rows) * (
+                tail + (self.pre if first else 0)),
+            max_pooling=alias in self.max_pooling)
         stage_work = stage_work + Work(sae_encoded=encoded)
         stages.append(_stage(
             FEATURES, alias, node.call.prompt.template, None, tail, None,

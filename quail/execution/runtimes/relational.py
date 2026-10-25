@@ -15,6 +15,7 @@ from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.rows import Rows, as_table
+from quail.logical.expressions import evaluate_expression
 from quail.logical.predicates import compare_literal
 from quail.physical import Aggregate, Limit, Project, Scan, Sort, Window
 
@@ -69,7 +70,14 @@ class ProjectRuntime:
         first, *rest = node.inputs
         value = as_table(inputs[first.name])
         labels = {port.name: as_table(inputs[port.name]) for port in rest}
-        if context.project is not None:
+        if node.expressions is not None:
+            batches = [pa.RecordBatch.from_arrays(
+                [evaluate_expression(expression, batch, qualified=True)
+                 for expression in node.expressions], names=list(node.columns))
+                if node.expressions else batch.select([])
+                for batch in row_batches(value)]
+            value = QueryResult.from_table(pa.Table.from_batches(batches))
+        elif context.project is not None:
             value = (context.project(node, value, labels) if labels
                      else context.project(node, value))
         # a projection keeps its rows; a lazy result's count is the

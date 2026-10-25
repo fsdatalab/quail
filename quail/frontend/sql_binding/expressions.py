@@ -86,11 +86,6 @@ class ExpressionBinder:
         # alias -> (RegularPredicate on an answer or span, selectivity)
         self.extract_tests: dict[str, list[tuple[RegularPredicate, float | None]]] = {}
         self.joins: list[JoinSpec] = []
-        # the AS name of FROM's UNNEST, and WHERE's tests of its fields
-        # each unnested list's name and its field names
-        self.unnested: dict[str, tuple[str, ...]] = {}
-        # the SELECT names of unnested field columns, as Aliases
-        self.unnest_aliases: list[Alias] = []
         self.unnest_tests: list[RegularPredicate] = []
 
     # ---- scope ------------------------------------------------------
@@ -119,7 +114,8 @@ class ExpressionBinder:
         if not isinstance(node, exp.Column):
             raise CompileError(f"{node.sql()} is not a column expression")
         parts = column_path(node)
-        scope = dict(self.tables if tables is None else tables)
+        scope = {**self.scope.relations,
+                 **dict(self.tables if tables is None else tables)}
         alias = parts[0] if len(parts) > 1 and parts[0] in scope else None
         column, *path = parts[1:] if alias is not None else parts
         return self.scope.resolve_value(column, alias, path=tuple(path),

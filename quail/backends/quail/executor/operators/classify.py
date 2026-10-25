@@ -12,6 +12,8 @@ from quail.backends.quail.executor.parts import (
     AnswerStream,
     SingleResultPart,
     execute_parts,
+    join_prior_rows,
+    prior_inputs,
     shared_prefix_tree,
 )
 from quail.backends.quail.executor.state import QueryExecutionState
@@ -25,7 +27,6 @@ from quail.backends.quail.reranker import (
 from quail.catalog.selection import document_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.logical import PROBABILITIES_SUFFIX
-from quail.physical import ValueType
 from quail.progress import answer_sink
 
 
@@ -102,14 +103,7 @@ def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     plan = ClassifyStages(state, node.spec, len(ids),
                           lambda key: position[key[1]])
     plan.seeds = ids
-    by_node = {member.node_id: part for part in parts for member in part.nodes}
-    priors = [(by_node[port.source.node_id], port.source)
-              for port in node.inputs
-              if port.value_type is ValueType.ROWS
-              and port.source.node_id in by_node]
-    prior_tables = [inputs[port.name] for port in node.inputs
-                    if port.value_type is ValueType.ROWS
-                    and port.source.node_id not in by_node]
+    priors, prior_tables = prior_inputs(node, parts, inputs)
     return ClassifyPart(node, ids, plan, priors, prior_tables=prior_tables)
 
 
@@ -218,12 +212,8 @@ class ClassifyPart(ClassifyBatch):
             scored = scored.with_column(
                 spec.name + PROBABILITIES_SUFFIX,
                 probability_column(spec.labels, plan.probabilities[labeled]))
-        # the labels the parts before it gave these documents, as a
-        # classify node on its own carries them from its scores input
-        prior_results = (part.results()[port.node_id].outputs[port.port]
-                         for part, port in self.priors)
-        for prior in (*self.prior_tables, *prior_results):
-            scored = scored.joined(prior, spec.aliases[0])
+        scored = join_prior_rows(scored, spec.aliases[0],
+                                 self.priors, self.prior_tables)
         return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),
             evaluated_documents=self.reached, fresh_tokens=tokens,

@@ -18,7 +18,6 @@ from quail.logical.expressions import (
     _explain,
     aliased_call,
     column_name,
-    column_references,
     packed_columns,
 )
 from quail.logical.nodes.base import LogicalNode
@@ -54,14 +53,20 @@ class Project:
         return self.columns
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        return tuple(dict.fromkeys(
-            ref for column in self.columns if aliased_call(column) is None
-            for ref in column_references(column)))
+        fields = {column_name(ref): ref for ref in self.input.output_schema()}
+        fields.update({column_name(column): column for column in self.columns
+                       if isinstance(column, ColumnRef)})
+        return tuple(fields.get(name, ColumnRef("", "", name))
+                     for name in self.result_columns())
 
     def validate(self) -> None:
         computed = {(node.call, node.name) for node in classifications(self.input)}
         extracted = {(node.call, node.name) for node in extractions(self.input)}
         for column in self.columns:
+            if isinstance(column, str):
+                if column not in self.input.result_columns():
+                    raise CompileError(f"Project reads an unknown column {column!r}")
+                continue
             column.validate()
             call = aliased_call(column)
             if call is not None and call.kind == "label" and (
@@ -249,18 +254,13 @@ class Window:
 
 @dataclass(frozen=True)
 class Result:
-    """Order result rows, remove duplicates, and apply an offset and limit.
-
-    ``output`` lists the result columns in SELECT order when it differs
-    from the input's, as over an Unnest; empty keeps the input's.
-    """
+    """Order result rows, remove duplicates, and apply an offset and limit."""
 
     input: LogicalNode
     limit: int | None = None
     order: tuple[SortKey, ...] = ()
     offset: int = 0
     distinct: bool = False
-    output: tuple[str, ...] = ()
     type_name: ClassVar[str] = "quail.logical_result"
 
     def children(self) -> tuple[LogicalNode, ...]:
@@ -274,17 +274,12 @@ class Result:
 
     def result_columns(self) -> tuple[str, ...]:
         """Return column names after projection or aggregation."""
-        return self.output or self.input.result_columns()
+        return self.input.result_columns()
 
     def validate(self) -> None:
         if not (reads_projection(self.input)
                 or isinstance(self.input, (Aggregate, Window))):
             raise CompileError("Result needs a projection, aggregation, or window")
-        missing = set(self.output) - set(self.input.result_columns())
-        if missing:
-            raise CompileError(
-                f"the result columns {sorted(missing)} are not columns of "
-                f"the rows below")
         if self.limit is not None and self.limit <= 0:
             raise CompileError("LIMIT must be a positive integer")
         if self.offset < 0:
@@ -337,8 +332,6 @@ class Result:
             "offset": self.offset,
             "distinct": self.distinct,
         }
-        if self.output:
-            fields["output"] = list(self.output)
         return fields
 
 

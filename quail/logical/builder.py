@@ -15,6 +15,7 @@ from quail.logical.expressions import (
     RegularPredicate,
     aliased_call,
     column_name,
+    column_references,
     model_call,
 )
 from quail.logical.nodes import (
@@ -265,7 +266,6 @@ class LogicalPlanBuilder:
         output: tuple = (),
         unnests: tuple = (),
         unnest_tests: tuple = (),
-        unnest_aliases: tuple = (),
         unnest_outer: tuple = (),
     ) -> LogicalPlan:
         """Build the plan's result nodes over the projected columns.
@@ -286,8 +286,6 @@ class LogicalPlanBuilder:
             unnest_tests: RegularPredicates on unnested field columns.
                 Each becomes a Filter above the Unnest that adds its
                 column.
-            unnest_aliases: The Aliases that name unnested field
-                columns, each on the Unnest that adds its column.
             unnest_outer: For each Unnest, whether a row with no
                 elements returns one row of nulls; empty means none do.
         """
@@ -305,9 +303,25 @@ class LogicalPlanBuilder:
                 "each field as its own column")
         unnested = {name for lists in unnests for name in lists}
         _check_feature_lists(columns, order, distinct, aggregation, unnested)
-        node = _unnested(Project(self._root, tuple(columns), tuple(structs)),
-                         unnests, unnest_tests, unnest_aliases,
+        expanded = {column_name(column): column for column in columns
+                    if any(ref.alias in unnested
+                           for ref in column_references(column))}
+        source = tuple(column for column in columns
+                       if column_name(column) not in expanded)
+        if unnests and aggregation is None:
+            source += tuple(key.expression for key in order
+                            if column_references(key.expression)
+                            and not any(ref.alias in unnested for ref in
+                                        column_references(key.expression))
+                            and key.expression not in source)
+        node = _unnested(Project(self._root, source, tuple(structs)),
+                         unnests, unnest_tests,
                          unnest_outer or (False,) * len(unnests))
+        if unnests:
+            selected = (tuple(column_name(column) for column in columns
+                              if column_name(column) not in unnested)
+                        if aggregation is not None or windows else tuple(output))
+            node = Project(node, tuple(expanded.get(name, name) for name in selected))
         if aggregation is not None:
             node = Aggregate(
                 node,
@@ -318,45 +332,31 @@ class LogicalPlanBuilder:
             )
         if windows:
             node = Window(node, tuple(windows), tuple(output))
-        # over an Unnest, the result puts its columns in SELECT order
-        selected = (tuple(output) if unnests and not windows
-                    and aggregation is None else ())
-        if limit is not None or order or offset or distinct or selected:
-            node = Result(node, limit, tuple(order), offset, distinct, selected)
+        if limit is not None or order or offset or distinct:
+            node = Result(node, limit, tuple(order), offset, distinct)
         plan = LogicalPlan(node)
         plan.validate()
         return plan
 
 
-def _unnested(node, unnests, tests, aliases, outer):
+def _unnested(node, unnests, tests, outer):
     """Return the node under its Unnests, each test above its field's Unnest.
-
-    Each Alias goes on the Unnest that adds the column it names.
 
     Raises:
         CompileError: An Unnest names no list column below it, or a test
-            or an Alias reads no unnested field.
+            reads no unnested field.
     """
-    tests, aliases = list(tests), list(aliases)
+    tests = list(tests)
     for lists, keep_empty in zip(unnests, outer, strict=True):
         node = Unnest(node, tuple(lists), outer=keep_empty)
         node.validate()
         fields = {name for names in node.fields().values() for name in names}
-        named = [alias for alias in aliases
-                 if column_name(alias.expression) in fields]
-        if named:
-            node = replace(node, aliases=tuple(named))
-            node.validate()
-            aliases = [alias for alias in aliases if alias not in named]
         for test in [test for test in tests if column_name(test.column) in fields]:
             node = Filter(node, test)
             tests.remove(test)
     if tests:
         raise CompileError(
             f"{tests[0]} tests no field of an unnested list")
-    if aliases:
-        raise CompileError(
-            f"{aliases[0].name!r} names no field of an unnested list")
     return node
 
 

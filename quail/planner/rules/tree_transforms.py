@@ -262,7 +262,8 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     """
     # the result rows above the Project, an Unnest chain among them, hold
     # no document operators
-    if isinstance(root, (Result, Aggregate, Window)) or above_unnest(root):
+    if (isinstance(root, (Result, Aggregate, Window)) or above_unnest(root)
+            or isinstance(root, Project) and above_unnest(root.input)):
         rewritten = lift_maps(root.input)
         return None if rewritten is None else root.with_children((rewritten,))
     nodes = LogicalPlan(root).walk()

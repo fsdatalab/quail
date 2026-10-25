@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.logical.expressions import WindowCall, packed_columns
+from quail.logical.expressions import Expression, WindowCall, packed_columns
 
 from ..base import (
     ExecutionLocation,
@@ -64,10 +64,13 @@ class Project(PhysicalNode):
         structs: (struct column, ((field, member column), ...)) pairs.
             Each struct column takes the place of its first member and
             holds one field per member; the members leave the result.
+        expressions: Value expressions over result rows. None projects
+            source columns and model answers by document ID.
     """
 
     columns: tuple[str, ...] = ()
     structs: tuple = ()
+    expressions: tuple[str | Expression, ...] | None = None
 
     type_name: ClassVar[str] = "quail.project"
     runtime_key: ClassVar[str] = type_name
@@ -163,13 +166,11 @@ class Unnest(PhysicalNode):
     per struct field, named ``<list>.<field>``; the other columns repeat
     for each element. A row returns as many rows as its longest list,
     with nulls past the end of a shorter one; with ``outer``, a row
-    with no elements returns one row of nulls. Each (field column, name)
-    of ``aliases`` returns the field column again under the name.
+    with no elements returns one row of nulls.
     ``columns`` are the output columns in result order.
     """
 
     lists: tuple[str, ...] = ()
-    aliases: tuple[tuple[str, str], ...] = ()
     outer: bool = False
     columns: tuple[str, ...] = ()
 

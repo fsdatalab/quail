@@ -4,6 +4,7 @@ import re
 from collections import Counter
 from enum import StrEnum
 
+import pyarrow as pa
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import OptimizeError
@@ -33,8 +34,9 @@ from quail.frontend.sql_binding.select import (
     _parse_offset,
     bind_order,
 )
-from quail.frontend.sql_binding.unnest import list_fields, take_unnests
+from quail.frontend.sql_binding.unnest import take_unnests
 from quail.logical import (
+    FEATURE_LIST,
     Alias,
     ColumnRef,
     CompileError,
@@ -495,18 +497,11 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
 
     b = ExpressionBinder(catalog, prompts, dialect=dialect.value)
 
-    for names, _, _ in unnests:
-        for name in names:
-            if name in b.unnested:
-                raise CompileError(f"two UNNEST lists are named {name!r}")
-            b.unnested[name] = list_fields()
     joins = JoinBinder(b)
     joins.bind_tables(tree)
-    for name in b.unnested:
-        if name in dict(b.tables):
-            raise CompileError(
-                f"{name!r} is both a table alias and an UNNEST list name; "
-                f"rename one")
+    for names, _, _ in unnests:
+        for name in names:
+            b.scope.add_relation(name, pa.schema(FEATURE_LIST.value_type))
     bind_where(b, tree, joins)
 
     selection = SelectBinder(b).bind(tree)
@@ -571,5 +566,4 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
         unnests=tuple(names for names, _, _ in unnests),
         unnest_outer=tuple(outer for _, _, outer in unnests),
         unnest_tests=tuple(b.unnest_tests),
-        unnest_aliases=tuple(b.unnest_aliases),
     )

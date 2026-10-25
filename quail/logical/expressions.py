@@ -116,7 +116,7 @@ def column_expression(reference: ColumnRef, path: tuple = (),
     return expression if name is None else Alias(expression, name)
 
 
-def evaluate_expression(expression, columns):
+def evaluate_expression(expression, columns, *, qualified: bool = False):
     """Evaluate a value expression over the columns of one table.
 
     Args:
@@ -124,6 +124,7 @@ def evaluate_expression(expression, columns):
             ScalarFunction, and Alias nodes.
         columns: The table, record batch, or scan input the columns come
             from, read with ``column(name)``.
+        qualified: Whether result columns include their table alias.
 
     Raises:
         CompileError: A field does not exist, or a function does not
@@ -132,11 +133,12 @@ def evaluate_expression(expression, columns):
     if isinstance(expression, str):
         return columns.column(expression)
     if isinstance(expression, ColumnRef):
-        return columns.column(expression.column)
+        return columns.column(column_name(expression) if qualified
+                              else expression.column)
     if isinstance(expression, Alias):
-        return evaluate_expression(expression.expression, columns)
+        return evaluate_expression(expression.expression, columns, qualified=qualified)
     if isinstance(expression, GetField):
-        values = evaluate_expression(expression.input, columns)
+        values = evaluate_expression(expression.input, columns, qualified=qualified)
         read = column_name(expression.input)
         if not pa.types.is_struct(values.type):
             raise CompileError(f"{read} has no fields; it is {values.type}")
@@ -145,7 +147,8 @@ def evaluate_expression(expression, columns):
                 f"{read} has no field {expression.field!r}; its fields are "
                 f"{[item.name for item in values.type]}")
         return pc.struct_field(values, expression.field)
-    arguments = [evaluate_expression(argument, columns) for argument in expression.args]
+    arguments = [evaluate_expression(argument, columns, qualified=qualified)
+                 for argument in expression.args]
     try:
         return SCALAR_FUNCTIONS[expression.function](*arguments)
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError,
@@ -203,7 +206,8 @@ def column_name(column, *, qualified: bool = True) -> str:
     if isinstance(column, str):
         return column
     if isinstance(column, ColumnRef):
-        return f"{column.alias}.{column.column}" if qualified else column.column
+        return (f"{column.alias}.{column.column}"
+                if qualified and column.alias else column.column)
     if isinstance(column, GetField):
         return f"{column_name(column.input, qualified=qualified)}.{column.field}"
     if isinstance(column, ScalarFunction):
