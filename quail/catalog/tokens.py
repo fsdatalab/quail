@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail.catalog.selection import group_ids
 from quail.logical.expressions import evaluate_expression
 
 
@@ -431,6 +432,35 @@ class ColumnStore:
         self._resources.close()
 
 
+# each document's first document with the same tokens and, after a
+# colon, the same values in the named row columns
+FIRST_DOCUMENT = "__first_document"
+
+
+def first_document_column(columns=()) -> str:
+    """Name the value column holding each document's first document.
+
+    Args:
+        columns: Row columns a document's first document must also
+            equal it in, such as a filter's stop key.
+    """
+    if not columns:
+        return FIRST_DOCUMENT
+    return f"{FIRST_DOCUMENT}:{','.join(sorted(columns))}"
+
+
+def first_document_columns(name: str) -> tuple[str, ...] | None:
+    """The row columns a first document column name groups by, or None.
+
+    Returns None for a name that is not a first document column.
+    """
+    if name == FIRST_DOCUMENT:
+        return ()
+    if name.startswith(f"{FIRST_DOCUMENT}:"):
+        return tuple(name[len(FIRST_DOCUMENT) + 1:].split(","))
+    return None
+
+
 class TokenStore(Sequence):
     """Provide random token access from one memory mapped Arrow file."""
 
@@ -461,6 +491,7 @@ class TokenStore(Sequence):
             self._lengths = TokenLengths(
                 pa.chunked_array(self._length_batches, type=pa.int64()), self)
             self._prefix_index = None
+            self._first_documents = None
             self._resources = resources.pop_all()
 
     @classmethod
@@ -497,6 +528,38 @@ class TokenStore(Sequence):
         return self._prefix_index
 
     @property
+    def first_documents(self) -> pa.Array:
+        """Return each document's first document with the same tokens, as int32.
+
+        A document whose tokens no earlier document has is its own first.
+        """
+        if self._first_documents is None:
+            self._first_documents = pa.array(
+                self.prefix_index.first_documents, pa.int32())
+        return self._first_documents
+
+    def first_documents_with(self, columns) -> pa.Array:
+        """Each document's first document with its tokens and its row values.
+
+        Args:
+            columns: Arrow arrays, one value per document; two documents
+                share a first document only if they are equal in each.
+        """
+        if not columns:
+            return self.first_documents
+        groups = group_ids([self.first_documents, *columns])
+        first = np.empty(groups.max() + 1, dtype=np.int64)
+        # assigned in reverse, so each group keeps its lowest row
+        first[groups[::-1]] = np.arange(len(groups))[::-1]
+        return pa.array(first[groups], pa.int32())
+
+    @property
+    def num_copies(self) -> int:
+        """Documents whose tokens equal an earlier document's."""
+        first = self.first_documents.to_numpy()
+        return int(np.count_nonzero(first != np.arange(len(first))))
+
+    @property
     def arrow_array(self) -> pa.ChunkedArray:
         """Return the stored token batches without copying their buffers."""
         return pa.chunked_array(
@@ -516,6 +579,7 @@ class TokenStore(Sequence):
     def close(self) -> None:
         """Close the memory mapped Arrow file."""
         self._prefix_index = None
+        self._first_documents = None
         self._resources.close()
 
     def select(self, indices) -> "TokenSelection":
@@ -734,8 +798,13 @@ class PrefixIndex:
             common = _array_common_prefix
         self.order = sorted(range(n), key=keys.__getitem__)
         self.shared = np.zeros(n, dtype=np.int64)
+        # equal keys are equal token sequences, adjacent in the order;
+        # the stable sort puts the lowest position of a run first
+        self.first_documents = np.arange(n, dtype=np.int32)
         # Every document computes its final token, including exact duplicates.
         for previous, index in zip(self.order, self.order[1:]):
+            if keys[index] == keys[previous]:
+                self.first_documents[index] = self.first_documents[previous]
             self.shared[index] = min(common(arrays[previous], arrays[index]),
                                      max(len(arrays[index]) - 1, 0))
         self._trees = {}
