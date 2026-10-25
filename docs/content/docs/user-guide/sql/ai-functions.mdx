@@ -435,6 +435,10 @@ strongest to the weakest. For the request `Hi, I need to cancel one of
 my flights booked on May 17.`, `intent` starts with
 `[{"feature": 7850, "strength": 2.01}, {"feature": 20512, "strength": 1.53}, ...]`.
 
+Strengths are nonnegative activation values, not probabilities. They can
+exceed 1 and are not normalized to sum to 1. A filter such as
+`strength > 1` uses an arbitrary cutoff; 1 has no special meaning.
+
 An `AI.SAE_FEATURES` call in `SELECT` requires a column alias with `AS`.
 The call must be a separate item, rather than part of a larger
 expression.
@@ -468,8 +472,8 @@ in `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates. To give a
 field another name in the result, write `f.feature AS feature_id` in
 `SELECT`. `WHERE` uses the original name.
 
-For example, with the same `tickets` table, count the requests that
-have each feature with a strength above 1:
+For example, with the same `tickets` table, count how many requests
+return each feature:
 
 ```sql
 SELECT f.feature, COUNT(*) AS requests
@@ -477,7 +481,6 @@ FROM tickets t,
      UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
                                    t.request),
                             pooling => 'last')) AS f
-WHERE f.strength > 1
 GROUP BY f.feature
 ORDER BY requests DESC;
 ```

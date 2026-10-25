@@ -225,9 +225,13 @@ table = query.collect()
 `collect()` returns an Arrow table. Its `intent` column has the type
 `list<struct<feature: int32, strength: float>>`.
 
+Strengths are nonnegative activation values, not probabilities. They can
+exceed 1 and are not normalized to sum to 1. A filter such as
+`strength > 1` uses an arbitrary cutoff; 1 has no special meaning.
+
 Call `unnest("intent")` to get one row for each feature, with the columns
-`intent.feature` and `intent.strength`. For example, count the requests
-that have each feature with a strength above 1:
+`intent.feature` and `intent.strength`. For example, count how many
+requests return each feature:
 
 ```python
 from quail.frontend.expressions import count
@@ -238,7 +242,6 @@ query = (
         prompt("{0}\n\nWhat is the customer asking for?", col("t.request")),
         pooling="last", name="intent")
     .unnest("intent")
-    .where(col("intent.strength") > 1)
     .group_by("intent.feature")
     .agg(requests=count())
     .order_by(col("requests").desc())
