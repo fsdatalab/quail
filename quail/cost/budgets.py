@@ -8,7 +8,7 @@ from math import ceil
 from quail.specs import DeviceSpec, ModelSpec
 
 POOL_FRACTION = 0.95    # fraction of device memory the executor claims
-PAGE_TOKENS = 16        # KV arena page size, tokens
+PAGE_TOKENS = 16        # default KV page size; devices may require larger pages
 INT32_MAX = 2**31 - 1
 ACT_BYTES = 2           # bf16 activations, bytes per element
 ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
@@ -45,23 +45,24 @@ def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
     upper = max(0, int(free // (ACT_RESERVE_CHUNKS * model.act_per_token)))
     while lower < upper:
         chunk = (lower + upper + 1) // 2
-        if chunk_memory_bytes(model, chunk) <= available:
+        if chunk_memory_bytes(model, chunk, device.page_tokens) <= available:
             lower = chunk
         else:
             upper = chunk - 1
     return lower
 
 
-def chunk_memory_bytes(model: ModelSpec, chunk_tokens: int) -> float:
+def chunk_memory_bytes(model: ModelSpec, chunk_tokens: int,
+                       page_tokens: int = PAGE_TOKENS) -> float:
     """Return resident weights, activation memory, and checkpoint reservations."""
     return (model.W_resident
             + ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token
-            + checkpoint_memory_bytes(model, chunk_tokens))
+            + checkpoint_memory_bytes(model, chunk_tokens, page_tokens))
 
 
-def pages(tokens: int) -> int:
+def pages(tokens: int, page_tokens: int = PAGE_TOKENS) -> int:
     """Return the KV pages that hold tokens."""
-    return -(-tokens // PAGE_TOKENS)
+    return -(-tokens // page_tokens)
 
 
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
@@ -96,7 +97,7 @@ def _chunk_leaving_kv(model: ModelSpec, device: DeviceSpec, chunk: int) -> int:
     if per > 0:
         chunk = min(chunk, max(1, int(free // per)))
     full, _ = arena_pages(model, device, chunk)
-    while chunk > 1 and full * PAGE_TOKENS < chunk:
+    while chunk > 1 and full * device.page_tokens < chunk:
         chunk -= 1
         full, _ = arena_pages(model, device, chunk)
     return chunk
@@ -140,18 +141,19 @@ INTERMEDIATE_BLOCK_TOKENS = 64
 SPLIT_EXTRA_TOKENS = 64
 
 
-def transient_sliding_pages(chunk_tokens: int, window: int) -> int:
+def transient_sliding_pages(chunk_tokens: int, window: int,
+                            page_tokens: int = PAGE_TOKENS) -> int:
     """Sliding-layer pages one chunk's fresh prefixes take before trimming.
 
     The chunk's rows, plus one page of rounding per document longer
     than the window, of which a chunk holds at most chunk / window.
     """
-    return -(-chunk_tokens // PAGE_TOKENS) + -(-chunk_tokens // window)
+    return pages(chunk_tokens, page_tokens) + -(-chunk_tokens // window)
 
 
-def checkpoint_pages(model: ModelSpec) -> float:
+def checkpoint_pages(model: ModelSpec, page_tokens: int = PAGE_TOKENS) -> float:
     """KV pages of memory one document checkpoint takes."""
-    return model.checkpoint_bytes / (model.kappa * PAGE_TOKENS)
+    return model.checkpoint_bytes / (model.kappa * page_tokens)
 
 
 def checkpoint_pass_bytes(model: ModelSpec, questions: int,
@@ -167,12 +169,13 @@ def checkpoint_pass_bytes(model: ModelSpec, questions: int,
             + buffers * MIB)
 
 
-def execution_pages(chunk_tokens: int) -> int:
+def execution_pages(chunk_tokens: int, page_tokens: int = PAGE_TOKENS) -> int:
     """KV pages kept free for two chunks of execution."""
-    return 2 * -(-chunk_tokens // PAGE_TOKENS)
+    return 2 * pages(chunk_tokens, page_tokens)
 
 
-def checkpoint_memory_bytes(model: ModelSpec, chunk_tokens: int) -> float:
+def checkpoint_memory_bytes(model: ModelSpec, chunk_tokens: int,
+                            page_tokens: int = PAGE_TOKENS) -> float:
     """Return workspace, execution KV, and one retained document's KV and state.
 
     Models without checkpoints reserve zero bytes. A retained document can
@@ -182,10 +185,11 @@ def checkpoint_memory_bytes(model: ModelSpec, chunk_tokens: int) -> float:
     if not model.checkpoint_bytes:
         return 0
     document_tokens = max(chunk_tokens, CHECKPOINT_DEFAULT_DOC_TOKENS)
-    reserved_pages = (execution_pages(chunk_tokens) + pages(document_tokens)
-                      + ceil(checkpoint_pages(model)))
+    reserved_pages = (execution_pages(chunk_tokens, page_tokens)
+                      + pages(document_tokens, page_tokens)
+                      + ceil(checkpoint_pages(model, page_tokens)))
     return (checkpoint_pass_bytes(model, CHECKPOINT_PASS_QUESTIONS, chunk_tokens)
-            + reserved_pages * model.kappa * PAGE_TOKENS)
+            + reserved_pages * model.kappa * page_tokens)
 
 
 def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec,
@@ -199,17 +203,17 @@ def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec,
     free = (arena_bytes(model, device, chunk_tokens)
             - checkpoint_pass_bytes(model, CHECKPOINT_PASS_QUESTIONS,
                                   chunk_tokens))
-    page_bytes = model.kappa * PAGE_TOKENS
-    return int(free // page_bytes) - execution_pages(chunk_tokens)
+    page_bytes = model.kappa * device.page_tokens
+    return int(free // page_bytes) - execution_pages(chunk_tokens, device.page_tokens)
 
 
 def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
                      kv_pages: int) -> int:
     """Checkpoints the pool holds beside an arena of `kv_pages`; 0 without them."""
-    pages = checkpoint_pages(model)
+    pages = checkpoint_pages(model, device.page_tokens)
     if not pages:
         return 0
-    retained = kv_pages - execution_pages(chunk_tokens)
+    retained = kv_pages - execution_pages(chunk_tokens, device.page_tokens)
     return max(0, int((hybrid_pool_pages(model, device, chunk_tokens)
                        - retained) // pages))
 
@@ -218,15 +222,15 @@ def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
                        mean_document_tokens: float | None) -> int:
     """Arena KV pages: two chunks of execution plus the retained KV.
 
-    A retained document of `l` tokens costs ceil(l / 16) KV pages plus
+    A retained document of `l` tokens costs ceil(l / page_tokens) KV pages plus
     its checkpoint, so the pool holds floor(pool / that) documents, and
     the KV the checkpoints leave is retained KV.
     """
     mean = CHECKPOINT_DEFAULT_DOC_TOKENS if mean_document_tokens is None else max(
         1.0, mean_document_tokens)
     pool = hybrid_pool_pages(model, device, chunk_tokens)
-    ckpt = checkpoint_pages(model)
-    slots = int(pool // (-(-mean // PAGE_TOKENS) + ckpt))
+    ckpt = checkpoint_pages(model, device.page_tokens)
+    slots = int(pool // (pages(mean, device.page_tokens) + ckpt))
     kv_pages = int(pool - slots * ckpt)
     if kv_pages <= 0:
         raise ValueError("the pool cannot hold one chunk's KV beside a checkpoint")
@@ -234,7 +238,7 @@ def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
         raise ValueError(
             f"the pool holds no checkpoint of {ckpt:.1f} pages beside a "
             f"document of {mean:.0f} tokens")
-    return kv_pages + execution_pages(chunk_tokens)
+    return kv_pages + execution_pages(chunk_tokens, device.page_tokens)
 
 
 def arena_pages(model: ModelSpec, device: DeviceSpec,
@@ -260,8 +264,8 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
         return hybrid_arena_pages(model, device, chunk_tokens,
                                   mean_document_tokens), 0
     free = arena_bytes(model, device, chunk_tokens)
-    page_bytes_full = model.kappa_full * PAGE_TOKENS
-    page_bytes_sliding = model.kappa_sliding * PAGE_TOKENS
+    page_bytes_full = model.kappa_full * device.page_tokens
+    page_bytes_sliding = model.kappa_sliding * device.page_tokens
     if not page_bytes_sliding:
         return int(free // page_bytes_full), 0
     window = model.sliding_window
@@ -270,7 +274,7 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
                 / (mean + SPLIT_EXTRA_TOKENS))
     full = int(free // (page_bytes_full + ratio * page_bytes_sliding))
     sliding = int(full * ratio)
-    floor = transient_sliding_pages(chunk_tokens, window)
+    floor = transient_sliding_pages(chunk_tokens, window, device.page_tokens)
     if sliding < floor:
         sliding = floor
         full = int((free - sliding * page_bytes_sliding) // page_bytes_full)
@@ -289,7 +293,7 @@ def arena_tokens(model: ModelSpec, device: DeviceSpec,
     every-token pool; see arena_pages.
     """
     full, _ = arena_pages(model, device, chunk_tokens, mean_document_tokens)
-    return full * PAGE_TOKENS
+    return full * device.page_tokens
 
 
 # ---- roofline arithmetic

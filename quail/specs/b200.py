@@ -26,4 +26,5 @@ B200 = DeviceSpec(
     price_source="https://modal.com/pricing",
     cuda_name="B200",
     modal_gpu="B200",
+    page_tokens=128,
 )

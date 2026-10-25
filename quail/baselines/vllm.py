@@ -321,6 +321,8 @@ class VLLMEngine:
         if speculative:
             kwargs["speculative_config"] = speculative_config(speculative)
         kwargs.update(diffusion_kwargs(spec))
+        if device is not None:
+            kwargs["block_size"] = device.page_tokens
         kwargs.update(text_only_kwargs(spec))
         return kwargs
 

@@ -288,6 +288,8 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
     assert "diffusion_config" not in qwen
     assert qwen["gpu_memory_utilization"] == 0.91
     assert qwen["max_model_len"] == -1
+    assert qwen["block_size"] == 16
+    assert engine.llm_kwargs(QWEN3_4B_FP8, B200)["block_size"] == 128
     assert engine.llm_kwargs(QWEN3_4B_FP8, B200)[
         "gpu_memory_utilization"] == 0.91
     l40s_util = engine.llm_kwargs(QWEN3_4B_FP8, L40S)["gpu_memory_utilization"]

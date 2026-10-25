@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from quail.cost.budgets import checkpoint_pages
+from quail.cost.budgets import checkpoint_pages, execution_pages
 from quail.cost.dense_decoder_cost import attention_pair_flops
 from quail.cost.sol import compute_seconds
 from quail.cost.work import Work, triangle
@@ -33,7 +33,7 @@ class RetentionPolicy:
 def retention_pages(arena_tokens: int, chunk_tokens: int, page_tokens: int) -> int:
     """Reserve two execution chunks before allocating retained pages."""
     return max(0, arena_tokens // page_tokens
-               - -(-2 * chunk_tokens // page_tokens))
+               - execution_pages(chunk_tokens, page_tokens))
 
 
 def coefficients(model, device) -> dict:
@@ -48,5 +48,5 @@ def coefficients(model, device) -> dict:
         "sliding_window": model.sliding_window,
     }
     if model.state_layers:
-        config["checkpoint_pages"] = checkpoint_pages(model)
+        config["checkpoint_pages"] = checkpoint_pages(model, device.page_tokens)
     return config

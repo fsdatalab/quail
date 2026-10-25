@@ -81,10 +81,11 @@ def test_filter_and_join_plan_on_l40s_and_b200(tmp_path):
 
 
 @pytest.mark.parametrize("device", ("l40s", "b200"))
-def test_hybrid_filter_plans_with_fp32_convolution_cost(tmp_path, device):
+@pytest.mark.parametrize("model", ("qwen3.5-4b-fp8", "qwen3.8-27b-fp8"))
+def test_hybrid_filter_plans_with_fp32_convolution_cost(tmp_path, device, model):
     _standin_filter_and_join(tmp_path)
     with quail.Session(
-        EngineConfig(model="qwen3.5-4b-fp8", device=device),
+        EngineConfig(model=model, device=device),
         tokenizer=letter_tokens,
     ) as sess:
         register_tables(sess, tmp_path)

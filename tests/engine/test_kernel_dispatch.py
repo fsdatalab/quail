@@ -142,7 +142,9 @@ def test_b200_head_256_requests_a_single_split(monkeypatch):
     engine = Engine.__new__(Engine)
     engine.fa_version = 4
     wide = SimpleNamespace(shape=(4, 128, 8, 256))
-    engine._fa(wide, wide, wide, None, None, 8, 128, True)
+    engine._fa(wide, wide, wide, None, None, 8, 129, True,
+               block_table=object())
+    assert recorded["max_seqlen_k"] == 256
     assert recorded["fa_version"] == 4
     assert recorded["num_splits"] == 1
 

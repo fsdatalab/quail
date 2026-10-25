@@ -82,6 +82,7 @@ compute rates. Quail represents it with `DeviceSpec`.
 | `usd_per_hour` | Modal GPU-only hourly price. |
 | `cuda_name` | Substring of `torch.cuda.get_device_name`. |
 | `modal_gpu` | Modal `gpu=` string, such as `H100!`. |
+| `page_tokens` | Tokens per KV page. The default is 16; B200 uses 128 for FA4. |
 
 All values describe one GPU. All three compute rates are required and
 must be positive. Use rates without structured sparsity. The

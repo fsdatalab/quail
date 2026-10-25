@@ -30,4 +30,4 @@ def arena_capacity(context, chunk: int) -> int:
     full, _ = pool_split(context.model, context.device, chunk, (
         summarize_alias(lengths, window, memo=context.memo)
         for lengths in context.document_tokens.values()))
-    return full * budgets.PAGE_TOKENS
+    return full * context.device.page_tokens

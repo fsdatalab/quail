@@ -19,7 +19,7 @@ from quail.progress import Progress, logger, quiet
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass.
-WARMUP_VERSION = 9
+WARMUP_VERSION = 10
 
 # Triton compiles one copy of a kernel for each class of its integer
 # arguments: equal to 1, a multiple of 16, or neither. Quail's row

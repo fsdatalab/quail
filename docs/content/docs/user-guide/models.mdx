@@ -42,6 +42,9 @@ document. See the
 `modal_gpu_type(device)` from `quail.specs`. See
 [Configuration](/docs/user-guide/configuration).
 
+L40S does not support DiffusionGemma, Qwen3.5, or Qwen3.8. Quail rejects
+these model and GPU combinations during planning.
+
 ## Configure a session
 
 For example, this session runs Qwen3 4B on one H100 SXM. Use

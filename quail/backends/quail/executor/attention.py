@@ -28,10 +28,6 @@ GROUP = 128            # fp8 quant group size, matches the engine
 # FlashAttention 3's widest head; wider heads run FlashAttention 4,
 # whose Hopper build takes heads up to 512, over arena pages.
 FA_MAX_HEAD_DIM = 256
-# Blackwell's dedicated head-256 kernel reads paged KV one 128-token
-# tile at a time. The arena page stays 16 tokens.
-FA4_HEAD_DIM = 256
-FA4_PAGE_TOKENS = 128
 
 # The two attention paths a chunk can run. "unified" is one causal
 # paged call in which every row reads the KV its own document needs.
@@ -60,64 +56,6 @@ def flash_attention_version(capability: tuple[int, int]) -> int:
     if capability == (12, 0):
         return 2
     raise ValueError(f"Quail does not support CUDA capability {capability}")
-
-
-def regroup_block_pages(block_pages, used, page_tokens,
-                        target=FA4_PAGE_TOKENS):
-    """Group block-table pages into pages of `target` tokens.
-
-    Args:
-        block_pages: Page ids per sequence, in logical order.
-        used: Resident tokens per sequence.
-        page_tokens: Tokens in each page of block_pages.
-        target: Tokens in each returned page.
-
-    Returns:
-        A tuple (pages, copies, num_pages, max_k). pages is the new
-        block table, every row padded to max_k // target entries.
-        copies is (destination page, source page, group index), the
-        source page's place inside that destination page. max_k is a
-        multiple of target.
-
-    Raises:
-        ValueError: page_tokens does not divide target, or a sequence
-            names fewer pages than its token count needs.
-    """
-    if target % page_tokens:
-        raise ValueError(
-            f"FlashAttention 4 head {FA4_HEAD_DIM} pages are {target} "
-            f"tokens; {page_tokens}-token pages do not divide that")
-    group = target // page_tokens
-    copies = []
-    pages = []
-    next_page = 0
-    max_tokens = 0
-    for row, tokens in zip(block_pages, used, strict=True):
-        tokens = int(tokens)
-        max_tokens = max(max_tokens, tokens)
-        if tokens <= 0:
-            pages.append([])
-            continue
-        src_used = (tokens + page_tokens - 1) // page_tokens
-        if src_used > len(row):
-            raise ValueError(
-                f"a sequence of {tokens} tokens needs {src_used} pages, "
-                f"and the block table has {len(row)}")
-        row_pages = []
-        for block in range((tokens + target - 1) // target):
-            row_pages.append(next_page)
-            for group_index in range(group):
-                src_index = block * group + group_index
-                if src_index >= src_used:
-                    break
-                copies.append((next_page, int(row[src_index]), group_index))
-            next_page += 1
-        pages.append(row_pages)
-    max_k = target if max_tokens == 0 else (
-        (max_tokens + target - 1) // target) * target
-    width = max_k // target
-    padded = [row + [0] * (width - len(row)) for row in pages]
-    return padded, copies, next_page, max_k
 
 
 def deep_gemm_supported(capability: tuple[int, int]) -> bool:
@@ -951,91 +889,27 @@ class Engine:
 
     # ---- attention: the two workload paths --------------------------
 
-    def _fa4_hd256_pages(self, k, version, block_table) -> bool:
-        """Whether this paged call is the head-256 FlashAttention 4 kernel."""
-        shape = getattr(k, "shape", None)
-        return (block_table is not None and version == 4
-                and shape is not None and len(shape) == 4
-                and shape[-1] == FA4_HEAD_DIM
-                and shape[1] != FA4_PAGE_TOKENS)
-
-    def _pack_fa4_hd256_kv(self, k, v, block_table, seqused_k):
-        """Gather 16-token arena pages into the 128-token pages FA4 reads.
-
-        Arena pages are not contiguous, so one kernel page is a copy of
-        eight arena pages in block-table order. seqused_k stays in tokens.
-
-        Args:
-            k: Key pool, (pages, page tokens, KV heads, head dim).
-            v: Value pool, same shape as k.
-            block_table: Page ids per sequence.
-            seqused_k: Resident tokens per sequence.
-
-        Returns:
-            Packed keys, packed values, the 128-token block table, and
-            max_k rounded up to a multiple of 128.
-        """
-        torch = self.torch
-        page_tokens = k.shape[1]
-        block_pages = block_table.detach().to("cpu").tolist()
-        used = [int(tokens) for tokens
-                in seqused_k.detach().to("cpu").tolist()]
-        pages, copies, num_pages, max_k = regroup_block_pages(
-            block_pages, used, page_tokens)
-        if num_pages == 0:
-            num_pages = 1
-        heads, dim = k.shape[2], k.shape[3]
-        packed_k = torch.zeros(
-            (num_pages, FA4_PAGE_TOKENS, heads, dim),
-            dtype=k.dtype, device=k.device)
-        packed_v = torch.zeros(
-            (num_pages, FA4_PAGE_TOKENS, heads, dim),
-            dtype=v.dtype, device=v.device)
-        if copies:
-            destination = torch.tensor(
-                [item[0] for item in copies], dtype=torch.long,
-                device=k.device)
-            source = torch.tensor(
-                [item[1] for item in copies], dtype=torch.long,
-                device=k.device)
-            group_index = torch.tensor(
-                [item[2] for item in copies], dtype=torch.long,
-                device=k.device)
-            for index in range(FA4_PAGE_TOKENS // page_tokens):
-                pick = group_index == index
-                if not pick.any():
-                    continue
-                start = index * page_tokens
-                chosen = destination[pick]
-                packed_k[chosen, start:start + page_tokens] = k[source[pick]]
-                packed_v[chosen, start:start + page_tokens] = v[source[pick]]
-        width = max_k // FA4_PAGE_TOKENS
-        flat = [page_id for row in pages for page_id in row]
-        packed_table = torch.tensor(
-            flat, dtype=torch.int32, device=block_table.device).view(
-                len(pages), width)
-        return packed_k, packed_v, packed_table, max_k
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None, softmax_scale=None,
             window=None, version=None):
         # LSE comes back as [heads, total_queries] for the merge kernel.
-        # The head-256 FA4 kernel is the one call that cannot read a
-        # 16-token arena page. num_splits=0 asks vLLM's heuristic, and
-        # that kernel rejects the SplitKV the heuristic can select.
+        # Blackwell's head-256 FA4 kernel rejects the SplitKV that
+        # num_splits=0 can select.
         from vllm.vllm_flash_attn import flash_attn_varlen_func
         version = version or self.fa_version
-        if self._fa4_hd256_pages(k, version, block_table):
-            k, v, block_table, max_k = self._pack_fa4_hd256_kv(
-                k, v, block_table, seqused_k)
         extra = {}
         if softmax_scale is not None:
             extra["softmax_scale"] = softmax_scale
         if window is not None:
             extra["window_size"] = list(window)
         shape = getattr(k, "shape", None)
-        if version == 4 and shape is not None and shape[-1] == FA4_HEAD_DIM:
+        if version == 4 and shape is not None and shape[-1] == 256:
             extra["num_splits"] = 1
+            if block_table is not None:
+                # FA4 requires a page-aligned bound; seqused_k masks padding.
+                page_tokens = k.shape[1]
+                max_k = -(-max_k // page_tokens) * page_tokens
         return flash_attn_varlen_func(
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
             max_seqlen_k=max_k, cu_seqlens_k=cu_k,

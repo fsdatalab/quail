@@ -339,6 +339,7 @@ class DeviceSpec:
     price_source: str = ""       # where usd_per_hour was read from
     cuda_name: str = ""          # substring of torch.cuda.get_device_name
     modal_gpu: str = ""          # Modal gpu= string, such as "H100!"
+    page_tokens: int = 16    # tokens per KV page required by the attention kernel
     mamf_fp8_flops: float = 0.0    # 0 uses the specification rate
     mamf_bf16_flops: float = 0.0
 
