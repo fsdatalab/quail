@@ -83,6 +83,37 @@ def _chunk_log(records: list):
     return run_one
 
 
+def _replay_log(records: list):
+    """Return a decode-graph forward that records each chunk's rows and bucket."""
+    from quail.backends.quail.executor.cuda_graphs import DecodeGraphs
+
+    original = DecodeGraphs.forward
+
+    def forward(self, chunk):
+        reads = chunk.meta.get("reads") or {}
+        records.append((chunk.tokens, self.config.bucket(chunk.tokens)
+                        if self.supports(chunk) else None,
+                        chunk.meta.get("max_a"), reads.get("max_q"),
+                        reads.get("max_used"),
+                        None if reads.get("table") is None else reads["table"].shape,
+                        None if reads.get("used") is None else reads["used"].numel()))
+        return original(self, chunk)
+
+    return forward
+
+
+def _print_replay_log(records: list) -> None:
+    """Print how many chunks replayed each bucket, and a few chunks' shapes."""
+    from collections import Counter
+
+    buckets = Counter(record[1] for record in records)
+    print("replays by bucket (None ran eager):",
+          dict(sorted(buckets.items(), key=lambda item: (item[0] is None, item[0]))))
+    for record in records[20:26]:
+        print("  chunk tokens, bucket, max_a, max_q, max_used, table, sequences:",
+              record)
+
+
 def _print_chunk_log(records: list) -> None:
     """Print the chunks by token count: how many, their groups, prefills, GPU ms."""
     import numpy as np
@@ -143,11 +174,16 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
         import torch
         from torch.profiler import ProfilerActivity
 
+        replays = []
         patched = mock.patch(
             "quail.backends.quail.executor.stage_executor.StageExecutor._run_one",
             _chunk_log(records))
-        with patched, torch.profiler.profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as trace:
+        replayed = mock.patch(
+            "quail.backends.quail.executor.cuda_graphs.DecodeGraphs.forward",
+            _replay_log(replays))
+        with patched, replayed, torch.profiler.profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True) as trace:
             result = query.run(plan=plan)
     else:
         result = query.run(plan=plan)
@@ -160,9 +196,17 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
         stats.sort_stats("cumtime").print_stats("quail/", 60)
     if profile_gpu:
         _print_chunk_log(records)
+        _print_replay_log(replays)
         print(trace.key_averages().table(sort_by="self_device_time_total",
                                          row_limit=45, max_name_column_width=90),
               flush=True)
+        by_shape = trace.key_averages(group_by_input_shape=True)
+        attention = [row for row in by_shape if "fa3" in row.key]
+        attention.sort(key=lambda row: -row.device_time_total)
+        for row in attention[:12]:
+            print(f"fa3 {row.key}: {row.count} calls, "
+                  f"{row.device_time_total / max(row.count, 1):.0f} us each, "
+                  f"shapes {row.input_shapes}", flush=True)
     report = result.report
     inference = report.get("backend_metrics", {}).get("inferences", [{}])
     answers = result.collect().column("answer").to_pylist()
