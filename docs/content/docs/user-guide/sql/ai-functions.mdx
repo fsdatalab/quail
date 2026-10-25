@@ -500,6 +500,8 @@ A `WHERE` test of a feature field compares the field with literals.
   `AI.CLASSIFY`, or `AI.EXTRACT`.
 - `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the feature list.
   Use the fields of an `UNNEST` instead.
+- `UNNEST` reads `AI.SAE_FEATURES` calls only, as a cross join:
+  `FROM t, UNNEST(...) AS f`.
 
 For the Python form, see
 [`ai_sae_features()`](/docs/user-guide/python-api/ai-functions#ai_sae_features).

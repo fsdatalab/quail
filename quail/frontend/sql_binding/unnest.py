@@ -30,13 +30,21 @@ def take_unnests(tree: exp.Select) -> tuple[tuple[tuple[str, ...], tuple], ...]:
         order.
 
     Raises:
-        CompileError: An UNNEST reads anything but AI.SAE_FEATURES
-            calls, or does not name each list.
+        CompileError: An UNNEST is an outer join, has an ON condition or
+            WITH ORDINALITY, reads anything but AI.SAE_FEATURES calls, or
+            does not name each list.
     """
     taken = []
     for join in [join for join in tree.args.get("joins") or ()
                  if isinstance(join.this, exp.Unnest)]:
         unnest = join.this
+        if join.side or join.args.get("on") or join.args.get("using"):
+            raise CompileError(
+                f"UNNEST is a cross join: write FROM t, UNNEST(...) AS f; "
+                f"{join.sql()} is not supported")
+        if unnest.args.get("offset"):
+            raise CompileError(
+                "UNNEST ... WITH ORDINALITY or WITH OFFSET is not supported")
         calls = tuple(unnest.expressions)
         if not calls or not all(
                 isinstance(call, exp.Anonymous)

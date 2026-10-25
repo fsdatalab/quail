@@ -13,6 +13,7 @@ from quail.logical import CompileError
 from quail.logical.prompts import bind_sae_features_prompt
 from quail.physical import AiSaeFeatures, decode_graph, encode_graph
 from quail.planner.plan import EngineConfig, Refusal
+from quail.planner.rules.logical import ShouldLiftMaps
 from quail.specs import MODELS, QWEN3_5_2B_SAE_BF16
 
 QUESTION = "{0}\n\nWhat is this review about?"
@@ -330,6 +331,10 @@ def test_unnest_needs_named_feature_lists_and_their_fields(session):
                       f"WHERE f.strength > r.id",
         "alias taken": f"SELECT f.feature FROM reviews f, "
                        f"{UNNEST.replace('r.body', 'f.body')}",
+        "outer join": f"SELECT r.id FROM reviews r LEFT JOIN "
+                      f"{UNNEST} ON TRUE",
+        "ordinality": f"SELECT r.id FROM reviews r, "
+                      f"{UNNEST.replace(' AS f', ' WITH ORDINALITY AS f')}",
     }
     for name, sql in bad.items():
         with pytest.raises(CompileError):
@@ -378,3 +383,18 @@ def test_a_cte_returns_two_zipped_lists_under_their_select_names(session):
     rows = finish(query, _two_lists_oracle()).collect()
     assert [tuple(row.values()) for row in rows.to_pylist()] == [
         (9, 1, 1), (9, 100, None)]
+
+
+def test_every_plan_the_rules_offer_keeps_each_filter_on_a_field(session):
+    query = session.sql(
+        f"SELECT r.id, f.feature FROM reviews r, {UNNEST} "
+        f"WHERE f.strength > 0.6 AND f.feature < 2")
+    root = query.logical.root
+    for candidate in ShouldLiftMaps().rewrites(root, None):
+        conditions = sorted(str(node.condition) for node in
+                            quail.logical.LogicalPlan(candidate).walk()
+                            if isinstance(node, quail.logical.Filter))
+        assert conditions == ["f.feature < 2", "f.strength > 0.6"]
+    rows = finish(query, _unnest_oracle()).collect()
+    assert rows.to_pylist() == [{"r.id": 7, "f.feature": 0},
+                                {"r.id": 9, "f.feature": 1}]
