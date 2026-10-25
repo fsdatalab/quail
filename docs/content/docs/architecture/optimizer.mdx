@@ -334,7 +334,7 @@ The `should_share_prefixes` rule enables [prefix sharing](/docs/architecture/kv#
 when the estimated compute savings exceed the additional KV write time:
 
 ```text
-saved_seconds = shared_tokens * 2 * model.params / device.peak_flops
+saved_seconds = shared_tokens * 2 * model.params / device.fp8_flops
 write_seconds = total_tokens * model.kappa / device.hbm_bw
 ```
 
@@ -343,7 +343,7 @@ write_seconds = total_tokens * model.kappa / device.hbm_bw
 | `shared_tokens` | Prefix token positions whose computation can be reused, counting complete KV pages only. |
 | `total_tokens` | Document token positions processed by the operator. |
 | `model.params` | Number of model parameters. The formula assumes about two floating-point operations per parameter per token. |
-| `device.peak_flops` | Peak FP8 operations per second. |
+| `device.fp8_flops` | Peak FP8 operations per second. |
 | `model.kappa` | KV bytes per token across all layers. |
 | `device.hbm_bw` | GPU memory bandwidth in bytes per second. |
 

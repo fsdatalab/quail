@@ -76,7 +76,7 @@ compute rates. Quail represents it with `DeviceSpec`.
 | `name` | The name used in `EngineConfig.device`. |
 | `mem_bytes` | GPU memory capacity in bytes. |
 | `hbm_bw` | GPU memory bandwidth in bytes per second. |
-| `peak_flops` | Peak dense FP8 operations per second. |
+| `fp8_flops` | Peak dense FP8 operations per second. |
 | `bf16_flops` | Peak dense BF16 operations per second. |
 
 All values describe one GPU. Use compute rates without structured
@@ -86,7 +86,7 @@ is a complete example.
 
 Register a new specification with `registry.register_device(spec)`.
 The backend must accept its device name and provide compatible execution
-code. The Quail backend currently accepts `h100-sxm` and
+code. The Quail backend currently accepts `h100-sxm`, `l40s`, `b200`, and
 `rtx-pro-6000-blackwell-server`. Its checks are in
 [`backend.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/backend.py).
 

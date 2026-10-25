@@ -19,6 +19,7 @@ QWEN3_4B_FP8 = ModelSpec(
     vocab=151_936,
     tied_head=True,        # lm_head shares the embedding tensor, so
     #                        nothing moves off the GPU at load
+    vllm_reserve_bytes=6 * 1024**3,
     turn_prefix=QWEN3_TURN_PREFIX,
     turn_suffix=QWEN3_TURN_SUFFIX,
     prompt_format=QWEN3_PROMPT_FORMAT,

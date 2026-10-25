@@ -273,6 +273,28 @@ def score_input_tokens(spec, context) -> tuple[int, int]:
     return prefix, longest[1] + len(parts[2]) + canvas
 
 
+def attention_device_refusal(model, device):
+    """Return a refusal when this GPU cannot run the model's attention.
+
+    The L40S attention path does not support DiffusionGemma or
+    the Qwen3.5 architecture, which Qwen3.8 also uses.
+    """
+    if device.name != "l40s":
+        return None
+    if model.arch not in {"diffusion_gemma", "qwen3_5"}:
+        return None
+    return Refusal(
+        reasons=(
+            f"{model.name} does not run on {device.name}: "
+            "FlashAttention 4 does not run on this GPU",
+        ),
+        constraint="flash_attention_4_unsupported",
+        needed=4,
+        available=2,
+        unit="version",
+    )
+
+
 def validate_query(plan, operators, context, model, device, gpus):
     """Return a refusal for unsupported inference or hardware requirements."""
     labels, applies = operators.labels, operators.applies
@@ -321,6 +343,9 @@ def validate_query(plan, operators, context, model, device, gpus):
             f"each apply() needs its own name; {names} repeat one")
     if any(len(group) > 1 for group in join_applies.values()):
         raise CompileError("a join takes one apply() returning pairs")
+    refusal = attention_device_refusal(model, device)
+    if refusal is not None:
+        return refusal
     weight_gpus = budgets.minimum_weight_gpus(model, device)
     if weight_gpus > 1:
         return Refusal(
@@ -330,7 +355,7 @@ def validate_query(plan, operators, context, model, device, gpus):
             ),
             constraint="weights_need_more_cards",
             needed=weight_gpus, available=1, unit="cards")
-    needed = budgets.chunk_memory_bytes(model, 1)
+    needed = budgets.chunk_memory_bytes(model, 1, device.page_tokens)
     available = device.mem_bytes * budgets.POOL_FRACTION
     if needed > available:
         return Refusal(
@@ -341,4 +366,18 @@ def validate_query(plan, operators, context, model, device, gpus):
             ),
             constraint="execution_needs_more_memory",
             needed=needed, available=available, unit="bytes")
+    if not budgets.sliding_kv_fits(model, device):
+        chunk = budgets.chunk_budget(model, device)
+        free = budgets.arena_bytes(model, device, chunk)
+        floor = budgets.transient_sliding_pages(
+            chunk, model.sliding_window, device.page_tokens)
+        needed = floor * model.kappa_sliding * device.page_tokens
+        return Refusal(
+            reasons=(
+                f"{model.name} does not fit {device.name}: a "
+                f"{chunk}-token chunk's sliding KV exceeds leftover "
+                f"GPU memory",
+            ),
+            constraint="sliding_kv_needs_more_memory",
+            needed=needed, available=max(0.0, free), unit="bytes")
     return None

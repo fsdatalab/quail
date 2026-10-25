@@ -260,11 +260,6 @@ class ChooseClassifyImplementation(PhysicalRule):
             graph.root)
 
 
-def page_aligned_shared_tokens(store) -> int:
-    """Tokens a prefix tree over the store saves in whole KV pages."""
-    return page_tree(store).shared_tokens
-
-
 def filter_attention(model, device, store, lengths, question_tokens: int) -> str:
     """The attention path for a filter whose documents share prefixes.
 
@@ -272,7 +267,7 @@ def filter_attention(model, device, store, lengths, question_tokens: int) -> str
     readers; each reads with its own tokens plus the question. The
     path that wins on the most borrowed tokens wins the filter.
     """
-    tree = page_tree(store)
+    tree = page_tree(store, device.page_tokens)
     votes = {"tree": 0, "unified": 0}
     for shared, readers, rows in zip(*tree.reader_groups(lengths)):
         path = choose_attention_path(
@@ -349,7 +344,8 @@ class ShouldSharePrefixes(PhysicalRule):
                 nodes.append(node)
                 continue
             if alias not in shared_by_alias:
-                shared_by_alias[alias] = page_aligned_shared_tokens(store)
+                shared_by_alias[alias] = page_tree(
+                    store, context.device.page_tokens).shared_tokens
             shared = shared_by_alias[alias]
             writes_pages = (node.arena_writes if isinstance(node, AiFilter)
                             else not isinstance(node, AiScore))

@@ -94,7 +94,7 @@ class LoadedGpu:
         self.device = device
         self.arena = KVArena(num_layers=spec.layers,
                              num_pages=full_pages,
-                             page_tokens=budgets.PAGE_TOKENS,
+                             page_tokens=device.page_tokens,
                              num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,
                              dtype=torch.bfloat16,
                              layer_kv=spec.kv_shapes,

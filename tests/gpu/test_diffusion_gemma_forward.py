@@ -90,6 +90,12 @@ def test_expert_fusions_preserve_quantization(rows):
     torch.testing.assert_close(actual_scales, scales, rtol=0, atol=0)
 
 
+def _device():
+    from quail.specs import B200, H100_SXM
+
+    return B200 if torch.cuda.get_device_capability()[0] == 10 else H100_SXM
+
+
 def _prompt_ids():
     from gigatoken import Tokenizer
 
@@ -131,7 +137,11 @@ def stock_rows_main(out_path, every_layer=False):
     spec = MODELS[MODEL]
     assert spec.canvas_tokens == 1
     with diffusion_canvas(spec):
+        # vLLM uses 64-token hybrid KV groups, which FA4 head-256 rejects.
         llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
+                  block_size=_device().page_tokens,
+                  attention_config=({"backend": "TRITON_ATTN"}
+                                    if _device().name == "b200" else {}),
                   enforce_eager=True, enable_prefix_caching=False,
                   diffusion_config={"canvas_length": 1, "max_denoising_steps": 1},
                   disable_log_stats=True)
@@ -190,14 +200,14 @@ def quail(prompts, stock_layers):
     from quail.backends.quail.executor.chunk import pack_chunk
     from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
-    from quail.cost.budgets import PAGE_TOKENS
     from quail.specs import MODELS
 
+    device = _device()
     spec = MODELS[MODEL]
     model = load_model(spec.hf_name, max_batched_tokens=8192,
                        moe_backend=spec.moe_backend)
     arena = KVArena(num_layers=spec.layers, num_pages=2048,
-                    page_tokens=PAGE_TOKENS, num_kv_heads=spec.num_kv_heads,
+                    page_tokens=device.page_tokens, num_kv_heads=spec.num_kv_heads,
                     d_head=spec.d_head, dtype=torch.bfloat16,
                     layer_kv=spec.kv_shapes,
                     sliding_layers=spec.sliding_layer_set,
@@ -290,6 +300,102 @@ def test_answers_agree_with_stock_vllm(stock_layers, quail):
           [(round(a, 2), round(b, 2)) for a, b in margins])
     agree = sum((a > 0) == (b > 0) for a, b in margins)
     assert agree == len(margins)
+
+
+def test_b200_attention_keeps_shared_kv_within_the_memory_budget():
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires Blackwell FA4")
+    from quail.backends.quail.executor.attention import Engine
+    from quail.specs import B200
+
+    page_tokens = B200.page_tokens
+    prefix, readers, suffix = 8192, 1024, 32
+    prefix_pages = prefix // page_tokens
+    torch.manual_seed(7)
+    k = torch.randn(prefix_pages + readers, page_tokens, 8, 256,
+                    dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    q = torch.randn(readers * suffix, 16, 256,
+                    dtype=torch.bfloat16, device="cuda")
+    table = torch.cat((
+        torch.arange(prefix_pages, device="cuda").expand(readers, -1),
+        torch.arange(prefix_pages, prefix_pages + readers, device="cuda")[:, None],
+    ), dim=1).int()
+    used = torch.full((readers,), prefix + suffix, dtype=torch.int32, device="cuda")
+    cu_q = torch.arange(readers + 1, dtype=torch.int32, device="cuda") * suffix
+    engine = Engine.__new__(Engine)
+    engine.torch = torch
+    engine.fa_version = 4
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    out = engine._paged(q, k, v, cu_q, suffix, used, prefix + suffix, table,
+                         causal=True, window=(1023, 0))
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - before < 2 * 2**30
+    assert torch.isfinite(out).all()
+    keys = k[table[0].long()].flatten(0, 1)[prefix + suffix - 1024:prefix + suffix]
+    values = v[table[0].long()].flatten(0, 1)[prefix + suffix - 1024:prefix + suffix]
+    keys = keys.float().repeat_interleave(2, dim=1)
+    values = values.float().repeat_interleave(2, dim=1)
+    scores = torch.einsum("hd,khd->hk", q[suffix - 1].float(), keys) / 16
+    expected = torch.einsum("hk,khd->hd", scores.softmax(-1), values)
+    torch.testing.assert_close(out[suffix - 1].float(), expected, atol=0.003, rtol=0.02)
+
+
+def test_b200_full_attention_reads_shared_and_partial_pages():
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires B200 FlashInfer")
+    from quail.backends.quail.executor.attention import Engine
+
+    torch.manual_seed(15)
+    k = torch.randn(5, 128, 2, 512, device="cuda", dtype=torch.bfloat16) * 0.2
+    v = torch.randn_like(k)
+    q = torch.randn(50, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.2
+    engine = Engine.__new__(Engine)
+    engine.torch, engine.fa_version = torch, 4
+    cases = []
+    for causal in (True, False):
+        for lengths in ([50], [17, 33], [33, 17], [1, 49]) * 2:
+            metadata = dict(
+                cu_q_host=[0, *torch.tensor(lengths).cumsum(0).tolist()],
+                used_host=[256 + length for length in lengths],
+                page_rows=[[1, 0, 2 + row, 4] for row in range(len(lengths))])
+            table = torch.tensor(metadata["page_rows"], dtype=torch.int32,
+                                 device="cuda")
+            used = torch.tensor(metadata["used_host"], dtype=torch.int32,
+                                device="cuda")
+            cu_q = torch.tensor(metadata["cu_q_host"], dtype=torch.int32,
+                                device="cuda")
+            cases.append((metadata, table, used, cu_q, causal, max(lengths)))
+    pending = []
+    for delayed in (False, True):
+        for metadata, table, used, cu_q, causal, max_q in cases:
+            # Delay uploads so the next batch can plan before they finish.
+            if delayed:
+                torch.cuda._sleep(20_000_000)
+            actual = engine._paged(
+                q, k, v, cu_q, max_q, used, max(metadata["used_host"]), table,
+                causal=causal, softmax_scale=1.0, metadata=metadata)
+            if delayed:
+                pending.append((actual, metadata, table, causal))
+        torch.cuda.synchronize()
+    for actual, metadata, table, causal in pending:
+        expected = []
+        offsets = metadata["cu_q_host"]
+        for row, (start, end) in enumerate(zip(offsets, offsets[1:])):
+            length = metadata["used_host"][row]
+            keys = k[table[row].long()].flatten(0, 1)[:length].float()
+            values = v[table[row].long()].flatten(0, 1)[:length].float()
+            keys, values = (x.repeat_interleave(8, dim=1) for x in (keys, values))
+            scores = torch.einsum("qhd,khd->hqk", q[start:end].float(), keys)
+            if causal:
+                positions = 256 + torch.arange(end - start, device="cuda")
+                mask = torch.arange(length, device="cuda")[None, :] > positions[:, None]
+                scores.masked_fill_(mask[None], -torch.inf)
+            expected.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), values))
+        torch.testing.assert_close(actual.float(), torch.cat(expected),
+                                   atol=0.003, rtol=0.02)
 
 
 if __name__ == "__main__":

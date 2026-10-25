@@ -173,7 +173,7 @@ def test_one_token_labels_decode_as_a_merged_letters_request():
 
 
 def test_smaller_chunks_pay_more_weight_reads_without_changing_work():
-    device = replace(H100_SXM, peak_flops=float("inf"), bf16_flops=float("inf"),
+    device = replace(H100_SXM, fp8_flops=float("inf"), bf16_flops=float("inf"),
                      mamf_fp8_flops=float("inf"), mamf_bf16_flops=float("inf"))
     large = _cost((10, 20, 30), device=device)
     small = _cost((10, 20, 30), device=device, chunk=40)
@@ -275,11 +275,6 @@ def test_decision_models_read_option_rows_through_their_head(resident):
                                     cost.passes))
     vocabulary = 2 * model.hidden * model.vocab * cost.passes / H100_SXM.hbm_bw
     assert cost.seconds < unrounded_seconds(work, model, H100_SXM, CHUNK) + vocabulary
-    without_rate = replace(H100_SXM, fp32_flops=0.0)
-    with pytest.raises(ValueError, match="fp32"):
-        estimate_suffixes(HEAD, FRAME, [50], expected_rows=3, lengths=lengths,
-                        shared=(), chunk=CHUNK, model=model, device=without_rate,
-                        answer_rows=options + 1)
 
 
 def test_one_token_labels_read_only_their_target_rows():

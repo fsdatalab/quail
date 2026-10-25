@@ -112,11 +112,11 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
     for s in operators.scans:
         if s.alias not in stats:
             raise ValueError(f"no document_tokens for alias {s.alias!r}")
-    admission = arena_split[0] * budgets.PAGE_TOKENS
+    admission = arena_split[0] * device.page_tokens
     return PlanStatistics(
         stats=stats, lengths=lengths, chunk=chunk,
         arena_pages=tuple(arena_split), admission=admission,
-        cap_pages=retention_pages(admission, chunk, budgets.PAGE_TOKENS),
+        cap_pages=retention_pages(admission, chunk, device.page_tokens),
         pre=preamble_tokens(
             lowered[prompt] for prompt in (
                 *(p.prompt for fs in ask_filters.values() for p in fs),

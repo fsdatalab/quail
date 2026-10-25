@@ -150,7 +150,7 @@ class PlanPricer:
     def _release_recompute(self, node: AiFilter) -> dict:
         """What a later join pays if the sequence's KV is released, not pinned."""
         prefix = self._mean_prefix(node)
-        pages = budgets.pages(prefix)
+        pages = budgets.pages(prefix, self.context.device.page_tokens)
         fits = self.statistics.cap_pages // max(1, pages)
         excess = max(0.0, self.expected_rows.get(node.alias, 0.0) - fits)
         return {
@@ -220,5 +220,5 @@ class PlanPricer:
         store = self._store(alias)
         if not node.share_prefixes or store is None:
             return None
-        return page_tree(store).shared
+        return page_tree(store, self.context.device.page_tokens).shared
 

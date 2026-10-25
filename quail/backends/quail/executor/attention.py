@@ -39,12 +39,32 @@ ATTENTION_PATHS = ("unified", "tree")
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:
-    """Select the attention implementation for a supported CUDA architecture."""
+    """Select the attention implementation for a supported CUDA architecture.
+
+    FlashAttention 3 is Hopper 9.x only. FlashAttention 4 covers 9.x,
+    10.x, and 11.x. FlashAttention 2 covers 8.0 and up. L40S (8.9)
+    uses 2; B200 (10.x) uses 4; H100 stays on 3; RTX PRO 6000 (12.0)
+    stays on 2.
+    """
+    major, _minor = capability
+    if capability == (8, 9):
+        return 2
     if capability == (9, 0):
         return 3
+    if major == 10:
+        return 4
     if capability == (12, 0):
         return 2
     raise ValueError(f"Quail does not support CUDA capability {capability}")
+
+
+def deep_gemm_supported(capability: tuple[int, int]) -> bool:
+    """Whether vLLM 0.29.0 enables DeepGEMM on this CUDA capability.
+
+    Matches CudaPlatform.support_deep_gemm: 9.0, 10.x, and 12.x.
+    """
+    major, _minor = capability
+    return capability == (9, 0) or major in (10, 12)
 
 
 def merge_partial(out, lse, index, out_c, lse_c) -> None:
@@ -96,7 +116,9 @@ class Engine:
                              f"got {kernels!r}")
         self.kernels = kernels
 
-        self.fa_version = flash_attention_version(torch.cuda.get_device_capability())
+        capability = torch.cuda.get_device_capability()
+        self.fa_version = flash_attention_version(capability)
+        self.use_deep_gemm = deep_gemm_supported(capability)
         self.torch = torch
         self.arena = arena
         self.rotary = rotary
@@ -120,16 +142,40 @@ class Engine:
     def gemm(self, q_input, input_scale, linear):
         if not self.is_fp8:
             return self.torch.nn.functional.linear(q_input, linear.weight)
-        # all linear projections (QKV, O, gate-up, down) run vLLM's
-        # DeepGEMM fp8 matmul; weights and scales are vLLM's layout
-        from vllm.utils.deep_gemm import fp8_gemm_nt
-        out = self.torch.empty(
-            (q_input.shape[0], linear.weight.shape[0]),
-            dtype=self.torch.bfloat16, device=q_input.device)
-        fp8_gemm_nt((q_input, input_scale),
-                    (linear.weight, self.weight_scale(linear)),
-                    out, is_deep_gemm_e8m0_used=self.use_ue8m0)
-        return out
+        weight_scale = self.weight_scale(linear)
+        if self.use_deep_gemm:
+            from vllm.utils.deep_gemm import fp8_gemm_nt
+            out = self.torch.empty(
+                (q_input.shape[0], linear.weight.shape[0]),
+                dtype=self.torch.bfloat16, device=q_input.device)
+            fp8_gemm_nt((q_input, input_scale),
+                        (linear.weight, weight_scale),
+                        out, is_deep_gemm_e8m0_used=self.use_ue8m0)
+            return out
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            w8a8_triton_block_scaled_mm,
+        )
+        return w8a8_triton_block_scaled_mm(
+            q_input, linear.weight,
+            self._triton_activation_scales(q_input, input_scale),
+            weight_scale, [GROUP, GROUP],
+            output_dtype=self.torch.bfloat16)
+
+    def _triton_activation_scales(self, q_input, input_scale):
+        """Return activation scales in the (tokens, groups) layout Triton wants.
+
+        Engine.quant writes column-major scales whose view is already
+        (tokens, K/128). A (groups, tokens) tensor is transposed.
+        """
+        groups = q_input.shape[-1] // GROUP
+        tokens = q_input.shape[0]
+        if input_scale.shape == (tokens, groups):
+            return input_scale
+        if input_scale.shape == (groups, tokens):
+            return input_scale.transpose(0, 1)
+        raise ValueError(
+            f"activation scales {tuple(input_scale.shape)} do not match "
+            f"tokens={tokens} groups={groups}")
 
     def quant(self, x):
         if not self.is_fp8:
@@ -843,31 +889,87 @@ class Engine:
 
     # ---- attention: the two workload paths --------------------------
 
+
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None, softmax_scale=None,
             window=None, version=None):
-        # vLLM's FA2 and FA3 both accept 16-token pages and return
-        # LSE as [heads, total_queries] for the merge kernel.
+        # LSE comes back as [heads, total_queries] for the merge kernel.
+        # Blackwell's head-256 FA4 kernel rejects the SplitKV that
+        # num_splits=0 can select.
         from vllm.vllm_flash_attn import flash_attn_varlen_func
+        version = version or self.fa_version
         extra = {}
         if softmax_scale is not None:
             extra["softmax_scale"] = softmax_scale
         if window is not None:
             extra["window_size"] = list(window)
+        shape = getattr(k, "shape", None)
+        if version == 4 and shape is not None and shape[-1] == 256:
+            extra["num_splits"] = 1
+            if block_table is not None:
+                # FA4 requires the table capacity; seqused_k masks padding.
+                max_k = block_table.shape[1] * k.shape[1]
         return flash_attn_varlen_func(
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
             max_seqlen_k=max_k, cu_seqlens_k=cu_k,
             block_table=block_table, seqused_k=seqused_k,
-            causal=causal, fa_version=version or self.fa_version,
+            causal=causal, fa_version=version,
             return_softmax_lse=True, **extra)
 
+    def _flashinfer_paged(self, q3, kp, vp, metadata, *, causal,
+                          softmax_scale, window):
+        """Run paged attention with a FlashInfer plan shared across layers."""
+        import numpy as np
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        if not hasattr(self, "_flashinfer_plans"):
+            self._flashinfer_plans = {}
+            # Head-512 split-KV plans exceed the usual 128 MiB workspace.
+            self._flashinfer_workspace = self.torch.empty(
+                256 * 1024 * 1024, dtype=self.torch.uint8, device=q3.device)
+        key = (causal, softmax_scale, window, q3.shape[1:], kp.shape[1:],
+               q3.dtype, kp.dtype)
+        previous, wrapper, uploaded = self._flashinfer_plans.get(
+            key, (None, None, None))
+        if wrapper is None:
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._flashinfer_workspace, kv_layout="NHD", backend="fa2")
+            uploaded = self.torch.cuda.Event()
+        if metadata is not previous:
+            page_tokens = kp.shape[1]
+            used = np.asarray(metadata["used_host"], dtype=np.int32)
+            counts = -(-used // page_tokens)
+            indptr = np.concatenate(([0], counts.cumsum())).astype(np.int32)
+            indices = np.concatenate([
+                pages[:count] for pages, count in zip(metadata["page_rows"], counts)
+            ]).astype(np.int32)
+            options = dict(
+                causal=causal, sm_scale=softmax_scale,
+                window_left=-1 if window is None else window[0],
+                q_data_type=q3.dtype, kv_data_type=kp.dtype)
+            # FlashInfer rewrites pinned host memory before its asynchronous upload.
+            uploaded.synchronize()
+            wrapper.plan(
+                self.torch.as_tensor(metadata["cu_q_host"], dtype=self.torch.int32),
+                self.torch.from_numpy(indptr), self.torch.from_numpy(indices),
+                self.torch.from_numpy((used - 1) % page_tokens + 1),
+                q3.shape[1], kp.shape[2], q3.shape[2], page_tokens, **options)
+            uploaded.record()
+            self._flashinfer_plans[key] = metadata, wrapper, uploaded
+        return wrapper.run(q3, (kp, vp))
+
     def _paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table, *,
-               causal, softmax_scale=None, window=None):
+               causal, softmax_scale=None, window=None, metadata=None):
         """One paged attention call.
 
         FlashAttention 3, or FlashAttention 4 when the head is wider
-        than it takes.
+        than it takes. A 512-wide head on a GPU that selects
+        FlashAttention 4 runs through FlashInfer CUDA attention.
         """
+        if self.fa_version == 4 and q3.shape[-1] == 512:
+            return self._flashinfer_paged(
+                q3, kp, vp, metadata, causal=causal,
+                softmax_scale=softmax_scale, window=window)
         wide = q3.shape[-1] > FA_MAX_HEAD_DIM
         out, _ = self._fa(
             q3, kp, vp, cu_q, None, max_q, max_seqused_k, causal=causal,
@@ -995,14 +1097,14 @@ class Engine:
         out = self._paged(
             q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
             pool["max_used"], pool["table"], causal=True,
-            softmax_scale=softmax_scale, window=behind)
+            softmax_scale=softmax_scale, window=behind, metadata=pool)
         if canvas is not None:
             q_c = q3.index_select(0, canvas["rows"])
             out_c = self._paged(
                 q_c, kp, vp, canvas["cu_q"], canvas["max_q"],
                 canvas_pool["used"], canvas_pool["max_used"],
                 canvas_pool["table"], causal=False,
-                softmax_scale=softmax_scale, window=around)
+                softmax_scale=softmax_scale, window=around, metadata=canvas_pool)
             out.index_copy_(0, canvas["rows"], out_c)
         meta["layer"] += 1
         return out.view(n, -1)

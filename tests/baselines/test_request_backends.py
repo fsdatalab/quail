@@ -23,13 +23,25 @@ from quail.baselines.nodes import (
     RequestJoinSpec,
 )
 from quail.baselines.sglang import SGLangClient, pipelined_sglang_backend
-from quail.baselines.vllm import VLLMEngine, sampling_kwargs, stock_vllm_backend
+from quail.baselines.vllm import (
+    VLLMEngine,
+    gpu_memory_utilization,
+    sampling_kwargs,
+    stock_vllm_backend,
+)
 from quail.builtins import built_in_registry
 from quail.physical import (
     Project,
     decode_graph,
 )
-from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_SXM, QWEN3_4B_FP8
+from quail.specs import (
+    B200,
+    DIFFUSION_GEMMA_26B_FP8,
+    H100_SXM,
+    L40S,
+    QWEN3_4B_FP8,
+    QWEN3_32B_FP8,
+)
 
 DOCS = {"id": ["a", "b"], "body": ["one", "two"]}
 
@@ -67,7 +79,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     boot = {"client": _Client(), "sampling_params": object(), "capacity": CAPACITY}
     monkeypatch.setattr(
         "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids, *, resources: (
+        lambda self, spec, allowed_ids, *, device, resources: (
             boot, {"kind": "cold", "boot_s": 0.1}))
     session = _session(
         "stock_vllm",
@@ -270,20 +282,37 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
             with engine_environment(QWEN3_4B_FP8):
                 assert os.environ.get(key) == previous
     assert len(cleared) == 16
-    qwen = engine.llm_kwargs(QWEN3_4B_FP8)
+    qwen = engine.llm_kwargs(QWEN3_4B_FP8, H100_SXM)
     assert qwen["max_num_batched_tokens"] == 25_305
     assert qwen["tokenizer_mode"] == "gigatoken"
     assert "diffusion_config" not in qwen
+    assert qwen["gpu_memory_utilization"] == 0.91
+    assert qwen["max_model_len"] == -1
+    assert qwen["block_size"] == 16
+    assert engine.llm_kwargs(QWEN3_4B_FP8, B200)["block_size"] == 128
+    assert engine.llm_kwargs(QWEN3_4B_FP8, B200)[
+        "gpu_memory_utilization"] == 0.91
+    l40s_util = engine.llm_kwargs(QWEN3_4B_FP8, L40S)["gpu_memory_utilization"]
+    assert l40s_util == pytest.approx(0.865, abs=1e-3)
+    assert l40s_util == gpu_memory_utilization(L40S, QWEN3_4B_FP8)
+    qwen32 = engine.llm_kwargs(QWEN3_32B_FP8, L40S)
+    assert qwen32["gpu_memory_utilization"] == pytest.approx(0.775, abs=1e-3)
+    assert engine.llm_kwargs(QWEN3_32B_FP8, H100_SXM)[
+        "gpu_memory_utilization"] == pytest.approx(0.866, abs=1e-3)
+    assert engine.llm_kwargs(QWEN3_32B_FP8, B200)[
+        "gpu_memory_utilization"] == 0.91
+    assert qwen32["max_model_len"] == -1
     # the mixture-of-experts model batches its own chunk cap; its
     # one-row canvas commits after one denoising step, and stays under
     # vLLM's eight-sequence cap trigger
-    gemma = engine.llm_kwargs(DIFFUSION_GEMMA_26B_FP8)
+    gemma = engine.llm_kwargs(DIFFUSION_GEMMA_26B_FP8, H100_SXM)
     assert gemma["max_num_batched_tokens"] == 65_536
     assert gemma["diffusion_config"] == {"canvas_length": 1,
                                          "max_denoising_steps": 1}
     assert gemma["max_num_seqs"] == 127
     assert gemma["max_logprobs"] == -1
-    wide = engine.llm_kwargs(replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=256))
+    wide = engine.llm_kwargs(
+        replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=256), H100_SXM)
     assert wide["diffusion_config"] == {"canvas_length": 256}
     assert wide["max_num_seqs"] == qwen["max_num_seqs"]
     assert sampling_kwargs([1, 2]) == {
@@ -549,7 +578,8 @@ class _Adapter:
         self.live = []
         self.fail = True
 
-    def boot(self, spec, allowed_ids, *, resources):
+    def boot(self, spec, allowed_ids, *, device, resources):
+        self.device = device
         client = SimpleNamespace(close=lambda: self.live.remove(client))
         self.live.append(client)
         resources.callback(client.close)
@@ -568,11 +598,12 @@ def test_a_request_backend_owns_its_engine_from_boot_to_release(monkeypatch):
     context = SimpleNamespace(
         registry=built_in_registry(), runtime_state={},
         request=SimpleNamespace(plan={
-            "model": "qwen3-4b-fp8",
+            "model": "qwen3-4b-fp8", "device": "b200",
             "settings": {"true_ids": [1], "false_ids": [2]}}))
     with pytest.raises(RuntimeError, match="warmup failed"):
         backend.prepare_request(context)
     assert adapter.live == [] and context.runtime_state == {}
+    assert adapter.device is B200
 
     adapter.fail = False
     backend.prepare_request(context)
@@ -590,9 +621,10 @@ def test_a_request_backend_owns_its_engine_from_boot_to_release(monkeypatch):
 def test_an_experiment_can_turn_on_vllm_ngram_drafts(monkeypatch):
     from quail.baselines.vllm import VLLMEngine, speculative_config
 
-    assert "speculative_config" not in VLLMEngine().llm_kwargs(QWEN3_4B_FP8)
+    assert "speculative_config" not in VLLMEngine().llm_kwargs(
+        QWEN3_4B_FP8, H100_SXM)
     monkeypatch.setenv("QUAIL_VLLM_SPECULATIVE", "ngram:5")
-    assert VLLMEngine().llm_kwargs(QWEN3_4B_FP8)["speculative_config"] == {
+    assert VLLMEngine().llm_kwargs(QWEN3_4B_FP8, H100_SXM)["speculative_config"] == {
         "method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 4}
     for value in ("ngram", "ngram:0", "eagle:5"):
         with pytest.raises(ValueError):

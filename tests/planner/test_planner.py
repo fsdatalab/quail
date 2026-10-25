@@ -844,15 +844,14 @@ def _token_store(path, bodies):
 
 def test_prefix_sharing_and_attention_path_follow_the_token_store(
         catalog, tmp_path):
-    from quail.planner.rules.physical import (
-        page_aligned_shared_tokens,
-        sharing_pays,
-    )
+    from quail.planner.rules.physical import sharing_pays
+    from quail.planner.statistics.prefixes import page_tree
 
     shared = " ".join(str(i) for i in range(40))
     store = _token_store(tmp_path / "shared.arrow",
                          [shared, shared + " 99 98", "7 7 7"])
-    assert page_aligned_shared_tokens(store) == 32
+    assert page_tree(store, H100_SXM.page_tokens).shared_tokens == 32
+    assert page_tree(store, 128).shared_tokens == 0
     plain = _token_store(tmp_path / "plain.arrow", ["1 2 3", "4 5 6"])
 
     logical = docs(catalog, "reviews").alias("r").ai_filter(
@@ -874,7 +873,7 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     little = _token_store(
         tmp_path / "little.arrow",
         [body, " ".join(str(i) for i in range(16)) + " 5"])
-    assert page_aligned_shared_tokens(little) == 16
+    assert page_tree(little, H100_SXM.page_tokens).shared_tokens == 16
     assert not filter_sequence(_plan(logical, {"r": little.lengths})).share_prefixes
     # a filter that already writes pages shares any whole page
     assert sharing_pays(QWEN3_4B_FP8, H100_SXM, shared_tokens=16,
@@ -916,6 +915,21 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     # anchors with nothing in common share nothing
     plan = _plan(logical, {"r": [401] * 20, "p": [20] * 20})
     assert not plan.graph.nodes_by_type(AiJoin.type_name)[0].share_prefixes
+
+
+def test_prefix_sharing_accounts_for_bf16_work_in_an_fp8_model():
+    from quail.planner.rules.physical import sharing_pays
+    from quail.specs import QWEN3_5_4B_FP8
+
+    # gemm_flops uses the measured BF16 rate when one is set
+    slower = replace(H100_SXM, bf16_flops=H100_SXM.bf16_flops / 10,
+                     mamf_bf16_flops=H100_SXM.mamf_bf16_flops / 10)
+    assert not sharing_pays(
+        QWEN3_5_4B_FP8, H100_SXM,
+        shared_tokens=100, total_tokens=100_000, writes_pages=False)
+    assert sharing_pays(
+        QWEN3_5_4B_FP8, slower,
+        shared_tokens=100, total_tokens=100_000, writes_pages=False)
 
 
 def test_attention_setting_forces_every_filter_and_join(catalog):

@@ -1,10 +1,12 @@
 """Deploy Quail Server on Modal.
 
-    modal deploy -m quail.server.modal_app 2>&1 | tee server-deploy.log
+    uv run python -m quail.server.modal_app --device l40s 2>&1 | tee server-deploy.log
 
-Deploys one web endpoint on the existing ``quail-engine`` app, backed by
-one H100 container. The URL is printed by ``modal deploy``; pass it as
-``endpoint`` to ``quail.Session``.
+Deploys one web endpoint on the existing ``quail-engine`` app.
+``--device`` is the registered device to rent (default ``h100-sxm``).
+``modal deploy -m quail.server.modal_app`` still deploys the default.
+The URL is printed on deploy; pass it as ``endpoint`` to
+``quail.Session``.
 
 Where the data lives:
 
@@ -29,20 +31,41 @@ Clients read the same variable, or pass ``token`` to ``ServerClient``.
 
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 
 import modal
 
 from quail.deploy.images import gpu_image
+from quail.specs import DEVICES, modal_gpu_type
 
 APP_NAME = "quail-engine"
 MODELS = ("qwen3-4b-fp8", "qwen3-32b-fp8", "diffusion-gemma-26b-a4b-fp8",
           "qwen3-reranker-0.6b-bf16", "qwen3-reranker-4b-bf16",
           "decision-2.0-kai-0.6b-bf16", "qwen3.5-4b-bf16", "qwen3.5-27b-fp8",
           "qwen3.8-27b-fp8", "lfm2-2.6b-bf16")
-DEVICE = "h100-sxm"
 GPUS = 1
+
+
+def _device_from_argv(argv=None) -> str:
+    """Read the device from the command line or container environment.
+
+    The remote container receives the selected device in ``QUAIL_SERVER_DEVICE``.
+    Without either setting, use ``h100-sxm``.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--device", default=os.environ.get("QUAIL_SERVER_DEVICE", "h100-sxm"))
+    args, _unknown = parser.parse_known_args(argv)
+    if args.device not in DEVICES:
+        raise SystemExit(
+            f"unknown device {args.device!r}; use one of {sorted(DEVICES)}"
+        )
+    return args.device
+
+
+DEVICE = _device_from_argv()
 
 VOLUME_DIR = Path("/results")
 DATA_DIR = VOLUME_DIR / "quail-server"
@@ -57,7 +80,8 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=Tr
 
 @app.cls(
     image=gpu_image(),
-    gpu=f"H100!:{GPUS}",
+    env={"QUAIL_SERVER_DEVICE": DEVICE},
+    gpu=modal_gpu_type(DEVICE, GPUS),
     volumes={
         str(VOLUME_DIR): results_volume,
         "/root/.cache/huggingface": hf_cache,
@@ -109,3 +133,26 @@ class QuailServer:
     @modal.exit()
     def stop(self) -> None:
         self.checkpoint.stop()
+
+
+def main(argv=None) -> None:
+    """Deploy this app. ``--device`` must match the module-level parse."""
+    parser = argparse.ArgumentParser(
+        prog="python -m quail.server.modal_app",
+        description="Deploy Quail Server on Modal.")
+    parser.add_argument(
+        "--device", default=DEVICE,
+        help=f"registered device to rent; default {DEVICE}")
+    args = parser.parse_args(argv)
+    if args.device != DEVICE:
+        raise SystemExit(
+            f"--device {args.device!r} must be passed at process start "
+            f"so the container GPU is set; this process used {DEVICE!r}"
+        )
+    print(f"deploying {APP_NAME} on {DEVICE} ({modal_gpu_type(DEVICE, GPUS)})",
+          flush=True)
+    app.deploy()
+
+
+if __name__ == "__main__":
+    main()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from quail.catalog.tokens import PrefixTree, prefix_tree
-from quail.cost.budgets import PAGE_TOKENS
 
 
 def document_shared_tokens(store) -> list[int]:
@@ -26,6 +25,6 @@ def subset_shared_tokens(store, rows) -> list[int]:
     return shared
 
 
-def page_tree(store) -> PrefixTree:
+def page_tree(store, page_tokens: int) -> PrefixTree:
     """Return the store's prefix tree in whole KV pages, cached on its token store."""
-    return prefix_tree(store, PAGE_TOKENS)
+    return prefix_tree(store, page_tokens)
