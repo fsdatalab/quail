@@ -346,6 +346,7 @@ class DecodeGraphs:
         if chunk.attention_mode == "tree":
             reads = chunk.meta["reads"]
             return not (reads is None or reads.get("nodes") is not None
+                        or reads.get("own") is not None
                         or reads["max_q"] > self.config.max_query_tokens
                         or reads["max_used"] > self.config.max_context_tokens
                         or reads["table"].shape[1] > table_width)

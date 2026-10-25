@@ -124,13 +124,20 @@ def test_a_recurrent_model_replays_accepted_tokens(monkeypatch):
 
 
 def test_two_maps_share_one_document_read(monkeypatch):
-    # two instructions over one table run as one stage list: the
-    # second rewinds past the first's answer and reads the resident KV
+    # two instructions over one table are put to the document at once:
+    # the first branch computes the document, and the second borrows
+    # its whole pages and computes only the tokens past them
     text = LEASE
     gold = "March 3, 2027"
     tables = make_vocabulary(text, gold)
     spec = make_map_spec(tables)
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    packed = []
+
+    def recording(torch, arena, specs, **kw):
+        packed.extend(specs)
+        return fake_pack(torch, arena, specs, **kw)
+
+    monkeypatch.setattr(chunk_mod, "pack_chunk", recording)
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
     monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
@@ -141,9 +148,9 @@ def test_two_maps_share_one_document_read(monkeypatch):
 
     def init(self, *args, **kwargs):
         original(self, *args, **kwargs)
-        for document in self.documents:
-            model.documents[document.key] = text
-            model.gold[document.key] = gold
+        for key in self.keys:
+            model.documents[key] = text
+            model.gold[key] = gold
         seen["stages"] = self
 
     monkeypatch.setattr(MapStages, "__init__", init)
@@ -161,8 +168,20 @@ def test_two_maps_share_one_document_read(monkeypatch):
     second = results["ai-map:second"].outputs["rows:c"]
     assert first.column("first").to_pylist() == [gold]
     assert second.column("second").to_pylist() == [gold]
-    # the document's prefix was packed once for both instructions
-    assert model.reads[stages.documents[0].key] == 1
+    assert stages.branches
+    length = len(stages.documents[0].prefix)
+    shared = stages.prefix_tree.shared[1]
+    assert shared and shared % 16 == 0 and shared < length
+    prefix_tokens = {}
+    for packed_spec in packed:
+        for key in packed_spec.get("keys", [packed_spec.get("key")]):
+            if packed_spec.get("prefix") is not None:
+                prefix_tokens[key] = (prefix_tokens.get(key, 0)
+                                      + len(packed_spec["prefix"]))
+    # the document is computed once; the second branch computes only
+    # the tokens past the pages it borrows
+    assert prefix_tokens[stages.keys[0]] == length
+    assert prefix_tokens[stages.keys[1]] == length - shared
 
 
 def test_map_answers_need_the_document_tokens_or_text():
@@ -365,3 +384,50 @@ def test_a_live_document_runs_in_every_pass(monkeypatch):
         # stop), and the round launched before the end was decided
         assert len(in_passes) == len(answer.written) + 2
         assert in_passes == list(range(in_passes[0], in_passes[-1] + 1))
+
+
+def test_a_small_pool_runs_more_documents_when_pages_grow_as_they_write(monkeypatch):
+    # twelve documents in a pool that holds three of them reserved for
+    # the whole answer limit: each gets pages for its prompt and first
+    # rounds, and more as it writes, so more run at once and all finish
+    from helpers.fakes import cpu_arena
+
+    gold = "March 3"
+    tables = make_vocabulary(LEASE, gold)
+    spec = make_map_spec(tables, max_answer_tokens=48, draft_tokens=2,
+                         draft_policy="fixed", expected_answer_tokens=4)
+    passes = []
+
+    def recording(torch, arena, specs, **kw):
+        passes.append({key for packed_spec in specs
+                       for key in packed_spec.get("keys", [packed_spec.get("key")])})
+        return fake_pack(torch, arena, specs, **kw)
+
+    monkeypatch.setattr(chunk_mod, "pack_chunk", recording)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
+    state = _state(model)
+    state.loaded_model.vocabulary = tables
+    tokens = tables.encode_ids(LEASE)
+    head, tail = spec.prompt_token_parts
+    whole = len(head) + len(tokens) + len(tail) - 1 + 1 + 48 + 2 * 2
+    state.loaded_model.arena = cpu_arena(3 * -(-whole // 16))
+    original = MapStages.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        for key in self.keys:
+            model.documents[key] = LEASE
+            model.gold[key] = gold
+
+    monkeypatch.setattr(MapStages, "__init__", init)
+    node = AiMap(node_id="ai-map:summary", backend_name="quail",
+                 model="qwen3-4b-fp8", spec=spec)
+    count = 12
+    inputs = {"document_ids": list(range(count)), "documents": {"c": [tokens] * count},
+              "texts": {"c": [LEASE] * count}}
+    result = MapPart.execute_group(state, [node], inputs)["ai-map:summary"]
+    assert result.outputs["rows:c"].column("summary").to_pylist() == [gold] * count
+    assert max(len(keys) for keys in passes) > 3
+    assert result.metrics.extension["kv_growth"]["max_running"] > 3

@@ -156,12 +156,14 @@ class SingleResultPart(ExecutionPart):
 
 def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
-                  paged=True, on_answers=None) -> dict:
+                  paged=True, on_answers=None, growth=None) -> dict:
     """Run prepared operator work together and collect per-node results.
 
     A limit ends the run once that many documents passed every part;
     documents are admitted only while the ones in flight are expected
-    to fall short of it, by the parts' selectivities.
+    to fall short of it, by the parts' selectivities. growth, the
+    parts' StageGrowth when their KV grows as they write, sizes each
+    document's pages as it goes.
     """
     stages = gated_stages(parts)
     paged = paged or state.loaded_model.pipeline.needs_pages
@@ -186,7 +188,8 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
         survival=survival(parts),
         stop_groups=stop_groups, paged=paged,
         on_chunk=transition_reporter(parts), on_answers=on_answers,
-        appended_tokens=max(part.appended_tokens for part in parts) or None)
+        appended_tokens=max(part.appended_tokens for part in parts) or None,
+        growth=growth)
     complete_parts(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
             for node_id, result in part.results().items()}
@@ -372,7 +375,9 @@ def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
         key = keys[anchor]
         if not arena.is_resident(key):
             return
-        if survived and keep_kv:
+        # only an (alias, document) key names KV a later operator
+        # reads; a branch's key holds one answer and is freed
+        if survived and keep_kv and isinstance(key, tuple) and len(key) == 2:
             arena.retain(key, len(prefixes[anchor]))
         else:
             arena.free_key(key)

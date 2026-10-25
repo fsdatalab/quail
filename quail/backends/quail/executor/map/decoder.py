@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from quail.backends.quail.executor.vocabulary import Vocabulary
-from quail.cost.draft_policy import MapDraftPolicy
+from quail.cost.draft_policy import AnswerLengthCurve, MapDraftPolicy
 from quail.cost.ngram_cache import MATCH_ORDERS, NgramCache
 from quail.physical import MapSpec
 
@@ -165,6 +165,13 @@ class MapDecoder:
                                          spec.expected_answer_tokens)
                           for _ in range(questions)]
                          if spec.draft_policy == "adaptive" else None)
+        # one answer-length curve per instruction, the policy's when it
+        # has one, for drafts and for sizing each document's KV
+        self.curves = ([policy.curve for policy in self.policies]
+                       if self.policies is not None else
+                       [AnswerLengthCurve(spec.max_answer_tokens,
+                                          spec.expected_answer_tokens)
+                        for _ in range(questions)])
         self.documents = documents
         num_documents = len(documents)
         self.states = [AnswerState(num_documents, spec.max_answer_tokens,
@@ -558,6 +565,30 @@ class MapDecoder:
             active = kept
         return tokens, cells, rates, hops
 
+    def remaining(self, q: int, index: np.ndarray, quantile: float) -> np.ndarray:
+        """Return the answer tokens each document is expected to still write.
+
+        The count is the quantile of the instruction's answer lengths
+        given the tokens each answer has written, from the answers
+        settled so far; a settled answer writes none.
+
+        Args:
+            q: The instruction's index.
+            index: The documents.
+            quantile: The fraction of answers expected to end within
+                the count.
+        """
+        state = self.states[q]
+        levels = np.asarray(self.curves[q].levels())
+        written = state.num_written[index]
+        # levels never rise, so the first level at or below the
+        # threshold ends the quantile, past the written tokens
+        threshold = (1.0 - quantile) * levels[written]
+        end = np.searchsorted(-levels, -threshold, side="left")
+        left = np.clip(end - written, 0, self.spec.max_answer_tokens - written)
+        left[state.done[index]] = 0
+        return left
+
     def settle(self, document: MapDocument, q: int) -> None:
         """Set the instruction's answer for the document: its written text."""
         state = self.states[q]
@@ -566,7 +597,6 @@ class MapDecoder:
             return
         state.done[index] = True
         count = int(state.num_written[index])
-        if self.policies is not None:
-            self.policies[q].curve.settle(count)
+        self.curves[q].settle(count)
         state.answers[index] = self.vocabulary.tokenizer.decode(
             state.written[index, :count].tolist(), skip_special_tokens=True).strip()

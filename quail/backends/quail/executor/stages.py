@@ -263,7 +263,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
                on_answers=None, stop_groups=None, appended_tokens=None,
-               gpu_timing=False, survival=None):
+               gpu_timing=False, survival=None, growth=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -319,6 +319,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         appended_tokens: The most tokens the append stages leave after
             a document's frame, when stages discard tokens earlier ones
             added; None sums every append stage's longest suffix.
+        growth: The stages' StageGrowth, when a document's KV grows as
+            it writes rather than being reserved whole at admission
+            (see quail.backends.quail.executor.growth); None reserves
+            it whole.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is
@@ -338,7 +342,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,
-        appended_tokens=appended_tokens, gpu_timing=gpu_timing,
+        appended_tokens=appended_tokens, gpu_timing=gpu_timing, growth=growth,
     ).run()
 
 

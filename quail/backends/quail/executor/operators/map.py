@@ -14,10 +14,19 @@ class MapPart(AnswerPart):
     node_type = AiMap
     stages_type = MapStages
     operator = "AI.MAP"
-    # a round's rows join their document's pages and one causal paged
-    # call reads them with the document, so each layer makes one
-    # attention call rather than the tree path's two and a merge
-    attention = "unified"
+    branches = True
+
+    @property
+    def attention(self) -> str:
+        """The attention path for this pipeline's maps.
+
+        One map's round reads its own document: its rows join the
+        document's pages and one causal paged call reads them with
+        it, rather than the tree path's two calls and a merge. Maps
+        put to a document at once read it once for all of their
+        branches, which the tree path does.
+        """
+        return "tree" if getattr(self.answer_stages, "branches", False) else "unified"
 
     def _answer_rows(self, node, q: int, kept, document_ids):
         """Return one map's written answers."""

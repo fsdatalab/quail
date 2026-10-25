@@ -93,7 +93,8 @@ class StageExecutor:
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
-                 appended_tokens=None, gpu_timing=False, survival=None):
+                 appended_tokens=None, gpu_timing=False, survival=None,
+                 growth=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -197,6 +198,19 @@ class StageExecutor:
             self.capacity_extra = max(self.capacity_extra, len(frame) + kept)
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
+        # rows past the prefix a document's pages cover at admission:
+        # all it can ever need, or, when its KV grows as it writes,
+        # its first request and the rounds in flight before it grows
+        self.growth = None
+        self.reserve_extra = self.capacity_extra
+        if growth is not None and self.slice_prefill:
+            from quail.backends.quail.executor.growth import KVGrowth
+
+            self.reserve_extra = min(self.capacity_extra,
+                                     max(frame_max, int(growth.initial_tokens)))
+            self.growth = KVGrowth(
+                self.arena, self.keys, growth, self.prefix_lengths,
+                [length + self.capacity_extra for length in self.prefix_lengths])
 
         resident = {}
         if self.paged:
@@ -239,12 +253,13 @@ class StageExecutor:
             limit=limit, survival=survival,
             stop_groups=stop_groups,
             stop_width=self._stop_width(stop_groups, budget),
-            extra_tokens=self.capacity_extra,
+            extra_tokens=self.reserve_extra,
             reserve=self._reserve if self.paged else None,
             repeats=[stage.repeats for stage in self.stages],
             slice_prefill=self.slice_prefill, ahead=self.ahead,
             costs=[stage.costs if ahead else None
                    for stage, ahead in zip(self.stages, self.ahead)],
+            admits=None if self.growth is None else self.growth.admits,
         )
         # the stages whose rounds are packed many at once, from arrays
         self.bulk = [bool(ahead and stage.rounds is not None)
@@ -358,7 +373,7 @@ class StageExecutor:
         # the admission prices a document at page_cost(prefix + extra)
         # less what it holds; a trimmed window holds fewer sliding
         # pages than that price assumes, so count what growing takes
-        capacity = prefix_tokens + self.capacity_extra
+        capacity = prefix_tokens + self.reserve_extra
         return (self.arena.page_cost(capacity)
                 - self.arena.growth_cost(key, capacity))
 
@@ -425,7 +440,7 @@ class StageExecutor:
         points = tuple(t for t in self.share_points[anchor]
                        if shared < t < prefix)
         if not self.arena.reserve(
-                key, prefix, capacity_tokens=prefix + self.capacity_extra,
+                key, prefix, capacity_tokens=prefix + self.reserve_extra,
                 borrow=(self.keys[parent], shared) if shared else None,
                 extension=self._extends, share_points=points):
             return False
@@ -437,6 +452,10 @@ class StageExecutor:
             self._held_parents.add(anchor)
             self.arena.hold(key, self.borrowers[anchor])
             self.arena.keep_window(key, self.lowest_borrow[anchor])
+        if self.growth is not None:
+            lent = (self.lowest_borrow.get(anchor, 0) // self.arena.page_tokens
+                    if anchor < len(self.borrowers) and self.borrowers[anchor] else 0)
+            self.growth.admitted(anchor, lent)
         return True
 
     def _merged(self, j, start, end):
@@ -624,8 +643,13 @@ class StageExecutor:
             fed[ends - 1] = -1
             following.append(fed)
             # a round's position replaces the appended-token bookkeeping
-            specs.append(dict(rounds=requests, keys=[self.keys[a] for a in anchors],
-                              feed_bound=self.stages[j].suffix_tokens))
+            spec = dict(rounds=requests, keys=[self.keys[a] for a in anchors],
+                        feed_bound=self.stages[j].suffix_tokens)
+            if self.mode == "tree":
+                groups, shared = self._shares(anchors)
+                if shared.any():
+                    spec.update(shared=shared, share_groups=groups)
+            specs.append(spec)
             sources.extend(self.latest[anchors[index]]
                            for index in np.flatnonzero(requests.device_fed))
         if bulk:
@@ -638,13 +662,41 @@ class StageExecutor:
             self.appended[a] = tokens
         return chunk, entries, following, group_entries, sources
 
+    def _shares(self, anchors):
+        """Return each round's share group and the leading pages it shares.
+
+        A borrower shares its parent's borrowed pages, and a parent the
+        pages its borrowers borrow. A group with one round in the
+        chunk shares nothing: reading its pages apart saves nothing.
+        """
+        groups = np.empty(len(anchors), dtype=np.int64)
+        shared = np.zeros(len(anchors), dtype=np.int64)
+        for index, a in enumerate(anchors):
+            parent = self.borrowing.parent(a)
+            if parent is not None:
+                groups[index], shared[index] = parent, self.borrowing.shared(a)
+            else:
+                groups[index], shared[index] = a, self.lowest_borrow.get(a, 0)
+        _, inverse, sizes = np.unique(groups, return_inverse=True,
+                                      return_counts=True)
+        shared[sizes[inverse] < 2] = 0
+        return groups, shared
+
     def _ordered(self, part):
-        """Return the groups with the bulk stages' rounds last, in their order."""
+        """Return the groups with the bulk stages' rounds last.
+
+        On the tree path the rounds of one share group are placed
+        together, so their shared pages are read once.
+        """
         if not any(self.bulk):
             return part
         rounds = [g for g in part if self.bulk[g[1]] and not g[4]]
         if not rounds:
             return part
+        if self.mode == "tree" and self.lowest_borrow:
+            groups, _ = self._shares([g[0] for g in rounds])
+            order = np.argsort(groups, kind="stable")
+            rounds = [rounds[index] for index in order.tolist()]
         return [g for g in part if not (self.bulk[g[1]] and not g[4])] + rounds
 
     def _settle(self, settlement):
@@ -663,6 +715,8 @@ class StageExecutor:
             self._settle(settlement)
         elif self.arena.is_resident(self.keys[settlement.anchor]):
             self.arena.free_key(self.keys[settlement.anchor])
+        if self.growth is not None:
+            self.growth.settled(settlement.anchor)
 
     def _report(self, entry):
         if entry.values is None:
@@ -747,6 +801,8 @@ class StageExecutor:
                     self.borrowers[parent] -= 1
             if self.arena.is_resident(self.keys[a]):
                 self.arena.free_key(self.keys[a])
+            if self.growth is not None:
+                self.growth.settled(a)
 
     def _log_memory_event(self, kind, **detail):
         log = getattr(self.arena, "log_event", None)
@@ -869,6 +925,11 @@ class StageExecutor:
                 # retained KV nothing here reads makes room
                 self.arena.evict_retained(self.sched.blocked_pages)
             started = time.perf_counter()
+            if self.growth is not None:
+                # the ready documents' next requests get their pages
+                # now; the ones that cannot wait a pass
+                self.sched.stalled = self.growth.grow(
+                    list(self.sched.ready), self.arena.free_pages)
             groups = self.sched.next_chunk(
                 self.arena.free_pages if self.paged else 1 << 62)
             self.host_s["admit"] += time.perf_counter() - started
@@ -883,7 +944,9 @@ class StageExecutor:
                 # pages: the children pack their whole prefixes
                 if self.arena.drop_holds(self.held):
                     continue
-                raise AssertionError("nothing buildable and nothing in flight")
+                raise AssertionError(
+                    f"nothing buildable and nothing in flight; "
+                    f"{len(self.sched.stalled)} documents wait for KV pages")
             self._run_part(groups)
             # the chunk is built, so the anchors launched ahead of
             # their answers can be asked for their next request
@@ -903,6 +966,8 @@ class StageExecutor:
         for anchor in self.sched.drain():
             if self.arena.is_resident(self.keys[anchor]):
                 self.arena.free_key(self.keys[anchor])
+            if self.growth is not None:
+                self.growth.settled(anchor)
         self.progress.finish(f"{self.label} done", f"{self.tokens:,} fresh tokens")
         self.arena.drop_holds(self.held)
         if self.stats is not None:
@@ -910,6 +975,8 @@ class StageExecutor:
             self.stats["pack_s"] = self.pack_s
             self.stats["host_s"] = {
                 key: round(value, 3) for key, value in self.host_s.items()}
+            if self.growth is not None:
+                self.stats["kv_growth"] = self.growth.stats()
         if self.spans:
             self.torch.cuda.synchronize()
             if self.stats is not None:

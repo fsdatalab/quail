@@ -917,6 +917,15 @@ class Engine:
                 nodes["cu_q"], nodes["cu_k"], nodes["max_q"], nodes["max_k"],
                 causal=False)
             merge_partial(out_b, lse_b, nodes["b_index"], out_c, lse_c)
+        own = reads.get("own")
+        if own is not None:
+            # split rounds: call B read the pages their documents
+            # share, stacked; each round's own pages past them merge in
+            out_o, lse_o = self._fa(
+                q3.index_select(0, own["rows"]), kp, vp, own["cu_q"], None,
+                own["max_q"], own["max_used"], causal=False,
+                block_table=own["table"], seqused_k=own["used"])
+            merge_partial(out_b, lse_b, own["b_index"], out_o, lse_o)
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(

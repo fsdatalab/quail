@@ -246,6 +246,9 @@ class AnswerPart(DocumentAnswerPart):
     node_type = None
     stages_type = None
     operator = ""
+    # whether the stages put a pipeline's questions to a document at
+    # once, as branches, when the pipeline runs on its own
+    branches = False
 
     @classmethod
     def execute_group(cls, state, nodes, inputs) -> dict:
@@ -268,15 +271,17 @@ class AnswerPart(DocumentAnswerPart):
         """
         state.gpu_timing = bool(inputs.get("gpu_timing", False))
         started = time.perf_counter()
-        part = cls(state, nodes, inputs["document_ids"], inputs)
+        part = cls(state, nodes, inputs["document_ids"], inputs, standalone=True)
         stages = part.answer_stages
-        tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes,
-                                   state.loaded_model.arena)
-                if nodes[0].spec.share_prefixes else None)
+        tree = getattr(stages, "prefix_tree", None)
+        if tree is None and nodes[0].spec.share_prefixes:
+            tree = shared_prefix_tree(nodes[0].spec.name, stages.prefixes,
+                                      state.loaded_model.arena)
         results = execute_parts(
             state, [part], stages.prefixes, stages.keys,
             keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
             limit=inputs.get("limit"),
+            growth=stages if getattr(stages, "grows", False) else None,
             label=f"{stages.operator} "
                   f"{', '.join(node.spec.name for node in nodes)}")
         first = nodes[0].node_id
@@ -304,7 +309,7 @@ class AnswerPart(DocumentAnswerPart):
                     f"{document_id} of {alias!r} unlike the pipeline before it")
         return part
 
-    def __init__(self, state, nodes, ids, inputs):
+    def __init__(self, state, nodes, ids, inputs, standalone=False):
         self.nodes = list(nodes)
         self.node = self.nodes[0]
         self.ids = np.asarray(ids, dtype=np.int64)
@@ -313,12 +318,15 @@ class AnswerPart(DocumentAnswerPart):
                 f"a {self.operator} pipeline holds "
                 f"{self.node_type.__name__} nodes only")
         alias = self.node.spec.alias
+        # branches need anchors of their own, so only a pipeline run on
+        # its own puts its questions at once
+        options = {"branches": True} if self.branches and standalone else {}
         self.answer_stages = self.stages_type(
             state, [node.spec for node in nodes], load_vocabulary(state),
             self.ids, inputs["documents"][alias],
             inputs.get("texts", {}).get(alias),
             pipeline_head=inputs.get("pipeline_head", self.node.document_head),
-            document_positions=inputs.get("document_positions"))
+            document_positions=inputs.get("document_positions"), **options)
         self.stages = self.answer_stages.stages
         self._results = {}
 
@@ -343,16 +351,21 @@ class AnswerPart(DocumentAnswerPart):
         The first node is charged the run's fresh tokens less the
         later questions' suffix tokens, the packing time, and the
         borrowed prefix tokens; each later node its own suffix tokens.
+        Questions put to a document at once share their stages, so the
+        first node is charged all of their GPU time.
         """
-        per_question = len(self.stages) // len(self.nodes)
+        branches = getattr(self.answer_stages, "branches", False)
+        per_question = (len(self.stages) if branches
+                        else len(self.stages) // len(self.nodes))
         kept = self.answer_stages.asked()
         document_ids = self.ids[kept]
         counts = self.counts
         later = sum(count["suffix_tokens"] for count in counts[1:])
         results = {}
         for q, node in enumerate(self.nodes):
-            start = offset + q * per_question
-            selected = stage_spans(spans, start, start + per_question)
+            start = offset + (0 if branches else q * per_question)
+            selected = (stage_spans(spans, start, start + per_question)
+                        if q == 0 or not branches else [])
             first = q == 0
             results[node.node_id] = NodeResult(
                 {node.rows_port: self._answer_rows(node, q, kept, document_ids)},
@@ -375,7 +388,9 @@ class AnswerPart(DocumentAnswerPart):
                         "readout_gpu_s": (stats.get("readout_gpu_s")
                                           if first else None),
                         "idle_gpu_s": (stats.get("idle_gpu_s")
-                                       if first else None)}))
+                                       if first else None),
+                        "kv_growth": stats.get("kv_growth") if first else None,
+                        "branches": bool(branches)}))
         self._results = results
         self.result_value = self._results[self.node.node_id]
 

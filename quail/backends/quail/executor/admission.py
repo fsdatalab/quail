@@ -238,6 +238,12 @@ class JoinAdmission:
             one's next request's tokens, -1 where its partner callable
             would pass it on, or None; an ahead stage with one asks it
             for its anchors at once in place of their partner callable.
+        admits: Optional callable(anchor, pages, free pages) -> bool,
+            asked before a fresh anchor that fits the free pages is
+            admitted; False holds it and every anchor after it.
+
+    The caller may set stalled to anchors that cannot be packed in the
+    next chunk; they stay ready and are placed in a later one.
         survival: The fraction of anchors expected to survive every
             stage, or None. Under a limit, anchors are admitted only
             while the ones in flight are expected to fall short of it;
@@ -276,8 +282,10 @@ class JoinAdmission:
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
                  stop_groups=None, stop_width=1, reserve=None, repeats=None,
-                 slice_prefill=False, ahead=None, costs=None):
+                 slice_prefill=False, ahead=None, costs=None, admits=None):
         k = len(stage_suffixes)
+        self.admits = admits
+        self.stalled = set()
         self.ahead = [False] * k if ahead is None else list(ahead)
         if len(self.ahead) != k:
             raise ValueError("ahead must match stage_suffixes")
@@ -759,7 +767,7 @@ class JoinAdmission:
                 break
             a = self.ready.popleft()
             j, i = self._stage[a], self._next[a]
-            if self._first_cost(a, j, i) > room:
+            if a in self.stalled or self._first_cost(a, j, i) > room:
                 deferred.append(a)
                 continue
             end, tokens, pages = self._take(a, j, i, room, free_pages)
@@ -815,6 +823,9 @@ class JoinAdmission:
                 if not self._zero_cost:
                     break
                 continue
+            if self.admits is not None and not self.admits(a, need, free_pages):
+                held.append(a)      # the pages it would grow into are spoken for
+                break
             carried = (self._carried[a] if borrow is None
                        else self.prefix[a] - borrow[1])
             sliced = False

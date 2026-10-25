@@ -140,14 +140,39 @@ def _print_chunk_log(records: list) -> None:
               f"{gpu_ms[chosen].sum() * 1000 / tokens[chosen].sum():.1f} us/token")
 
 
-def _run_one(session, table, column, instruction, cap, draft_policy,
+def answer_stats(answers) -> dict:
+    """Return one map's empty answers, answer lengths, and a few samples."""
+    lengths = sorted(len(a or "") for a in answers)
+    return {
+        "num_documents": len(answers),
+        "num_empty_answers": sum(not a for a in answers),
+        "answer_chars": {"min": lengths[0], "median": lengths[len(lengths) // 2],
+                         "max": lengths[-1]},
+        "sample_answers": answers[:3],
+    }
+
+
+def _run_one(session, table, column, maps, draft_policy,
              usd_per_hour, profile=False, profile_gpu=False) -> dict:
     """Run one map configuration and return its measurements.
 
-    With profile, the run is traced with cProfile and the functions
-    with the most own time are printed. With profile_gpu, the run is
-    traced with the torch profiler, the kernels with the most GPU time
-    are printed, and the chunks are summarized by size.
+    Args:
+        session: The Quail session.
+        table: The table the maps read.
+        column: The document column.
+        maps: (result column, instruction, max answer tokens) per map;
+            several maps go in one query, as one map pipeline.
+        draft_policy: The maps' draft policy.
+        usd_per_hour: The GPU price.
+        profile: Whether to trace the run with cProfile and print the
+            functions with the most own time.
+        profile_gpu: Whether to trace the run with the torch profiler,
+            print the kernels with the most GPU time, and summarize the
+            chunks by size.
+
+    Returns:
+        The query's timings and the first map's answer statistics and
+        inference metrics; with several maps, "maps" holds each one's.
     """
     import cProfile
     import pstats
@@ -156,12 +181,14 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
 
     from quail.physical import AiMap
 
-    query = (session.docs(table).alias("d")
-             .ai_map(f"d.{column}", instruction, name="answer")
-             .select("d.id", "answer"))
+    query = session.docs(table).alias("d")
+    for name, instruction, _ in maps:
+        query = query.ai_map(f"d.{column}", instruction, name=name)
+    query = query.select("d.id", *(name for name, _, _ in maps))
+    caps = {name: cap for name, _, cap in maps}
     plan = query.plan()
     nodes = tuple(replace(
-        node, spec=replace(node.spec, max_answer_tokens=cap,
+        node, spec=replace(node.spec, max_answer_tokens=caps[node.spec.name],
                            draft_policy=draft_policy))
         if isinstance(node, AiMap) else node for node in plan.nodes)
     plan = replace(plan, nodes=nodes)
@@ -208,10 +235,16 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
                   f"{row.device_time_total / max(row.count, 1):.0f} us each, "
                   f"shapes {row.input_shapes}", flush=True)
     report = result.report
-    inference = report.get("backend_metrics", {}).get("inferences", [{}])
-    answers = result.collect().column("answer").to_pylist()
-    lengths = sorted(len(a or "") for a in answers)
-    return {
+    inferences = report.get("backend_metrics", {}).get("inferences", [{}]) or [{}]
+    table_out = result.collect()
+    per_map = {}
+    for name, _, _ in maps:
+        per_map[name] = answer_stats(table_out.column(name).to_pylist())
+        per_map[name]["inference"] = next(
+            (inference for inference in inferences
+             if inference.get("output") == name), {})
+    first = per_map[maps[0][0]]
+    measured = {
         "wall_s": round(wall, 2),
         "engine_wall_s": report.get("wall_s"),
         "gpu_s": report.get("gpu_s"),
@@ -219,13 +252,11 @@ def _run_one(session, table, column, instruction, cap, draft_policy,
         "fresh_tokens": report.get("fresh_tokens"),
         "cached_tokens": report.get("cached_tokens"),
         "usd_per_query": (report.get("wall_s") or wall) / 3600 * usd_per_hour,
-        "num_documents": len(answers),
-        "num_empty_answers": sum(not a for a in answers),
-        "answer_chars": {"min": lengths[0], "median": lengths[len(lengths) // 2],
-                         "max": lengths[-1]},
-        "inference": inference[0] if inference else {},
-        "sample_answers": answers[:3],
+        **first,
     }
+    if len(maps) > 1:
+        measured["maps"] = per_map
+    return measured
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=14400,
@@ -284,7 +315,7 @@ def map_quadrants(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
                 run_name = f"{name}_{policy}"
                 print(f"running {run_name}", flush=True)
                 measurements["runs"][run_name] = _run_one(
-                    session, table, column, instruction, cap, policy,
+                    session, table, column, (("answer", instruction, cap),), policy,
                     H100_USD_PER_HOUR, profile=profile, profile_gpu=profile_gpu)
                 print(json.dumps(
                     {run_name: measurements["runs"][run_name]}, default=str),

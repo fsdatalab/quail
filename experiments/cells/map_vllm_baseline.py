@@ -43,9 +43,19 @@ def _prompts(directory, table, column, instruction, spec) -> list[str]:
             for text in texts]
 
 
-def _run_one(client, prompts, cap) -> dict:
-    """Submit every prompt at once and measure the generation."""
-    params = client.decode_params(cap)
+def _run_one(client, prompts, cap, keep_answers=False) -> dict:
+    """Submit every prompt at once and measure the generation.
+
+    Args:
+        client: The booted vLLM client.
+        prompts: The prompt texts.
+        cap: The most answer tokens, one for every prompt or a list
+            with one per prompt.
+        keep_answers: Whether the result holds every answer, stripped,
+            in prompt order, under "answers".
+    """
+    params = ([client.decode_params(each) for each in cap]
+              if isinstance(cap, (list, tuple)) else client.decode_params(cap))
     started = time.perf_counter()
     outputs = client.generate(prompts, params, use_tqdm=False)
     wall = time.perf_counter() - started
@@ -53,7 +63,9 @@ def _run_one(client, prompts, cap) -> dict:
     answers = [output.outputs[0].text for output in outputs]
     output_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
     lengths = sorted(len(answer.strip()) for answer in answers)
+    kept = {"answers": [answer.strip() for answer in answers]} if keep_answers else {}
     return {
+        **kept,
         "wall_s": round(wall, 2),
         "input_tokens": input_tokens,
         "input_tokens_per_second": round(input_tokens / wall, 1),
