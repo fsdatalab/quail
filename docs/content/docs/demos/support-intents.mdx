@@ -26,12 +26,13 @@ across requests, but they have no topic labels attached to them.
 For example, an illustrative vector `{17: 0.8, 24933: 2.1}` activates
 features 17 and 24933. All other entries are zero.
 
-Dense embeddings are useful for comparing documents, but their individual
-coordinates usually have no clear meaning. Sparse features offer a chance
-to interpret individual coordinates: requests that strongly activate one
-feature may share a recognizable topic. Research on
+Dense embeddings are useful for comparing documents, but a single vector
+[may miss details when a document covers several topics](https://arxiv.org/abs/2005.09069).
+Their individual coordinates also usually have no clear meaning. Sparse
+features offer a chance to inspect individual topics. Requests that
+strongly activate one feature may share a recognizable topic. Research on
 [interpretable sparse features](https://www.transformer-circuits.pub/2023/monosemantic-features/index.html)
-provides the basis for this approach.
+provides the basis for this approach. Sparse features can miss details too.
 
 ## Get features for each request
 
