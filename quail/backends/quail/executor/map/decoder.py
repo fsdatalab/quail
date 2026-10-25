@@ -178,6 +178,10 @@ class MapDecoder:
         num_documents = len(documents)
         self.states = [AnswerState(num_documents, other.max_answer_tokens,
                                    spec.draft_tokens) for other in specs]
+        # per instruction, survival() and the round count it was built at
+        self._survival = [(None, -1) for _ in specs]
+        self._versions = [0] * len(specs)
+        self._fresh = {}
         for document in documents:
             document.answers = [MapAnswer(state, document.index)
                                 for state in self.states]
@@ -300,6 +304,7 @@ class MapDecoder:
         """
         state = self.states[q]
         cap = self.caps[q]
+        self._versions[q] += 1
         state.steps[index] += 1
         num_documents = len(index)
         starts = np.concatenate(([0], np.cumsum(num_rows)[:-1]))
@@ -575,7 +580,11 @@ class MapDecoder:
         answers that settle last are not missing from it while the
         short ones settle first. Where no answer has been seen the
         estimate stays flat, so an unseen length is taken to go on.
+        It is built once per round of the instruction.
         """
+        cached, version = self._survival[q]
+        if version == self._versions[q]:
+            return cached
         state = self.states[q]
         cap = self.caps[q]
         settled = self.curves[q].lengths.astype(np.float64)
@@ -586,7 +595,9 @@ class MapDecoder:
         at_risk = (np.cumsum(settled[::-1])[::-1] + np.cumsum(running[::-1])[::-1])
         hazard = np.divide(settled, at_risk, out=np.zeros_like(settled),
                            where=at_risk > 0)
-        return np.cumprod(1.0 - hazard)
+        survival = np.cumprod(1.0 - hazard)
+        self._survival[q] = survival, self._versions[q]
+        return survival
 
     def remaining(self, q: int, index: np.ndarray, quantile: float) -> np.ndarray:
         """Return the answer tokens each document is expected to still write.
@@ -613,6 +624,17 @@ class MapDecoder:
         left[state.done[index]] = 0
         return left
 
+    def fresh_remaining(self, q: int, quantile: float) -> int:
+        """Return remaining() for an answer not yet written, once per round."""
+        key = (q, quantile, self._versions[q])
+        cached = self._fresh.get(q)
+        if cached is None or cached[0] != key:
+            survival = self.survival(q)
+            end = int(np.searchsorted(-survival, -(1.0 - quantile), side="left"))
+            cached = key, min(end, self.caps[q])
+            self._fresh[q] = cached
+        return cached[1]
+
     def settle(self, document: MapDocument, q: int) -> None:
         """Set the instruction's answer for the document: its written text."""
         state = self.states[q]
@@ -620,6 +642,7 @@ class MapDecoder:
         if state.done[index]:
             return
         state.done[index] = True
+        self._versions[q] += 1
         count = int(state.num_written[index])
         self.curves[q].settle(count)
         state.answers[index] = self.vocabulary.tokenizer.decode(

@@ -273,12 +273,21 @@ class MapStages(AnswerStages):
         when not yet asked, and a round in flight.
         """
         anchors = np.asarray(anchors, dtype=np.int64)
+        round_rows = 1 + self.spec.draft_tokens
+        if len(anchors) == 1:
+            # the admission asks about one fresh anchor at a time
+            q = int(self.anchor_question[anchors[0]])
+            index = int(self.anchor_document[anchors[0]])
+            state = self.decoder.states[q]
+            if not state.started[index] and not state.done[index]:
+                left = self.decoder.fresh_remaining(q, OCCUPANCY_QUANTILE)
+                return np.array([left + int(self.tail_lengths[q]) + round_rows])
         out = np.zeros(len(anchors), dtype=np.int64)
         for q, positions, documents in self._split(anchors, None):
             state = self.decoder.states[q]
             left = self.decoder.remaining(q, documents, OCCUPANCY_QUANTILE)
             left = left + np.where(state.started[documents], 0, self.tail_lengths[q])
-            left = left + 1 + self.spec.draft_tokens
+            left = left + round_rows
             out[positions] = np.where(state.done[documents], 0, left)
         return out
 

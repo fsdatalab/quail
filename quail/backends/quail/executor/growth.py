@@ -105,8 +105,16 @@ class KVGrowth:
         self.kept_pages[anchor] = len(accounting.borrowed[key]) + lent_pages
         self.running[anchor] = None
         self.max_running = max(self.max_running, len(self.running))
-        self._margins = None
-        # admits() already counted this document in the projection
+        # admits() already counted this document in the projection; it
+        # is the youngest, so its margin joins the end of the others
+        if self._margins is not None:
+            rank, base, total_frees = self._margins
+            held = int(self._pages(self.capacity[anchor]))
+            frees = max(held - int(self.kept_pages[anchor]), 0)
+            need = max(int(self._pages(self.final[anchor])) - held, 0)
+            rank[anchor] = len(base)
+            self._margins = (rank, np.append(base, total_frees - need),
+                             total_frees + frees)
 
     def settled(self, anchor: int) -> None:
         """Forget a document whose pages were freed or retained."""
