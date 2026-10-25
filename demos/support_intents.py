@@ -12,13 +12,14 @@ Or run on Modal with the companion script:
 The input is the QUAIL-B support_traces table: customer-support
 conversations from tau-bench, with each conversation's opening request,
 its domain (airline or retail), and whether the agent completed the task.
-The query reads the SAE features of each opening request. The analysis
+The query reads the SAE features of each opening request and unnests
+them into one row per (request, feature). The analysis
 weights each feature by how rare it is, keeps each request's strongest
 weighted features, counts them, prints the requests where each one weighs
 most, and compares how often each one occurs in failed and completed
 conversations.
 
-The feature lists are saved as features.parquet and the report as
+The unnested features are saved as features.parquet and the report as
 report.json under the output directory.
 """
 
@@ -51,7 +52,7 @@ def load_conversations(scale_factor: float = 1.0) -> pa.Table:
 
 
 def read_features(conversations: pa.Table) -> pa.Table:
-    """Return (id, intent) with each opening request's SAE features."""
+    """Return (id, feature, strength), one row per request and feature."""
     import quail
 
     config = quail.EngineConfig(model=MODEL, device=DEVICE)
@@ -62,17 +63,9 @@ def read_features(conversations: pa.Table) -> pa.Table:
             session.docs("conversations").alias("t")
             .ai_sae_features(quail.prompt(QUESTION, quail.col("t.request")),
                              pooling="last", name="intent")
-            .select("t.id", "intent"))
+            .unnest("intent")
+            .select("t.id", "intent.feature", "intent.strength"))
         return query.collect()
-
-
-def flatten(features: pa.ChunkedArray) -> tuple[np.ndarray, ...]:
-    """Return (row, feature, strength) arrays, one entry per feature."""
-    lists = features.combine_chunks()
-    pairs = pc.list_flatten(lists)
-    return (pc.list_parent_indices(lists).to_numpy(),
-            pairs.field("feature").to_numpy(),
-            pairs.field("strength").to_numpy())
 
 
 def top_features(rows, features, strengths, *, num_features: int,
@@ -113,10 +106,10 @@ def examples(entries, rows, features, weights, conversations, feature,
 def analyze(conversations: pa.Table, intents: pa.Table, *,
             num_features: int = 32_768, top: int = 8) -> dict:
     """Return the most frequent intent features and the failure comparison."""
-    # the query selects the id first, then the feature lists
-    order = pc.index_in(intents.column(0), conversations.column("id"))
-    conversations = conversations.take(order)
-    rows, features, strengths = flatten(intents.column(1))
+    # the query selects the id, then the feature and its strength
+    rows = pc.index_in(intents.column(0), conversations.column("id")).to_numpy()
+    features = intents.column(1).to_numpy()
+    strengths = intents.column(2).to_numpy()
     total = conversations.num_rows
     entries, weights = top_features(rows, features, strengths,
                                     num_features=num_features,

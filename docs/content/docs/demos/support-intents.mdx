@@ -30,7 +30,8 @@ The agent completed 778 tasks and failed 542.
 
 ## Query
 
-The query reads the features of each request:
+The query reads the features of each request and returns one row for
+each (request, feature) pair:
 
 ```python
 query = (
@@ -38,7 +39,8 @@ query = (
     .ai_sae_features(
         prompt("{0}\n\nWhat is the customer asking for?", col("t.request")),
         pooling="last", name="intent")
-    .select("t.id", "intent")
+    .unnest("intent")
+    .select("t.id", "intent.feature", "intent.strength")
 )
 features = query.collect()
 ```
@@ -46,6 +48,8 @@ features = query.collect()
 The `last` pooling uses the last token of the prompt. The question comes
 after the request, so the question changes these features toward the
 customer's intent. Each request gets its 100 strongest features.
+`unnest("intent")` puts each feature in its own row, with the columns
+`intent.feature` and `intent.strength`.
 
 ## Model
 
@@ -54,30 +58,18 @@ Quail runs `qwen3.5-2b-sae-bf16` on one H100. See
 
 ## Read the features
 
-The demo uses numpy and pyarrow for the steps after the query.
+The demo uses numpy for the steps after the query.
 
-1. **Flatten the lists.** `list_flatten` gives one entry for each
-   (request, feature) pair, and `list_parent_indices` gives the request
-   of each entry:
-
-   ```python
-   lists = features.column("intent").combine_chunks()
-   pairs = pc.list_flatten(lists)
-   rows = pc.list_parent_indices(lists).to_numpy()
-   feature = pairs.field("feature").to_numpy()
-   strength = pairs.field("strength").to_numpy()
-   ```
-
-2. **Weight each feature by how rare it is.** Some features occur in
+1. **Weight each feature by how rare it is.** Some features occur in
    almost every request. These features describe the form of a support
    request, not one intent. The demo multiplies each strength by
    `log(requests / requests with the feature)`, the same weight that
    TF-IDF gives a word. A rare feature keeps more of its strength.
 
-3. **Keep the 3 features with the largest weight in each request.**
+2. **Keep the 3 features with the largest weight in each request.**
    Then count how many requests keep each feature.
 
-4. **Read the examples.** For each frequent feature, the demo prints the
+3. **Read the examples.** For each frequent feature, the demo prints the
    requests where the feature has the largest weight, one request for
    each task.
 
@@ -139,8 +131,8 @@ It loads the table with the QUAIL-B package.
 uv run python demos/support_intents.py --output-dir /tmp/support-intents
 ```
 
-The demo writes `features.parquet` and `report.json` to the output
-directory.
+The demo writes the unnested features to `features.parquet` and the
+report to `report.json` in the output directory.
 
 </Tab>
 <Tab>
