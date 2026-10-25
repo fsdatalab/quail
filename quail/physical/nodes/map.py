@@ -61,11 +61,14 @@ class MapSpec(InferenceSpec):
                 raise ValueError(f"{name} is a nonnegative number")
 
     def same_decoding(self, other: "MapSpec") -> bool:
-        """Return whether two maps can use the same decoder."""
+        """Return whether two maps can use the same decoder.
+
+        Each map keeps its own answer limit and expected answer length;
+        the drafts, their pricing, and the readout are shared.
+        """
         return all(getattr(self, name) == getattr(other, name) for name in (
-            "max_answer_tokens", "draft_tokens", "draft_policy",
-            "expected_answer_tokens", "round_cost_per_token", "ridge_tokens",
-            "top_tokens"))
+            "draft_tokens", "draft_policy", "round_cost_per_token",
+            "ridge_tokens", "top_tokens"))
 
     @property
     def alias(self) -> str:

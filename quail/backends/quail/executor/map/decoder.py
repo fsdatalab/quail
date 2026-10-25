@@ -33,7 +33,6 @@ import numpy as np
 from quail.backends.quail.executor.vocabulary import Vocabulary
 from quail.cost.draft_policy import AnswerLengthCurve, MapDraftPolicy
 from quail.cost.ngram_cache import MATCH_ORDERS, NgramCache
-from quail.physical import MapSpec
 
 # a draft token's policy cell: copied from the document, or none
 COPY_CELL = -1
@@ -148,34 +147,37 @@ class MapDecoder:
         k: How many likeliest tokens each readout row carries.
         width: The values in each readout row: the stop, then k ids
             and k log probabilities.
-        questions: How many instructions the pipeline puts.
-        spec: Map plan carrying the execution settings.
+        specs: The pipeline's MapSpecs, one per instruction. They share
+            their draft and pricing settings; each has its own answer
+            limit and expected answer length.
         documents: The MapDocuments, in index order.
     """
 
-    def __init__(self, vocabulary: Vocabulary, k: int, width: int, questions: int,
-                 spec: MapSpec, documents: list):
+    def __init__(self, vocabulary: Vocabulary, k: int, width: int, specs: list,
+                 documents: list):
+        spec = specs[0]
         self.spec = spec
+        self.caps = [other.max_answer_tokens for other in specs]
         self.vocabulary = vocabulary
         self.k = k
         self.width = width
         self.cache = NgramCache()
         # one acceptance table and answer-length curve per instruction
-        self.policies = ([MapDraftPolicy(spec.draft_tokens, spec.max_answer_tokens,
-                                         spec.expected_answer_tokens)
-                          for _ in range(questions)]
+        self.policies = ([MapDraftPolicy(spec.draft_tokens, other.max_answer_tokens,
+                                         other.expected_answer_tokens)
+                          for other in specs]
                          if spec.draft_policy == "adaptive" else None)
         # one answer-length curve per instruction, the policy's when it
         # has one, for drafts and for sizing each document's KV
         self.curves = ([policy.curve for policy in self.policies]
                        if self.policies is not None else
-                       [AnswerLengthCurve(spec.max_answer_tokens,
-                                          spec.expected_answer_tokens)
-                        for _ in range(questions)])
+                       [AnswerLengthCurve(other.max_answer_tokens,
+                                          other.expected_answer_tokens)
+                        for other in specs])
         self.documents = documents
         num_documents = len(documents)
-        self.states = [AnswerState(num_documents, spec.max_answer_tokens,
-                                   spec.draft_tokens) for _ in range(questions)]
+        self.states = [AnswerState(num_documents, other.max_answer_tokens,
+                                   spec.draft_tokens) for other in specs]
         for document in documents:
             document.answers = [MapAnswer(state, document.index)
                                 for state in self.states]
@@ -297,7 +299,7 @@ class MapDecoder:
             How many of the documents' answers ended in this round.
         """
         state = self.states[q]
-        cap = self.spec.max_answer_tokens
+        cap = self.caps[q]
         state.steps[index] += 1
         num_documents = len(index)
         starts = np.concatenate(([0], np.cumsum(num_rows)[:-1]))
@@ -431,7 +433,7 @@ class MapDecoder:
         if not len(index):
             return
         state = self.states[q]
-        cap = self.spec.max_answer_tokens
+        cap = self.caps[q]
         span = self.spec.draft_tokens
         policy = None if self.policies is None else self.policies[q]
         written = state.num_written[index]
@@ -565,12 +567,33 @@ class MapDecoder:
             active = kept
         return tokens, cells, rates, hops
 
+    def survival(self, q: int) -> np.ndarray:
+        """Return P(an answer has more than j tokens) for j = 0 to the limit.
+
+        A Kaplan-Meier estimate: answers still being written count as
+        lasting at least as long as they have written, so the long
+        answers that settle last are not missing from it while the
+        short ones settle first. Where no answer has been seen the
+        estimate stays flat, so an unseen length is taken to go on.
+        """
+        state = self.states[q]
+        cap = self.caps[q]
+        settled = self.curves[q].lengths.astype(np.float64)
+        writing = state.asked & ~state.done
+        running = np.bincount(np.minimum(state.num_written[writing], cap),
+                              minlength=cap + 1).astype(np.float64)
+        # at risk at length j: answers that reached j tokens
+        at_risk = (np.cumsum(settled[::-1])[::-1] + np.cumsum(running[::-1])[::-1])
+        hazard = np.divide(settled, at_risk, out=np.zeros_like(settled),
+                           where=at_risk > 0)
+        return np.cumprod(1.0 - hazard)
+
     def remaining(self, q: int, index: np.ndarray, quantile: float) -> np.ndarray:
         """Return the answer tokens each document is expected to still write.
 
-        The count is the quantile of the instruction's answer lengths
-        given the tokens each answer has written, from the answers
-        settled so far; a settled answer writes none.
+        The count is the quantile of the instruction's answer lengths,
+        given the tokens each answer has written, from survival(); a
+        settled answer writes none.
 
         Args:
             q: The instruction's index.
@@ -579,13 +602,14 @@ class MapDecoder:
                 the count.
         """
         state = self.states[q]
-        levels = np.asarray(self.curves[q].levels())
+        survival = self.survival(q)
         written = state.num_written[index]
-        # levels never rise, so the first level at or below the
-        # threshold ends the quantile, past the written tokens
-        threshold = (1.0 - quantile) * levels[written]
-        end = np.searchsorted(-levels, -threshold, side="left")
-        left = np.clip(end - written, 0, self.spec.max_answer_tokens - written)
+        # P(longer than written - 1) conditions on what is written;
+        # survival never rises, so the first length at or below the
+        # threshold ends the quantile
+        before = np.concatenate(([1.0], survival))[written]
+        end = np.searchsorted(-survival, -(1.0 - quantile) * before, side="left")
+        left = np.clip(end - written, 0, self.caps[q] - written)
         left[state.done[index]] = 0
         return left
 

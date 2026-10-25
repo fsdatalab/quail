@@ -387,9 +387,11 @@ def test_a_live_document_runs_in_every_pass(monkeypatch):
 
 
 def test_a_small_pool_runs_more_documents_when_pages_grow_as_they_write(monkeypatch):
-    # twelve documents in a pool that holds three of them reserved for
-    # the whole answer limit: each gets pages for its prompt and first
-    # rounds, and more as it writes, so more run at once and all finish
+    # twenty-four documents in a pool that holds six of them reserved
+    # for the whole answer limit: each gets pages for its prompt and
+    # first rounds, and more as it writes. Once short answers settle,
+    # the admission expects the rest to be short, so more run at once,
+    # and all finish
     from helpers.fakes import cpu_arena
 
     gold = "March 3"
@@ -412,7 +414,7 @@ def test_a_small_pool_runs_more_documents_when_pages_grow_as_they_write(monkeypa
     tokens = tables.encode_ids(LEASE)
     head, tail = spec.prompt_token_parts
     whole = len(head) + len(tokens) + len(tail) - 1 + 1 + 48 + 2 * 2
-    state.loaded_model.arena = cpu_arena(3 * -(-whole // 16))
+    state.loaded_model.arena = cpu_arena(6 * -(-whole // 16))
     original = MapStages.__init__
 
     def init(self, *args, **kwargs):
@@ -424,10 +426,71 @@ def test_a_small_pool_runs_more_documents_when_pages_grow_as_they_write(monkeypa
     monkeypatch.setattr(MapStages, "__init__", init)
     node = AiMap(node_id="ai-map:summary", backend_name="quail",
                  model="qwen3-4b-fp8", spec=spec)
-    count = 12
+    count = 24
     inputs = {"document_ids": list(range(count)), "documents": {"c": [tokens] * count},
               "texts": {"c": [LEASE] * count}}
     result = MapPart.execute_group(state, [node], inputs)["ai-map:summary"]
     assert result.outputs["rows:c"].column("summary").to_pylist() == [gold] * count
-    assert max(len(keys) for keys in passes) > 3
-    assert result.metrics.extension["kv_growth"]["max_running"] > 3
+    assert max(len(keys) for keys in passes) > 6
+    assert result.metrics.extension["kv_growth"]["max_running"] > 6
+
+
+def test_answers_still_writing_keep_long_lengths_in_the_estimate(monkeypatch):
+    # one answer settled after 3 tokens while two are still writing at
+    # 40: the estimate counts the two as lasting at least 40, so it
+    # expects them to go on rather than to end like the short one
+    tables = make_vocabulary(LEASE)
+    spec = make_map_spec(tables, max_answer_tokens=64)
+    monkeypatch.setattr(MapStages, "_readout",
+                        lambda self, state: _fake_readout(tables, 4))
+    model = ScriptedModel(tables, {}, {}, 4)
+    state = _state(model)
+    state.loaded_model.vocabulary = tables
+    tokens = tables.encode_ids(LEASE)
+    stages = MapStages(state, [spec], tables, [0, 1, 2], [tokens] * 3)
+    decoder = stages.decoder
+    answers = decoder.states[0]
+    answers.asked[:] = True
+    answers.num_written[:] = [3, 40, 40]
+    decoder.settle(stages.documents[0], 0)
+    left = decoder.remaining(0, np.array([1, 2]), 0.9)
+    assert left.tolist() == [24, 24]
+
+
+def test_maps_with_different_answer_limits_run_as_branches(monkeypatch):
+    # two instructions over one table with limits of 2 and 5 tokens:
+    # they share one pipeline, and each answer stops at its own limit
+    gold = "March 3, 2027 at noon"
+    tables = make_vocabulary(LEASE, gold)
+    short = make_map_spec(tables, max_answer_tokens=2, draft_tokens=0)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
+    state = _state(model)
+    state.loaded_model.vocabulary = tables
+    seen = {}
+    original = MapStages.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        for key in self.keys:
+            model.documents[key] = LEASE
+            model.gold[key] = gold
+        seen["stages"] = self
+
+    monkeypatch.setattr(MapStages, "__init__", init)
+    from dataclasses import replace
+    longer = replace(short, name="longer", max_answer_tokens=5,
+                     expected_answer_tokens=5)
+    assert short.same_decoding(longer)
+    nodes = [AiMap(node_id=f"ai-map:{spec.name}", backend_name="quail",
+                   model="qwen3-4b-fp8", spec=spec) for spec in (short, longer)]
+    inputs = {"document_ids": [0], "documents": {"c": [tables.encode_ids(LEASE)]},
+              "texts": {"c": [LEASE]}}
+    MapPart.execute_group(state, nodes, inputs)
+    stages = seen["stages"]
+    assert stages.branches
+    written = [len(document_answers.written)
+               for document_answers in stages.documents[0].answers]
+    assert written == [2, 5]

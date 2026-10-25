@@ -66,6 +66,10 @@ class KVGrowth:
         horizon = int((self.final - self.prefix).max()) if num_anchors else 0
         # the projection's time axis, in rows written, a page apart
         self.grid = np.arange(0, horizon + self.page, self.page, dtype=np.int64)
+        # pages the projection leaves free at its peak: the most one
+        # document can still grow, so the oldest grows without
+        # stalling the others
+        self.reserve = int(self._pages(horizon))
         # rows each anchor's pages cover, and pages its finish does not
         # free: the ones it borrowed and the ones it lent to borrowers
         self.capacity = np.zeros(num_anchors, dtype=np.int64)
@@ -213,7 +217,8 @@ class KVGrowth:
         """Return whether a fresh document fits, and count it if so.
 
         It fits when the pool stays safe with it admitted last and the
-        projected growth, with it added, never passes the pages left.
+        projected growth, with it added, never comes within reserve
+        pages of the pages left.
 
         Args:
             anchor: The fresh document.
@@ -230,7 +235,7 @@ class KVGrowth:
         remaining = int(self.model.remaining(np.array([anchor], dtype=np.int64))[0])
         rows = self.prefix[anchor] + self.model.initial_tokens + self.grid
         own = np.where(self.grid < remaining, self._pages(rows) - pages, -pages)
-        if int((growth + own).max()) > left:
+        if int((growth + own).max()) > left - self.reserve:
             return False
         self._projection = growth + own
         return True

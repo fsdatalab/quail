@@ -91,7 +91,7 @@ class MapStages(AnswerStages):
         self._order_documents(document_ids)
         self.readout = self._readout(state) if readout is None else readout
         self.decoder = MapDecoder(vocabulary, self.readout.k, self.readout.width,
-                                  len(self.specs), self.spec, self.documents)
+                                  self.specs, self.documents)
         self.branches = bool(branches) and len(self.specs) > 1 and not self.recurrent
         self._anchors(state.loaded_model.arena.page_tokens)
         # per instruction, each document's cue position: the first
@@ -243,7 +243,8 @@ class MapStages(AnswerStages):
         the answer's end was decided.
         """
         tail = int(self.tail_lengths.max()) if self.branches else 1
-        return tail + self.spec.max_answer_tokens + 2 * self.spec.draft_tokens
+        answer = max(spec.max_answer_tokens for spec in self.specs)
+        return tail + answer + 2 * self.spec.draft_tokens
 
     # ---- the growth model ---------------------------------------------------
 

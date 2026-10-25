@@ -56,15 +56,16 @@ def test_the_oldest_document_grows_first_and_a_younger_one_waits():
 def test_a_document_is_admitted_when_the_projected_peak_fits():
     # two documents hold a page each: one is expected to end within
     # 16 rows, the other within 64. A third, admitted with two pages,
-    # peaks with them at five pages past what is free after it
-    arena, keys, model, growth = _growth(12, 3)
+    # peaks with them at five pages past what is free after it, and
+    # the projection keeps the four pages one document can still grow
+    # in reserve: twelve pages left after it fit
+    arena, keys, model, growth = _growth(16, 3)
     _admit(arena, keys, growth, 0)
     _admit(arena, keys, growth, 1)
     model.left = {0: 16, 1: 64, 2: 64}
     assert growth.admits(2, 2, arena.free_pages)
-    # with four fewer pages, four are left after it: the peak of five
-    # does not fit
-    arena, keys, model, growth = _growth(8, 3)
+    # with eight left after it, the peak and the reserve do not fit
+    arena, keys, model, growth = _growth(12, 3)
     _admit(arena, keys, growth, 0)
     _admit(arena, keys, growth, 1)
     model.left = {0: 16, 1: 64, 2: 64}
