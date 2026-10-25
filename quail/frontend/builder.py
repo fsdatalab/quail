@@ -3,6 +3,8 @@
 from collections.abc import Mapping
 from typing import Optional
 
+import pyarrow as pa
+
 from quail.catalog import Catalog
 from quail.frontend.expressions import (
     AggSpec,
@@ -20,6 +22,7 @@ from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
 from quail.logical import (
+    FEATURE_LIST,
     AggregateCall,
     Aggregation,
     Alias,
@@ -68,6 +71,10 @@ class Query:
         self._scores = {}            # name -> Alias of an AI.SCORE call
         # name -> an AI.EXTRACT's ExtractStruct and its fields' Aliases
         self._extracts = {}
+        self._features = {}          # name -> Alias of an AI.SAE_FEATURES call
+        self._unnests = []           # the list names of each unnest()
+        self._unnest_outer = []      # whether each unnest() keeps empty rows
+        self._unnest_tests = []      # RegularPredicate on their fields
         self._regular_predicates = {}  # alias -> [RegularPredicate]
         # alias -> [(RegularPredicate on an answer or span, selectivity)]
         self._extract_filters = {}
@@ -174,6 +181,67 @@ class Query:
         call = ModelCall(bound, "score")
         call.validate()
         self._scores[name] = Alias(call, name)
+        return self
+
+    def ai_sae_features(self, p: PromptSpec, *, pooling: str,
+                        name: str) -> "Query":
+        """Add a named column of the prompt's sparse autoencoder features.
+
+        The call generates no text: the engine runs the prompt and
+        returns the nonzero features as a list of (feature, strength)
+        pairs, one list per document. Use select() to return the column.
+
+        Args:
+            p: A prompt over one document column.
+            pooling: Which tokens become a row's list: "last" reads the
+                final prompt token; "max" takes each feature's largest
+                strength over every prompt token.
+            name: The feature list column's name, without a dot.
+        """
+        if self._pending_join is not None:
+            raise CompileError(
+                "join() is waiting for the ai_filter over its pairs; "
+                "read features before joining")
+        if not name or "." in name:
+            raise CompileError(
+                f"a feature call needs a column name without a dot, "
+                f"got {name!r}")
+        self._claim_name(name)
+        refs = tuple(self._resolve_value(c) for c in p.cols)
+        bound = self._prompts.bind("features", p.template, refs)
+        for ref in refs:
+            self._note_document_column(ref)
+        call = ModelCall(bound, "features", pooling=pooling)
+        call.validate()
+        self._features[name] = Alias(call, name)
+        return self
+
+    def unnest(self, *names: str, outer: bool = False) -> "Query":
+        """Return one row per element of ai_sae_features() columns.
+
+        Each column ``name`` becomes ``name.feature`` and
+        ``name.strength``, which select(), where(), group_by(), agg(),
+        and order_by() read like other columns; the other selected
+        columns repeat for each element. The lists of one call are
+        zipped: a row returns as many rows as its longest list, with
+        nulls past the end of a shorter one. A row with no elements
+        returns no rows, or one row of nulls with ``outer=True``, as
+        LEFT JOIN UNNEST does. A second call unnests each row of the
+        first, so two calls return the product.
+        """
+        if not names:
+            raise CompileError("unnest() names at least one column")
+        unnested = {name for lists in self._unnests for name in lists}
+        for name in names:
+            if name not in self._features:
+                raise CompileError(
+                    f"unnest() names an ai_sae_features() column, got {name!r}")
+            if name in unnested or names.count(name) > 1:
+                raise CompileError(f"unnest() reads {name!r} twice")
+        for name in names:
+            self._scope_.add_relation(name, pa.schema(FEATURE_LIST.value_type))
+        self._unnests.append(tuple(names))
+        self._unnest_outer.append(outer)
         return self
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
@@ -298,7 +366,7 @@ class Query:
     def _claim_name(self, name: str) -> None:
         """Check that no earlier call, table alias, or source column uses the name."""
         if (name in self._labels or name in self._scores
-                or name in self._extracts
+                or name in self._extracts or name in self._features
                 or any(name == n + SPAN_SUFFIX for n in self._extracts)
                 or name in self._scope()):
             raise CompileError(f"the name {name!r} is already used")
@@ -478,11 +546,13 @@ class Query:
             if alias in self._scope():
                 raise CompileError(f"duplicate table alias {alias!r}")
             self._claim_name(alias)
-            for name in (*other._labels, *other._scores, *other._extracts):
+            for name in (*other._labels, *other._scores, *other._extracts,
+                         *other._features):
                 self._claim_name(name)
             self._labels.update(other._labels)
             self._scores.update(other._scores)
             self._extracts.update(other._extracts)
+            self._features.update(other._features)
             self._scope_.add_table(alias, provider)
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
@@ -611,7 +681,7 @@ class Query:
     filter = where
 
     def _where_test(self, test: PredicateSpec) -> None:
-        """Route one test to the scan, a label filter, or an answer filter."""
+        """Route one test to the scan, a label, an answer, or an unnest filter."""
         spec = test.col
         if spec.alias is None and spec.column in self._labels:
             if test.comparison not in ("=", "in"):
@@ -640,8 +710,11 @@ class Query:
         predicate = RegularPredicate(self._resolve_value(spec), test.comparison,
                                      test.value)
         predicate.validate()
-        self._regular_predicates.setdefault(predicate.column.alias, []).append(
-            predicate)
+        if predicate.column.alias in self._scope_.relations:
+            self._unnest_tests.append(predicate)
+        else:
+            self._regular_predicates.setdefault(predicate.column.alias, []).append(
+                predicate)
 
     def _extract_column(self, spec: ColSpec) -> Optional[ColumnRef]:
         """Resolve a col() naming an extraction's answer or span, or None.
@@ -752,7 +825,7 @@ class Query:
                 f"over its pairs; a plain join belongs in the database "
                 f"the ids came from")
         if not (self._joins or self._filters or self._labels or self._scores
-                or self._extracts):
+                or self._extracts or self._features):
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "
                                "came from")
@@ -770,27 +843,32 @@ class Query:
                     "supported")
             columns, aggregation = self._aggregation(cols)
         windows, output = self._windowing(columns, cols)
+        selected = []                # the result column names, in order
         for c in () if aggregation is not None or windows else cols:
             if isinstance(c, str) and c in self._labels:
                 columns.append(self._labels[c])
-                continue
-            if isinstance(c, str) and c in self._scores:
+            elif isinstance(c, str) and c in self._scores:
                 columns.append(self._scores[c])
-                continue
-            if isinstance(c, str) and c in self._extracts:
+            elif isinstance(c, str) and c in self._features:
+                columns.append(self._features[c])
+            elif isinstance(c, str) and c in self._extracts:
                 struct, members = self._extracts[c]
                 structs.append(struct)
                 columns.extend(members)
+                selected.append(struct.name)
                 continue
-            if isinstance(c, str) and c == "*":
+            elif isinstance(c, str) and c == "*":
                 for alias, provider in self._tables:
                     for name in self._catalog.get(provider).columns:
                         columns.append(ColumnRef(alias=alias,
                                                  provider=provider,
                                                  column=name))
+                        selected.append(column_name(columns[-1]))
                 continue
-            columns.append(self._resolve_value(col(c) if isinstance(c, str) else c,
-                                               named=True))
+            else:
+                columns.append(self._resolve_value(
+                    col(c) if isinstance(c, str) else c, named=True))
+            selected.append(column_name(columns[-1]))
         # a classification is planned when the query returns or tests
         # its label
         tested = {name for tests in self._label_filters.values()
@@ -800,6 +878,14 @@ class Query:
         # an extraction is planned when the query returns its answer
         extracted = [column for column in columns
                      if aliased_call(column, "extract") is not None]
+        for lists in self._unnests:
+            columns.extend(self._features[name] for name in lists
+                           if self._features[name] not in columns)
+        if self._unnests and aggregation is None and not windows:
+            output = tuple(selected)
+        # a feature call is planned when the query returns its list
+        featured = [column for column in columns
+                    if aliased_call(column, "features") is not None]
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(
@@ -817,6 +903,9 @@ class Query:
                                for column in extracted
                                if column.expression.aliases() == (alias,)),
                 extract_filters=tuple(self._extract_filters.get(alias, ())),
+                sae_features=tuple((column.expression, column.name)
+                                   for column in featured
+                                   if column.expression.aliases() == (alias,)),
                 schema=self._catalog.get(provider).schema(),
             )
         for join in self._joins:
@@ -842,7 +931,10 @@ class Query:
         return logical.project(tuple(columns), self._limit, order=tuple(order),
                                offset=self._offset, distinct=self._distinct,
                                aggregation=aggregation, structs=tuple(structs),
-                               windows=windows, output=output)
+                               windows=windows, output=output,
+                               unnests=tuple(self._unnests),
+                               unnest_outer=tuple(self._unnest_outer),
+                               unnest_tests=tuple(self._unnest_tests))
 
     def _project(self, columns: list, c) -> str:
         """Add the column or named output ``c`` to ``columns``; return its name."""

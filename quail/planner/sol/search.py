@@ -14,6 +14,7 @@ import pyarrow as pa
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
 from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
+from quail.cost.sae_features import sae_encoded_tokens
 from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan
 from quail.logical import oriented_join_conditions
@@ -30,6 +31,7 @@ from quail.planner.search.table_steps import (
     table_steps,
 )
 from quail.planner.search.table_steps import CLASSIFY as CLASSIFY_STEP
+from quail.planner.search.table_steps import FEATURES as FEATURES_STEP
 from quail.planner.statistics.prefixes import (
     document_shared_tokens,
     subset_shared_tokens,
@@ -50,6 +52,7 @@ CLASSIFY = "AI.CLASSIFY"
 EXTRACT = "AI.EXTRACT"
 LABEL_IN = "IN"
 ANSWER_TEST = "ANSWER TEST"
+FEATURES = "AI.SAE_FEATURES"
 
 
 
@@ -86,6 +89,9 @@ class _EstimatePricing:
         return self._question(call.prompt)
 
     def extract(self, node) -> tuple:
+        return self._question(node.call.prompt)
+
+    def features(self, node) -> tuple:
         return self._question(node.call.prompt)
 
     def document_head(self, prompt):
@@ -139,6 +145,9 @@ class Search:
         self.label_filters = operators.label_filters
         self.extracts = operators.extracts
         self.extract_filters = operators.extract_filters
+        self.sae_features = operators.sae_features
+        self.max_pooling = {node.alias for node in self.sae_features
+                            if node.pooling == "max"}
         if self.labels.calls and label is None:
             raise ValueError(
                 "the query classifies documents; pass label=(prompt, "
@@ -350,7 +359,9 @@ class Search:
             calls = [call for call, owner in self.labels.calls
                      if owner == alias and len(call.aliases()) == 1]
             extracts = [node for node in self.extracts if node.alias == alias]
-            if not asks and not calls and not extracts:
+            feature_calls = [node for node in self.sae_features
+                             if node.alias == alias]
+            if not asks and not calls and not extracts and not feature_calls:
                 continue
             tokens = self.aliases[alias].tokens
             mean_document_tokens = sum(tokens) / len(tokens) if tokens else 0
@@ -388,6 +399,11 @@ class Search:
                 elif step.kind == CLASSIFY_STEP:
                     rows, stage_work = self.classify_stage(
                         alias, step.key, rows, first, stages)
+                elif step.kind == FEATURES_STEP:
+                    node = next(node for node in feature_calls
+                                if node.name == step.key)
+                    rows, stage_work = self.features_stage(
+                        alias, node, rows, first, stages)
                 else:
                     node = next(node for node in extracts if node.name == step.key)
                     rows, stage_work = self.extract_stage(
@@ -429,6 +445,27 @@ class Search:
                 name=self.labels.names[call],
                 accepted=list(test.condition.value)))
             rows = passed
+        return rows, stage_work
+
+    def features_stage(self, alias, node, rows, first, stages):
+        """Read the live rows' SAE features; every row survives.
+
+        The pooling 'last' encodes one token per row; 'max' encodes the
+        prompt's tokens, the documents' once across the alias's feature
+        calls because their maxima are kept.
+        """
+        tail = self.lower(node.call.prompt).tail_tokens
+        stage_work = self.question_work(alias, rows, tail, first)
+        tokens = self.aliases[alias].tokens
+        documents = float(sum(tokens[row] for row in rows)) if first else 0.0
+        encoded = sae_encoded_tokens(
+            node.pooling, len(rows), documents + len(rows) * (
+                tail + (self.pre if first else 0)),
+            max_pooling=alias in self.max_pooling)
+        stage_work = stage_work + Work(sae_encoded=encoded)
+        stages.append(_stage(
+            FEATURES, alias, node.call.prompt.template, None, tail, None,
+            rows, rows, stage_work, name=node.name))
         return rows, stage_work
 
     def extract_stage(self, alias, node, rows, first, stages):

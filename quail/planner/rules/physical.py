@@ -15,6 +15,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiSaeFeatures,
     AiScore,
     Limit,
     PhysicalGraph,
@@ -324,8 +325,13 @@ class ShouldSharePrefixes(PhysicalRule):
             for alias, lengths in context.document_tokens.items()
         }
         shared_by_alias = {}
+        max_pooling_aliases = {
+            node.document_aliases[0] for node in graph.nodes
+            if isinstance(node, AiSaeFeatures) and node.spec.pooling == "max"
+        }
         for node in graph.nodes:
-            if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract, AiScore))
+            if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract,
+                                      AiSaeFeatures, AiScore))
                     or (isinstance(node, AiInference) and node.spec is None)
                     or node.share_prefixes
                     or (isinstance(node, AiScore) and len(node.spec.aliases) != 1)):
@@ -333,6 +339,10 @@ class ShouldSharePrefixes(PhysicalRule):
                 continue
             alias = (node.spec.aliases[0] if isinstance(node, AiScore)
                      else node.document_aliases[0])
+            # Borrowed KV has no residual rows from which to recover SAE maxima.
+            if alias in max_pooling_aliases:
+                nodes.append(node)
+                continue
             lengths = context.document_tokens.get(alias)
             store = None if lengths is None else lengths.store
             if store is None:

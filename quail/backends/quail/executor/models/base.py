@@ -36,12 +36,18 @@ class ModelPipeline:
     warm_row_classes = True    # row-count classes keep one KV row per reader
     warm_joins = True          # join and classification chunks borrow prefixes
     decode_graphs = None
+    # For a spec with an SAE, forward_chunk returns the residual stream
+    # after the last loaded layer instead of the final-normed rows, and
+    # forward_hook, when a query sets it, is called with (stream, chunk)
+    # over every row of each chunk before the final_indices select.
+    forward_hook = None
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.
 
-        The loop owns the chunk's pages, temporaries included; this
-        only computes.
+        For a spec with an SAE, return the residual stream of those rows
+        instead, without the final norm. The loop owns the chunk's
+        pages, temporaries included; this only computes.
         """
         raise NotImplementedError
 

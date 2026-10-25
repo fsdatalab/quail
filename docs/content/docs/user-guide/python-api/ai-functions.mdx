@@ -3,7 +3,7 @@ title: AI functions
 ---
 
 Use AI functions to filter and join documents, score answers, classify
-rows, and extract text. Calling these builder functions creates a query.
+rows, extract text, and read sparse autoencoder features. Calling these builder functions creates a query.
 The model runs when you call `run()` or `collect()`.
 
 ## Functions
@@ -19,6 +19,7 @@ Select a row to jump to its arguments and examples.
 | [`ai_score(prompt, name=...)`](#ai_score) | Adds a score from 0 to 1 for each document. |
 | [`ai_classify(prompt, labels, ...)`](#ai_classify) | Assigns one of the supplied labels. |
 | [`ai_extract(column, questions, ...)`](#ai_extract) | Copies answers from a document and returns their positions. |
+| [`ai_sae_features(prompt, ...)`](#ai_sae_features) | Returns the sparse autoencoder features of a prompt. |
 
 </div>
 
@@ -192,6 +193,69 @@ set the expected fraction of documents that pass.
 
 See [`AI.EXTRACT`](/docs/user-guide/sql/ai-functions#aiextract) for output examples
 and supported queries.
+
+## ai_sae_features
+
+`ai_sae_features(prompt, *, pooling, name)`
+
+Add a column with the sparse autoencoder (SAE) features of each
+document's prompt. Each feature has an ID and a strength. The column
+holds a list of the features with a nonzero strength.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `prompt` | `Prompt` | The question and one document column, built with `prompt()`. |
+| `pooling` | `str` | The tokens that give the features: `"last"` or `"max"`. |
+| `name` | `str` | Name of the result column. |
+
+For example, imagine a `tickets` table with the first message of each
+support conversation in `request`. Return the features of each request:
+
+```python
+query = (
+    session.docs("tickets").alias("t")
+    .ai_sae_features(
+        prompt("{0}\n\nWhat is the customer asking for?", col("t.request")),
+        pooling="last", name="intent")
+    .select("t.id", "intent")
+)
+table = query.collect()
+```
+
+`collect()` returns an Arrow table. Its `intent` column has the type
+`list<struct<feature: int32, strength: float>>`.
+
+Strengths are nonnegative activation values, not probabilities. They can
+exceed 1 and are not normalized to sum to 1. A filter such as
+`strength > 1` uses an arbitrary cutoff; 1 has no special meaning.
+
+Call `unnest("intent")` to get one row for each feature, with the columns
+`intent.feature` and `intent.strength`. For example, count how many
+requests return each feature:
+
+```python
+from quail.frontend.expressions import count
+
+query = (
+    session.docs("tickets").alias("t")
+    .ai_sae_features(
+        prompt("{0}\n\nWhat is the customer asking for?", col("t.request")),
+        pooling="last", name="intent")
+    .unnest("intent")
+    .group_by("intent.feature")
+    .agg(requests=count())
+    .order_by(col("requests").desc())
+    .select("intent.feature", "requests")
+)
+```
+
+`unnest("f", "g")` puts two lists side by side, as `UNNEST(a, b)` does
+in SQL. `unnest("f").unnest("g")` gives each pair of elements.
+`unnest("f", outer=True)` keeps a row with no features, with null fields,
+as `LEFT JOIN UNNEST` does in SQL.
+
+See [`AI.SAE_FEATURES`](/docs/user-guide/sql/ai-functions#aisae_features)
+for the two poolings and the limits.
 
 See [Non-AI functions](/docs/user-guide/python-api/non-ai-functions)
 for conditions on AI outputs, sorting, aggregation, and result collection.

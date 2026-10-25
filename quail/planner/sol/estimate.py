@@ -49,6 +49,8 @@ from quail.logical import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticSaeFeatures,
+    Unnest,
     Window,
 )
 from quail.planner.sol.search import (
@@ -64,7 +66,8 @@ from quail.planner.sol.search import (
 from quail.specs import DeviceSpec, ModelSpec
 
 _PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, SemanticExtract,
-                 Filter, Join, SemanticJoin, Project, Aggregate, Window, Result)
+                 SemanticSaeFeatures, Filter, Join, SemanticJoin, Project,
+                 Unnest, Aggregate, Window, Result)
 
 
 @dataclass(frozen=True)
@@ -262,11 +265,12 @@ def _refuse_unpriced(logical) -> None:
             raise NotImplementedError(
                 "the speed of light estimate prices binary join predicates")
     for column in operators.projections:
-        if column.expression.kind not in ("label", "extract"):
+        if column.expression.kind not in ("label", "extract", "features"):
             raise NotImplementedError(
                 f"the speed of light estimate does not price the "
                 f"{column.expression.kind!r} column {column.name!r}; it "
-                f"prices AI.CLASSIFY and AI.EXTRACT columns")
+                f"prices AI.CLASSIFY, AI.EXTRACT, and AI.SAE_FEATURES "
+                f"columns")
     joined = [frozenset(arg.alias for arg in join.prompt.args)
               for join in operators.joins]
     for call, _ in operators.labels.calls:

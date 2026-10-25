@@ -18,12 +18,13 @@ from quail.logical.expressions import (
     _explain,
     aliased_call,
     column_name,
-    column_references,
     packed_columns,
 )
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import classifications
 from quail.logical.nodes.extract import extractions
+from quail.logical.nodes.filter import above_unnest
+from quail.logical.nodes.sae_features import FEATURE_LIST
 
 
 def _named_schema(input: LogicalNode, output: tuple[str, ...]) -> tuple:
@@ -52,14 +53,20 @@ class Project:
         return self.columns
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        return tuple(dict.fromkeys(
-            ref for column in self.columns if aliased_call(column) is None
-            for ref in column_references(column)))
+        fields = {column_name(ref): ref for ref in self.input.output_schema()}
+        fields.update({column_name(column): column for column in self.columns
+                       if isinstance(column, ColumnRef)})
+        return tuple(fields.get(name, ColumnRef("", "", name))
+                     for name in self.result_columns())
 
     def validate(self) -> None:
         computed = {(node.call, node.name) for node in classifications(self.input)}
         extracted = {(node.call, node.name) for node in extractions(self.input)}
         for column in self.columns:
+            if isinstance(column, str):
+                if column not in self.input.result_columns():
+                    raise CompileError(f"Project reads an unknown column {column!r}")
+                continue
             column.validate()
             call = aliased_call(column)
             if call is not None and call.kind == "label" and (
@@ -116,6 +123,11 @@ class Project:
         return packed_columns(
             (column_name(column) for column in self.columns), self.packing())
 
+    def list_types(self) -> dict:
+        """Return the Arrow type of each list column the projection returns."""
+        return {column.name: FEATURE_LIST for column in self.columns
+                if aliased_call(column, "features") is not None}
+
     def with_children(self, children: tuple[LogicalNode, ...]) -> "Project":
         if len(children) != 1:
             raise CompileError("Project needs one child")
@@ -134,9 +146,9 @@ class Project:
 
 @dataclass(frozen=True)
 class Aggregate:
-    """Group projected rows and compute aggregate outputs."""
+    """Group projected or unnested rows and compute aggregate outputs."""
 
-    input: Project
+    input: LogicalNode
     keys: tuple[str, ...]
     aggregates: tuple[AggregateCall, ...]
     output: tuple[str, ...]
@@ -153,7 +165,7 @@ class Aggregate:
         return _named_schema(self.input, self.output)
 
     def validate(self) -> None:
-        if not isinstance(self.input, Project):
+        if not reads_projection(self.input):
             raise CompileError("Aggregate needs projected input columns")
         self.specification().validate(self.input.result_columns())
 
@@ -210,7 +222,7 @@ class Window:
         return _named_schema(self.input, self.output)
 
     def validate(self) -> None:
-        if not isinstance(self.input, (Project, Aggregate)):
+        if not (reads_projection(self.input) or isinstance(self.input, Aggregate)):
             raise CompileError("Window needs projected or aggregated input columns")
         projected = self.input.result_columns()
         names = list(projected)
@@ -265,7 +277,8 @@ class Result:
         return self.input.result_columns()
 
     def validate(self) -> None:
-        if not isinstance(self.input, (Project, Aggregate, Window)):
+        if not (reads_projection(self.input)
+                or isinstance(self.input, (Aggregate, Window))):
             raise CompileError("Result needs a projection, aggregation, or window")
         if self.limit is not None and self.limit <= 0:
             raise CompileError("LIMIT must be a positive integer")
@@ -287,6 +300,7 @@ class Result:
             if (
                 isinstance(key.expression, Alias)
                 and key.expression not in projection.columns
+                and key.name not in projected
             ):
                 raise CompileError(
                     f"ORDER BY {key.name!r} names an expression the "
@@ -312,9 +326,15 @@ class Result:
         return replace(self, order=expressions)
 
     def explain_fields(self) -> dict:
-        return {
+        fields = {
             "order": [str(key) for key in self.order],
             "limit": self.limit,
             "offset": self.offset,
             "distinct": self.distinct,
         }
+        return fields
+
+
+def reads_projection(node) -> bool:
+    """Return whether the node is the Project or an Unnest chain above it."""
+    return isinstance(node, Project) or above_unnest(node)

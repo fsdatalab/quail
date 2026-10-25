@@ -116,7 +116,7 @@ def column_expression(reference: ColumnRef, path: tuple = (),
     return expression if name is None else Alias(expression, name)
 
 
-def evaluate_expression(expression, columns):
+def evaluate_expression(expression, columns, *, qualified: bool = False):
     """Evaluate a value expression over the columns of one table.
 
     Args:
@@ -124,6 +124,7 @@ def evaluate_expression(expression, columns):
             ScalarFunction, and Alias nodes.
         columns: The table, record batch, or scan input the columns come
             from, read with ``column(name)``.
+        qualified: Whether result columns include their table alias.
 
     Raises:
         CompileError: A field does not exist, or a function does not
@@ -132,11 +133,12 @@ def evaluate_expression(expression, columns):
     if isinstance(expression, str):
         return columns.column(expression)
     if isinstance(expression, ColumnRef):
-        return columns.column(expression.column)
+        return columns.column(column_name(expression) if qualified
+                              else expression.column)
     if isinstance(expression, Alias):
-        return evaluate_expression(expression.expression, columns)
+        return evaluate_expression(expression.expression, columns, qualified=qualified)
     if isinstance(expression, GetField):
-        values = evaluate_expression(expression.input, columns)
+        values = evaluate_expression(expression.input, columns, qualified=qualified)
         read = column_name(expression.input)
         if not pa.types.is_struct(values.type):
             raise CompileError(f"{read} has no fields; it is {values.type}")
@@ -145,7 +147,8 @@ def evaluate_expression(expression, columns):
                 f"{read} has no field {expression.field!r}; its fields are "
                 f"{[item.name for item in values.type]}")
         return pc.struct_field(values, expression.field)
-    arguments = [evaluate_expression(argument, columns) for argument in expression.args]
+    arguments = [evaluate_expression(argument, columns, qualified=qualified)
+                 for argument in expression.args]
     try:
         return SCALAR_FUNCTIONS[expression.function](*arguments)
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError,
@@ -203,7 +206,8 @@ def column_name(column, *, qualified: bool = True) -> str:
     if isinstance(column, str):
         return column
     if isinstance(column, ColumnRef):
-        return f"{column.alias}.{column.column}" if qualified else column.column
+        return (f"{column.alias}.{column.column}"
+                if qualified and column.alias else column.column)
     if isinstance(column, GetField):
         return f"{column_name(column.input, qualified=qualified)}.{column.field}"
     if isinstance(column, ScalarFunction):
@@ -290,7 +294,9 @@ DEFAULT_SELECTIVITY = 0.2
 SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 
-MODEL_CALL_KINDS = ("boolean", "score", "label", "extract")
+MODEL_CALL_KINDS = ("boolean", "score", "label", "extract", "features")
+# the token poolings of an AI.SAE_FEATURES call
+SAE_POOLINGS = ("last", "max")
 
 
 def effective_selectivity(selectivity: Optional[float]) -> float:
@@ -324,6 +330,9 @@ class ModelCall:
     probabilities: bool = False
     # an "extract" call only: the question the answer is copied for
     question: str = ""
+    # a "features" call only: which tokens become the row's feature
+    # list, "last" or "max"
+    pooling: str = ""
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -342,10 +351,16 @@ class ModelCall:
             raise CompileError("only an AI.CLASSIFY call has labels")
         if self.kind != "extract" and self.question:
             raise CompileError("only an AI.EXTRACT call has a question")
+        if self.kind != "features" and self.pooling:
+            raise CompileError("only an AI.SAE_FEATURES call has a pooling")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)
         elif self.kind == "extract":
             validate_question(self.question)
+        elif self.kind == "features" and self.pooling not in SAE_POOLINGS:
+            raise CompileError(
+                f"AI.SAE_FEATURES pooling must be one of {SAE_POOLINGS}, "
+                f"got {self.pooling!r}")
 
 
 def validate_question(question: str) -> None:
@@ -706,6 +721,10 @@ def validate_predicate(expression) -> None:
             raise CompileError(
                 "an AI.EXTRACT answer is a result column, not a predicate"
             )
+        if expression.kind == "features":
+            raise CompileError(
+                "an AI.SAE_FEATURES list is a result column, not a predicate"
+            )
         return
     raise CompileError(
         f"a predicate is a model call or a comparison of an AI.SCORE call, "
@@ -763,6 +782,9 @@ def _explain(expression) -> str:
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"
     if expression.kind == "extract":
         return f"AI.EXTRACT({expression.prompt.template!r}, {expression.question!r})"
+    if expression.kind == "features":
+        return (f"AI.SAE_FEATURES({expression.prompt.template!r}, "
+                f"pooling={expression.pooling!r})")
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
     return f"{function}({expression.prompt.template!r})"
 

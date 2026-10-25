@@ -25,6 +25,7 @@ from .nodes import (
     AiExtract,
     AiFilter,
     AiJoin,
+    AiSaeFeatures,
     AiScore,
     Barrier,
     Exchange,
@@ -37,6 +38,7 @@ from .nodes import (
     Recombine,
     Scan,
     Sort,
+    Unnest,
     Window,
 )
 
@@ -239,6 +241,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         Filter,
         AiClassify,
         AiExtract,
+        AiSaeFeatures,
         Barrier,
         Exchange,
         Foreign,
@@ -250,6 +253,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         Sort,
         Window,
         Limit,
+        Unnest,
     ))
 
 

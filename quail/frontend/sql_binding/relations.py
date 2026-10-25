@@ -231,7 +231,10 @@ def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
                 f"HINT estimates a test of a label or an answer; "
                 f"{term.sql()} tests a source column, applied at the scan")
         plain = bind_plain_test(b, test)
-        b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
+        if plain.column.alias in b.scope.relations:
+            b.unnest_tests.append(plain)
+        else:
+            b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
     return True
 
 

@@ -1,8 +1,8 @@
-"""Runtimes for the relational nodes: scan, project, limit, aggregate, and sort."""
+"""Runtimes for the relational nodes: scan, project, limit, aggregate, sort."""
 
 from __future__ import annotations
 
-from collections.abc import Sized
+from collections.abc import Iterator, Sized
 
 import numpy as np
 import pyarrow as pa
@@ -15,6 +15,7 @@ from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.rows import Rows, as_table
+from quail.logical.expressions import evaluate_expression
 from quail.logical.predicates import compare_literal
 from quail.physical import Aggregate, Limit, Project, Scan, Sort, Window
 
@@ -69,7 +70,14 @@ class ProjectRuntime:
         first, *rest = node.inputs
         value = as_table(inputs[first.name])
         labels = {port.name: as_table(inputs[port.name]) for port in rest}
-        if context.project is not None:
+        if node.expressions is not None:
+            batches = [pa.RecordBatch.from_arrays(
+                [evaluate_expression(expression, batch, qualified=True)
+                 for expression in node.expressions], names=list(node.columns))
+                if node.expressions else batch.select([])
+                for batch in row_batches(value)]
+            value = QueryResult.from_table(pa.Table.from_batches(batches))
+        elif context.project is not None:
             value = (context.project(node, value, labels) if labels
                      else context.project(node, value))
         # a projection keeps its rows; a lazy result's count is the
@@ -78,6 +86,34 @@ class ProjectRuntime:
         output_rows = _num_rows(value)
         return NodeResult({"rows": value}, NodeMetrics(
             input_rows=rows, output_rows=rows if output_rows is None else output_rows))
+
+
+def row_batches(value) -> Iterator[pa.RecordBatch]:
+    """Yield a node's rows input one record batch at a time.
+
+    An empty input yields one empty batch, which carries the schema.
+    """
+    value = as_table(value)
+    if isinstance(value, QueryResult):
+        reader = value.execute_stream()
+        schema = reader.schema
+        batches = iter(reader)
+    elif isinstance(value, pa.RecordBatch):
+        schema, batches, reader = value.schema, iter([value]), None
+    elif isinstance(value, pa.Table):
+        schema, batches, reader = value.schema, iter(value.to_batches()), None
+    else:
+        raise TypeError(f"expected rows, got {type(value).__name__}")
+    try:
+        empty = True
+        for batch in batches:
+            empty = False
+            yield batch
+        if empty:
+            yield pa.RecordBatch.from_pylist([], schema=schema)
+    finally:
+        if reader is not None:
+            reader.close()
 
 
 class LimitRuntime:

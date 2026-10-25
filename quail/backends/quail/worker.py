@@ -75,7 +75,9 @@ class LoadedGpu:
                                 answer_token_ids=answer_token_ids,
                                 max_batched_tokens=budget,
                                 moe_backend=spec.moe_backend,
-                                text_only=spec.vision_tower)
+                                text_only=spec.vision_tower,
+                                num_layers=(spec.layers if spec.checkpoint_layers
+                                            else None))
         self.load_model_s = time.perf_counter() - t0
         self.weights_bytes = int(torch.cuda.memory_allocated())
 

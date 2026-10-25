@@ -23,6 +23,7 @@ from quail.logical.expressions import (
     model_call,
 )
 from quail.logical.nodes import (
+    FEATURE_LIST,
     Aggregate,
     Apply,
     Filter,
@@ -35,6 +36,8 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticSaeFeatures,
+    Unnest,
     Window,
     WithCTE,
 )
@@ -109,13 +112,13 @@ class LogicalPlan:
 
     @property
     def projection(self) -> Project:
-        """Return the projection that supplies result columns."""
+        """Return the first projection over source columns and model answers."""
         node = self.root.input if isinstance(self.root, WithCTE) else self.root
-        while isinstance(node, (Result, Aggregate, Window)):
-            node = node.input
-        if not isinstance(node, Project):
+        projection = next((found for found in LogicalPlan(node).walk()
+                           if isinstance(found, Project)), None)
+        if projection is None:
             raise CompileError("a query plan needs a projection")
-        return node
+        return projection
 
     @property
     def result(self) -> Result:
@@ -171,9 +174,16 @@ class LogicalPlan:
                 raise CompileError(
                     f"the Scan of {scan.alias!r} carries no schema; the result "
                     f"cannot be typed")
-        fields = _projected_fields(self.projection, scans)
+        projection = self.projection
+        fields = _projected_fields(projection, scans)
         for node in self.walk():
-            if isinstance(node, Aggregate):
+            if isinstance(node, Project) and node is not projection:
+                table = pa.schema(fields).empty_table()
+                fields = {column_name(column): evaluate_expression(
+                    column, table, qualified=True).type for column in node.columns}
+            elif isinstance(node, Unnest):
+                fields = _unnested_fields(node, fields)
+            elif isinstance(node, Aggregate):
                 fields = _aggregated_fields(node, fields)
             elif isinstance(node, Window):
                 fields = _windowed_fields(node, fields)
@@ -182,8 +192,9 @@ class LogicalPlan:
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, applies, classifies = [], {}, [], [], []
-        extracts, tested, aliases = [], {}, []
-        nodes = self.walk()
+        extracts, feature_calls, tested, aliases = [], [], {}, []
+        # the nodes above the projection read result rows, not documents
+        nodes = LogicalPlan(self.projection).walk()
         for node in nodes:
             if isinstance(node, Scan):
                 scans.append(node)
@@ -206,6 +217,8 @@ class LogicalPlan:
                 classifies.append(node)
             elif isinstance(node, SemanticExtract):
                 extracts.append(node)
+            elif isinstance(node, SemanticSaeFeatures):
+                feature_calls.append(node)
         calls = {
             (node.alias, node.name): node.call
             for node in classifies
@@ -259,6 +272,7 @@ class LogicalPlan:
             labels=_label_work(classifies, columns, label_filters),
             classifies=tuple(classifies),
             extracts=tuple(extracts),
+            sae_features=tuple(feature_calls),
         )
 
 
@@ -280,6 +294,7 @@ class Operators:
     projections: tuple = ()  # named model calls in SELECT order
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
     extracts: tuple = ()  # tuple[SemanticExtract, ...]
+    sae_features: tuple = ()  # tuple[SemanticSaeFeatures, ...]
     label_filters: dict = field(default_factory=dict)
     #                     alias -> tuple[ColumnTest, ...] on labels
     extract_filters: dict = field(default_factory=dict)
@@ -392,6 +407,8 @@ def _projected_fields(project: Project, scans: dict) -> dict:
             types[name] = pa.string()
             if call.probabilities:
                 types[name + PROBABILITIES_SUFFIX] = PROBABILITIES_TYPE
+        elif call.kind == "features":
+            types[name] = FEATURE_LIST
         else:
             types[name] = pa.string()
             types[name + SPAN_SUFFIX] = SPAN_TYPE
@@ -407,6 +424,18 @@ def _projected_fields(project: Project, scans: dict) -> dict:
             packed[struct] = pa.struct([
                 (field, types[member]) for field, member in packing[struct]])
     return packed
+
+
+def _unnested_fields(node: Unnest, fields: dict) -> dict:
+    """Return name -> Arrow type of an Unnest's output columns."""
+    types = {}
+    for name, value_type in fields.items():
+        if name in node.columns:
+            types.update({f"{name}.{field.name}": field.type
+                          for field in value_type.value_type})
+        else:
+            types[name] = value_type
+    return types
 
 
 def _aggregated_fields(node: Aggregate, fields: dict) -> dict:
@@ -439,17 +468,24 @@ def cte_schema(plan: LogicalPlan) -> pa.Schema:
     """Return the schema of a plan's result, named as a CTE's columns.
 
     A projected column reference is named by its column alone, so
-    ``SELECT c.id`` gives ``id``; every other column keeps its name.
+    ``SELECT c.id`` gives ``id``, and an unnested field by its field
+    alone, so ``SELECT f.feature`` gives ``feature``; every other column
+    keeps its name.
 
     Raises:
         CompileError: A projected expression has no AS name, or two
             columns would share one name.
     """
     expressions = {column_name(column): column for column in plan.projection.columns}
+    unnested = {name: name.removeprefix(f"{column}.")
+                for node in plan.walk() if isinstance(node, Unnest)
+                for column, names in node.fields().items() for name in names}
     fields = []
     for result in plan.schema():
         column = expressions.get(result.name)
-        if isinstance(column, ColumnRef):
+        if result.name in unnested:
+            result = result.with_name(unnested[result.name])
+        elif isinstance(column, ColumnRef):
             result = result.with_name(column.column)
         elif column is not None and not isinstance(column, Alias):
             raise CompileError(

@@ -29,6 +29,8 @@ class Chunk:
             the chunk out for.
         tokens: Rows in the chunk.
         layout: (arena key, suffix count) per group in chunk order.
+        row_spans: (arena key, first row, first suffix row, end row) per
+            group in chunk order; a pipeline's forward hook reads them.
         temporary_keys: Arena keys the loop frees after the forward pass.
         fresh_keys: Keys whose prefix this chunk computes; the loop
             trims their sliding pages after the pass.
@@ -44,6 +46,7 @@ class Chunk:
     attention_mode: str
     tokens: int
     layout: list
+    row_spans: tuple = ()
     temporary_keys: tuple = ()
     fresh_keys: tuple = ()
     rows_per_answer: np.ndarray | None = None
@@ -387,6 +390,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # own prefix (wider than the planner's readers, which are children)
     reader_rows = []
     kv_writes, layout = [], []
+    row_spans = []
     fresh_keys = []
     read_keys, read_used, cu_q = [], [], [0]
     max_q = 0
@@ -559,6 +563,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 kv_writes.append((key, s_row0, s_row0 + wst, dest))
         num_s = num_tokens - s_row0
         layout.append((key, n))
+        row_spans.append((key, row0, prefix_end, num_tokens))
         if stacked:
             # every row of the group reads the parent's pages up to
             # start; siblings packed back to back share that read
@@ -810,7 +815,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         positions=stage("positions", _concatenate(position), torch.int64),
         final_indices=stage("finals", _concatenate(finals), torch.int64),
         meta=meta, attention_mode=attention_mode, tokens=num_tokens,
-        layout=layout, temporary_keys=tuple(temporary_keys),
+        layout=layout, row_spans=tuple(row_spans),
+        temporary_keys=tuple(temporary_keys),
         fresh_keys=tuple(fresh_keys),
         rows_per_answer=(np.concatenate(rows_per_answer) if multi_row else None))
     _tick(timing, "pack_h2d", t)

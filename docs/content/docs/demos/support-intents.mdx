@@ -1,0 +1,145 @@
+---
+title: Explore topics in support conversations
+description: Discover recurring topics in customer requests with sparse feature vectors.
+---
+
+<Callout type="info">
+**Highly experimental.** Quail supports sparse feature vectors, but we do
+not yet know whether they are useful for topic discovery.
+</Callout>
+
+Quail can help discover recurring topics in text without a predefined
+list of labels.
+
+In this tutorial, we use 1,320 support conversations from
+[τ-bench](https://github.com/sierra-research/tau-bench) to explore topics
+in airline bookings and retail orders. We'll look for common types of
+requests and retrieve examples of each.
+
+## Sparse feature vectors
+
+`AI.SAE_FEATURES` represents each request as a sparse feature vector.
+Most entries are zero. Each request activates a small set of features,
+and a larger value means a stronger activation. Feature IDs are shared
+across requests, but they have no topic labels attached to them.
+
+For example, an illustrative vector `{17: 0.8, 24933: 2.1}` activates
+features 17 and 24933. All other entries are zero.
+
+Dense embeddings are useful for comparing documents, but have limitations
+for exploratory analysis:
+
+1. Embeddings from a small encoder model, such as
+   [`all-MiniLM-L6-v2`](https://sbert.net/docs/sentence_transformer/pretrained_models.html),
+   may not capture all the topics and details in a document.
+2. Individual features are difficult to interpret. A feature does
+   not usually correspond to a topic or a property of the document.
+
+Sparse features offer a chance to inspect individual topics. Requests that
+strongly activate one feature may share a recognizable topic. Research on
+[interpretable sparse features](https://www.transformer-circuits.pub/2023/monosemantic-features/index.html)
+provides the basis for this approach. Sparse features can miss details too.
+
+## Get features for each request
+
+The conversations are loaded from the QUAIL-B `support_traces` table.
+Each row contains
+one conversation's `id`, its opening `request`, and a `task_id`. Several
+conversations can come from the same customer task.
+
+The query asks what the customer wants. It runs on one H100 with the
+`qwen3.5-2b-sae-bf16` model. The complete script and its Modal command are
+at the end of this page.
+
+```python
+import quail
+from quail_b import load_table
+
+conversations = load_table("support_traces", scale_factor=1.0)
+config = quail.EngineConfig(model="qwen3.5-2b-sae-bf16", device="h100-sxm")
+
+with quail.Session(config) as session:
+    session.register("conversations", quail.DocumentProvider.from_table(
+        conversations, id_col="id"))
+    features = (
+        session.docs("conversations").alias("t")
+        .ai_sae_features(
+            quail.prompt("{0}\n\nWhat is the customer asking for?",
+                         quail.col("t.request")),
+            pooling="last", name="intent")
+        .unnest("intent")
+        .select("t.id", "intent.feature", "intent.strength")
+        .collect()
+    )
+```
+
+`AI.SAE_FEATURES` returns up to 100 positive feature values per request
+with this configuration. `unnest("intent")` expands each list into rows:
+
+| Column | Meaning |
+| --- | --- |
+| `t.id` | The conversation ID. |
+| `intent.feature` | The feature ID. |
+| `intent.strength` | Its activation strength for this request. |
+
+## Find common features and inspect their requests
+
+The demo reduces the weight of features that occur in nearly every
+request, then keeps three features per request. The analysis counts how
+many requests keep each feature and selects three representative
+requests from different customer tasks.
+
+```python
+from demos.support_intents import analyze
+
+report = analyze(conversations, features)
+for feature in report["intents"]:
+    print(feature["feature"], feature["requests"], feature["examples"])
+```
+
+The table shows four features from the demo run. Each example is the
+first sentence of the request with the largest weighted activation.
+The possible topics come from inspecting all three examples per feature.
+The request counts are after the three-feature selection.
+
+| Feature | Requests | Representative request | Possible topic |
+| ---: | ---: | --- | --- |
+| 24933 | 50 | Hi, I need to cancel one of my flights booked on May 17. | Flight cancellation. |
+| 30532 | 37 | Hi, I recently purchased a 500ml water bottle, but I'm having second thoughts. | Product exchange. |
+| 9464 | 36 | Hi there! I need to make some changes to my upcoming roundtrip flights between Detroit and New York. | Flight booking changes. |
+| 4561 | 37 | Hi, I received a bicycle that was damaged during delivery, and I'm really frustrated. | Mixed: delivery problems and a flight cancellation. |
+
+Feature 24933 suggests a flight cancellation topic. Feature 4561 combines
+several topics, so it needs more inspection. A feature's meaning depends
+on the requests that activate it.
+
+## Retrieve more requests for a topic
+
+The feature table can retrieve more examples without another model run.
+The following code selects feature 24933, sorts by activation strength,
+and looks up the original requests by conversation ID:
+
+```python
+import pyarrow.compute as pc
+
+matches = features.filter(pc.equal(features["intent.feature"], 24933))
+matches = matches.sort_by([("intent.strength", "descending")])
+positions = pc.index_in(matches["t.id"], value_set=conversations["id"])
+requests = conversations.take(positions).select(["id", "request"])
+print(requests.slice(0, 10).to_pylist())
+```
+
+## Run the demo
+
+The complete analysis is in
+[`demos/support_intents.py`](https://github.com/fsdatalab/quail/blob/main/demos/support_intents.py).
+The Modal wrapper loads the data and runs the query on one H100:
+
+```bash
+uv run modal run --detach demos/support_intents_modal.py \
+    2>&1 | tee /tmp/quail-support-intents.log
+```
+
+The wrapper prints its Modal function call ID. It saves the feature table
+as `features.parquet` and the counts and example requests as `report.json`
+under `demos/support-intents/` on the `quail-results` volume.
