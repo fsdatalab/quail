@@ -1,149 +1,156 @@
 ---
-title: Support intents
-description: Find customer intents in support conversations with SAE features.
+title: Explore topics in support conversations
+description: Use SAE features to discover common requests and compare completed and failed conversations.
 ---
 
-The support intents demo shows how you can use `AI.SAE_FEATURES` to find
-what customers ask for, without a list of intents to start from.
+Exploratory analysis can reveal topics in a text collection before those
+topics have labels. Quail supports this kind of topic discovery with
+`AI.SAE_FEATURES`. The function returns numerical features that can help
+group related text. Example documents help identify the topic of each group.
 
-With `AI.CLASSIFY`, you choose the labels before you read the data. With
-SAE features, you read the data first. Quail returns the features of
-each request. You count the features, then read the requests where each
-feature is strongest to find what it means.
+For example, a support team may want to know which customer requests are
+common and which appear more often in failed conversations. The example
+below explores airline and retail support conversations.
+The results suggest topics such as flight cancellations and product
+exchanges, without a predefined list of customer intents.
 
-## Data
+A sparse autoencoder (SAE) converts a language model's internal
+representation of text into features. Each feature has an ID and a
+strength. A feature ID has no topic name attached to it, and one feature
+may occur in text about several topics. The examples are part of the
+analysis, not just illustrations of its output.
 
-The demo uses the 1,320 conversations of the QUAIL-B `support_traces`
-table. The conversations come from
-[τ-bench](https://github.com/sierra-research/tau-bench). Two models act
-as the support agent for simulated customers of an airline and a retail
-store. Each row contains these columns:
+## Support conversations
+
+The demo uses the 1,320 conversations in the QUAIL-B `support_traces`
+table, from [τ-bench](https://github.com/sierra-research/tau-bench).
+Two models act as support agents for simulated customers of an airline
+and a retail store. Each row represents one conversation:
 
 | Column | Contents |
 | --- | --- |
+| `id` | The conversation ID. |
 | `request` | The customer's first message. |
 | `task_id` | The customer task. Each of the 165 tasks has 8 conversations. |
 | `domain` | `airline` or `retail`. |
 | `reward` | 1 when the agent completed the task, and 0 when it failed. |
 
-The agent completed 778 tasks and failed 542.
+The agent completed the task in 778 conversations and failed in 542.
 
-## Query
+## Extract features from each request
 
-The query reads the features of each request and returns one row for
-each (request, feature) pair:
+The query asks what the customer wants and returns features for the
+opening message. The model is `qwen3.5-2b-sae-bf16`, running on one H100.
+The complete script and its Modal command are at the end of this page.
 
 ```python
-query = (
-    session.docs("conversations").alias("t")
-    .ai_sae_features(
-        prompt("{0}\n\nWhat is the customer asking for?", col("t.request")),
-        pooling="last", name="intent")
-    .unnest("intent")
-    .select("t.id", "intent.feature", "intent.strength")
-)
-features = query.collect()
+import quail
+from quail_b import load_table
+
+conversations = load_table("support_traces", scale_factor=1.0)
+config = quail.EngineConfig(model="qwen3.5-2b-sae-bf16", device="h100-sxm")
+
+with quail.Session(config) as session:
+    session.register("conversations", quail.DocumentProvider.from_table(
+        conversations, id_col="id"))
+    features = (
+        session.docs("conversations").alias("t")
+        .ai_sae_features(
+            quail.prompt("{0}\n\nWhat is the customer asking for?",
+                         quail.col("t.request")),
+            pooling="last", name="intent")
+        .unnest("intent")
+        .select("t.id", "intent.feature", "intent.strength")
+        .collect()
+    )
 ```
 
-The `last` pooling uses the last token of the prompt. The question comes
-after the request, so the question changes these features toward the
-customer's intent. Each request gets its 100 strongest features.
-`unnest("intent")` puts each feature in its own row, with the columns
-`intent.feature` and `intent.strength`.
+The query returns one row for each request and feature, with columns
+`t.id`, `intent.feature`, and `intent.strength`. `AI.SAE_FEATURES` returns
+up to 100 features per request;
+[`unnest("intent")`](/docs/user-guide/sql/ai-functions#unnest-the-features)
+expands the list into rows.
 
-## Model
+With `pooling="last"`, the SAE reads the model's representation at the
+final prompt token, after the request and the question.
 
-Quail runs `qwen3.5-2b-sae-bf16` on one H100. See
-[Qwen3.5 2B Base with Qwen-Scope SAE](/docs/user-guide/models#qwen35-2b-base-with-qwen-scope-sae).
+The [model reference](/docs/user-guide/models#qwen35-2b-base-with-qwen-scope-sae)
+describes the SAE and its output.
 
-## Read the features
+## Find recurring topics
 
-The demo uses numpy for the steps after the query.
+The analysis ranks features within each request, counts them across
+requests, and selects examples for inspection. The demo performs these
+steps with NumPy:
 
-1. **Weight each feature by how rare it is.** Some features occur in
-   almost every request. These features describe the form of a support
-   request, not one intent. The demo multiplies each strength by
-   `log(requests / requests with the feature)`, the same weight that
-   TF-IDF gives a word. A rare feature keeps more of its strength.
+1. **Reduce the weight of common features.** Each strength is multiplied
+   by `log(total requests / requests with the feature)`. The formula is the
+   inverse document frequency weight used in TF-IDF. A feature present in
+   nearly every request receives little weight.
+2. **Keep three features per request.** The three features with the
+   largest weighted strengths contribute to the frequency counts below.
+3. **Inspect representative requests.** For each frequent feature, the
+   demo returns the three requests with the largest weighted strengths,
+   each from a different customer task.
 
-2. **Keep the 3 features with the largest weight in each request.**
-   Then count how many requests keep each feature.
+The eight most frequent features occur in 36 to 50 requests each after
+selection. The table shows four of them. The topic descriptions come
+from reading the three examples for each feature; the table includes
+only the first sentence of the strongest example.
 
-3. **Read the examples.** For each frequent feature, the demo prints the
-   requests where the feature has the largest weight, one request for
-   each task.
-
-## Results
-
-The 8 most frequent features occur in 36 to 50 requests each. This table
-shows 4 of them, with the first sentence of the request where each
-feature has the largest weight. The last column is our reading of the
-first three examples.
-
-| Feature | Requests | Strongest request | Reading |
+| Feature | Requests | Strongest example | Possible topic |
 | ---: | ---: | --- | --- |
-| 24933 | 50 | Hi, I need to cancel one of my flights booked on May 17. | Cancel a flight. |
-| 30532 | 37 | Hi, I recently purchased a 500ml water bottle, but I'm having second thoughts. | Exchange a product for another model. |
-| 9464 | 36 | Hi there! I need to make some changes to my upcoming roundtrip flights between Detroit and New York. | Change a flight booking. |
+| 24933 | 50 | Hi, I need to cancel one of my flights booked on May 17. | Flight cancellation. |
+| 30532 | 37 | Hi, I recently purchased a 500ml water bottle, but I'm having second thoughts. | Product exchange. |
+| 9464 | 36 | Hi there! I need to make some changes to my upcoming roundtrip flights between Detroit and New York. | Flight booking changes. |
 | 4561 | 37 | Hi, I received a bicycle that was damaged during delivery, and I'm really frustrated. | Mixed: damaged or worn deliveries, and a flight cancellation for a family emergency. |
 
-Not every feature is one intent. Feature 4561 occurs in requests about
-two different problems. Read several examples before you name a
-feature.
+Feature 4561 has no single clear topic in these examples. Its requests
+need further inspection before the feature can serve as a topic label.
 
-Then the demo compares how often each feature occurs in failed and in
-completed conversations. It keeps features that occur in at least 20
-requests.
+## Compare failed and completed conversations
 
-| Feature | Failed conversations | Completed conversations | Reading |
+The same features can help investigate agent failures. The next comparison
+keeps features selected in at least 20 requests. Each percentage is the
+share of failed or completed conversations whose opening request contains
+that feature among its three selected features.
+
+| Feature | Failed conversations | Completed conversations | Possible topic |
 | ---: | ---: | ---: | --- |
-| 14888 | 3.5% | 0.6% | Book, change, or upgrade a flight. |
-| 9464 | 4.1% | 1.8% | Change a flight booking. |
-| 30532 | 3.9% | 2.1% | Exchange a product for another model. |
+| 14888 | 3.5% | 0.6% | Flight booking, changes, or upgrades. |
+| 9464 | 4.1% | 1.8% | Flight booking changes. |
+| 30532 | 3.9% | 2.1% | Product exchange. |
 
-Requests to change a flight or to exchange a product occur more often
-when the agent fails. These features occur in 24 to 37 requests, and
-each task has 8 conversations, so the requests are not independent. Use a result like this to choose conversations to read,
-not as a measurement.
+Feature 9464 appears in 4.1% of failed conversations, compared with 1.8%
+of completed conversations. Its examples suggest that flight booking
+changes are worth investigating. The comparison does not establish why
+those conversations failed. Each customer task has eight conversations,
+so the rows are not independent observations.
 
-## Other uses
+## Continue the analysis
 
-- **Compare two groups.** Count the features in each group, e.g., the
-  conversations of two products, and read the features whose shares
-  differ most.
-- **Find documents with one feature.** After you name a feature, keep the
-  rows that have it with
-  [`UNNEST`](/docs/user-guide/sql/ai-functions#unnest-the-features), e.g.,
-  `WHERE f.feature = 24933`.
-- **Watch agent traces.** Read the features of each step of an agent
-  trace to find a behavior that repeats, e.g., the same failed command.
+- **Inspect a topic.** A query with `UNNEST` and
+  `WHERE f.feature = 24933` selects requests containing the flight
+  cancellation feature.
+- **Compare groups.** Feature frequencies can be compared across products,
+  customer groups, or time periods. Example requests help explain the
+  differences.
+- **Create labels.** Once the topics are clear, `AI.CLASSIFY` can assign
+  documents to an explicit set of labels.
 
-## Run
+## Run the demo
 
-The source is
-[`demos/support_intents.py`](https://github.com/fsdatalab/quail/tree/main/demos/support_intents.py).
-It loads the table with the QUAIL-B package.
-
-<Tabs items={['Local H100', 'Modal']}>
-<Tab>
+The complete analysis is in
+[`demos/support_intents.py`](https://github.com/fsdatalab/quail/blob/main/demos/support_intents.py).
+The Modal wrapper loads the QUAIL-B table and runs the query on one H100:
 
 ```bash
-uv run python demos/support_intents.py --output-dir /tmp/support-intents
+uv run modal run --detach demos/support_intents_modal.py \
+    2>&1 | tee /tmp/quail-support-intents.log
 ```
 
-The demo writes the unnested features to `features.parquet` and the
-report to `report.json` in the output directory.
-
-</Tab>
-<Tab>
-
-```bash
-uv run modal run --detach demos/support_intents_modal.py
-```
-
-The Modal wrapper mounts the `quail-results` volume and writes the same
-files under `demos/support-intents/` inside the volume. The wrapper
-prints the Modal function call id before waiting for the query.
-
-</Tab>
-</Tabs>
+The wrapper prints its Modal function call ID. It saves `features.parquet`
+and `report.json` under `demos/support-intents/` on the `quail-results`
+volume. The feature table supports further analysis without another model
+run; the report contains the counts, example requests, and failure
+comparisons shown above.
