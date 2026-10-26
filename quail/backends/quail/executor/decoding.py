@@ -395,8 +395,6 @@ class AnswerPart(DocumentAnswerPart):
                                           if first else None),
                         "graph_fallbacks": (stats.get("graph_fallbacks")
                                             if first else None),
-                        "piece_replays": (stats.get("piece_replays")
-                                          if first else None),
                         "readout_gpu_s": (stats.get("readout_gpu_s")
                                           if first else None),
                         "idle_gpu_s": (stats.get("idle_gpu_s")

@@ -16,7 +16,7 @@ from quail.progress import logger
 def _default_buckets() -> tuple:
     """Row buckets: finer where chunks are small, so little is padded."""
     return ((32,) + tuple(range(64, 1025, 64)) + tuple(range(1152, 2049, 128))
-            + tuple(range(2304, 4097, 256)) + tuple(range(4608, 8193, 512)))
+            + tuple(range(2304, 4097, 256)))
 
 
 @dataclass(frozen=True)
@@ -28,13 +28,6 @@ class DecodeGraphConfig:
     max_query_tokens: int = 32
     # the rows of one document's map branches read together
     max_document_rows: int = 128
-
-    def bucket(self, tokens: int) -> int | None:
-        """Return the smallest bucket holding this many rows, or None."""
-        for rows in self.row_buckets:
-            if rows >= tokens:
-                return rows
-        return None
 
     def __post_init__(self):
         if (not isinstance(self.row_buckets, tuple) or not self.row_buckets
@@ -212,87 +205,6 @@ class DecodeBuffers:
             documents["table"])
 
 
-class PieceGraphs:
-    """Replay a pipeline's work between attention calls; run attention eagerly.
-
-    Everything but attention depends only on a pass's row count, so one
-    graph per piece and row bucket serves every pass of that size, of
-    any operator and attention path. A pass copies its ids into the
-    padded buffers, replays piece 0, then for each layer runs attention
-    on its real rows and replays the next piece. Padded rows never
-    reach attention, so they read and write no KV.
-
-    The pipeline provides num_pieces, piece_widths(), piece(),
-    attention_piece(), and final_piece().
-    """
-
-    def __init__(self, pipeline, config: DecodeGraphConfig):
-        self.pipeline = pipeline
-        self.config = config
-        self.graphs = {}        # bucket rows -> one graph per piece
-        self.buffers = None
-        self.pool = None
-        self.replays = 0
-
-    def _views(self, rows):
-        ids, hidden, residual, qkv, out = self.buffers
-        return ids[:rows], hidden[:rows], residual[:rows], qkv[:rows], out[:rows]
-
-    def prepare(self, torch, stream):
-        """Capture every piece of every bucket, once; return whether it captured."""
-        if self.graphs:
-            return False
-        pipeline = self.pipeline
-        rows = self.config.row_buckets[-1]
-        width, qkv_width = pipeline.piece_widths()
-        dtype = pipeline.embed.weight.dtype
-
-        def rows_of(columns):
-            return torch.zeros((rows, columns), dtype=dtype, device="cuda")
-
-        self.buffers = (torch.zeros(rows, dtype=torch.int64, device="cuda"),
-                        rows_of(width), rows_of(width), rows_of(qkv_width),
-                        rows_of(width))
-        self.pool = torch.cuda.graph_pool_handle()
-        for index, bucket in enumerate(self.config.row_buckets):
-            views = self._views(bucket)
-            # the first bucket warms every kernel; the rest need one
-            # pass at their own shape
-            for _ in range(3 if index == 0 else 1):
-                for piece in range(pipeline.num_pieces):
-                    pipeline.piece(piece, *views)
-            stream.synchronize()
-            graphs = []
-            for piece in range(pipeline.num_pieces):
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=self.pool, stream=stream):
-                    pipeline.piece(piece, *views)
-                graphs.append(graph)
-            self.graphs[bucket] = graphs
-        return True
-
-    def supports(self, chunk):
-        """Whether a pass's rows fit a captured bucket and its model has no state."""
-        return bool(self.graphs and 0 < chunk.tokens <= self.config.row_buckets[-1]
-                    and chunk.meta.get("canvas") is None
-                    and chunk.meta.get("gdn") is None)
-
-    def forward(self, chunk):
-        """Run a pass: the pieces replayed, attention eager on the real rows."""
-        n = chunk.tokens
-        graphs = self.graphs[self.config.bucket(n)]
-        ids, hidden, residual, qkv, out = self._views(self.config.bucket(n))
-        ids[:n].copy_(chunk.input_ids)
-        ids[n:].zero_()
-        chunk.meta["layer"] = 0
-        graphs[0].replay()
-        for index, graph in enumerate(graphs[1:]):
-            hidden[:n].copy_(self.pipeline.attention_piece(index, qkv[:n], chunk))
-            graph.replay()
-        self.replays += 1
-        return self.pipeline.final_piece(out[:n], residual[:n], chunk.final_indices)
-
-
 @dataclass
 class CapturedDecode:
     """A graph and its persistent inputs and output."""
@@ -321,9 +233,6 @@ class DecodeGraphs:
         self.replays = 0
         # why passes ran without a graph: reason -> passes
         self.fallbacks = {}
-        # a pass no graph fits replays the work between attention calls
-        self.pieces = (PieceGraphs(pipeline, self._config)
-                       if hasattr(pipeline, "piece") else None)
         self.capture_s = 0.0
         self.capture_bytes = 0
 
@@ -339,44 +248,15 @@ class DecodeGraphs:
         self.pool = None
         self.storage = None
 
-    def _prepare_pieces(self) -> bool:
-        """Capture the piece graphs once; they read no KV, so they outlive it."""
-        engine = self.pipeline.engine
-        if (self.pieces is None or not self.enabled or engine.fa_version != 3
-                or engine.arena.has_sliding):
-            return False
-        torch = engine.torch
-        started = time.perf_counter()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        free, _ = torch.cuda.mem_get_info()
-        stream = torch.cuda.Stream()
-        current = torch.cuda.current_stream()
-        stream.wait_stream(current)
-        with torch.cuda.stream(stream), torch.inference_mode():
-            captured = self.pieces.prepare(torch, stream)
-        current.wait_stream(stream)
-        stream.synchronize()
-        if captured:
-            logger.info("captured %d piece graphs in %.2f s, holding %.2f GiB",
-                        sum(len(graphs) for graphs in self.pieces.graphs.values()),
-                        time.perf_counter() - started,
-                        (free - torch.cuda.mem_get_info()[0]) / 2**30)
-        return captured
-
     def prepare(self):
-        """Capture supported shapes using scratch KV, once per allocation.
-
-        The piece graphs are captured on the first call.
-        """
-        pieces = self._prepare_pieces()
+        """Capture supported shapes using scratch KV, once per allocation."""
         engine = self.pipeline.engine
         arena, torch = engine.arena, engine.torch
         if (not self.enabled or not self.pipeline.tree_attention
                 or engine.fa_version != 3 or arena.has_sliding):
-            return pieces
+            return False
         if self.storage is arena.k:
-            return pieces
+            return False
         self.invalidate()
         started = time.perf_counter()
         scratch = arena.alloc_temporary(arena.page_tokens)
@@ -494,6 +374,4 @@ class DecodeGraphs:
                     return captured.output.index_select(0, chunk.final_indices)
         reason = self.refusal(chunk) or "no bucket"
         self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1
-        if self.pieces is not None and self.pieces.supports(chunk):
-            return self.pieces.forward(chunk)
         return self.pipeline.forward_chunk(chunk)

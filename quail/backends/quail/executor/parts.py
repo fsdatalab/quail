@@ -337,7 +337,7 @@ def transition_reporter(parts):
     return report
 
 
-RUN_STATS = ("host_s", "run_s", "graph_replays", "piece_replays", "graph_fallbacks",
+RUN_STATS = ("host_s", "run_s", "graph_replays", "graph_fallbacks",
              "readout_gpu_s", "idle_gpu_s", "kv_growth")
 
 

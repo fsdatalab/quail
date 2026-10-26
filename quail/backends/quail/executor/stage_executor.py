@@ -76,12 +76,6 @@ def borrow_check(arena, keys, borrowing):
     return can_borrow
 
 
-def _replay_counts(graphs) -> tuple:
-    """Return the passes a pipeline's decode graphs and piece graphs replayed."""
-    return (graphs.replays,
-            0 if graphs.pieces is None else graphs.pieces.replays)
-
-
 def lowest_borrows(borrowing):
     """Per document, the fewest tokens any of its borrowers shares."""
     lowest = {}
@@ -322,8 +316,7 @@ class StageExecutor:
         # host seconds per phase of the loop, and the readouts' GPU
         # event pairs, for telling host-bound passes from GPU-bound
         self.host_s = {"admit": 0.0, "advance": 0.0, "launch": 0.0,
-                       "launch_graph": 0.0, "launch_pieces": 0.0,
-                       "launch_eager": 0.0, "wait": 0.0,
+                       "launch_graph": 0.0, "launch_eager": 0.0, "wait": 0.0,
                        "report": 0.0, "decide": 0.0, "submit": 0.0}
         self.readout_spans = []
         self.outstanding = []     # PendingAnswers in launch order
@@ -885,15 +878,13 @@ class StageExecutor:
             e1 = self.torch.cuda.Event(enable_timing=True)
             e0.record()
         graphs = self.pipeline.decode_graphs
-        before = None if graphs is None else _replay_counts(graphs)
+        replays = None if graphs is None else graphs.replays
         started = time.perf_counter()
         normed = forward_chunk(self.pipeline, self.arena, chunk)
         launched = time.perf_counter() - started
         self.host_s["launch"] += launched
-        after = None if graphs is None else _replay_counts(graphs)
-        kind = ("launch_eager" if before == after
-                else "launch_graph" if after[0] != before[0] else "launch_pieces")
-        self.host_s[kind] += launched
+        replayed = graphs is not None and graphs.replays != replays
+        self.host_s["launch_graph" if replayed else "launch_eager"] += launched
         if self.gpu_timing:
             e1.record()
             self.spans.append((self._rows_by_stage(part), chunk.tokens, e0, e1))
@@ -936,8 +927,6 @@ class StageExecutor:
         run_started = time.perf_counter()
         graphs = self.pipeline.decode_graphs
         replays = 0 if graphs is None else graphs.replays
-        pieces = (0 if graphs is None or graphs.pieces is None
-                  else graphs.pieces.replays)
         fallbacks = {} if graphs is None else dict(graphs.fallbacks)
         while True:
             # documents with nothing to send at their first stage never run
@@ -1015,9 +1004,6 @@ class StageExecutor:
             self.stats["run_s"] = round(time.perf_counter() - run_started, 3)
             self.stats["graph_replays"] = (0 if graphs is None
                                            else graphs.replays - replays)
-            self.stats["piece_replays"] = (
-                0 if graphs is None or graphs.pieces is None
-                else graphs.pieces.replays - pieces)
             self.stats["graph_fallbacks"] = (
                 {} if graphs is None else
                 {reason: count - fallbacks.get(reason, 0)
