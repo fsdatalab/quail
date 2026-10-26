@@ -11,6 +11,7 @@ from quail.backends.quail.executor.admission import (
     SKIP,
     JoinAdmission,
     OwnRequests,
+    SkipTo,
 )
 from quail.backends.quail.executor.readout_groups import ReadoutGroups
 from quail.backends.quail.executor.stages import (
@@ -20,6 +21,10 @@ from quail.backends.quail.executor.stages import (
     state_share_points,
 )
 from quail.progress import Progress, logger
+
+# the draft token fed after a readout row, where there is none
+_NO_FOLLOWING = np.full(1 << 16, -1, dtype=np.int64)
+_NO_FOLLOWING.setflags(write=False)
 
 
 def attention_path(pipeline, requested, default_attention="unified") -> str:
@@ -88,7 +93,8 @@ class StageExecutor:
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
-                 appended_tokens=None, gpu_timing=False, survival=None):
+                 appended_tokens=None, gpu_timing=False, survival=None,
+                 growth=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -143,6 +149,20 @@ class StageExecutor:
             attention_mode = "tree"
         self.mode = attention_path(
             self.pipeline, attention_mode, default_attention=default_attention)
+        # rounds and prefix slices are laid out as plain rows over the
+        # document's pages: on the tree path, or on the unified path
+        # of a model with one KV pool and no recurrent state
+        plain = bool(paged and (
+            self.mode == "tree"
+            or not (getattr(self.arena, "has_sliding", False)
+                    or getattr(self.arena, "num_state_slots", 0))))
+        # a prefix longer than a pass's room is packed over several
+        # passes, so a document's length never bounds the budget
+        self.slice_prefill = plain
+        # a stage that runs ahead of its answers feeds its rounds from
+        # the GPU
+        self.ahead = [bool(stage.ahead) and plain for stage in stages]
+        self.feeding = any(self.ahead)
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
@@ -159,17 +179,44 @@ class StageExecutor:
                                    self.frames, self.stages, self.suffixes,
                                    self.canvas_rows)
                                if stage.single])
+        # what a document's fixed requests need: all but the stages
+        # that append every round, whose KV can grow as they write
+        fixed_extra = self.capacity_extra
         appended = sorted(
-            (tuple(frame), int(suffixes.lengths.max()))
+            (tuple(frame), int(suffixes.lengths.max()), stage.repeats)
             for frame, suffixes, stage in zip(self.frames, self.suffixes, self.stages)
             if stage.append)
         for frame, group in groupby(appended, key=lambda entry: entry[0]):
-            kept = sum(tokens for _, tokens in group)
-            if appended_tokens is not None:
-                kept = min(kept, int(appended_tokens))
+            entries = list(group)
+            kept = sum(tokens for _, tokens, _ in entries)
+            if any(repeats for _, _, repeats in entries):
+                # a repeating stage appends its suffix every round, so
+                # only the caller's bound says what it leaves in KV
+                if appended_tokens is None:
+                    raise ValueError("a repeating append stage needs "
+                                     "appended_tokens")
+                kept = max(kept, int(appended_tokens))
+            else:
+                if appended_tokens is not None:
+                    kept = min(kept, int(appended_tokens))
+                fixed_extra = max(fixed_extra, len(frame) + kept)
             self.capacity_extra = max(self.capacity_extra, len(frame) + kept)
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
+        # rows past the prefix a document's pages cover at admission:
+        # all it can ever need, or, when its KV grows as it writes,
+        # its first request and the rounds in flight before it grows
+        self.growth = None
+        self.reserve_extra = self.capacity_extra
+        if growth is not None and self.slice_prefill:
+            from quail.backends.quail.executor.growth import KVGrowth
+
+            self.reserve_extra = min(self.capacity_extra,
+                                     max(fixed_extra, int(growth.initial_tokens)))
+            self.growth = KVGrowth(
+                self.arena, self.keys, growth, self.prefix_lengths,
+                [length + self.capacity_extra for length in self.prefix_lengths],
+                initial_tokens=self.reserve_extra)
 
         resident = {}
         if self.paged:
@@ -212,9 +259,17 @@ class StageExecutor:
             limit=limit, survival=survival,
             stop_groups=stop_groups,
             stop_width=self._stop_width(stop_groups, budget),
-            extra_tokens=self.capacity_extra,
+            extra_tokens=self.reserve_extra,
             reserve=self._reserve if self.paged else None,
+            repeats=[stage.repeats for stage in self.stages],
+            slice_prefill=self.slice_prefill, ahead=self.ahead,
+            costs=[stage.costs if ahead else None
+                   for stage, ahead in zip(self.stages, self.ahead)],
+            admits=None if self.growth is None else self.growth.admits,
         )
+        # the stages whose rounds are packed many at once, from arrays
+        self.bulk = [bool(ahead and stage.rounds is not None)
+                     for stage, ahead in zip(self.stages, self.ahead)]
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         # a Gated DeltaNet layer starts a borrower from the parent's state
@@ -258,7 +313,16 @@ class StageExecutor:
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
+        # host seconds per phase of the loop, and the readouts' GPU
+        # event pairs, for telling host-bound passes from GPU-bound
+        self.host_s = {"admit": 0.0, "advance": 0.0, "launch": 0.0, "wait": 0.0,
+                       "report": 0.0, "decide": 0.0, "submit": 0.0}
+        self.readout_spans = []
         self.outstanding = []     # PendingAnswers in launch order
+        self.passes = 0
+        # per anchor, the pass and answer index of its latest launched
+        # request: the source of its next device-fed round
+        self.latest = {}
         self.split_answers = any(s.append and s.own_suffixes for s in stages)
 
         if self.label is None:
@@ -294,7 +358,15 @@ class StageExecutor:
                 else self.suffixes[j])
 
     def _entry_rows(self, a, j, start, end, carried):
+        if self.bulk[j] and not carried:
+            return max(0, int(self.stages[j].costs(np.array([a]))[0]))
         f = self.prefix_lengths[a]
+        sliced = self.sched.slices.get(a) if carried else None
+        if sliced is not None:
+            first, last = sliced
+            if end == start:
+                return last - first
+            f = last - first
         indices = self.sched.partner_indices(a, j, start, end)
         lengths = self._suffixes_of(j, a).lengths_at(indices)
         rows = ((f if carried else 0) + int(lengths.sum())
@@ -303,11 +375,26 @@ class StageExecutor:
             rows += len(self.frames[j]) + len(self.canvas)
         return rows
 
+    def _rows_by_stage(self, part):
+        """Return the rows each stage packs into a chunk, pricing rounds together."""
+        by_stage = {}
+        rounds = {}
+        for entry in part:
+            j = entry[1]
+            if self.bulk[j] and not entry[4]:
+                rounds.setdefault(j, []).append(entry[0])
+            else:
+                by_stage[j] = by_stage.get(j, 0) + self._entry_rows(*entry)
+        for j, anchors in rounds.items():
+            costs = self.stages[j].costs(np.asarray(anchors, dtype=np.int64))
+            by_stage[j] = by_stage.get(j, 0) + int(np.maximum(costs, 0).sum())
+        return by_stage
+
     def _held_pages(self, key, prefix_tokens):
         # the admission prices a document at page_cost(prefix + extra)
         # less what it holds; a trimmed window holds fewer sliding
         # pages than that price assumes, so count what growing takes
-        capacity = prefix_tokens + self.capacity_extra
+        capacity = prefix_tokens + self.reserve_extra
         return (self.arena.page_cost(capacity)
                 - self.arena.growth_cost(key, capacity))
 
@@ -327,10 +414,12 @@ class StageExecutor:
             if not stage.own_suffixes:
                 return None if stage.requests is None else stage.requests(key)
             got = stage.suffixes(key)
-            if got is DROP or got is SKIP:
+            if got is DROP or got is SKIP or isinstance(got, SkipTo):
                 return got
             own = got.suffixes
-            if len(own) and int(own.lengths.max()) > stage.suffix_tokens:
+            longest = (int(own.lengths[0]) if len(own) == 1
+                       else int(own.lengths.max()) if len(own) else 0)
+            if longest > stage.suffix_tokens:
                 raise ValueError(
                     f"{stage.label or f'stage {j}'}: a document's suffix has "
                     f"{int(own.lengths.max())} tokens, over the stage's "
@@ -372,7 +461,7 @@ class StageExecutor:
         points = tuple(t for t in self.share_points[anchor]
                        if shared < t < prefix)
         if not self.arena.reserve(
-                key, prefix, capacity_tokens=prefix + self.capacity_extra,
+                key, prefix, capacity_tokens=prefix + self.reserve_extra,
                 borrow=(self.keys[parent], shared) if shared else None,
                 extension=self._extends, share_points=points):
             return False
@@ -384,6 +473,10 @@ class StageExecutor:
             self._held_parents.add(anchor)
             self.arena.hold(key, self.borrowers[anchor])
             self.arena.keep_window(key, self.lowest_borrow[anchor])
+        if self.growth is not None:
+            lent = (self.lowest_borrow.get(anchor, 0) // self.arena.page_tokens
+                    if anchor < len(self.borrowers) and self.borrowers[anchor] else 0)
+            self.growth.admitted(anchor, lent)
         return True
 
     def _merged(self, j, start, end):
@@ -391,28 +484,102 @@ class StageExecutor:
         return self.stages[j].single and end - start == 1
 
     def _build(self, chunk_groups):
-        """Pack a chunk and identify each entry's stage and answer row count."""
+        """Pack a chunk and identify each entry's stage and answer row count.
+
+        Returns:
+            The chunk; its entries, (stage, answer rows) per readout
+            answer in order; per answer row, the draft token fed after
+            it, or -1; per group, the index of its answer, or None for
+            a prefix slice; and per device-fed round, in chunk order,
+            the pass and answer index of the answer it follows.
+        """
         from quail.backends.quail.executor.chunk import Suffixes, pack_chunk
 
         specs = []
         entries = []
+        following = []
+        group_entries = []
+        sources = []
         appended = {}
+
+        def entry(j, rows, fed=None):
+            entries.append((j, rows))
+            if fed is None:
+                fed = (_NO_FOLLOWING[:rows] if rows <= len(_NO_FOLLOWING)
+                       else np.full(rows, -1, dtype=np.int64))
+            following.append(fed)
+
+        bulk = {}
         for a, j, start, end, carried in chunk_groups:
             key = self.keys[a]
             f = self.prefix_lengths[a]
             frame = self.frames[j]
-            append = self.stages[j].append
+            stage = self.stages[j]
+            append = stage.append
+            if self.bulk[j] and not carried:
+                # the rounds of this stage are packed together, after
+                # every other group; _run_one orders the groups so
+                bulk.setdefault(j, []).append(a)
+                group_entries.append(("bulk", j, len(bulk[j]) - 1))
+                continue
+            sliced = self.sched.slices.get(a) if carried else None
+            if sliced is not None and end == start:
+                # a slice of the prefix alone: its rows read the slices
+                # before it from the key's pages and are written after
+                # them; nothing is asked of it yet
+                first, last = sliced
+                # the tree path's f is the resident rows the slice
+                # reads; the unified path's is the sequence's length
+                specs.append(dict(
+                    key=key, prefix=self.prefixes[a][first:last], start=first,
+                    f=first if self.mode == "tree" else last,
+                    suffixes=Suffixes.of([])))
+                group_entries.append(None)
+                continue
             request = self.own.get((j, a))
+            if (request is not None and not carried and append
+                    and stage.single and end - start == 1
+                    and not self.writes[j] and not stage.rewind
+                    and stage.read_all_rows and stage.paths is None
+                    and stage.canvas is None and request.read_rows is None
+                    and self.read_rows[j] is None
+                    and self.read_masks[j] is None):
+                # a decode round: the document's own one suffix, kept
+                # after the path earlier rounds appended; the general
+                # bookkeeping below reduces to this
+                base = f + len(frame)
+                position = request.position
+                if position is None:
+                    position = base + max(0, self.appended[a] - request.discard)
+                sufs = request.suffixes
+                total = int(sufs.lengths[0])
+                kept = (total if request.write_suffix_tokens is None
+                        else request.write_suffix_tokens)
+                appended[a] = position - base + kept
+                spec = dict(
+                    key=key, prefix=None, f=position,
+                    suffixes=sufs, read_all_rows=True,
+                    write_suffix_tokens=kept, single=True)
+                specs.append(spec)
+                entry(j, total, np.concatenate((sufs.ids[1:], _NO_FOLLOWING[:1])))
+                group_entries.append(len(entries) - 1)
+                continue
             # a written frame, or a rewinding stage, replaces any path
             # an earlier stage kept
             rewinds = self.writes[j] or self.stages[j].rewind
             path = 0 if rewinds and start == 0 else self.appended[a]
             if request is not None:
                 path = max(0, path - request.discard)
+                if request.position is not None:
+                    path = request.position - f - len(frame)
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
             prefix = None
-            if carried:
+            if sliced is not None:
+                # the rest of a prefix whose first slices are resident
+                shared = sliced[0]
+                prefix = self.prefixes[a][shared:]
+            elif carried:
                 prefix = self.prefixes[a][shared:] if shared else self.prefixes[a]
             indices = self.sched.partner_indices(a, j, start, end)
             sufs = self._suffixes_of(j, a).take(indices)
@@ -436,11 +603,12 @@ class StageExecutor:
                     rows = self.stages[j].canvas_rows * len(sufs)
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
-            read_key = self.keys[parent] if shared and self.stages[j].single else None
+            borrowed = shared and parent is not None
+            read_key = self.keys[parent] if borrowed and self.stages[j].single else None
             carry = {}
             if prefix is not None:
                 carry = dict(
-                    borrow_key=self.keys[parent] if shared else None,
+                    borrow_key=self.keys[parent] if borrowed else None,
                     share_points=self.share_points[a])
             kept = int(sufs.lengths.sum()) if append else 0
             if request is not None and request.write_suffix_tokens is not None:
@@ -464,7 +632,7 @@ class StageExecutor:
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f, suffixes=Suffixes(self.frame_ids[j], [len(frame)]),
                     write_suffix_tokens=len(frame), **carry))
-                entries.append((j, 1))
+                entry(j, 1)
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
@@ -478,13 +646,42 @@ class StageExecutor:
                     write_suffix_tokens=kept,
                     single=self.stages[j].single and end - start == 1,
                     paths=self.stages[j].paths, **carry, **own))
-            entries.append((j, rows))
+            entry(j, rows)
+            group_entries.append(len(entries) - 1)
+        firsts = {}
+        for j, anchors in bulk.items():
+            firsts[j] = len(entries)
+            requests = self.stages[j].rounds(np.asarray(anchors, dtype=np.int64))
+            lengths = requests.lengths
+            ends = np.cumsum(lengths)
+            entries.extend((j, int(length)) for length in lengths.tolist())
+            fed = np.concatenate((requests.ids[1:], _NO_FOLLOWING[:1]))
+            fed[ends - 1] = -1
+            following.append(fed)
+            # a round's position replaces the appended-token bookkeeping
+            spec = dict(rounds=requests, keys=[self.keys[a] for a in anchors],
+                        feed_bound=self.stages[j].suffix_tokens)
+            specs.append(spec)
+            sources.extend(self.latest[anchors[index]]
+                           for index in np.flatnonzero(requests.device_fed))
+        if bulk:
+            group_entries = [firsts[e[1]] + e[2] if isinstance(e, tuple) else e
+                             for e in group_entries]
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
             staging=self.staging, canvas=self.canvas, answer_row=self.answer_row)
         for a, tokens in appended.items():
             self.appended[a] = tokens
-        return chunk, entries
+        return chunk, entries, following, group_entries, sources
+
+    def _ordered(self, part):
+        """Return the groups with the bulk stages' rounds last."""
+        if not any(self.bulk):
+            return part
+        rounds = [g for g in part if self.bulk[g[1]] and not g[4]]
+        if not rounds:
+            return part
+        return [g for g in part if not (self.bulk[g[1]] and not g[4])] + rounds
 
     def _settle(self, settlement):
         anchor = settlement.anchor
@@ -502,29 +699,54 @@ class StageExecutor:
             self._settle(settlement)
         elif self.arena.is_resident(self.keys[settlement.anchor]):
             self.arena.free_key(self.keys[settlement.anchor])
+        if self.growth is not None:
+            self.growth.settled(settlement.anchor)
 
     def _report(self, entry):
         if entry.values is None:
+            # waits for the pass's readout, so this is GPU time, not host
+            started = time.perf_counter()
             entry.values = self.readouts.results(entry.handles)
+            self.host_s["wait"] += time.perf_counter() - started
             entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
         groups = entry.groups[entry.at:entry.at + entry.step]
         values, position = entry.values, entry.positions
         transitions = []
+        group_rows = []
+        prepared = {}
         for a, j, start, end, _ in groups:
+            if end == start:
+                group_rows.append(None)     # a prefix slice has no answer
+                continue
             key = self.readouts.group_key[j]
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
                 position[key] += 1        # the frame entry's answer means nothing
             count = end - start
             rows = values[key][position[key]:position[key] + count]
-            result = self.sched.report(a, j, start, end, rows)
-            if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
+            position[key] += count
+            group_rows.append(rows)
+            if self.stages[j].prepare is not None:
+                anchors, stage_rows = prepared.setdefault(j, ([], []))
+                anchors.append(a)
+                stage_rows.append(rows)
+        started = time.perf_counter()
+        for j, (anchors, stage_rows) in prepared.items():
+            self.stages[j].prepare(anchors, stage_rows)
+        self.host_s["decide"] += time.perf_counter() - started
+        for (a, j, start, end, _), rows in zip(groups, group_rows):
+            if end == start:
+                continue        # a prefix slice: nothing was asked
+            if (self.stages[j].own_suffixes and not self.ahead[j]
+                    and end == self.sched.num_partners(a, j)):
+                # the request was packed; a repeating stage asks anew,
+                # and an ahead stage has asked already
                 del self.own[(j, a)]
+            result = self.sched.report(a, j, start, end, rows)
             if self.on_answers is not None:
                 self.on_answers(a, j, start, end, rows)
             for settlement in result.settlements:
                 self._event(settlement)
             transitions.extend(result.transitions)
-            position[key] += count
         entry.at += len(groups)
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)
@@ -563,6 +785,8 @@ class StageExecutor:
                     self.borrowers[parent] -= 1
             if self.arena.is_resident(self.keys[a]):
                 self.arena.free_key(self.keys[a])
+            if self.growth is not None:
+                self.growth.settled(a)
 
     def _log_memory_event(self, kind, **detail):
         log = getattr(self.arena, "log_event", None)
@@ -597,37 +821,78 @@ class StageExecutor:
             self._run_part(part[:half])
             self._run_part(part[half:])
 
+    def _launched(self, part):
+        """Tell each stage with a launched callback which documents it launched."""
+        by_stage = {}
+        for a, j, start, end, _ in part:
+            if end > start and self.stages[j].launched is not None:
+                by_stage.setdefault(j, []).append(a)
+        for j, anchors in by_stage.items():
+            self.stages[j].launched(anchors)
+
     def _run_one(self, part):
         started = time.perf_counter()
-        chunk, entries = self._build(part)
+        part = self._ordered(part)
+        chunk, entries, following, group_entries, sources = self._build(part)
+        if sources:
+            # the rounds follow answers of the pass before, whose
+            # readout is still on the stream
+            previous = self.outstanding[-1] if self.outstanding else None
+            if previous is None or any(
+                    pass_index != previous.pass_index for pass_index, _ in sources):
+                raise AssertionError(
+                    "a device-fed round follows an answer already decided")
+            chunk.apply_feed(self.torch, previous.feed,
+                             [index for _, index in sources], self.arena.page_tokens)
         self.pack_s += time.perf_counter() - started
         self.tokens += chunk.tokens
         if self.gpu_timing:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
             e0.record()
+        started = time.perf_counter()
         normed = forward_chunk(self.pipeline, self.arena, chunk)
+        self.host_s["launch"] += time.perf_counter() - started
         if self.gpu_timing:
             e1.record()
-            by_stage = {}
-            for entry in part:
-                stage = entry[1]
-                by_stage[stage] = by_stage.get(stage, 0) + self._entry_rows(*entry)
-            self.spans.append((by_stage, chunk.tokens, e0, e1))
+            self.spans.append((self._rows_by_stage(part), chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
             self.arena.trim_window(key)
-        # the earlier passes' readouts finished before this forward pass
-        # started, so their answers are decided while the GPU runs it;
-        # a readout of many rows launches enough kernels to fill the
-        # launch queue, and a host blocked there could not decide them
-        while self.outstanding:
-            self._report_next()
+        # the readout is queued right behind the pass, so the stream
+        # never waits for the host; the earlier passes' readouts are
+        # done by now, so their answers are decided while the GPU runs
+        # this pass and its readout
+        started = time.perf_counter()
+        if self.gpu_timing:
+            e2 = self.torch.cuda.Event(enable_timing=True)
+            e2.record()
         handles = self.readouts.submit(
             normed, entries, chunk.rows_per_answer)
-        self.outstanding.append(PendingAnswers(part, handles))
+        feed = None
+        if self.feeding and entries:
+            feed = self.readouts.feed(handles, np.concatenate(following),
+                                      entries, self.ahead)
+        for (a, _, _, _, _), index in zip(part, group_entries):
+            if index is not None:
+                self.latest[a] = (self.passes, index)
+        self._launched(part)
+        submitted = time.perf_counter()
+        self.host_s["submit"] += submitted - started
+        if self.gpu_timing:
+            e3 = self.torch.cuda.Event(enable_timing=True)
+            e3.record()
+            # e1 to e2 is the stream idle until the host submits the
+            # readout; e2 to e3 is the readout
+            self.readout_spans.append((e1, e2, e3))
+        while self.outstanding:
+            self._report_next()
+        self.host_s["report"] += time.perf_counter() - submitted
+        self.outstanding.append(PendingAnswers(part, handles, self.passes, feed))
+        self.passes += 1
 
     def run(self):
         """Drive admission and drain the launched answer handles in order."""
+        run_started = time.perf_counter()
         while True:
             # documents with nothing to send at their first stage never run
             for settlement in self.sched.take_settled():
@@ -635,16 +900,27 @@ class StageExecutor:
             if self.sched.done():
                 break
             if len(self.outstanding) > 1:
+                started = time.perf_counter()
                 self._report_next()
+                self.host_s["report"] += time.perf_counter() - started
             if self.sched.blocked_pages:
                 # the free list is short for the next fresh document:
                 # retained KV nothing here reads makes room
                 self.arena.evict_retained(self.sched.blocked_pages)
+            started = time.perf_counter()
+            if self.growth is not None:
+                # the ready documents' next requests get their pages
+                # now; the ones that cannot wait a pass
+                self.sched.stalled = self.growth.grow(
+                    list(self.sched.ready), self.arena.free_pages)
             groups = self.sched.next_chunk(
                 self.arena.free_pages if self.paged else 1 << 62)
+            self.host_s["admit"] += time.perf_counter() - started
             if not groups:
                 if self.outstanding:
+                    started = time.perf_counter()
                     self._report_next(partial=True)
+                    self.host_s["report"] += time.perf_counter() - started
                     continue
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):
@@ -653,8 +929,14 @@ class StageExecutor:
                 # pages: the children pack their whole prefixes
                 if self.arena.drop_holds(self.held):
                     continue
-                raise AssertionError("nothing buildable and nothing in flight")
+                raise AssertionError(
+                    f"nothing buildable and nothing in flight; "
+                    f"{len(self.sched.stalled)} documents wait for KV pages")
             self._run_part(groups)
+            started = time.perf_counter()
+            # the chunk is built, so the anchors launched ahead of
+            # their answers can be asked for their next request
+            self.sched.advance_ahead()
             # the packed children hold their parents' pages now
             for a, _, start, _, carried in groups:
                 parent = (self.borrowing.tree_parent[a]
@@ -663,6 +945,7 @@ class StageExecutor:
                     self.arena.release(self.keys[parent])
                 if a in self._reserved_parents:
                     self.arena.done_reading((self._reserved_parents.pop(a),))
+            self.host_s["advance"] += time.perf_counter() - started
         while self.outstanding:
             self._report_next()
         self._release_skipped()
@@ -670,6 +953,8 @@ class StageExecutor:
         for anchor in self.sched.drain():
             if self.arena.is_resident(self.keys[anchor]):
                 self.arena.free_key(self.keys[anchor])
+            if self.growth is not None:
+                self.growth.settled(anchor)
         self.progress.finish(f"{self.label} done", f"{self.tokens:,} fresh tokens")
         self.arena.drop_holds(self.held)
         if self.sched.oversized:
@@ -680,6 +965,17 @@ class StageExecutor:
             self.stats["borrowed_tokens"] = self.borrowing.borrowed_tokens
             self.stats["pack_s"] = self.pack_s
             self.stats["skipped_documents"] = len(self.sched.oversized)
+            self.stats["host_s"] = {k: round(v, 3) for k, v in self.host_s.items()}
+            self.stats["run_s"] = round(time.perf_counter() - run_started, 3)
+            if self.growth is not None:
+                self.stats["kv_growth"] = self.growth.stats()
         if self.spans:
             self.torch.cuda.synchronize()
+            if self.stats is not None:
+                self.stats["readout_gpu_s"] = round(sum(
+                    e2.elapsed_time(e3) for _, e2, e3 in self.readout_spans)
+                    / 1000.0, 3)
+                self.stats["idle_gpu_s"] = round(sum(
+                    e1.elapsed_time(e2) for e1, e2, _ in self.readout_spans)
+                    / 1000.0, 3)
         return self.sched.answers, self.spans, self.tokens

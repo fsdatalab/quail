@@ -159,3 +159,119 @@ def test_warmup_runs_every_row_count_class(monkeypatch, mode):
         assert [n for n, _ in shapes[1:]] == [n for n, _ in warmup.ROW_CLASSES]
     # every key the pass made is freed
     assert arena.accounting.free_pages == 256
+
+
+def test_a_prefix_slice_reads_the_slices_before_it_and_writes_after_them(
+        monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    key = ("d", 5)
+    arena.activate(key, 40, capacity_tokens=48, base_tokens=40)
+    rows = arena.capacity_rows(key).tolist()
+    # the first slice reads nothing resident
+    first = chunk_mod.pack_chunk(
+        torch, arena, [dict(key=key, prefix=list(range(16)), start=0, f=0,
+                            suffixes=Suffixes.of([]))], attention_mode="tree")
+    assert first.meta["kv_dst"].tolist() == rows[:16]
+    assert first.meta["reads"] is None
+    assert first.meta["cu_a"].tolist() == [0, 16]
+    # the second reads the first from the key's pages
+    second = chunk_mod.pack_chunk(
+        torch, arena, [dict(key=key, prefix=list(range(16, 32)), start=16, f=16,
+                            suffixes=Suffixes.of([]))], attention_mode="tree")
+    assert second.positions.tolist() == list(range(16, 32))
+    assert second.meta["kv_dst"].tolist() == rows[16:32]
+    assert second.meta["reads"]["used"].tolist() == [16]
+    assert second.meta["reads"]["rows"].tolist() == list(range(16))
+    assert second.rows_per_answer is None
+    # the last slice carries the first request, which reads the whole prefix
+    final = chunk_mod.pack_chunk(
+        torch, arena, [dict(key=key, prefix=list(range(32, 40)), start=32, f=40,
+                            suffixes=[[91]], write_suffix_tokens=1, single=True)],
+        attention_mode="tree")
+    assert final.positions.tolist() == list(range(32, 41))
+    assert final.meta["kv_dst"].tolist() == rows[32:41]
+    assert final.meta["reads"]["used"].tolist() == [32, 40]
+    assert final.meta["cu_a"].tolist() == [0, 8, 9]
+    assert final.final_indices.tolist() == [8]
+
+
+def test_rounds_packed_together_on_the_tree_path_follow_their_answers(monkeypatch):
+    import numpy as np
+
+    from quail.backends.quail.executor.readout import RoundFeed
+    from quail.backends.quail.executor.stages import RoundRequests
+
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    first, second = ("d", 1), ("d", 2)
+    for key in (first, second):
+        arena.activate(key, 3, capacity_tokens=16, base_tokens=3)
+    rows = {key: arena.capacity_rows(key) for key in (first, second)}
+    # each round is packed at the first position of the round before
+    # it, whose rows the GPU has not read out yet: a placeholder, then
+    # the draft; the round before had at most three rows
+    requests = RoundRequests(
+        ids=np.array([0, 51, 52, 0]), lengths=np.array([3, 1]),
+        positions=np.array([6, 9]), device_fed=np.array([True, True]))
+    chunk = chunk_mod.pack_chunk(
+        torch, arena, [dict(rounds=requests, keys=[first, second], feed_bound=3)],
+        attention_mode="tree")
+    plan = dict(chunk.meta["feed"])["reads"]
+    assert plan["first"].tolist() == [0, 3]
+    assert plan["rows"].tolist() == [0, 1, 2, 3]
+    assert plan["entry"].tolist() == [0, 0, 0, 1]
+    assert plan["sequence"].tolist() == [0, 1]
+    assert plan["kv_rows"].tolist() == [0, 1, 2, 3]
+    # the KV read is bounded by the rows the round before could accept
+    assert chunk.meta["reads"]["max_used"] == 12
+    # the first round's source accepted one draft token and chose 50
+    # at the row after it; the second's accepted none and chose 60
+    feed = RoundFeed(accepted=torch.tensor([0, 1]), chosen=torch.tensor([60, 50]))
+    chunk.apply_feed(torch, feed, [1, 0], arena.page_tokens)
+    assert chunk.input_ids.tolist() == [50, 51, 52, 60]
+    assert chunk.positions.tolist() == [8, 9, 10, 10]
+    assert chunk.meta["reads"]["used"].tolist() == [8, 10]
+    assert chunk.meta["kv_dst"].tolist() == (rows[first][8:11].tolist()
+                                             + rows[second][10:11].tolist())
+
+
+def test_rounds_packed_together_on_the_unified_path_follow_their_answers(monkeypatch):
+    import numpy as np
+
+    from quail.backends.quail.executor.readout import RoundFeed
+    from quail.backends.quail.executor.stages import RoundRequests
+
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    first, second = ("d", 1), ("d", 2)
+    for key in (first, second):
+        arena.activate(key, 3, capacity_tokens=16, base_tokens=3)
+    rows = {key: arena.capacity_rows(key) for key in (first, second)}
+    requests = RoundRequests(
+        ids=np.array([0, 51, 52, 0]), lengths=np.array([3, 1]),
+        positions=np.array([6, 9]), device_fed=np.array([True, True]))
+    chunk = chunk_mod.pack_chunk(
+        torch, arena, [dict(rounds=requests, keys=[first, second], feed_bound=3)],
+        attention_mode="unified")
+    unified = chunk.meta["unified"]
+    assert chunk.positions.tolist() == [6, 7, 8, 9]
+    assert chunk.rows_per_answer.tolist() == [3, 1]
+    # each round's rows join its document's pages and one causal call
+    # reads the document with them
+    assert unified["cu_q"].tolist() == [0, 3, 4]
+    assert unified["used"].tolist() == [9, 10]
+    # a shifted round reads its rows and up to its bound past them
+    assert unified["max_used"] == 13
+    assert unified["dst"].tolist() == (rows[first][6:9].tolist()
+                                       + rows[second][9:10].tolist())
+    plan = dict(chunk.meta["feed"])["unified"]
+    assert plan["sequence"].tolist() == [0, 1]
+    assert plan["kv_rows"].tolist() == [0, 1, 2, 3]
+    feed = RoundFeed(accepted=torch.tensor([0, 1]), chosen=torch.tensor([60, 50]))
+    chunk.apply_feed(torch, feed, [1, 0], arena.page_tokens)
+    assert chunk.input_ids.tolist() == [50, 51, 52, 60]
+    assert chunk.positions.tolist() == [8, 9, 10, 10]
+    assert unified["used"].tolist() == [11, 11]
+    assert unified["dst"].tolist() == (rows[first][8:11].tolist()
+                                       + rows[second][10:11].tolist())

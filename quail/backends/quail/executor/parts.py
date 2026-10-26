@@ -138,6 +138,24 @@ class ExecutionPart(ABC):
         """Return completed results keyed by node or output name."""
 
 
+class DocumentAnswerPart(ExecutionPart):
+    """A part over one table's documents, fed their ids or an operator's rows."""
+
+    @staticmethod
+    def model_inputs(node, inputs, context, upstream=None, nodes=None):
+        if nodes is not None:
+            inputs = inputs[node.node_id]
+        # the one input carries the documents' ids, or the rows of an
+        # earlier operator over them
+        (value,) = inputs.values()
+        ids = (value.ids[node.spec.alias].to_numpy() if isinstance(value, Rows)
+               else np.asarray(value, dtype=np.int64))
+        return {"document_ids": ids,
+                "documents": context.state["documents"],
+                "texts": context.state.get("texts", {}),
+                "limit": context.state.get("filter_limit")}
+
+
 class SingleResultPart(ExecutionPart):
     """Prepared work whose execution produces one result."""
 
@@ -170,9 +188,12 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
 
     A limit ends the run once that many documents passed every part;
     documents are admitted only while the ones in flight are expected
-    to fall short of it, by the parts' selectivities.
+    to fall short of it, by the parts' selectivities. When one part's
+    KV grows as it writes, its StageGrowth sizes each document's pages
+    as it goes.
     """
     stages = gated_stages(parts)
+    growth = growing_stages(parts)
     paged = paged or state.loaded_model.pipeline.needs_pages
     if keep_kv and not paged:
         raise ValueError("retaining document KV requires arena writes")
@@ -198,10 +219,28 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
             survival=survival(parts),
             stop_groups=stop_groups, paged=paged,
             on_chunk=transition_reporter(parts), on_answers=on_answers,
-            appended_tokens=max(part.appended_tokens for part in parts) or None)
+            appended_tokens=max(part.appended_tokens for part in parts) or None,
+            growth=growth)
     complete_parts(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
             for node_id, result in part.results().items()}
+
+
+def growing_stages(parts):
+    """Return the StageGrowth of the one part whose KV grows as it writes.
+
+    Returns None unless exactly one part grows and no other part's
+    stage repeats: the other parts' requests are then sized when a
+    document is admitted.
+    """
+    growing = [part for part in parts
+               if getattr(getattr(part, "answer_stages", None), "grows", False)]
+    if len(growing) != 1:
+        return None
+    if any(stage.repeats for part in parts if part is not growing[0]
+           for stage in part.stages):
+        return None
+    return growing[0].answer_stages
 
 
 def gated_stages(parts) -> list:
@@ -298,12 +337,16 @@ def transition_reporter(parts):
     return report
 
 
+RUN_STATS = ("host_s", "run_s", "readout_gpu_s", "idle_gpu_s", "kv_growth")
+
+
 def complete_parts(parts, every, spans, tokens, stats):
     """Finalize pipeline parts and store each operator's result.
 
     The first part with stages receives document token costs, prefix-sharing
     counts, and packing time. Later parts receive their own frame and suffix
-    token costs. GPU time is apportioned by the rows each part processed.
+    token costs, and the run's RUN_STATS. GPU time is apportioned by the
+    rows each part processed.
 
     Args:
         parts: Pipeline parts in execution order.
@@ -313,6 +356,8 @@ def complete_parts(parts, every, spans, tokens, stats):
         stats: Packing time and prefix-sharing counts.
     """
     slices = _part_slices(parts)
+    # what the run measured as a whole, reported by every part
+    shared = {key: stats[key] for key in RUN_STATS if key in stats}
     own = [part.finish(every[low:high])
            for part, (low, high) in zip(parts, slices)]
     staged = [index for index, part in enumerate(parts) if part.stages]
@@ -321,7 +366,7 @@ def complete_parts(parts, every, spans, tokens, stats):
         part_spans = stage_spans(spans, low, high)
         part.complete(
             remainder if staged and index == staged[0] else (own[index] or 0),
-            part_spans, stats if staged and index == staged[0] else {},
+            part_spans, stats if staged and index == staged[0] else shared,
             low)
 
 
@@ -384,7 +429,9 @@ def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
         key = keys[anchor]
         if not arena.is_resident(key):
             return
-        if survived and keep_kv:
+        # only an (alias, document) key names KV a later operator
+        # reads; a branch's key holds one answer and is freed
+        if survived and keep_kv and isinstance(key, tuple) and len(key) == 2:
             arena.retain(key, len(prefixes[anchor]))
         else:
             arena.free_key(key)

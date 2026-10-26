@@ -34,3 +34,19 @@ def _subtree(node) -> tuple:
         nodes.extend(_subtree(child))
     nodes.append(node)
     return tuple(nodes)
+
+
+def with_answer_columns(node, *names: str) -> tuple[ColumnRef, ...]:
+    """Return the node's input columns plus answer columns of its table.
+
+    Args:
+        node: A one-table operator with `input` and `alias`.
+        names: The answer column names the node adds.
+
+    Returns:
+        The input schema followed by one ColumnRef per name.
+    """
+    fields = node.input.output_schema()
+    provider = next(
+        (field.provider for field in fields if field.alias == node.alias), "")
+    return fields + tuple(ColumnRef(node.alias, provider, name) for name in names)

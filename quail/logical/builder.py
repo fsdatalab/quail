@@ -30,6 +30,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SemanticSaeFeatures,
     Unnest,
     Window,
@@ -80,6 +81,7 @@ class LogicalPlanBuilder:
         extract_filters: tuple = (),
         sae_features: tuple = (),
         schema=None,
+        maps: tuple = (),
     ) -> None:
         """Add one table with its filters, applies, classifications, and extractions.
 
@@ -105,6 +107,8 @@ class LogicalPlanBuilder:
                 order. Each sits right above the extraction it tests.
             sae_features: (call, name) per AI.SAE_FEATURES call, in
                 order. They sit above the extractions.
+            maps: (call, name) per AI.MAP, in order. They sit above
+                the extractions.
 
         Raises:
             CompileError: The alias is taken, a label filter names a
@@ -170,6 +174,8 @@ class LogicalPlanBuilder:
                 f"does not return")
         for call, name in sae_features:
             node = SemanticSaeFeatures(node, call, name)
+        for call, name in maps:
+            node = SemanticMap(node, call, name)
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:

@@ -9,6 +9,7 @@ Tensor construction is handled by chunk.py.
 from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 
@@ -33,6 +34,8 @@ def pages_for(tokens: int, page_tokens: int) -> int:
 # --------------------------------------------- join admission
 
 _DONE = -2      # the anchor's last stage answered, or it failed a gate
+# the fewest prefix tokens a chunk packs as a slice of a longer prefix
+SLICE_MIN_TOKENS = 512
 
 
 def partner_pages(page_cost, page_tokens, prefix_tokens, frame_tokens,
@@ -128,6 +131,21 @@ DROP = object()
 SKIP = object()
 
 
+# the partner list of an anchor with one request at a stage
+_ONE_PARTNER = np.zeros(1, dtype=np.int64)
+_ONE_PARTNER.setflags(write=False)
+
+
+class SkipTo(NamedTuple):
+    """A partner request that passes an anchor on to a later stage.
+
+    Every stage before `stage` is passed with nothing asked, in one
+    step; a stage index past the last finishes the anchor.
+    """
+
+    stage: int
+
+
 @dataclass(frozen=True)
 class Settlement:
     """Completion record indicating whether a document survived the last stage."""
@@ -169,10 +187,11 @@ class JoinAdmission:
             stage's partner list the anchor streams, or None for the
             whole list. Omitted anchors stream the whole list at every
             stage. An anchor's value may instead be a callable(stage)
-            -> list, None, DROP, or SKIP, asked when the anchor enters
-            the stage; DROP takes the anchor out of the run there,
-            SKIP passes it to the next stage with nothing asked (a
-            stage after the first only).
+            -> list, None, DROP, SKIP, or SkipTo, asked when the anchor
+            enters the stage; DROP takes the anchor out of the run
+            there, SKIP passes it to the next stage with nothing asked
+            (a stage after the first only), and SkipTo(stage) passes
+            it to that stage.
         frame_canvas_tokens: Rows a diffusion model adds after a frame
             entry. They take chunk room and page room but are never
             kept in the anchor's KV. A suffix's canvas rows are part of
@@ -198,6 +217,33 @@ class JoinAdmission:
             before packs no frame rows. None writes every frame.
         limit: Stop admitting anchors once this many survived the last
             stage; None runs every anchor.
+        repeats: Per stage, whether an anchor whose decision is true is
+            asked again at the same stage, with its answers dropped,
+            until its callable partner request passes it on with SKIP
+            or SkipTo, or drops it.
+        slice_prefill: Whether an anchor whose prefix and first request
+            do not fit a chunk's room is admitted anyway, packing a
+            slice of its prefix per chunk, with no request until the
+            slice that completes it. Its KV pages are reserved at the
+            first slice. A borrowing anchor packs whole.
+        ahead: Per stage, whether an anchor launched there is asked for
+            its next request before its answer arrives: it re-enters a
+            repeating stage, or enters the next one, as soon as the
+            caller calls advance_ahead() after the launch, so it runs
+            in every chunk. Its answer, when it comes, re-asks a
+            request still queued and is otherwise ignored; a request
+            launched for an anchor that has since left the stage is
+            dropped.
+        costs: Per stage, a callable from an array of anchors to each
+            one's next request's tokens, -1 where its partner callable
+            would pass it on, or None; an ahead stage with one asks it
+            for its anchors at once in place of their partner callable.
+        admits: Optional callable(anchor, pages, free pages) -> bool,
+            asked before a fresh anchor that fits the free pages is
+            admitted; False holds it and every anchor after it.
+
+    The caller may set stalled to anchors that cannot be packed in the
+    next chunk; they stay ready and are placed in a later one.
         survival: The fraction of anchors expected to survive every
             stage, or None. Under a limit, anchors are admitted only
             while the ones in flight are expected to fall short of it;
@@ -235,8 +281,31 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
-                 stop_groups=None, stop_width=1, reserve=None):
+                 stop_groups=None, stop_width=1, reserve=None, repeats=None,
+                 slice_prefill=False, ahead=None, costs=None, admits=None):
         k = len(stage_suffixes)
+        self.admits = admits
+        self.stalled = set()
+        self.ahead = [False] * k if ahead is None else list(ahead)
+        if len(self.ahead) != k:
+            raise ValueError("ahead must match stage_suffixes")
+        self.costs = [None] * k if costs is None else list(costs)
+        if len(self.costs) != k:
+            raise ValueError("costs must match stage_suffixes")
+        # anchors launched at an ahead stage, with the stage, until
+        # advance_ahead() asks their next request
+        self._ahead = {}
+        # a prefix longer than the room is packed over several chunks,
+        # its KV written slice by slice; prefilling holds the anchors
+        # between their first slice and their last, and slices the
+        # (first, end) prefix tokens each anchor packs in this chunk
+        self.slice_prefill = slice_prefill
+        self.prefilling = deque()
+        self._prefilled = []
+        self.slices = {}
+        self.repeats = [False] * k if repeats is None else list(repeats)
+        if len(self.repeats) != k:
+            raise ValueError("repeats must match stage_suffixes")
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
         if len(self.answer_dtypes) != k:
@@ -364,14 +433,17 @@ class JoinAdmission:
             if lst is DROP:
                 self._stage[a] = _DONE
                 return "dropped"
-            if lst is SKIP:
-                # nothing asked here: the anchor passes this stage
-                self._true[a][j] = True
-                if j + 1 == k:
+            if lst is SKIP or isinstance(lst, SkipTo):
+                # nothing asked here: the anchor passes this stage,
+                # and every stage before a SkipTo's
+                until = j + 1 if lst is SKIP else max(lst.stage, j + 1)
+                for passed in range(j, min(until, k)):
+                    self._true[a][passed] = True
+                if until >= k:
                     self._stage[a] = _DONE
                     self.survivors += 1
                     return "finished"
-                j += 1
+                j = until
                 continue
             if ask is not None:
                 self._lists[a][j], self._cums[a][j] = self._partner_list(
@@ -391,6 +463,9 @@ class JoinAdmission:
         if lst is None:
             return None, None
         lengths = lst.lengths if isinstance(lst, OwnRequests) else None
+        if lengths is not None and len(lengths) == 1:
+            # a decode round's one request skips the array work
+            return _ONE_PARTNER, np.array([0, int(lengths[0])], dtype=np.int64)
         lst = np.asarray(lst, dtype=np.int64)
         if lengths is None:
             invalid = (lst < 0) | (lst >= len(self.stages[j]))
@@ -447,12 +522,14 @@ class JoinAdmission:
         elif need > self.arena_pages:
             oversized = True
         cum = self._cum[0] if lists[0] is None else cums[0]
-        if not oversized and resident_pages is None and len(cum) > 1:
+        if (not oversized and not self.slice_prefill and resident_pages is None
+                and len(cum) > 1):
             first = self.frame_rows[0] + int(cum[1] - cum[0])
             oversized = prefix + first > self.chunk_budget
         if oversized:
-            # a document that cannot fit one chunk or the arena is
-            # skipped: it settles unanswered, like one with nothing to ask
+            # a document that cannot fit the arena, or one chunk without
+            # slicing, is skipped: it settles unanswered, like one with
+            # nothing to ask
             self.oversized.append(a)
             need = 0
             lists[0], cums[0] = self._partner_list(a, 0, [])
@@ -462,6 +539,7 @@ class JoinAdmission:
         self._cums.append(cums)
         self._page_cost.append(need)
         self._carried.append(carried)
+        self._prefilled.append(0)
         self._stage.append(-1)
         self._next.append(0)
         self._true.append([False] * k)
@@ -548,6 +626,71 @@ class JoinAdmission:
         self.in_flight += 1
         return end < self.num_partners(a, j)
 
+    def _launched(self, a, j, end, continued):
+        """Queue the anchor's rest of the stream, or its next request ahead."""
+        if self._launch(a, j, end):
+            continued.append(a)
+        elif self.ahead[j]:
+            self._ahead[a] = j
+
+    def advance_ahead(self):
+        """Ask the anchors launched at an ahead stage for their next request.
+
+        The caller calls this once the launched chunk is built, since
+        the request asked here replaces the one the chunk packs. An
+        anchor re-enters a repeating stage or enters the next one, and
+        is queued for the next chunk; one its callback passes on or
+        drops settles.
+        """
+        launched, self._ahead = self._ahead, {}
+        k = len(self.stages)
+        targets = {}
+        for a, j in launched.items():
+            if self._stage[a] != j:
+                continue        # skipped by its group's survivor
+            if self.repeats[j]:
+                target = j
+            else:
+                self._true[a][j] = True
+                target = j + 1
+                if target >= k:
+                    continue    # its answer settles it
+            targets.setdefault(target, []).append(a)
+        for target, anchors in targets.items():
+            for a, settled in self._enter_many(anchors, target):
+                if settled is None:
+                    self.ready.append(a)
+                else:
+                    self._settled.append(Settlement(
+                        settled, a, bool(self._true[a][-1])))
+
+    def _enter_many(self, anchors, j):
+        """Enter anchors at stage j; yield (anchor, _enter's result) for each.
+
+        A stage with a costs callable prices every anchor's one request
+        in one call, so entering costs no per-anchor callback; the
+        anchors it passes on go through the partner callable as usual.
+        """
+        costs = self.costs[j]
+        if costs is None:
+            for a in anchors:
+                yield a, self._enter(a, j)
+            return
+        priced = costs(np.asarray(anchors, dtype=np.int64)).tolist()
+        for a, cost in zip(anchors, priced):
+            if cost < 0:
+                yield a, self._enter(a, j)
+                continue
+            self._stage[a] = j
+            self._next[a] = 0
+            self._lists[a][j] = _ONE_PARTNER
+            cum = self._cums[a][j]
+            if cum is None or cum is self._cum[j] or len(cum) != 2:
+                self._cums[a][j] = np.array([0, cost], dtype=np.int64)
+            else:
+                cum[1] = cost
+            yield a, None
+
     def next_chunk(self, free_pages):
         """Groups for the next chunk: [(anchor, stage, start, end, carried)].
 
@@ -566,13 +709,71 @@ class JoinAdmission:
         continued = []
         deferred = []
         temporary_pages = 0
-        # 1) placed anchors: cut streams (front) and next-stage starts
+        self.slices = {}
+        room, free_pages, temporary_pages = self._continue_prefill(
+            room, free_pages, temporary_pages, groups, continued)
+        room, free_pages, temporary_pages = self._place_ready(
+            room, free_pages, temporary_pages, groups, continued, deferred)
+        self._admit_fresh(room, free_pages, temporary_pages, groups, continued)
+        self.ready.extendleft(reversed(continued))
+        self.ready.extendleft(reversed(deferred))
+        return groups
+
+    def _continue_prefill(self, room, free_pages, temporary_pages, groups,
+                          continued):
+        """Pack the next slice of each anchor mid-prefill, oldest first.
+
+        An anchor whose remaining prefix and first request fit the room
+        packs them and launches; otherwise it packs a slice of the room
+        and stays in prefilling.
+        """
+        for _ in range(len(self.prefilling)):
+            if room < SLICE_MIN_TOKENS:
+                break
+            a = self.prefilling.popleft()
+            first = self._prefilled[a]
+            remaining = self._carried[a] - first
+            if remaining + self._first[a] <= room:
+                end, tokens, pages = self._take(a, 0, 0, room - remaining, free_pages)
+                if end == 0:
+                    self.blocked_pages = self._suffix_page_cost(a, 0, 0) - free_pages
+                    self.prefilling.appendleft(a)
+                    break
+                self.slices[a] = (first, self._carried[a])
+                self._prefilled[a] = self._carried[a]
+                groups.append((a, 0, 0, end, True))
+                room -= remaining + tokens
+                free_pages -= pages
+                temporary_pages += pages
+                self._launched(a, 0, end, continued)
+                continue
+            taken = min(remaining, room)
+            self.slices[a] = (first, first + taken)
+            self._prefilled[a] = first + taken
+            groups.append((a, 0, 0, 0, True))
+            room -= taken
+            self.prefilling.append(a)
+        return room, free_pages, temporary_pages
+
+    def _slice_fresh(self, a, room) -> bool:
+        """Admit a fresh anchor by its first prefix slice; False when it cannot."""
+        if (not self.slice_prefill or room < SLICE_MIN_TOKENS
+                or self._first[a] > self.chunk_budget):
+            return False
+        self.slices[a] = (0, room)
+        self._prefilled[a] = room
+        self.prefilling.append(a)
+        return True
+
+    def _place_ready(self, room, free_pages, temporary_pages, groups, continued,
+                     deferred):
+        """Add the placed anchors' next groups: cut streams and next-stage starts."""
         for _ in range(len(self.ready)):
             if room == 0:
                 break
             a = self.ready.popleft()
             j, i = self._stage[a], self._next[a]
-            if self._first_cost(a, j, i) > room:
+            if a in self.stalled or self._first_cost(a, j, i) > room:
                 deferred.append(a)
                 continue
             end, tokens, pages = self._take(a, j, i, room, free_pages)
@@ -584,15 +785,20 @@ class JoinAdmission:
             temporary_pages += pages
             groups.append((a, j, i, end, False))
             room -= tokens
-            if self._launch(a, j, end):
-                continued.append(a)
-        # 2) fresh anchors: pages in queue order, chunk room may skip
+            self._launched(a, j, end, continued)
+        return room, free_pages, temporary_pages
+
+    def _admit_fresh(self, room, free_pages, temporary_pages, groups, continued):
+        """Add fresh anchors: pages in queue order, chunk room may skip."""
         held = []
         blocked = False
         admitted = set()
         paced = self.limit is not None and self.survival is not None
         expected_rows = self._live() if paced else 0
-        while self.pending and room >= self._min_fresh:
+        # a sliced prefix packs as little as a slice
+        least = (min(self._min_fresh, SLICE_MIN_TOKENS) if self.slice_prefill
+                 else self._min_fresh)
+        while self.pending and room >= least:
             if paced and self.survivors + expected_rows * self.survival >= self.limit:
                 break       # the anchors in flight should reach the limit
             a = self.pending.popleft()
@@ -604,8 +810,9 @@ class JoinAdmission:
                 held.append(a)      # the group's anchors in flight are enough
                 continue
             borrow = self.borrowing.decide(a, admitted)
-            if borrow == Borrowing.WAIT:
-                held.append(a)      # its parent is still queued
+            if borrow == Borrowing.WAIT or (
+                    borrow is not None and borrow[0] in self.prefilling):
+                held.append(a)      # its parent is still queued or mid-prefill
                 continue
             need = (self._page_cost[a] if borrow is None
                     else self.page_cost(self.prefix[a] - borrow[1] + self._extra))
@@ -622,24 +829,36 @@ class JoinAdmission:
                 if not self._zero_cost:
                     break
                 continue
+            if self.admits is not None and not self.admits(a, need, free_pages):
+                held.append(a)      # the pages it would grow into are spoken for
+                break
             carried = (self._carried[a] if borrow is None
                        else self.prefix[a] - borrow[1])
+            sliced = False
             if carried + self._first[a] > room:
-                held.append(a)      # chunk room only; retry next chunk
-                continue
-            end, tokens, pages = self._take(
-                a, 0, 0, room - carried, free_pages - need)
-            if end == 0:
-                held.append(a)
-                self.blocked_pages = (
-                    need + self._suffix_page_cost(a, 0, 0) - free_pages)
-                break
+                sliced = borrow is None and carried > room
+                if not sliced or not self._slice_fresh(a, room):
+                    held.append(a)      # chunk room only; retry next chunk
+                    continue
+                end, tokens, pages = 0, 0, 0
+            else:
+                end, tokens, pages = self._take(
+                    a, 0, 0, room - carried, free_pages - need)
+                if end == 0:
+                    held.append(a)
+                    self.blocked_pages = (
+                        need + self._suffix_page_cost(a, 0, 0) - free_pages)
+                    break
             if self.reserve is not None and not self.reserve(a, borrow):
+                if sliced:
+                    self.prefilling.pop()
+                    self.slices.pop(a)
+                    self._prefilled[a] = 0
                 held.append(a)
                 break
             temporary_pages += pages
             groups.append((a, 0, 0, end, carried > 0))
-            room -= carried + tokens
+            room -= (carried + tokens) if not sliced else room
             free_pages -= need + pages
             if not self._page_cost[a]:
                 self._zero_cost -= 1
@@ -651,12 +870,9 @@ class JoinAdmission:
                 self._group_busy[group] = self._group_busy.get(group, 0) + 1
                 self._group_members[group].discard(a)
             self.borrowing.record(a, borrow)
-            if self._launch(a, 0, end):
-                continued.append(a)
+            if not sliced:
+                self._launched(a, 0, end, continued)
         self.pending.extendleft(reversed(held))
-        self.ready.extendleft(reversed(continued))
-        self.ready.extendleft(reversed(deferred))
-        return groups
 
     # ---- gating --------------------------------------------------------
 
@@ -669,6 +885,8 @@ class JoinAdmission:
             next stage immediately removes the document. Settlements record
             whether the document survived its final stage.
         """
+        if self.ahead[j]:
+            return self._report_ahead(a, j, start, end, bits)
         dtype = self.answer_dtypes[j]
         if dtype is None:
             row = self.answers[j].setdefault(a, [])
@@ -698,7 +916,19 @@ class JoinAdmission:
             self._true[a][j] = True
         settlements = []
         transitions = []
-        if j == self._stage[a] and j + 1 < k:
+        if (j == self._stage[a] and complete and self.repeats[j]
+                and self._true[a][j]):
+            # the stage asks the anchor again; its answers were read
+            self.answers[j].pop(a, None)
+            self._answer_counts[j].pop(a, None)
+            settled = self._enter(a, j)
+            if settled is None:
+                self.ready.append(a)
+            else:
+                transitions.append((a, j, True))
+                settlements.append(Settlement(
+                    settled, a, bool(self._true[a][-1])))
+        elif j == self._stage[a] and j + 1 < k:
             if self._true[a][j] and self._next[a] == num_partners:
                 # the whole stream is launched, so every later chunk
                 # is behind it on the stream and the next stage's
@@ -714,7 +944,8 @@ class JoinAdmission:
                 self._stage[a] = _DONE
                 transitions.append((a, j, False))
                 settlements.append(Settlement("dropped", a, False))
-        if j == k - 1 and complete:
+        if j == k - 1 and complete and not (
+                self.repeats[j] and self._true[a][j]):
             self._stage[a] = _DONE
             if self._true[a][j]:
                 self.survivors += 1
@@ -724,6 +955,30 @@ class JoinAdmission:
         for settlement in settlements:
             self._settle_group(settlement.anchor, settlement.survived)
         return AdmissionReport(tuple(settlements), tuple(transitions))
+
+    def _report_ahead(self, a, j, start, end, bits):
+        """Record a group's answers at an ahead stage.
+
+        The caller's prepare callback has read the answers already,
+        so they are not kept. An anchor still at the stage whose next
+        request is queued is asked again, as the answer changes what
+        it feeds, or passes it on; one whose next request is launched
+        is asked when advance_ahead() reaches it.
+        """
+        if end - start != 1 or len(bits) != 1:
+            raise AssertionError(
+                f"anchor {a} stage {j}: an ahead stage answers one request")
+        self.in_flight -= 1
+        if j != self._stage[a] or a in self._ahead:
+            return AdmissionReport()
+        self.ready.remove(a)
+        (_, settled), = self._enter_many([a], j if self.repeats[j] else j + 1)
+        if settled is None:
+            self.ready.append(a)
+            return AdmissionReport()
+        settlement = Settlement(settled, a, bool(self._true[a][-1]))
+        self._settle_group(a, settlement.survived)
+        return AdmissionReport((settlement,), ((a, j, True),))
 
     def _settle_group(self, a, survived):
         """Free the anchor's group for its next anchor, or skip the rest.
@@ -771,10 +1026,12 @@ class JoinAdmission:
             have not run through the remaining stages.
         """
         out = [a for a in self.ready if self._stage[a] != _DONE]
+        out.extend(a for a in self.prefilling)
         out.extend(a for a in self.pending if self._stage[a] != -1)
         for a in out:
             self._stage[a] = _DONE
         self.ready.clear()
+        self.prefilling.clear()
         self.pending.clear()
         self._dead = 0
         return out
@@ -785,4 +1042,5 @@ class JoinAdmission:
         if self.limit_reached():
             return not self.in_flight and not self._settled
         return len(self.pending) == self._dead and not self.ready \
-            and not self.in_flight and not self._settled
+            and not self.prefilling and not self._ahead and not self.in_flight \
+            and not self._settled

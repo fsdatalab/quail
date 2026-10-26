@@ -24,14 +24,12 @@ from quail.backends.quail.distributed import (
 )
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract.candidates import Stream
-from quail.backends.quail.executor.extract.decode import AnswerState, Decoder
+from quail.backends.quail.executor.extract.decoder import AnswerState, Decoder
 from quail.backends.quail.executor.extract.stages import ExtractionStages
-from quail.backends.quail.executor.extract.vocabulary import same_word
-from quail.backends.quail.executor.operators.extract import (
-    execute_extractions,
-)
+from quail.backends.quail.executor.operators.extract import ExtractPart
 from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
+from quail.backends.quail.executor.vocabulary import same_word
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_execute
 from quail.builtins import built_in_registry
@@ -302,7 +300,8 @@ class ScriptedModel:
                 # rewinding stage, or a discarding one drops what an
                 # earlier stage appended
                 if spec.get("prefix") is not None:
-                    self.prefix_len[key] = len(spec["prefix"])
+                    # a prefix slice continues from where the one before ended
+                    self.prefix_len[key] = spec.get("start", 0) + len(spec["prefix"])
                     self.reads[key] += 1
                 held = self.kv.get(key, [])
                 if spec.get("f") is not None and key in self.prefix_len:
@@ -316,6 +315,8 @@ class ScriptedModel:
                     rows.append(self._row_after(key, path[:end]))
                 if spec.get("write_suffix_tokens", 0):
                     self.kv[key] = path
+        if not rows:
+            return np.zeros((0, self.width), dtype=np.float32)
         return np.stack(rows)
 
     def _row_after(self, key, path):
@@ -369,7 +370,16 @@ def _fake_readout(tables, k):
         values = np.asarray(rows, dtype=np.float32)[:, :width]
         return split_rows(values, rows_per_answer)
 
-    value.submit, value.result = submit, lambda handle: handle
+    def feed(handle, following, counts):
+        import torch
+
+        from quail.backends.quail.executor.readout import round_feed
+
+        values = torch.as_tensor(np.concatenate(list(handle)))
+        return round_feed(torch, values, following, counts,
+                          torch.as_tensor(tables.is_stop), 1, k)
+
+    value.submit, value.result, value.feed = submit, lambda handle: handle, feed
     return value
 
 
@@ -431,12 +441,12 @@ def _setup(monkeypatch, documents=None, token_documents=None,
               "texts": {"c": documents}, "gpu_timing": gpu_timing}
 
     def run(name="ends", keep_kv=False):
-        result = execute_extractions(
+        result = ExtractPart.execute_group(
             state, [replace(node(name), keep_kv=keep_kv)], inputs)[node(name).node_id]
         return result, stages_seen["stages"]
 
     def run_pipeline(*names):
-        results = execute_extractions(state, [node(name) for name in names],
+        results = ExtractPart.execute_group(state, [node(name) for name in names],
                                       inputs)
         return results, stages_seen["stages"]
 
@@ -753,7 +763,8 @@ def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
 
     run_stages(state.torch, state.loaded_model.arena,
                state.loaded_model.pipeline, stages.stages, stages.prefixes,
-               state.chunk_tokens, anchor_keys=stages.keys)
+               state.chunk_tokens, anchor_keys=stages.keys,
+               appended_tokens=stages.appended_tokens)
     stages.finish()
     asked = stages.documents[0].answers[0]
     assert asked.done and len(asked.written) == stages.spec.max_answer_tokens

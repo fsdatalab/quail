@@ -51,6 +51,7 @@ def bare_arena(arena, pages):
     arena.pinned = False
     arena._rows = {}
     arena._capacity_rows = {}
+    arena._capacity_rows_numpy = {}
     arena._sliding_rows = {}
     arena._base = {}
     arena._sliding_start = {}
@@ -162,6 +163,27 @@ def fake_torch():
 
 
 def fake_pack(torch, arena, specs, **kw):
+    from quail.backends.quail.executor.chunk import Suffixes
+
+    # rounds packed together become one spec each, as the model
+    # scripts them
+    expanded = []
+    for spec in specs:
+        rounds = spec.get("rounds")
+        if rounds is None:
+            expanded.append(spec)
+            continue
+        ends = np.cumsum(rounds.lengths)
+        for key, start, end, f, fed in zip(
+                spec["keys"], (ends - rounds.lengths).tolist(), ends.tolist(),
+                rounds.positions.tolist(), rounds.device_fed.tolist()):
+            expanded.append(dict(
+                key=key, prefix=None, f=f,
+                suffixes=Suffixes(rounds.ids[start:end], [end - start]),
+                write_suffix_tokens=end - start, single=True, read_all_rows=True,
+                device_fed=fed))
+    specs = expanded
+
     def own_rows(spec):
         own = spec.get("canvas")
         return len(kw.get("canvas", ())) if own is None else np.shape(own)[-1]
@@ -187,7 +209,8 @@ def fake_pack(torch, arena, specs, **kw):
         rows_per_answer = None
     else:
         rows_per_answer = np.asarray(rows_per_answer, dtype=np.int64)
-    meta = {}
+    meta = {"feed": [index for index, spec in enumerate(specs)
+                     if spec.get("device_fed")] or None}
     if arena.num_state_slots:
         from quail.backends.quail.executor.gdn import plan_phases
 
@@ -208,9 +231,22 @@ def fake_pack(torch, arena, specs, **kw):
             offset = int(ends[-1])
         meta["gdn"] = plan_phases(
             arena, groups, lambda name, values, dtype: np.asarray(values))
-    return SimpleNamespace(specs=specs, tokens=tokens, layout=[], temporary_keys=(),
-                           fresh_keys=(), rows_per_answer=rows_per_answer,
-                           meta=meta)
+    chunk = SimpleNamespace(specs=specs, tokens=tokens, layout=[], temporary_keys=(),
+                            fresh_keys=(), rows_per_answer=rows_per_answer,
+                            meta=meta)
+
+    def apply_feed(torch, feed, source, page_tokens):
+        """Fill the device-fed rounds as Chunk.apply_feed does, on the specs."""
+        for index, at in zip(meta["feed"], source):
+            spec = specs[index]
+            accepted = int(feed.accepted[at])
+            ids = spec["suffixes"].ids.copy()
+            ids[0] = int(feed.chosen[at])
+            spec["suffixes"] = Suffixes(ids, [len(ids)])
+            spec["f"] += accepted + 1
+
+    chunk.apply_feed = apply_feed
+    return chunk
 
 
 def expected_filter_rows(filter_truth):

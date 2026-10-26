@@ -11,12 +11,29 @@ stalling the stream; result() waits on that copy.
 """
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
+from quail.backends.quail.executor.chunk import device_arrays
 from quail.backends.quail.executor.model_loading import answer_weights
 from quail.planner.prompt_lowering import true_false_ids
+
+
+def readout_rows(row, width: int) -> np.ndarray:
+    """Return a stage's answer as its rows of readout values.
+
+    Args:
+        row: One document's answer: the readout's values, or an object
+            array holding them.
+        width: The values in each readout row.
+    """
+    values = np.asarray(row)
+    if values.dtype == object:
+        values = np.asarray(values.reshape(-1)[0], dtype=np.float32)
+    return values.reshape(-1, width)
 
 
 class AnswerRows:
@@ -227,6 +244,139 @@ class AsyncLabelLogprobs(_HostReadout):
         return self._copy(values)
 
 
+@dataclass
+class RoundFeed:
+    """What a pass's answers chose, on the GPU, for the rounds fed from it.
+
+    Attributes:
+        accepted: Per answer, how many of its draft tokens the model
+            chose in turn: the row after the last of them chooses the
+            next token.
+        chosen: Per answer, the token that row chose.
+    """
+
+    accepted: Any
+    chosen: Any
+
+
+def round_feed(torch, values, following, counts, stop_mask, num_extras, k):
+    """Return each answer's accepted draft tokens and chosen token.
+
+    Mirrors the map decoder's rule on the host: a row's token is its
+    likeliest, chosen when it beats the stop group and is not a stop
+    token, and a draft token is accepted when the row before it chose
+    it.
+
+    Args:
+        torch: The torch module.
+        values: (rows, width) readout values of every answer row, in
+            answer order, on the device the feed is computed on.
+        following: Per row, the draft token fed after it, or -1 after
+            an answer's last row; a host array.
+        counts: Per answer, its rows; a host array.
+        stop_mask: A device bool tensor over the vocabulary, True at
+            the stop tokens.
+        num_extras: The extra columns before the k token ids.
+        k: How many likeliest tokens a row carries.
+    """
+    device = values.device
+    ids = values[:, num_extras:num_extras + k]
+    lps = values[:, num_extras + k:num_extras + 2 * k]
+    if k == 1:
+        top, lp_top = ids[:, 0], lps[:, 0]
+    else:
+        best = lps.argmax(dim=1, keepdim=True)
+        top, lp_top = ids.gather(1, best)[:, 0], lps.gather(1, best)[:, 0]
+    top = top.long()
+    ok = (lp_top > values[:, 0]) & ~stop_mask[top]
+    counts = np.asarray(counts, dtype=np.int64)
+    starts = np.cumsum(counts) - counts
+    segment = np.repeat(np.arange(len(counts)), counts)
+    within = np.arange(int(counts.sum())) - np.repeat(starts, counts)
+    following, counts, starts, segment, within = device_arrays(
+        torch, [following, counts, starts, segment, within], device)
+    match = ok & (top == following)
+    # the first row that did not choose the draft token after it ends
+    # the accepted run; the last row has no following token. Every row
+    # takes part, as selecting the missed rows would wait for the GPU
+    accepted = counts.clone()
+    accepted.scatter_reduce_(0, segment, torch.where(match, counts[segment], within),
+                             reduce="amin")
+    chosen = top.index_select(0, starts + accepted)
+    return RoundFeed(accepted=accepted, chosen=chosen)
+
+
+_ROW_TOP = None
+
+
+def row_top_kernel():
+    """Return the fused row reduction kernel, compiled once: lse, top id, top value.
+
+    Returns None where Triton is not available.
+    """
+    global _ROW_TOP
+    if _ROW_TOP is None:
+        try:
+            import triton
+            import triton.language as tl
+        except ImportError:
+            _ROW_TOP = False
+            return None
+
+        @triton.jit
+        def row_lse_top(x_ptr, lse_ptr, top_ptr, value_ptr, stride, width,
+                        BLOCK: tl.constexpr):
+            row = tl.program_id(0)
+            base = x_ptr + row * stride
+            running_max = tl.full((), float("-inf"), tl.float32)
+            running_sum = tl.zeros((), tl.float32)
+            best = tl.full((), float("-inf"), tl.float32)
+            best_id = tl.zeros((), tl.int32)
+            for start in range(0, width, BLOCK):
+                offs = start + tl.arange(0, BLOCK)
+                x = tl.load(base + offs, mask=offs < width,
+                            other=float("-inf")).to(tl.float32)
+                block_max = tl.max(x, axis=0)
+                new_max = tl.maximum(running_max, block_max)
+                running_sum = (running_sum * tl.exp(running_max - new_max)
+                               + tl.sum(tl.exp(x - new_max), axis=0))
+                running_max = new_max
+                # the earliest row of the largest value, as the ties fall
+                take = block_max > best
+                best_id = tl.where(take, start + tl.argmax(x, axis=0), best_id)
+                best = tl.where(take, block_max, best)
+            tl.store(lse_ptr + row, running_max + tl.log(running_sum))
+            tl.store(top_ptr + row, best_id)
+            tl.store(value_ptr + row, best)
+
+        _ROW_TOP = row_lse_top
+    return _ROW_TOP or None
+
+
+def row_top(torch, logits):
+    """Return each row's log-sum-exp, likeliest token, and its logit, in one read.
+
+    Args:
+        torch: The torch module.
+        logits: (rows, vocabulary) logits on the GPU, rows contiguous.
+
+    Returns:
+        (lse, top, value): float32, int32, and float32 tensors of one
+        value per row, or None when the fused kernel is unavailable.
+    """
+    kernel = row_top_kernel()
+    if kernel is None or not logits.is_cuda:
+        return None
+    rows, width = logits.shape
+    lse = torch.empty(rows, dtype=torch.float32, device=logits.device)
+    top = torch.empty(rows, dtype=torch.int32, device=logits.device)
+    value = torch.empty(rows, dtype=torch.float32, device=logits.device)
+    if rows:
+        kernel[(rows,)](logits, lse, top, value, logits.stride(0), width,
+                        BLOCK=4096)
+    return lse, top, value
+
+
 class AsyncTopLogprobs(_HostReadout):
     """Asynchronous readout of each row's likeliest tokens' log probabilities.
 
@@ -249,7 +399,10 @@ class AsyncTopLogprobs(_HostReadout):
             array per answer, in an object array.
     """
 
-    BLOCK_ROWS = AsyncLabelLogprobs.BLOCK_ROWS
+    # rows per head block: every block reads the whole head once, and
+    # a pass's rows mostly fit one block; 1024 x 151,936 bf16 logits
+    # are 311 MiB
+    BLOCK_ROWS = 1024
 
     def __init__(self, torch, F, head, k, extras, ragged=False):
         super().__init__(torch)
@@ -266,6 +419,7 @@ class AsyncTopLogprobs(_HostReadout):
         self.ragged = ragged
         self.dtype = (np.dtype(object) if ragged
                       else np.dtype((np.float32, (self.width,))))
+        self.stop_mask = None
 
     def values(self, normed):
         """Compute each row's values from normalized hidden states."""
@@ -275,24 +429,56 @@ class AsyncTopLogprobs(_HostReadout):
         n = len(self.groups)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
-            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
-            logits -= torch.logsumexp(logits, dim=1, keepdim=True)
+            # the logits stay in the head's dtype: every pass over the
+            # vocabulary reads them once, and the normalizer shifts a
+            # row's values alike
+            logits = self.F.linear(block.to(self.head.dtype), self.head)
             rows = slice(start, start + block.shape[0])
-            picked = logits.index_select(1, self.extras)
+            fused = row_top(torch, logits) if self.k == 1 else None
+            if fused is not None:
+                # one read of the logits gives the normalizer and the
+                # likeliest token
+                lse, ids, top = fused
+                norm = lse[:, None]
+                ids, top = ids[:, None], top[:, None]
+            else:
+                norm = torch.logsumexp(logits, dim=1, keepdim=True).float()
+                if self.k == 1:
+                    top, ids = logits.max(dim=1, keepdim=True)
+                else:
+                    top, ids = torch.topk(logits, self.k, dim=1)
+            picked = logits.index_select(1, self.extras).float() - norm
             for column, group in enumerate(self.groups):
                 out[rows, column] = torch.logsumexp(picked[:, group], dim=1)
-            top, ids = torch.topk(logits, self.k, dim=1)
             out[rows, n:n + self.k] = ids.float()
-            out[rows, n + self.k:] = top
+            out[rows, n + self.k:] = top.float() - norm
         return out
 
     def submit(self, normed, rows_per_answer=None):
-        return (*self._copy(self.values(normed)), rows_per_answer)
+        values = self.values(normed)
+        # the device values stay in the handle for feed()
+        return (*self._copy(values), rows_per_answer, values)
 
     def result(self, handle):
-        *transfer, rows_per_answer = handle
+        *transfer, rows_per_answer, _ = handle
         values = super().result(transfer)
         return split_rows(values, rows_per_answer) if self.ragged else values
+
+    def feed(self, handle, following, counts) -> RoundFeed:
+        """Return the submitted answers' chosen tokens and accepted drafts.
+
+        Args:
+            handle: A submit() handle.
+            following: Per row, the draft token fed after it, or -1.
+            counts: Per answer, its rows.
+        """
+        values = handle[-1]
+        if self.stop_mask is None:
+            self.stop_mask = self.torch.zeros(self.head.shape[0], dtype=self.torch.bool,
+                                              device=values.device)
+            self.stop_mask[self.extras[self.groups[0]]] = True
+        return round_feed(self.torch, values, following, counts, self.stop_mask,
+                          len(self.groups), self.k)
 
 
 def split_rows(values, rows_per_answer):

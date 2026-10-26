@@ -95,7 +95,8 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
     if context is None:
         raise ValueError("plan statistics need a planning context")
     lowered = {prompt: context.lowered(prompt) for prompt in (
-        *operators.prompts, *(node.call.prompt for node in operators.extracts))}
+        *operators.prompts, *(node.call.prompt for node in operators.extracts),
+        *(node.call.prompt for node in operators.maps))}
     lengths = {a: summarize_alias(t, model.sliding_window,
                                   memo=context.memo if context is not None else None)
                for a, t in document_tokens.items()}

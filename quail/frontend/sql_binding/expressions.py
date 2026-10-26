@@ -379,6 +379,41 @@ class ExpressionBinder:
         model_call.validate()
         return model_call
 
+    def bind_ai_map(self, node, name: str) -> Alias:
+        """Parse an AI.MAP call and bind its document reference.
+
+        The call is ``AI.MAP(column, 'instruction')``.
+
+        Args:
+            node: The AI_MAP call.
+            name: The answer column's AS name.
+
+        Returns:
+            The map Alias.
+
+        Raises:
+            CompileError: The column or instruction is invalid.
+        """
+        args = list(node.expressions)
+        if len(args) != 2:
+            raise CompileError(
+                "AI.MAP takes a document column and an instruction string")
+        if not isinstance(args[0], COLUMN_NODES):
+            raise CompileError(
+                f"AI.MAP's first argument is a document column, "
+                f"got {args[0].sql()}")
+        if not (isinstance(args[1], exp.Literal) and args[1].is_string):
+            raise CompileError(
+                f"AI.MAP's second argument is an instruction string, "
+                f"got {args[1].sql()}")
+        ref = self.resolve_value(args[0])
+        instruction = str(args[1].this)
+        prompt = self.prompts.bind("map", instruction, (ref,))
+        self.note_document_column(ref)
+        call = ModelCall(prompt, "map", instruction=instruction)
+        call.validate()
+        return Alias(call, name)
+
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:
         """Bind a score or classification to its model call."""
         if isinstance(node, exp.AIClassify):

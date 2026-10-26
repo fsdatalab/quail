@@ -12,7 +12,7 @@ from quail.logical.expressions import (
     CompileError,
     _explain,
 )
-from quail.logical.nodes.base import LogicalNode, _subtree
+from quail.logical.nodes.base import LogicalNode, _subtree, with_answer_columns
 
 # the Arrow type of one feature list
 FEATURE_LIST = pa.list_(
@@ -53,11 +53,7 @@ class SemanticSaeFeatures:
         return (self.call,)
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        fields = self.input.output_schema()
-        provider = next(
-            (field.provider for field in fields if field.alias == self.alias), ""
-        )
-        return fields + (ColumnRef(self.alias, provider, self.name),)
+        return with_answer_columns(self, self.name)
 
     def validate(self) -> None:
         self.call.validate()

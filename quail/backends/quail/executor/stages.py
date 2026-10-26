@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.admission import DROP, SKIP
+from quail.backends.quail.executor.admission import DROP, SKIP, SkipTo
 
 
 @dataclass
@@ -40,17 +40,40 @@ class StageRequests:
             stage's readout settings.
         discard: Tokens to remove from the previously appended KV before
             processing these suffixes.
+        position: The position of the first suffix token in the
+            document's sequence, or None to place it after what the
+            earlier stages appended, less discard.
     """
 
     suffixes: Any
     write_suffix_tokens: int | None = None
     read_rows: list[int] | None = None
     discard: int = 0
+    position: int | None = None
 
     def __post_init__(self):
         from quail.backends.quail.executor.chunk import Suffixes
 
         self.suffixes = Suffixes.of(self.suffixes)
+
+
+@dataclass
+class RoundRequests:
+    """Many documents' one-request rounds at once, for an ahead stage.
+
+    Attributes:
+        ids: Every request's tokens back to back, in document order.
+        lengths: Each request's tokens.
+        positions: Each request's first position in its document's
+            sequence, as StageRequests.position.
+        device_fed: Per request, whether its first token is a
+            placeholder the GPU replaces, as StageRequests.device_fed.
+    """
+
+    ids: np.ndarray
+    lengths: np.ndarray
+    positions: np.ndarray
+    device_fed: np.ndarray
 
 
 @dataclass
@@ -62,8 +85,9 @@ class Stage:
             or a callback from document key to StageRequests,
             asked when the document enters the stage, so a
             stage can feed what an earlier stage's answer chose for it.
-            The callback may return DROP or SKIP as requests does; it
-            takes the place of requests, and suffix_tokens bounds it.
+            The callback may return DROP, SKIP, or SkipTo as requests
+            does; it takes the place of requests, and suffix_tokens
+            bounds it.
         suffix_tokens: The most tokens one sequence of a callback
             suffixes may have; admission and page capacity count it.
         readout: Converts selected hidden states to Boolean answers, scores,
@@ -72,10 +96,15 @@ class Stage:
             frames are written only once.
         requests: Optional callback from document key to suffix indices.
             None selects all suffixes; DROP removes the document; SKIP
-            advances it without a request.
+            advances it without a request, and SkipTo(stage) advances
+            it to that stage.
         decide: Optional callback from document index and answer row to a
             Boolean. True advances the document or retains it at the final
             stage. Without a callback, any true answer is sufficient.
+        prepare: Optional callback from the document indices of a
+            chunk's groups at this stage and their answer rows, called
+            once per chunk before decide or suffixes is asked for any
+            of them, so a stage decides and drafts a chunk at once.
         read_all_rows: Whether to read every suffix row rather than its last.
         read_rows: Optional count of trailing rows to read per suffix,
             overriding read_all_rows. None takes the readout's
@@ -88,6 +117,25 @@ class Stage:
         rewind: Whether the request's tokens follow the frame directly,
             in place of the tokens earlier append stages added, as the
             first stage of a new question over the same document does.
+        repeats: Whether a document whose decision is true is asked
+            again at this stage, until its suffixes callback passes it
+            on with SKIP or SkipTo, or drops it.
+        ahead: Whether a document launched at this stage is asked for
+            its next request, at this stage again or the next, before
+            its answer arrives, so it runs in every pass; the request
+            may be device_fed. Its answer re-asks a request still
+            queued. Runs on the tree attention path only.
+        launched: Optional callback from the document indices of a
+            chunk's groups at this stage, called once the chunk is
+            launched and before any earlier chunk's answers are read.
+        costs: For an ahead stage whose suffixes are each document's
+            own, a callback from document indices to each one's next
+            request's tokens, or -1 where suffixes would pass the
+            document on; the admission asks it in place of suffixes.
+        rounds: With costs, a callback from document indices to their
+            RoundRequests, asked when the chunk is built in place of
+            suffixes; suffixes is still asked for a document costs
+            passed on.
         label: Name displayed in progress messages.
         paths: Optional trie paths and ancestor references from trie_paths().
         read_mask: Optional mask of the rows read in the sole paths
@@ -100,17 +148,24 @@ class Stage:
 
     DROP = DROP
     SKIP = SKIP
+    SkipTo = SkipTo
 
     suffixes: Any
     readout: Any
     frame: list = field(default_factory=list)
     requests: Callable | None = None
     decide: Callable | None = None
+    prepare: Callable | None = None
     read_all_rows: bool = False
     read_rows: Any = None
     single: bool = False
     rewind: bool = False
     append: bool = False
+    repeats: bool = False
+    ahead: bool = False
+    launched: Callable | None = None
+    costs: Callable | None = None
+    rounds: Callable | None = None
     label: str = ""
     paths: list | None = None
     read_mask: Any = None
@@ -119,6 +174,10 @@ class Stage:
     suffix_tokens: int = 0
 
     def __post_init__(self):
+        if (self.costs is None) != (self.rounds is None) or (
+                self.costs is not None and not (self.ahead and self.own_suffixes)):
+            raise ValueError("costs and rounds come together, on an ahead "
+                             "stage whose suffixes are a callback")
         if self.own_suffixes:
             if self.suffix_tokens < 1:
                 raise ValueError("a stage whose suffixes come from a callback "
@@ -199,7 +258,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
                on_answers=None, stop_groups=None, appended_tokens=None,
-               gpu_timing=False, survival=None):
+               gpu_timing=False, survival=None, growth=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -222,8 +281,11 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         prefix_tree: A PrefixTree over anchor_prefixes, or None.
         gpu_timing: Record forward-pass CUDA events and synchronize them once
             at the end of the run. False returns no timing spans.
-        stats: When given, receives borrowed_tokens and pack_s, the
-            host seconds spent building chunks.
+        stats: When given, receives borrowed_tokens, pack_s (the host
+            seconds spent building chunks), host_s (host seconds per
+            loop phase, wait being the time blocked on a readout), and,
+            with gpu_timing, readout_gpu_s and idle_gpu_s (the stream
+            idle between a pass and its readout).
         limit: Stop admitting documents once this many survived the
             last stage; the rest never run.
         survival: The fraction of documents expected to survive every
@@ -252,6 +314,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         appended_tokens: The most tokens the append stages leave after
             a document's frame, when stages discard tokens earlier ones
             added; None sums every append stage's longest suffix.
+        growth: The stages' StageGrowth, when a document's KV grows as
+            it writes rather than being reserved whole at admission
+            (see quail.backends.quail.executor.growth); None reserves
+            it whole.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is
@@ -271,7 +337,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,
-        appended_tokens=appended_tokens, gpu_timing=gpu_timing,
+        appended_tokens=appended_tokens, gpu_timing=gpu_timing, growth=growth,
     ).run()
 
 
@@ -302,10 +368,17 @@ def state_share_points(parents, shared, limit=None):
 
 @dataclass
 class PendingAnswers:
-    """One launched chunk's readout and progress through its document decisions."""
+    """One launched chunk's readout and progress through its document decisions.
+
+    feed is the chunk's RoundFeed, the token each answer chose and
+    how many draft tokens it accepted, on the GPU, for the device-fed
+    requests of the chunk after it.
+    """
 
     groups: list
     handles: list
+    pass_index: int = 0
+    feed: Any = None
     values: list | None = None
     positions: np.ndarray | None = None
     at: int = 0

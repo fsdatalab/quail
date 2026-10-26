@@ -46,6 +46,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SemanticSaeFeatures,
     Unnest,
     Window,
@@ -53,6 +54,7 @@ from quail.logical.nodes import (
     above_unnest,
     classified_above_joins,
     extracted_above_joins,
+    mapped_above_joins,
 )
 from quail.logical.plan import (
     LabelWork,
@@ -126,6 +128,7 @@ __all__ = [
     "SemanticFilter",
     "SemanticJoin",
     "SemanticSaeFeatures",
+    "SemanticMap",
     "SortKey",
     "WindowCall",
     "above_unnest",
@@ -145,6 +148,7 @@ __all__ = [
     "join_label",
     "join_outer_input",
     "label_text",
+    "mapped_above_joins",
     "model_call",
     "oriented_join_conditions",
     "packed_columns",

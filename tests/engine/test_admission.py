@@ -579,3 +579,100 @@ def test_a_limit_paces_admission_by_the_parts_survival():
     sched.report(1, 0, 0, 1, [1])
     sched.report(2, 0, 0, 1, [1])
     assert sched.limit_reached() and sched.next_chunk(500) == []
+
+
+def test_a_repeating_stage_asks_the_anchor_again_until_its_callback_passes_it_on():
+    # one anchor; stage 0 is a plain stage and stage 1 repeats: its
+    # callback hands out one request per round, then SKIP after three
+    rounds = []
+
+    def partners(stage):
+        if stage == 0:
+            return [0]
+        rounds.append(stage)
+        return SKIP if len(rounds) > 3 else [0]
+
+    sched = JoinAdmission([50], [[10], [10]], 250, arena_pages=100,
+                          page_tokens=16, anchor_partners={0: partners},
+                          repeats=[False, True])
+    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
+    report = sched.report(0, 0, 0, 1, [1])
+    assert list(report.transitions) == [(0, 0, True)]
+    assert not report.settlements
+    for _ in range(2):
+        assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+        report = sched.report(0, 1, 0, 1, [1])
+        assert not report.transitions and not report.settlements
+        assert not sched.done()
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+    report = sched.report(0, 1, 0, 1, [1])
+    assert list(report.settlements) == [Settlement("finished", 0, True)]
+    assert sched.done() and sched.survivors == 1
+    assert rounds == [1, 1, 1, 1]
+
+
+def test_a_long_prefix_is_packed_over_several_chunks():
+    # a 1,500-token prefix in 600-token chunks: two slices alone, then
+    # the rest with the first request; nothing is reported for a slice
+    sched = JoinAdmission([1500, 50], [[10]], 600, arena_pages=400,
+                          page_tokens=16, slice_prefill=True)
+    assert sched.next_chunk(400) == [(0, 0, 0, 0, True)]
+    assert sched.slices == {0: (0, 600)} and not sched.done()
+    # the next chunk continues the slice, which fills the room
+    assert sched.next_chunk(400) == [(0, 0, 0, 0, True)]
+    assert sched.slices == {0: (600, 1200)}
+    # the rest fits with the first request, and the room left admits
+    # the short anchor whole
+    assert sched.next_chunk(400) == [(0, 0, 0, 1, True), (1, 0, 0, 1, True)]
+    assert sched.slices == {0: (1200, 1500)}
+    assert not sched.done()
+    sched.report(0, 0, 0, 1, [1])
+    sched.report(1, 0, 0, 1, [1])
+    assert sched.done() and sched.survivors == 2
+
+
+def test_an_ahead_stage_asks_the_anchors_next_round_before_its_answer_arrives():
+    # one anchor; stage 0 is its tail and stage 1 repeats, both ahead:
+    # the next round is asked once advance_ahead() runs after each
+    # launch, an answer that continues re-asks a round still queued,
+    # and the answer that ends it passes it on; the round launched
+    # before that answer is ignored when it reports
+    asked = []
+    ended = False
+
+    def partners(stage):
+        if stage == 0:
+            return [0]
+        asked.append(stage)
+        return SKIP if ended else [0]
+
+    sched = JoinAdmission([50], [[10], [10]], 250, arena_pages=100,
+                          page_tokens=16, anchor_partners={0: partners},
+                          repeats=[False, True], ahead=[True, True])
+    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
+    assert asked == [] and not sched.ready
+    sched.advance_ahead()
+    assert asked == [1] and list(sched.ready) == [0]
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+    sched.advance_ahead()
+    assert asked == [1, 1]
+    # the tail's answer arrives once its round is launched: nothing changes
+    report = sched.report(0, 0, 0, 1, [1])
+    assert not report.transitions and not report.settlements
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+    sched.advance_ahead()
+    # the first round's answer continues; the queued round is asked again
+    report = sched.report(0, 1, 0, 1, [1])
+    assert not report.settlements and asked == [1, 1, 1, 1]
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+    # the second round's answer ends it while the third is on the
+    # stream: the callback passes it on when the third is advanced
+    ended = True
+    report = sched.report(0, 1, 0, 1, [1])
+    assert not report.settlements
+    sched.advance_ahead()
+    assert sched.take_settled() == [Settlement("finished", 0, True)]
+    assert not sched.done() and sched.in_flight == 1
+    report = sched.report(0, 1, 0, 1, [1])
+    assert not report.settlements and not report.transitions
+    assert sched.done() and sched.survivors == 1

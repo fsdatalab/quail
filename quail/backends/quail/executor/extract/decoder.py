@@ -21,8 +21,8 @@ from quail.backends.quail.executor.extract.candidates import (
     first_tokens,
     make_streams,
 )
-from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.cost.draft_policy import DraftPolicy
+from quail.backends.quail.executor.vocabulary import Vocabulary
+from quail.cost.draft_policy import ExtractDraftPolicy
 from quail.physical import ExtractSpec
 
 
@@ -78,17 +78,10 @@ class Decoder:
         self.scores = np.full(len(vocabulary.vocab), NEG, dtype=np.float32)
         self.previous_ids = np.empty(0, dtype=np.int64)
         # one answer-length curve per question under the adaptive policy
-        self.policies = ([DraftPolicy(spec.draft_tokens, spec.max_answer_tokens,
+        self.policies = ([ExtractDraftPolicy(spec.draft_tokens, spec.max_answer_tokens,
                                       spec.expected_answer_tokens)
                           for _ in range(questions)]
                          if spec.draft_policy == "adaptive" else None)
-
-    def rows(self, row) -> np.ndarray:
-        """Return a stage's answer as its rows of readout values."""
-        values = np.asarray(row)
-        if values.dtype == object:
-            values = np.asarray(values.reshape(-1)[0], dtype=np.float32)
-        return values.reshape(-1, self.width)
 
     def draft(self, answer: AnswerState, rho: float = 0.0, q: int = 0) -> list:
         """Return the tokens the next round feeds: the chosen token, then a draft.
