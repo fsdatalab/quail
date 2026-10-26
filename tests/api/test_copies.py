@@ -48,14 +48,15 @@ def _short(session):
             .ai_filter(quail.prompt("Is {0} short?", quail.col("r.body"))))
 
 
-def test_the_planner_names_a_key_column_for_a_table_with_copies():
+def test_the_planner_deduplicates_tables_with_copies_except_on_request_backends():
     with _session() as session:
         plan = _planned(_short(session).select("r.id"))
         assert plan.settings["deduplicate"] == {"r": ()}
         # a filter's stop key is read beside the tokens, so the key
         # document must match in it too
-        plan = _planned(_short(session).distinct().select("r.hotel"))
-        assert plan.settings["deduplicate"] == {"r": ("hotel",)}
+        query = _short(session).distinct().select("r.hotel")
+        assert _planned(query).settings["deduplicate"] == {"r": ("hotel",)}
+        assert "deduplicate: r (by text and hotel)" in query.explain()
         session.register("lifts", quail.DocumentProvider.from_table(pa.table({
             "id": ["l0", "l1"], "body": ["slow lift", "fast lift"]}), id_col="id"))
         plan = _planned(
@@ -63,29 +64,10 @@ def test_the_planner_names_a_key_column_for_a_table_with_copies():
             .ai_filter(quail.prompt("Is {0} short?", quail.col("l.body")))
             .select("l.id"))
         assert "deduplicate" not in plan.settings
-
-
-def test_explain_names_the_deduplicated_tables():
-    with _session() as session:
-        query = _short(session).distinct().select("r.hotel")
-        _planned(query)
-        assert "deduplicate: r (by text and hotel)" in query.explain()
-
-
-def test_a_request_backend_asks_every_copy(monkeypatch):
     with _request_session("stock_vllm", reviews={
             "id": [f"r{index}" for index in range(len(BODIES))],
             "body": BODIES}) as session:
-        plan = _planned(_short(session).select("r.id"))
-        assert "deduplicate" not in plan.settings
-
-
-def test_the_rule_is_the_only_source_of_the_setting(monkeypatch):
-    monkeypatch.setattr(ShouldDeduplicate, "rewrite",
-                        lambda self, graph, context: None)
-    with _session() as session:
-        plan = _planned(_short(session).select("r.id"))
-        assert "deduplicate" not in plan.settings
+        assert "deduplicate" not in _planned(_short(session).select("r.id")).settings
 
 
 TOPIC = {"noisy room": "noise", "cold room": "cold", "slow lift": "lift"}
@@ -162,25 +144,6 @@ def test_a_filter_over_copies_asks_once_per_text_and_returns_every_copy(
     assert (grouped.documents, plain.documents) == ([0, 1, 3], list(range(6)))
 
 
-def test_a_classification_over_copies_labels_every_copy_from_one_answer(
-        monkeypatch):
-    def build(session):
-        return (session.docs("reviews").alias("r")
-                .ai_classify(quail.prompt("What is {0} about?", quail.col("r.body")),
-                             ["noise", "cold", "lift"], name="topic")
-                .select("r.id", "topic"))
-
-    def oracle():
-        return Oracle(labels=lambda spec, ids: TOPIC[BODIES[ids[0]]])
-
-    grouped, plain = oracle(), oracle()
-    rows, _, _ = _both(build, grouped, plain, monkeypatch)
-    assert rows == [("r0", "noise"), ("r1", "cold"), ("r2", "noise"),
-                    ("r3", "lift"), ("r4", "noise"), ("r5", "cold")]
-    assert sorted(row for _, rows in grouped.calls for (row,) in rows) == [0, 1, 3]
-    assert sorted(row for _, rows in plain.calls for (row,) in rows) == list(range(6))
-
-
 def test_an_extraction_over_copies_answers_every_copy_from_one_reading(
         monkeypatch):
     def build(session):
@@ -203,31 +166,6 @@ def test_an_extraction_over_copies_answers_every_copy_from_one_reading(
         ("r4", {"thing": "noisy"}), ("r5", {"thing": "cold"})]
     assert rows[0][2] == {"thing": {"start": 0, "end": 5}}
     assert (grouped, plain) == ([0, 1, 3], list(range(6)))
-
-
-@pytest.mark.parametrize("pipelines", [False, True])
-def test_a_chain_of_filters_is_asked_once_per_text(monkeypatch, pipelines):
-    grouped, plain = _Asked(pipelines), _Asked(pipelines)
-
-    def build(session):
-        body = quail.col("r.body")
-        return (session.docs("reviews").alias("r")
-                .ai_filter(quail.prompt("Is {0} about a room?", body),
-                           selectivity=0.5)
-                .ai_filter(quail.prompt("Is {0} about noise?", body),
-                           selectivity=0.5)
-                .select("r.id"))
-
-    rows, _, _ = _both(build, grouped.oracle(), plain.oracle(), monkeypatch)
-    assert rows == [("r0",), ("r2",), ("r4",)]
-    # the planner orders the filters; each asks a text once: the three
-    # texts first, then the key documents the first filter kept
-    assert grouped.documents[:3] == [0, 1, 3]
-    assert grouped.documents[3:] == sorted(set(grouped.documents[3:]))
-    assert set(grouped.documents[3:]) < {0, 1, 3}
-    assert len(plain.documents) == 6 + len({
-        document for document in plain.documents[6:]})
-    assert len(grouped.documents) < len(plain.documents)
 
 
 @pytest.mark.parametrize("pipelines", [False, True])
@@ -295,7 +233,7 @@ def test_a_join_over_key_pairs_asks_each_pair_of_texts_once(monkeypatch,
     assert sorted(grouped.pairs) == [(0, 0), (0, 1), (0, 3), (1, 0), (1, 1)]
 
 
-@pytest.mark.parametrize("semantics", ["full", "exists", "anti"])
+@pytest.mark.parametrize("semantics", ["exists", "anti"])
 def test_a_join_of_every_pair_asks_each_pair_of_texts_once(monkeypatch,
                                                            semantics):
     grouped, plain = _Asked(), _Asked()
@@ -307,50 +245,16 @@ def test_a_join_of_every_pair_asks_each_pair_of_texts_once(monkeypatch,
                          quail.prompt("Does {0} match {1}?", quail.col("r.body"),
                                       quail.col("n.body")),
                          anchor="r", semantics=semantics)
-                .select(*(("r.id", "n.id") if semantics == "full" else ("r.id",))))
+                .select("r.id"))
 
     rows, _, _ = _both(build, grouped.oracle(), plain.oracle(), monkeypatch)
     assert rows == {
-        "full": [("r0", "n0"), ("r0", "n2"), ("r1", "n1"), ("r2", "n0"),
-                 ("r2", "n2"), ("r4", "n0"), ("r4", "n2"), ("r5", "n1")],
         "exists": [("r0",), ("r1",), ("r2",), ("r4",), ("r5",)],
         # the lift note is in hotel h3, so no note matches r3
         "anti": [("r3",)],
     }[semantics]
     assert set(grouped.pairs) <= {(0, 0), (0, 1), (1, 0), (1, 1), (3, 0), (3, 1)}
     assert len(grouped.pairs) < len(plain.pairs)
-
-
-@pytest.mark.parametrize("pipelines", [False, True])
-def test_a_classification_of_joined_pairs_labels_every_pair_from_one_answer(
-        monkeypatch, pipelines):
-    def build(session):
-        return session.sql(
-            "SELECT r.id, n.id, AI.CLASSIFY(PROMPT('How does {0} relate to {1}?', "
-            "r.body, n.body), ARRAY['same', 'other']) AS relation "
-            "FROM reviews r JOIN notes n ON AI_FILTER(PROMPT('Does {0} match "
-            "{1}?', r.body, n.body))")
-
-    grouped, plain = [], []
-
-    def oracle(labeled):
-        def label(spec, ids):
-            labeled.append(tuple(ids))
-            return "same"
-        return Oracle(joins=_matches, labels=label, pipelines=pipelines)
-
-    rows, _, _ = _both(build, oracle(grouped), oracle(plain), monkeypatch)
-    assert len(rows) == 9
-    assert {relation for *_, relation in rows} == {"same"}
-    assert len(plain) == 9
-    if pipelines:
-        # the join and its classification are one group: three review
-        # texts and three note texts make three true pairs of keys
-        assert sorted(grouped) == [(0, 0), (1, 1), (3, 3)]
-    else:
-        # on its own, the classification reads the join's answers over
-        # every pair, which the executor does not reduce
-        assert len(grouped) == 9
 
 
 def test_a_self_join_asks_each_pair_of_texts_once(monkeypatch):

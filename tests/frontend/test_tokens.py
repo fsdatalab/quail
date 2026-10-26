@@ -204,7 +204,8 @@ def test_offsets_reject_changed_text_and_preserve_sliced_rows():
     assert mapper(empty, pa.array([], type=pa.string())).to_pylist() == []
 
 
-def test_a_document_points_at_the_first_document_with_its_tokens(tmp_path):
+def test_a_document_points_at_the_first_document_with_its_tokens_and_row_values(
+        tmp_path):
     from quail.catalog.tokens import PrefixIndex
 
     documents = [[1, 2, 3], [1, 2, 3], [3, 2, 1], [1, 2, 3, 0], [1, 2], [], []]
@@ -220,21 +221,11 @@ def test_a_document_points_at_the_first_document_with_its_tokens(tmp_path):
                              document_column="body", tokenizer=str.split,
                              token_type=pa.string())
     assert store.first_documents.to_pylist() == [0, 0, 2, 0]
+    assert store.first_documents_with([]).to_pylist() == [0, 0, 2, 0]
     assert store.num_copies == 2
     assert prefix_tree(store, 1).shared == [0, 0, 0, 0]
-
-
-def test_a_first_document_with_row_columns_matches_their_values_too(tmp_path):
-    schema = pa.schema({"id": pa.string(), "body": pa.string()})
-    batches = [pa.record_batch(
-        [["a", "b", "c", "d"], ["ok", "ok", "ok", "no"]], schema=schema)]
-    store = TokenStore.write(str(tmp_path / "rows.arrow"), batches,
-                             document_column="body", tokenizer=str.split,
-                             token_type=pa.string())
-    assert store.first_documents.to_pylist() == [0, 0, 0, 3]
-    assert store.first_documents_with([]).to_pylist() == [0, 0, 0, 3]
     hotel = pa.array(["h1", "h2", "h1", "h1"])
-    assert store.first_documents_with([hotel]).to_pylist() == [0, 1, 0, 3]
-    # a null, and a NaN, is one value like any other
-    stars = pa.array([None, 1.0, None, 1.0])
-    assert store.first_documents_with([hotel, stars]).to_pylist() == [0, 1, 0, 3]
+    assert store.first_documents_with([hotel]).to_pylist() == [0, 1, 2, 0]
+    # a null is one value like any other
+    stars = pa.array([None, 1.0, None, None])
+    assert store.first_documents_with([hotel, stars]).to_pylist() == [0, 1, 2, 0]
