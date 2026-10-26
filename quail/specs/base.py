@@ -1,7 +1,7 @@
 """Model and device spec structs for the planner."""
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 Precision = Literal["fp8", "bf16", "fp32"]
 # What a model answers with: a generative model scores TRUE against
@@ -47,6 +47,30 @@ class AnswerCanvas:
     rows: int
     turn_close_id: int
     pad_id: int
+
+
+@dataclass(frozen=True)
+class SaeSpec:
+    """A sparse autoencoder (SAE) read beside a model, for AI.SAE_FEATURES.
+
+    A model with an SAE returns, from its forward pass, the residual
+    stream after its last loaded layer instead of the final-normed
+    rows, and the SAE encodes that stream. Such a model serves feature
+    calls only.
+
+    Attributes:
+        hf_name: Hugging Face repo of the SAE checkpoints.
+        revision: Pinned hub commit hash.
+        file: The read layer's tensors, W_enc and b_enc.
+        num_features: Encoder rows, one per feature.
+        keep: Features kept per token, the SAE's top k.
+    """
+
+    hf_name: str
+    revision: str
+    file: str
+    num_features: int
+    keep: int
 
 
 @dataclass(frozen=True)
@@ -118,6 +142,7 @@ class ModelSpec:
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);
     #                                   None lets vLLM pick
+    vllm_reserve_bytes: float = 0.0    # bytes left outside vLLM's memory pool
     layer_kinds: tuple[LayerKind, ...] = ()    # one kind per layer; required
     #                                            when sliding_window is set;
     #                                            empty means every layer is
@@ -143,8 +168,16 @@ class ModelSpec:
     gdn_value_dim: int = 0
     gdn_weight_precision: Precision | None = None
     conv_width: int = 0
+    checkpoint_layers: int = 0    # layers in the checkpoint; when larger
+    #                               than layers, the loader keeps the first
+    #                               `layers` and frees the rest
+    sae: SaeSpec | None = None
 
     def __post_init__(self):
+        if self.checkpoint_layers and self.checkpoint_layers < self.layers:
+            raise ValueError(
+                f"{self.name}: checkpoint_layers ({self.checkpoint_layers}) "
+                f"is below layers ({self.layers})")
         if self.layer_kinds and len(self.layer_kinds) != self.layers:
             raise ValueError(
                 f"{self.name}: layer_kinds has {len(self.layer_kinds)} "
@@ -330,20 +363,15 @@ class DeviceSpec:
     name: str
     mem_bytes: float     # M: physical memory
     hbm_bw: float        # BW: memory bandwidth, bytes/s
-    peak_flops: float    # R_D at the executor's compute dtype
-    bf16_flops: float = 0.0    # dense bf16 peak. Attention runs in
-    #                            bf16 (FlashAttention-3 over bf16 KV),
-    #                            so the pair FLOPs price against this,
-    #                            not against the fp8 ceiling. 0 falls
-    #                            back to half of peak_flops, the fp8-
-    #                            to-bf16 ratio on every tensor core
-    #                            generation we run on.
-    fp32_flops: float = 0.0    # fp32 peak on the CUDA cores, not the
-    #                            tensor cores: the decision head runs
-    #                            there. 0 means no rate is known.
+    fp8_flops: float     # dense tensor-core FLOP/s, without sparsity
+    bf16_flops: float    # dense tensor-core FLOP/s, without sparsity
+    fp32_flops: float    # CUDA-core FLOP/s, not tensor-core TF32
     usd_per_hour: float = 0.0    # rental price of one device; 0 means
     #                              no price is known
     price_source: str = ""       # where usd_per_hour was read from
+    cuda_name: str = ""          # substring of torch.cuda.get_device_name
+    modal_gpu: str = ""          # Modal gpu= string, such as "H100!"
+    page_tokens: int = 16    # tokens per KV page required by the attention kernel
     mamf_fp8_flops: float = 0.0    # 0 uses the specification rate
     mamf_bf16_flops: float = 0.0
 
@@ -352,17 +380,18 @@ class DeviceSpec:
         measured = {"fp8": self.mamf_fp8_flops, "bf16": self.mamf_bf16_flops}
         return measured.get(precision, 0.0) or self.arithmetic_bandwidth(precision)
 
-    @property
-    def attn_flops(self) -> float:
-        """Dense peak for the attention kernels, FLOP/s."""
-        return self.bf16_flops or self.peak_flops / 2
+    def __post_init__(self):
+        for precision in get_args(Precision):
+            if not self.arithmetic_bandwidth(precision) > 0:
+                raise ValueError(
+                    f"{self.name}: {precision}_flops must be positive")
 
     def arithmetic_bandwidth(self, precision: Precision) -> float:
         """Return arithmetic throughput for one component precision."""
         if precision == "fp8":
-            return self.peak_flops
+            return self.fp8_flops
         if precision == "bf16":
-            return self.attn_flops
-        if precision == "fp32" and self.fp32_flops:
+            return self.bf16_flops
+        if precision == "fp32":
             return self.fp32_flops
         raise ValueError(f"unsupported precision: {precision}")

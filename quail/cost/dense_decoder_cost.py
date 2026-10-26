@@ -194,6 +194,19 @@ def dense_decoder_components(work: Work, model: ModelSpec, passes: float,
             bytes_moved=0.0,
             precision="fp32",
         ),)
+    if work.sae_encoded and model.sae is not None:
+        # the SAE encode: one GEMM of hidden x num_features per encoded
+        # token, with the encoder weight read once per pass and at most
+        # keep (feature, strength) pairs written per token
+        encode = 2.0 * model.hidden * model.sae.num_features
+        components += (CostComponent(
+            name="sae_encode",
+            flops=encode * work.sae_encoded,
+            bytes_moved=(encode * passes
+                         + work.sae_encoded * (2.0 * model.hidden
+                                               + 8.0 * model.sae.keep)),
+            precision="bf16", gemm=True,
+        ),)
     if rows:
         components += (_readout(model, rows, passes, head_rows),)
     return components

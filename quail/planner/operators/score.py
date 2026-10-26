@@ -110,8 +110,10 @@ class ScoreLowering:
                 else f"one pair of {spec.aliases[0]!r} and {spec.aliases[1]!r}")
         needed, available, unit = prefix + suffix, self.chunk, "tokens"
         if needed <= available:
-            needed = budgets.pages(prefix) + budgets.pages(suffix)
-            available, unit = self.capacity // budgets.PAGE_TOKENS, "pages"
+            page_tokens = self.context.device.page_tokens
+            needed = (budgets.pages(prefix, page_tokens)
+                      + budgets.pages(suffix, page_tokens))
+            available, unit = self.capacity // page_tokens, "pages"
         if needed > available:
             raise ScoreRefusedError(Refusal(
                 reasons=(f"{what} needs {needed} {unit} with its prompt, "

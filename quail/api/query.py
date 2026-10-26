@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import closing
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -11,8 +12,9 @@ import pyarrow as pa
 from quail.api.execute import execute_query
 from quail.catalog import inputs
 from quail.catalog.pairs import columns_key, estimate_pair_fraction
+from quail.catalog.providers import ScanRequest
 from quail.catalog.selection import selected_rows
-from quail.catalog.tokens import FIRST_DOCUMENT
+from quail.catalog.tokens import FIRST_DOCUMENT, TokenLengths
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
 from quail.execution.projection import projection_for
 from quail.execution.reporting import collect_answers, execution_report
@@ -22,6 +24,7 @@ from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
 from quail.logical import (
     LogicalPlan,
+    WithCTE,
     join_conditions,
     oriented_join_conditions,
 )
@@ -36,6 +39,7 @@ from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import Refusal, RefusalError
 from quail.planner.search.statistics import filter_stop_keys
+from quail.planner.stages import relational_plan
 
 if TYPE_CHECKING:
     from quail.api.session import Session
@@ -69,8 +73,10 @@ class Query:
     """A compiled query that plans and executes in the current process."""
 
     def __init__(self, session: "Session", logical: LogicalPlan,
-                 order: str | None = None):
+                 order: str | None = None, *, catalog=None, inputs=None):
         self.session = session
+        self.catalog = session.catalog if catalog is None else catalog
+        self.inputs = session.inputs if inputs is None else inputs
         self.logical = logical
         self._logical_input = logical
         self.order = order
@@ -109,6 +115,22 @@ class Query:
         Returns:
             The physical plan, or a Refusal when no backend can run it.
         """
+        if self._plan is not None:
+            return self._plan
+        if isinstance(self.logical.root, WithCTE):
+            from quail.api.stages import plan_stages
+
+            self._plan = plan_stages(self)
+            return self._plan
+        if not self.logical.operators().prompts:
+            (scan,) = self.logical.operators().scans
+            num_documents = self.catalog.get(scan.provider).statistics().num_rows
+            if self.inputs.pending(scan.provider):
+                num_documents = len(self.inputs.estimate_lengths(
+                    scan.provider, scan.column))
+            self._plan = relational_plan(
+                self.logical, self.session.config, num_documents or 0)
+            return self._plan
         if self._plan is None:
             self._planning_started_at = time.perf_counter()
             config = self.session.config
@@ -117,11 +139,11 @@ class Query:
             self._token_inputs = {}
             estimated = []
             for s in operators.scans:
-                exact = self.session.inputs.token_lengths(s.provider, s.column)
+                exact = self.inputs.token_lengths(s.provider, s.column)
                 if exact is not None:
                     self._document_tokens[s.alias] = exact
                     continue
-                self._document_tokens[s.alias] = self.session.inputs.estimate_lengths(
+                self._document_tokens[s.alias] = self.inputs.estimate_lengths(
                     s.provider, s.column)
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
@@ -133,7 +155,7 @@ class Query:
             self._scan_selectivities = scan_fractions
             self._pair_selectivities = pair_fractions
             context = PlanningContext(
-                catalog=self.session.catalog, engine_config=config,
+                catalog=self.catalog, engine_config=config,
                 model=self.session.model, device=self.session.device,
                 gpus=config.gpus, document_tokens=self._document_tokens,
                 backend=config.backend, order=self.order,
@@ -149,10 +171,14 @@ class Query:
             self.logical = candidates[0].plan
             scans = {}
             offset_aliases = set()
+            # an alias some plan scans without predicates reads every row
+            whole_aliases = set()
             for candidate in candidates:
                 operators = candidate.plan.operators()
                 offset_aliases.update(alias for extract in operators.extracts
                                       for alias in extract.call.aliases())
+                whole_aliases.update(scan.alias for scan in operators.scans
+                                     if not scan.predicates)
                 for scan in operators.scans:
                     previous = scans.get(scan.alias, scan)
                     scans[scan.alias] = replace(scan, columns=tuple(dict.fromkeys(
@@ -162,16 +188,22 @@ class Query:
             reads_text = getattr(backend, "reads_document_text", False)
             locates_answers = getattr(backend, "locates_answers_in_text", False)
             for s in scans.values():
+                if self.inputs.pending(s.provider):
+                    continue
                 columns = s.columns
-                with_offsets = locates_answers and s.alias in offset_aliases
+                # the extraction computes the offsets of the rows the
+                # predicates keep; computing them for every row of a
+                # large table costs far more than tokenizing it
+                with_offsets = (locates_answers and s.alias in offset_aliases
+                                and s.alias in whole_aliases)
                 if reads_text:
                     columns = tuple(dict.fromkeys(
                         (*columns, *source_columns(s.column))))
                 if s.alias not in self._estimated:
-                    self._token_inputs[s.alias] = self.session.inputs.tokenize(
+                    self._token_inputs[s.alias] = self.inputs.tokenize(
                         s.provider, s.column, columns, with_offsets=with_offsets)
                     continue
-                future = self.session.inputs.tokenize_async(
+                future = self.inputs.tokenize_async(
                     s.provider, s.column, columns, with_offsets=with_offsets)
 
                 def record_finished(_future, alias=s.alias):
@@ -192,7 +224,7 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions,
-                memo=context.memo, catalog=self.session.catalog,
+                memo=context.memo, catalog=self.catalog,
                 engine_config=config, logical_candidates=candidates)
             if not isinstance(self._plan, Refusal):
                 self.logical = self._plan.logical_plan
@@ -237,7 +269,7 @@ class Query:
                 for ref in refs:
                     if (ref.alias, ref.column) not in samples:
                         samples[(ref.alias, ref.column)] = (
-                            self.session.inputs.sample_columns(
+                            self.inputs.sample_columns(
                                 providers[ref.alias], [ref.column])[ref.column])
                 out.append(evaluate_expression(expression, pa.table({
                     ref.column: samples[(ref.alias, ref.column)] for ref in refs})))
@@ -260,7 +292,7 @@ class Query:
         for scan in scans:
             if not scan.predicates:
                 continue
-            columns = pa.table(self.session.inputs.sample_columns(
+            columns = pa.table(self.inputs.sample_columns(
                 scan.provider,
                 [predicate.column.column for predicate in scan.predicates]))
             sampled = columns.num_rows
@@ -280,11 +312,19 @@ class Query:
                 each node's measured rows, time, and tokens beside the
                 planner's estimates, then the measured totals.
         """
+        result = self.run() if analyze else None
+        return self._explain(result, verbose)
+
+    def _explain(self, result, verbose: bool) -> str:
+        """Return the plan text, with the measurements of result when given.
+
+        Args:
+            result: The QueryResult of running the plan, or None.
+            verbose: Include runtime settings and internal node fields.
+        """
         # plan() first: it replaces self.logical with the optimized tree
         physical = self.plan()
-        result = None
-        if analyze:
-            result = self.run()
+        if result is not None:
             physical = self._plan
             # the root relation is lazy, so its row count is taken here
             rows = result.count()
@@ -313,6 +353,9 @@ class Query:
         A plan made on estimated lengths is searched again with exact inputs,
         so prefix sharing can change which logical alternative wins.
         """
+        if not self.logical.operators().prompts:
+            self._prepare_relational()
+            return
         started = time.perf_counter()
         refine = bool(self._token_futures)
         for alias, future in list(self._token_futures.items()):
@@ -336,7 +379,7 @@ class Query:
             if self._plan is self._searched_plan:
                 self._plan = plan_query(
                     self._logical_input, scan_fractions=self._scan_selectivities,
-                    catalog=self.session.catalog, engine_config=self.session.config,
+                    catalog=self.catalog, engine_config=self.session.config,
                     **options)
                 if not isinstance(self._plan, Refusal):
                     self.logical = self._plan.logical_plan
@@ -348,6 +391,24 @@ class Query:
                     **self._plan.settings, "gpu_timing": True})
             self._replanning_s += time.perf_counter() - started
             self._estimated = ()
+
+    def _prepare_relational(self):
+        """Read a relational stage's value columns without tokenizing them."""
+        if self._token_inputs is not None:
+            return
+        (scan,) = self.logical.operators().scans
+        provider = self.catalog.get(scan.provider)
+        expressions = (*self.logical.projection.columns,
+                       *(key.expression for key in self.logical.result.order),
+                       *(predicate.column for predicate in scan.predicates))
+        columns = tuple(dict.fromkeys(
+            column for expression in expressions
+            for column in source_columns(expression)))
+        with closing(provider.scan(ScanRequest(columns=columns))) as reader:
+            table = reader.read_all()
+        self._token_inputs = {scan.alias: table}
+        self._document_tokens = {scan.alias: TokenLengths([0] * table.num_rows)}
+        self._plan = relational_plan(self.logical, self.session.config, table.num_rows)
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
@@ -450,12 +511,13 @@ class Query:
         plan = self.plan()
         out = response.metrics
         report = execution_report(
-            plan, out, self.session.inputs.notes, coordinator_wall)
+            plan, out, self.inputs.notes, coordinator_wall)
         sources = {
             node.input_id: range(node.num_documents)
             for node in plan.nodes
             if isinstance(node, Scan)
         }
+        sources.update(self._column_tables())
         observers = self.session.registry.new_observers()
         run = GenericRunner().run(
             plan.graph,

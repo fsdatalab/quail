@@ -13,12 +13,10 @@ from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import (
     DEFAULT_BATCH_ROWS,
-    answer_table,
-    filter_answer_table,
 )
 from quail.execution.rows import Rows, rows_of
 from quail.logical import PROBABILITIES_SUFFIX
-from quail.physical import AiClassify, AiScore, ClassifySpec, Filter, ValueType
+from quail.physical import AiClassify, AiScore, ClassifySpec, ValueType
 from quail.progress import answer_sink
 
 # one kernel per entry of quail.logical.SCORE_COMPARISONS
@@ -319,53 +317,3 @@ class RerankerModelExecution:
                 },
             ),
         )
-
-
-def _filter_answer_table(node: Filter, rows: Rows, answers) -> pa.Table:
-    """Build one answer row per document using the filter answer schema."""
-    alias = node.aliases[0]
-    return filter_answer_table(
-        alias, rows.ids[alias],
-        np.full(rows.num_rows, node.written_position, dtype=np.int32), answers)
-
-
-class FilterRuntime:
-    """Keep the rows of a score or label table that pass the predicate."""
-
-    def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, Filter):
-            raise TypeError(type(node).__name__)
-        if len(inputs) != 1:
-            raise ValueError("Filter needs one score or label input")
-        rows = next(iter(inputs.values()))
-        return filter_scores(node, rows)
-
-
-def filter_scores(node, rows: Rows) -> NodeResult:
-    """Apply a filter to rows of scores, labels, or answers."""
-    answers = node.predicate.accepts(rows)
-    filtered = rows.filter(answers)
-    if len(node.aliases) == 1:
-        answer_name = f"filter_answers:{node.aliases[0]}"
-        answer_relation = _filter_answer_table(node, rows, answers)
-    else:
-        left, right = node.aliases
-        answer_name = f"join_answers:{node.written_position}"
-        answer_relation = answer_table(
-            {left: rows.ids[left], right: rows.ids[right]},
-            answers,
-            "join_answers",
-            metadata={
-                "written_position": node.written_position,
-                "anchor": left,
-                "partners": right,
-                "semantics": "full",
-                "comparison": node.predicate.comparison,
-                "threshold": node.predicate.value,
-            },
-        )
-    outputs = {node.rows_port: filtered, answer_name: answer_relation}
-    return NodeResult(
-        outputs,
-        NodeMetrics(input_rows=rows.num_rows, output_rows=filtered.num_rows),
-    )

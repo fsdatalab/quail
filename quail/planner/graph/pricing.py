@@ -22,6 +22,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiSaeFeatures,
     AiScore,
     PhysicalGraph,
 )
@@ -104,7 +105,8 @@ class PlanPricer:
                     work=self.stage_works.get(node.written_position, Work())
                 )
                 entry["seconds"] = self._seconds(price.work)
-            elif isinstance(node, (AiScore, AiClassify, AiExtract)) \
+            elif isinstance(node, (AiScore, AiClassify, AiExtract,
+                                   AiSaeFeatures)) \
                     and node.spec is not None:
                 price = NodePrice(seconds=self._inference_seconds(node, resident))
                 entry["seconds"] = price.seconds
@@ -148,7 +150,7 @@ class PlanPricer:
     def _release_recompute(self, node: AiFilter) -> dict:
         """What a later join pays if the sequence's KV is released, not pinned."""
         prefix = self._mean_prefix(node)
-        pages = budgets.pages(prefix)
+        pages = budgets.pages(prefix, self.context.device.page_tokens)
         fits = self.statistics.cap_pages // max(1, pages)
         excess = max(0.0, self.expected_rows.get(node.alias, 0.0) - fits)
         return {
@@ -196,12 +198,16 @@ class PlanPricer:
 
             whole = seconds(())
             return seconds(shared) / whole if whole else 1.0
-        # a score's time is taken as proportional to the tokens it
-        # computes, its documents borrowing the table's share of theirs
+        # a score's or a feature call's time is taken as proportional
+        # to the tokens it computes, its documents borrowing the
+        # table's share of theirs
+        if isinstance(node, AiSaeFeatures):
+            fixed = sum(map(len, spec.prompt_token_parts))
+        else:
+            fixed = score_fixed_tokens(tuple(map(len, spec.prompt_token_parts)),
+                                       context.model.canvas_tokens, spec.draws)
         summary = summarize_alias(context.document_tokens[alias],
                                   context.model.sliding_window, memo=context.memo)
-        fixed = score_fixed_tokens(tuple(map(len, spec.prompt_token_parts)),
-                                   context.model.canvas_tokens, spec.draws)
         total = summary.total + summary.count * fixed
         return max(0.0, 1.0 - sum(shared) / total) if total else 1.0
 
@@ -214,5 +220,5 @@ class PlanPricer:
         store = self._store(alias)
         if not node.share_prefixes or store is None:
             return None
-        return page_tree(store).shared
+        return page_tree(store, self.context.device.page_tokens).shared
 

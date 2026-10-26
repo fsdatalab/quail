@@ -26,7 +26,9 @@ class Scan:
     the query returns its text. The
     projection pushdown rule fills ``columns``; before it runs the
     tuple is empty. ``predicates`` are regular predicates, all of which a
-    document must pass before any operator reads it.
+    document must pass before any operator reads it. ``schema`` is the
+    provider's Arrow schema, which types the plan's result; a front end
+    sets it from the catalog.
     """
 
     provider: str
@@ -34,6 +36,7 @@ class Scan:
     column: Any  # a value expression, or "" before a prompt names one
     columns: tuple = ()  # tuple[str, ...]
     predicates: tuple = ()  # tuple[RegularPredicate, ...]
+    schema: Any = None  # pa.Schema
 
     type_name: ClassVar[str] = "quail.scan"
 
@@ -44,7 +47,8 @@ class Scan:
         return self.predicates
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        sources = source_columns(self.column)
+        sources = (source_columns(self.column) if self.column
+                   else tuple(self.schema.names) if self.schema is not None else ())
         fields = [ColumnRef(self.alias, self.provider, source) for source in sources]
         fields.extend(
             ColumnRef(self.alias, self.provider, column)
@@ -54,7 +58,8 @@ class Scan:
         return tuple(fields)
 
     def validate(self) -> None:
-        if not self.provider or not self.alias or not self.column:
+        if (not self.provider or not self.alias
+                or (not self.column and self.schema is None)):
             raise CompileError("Scan needs a provider, alias, and column")
         if not isinstance(self.column, str):
             self.column.validate()

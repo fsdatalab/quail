@@ -15,6 +15,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiSaeFeatures,
     AiScore,
     Limit,
     PhysicalGraph,
@@ -259,11 +260,6 @@ class ChooseClassifyImplementation(PhysicalRule):
             graph.root)
 
 
-def page_aligned_shared_tokens(store) -> int:
-    """Tokens a prefix tree over the store saves in whole KV pages."""
-    return page_tree(store).shared_tokens
-
-
 def filter_attention(model, device, store, lengths, question_tokens: int) -> str:
     """The attention path for a filter whose documents share prefixes.
 
@@ -271,7 +267,7 @@ def filter_attention(model, device, store, lengths, question_tokens: int) -> str
     readers; each reads with its own tokens plus the question. The
     path that wins on the most borrowed tokens wins the filter.
     """
-    tree = page_tree(store)
+    tree = page_tree(store, device.page_tokens)
     votes = {"tree": 0, "unified": 0}
     for shared, readers, rows in zip(*tree.reader_groups(lengths)):
         path = choose_attention_path(
@@ -324,8 +320,13 @@ class ShouldSharePrefixes(PhysicalRule):
             for alias, lengths in context.document_tokens.items()
         }
         shared_by_alias = {}
+        max_pooling_aliases = {
+            node.document_aliases[0] for node in graph.nodes
+            if isinstance(node, AiSaeFeatures) and node.spec.pooling == "max"
+        }
         for node in graph.nodes:
-            if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract, AiScore))
+            if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract,
+                                      AiSaeFeatures, AiScore))
                     or (isinstance(node, AiInference) and node.spec is None)
                     or node.share_prefixes
                     or (isinstance(node, AiScore) and len(node.spec.aliases) != 1)):
@@ -333,13 +334,18 @@ class ShouldSharePrefixes(PhysicalRule):
                 continue
             alias = (node.spec.aliases[0] if isinstance(node, AiScore)
                      else node.document_aliases[0])
+            # Borrowed KV has no residual rows from which to recover SAE maxima.
+            if alias in max_pooling_aliases:
+                nodes.append(node)
+                continue
             lengths = context.document_tokens.get(alias)
             store = None if lengths is None else lengths.store
             if store is None:
                 nodes.append(node)
                 continue
             if alias not in shared_by_alias:
-                shared_by_alias[alias] = page_aligned_shared_tokens(store)
+                shared_by_alias[alias] = page_tree(
+                    store, context.device.page_tokens).shared_tokens
             shared = shared_by_alias[alias]
             writes_pages = (node.arena_writes if isinstance(node, AiFilter)
                             else not isinstance(node, AiScore))

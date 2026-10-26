@@ -14,6 +14,9 @@ import pyarrow as pa
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.operators.filter import filter_result
+from quail.backends.quail.executor.operators.sae_features import (
+    FEATURE_LIST,
+)
 from quail.backends.quail.reranker import (
     RerankerBatch,
     RerankerModelExecution,
@@ -28,6 +31,7 @@ from quail.physical import (
     AiExtract,
     AiFilter,
     AiJoin,
+    AiSaeFeatures,
     AiScore,
     ClassifySpec,
 )
@@ -48,6 +52,9 @@ class Oracle:
         scores: A callable (spec, ids) -> the score of one row.
         answers: A callable (spec, document) -> the extracted text or
             None; or a sequence indexed by document for every question.
+        features: A callable (spec, document) -> a feature list of
+            {"feature", "strength"} mappings; None plants one feature
+            per document, its id modulo 7 at strength id + 1.
         probabilities: Whether a classification reports label
             probabilities when its spec asks for them.
         retain: How many of a keep_kv filter's survivors the oracle
@@ -63,13 +70,14 @@ class Oracle:
     execute_pipeline = None
 
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
-                 answers=None, *, probabilities=False, retain=0,
-                 join_metrics=None, streams=False, pipelines=False):
+                 answers=None, features=None, *, probabilities=False,
+                 retain=0, join_metrics=None, streams=False, pipelines=False):
         self.filters = filters or {}
         self.joins = joins or {}
         self.labels = labels
         self.scores = scores or (lambda spec, ids: (sum(ids) + 1) / 10)
         self.answers = answers
+        self.features = features
         self.probabilities = probabilities
         self.retain = retain
         self.join_metrics = join_metrics
@@ -103,6 +111,8 @@ class Oracle:
             return self.execute_predicates((node,), inputs)[node.node_id]
         if isinstance(node, AiExtract):
             return self._extract(node, inputs)
+        if isinstance(node, AiSaeFeatures):
+            return self._sae_features(node, inputs)
         if isinstance(node, AiClassify) and node.spec.partner is not None:
             return self._classify_joined(node, inputs)
         if isinstance(node, (AiScore, AiClassify)):
@@ -265,6 +275,22 @@ class Oracle:
                 spec.alias, spec.name, spec.span_name, ids, found, spans)},
             NodeMetrics(input_rows=len(ids), output_rows=len(ids),
                         evaluated_documents=len(ids)))
+
+    def _sae_features(self, node, inputs) -> NodeResult:
+        spec = node.spec
+        ids = [int(document) for document in inputs["document_ids"]]
+        values = [self._feature_list(spec, document) for document in ids]
+        rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
+        return NodeResult(
+            {node.rows_port: score_rows(rows, spec.aliases, spec.name,
+                                        values, FEATURE_LIST)},
+            NodeMetrics(input_rows=len(ids), output_rows=len(ids),
+                        evaluated_documents=len(ids)))
+
+    def _feature_list(self, spec, document) -> list:
+        if callable(self.features):
+            return self.features(spec, document)
+        return [{"feature": document % 7, "strength": float(document + 1)}]
 
     def _answer(self, spec, document):
         if callable(self.answers):

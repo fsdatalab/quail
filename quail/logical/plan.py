@@ -5,15 +5,25 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+import pyarrow as pa
+from pyarrow import compute as pc
+
 from quail.logical.expressions import (
+    PROBABILITIES_SUFFIX,
+    SPAN_SUFFIX,
+    Alias,
     ColumnRef,
     CompileError,
     ModelCall,
     RegularPredicate,
     aliased_call,
+    column_name,
+    column_references,
+    evaluate_expression,
     model_call,
 )
 from quail.logical.nodes import (
+    FEATURE_LIST,
     Aggregate,
     Apply,
     Filter,
@@ -26,7 +36,10 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticSaeFeatures,
+    Unnest,
     Window,
+    WithCTE,
 )
 
 
@@ -99,18 +112,26 @@ class LogicalPlan:
 
     @property
     def projection(self) -> Project:
-        """Return the projection that supplies result columns."""
-        node = self.root
-        while isinstance(node, (Result, Aggregate, Window)):
-            node = node.input
-        if not isinstance(node, Project):
+        """Return the first projection over source columns and model answers."""
+        node = self.root.input if isinstance(self.root, WithCTE) else self.root
+        projection = next((found for found in LogicalPlan(node).walk()
+                           if isinstance(found, Project)), None)
+        if projection is None:
             raise CompileError("a query plan needs a projection")
-        return node
+        return projection
 
     @property
     def result(self) -> Result:
         """Return result modifiers, using defaults when they are absent."""
-        return self.root if isinstance(self.root, Result) else Result(self.root)
+        root = self.root.input if isinstance(self.root, WithCTE) else self.root
+        return root if isinstance(root, Result) else Result(root)
+
+    def stages(self) -> tuple:
+        """Return CTE definitions and the final query in dependency order."""
+        if isinstance(self.root, WithCTE):
+            return (*((name, LogicalPlan(node)) for name, node in self.root.ctes),
+                    ("", LogicalPlan(self.root.input)))
+        return (("", self),)
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
         """Return the columns produced by the root node."""
@@ -133,11 +154,47 @@ class LogicalPlan:
         for node in self.walk():
             node.validate()
 
+    def schema(self) -> pa.Schema:
+        """Return the Arrow schema of the result, without running the plan.
+
+        The types follow the result the executor builds: a source column
+        has its provider's type, a score is a float, a label is text, an
+        extraction is a struct of answer fields beside a struct of their
+        character spans, and aggregates and windows have the types of
+        the Arrow kernels that compute them.
+
+        Raises:
+            CompileError: A Scan carries no provider schema.
+        """
+        if isinstance(self.root, WithCTE):
+            return LogicalPlan(self.root.input).schema()
+        scans = {node.alias: node for node in self.walk() if isinstance(node, Scan)}
+        for scan in scans.values():
+            if scan.schema is None:
+                raise CompileError(
+                    f"the Scan of {scan.alias!r} carries no schema; the result "
+                    f"cannot be typed")
+        projection = self.projection
+        fields = _projected_fields(projection, scans)
+        for node in self.walk():
+            if isinstance(node, Project) and node is not projection:
+                table = pa.schema(fields).empty_table()
+                fields = {column_name(column): evaluate_expression(
+                    column, table, qualified=True).type for column in node.columns}
+            elif isinstance(node, Unnest):
+                fields = _unnested_fields(node, fields)
+            elif isinstance(node, Aggregate):
+                fields = _aggregated_fields(node, fields)
+            elif isinstance(node, Window):
+                fields = _windowed_fields(node, fields)
+        return pa.schema(fields)
+
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, applies, classifies = [], {}, [], [], []
-        extracts, tested, aliases = [], {}, []
-        nodes = self.walk()
+        extracts, feature_calls, tested, aliases = [], [], {}, []
+        # the nodes above the projection read result rows, not documents
+        nodes = LogicalPlan(self.projection).walk()
         for node in nodes:
             if isinstance(node, Scan):
                 scans.append(node)
@@ -160,6 +217,8 @@ class LogicalPlan:
                 classifies.append(node)
             elif isinstance(node, SemanticExtract):
                 extracts.append(node)
+            elif isinstance(node, SemanticSaeFeatures):
+                feature_calls.append(node)
         calls = {
             (node.alias, node.name): node.call
             for node in classifies
@@ -213,6 +272,7 @@ class LogicalPlan:
             labels=_label_work(classifies, columns, label_filters),
             classifies=tuple(classifies),
             extracts=tuple(extracts),
+            sae_features=tuple(feature_calls),
         )
 
 
@@ -234,6 +294,7 @@ class Operators:
     projections: tuple = ()  # named model calls in SELECT order
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
     extracts: tuple = ()  # tuple[SemanticExtract, ...]
+    sae_features: tuple = ()  # tuple[SemanticSaeFeatures, ...]
     label_filters: dict = field(default_factory=dict)
     #                     alias -> tuple[ColumnTest, ...] on labels
     extract_filters: dict = field(default_factory=dict)
@@ -321,3 +382,119 @@ def join_applies(join: "SemanticJoin") -> tuple:
         applies.append(node)
         node = node.input
     return tuple(reversed(applies))
+
+
+SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])
+PROBABILITIES_TYPE = pa.map_(pa.string(), pa.float64())
+
+# the Arrow kernel each aggregate runs, which fixes its output type
+_AGGREGATE_KERNELS = {"sum": pc.sum, "avg": pc.mean, "min": pc.min, "max": pc.max}
+
+
+def _projected_fields(project: Project, scans: dict) -> dict:
+    """Return name -> Arrow type of each column a Project returns, packed."""
+    types = {}
+    for column in project.columns:
+        name = column_name(column)
+        call = aliased_call(column)
+        if call is None:
+            (ref, *_) = column_references(column)
+            table = scans[ref.alias].schema.empty_table()
+            types[name] = evaluate_expression(column, table).type
+        elif call.kind == "score":
+            types[name] = pa.float64()
+        elif call.kind == "label":
+            types[name] = pa.string()
+            if call.probabilities:
+                types[name + PROBABILITIES_SUFFIX] = PROBABILITIES_TYPE
+        elif call.kind == "features":
+            types[name] = FEATURE_LIST
+        else:
+            types[name] = pa.string()
+            types[name + SPAN_SUFFIX] = SPAN_TYPE
+    packing = dict(project.packing())
+    owner = {member: struct for struct, members in packing.items()
+             for _, member in members}
+    packed = {}
+    for name, value_type in types.items():
+        struct = owner.get(name)
+        if struct is None:
+            packed[name] = value_type
+        elif struct not in packed:
+            packed[struct] = pa.struct([
+                (field, types[member]) for field, member in packing[struct]])
+    return packed
+
+
+def _unnested_fields(node: Unnest, fields: dict) -> dict:
+    """Return name -> Arrow type of an Unnest's output columns."""
+    types = {}
+    for name, value_type in fields.items():
+        if name in node.columns:
+            types.update({f"{name}.{field.name}": field.type
+                          for field in value_type.value_type})
+        else:
+            types[name] = value_type
+    return types
+
+
+def _aggregated_fields(node: Aggregate, fields: dict) -> dict:
+    """Return name -> Arrow type of an Aggregate's output columns."""
+    types = dict(fields)
+    for call in node.aggregates:
+        if call.function in ("count", "count_distinct"):
+            types[call.name] = pa.int64()
+        else:
+            empty = pa.array([], fields[call.argument])
+            types[call.name] = _AGGREGATE_KERNELS[call.function](empty).type
+    return {name: types[name] for name in node.output}
+
+
+def _windowed_fields(node: Window, fields: dict) -> dict:
+    """Return name -> Arrow type of a Window's output columns."""
+    types = dict(fields)
+    for call in node.calls:
+        if call.function in ("row_number", "count"):
+            types[call.name] = pa.int64()
+        elif call.function in ("lag", "lead"):
+            types[call.name] = fields[call.argument]
+        else:
+            empty = pa.array([], fields[call.argument])
+            types[call.name] = pc.cumulative_sum(pc.fill_null(empty, 0)).type
+    return {name: types[name] for name in node.output}
+
+
+def cte_schema(plan: LogicalPlan) -> pa.Schema:
+    """Return the schema of a plan's result, named as a CTE's columns.
+
+    A projected column reference is named by its column alone, so
+    ``SELECT c.id`` gives ``id``, and an unnested field by its field
+    alone, so ``SELECT f.feature`` gives ``feature``; every other column
+    keeps its name.
+
+    Raises:
+        CompileError: A projected expression has no AS name, or two
+            columns would share one name.
+    """
+    expressions = {column_name(column): column for column in plan.projection.columns}
+    unnested = {name: name.removeprefix(f"{column}.")
+                for node in plan.walk() if isinstance(node, Unnest)
+                for column, names in node.fields().items() for name in names}
+    fields = []
+    for result in plan.schema():
+        column = expressions.get(result.name)
+        if result.name in unnested:
+            result = result.with_name(unnested[result.name])
+        elif isinstance(column, ColumnRef):
+            result = result.with_name(column.column)
+        elif column is not None and not isinstance(column, Alias):
+            raise CompileError(
+                f"{result.name} in a CTE needs an AS name; a later query reads "
+                f"the column by that name")
+        fields.append(result)
+    schema = pa.schema(fields)
+    if len(set(schema.names)) != len(schema.names):
+        raise CompileError(
+            f"the CTE returns a column name twice: {schema.names}; give one an "
+            f"AS name")
+    return schema

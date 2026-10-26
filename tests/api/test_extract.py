@@ -79,6 +79,28 @@ def test_extract_prefix_sharing_is_planned_from_exact_document_tokens():
         assert node.spec.share_prefixes
 
 
+
+def test_offsets_are_computed_up_front_only_for_a_scan_of_every_row(
+        session, monkeypatch):
+    requested = []
+    for name in ("tokenize", "tokenize_async"):
+        original = getattr(session.inputs, name)
+
+        def record(*args, original=original, **kwargs):
+            requested.append(kwargs.get("with_offsets", False))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(session.inputs, name, record)
+    head = (f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+            f"FROM contracts c")
+    for where, expected in (("", True), (" WHERE c.id > 1", False)):
+        requested.clear()
+        query = session.sql(head + where, dialect="bq")
+        query.plan()
+        query.wait_for_tokens()
+        # a WHERE leaves the offsets to the extraction, for the rows it keeps
+        assert requested and set(requested) == {expected}
+
 def test_sql_and_builder_extract_the_same_answer_columns(session):
     built = _ends(session)
     for dialect in ('snowflake', 'bq'):
@@ -473,7 +495,7 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
             "capacity": request_tests.CAPACITY}
     monkeypatch.setattr(
         "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids, *, resources: (
+        lambda self, spec, allowed_ids, *, device, resources: (
             boot, {"kind": "cold", "boot_s": 0.1}))
     result = request_tests._run_stock_vllm(session, query)
     rows = result.collect()
@@ -509,6 +531,37 @@ def test_extraction_settings_survive_plan_serialization(session):
     request = RequestExtractSpec(alias="c", output="ends", question=QUESTION,
                                  tail_token_ids=(1, 2), max_answer_tokens=7)
     assert decode_value(RequestExtractSpec, encode_value(request)) == request
+
+
+@pytest.mark.parametrize("model,precision,changes", [
+    ("qwen3.5-4b-bf16", "fp8", False),
+    ("qwen3.5-4b-fp8", "bf16", True),
+    ("qwen3.5-4b-fp8", "fp32", True),
+])
+def test_extraction_cost_uses_each_component_precision(
+        monkeypatch, model, precision, changes):
+    from quail.specs import DEVICES, H100_SXM
+
+    costs = []
+    for multiplier in (1, 2):
+        device = replace(H100_SXM, **{
+            f"{precision}_flops":
+                H100_SXM.arithmetic_bandwidth(precision) * multiplier})
+        monkeypatch.setitem(DEVICES, device.name, device)
+        with quail.Session(
+            EngineConfig(model=model, device=device.name),
+            tokenizer=letter_tokens,
+        ) as session:
+            session.register("contracts", DocumentProvider.from_table(
+                pa.table({"id": [1], "text": [LEASE]}), id_col="id"))
+            plan = _ends(session).plan()
+            node = next(node for node in plan.nodes if isinstance(node, AiExtract))
+            costs.append(node.spec.round_cost_per_token)
+    assert costs[0] > 0
+    if changes:
+        assert costs[1] > costs[0]
+    else:
+        assert costs[0] == costs[1]
 
 
 FIELDS = {"ends": QUESTION, "rent": "What is the rent?"}

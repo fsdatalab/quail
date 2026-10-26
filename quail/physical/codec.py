@@ -25,6 +25,7 @@ from .nodes import (
     AiExtract,
     AiFilter,
     AiJoin,
+    AiSaeFeatures,
     AiScore,
     Barrier,
     Exchange,
@@ -33,9 +34,11 @@ from .nodes import (
     HashJoin,
     Limit,
     Project,
+    QueryStage,
     Recombine,
     Scan,
     Sort,
+    Unnest,
     Window,
 )
 
@@ -232,11 +235,13 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
     """Return codecs for every built in physical node."""
     return tuple(NodeCodec(node_type) for node_type in (
         Scan,
+        QueryStage,
         AiFilter,
         AiScore,
         Filter,
         AiClassify,
         AiExtract,
+        AiSaeFeatures,
         Barrier,
         Exchange,
         Foreign,
@@ -248,6 +253,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         Sort,
         Window,
         Limit,
+        Unnest,
     ))
 
 

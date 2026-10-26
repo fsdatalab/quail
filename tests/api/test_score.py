@@ -15,7 +15,6 @@ import quail
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.reranker import (
-    FilterRuntime,
     RerankerBatch,
     RerankerModelExecution,
     ScoreRows,
@@ -30,6 +29,7 @@ from quail.execution.runner import (
     GenericRunner,
     compute_subgraph,
 )
+from quail.execution.runtimes import FilterRuntime
 from quail.frontend.sql import compile_sql
 from quail.logical import ColumnRef, CompileError, RegularPredicate, SemanticJoin
 from quail.physical import (
@@ -748,13 +748,19 @@ def test_score_query_shape_errors_are_compile_errors(catalog):
 def test_score_refusals_name_oversized_documents_and_missing_scores(
         catalog, monkeypatch):
     from quail.cost import budgets
+    from quail.planner.operators import score as score_operator
 
-    # a 4-token chunk, then an arena of one 16-token page
-    for budget, value, unit in (("chunk_budget", 4, "tokens"),
-                                ("arena_pages", (1, 0), "pages")):
+    # chunk_budget calls arena_pages, so a one-page arena stub would
+    # shrink the chunk and the refusal would be reported in tokens.
+    # The pages case stubs the capacity the score reads instead.
+    cases = (
+        (budgets, "chunk_budget", lambda *args, **kwargs: 4, "tokens"),
+        (score_operator, "arena_capacity", lambda *args, **kwargs: 16,
+         "pages"),
+    )
+    for module, name, stub, unit in cases:
         with monkeypatch.context() as patch:
-            patch.setattr(budgets, budget,
-                          lambda model, device, *rest, value=value: value)
+            patch.setattr(module, name, stub)
             session = _session(catalog)
             query = session.sql(
                 "SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s "
@@ -762,10 +768,10 @@ def test_score_refusals_name_oversized_documents_and_missing_scores(
             )
             plan = query.plan()
             session.close()
-        assert isinstance(plan, Refusal), budget
-        assert plan.constraint == "suffix_over_chunk", budget
-        assert plan.unit == unit, budget
-        assert "a document in 'd'" in plan.reasons[0], budget
+        assert isinstance(plan, Refusal), name
+        assert plan.constraint == "suffix_over_chunk", name
+        assert plan.unit == unit, name
+        assert "a document in 'd'" in plan.reasons[0], name
 
     with _session(catalog) as session:
         plan = session.sql(

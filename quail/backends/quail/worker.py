@@ -75,7 +75,9 @@ class LoadedGpu:
                                 answer_token_ids=answer_token_ids,
                                 max_batched_tokens=budget,
                                 moe_backend=spec.moe_backend,
-                                text_only=spec.vision_tower)
+                                text_only=spec.vision_tower,
+                                num_layers=(spec.layers if spec.checkpoint_layers
+                                            else None))
         self.load_model_s = time.perf_counter() - t0
         self.weights_bytes = int(torch.cuda.memory_allocated())
 
@@ -92,7 +94,7 @@ class LoadedGpu:
         self.device = device
         self.arena = KVArena(num_layers=spec.layers,
                              num_pages=full_pages,
-                             page_tokens=budgets.PAGE_TOKENS,
+                             page_tokens=device.page_tokens,
                              num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,
                              dtype=torch.bfloat16,
                              layer_kv=spec.kv_shapes,

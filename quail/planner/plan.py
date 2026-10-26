@@ -36,10 +36,11 @@ class Refusal:
     """Returned when a configuration cannot execute the query."""
     reasons: tuple
     constraint: str    # "weights_need_more_cards" | "suffix_over_chunk"
-    #                    | "unknown_model"
+    #                    | "unknown_model" | "sliding_kv_needs_more_memory"
+    #                    | "flash_attention_4_unsupported"
     needed: float
     available: float
-    unit: str          # "cards" | "tokens" | "bytes"
+    unit: str          # "cards" | "tokens" | "bytes" | "version"
 
 
 class RefusalError(RuntimeError):

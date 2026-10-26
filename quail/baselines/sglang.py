@@ -142,13 +142,14 @@ class SGLangEngine:
     label = "SGLang"
     runtime_package = "sglang==0.5.18"
 
-    def boot(self, spec, allowed_ids: list[int], *,
+    def boot(self, spec, allowed_ids: list[int], device=None, *,
              resources: ExitStack) -> tuple[dict, dict]:
         """Load the spec's model and return its settings and boot record.
 
         Args:
             spec: The model to load.
             allowed_ids: The token ids a filter answer may be.
+            device: Device spec; SGLang detects its hardware at startup.
             resources: Owns the engine; closing it stops the engine.
         """
         import sglang as sgl

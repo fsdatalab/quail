@@ -29,6 +29,8 @@ class Chunk:
             the chunk out for.
         tokens: Rows in the chunk.
         layout: (arena key, suffix count) per group in chunk order.
+        row_spans: (arena key, first row, first suffix row, end row) per
+            group in chunk order; a pipeline's forward hook reads them.
         temporary_keys: Arena keys the loop frees after the forward pass.
         fresh_keys: Keys whose prefix this chunk computes; the loop
             trims their sliding pages after the pass.
@@ -44,6 +46,7 @@ class Chunk:
     attention_mode: str
     tokens: int
     layout: list
+    row_spans: tuple = ()
     temporary_keys: tuple = ()
     fresh_keys: tuple = ()
     rows_per_answer: np.ndarray | None = None
@@ -310,7 +313,7 @@ class _PoolBuilder:
             tail_dst=(stage(f"tail_dst{tag}", _concatenate(self.tail_dst),
                             torch.int64) if self.tail_dst else None),
             used=stage(f"unified_lengths{tag}", self.lengths, torch.int32),
-            table=table,
+            table=table, page_rows=self.page_rows, used_host=self.lengths,
             max_used=max(self.lengths))
 
 
@@ -387,6 +390,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # own prefix (wider than the planner's readers, which are children)
     reader_rows = []
     kv_writes, layout = [], []
+    row_spans = []
     fresh_keys = []
     read_keys, read_used, cu_q = [], [], [0]
     max_q = 0
@@ -559,6 +563,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 kv_writes.append((key, s_row0, s_row0 + wst, dest))
         num_s = num_tokens - s_row0
         layout.append((key, n))
+        row_spans.append((key, row0, prefix_end, num_tokens))
         if stacked:
             # every row of the group reads the parent's pages up to
             # start; siblings packed back to back share that read
@@ -733,6 +738,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             unified = dict(
                 built[0],
                 cu_q=stage("unified_cu_q", cu_q, torch.int32),
+                cu_q_host=cu_q,
                 max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])))
             if sliding:
                 unified["sliding"] = built[1]
@@ -781,8 +787,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             seq = stage("canvas_seq", canvas_seq, torch.int64)
             canvas_meta["table"] = unified["table"].index_select(0, seq)
             canvas_meta["used"] = unified["used"].index_select(0, seq)
-            canvas_meta["max_used"] = max(
-                pools[0].lengths[i] for i in canvas_seq)
+            canvas_meta["used_host"] = [pools[0].lengths[i] for i in canvas_seq]
+            canvas_meta["page_rows"] = [pools[0].page_rows[i] for i in canvas_seq]
+            canvas_meta["max_used"] = max(canvas_meta["used_host"])
             if "sliding" in unified:
                 canvas_meta["sliding"] = dict(
                     table=unified["sliding"]["table"].index_select(0, seq),
@@ -810,7 +817,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         positions=stage("positions", _concatenate(position), torch.int64),
         final_indices=stage("finals", _concatenate(finals), torch.int64),
         meta=meta, attention_mode=attention_mode, tokens=num_tokens,
-        layout=layout, temporary_keys=tuple(temporary_keys),
+        layout=layout, row_spans=tuple(row_spans),
+        temporary_keys=tuple(temporary_keys),
         fresh_keys=tuple(fresh_keys),
         rows_per_answer=(np.concatenate(rows_per_answer) if multi_row else None))
     _tick(timing, "pack_h2d", t)

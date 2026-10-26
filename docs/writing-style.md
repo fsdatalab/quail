@@ -64,6 +64,7 @@ The following rules include preferences from this conversation. They are additio
 - State conditions and consequences explicitly. Do not require readers to infer the relationship.
 - Use literal descriptions. Remove metaphors and dramatic contrasts.
 - Remove empty emphasis and filler. Keep words that explain the behavior.
+- Do not use "named" as an adjective. Describe what the object is or does.
 
 ## Review meaning before formatting
 

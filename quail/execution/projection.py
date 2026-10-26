@@ -35,10 +35,12 @@ def projection_for(logical, token_inputs, documents):
                        *(key.expression for key in logical.result.order))
         if column_references(column)}
     model_calls = {node.name: node.call
-                   for node in (*operators.classifies, *operators.extracts)}
+                   for node in (*operators.classifies, *operators.extracts,
+                                *operators.sae_features)}
     model_calls.update({node.span_name: node.call for node in operators.extracts})
     model_calls.update({column.name: call for column in logical.projection.columns
-                        if (call := aliased_call(column, "label", "extract", "score"))
+                        if (call := aliased_call(column, "label", "extract",
+                                                 "score", "features"))
                         is not None})
 
     def project(node, value, labels=None):
@@ -139,7 +141,9 @@ def projection_for(logical, token_inputs, documents):
                 )
             store = token_inputs[source.alias]
             for ref in column_references(source_columns[name]):
-                if ref.column not in store.projected_columns:
+                loaded = (store.column_names if isinstance(store, pa.Table)
+                          else store.projected_columns)
+                if ref.column not in loaded:
                     raise CompileError(
                         f"projection column {name!r} was not loaded by the "
                         f"scan of {source.alias!r}; the "

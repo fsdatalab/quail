@@ -31,11 +31,11 @@ from quail.baselines.nodes import RequestExecution
 from quail.execution.result import answer_values
 from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt, bind_extract_prompt
-from quail.physical import AiClassify, AiExtract, AiScore
+from quail.physical import AiClassify, AiExtract, AiSaeFeatures, AiScore
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import lower_prompt
 from quail.progress import say
-from quail.specs import H100_USD_PER_HOUR, MODELS
+from quail.specs import DEVICES, MODELS
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     IN_LIST_SELECTIVITY_ESTIMATES,
@@ -201,6 +201,14 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
                 operator.relation, table.column(operator.relation)),
             "score": table.column(operator.output).cast(pa.float64()),
         })
+    features_answers = {}
+    for operator in info.sae_features:
+        table = result.answer_tables["features"][operator.output]
+        features_answers[operator.id] = pa.table({
+            operator.relation: id_column(
+                operator.relation, table.column(operator.relation)),
+            "features": table.column(operator.output),
+        })
     extract_answers = {}
     for operator in info.extracts:
         name = _extract_name(info, operator)
@@ -225,7 +233,8 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         result.report["wall_s"], dict(result.report, collection_s=collection_s),
         classify_answers=classify_answers or None,
         score_answers=score_answers or None,
-        extract_answers=extract_answers or None)
+        extract_answers=extract_answers or None,
+        features_answers=features_answers or None)
 
 
 def _alias_filters(info: PlanInfo, alias: str) -> list:
@@ -269,7 +278,7 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                      if lower(prompt).preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": [], "classifies": [], "scores": [],
-              "extracts": []}
+              "extracts": [], "features": []}
     for alias, predicates in filters.items():
         written = _alias_filters(info, alias)
         for position, predicate in enumerate(predicates):
@@ -320,6 +329,18 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                 f"query reports no prompt pieces")
             return None
         pieces["extracts"].append({"id": operator.id, "tail": list(tail)})
+    for operator in info.sae_features:
+        node = next(node for node in query.plan().nodes
+                    if isinstance(node, AiSaeFeatures)
+                    and node.spec.name == operator.output)
+        head, tail = node.spec.prompt_token_parts
+        if not pieces["preamble"]:
+            pieces["preamble"] = list(head)
+        elif list(head) != pieces["preamble"]:
+            say(f"feature call {operator.id} has its own prompt head; the "
+                f"query reports no prompt pieces")
+            return None
+        pieces["features"].append({"id": operator.id, "tail": list(tail)})
     return pieces
 
 
@@ -459,12 +480,16 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
 
 def run_suite(only=None, *, scale_factor=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
-              h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
+              usd_per_hour=None, root=None):
     """Run Quail queries through QUAIL-B and save the benchmark report.
 
     Queries the backend refuses to plan are left out of the run and
-    listed under `skipped_queries` in the returned record.
+    listed under `skipped_queries` in the returned record. Cost uses
+    ``DEVICES[config.device].usd_per_hour`` unless ``usd_per_hour``
+    is passed.
     """
+    if usd_per_hour is None:
+        usd_per_hour = DEVICES[config.device].usd_per_hour
     skipped = {}
     explicit = only is not None
     only = list(query_specs()) if only is None else list(only)
@@ -495,14 +520,14 @@ def run_suite(only=None, *, scale_factor=0.1, config, data_dir=None,
         return _empty_record(skipped, scale_factor=scale_factor, data_dir=data_dir,
                              ground_truth_collection=ground_truth_collection,
                              root=root, config=config, metadata=metadata,
-                             h100_usd_per_hour=h100_usd_per_hour,
+                             usd_per_hour=usd_per_hour,
                              output_dir=output_dir)
     with quail.Session(config) as session:
         record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=scale_factor,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection, root=root,
-            gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
+            gpu_count=config.gpus, gpu_hourly_rate_usd=usd_per_hour,
             metadata=metadata)
         record["skipped_queries"] = skipped
         write_json(Path(output_dir) / "run.json", record)
@@ -511,7 +536,7 @@ def run_suite(only=None, *, scale_factor=0.1, config, data_dir=None,
 
 
 def _empty_record(skipped, *, scale_factor, data_dir, ground_truth_collection, root,
-                  config, metadata, h100_usd_per_hour, output_dir) -> dict:
+                  config, metadata, usd_per_hour, output_dir) -> dict:
     """Build a run record for a suite in which every query was skipped."""
     from quail_b import __version__
     from quail_b.run import RUN_SCHEMA_VERSION
@@ -526,7 +551,7 @@ def _empty_record(skipped, *, scale_factor, data_dir, ground_truth_collection, r
         "collection_id": suite.ground_truth.collection_id,
         "reference_model": suite.ground_truth.reference_model,
         "metadata": metadata, "gpu_count": config.gpus,
-        "gpu_hourly_rate_usd": h100_usd_per_hour,
+        "gpu_hourly_rate_usd": usd_per_hour,
         "started_at": started, "finished_at": started, "status": "complete",
         "queries": [], "skipped_queries": skipped,
     }

@@ -1,11 +1,11 @@
-"""Coordinator nodes: Exchange, Recombine, Project, Aggregate, Sort, Limit."""
+"""Coordinator nodes: Exchange, Recombine, Project, and the result nodes."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.logical.expressions import WindowCall, packed_columns
+from quail.logical.expressions import Expression, WindowCall, packed_columns
 
 from ..base import (
     ExecutionLocation,
@@ -64,10 +64,13 @@ class Project(PhysicalNode):
         structs: (struct column, ((field, member column), ...)) pairs.
             Each struct column takes the place of its first member and
             holds one field per member; the members leave the result.
+        expressions: Value expressions over result rows. None projects
+            source columns and model answers by document ID.
     """
 
     columns: tuple[str, ...] = ()
     structs: tuple = ()
+    expressions: tuple[str | Expression, ...] | None = None
 
     type_name: ClassVar[str] = "quail.project"
     runtime_key: ClassVar[str] = type_name
@@ -147,6 +150,31 @@ class Window(PhysicalNode):
     columns: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.window"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
+
+@dataclass(frozen=True)
+class Unnest(PhysicalNode):
+    """Return one row per element of list columns, zipped by position.
+
+    Each list column in ``lists`` holds structs and becomes one column
+    per struct field, named ``<list>.<field>``; the other columns repeat
+    for each element. A row returns as many rows as its longest list,
+    with nulls past the end of a shorter one; with ``outer``, a row
+    with no elements returns one row of nulls.
+    ``columns`` are the output columns in result order.
+    """
+
+    lists: tuple[str, ...] = ()
+    outer: bool = False
+    columns: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.unnest"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 

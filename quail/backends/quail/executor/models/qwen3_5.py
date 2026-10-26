@@ -163,6 +163,15 @@ class Qwen35Pipeline(ModelPipeline):
                                      residual)
             hidden = feed_forward(x)
         final = chunk.final_indices
+        if self.spec.sae is not None:
+            # the SAE reads the residual stream after the last layer: the
+            # MLP output not yet added (hidden) plus the running residual
+            if self.forward_hook is not None:
+                stream = hidden + residual
+                self.forward_hook(stream, chunk)
+                return stream.index_select(0, final)
+            return (hidden.index_select(0, final)
+                    + residual.index_select(0, final))
         normed, _ = self._norm(self.final_norm, hidden.index_select(0, final),
                                residual.index_select(0, final))
         return normed

@@ -13,6 +13,9 @@ from quail.logical.expressions import (
     ModelCall,
     Prompt,
     RegularPredicate,
+    aliased_call,
+    column_name,
+    column_references,
     model_call,
 )
 from quail.logical.nodes import (
@@ -27,6 +30,8 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticSaeFeatures,
+    Unnest,
     Window,
 )
 from quail.logical.plan import (
@@ -73,6 +78,8 @@ class LogicalPlanBuilder:
         regular_predicates: tuple = (),
         extracts: tuple = (),
         extract_filters: tuple = (),
+        sae_features: tuple = (),
+        schema=None,
     ) -> None:
         """Add one table with its filters, applies, classifications, and extractions.
 
@@ -80,6 +87,7 @@ class LogicalPlanBuilder:
             alias: The table's alias in the query.
             provider: The registered provider name.
             column: The document column.
+            schema: The provider's Arrow schema, for typing the result.
             predicates: The table's AI.IF predicates in written order.
             regular_predicates: RegularPredicate tests the scan applies
                 before any operator reads a document.
@@ -95,6 +103,8 @@ class LogicalPlanBuilder:
             extract_filters: (RegularPredicate, selectivity) per Filter
                 on an extraction's answer or span column, in written
                 order. Each sits right above the extraction it tests.
+            sae_features: (call, name) per AI.SAE_FEATURES call, in
+                order. They sit above the extractions.
 
         Raises:
             CompileError: The alias is taken, a label filter names a
@@ -108,6 +118,7 @@ class LogicalPlanBuilder:
             alias=alias,
             column=column,
             predicates=tuple(regular_predicates),
+            schema=schema,
         )
         if predicates:
             node = SemanticFilter(node, tuple(predicates))
@@ -157,6 +168,8 @@ class LogicalPlanBuilder:
             raise CompileError(
                 f"the filter {tests[0][0]} tests an extraction the query "
                 f"does not return")
+        for call, name in sae_features:
+            node = SemanticSaeFeatures(node, call, name)
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:
@@ -251,6 +264,9 @@ class LogicalPlanBuilder:
         structs: tuple = (),
         windows: tuple = (),
         output: tuple = (),
+        unnests: tuple = (),
+        unnest_tests: tuple = (),
+        unnest_outer: tuple = (),
     ) -> LogicalPlan:
         """Build the plan's result nodes over the projected columns.
 
@@ -264,7 +280,14 @@ class LogicalPlanBuilder:
             structs: The AI.EXTRACT struct columns the projection packs.
             windows: The WindowCalls over the projected or grouped rows.
             output: The result columns in SELECT order when windows
-                are present.
+                or unnested lists are present.
+            unnests: The list columns of each Unnest, lowest first; the
+                lists of one Unnest are zipped.
+            unnest_tests: RegularPredicates on unnested field columns.
+                Each becomes a Filter above the Unnest that adds its
+                column.
+            unnest_outer: For each Unnest, whether a row with no
+                elements returns one row of nulls; empty means none do.
         """
         if self._root is None:
             raise CompileError("a logical plan needs an input table")
@@ -278,7 +301,27 @@ class LogicalPlanBuilder:
             raise CompileError(
                 "DISTINCT does not compare AI.EXTRACT struct columns; extract "
                 "each field as its own column")
-        node = Project(self._root, tuple(columns), tuple(structs))
+        unnested = {name for lists in unnests for name in lists}
+        _check_feature_lists(columns, order, distinct, aggregation, unnested)
+        expanded = {column_name(column): column for column in columns
+                    if any(ref.alias in unnested
+                           for ref in column_references(column))}
+        source = tuple(column for column in columns
+                       if column_name(column) not in expanded)
+        if unnests and aggregation is None:
+            source += tuple(key.expression for key in order
+                            if column_references(key.expression)
+                            and not any(ref.alias in unnested for ref in
+                                        column_references(key.expression))
+                            and key.expression not in source)
+        node = _unnested(Project(self._root, source, tuple(structs)),
+                         unnests, unnest_tests,
+                         unnest_outer or (False,) * len(unnests))
+        if unnests:
+            selected = (tuple(column_name(column) for column in columns
+                              if column_name(column) not in unnested)
+                        if aggregation is not None or windows else tuple(output))
+            node = Project(node, tuple(expanded.get(name, name) for name in selected))
         if aggregation is not None:
             node = Aggregate(
                 node,
@@ -294,3 +337,53 @@ class LogicalPlanBuilder:
         plan = LogicalPlan(node)
         plan.validate()
         return plan
+
+
+def _unnested(node, unnests, tests, outer):
+    """Return the node under its Unnests, each test above its field's Unnest.
+
+    Raises:
+        CompileError: An Unnest names no list column below it, or a test
+            reads no unnested field.
+    """
+    tests = list(tests)
+    for lists, keep_empty in zip(unnests, outer, strict=True):
+        node = Unnest(node, tuple(lists), outer=keep_empty)
+        node.validate()
+        fields = {name for names in node.fields().values() for name in names}
+        for test in [test for test in tests if column_name(test.column) in fields]:
+            node = Filter(node, test)
+            tests.remove(test)
+    if tests:
+        raise CompileError(
+            f"{tests[0]} tests no field of an unnested list")
+    return node
+
+
+def _check_feature_lists(columns, order, distinct, aggregation,
+                         unnested) -> None:
+    """Refuse an AI.SAE_FEATURES list where the query compares values.
+
+    An unnested list is compared by its scalar fields, so it is exempt.
+
+    Raises:
+        CompileError: ORDER BY, GROUP BY, or DISTINCT reads a feature
+            list column.
+    """
+    names = {column.name for column in columns
+             if aliased_call(column, "features") is not None
+             and column.name not in unnested}
+    if not names:
+        return
+    if aggregation is not None or distinct:
+        raise CompileError(
+            "GROUP BY and DISTINCT do not compare AI.SAE_FEATURES list "
+            "columns")
+    for key in order:
+        expression = key.expression
+        if (getattr(expression, "name", None) in names
+                or aliased_call(expression, "features") is not None
+                or (isinstance(expression, ModelCall)
+                    and expression.kind == "features")):
+            raise CompileError(
+                "ORDER BY does not compare AI.SAE_FEATURES list columns")

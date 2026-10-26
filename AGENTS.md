@@ -53,15 +53,15 @@ CI runs these on every pull request. Run them before pushing:
   `logical`, and so on down to `specs`. Put shared code in the lower
   package rather than importing upward.
 - `tools/check_long_strings.py` flags string literals over 200
-  characters. Long content is allowed when named as content (a name
-  containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
+  characters. Long content is allowed when its name identifies content
+  (a name containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
   prompts module or folder, or plainly HTML or SQL. Docstrings are
   exempt. Shorten long messages and log lines.
 - `tools/check_names.py` reports two names for one concept or one
   name for two: duplicate function bodies, a parameter passed on
   under another keyword, identifiers that differ by a synonym, and a
-  variable named for a type it does not hold. `--inventory` lists
-  what the code defines, for finding such names by hand.
+  variable whose name describes a type it does not hold. `--inventory`
+  lists what the code defines, for finding such names by hand.
 
 ## Tests
 
@@ -118,7 +118,7 @@ one. `tools/check_names.py` enforces the chosen words:
 - Every document operator emits one `rows:<alias>` port carrying
   `Rows`, and a pair operator emits `rows`. Read ids from `Rows` with
   `document_ids()`; do not keep a separate ids port.
-- A variable named for a type holds that type: `rows`, `scored`,
+- A variable with a type's name holds that type: `rows`, `scored`,
   `labels`, and `answers` hold `Rows`; `table`, `batch`, and
   `relation` hold Arrow tables.
 
@@ -127,8 +127,8 @@ one. `tools/check_names.py` enforces the chosen words:
 - Filter and join queries on Qwen3 4B fp8, Qwen3 32B fp8,
   DiffusionGemma 26B-A4B fp8, Decision-2.0-Kai 0.6B bf16, or the hybrid
   models Qwen3.5 4B bf16, Qwen3.5 27B fp8, Qwen3.8 27B fp8, and LFM2
-  2.6B bf16, on one H100 per model copy. No tensor-parallel weight
-  sharding.
+  2.6B bf16, on one GPU per model copy (H100 SXM, L40S, or B200).
+  No tensor-parallel weight sharding.
 - `AI.MAP` is on the roadmap.
   Open-ended generation, speculation, and forking are not supported.
 
@@ -160,7 +160,7 @@ features: their APIs, their code layout, their tests, their docs, and
 how they release and explain changes.
 
 - **Apache Spark**: the model for Quail as a whole.
-  - Catalyst, for logical and physical plans rewritten by named rules
+  - Catalyst, for logical and physical plans rewritten by rules
     (Quail's planner rules).
   - The DataFrame and SQL APIs, for Quail's builder and `sql()`.
   - Spark Connect, for a thin client talking to a remote server
@@ -251,8 +251,8 @@ how they release and explain changes.
     quail-b reports it as `input_tokens_per_second`. Give document and
     pair counts beside it as plain counts, not as throughput.
   - `$/query` is query time in hours times the number of GPUs times
-    `quail.specs.H100_USD_PER_HOUR` ($3.9492, from
-    https://modal.com/pricing).
+    `DEVICES[device].usd_per_hour`. On H100 that is
+    `H100_USD_PER_HOUR` ($3.9492, from https://modal.com/pricing).
   - Query time and `$/query` exclude model startup. Report startup
     separately if it matters.
 

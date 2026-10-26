@@ -29,6 +29,7 @@ class Scope:
     def __init__(self, catalog: Catalog):
         self.catalog = catalog
         self.tables: list[tuple[str, str]] = []
+        self.relations: dict[str, pa.Schema] = {}
         self.document_columns: dict = {}  # alias -> the document expression
 
     def add_table(self, alias: str, provider: str) -> None:
@@ -39,9 +40,20 @@ class Scope:
                 is already in scope.
         """
         self.catalog.get(provider)
-        if alias in dict(self.tables):
+        if alias in dict(self.tables) or alias in self.relations:
             raise CompileError(f"duplicate table alias {alias!r}")
         self.tables.append((alias, provider))
+
+    def add_relation(self, alias: str, schema: pa.Schema) -> None:
+        """Bring the columns produced by a relational operator into scope."""
+        if alias in dict(self.tables) or alias in self.relations:
+            raise CompileError(f"duplicate table alias {alias!r}")
+        self.relations[alias] = schema
+
+    def schema(self, alias: str, provider: str) -> pa.Schema:
+        """Return the schema of a source table or a relational operator."""
+        return (self.catalog.get(provider).schema() if provider
+                else self.relations[alias])
 
     def resolve(self, column: str, alias: str | None = None, *,
                 tables=None, shown: str = "") -> ColumnRef:
@@ -59,20 +71,21 @@ class Scope:
             CompileError: The alias is unknown, the column is not in the
                 aliased table, or no single table has the column.
         """
-        scope = dict(self.tables if tables is None else tables)
+        scope = {**dict.fromkeys(self.relations, ""),
+                 **dict(self.tables if tables is None else tables)}
         if alias is not None:
             if alias not in scope:
                 raise CompileError(
                     f"unknown table alias {alias!r}"
                     + (f" in column {shown}" if shown else ""))
             provider = scope[alias]
-            if column not in self.catalog.get(provider).columns:
+            if column not in self.schema(alias, provider).names:
                 raise CompileError(
                     f"column {column!r} not in provider {provider!r} "
-                    f"(schema: {self.catalog.get(provider).columns})")
+                    f"(schema: {self.schema(alias, provider).names})")
             return ColumnRef(alias=alias, provider=provider, column=column)
         owners = [(a, p) for a, p in scope.items()
-                  if column in self.catalog.get(p).columns]
+                  if column in self.schema(a, p).names]
         if len(owners) != 1:
             raise CompileError(
                 f"column {column!r} is "
@@ -98,7 +111,7 @@ class Scope:
         expression = column_expression(ref, tuple(path), function, name)
         if expression is not ref:
             expression.validate()
-            schema = self.catalog.get(ref.provider).schema()
+            schema = self.schema(ref.alias, ref.provider)
             evaluate_expression(expression, schema.empty_table())
         return expression
 
