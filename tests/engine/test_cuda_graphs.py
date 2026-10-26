@@ -101,3 +101,49 @@ def test_replay_returns_independent_output_storage():
     graphs.invalidate()
     assert not graphs.graphs
     assert graphs.storage is None
+
+
+def test_document_read_padding_merges_only_into_an_unread_row():
+    # the chunk's two rounds are branches of one document: their five
+    # rows read its two pages once, beside their own call B reads
+    source = chunk()
+    source.meta["reads"]["documents"] = dict(
+        b_index=torch.arange(5), cu_q=torch.tensor([0, 5], dtype=torch.int32),
+        max_q=5, used=torch.tensor([32], dtype=torch.int32), max_used=32,
+        table=torch.tensor([[3, 4]], dtype=torch.int32))
+    buffers = DecodeBuffers(torch, 8, 16, device="cpu", documents=True)
+    buffers.synthetic(7)
+    buffers.copy(source)
+    documents = buffers.chunk.meta["reads"]["documents"]
+    # padding indices name call B's last row, past the five real ones
+    assert documents["b_index"].tolist() == [0, 1, 2, 3, 4, 7, 7, 7]
+    assert documents["cu_q"].tolist() == [0, 5, 6, 7, 8, 8, 8, 8, 8]
+    assert documents["used"].tolist() == [32, 0, 0, 0, 0, 0, 0, 0]
+    assert documents["table"][:1, :2].tolist() == [[3, 4]]
+
+
+def test_a_document_read_replays_only_a_graph_with_a_spare_row():
+    source = chunk()
+    source.meta["reads"]["documents"] = dict(
+        b_index=torch.arange(5), cu_q=torch.tensor([0, 5], dtype=torch.int32),
+        max_q=5, used=torch.tensor([32], dtype=torch.int32), max_used=32,
+        table=torch.tensor([[3, 4]], dtype=torch.int32))
+    arena = SimpleNamespace(k=[], page_tokens=16)
+    graphs = DecodeGraphs(SimpleNamespace(
+        engine=SimpleNamespace(arena=arena), forward_chunk=lambda x: "eager"))
+    graphs.storage = arena.k
+    output = torch.arange(8 * 3).reshape(8, 3)
+    replayed = []
+
+    def captured(rows, documents):
+        return SimpleNamespace(
+            buffers=DecodeBuffers(torch, rows, 16, device="cpu",
+                                  documents=documents),
+            graph=SimpleNamespace(replay=lambda: replayed.append(rows)),
+            output=output)
+
+    graphs.graphs = [captured(8, False)]
+    graphs.document_graphs = [captured(5, True), captured(8, True)]
+    assert graphs.forward(source).equal(output[[2, 4]])
+    # five rows need a six-row graph at least, so the eight-row one runs
+    assert replayed == [8]

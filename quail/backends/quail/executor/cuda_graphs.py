@@ -14,6 +14,8 @@ class DecodeGraphConfig:
     row_buckets: tuple[int, ...] = (32, 64, 128, 256, 512)
     max_context_tokens: int = 65536
     max_query_tokens: int = 32
+    # the rows of one document's map branches read together
+    max_document_rows: int = 128
 
     def __post_init__(self):
         if (not isinstance(self.row_buckets, tuple) or not self.row_buckets
@@ -24,7 +26,9 @@ class DecodeGraphConfig:
         if (type(self.max_context_tokens) is not int
                 or self.max_context_tokens < 1
                 or type(self.max_query_tokens) is not int
-                or self.max_query_tokens < 1):
+                or self.max_query_tokens < 1
+                or type(self.max_document_rows) is not int
+                or self.max_document_rows < 1):
             raise ValueError(
                 "capture context and query limits must be positive integers")
 
@@ -34,10 +38,14 @@ class DecodeBuffers:
 
     Padding has no KV writes and no resident context. Every padded
     query forms a separate sequence so it cannot affect real rows.
+    With documents, the batch also carries the document read of map
+    branches (see Stage.document_reads); its padding merges into call
+    B's last row, which a batch with documents leaves unread.
     """
 
     def __init__(self, torch, rows, page_tokens, *,
-                 config: DecodeGraphConfig | None = None, device="cuda"):
+                 config: DecodeGraphConfig | None = None, device="cuda",
+                 documents=False):
         config = DecodeGraphConfig() if config is None else config
         self.rows = rows
         self.indices = torch.arange(rows + 1, dtype=torch.int32, device=device)
@@ -56,16 +64,26 @@ class DecodeBuffers:
         self.table = zeros((rows, (config.max_context_tokens + page_tokens - 1)
                             // page_tokens), torch.int32)
         self.source = zeros(rows, torch.int32)
+        reads = dict(rows=self.read_rows, cu_q=self.cu_q,
+                     max_q=config.max_query_tokens, used=self.used,
+                     max_used=config.max_context_tokens, table=self.table,
+                     source=self.source)
+        self.documents = None
+        if documents:
+            self.documents = dict(
+                b_index=self.indices[:-1].to(torch.int64),
+                cu_q=self.indices.clone(), max_q=config.max_document_rows,
+                used=zeros(rows, torch.int32),
+                max_used=config.max_context_tokens,
+                table=zeros(self.table.shape, torch.int32))
+            reads["documents"] = self.documents
         self.chunk = Chunk(
             input_ids=self.ids, positions=self.positions,
             final_indices=self.indices[:-1].to(torch.int64),
             meta=dict(layer=0, canvas=None, unified=None,
                       kv_src=self.src, kv_dst=self.dst,
                       cu_a=self.cu_a, max_a=config.max_query_tokens,
-                      reads=dict(rows=self.read_rows, cu_q=self.cu_q,
-                                 max_q=config.max_query_tokens, used=self.used,
-                                 max_used=config.max_context_tokens, table=self.table,
-                                 source=self.source)),
+                      reads=reads),
             attention_mode="tree", tokens=rows, layout=[])
 
     def synthetic(self, page):
@@ -77,6 +95,9 @@ class DecodeBuffers:
         self.used.fill_(1)
         self.table.fill_(page)
         self.source.copy_(self.indices[:-1])
+        if self.documents is not None:
+            self.documents["used"].fill_(1)
+            self.documents["table"].fill_(page)
 
     def _bounds(self, target, source, count):
         sequences = source.numel() - 1
@@ -112,6 +133,20 @@ class DecodeBuffers:
             writes = chunk.meta["kv_src"].numel()
             self.src[:writes].copy_(chunk.meta["kv_src"])
             self.dst[:writes].copy_(chunk.meta["kv_dst"])
+        if self.documents is not None:
+            documents = reads["documents"]
+            count = documents["b_index"].numel()
+            groups = documents["used"].numel()
+            index = self.documents["b_index"]
+            # call B's rows past the real ones are never merged into
+            # a real row, and a batch with documents has at least one
+            index.fill_(self.rows - 1)
+            index[:count].copy_(documents["b_index"])
+            self._bounds(self.documents["cu_q"], documents["cu_q"], count)
+            self.documents["used"].zero_()
+            self.documents["used"][:groups].copy_(documents["used"])
+            self.documents["table"][:groups, :documents["table"].shape[1]].copy_(
+                documents["table"])
 
 
 @dataclass
@@ -135,6 +170,8 @@ class DecodeGraphs:
         self.pipeline = pipeline
         self.enabled = True
         self.graphs = []
+        # the same buckets with the document read of map branches
+        self.document_graphs = []
         self.storage = None
         self.replays = 0
         self.capture_s = 0.0
@@ -147,6 +184,7 @@ class DecodeGraphs:
     def invalidate(self):
         """Release graphs before replacing their KV allocation."""
         self.graphs.clear()
+        self.document_graphs.clear()
         self.storage = None
 
     def prepare(self):
@@ -174,17 +212,20 @@ class DecodeGraphs:
                 v[start:start + arena.page_tokens].zero_()
             stream.wait_stream(current)
             with torch.cuda.stream(stream), torch.inference_mode():
-                for rows in self.config.row_buckets:
-                    buffers = DecodeBuffers(torch, rows, arena.page_tokens,
-                                            config=self.config)
-                    buffers.synthetic(page)
-                    for _ in range(3):
-                        self.pipeline.forward_chunk(buffers.chunk)
-                    stream.synchronize()
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, stream=stream):
-                        output = self.pipeline.forward_chunk(buffers.chunk)
-                    self.graphs.append(CapturedDecode(buffers, graph, output))
+                for documents, graphs in ((False, self.graphs),
+                                          (True, self.document_graphs)):
+                    for rows in self.config.row_buckets:
+                        buffers = DecodeBuffers(torch, rows, arena.page_tokens,
+                                                config=self.config,
+                                                documents=documents)
+                        buffers.synthetic(page)
+                        for _ in range(3):
+                            self.pipeline.forward_chunk(buffers.chunk)
+                        stream.synchronize()
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph, stream=stream):
+                            output = self.pipeline.forward_chunk(buffers.chunk)
+                        graphs.append(CapturedDecode(buffers, graph, output))
             current.wait_stream(stream)
             stream.synchronize()
         except Exception:
@@ -195,7 +236,7 @@ class DecodeGraphs:
         self.storage = arena.k
         self.capture_s = time.perf_counter() - started
         logger.info("captured %d decode graphs in %.2f s",
-                    len(self.graphs), self.capture_s)
+                    len(self.graphs) + len(self.document_graphs), self.capture_s)
         return True
 
     def supports(self, chunk):
@@ -207,22 +248,29 @@ class DecodeGraphs:
                 or chunk.meta["max_a"] > self.config.max_query_tokens):
             return False
         reads = chunk.meta["reads"]
+        page_tokens = self.pipeline.engine.arena.page_tokens
+        width = (self.config.max_context_tokens + page_tokens - 1) // page_tokens
         if (reads is None or reads.get("nodes") is not None
-                or reads.get("documents") is not None
                 or reads["max_q"] > self.config.max_query_tokens
                 or reads["max_used"] > self.config.max_context_tokens
-                or reads["table"].shape[1] > (
-                    self.config.max_context_tokens
-                    + self.pipeline.engine.arena.page_tokens - 1
-                ) // self.pipeline.engine.arena.page_tokens):
+                or reads["table"].shape[1] > width):
+            return False
+        documents = reads.get("documents")
+        if documents is not None and (
+                documents["max_q"] > self.config.max_document_rows
+                or documents["max_used"] > self.config.max_context_tokens
+                or documents["table"].shape[1] > width
+                or chunk.tokens >= self.config.row_buckets[-1]):
             return False
         return True
 
     def forward(self, chunk):
         """Replay a matching graph, falling back to the ordinary forward."""
         if self.supports(chunk):
-            for captured in self.graphs:
-                if captured.buffers.rows >= chunk.tokens:
+            documents = chunk.meta["reads"].get("documents") is not None
+            # a batch with documents leaves call B's last row unread
+            for captured in (self.document_graphs if documents else self.graphs):
+                if captured.buffers.rows >= chunk.tokens + documents:
                     captured.buffers.copy(chunk)
                     captured.graph.replay()
                     self.replays += 1

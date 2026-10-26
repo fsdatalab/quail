@@ -50,6 +50,9 @@ def gpu_memory_utilization(device: DeviceSpec | None,
 
 
 CUDA_GRAPH_CAPTURE_SIZE = 8_192
+# the capture sizes the stock vLLM baseline runs with: one graph, so
+# vLLM pads every step of up to 8,192 tokens to 8,192
+SINGLE_CUDA_GRAPH = (CUDA_GRAPH_CAPTURE_SIZE,)
 # vLLM caps a diffusion model at 8 sequences per step whenever the
 # setting is 128 or more, sized for its 256-row canvas; one row needs
 # no cap, so stay just under the trigger.
@@ -270,7 +273,14 @@ class VLLMClient:
 
 
 class VLLMEngine:
-    """Boot vLLM for a request backend, with Quail's tuned engine settings."""
+    """Boot vLLM for a request backend, with Quail's tuned engine settings.
+
+    Args:
+        capture_sizes: The batch sizes, in tokens, vLLM captures CUDA
+            graphs for; a step pads to the smallest size that holds it
+            and runs without graphs past the largest. None keeps vLLM's
+            own default.
+    """
 
     kind = "vllm"
     label = "vLLM"
@@ -283,6 +293,16 @@ class VLLMEngine:
     reads_logprobs = True
     # a decision model runs on the pooling runner
     roles = frozenset({"generative", "decision"})
+
+    def __init__(self, capture_sizes: tuple[int, ...] | None = SINGLE_CUDA_GRAPH):
+        self.capture_sizes = (None if capture_sizes is None
+                              else tuple(capture_sizes))
+        if self.capture_sizes != SINGLE_CUDA_GRAPH:
+            # vLLM fixes its graphs when the engine is built, so an
+            # engine with other graphs never shares a loaded model
+            shown = ("vllm-default" if self.capture_sizes is None
+                     else f"{len(self.capture_sizes)}-to-{self.capture_sizes[-1]}")
+            self.kind = f"{type(self).kind}-graphs-{shown}"
 
     def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
         """Return the LLM constructor arguments beyond the model name.
@@ -308,13 +328,13 @@ class VLLMEngine:
             "enable_prefix_caching": True,
             "disable_log_stats": True,
             "tokenizer_mode": "gigatoken",
-            "compilation_config": {
-                "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
-            },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
                              else min(MAX_SEQUENCES,
                                       spec.max_num_seqs or MAX_SEQUENCES)),
         }
+        if self.capture_sizes is not None:
+            kwargs["compilation_config"] = {
+                "cudagraph_capture_sizes": list(self.capture_sizes)}
         if spec.moe_backend is not None:
             kwargs["moe_backend"] = spec.moe_backend
         speculative = os.environ.get("QUAIL_VLLM_SPECULATIVE")
