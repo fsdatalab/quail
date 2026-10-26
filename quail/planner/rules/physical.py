@@ -15,6 +15,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiMap,
     AiScore,
     Limit,
     PhysicalGraph,
@@ -247,6 +248,10 @@ class ChooseClassifyImplementation(PhysicalRule):
         chosen = {}
         for node in pending:
             table = classify_scoring(context, node.spec.anchor)
+            if any(isinstance(other, AiMap) for other in paths[node.node_id]):
+                # trie_tree runs its pipeline on the tree path, where a
+                # map's decode rounds have no unified reads or graphs
+                table = replace(table, tree=False)
             resident = paths[node.node_id][0] is not node
             chosen[node.node_id] = replace(node, spec=table.choose_scoring(
                 node.spec, calls[node.spec.name], resident))

@@ -1331,3 +1331,25 @@ def test_a_label_in_where_names_the_classification_by_its_as_name(session):
     with pytest.raises(CompileError, match="both a column"):
         session.sql(f"SELECT d.id, {call} AS body FROM documents d "
                     f"WHERE body = 'refund'")
+
+
+def test_a_classification_before_a_map_scores_without_the_tree_path(session, tmp_path):
+    # labels of several tokens are scored best as a packed trie, which
+    # needs the tree path; a map in the same pipeline would then decode
+    # on the tree path too, so the classification takes another rule
+    _corpus(session, tmp_path, "reviews", "body", 60, 120)
+    labels = [f"label number {i}" for i in range(12)]
+
+    def classified():
+        return (session.docs("reviews").alias("r")
+                .ai_classify(quail.prompt("Topic of {0}?", quail.col("r.body")),
+                             labels, name="topic"))
+
+    def scoring(query):
+        (classify,) = [node for node in query.plan().nodes
+                       if isinstance(node, AiClassify)]
+        return classify.spec.scoring
+
+    assert scoring(classified().select("r.id", "topic")) == "trie_tree"
+    mapped = classified().ai_map("r.body", "Summarize.", name="summary")
+    assert scoring(mapped.select("r.id", "topic", "summary")) != "trie_tree"
