@@ -496,10 +496,13 @@ def test_maps_with_different_answer_limits_run_as_branches(monkeypatch):
     assert written == [2, 5]
 
 
-def test_a_map_after_a_filter_grows_its_pages_in_a_small_pool(monkeypatch):
-    # a filter then a map in one pipeline, twenty-four documents, and a
-    # pool that holds six reserved for the whole answer limit: the map
-    # grows each survivor's pages as it writes, so more run at once
+def _filter_then_map(monkeypatch, *, pool_documents=None, filter_limit=None,
+                     first_gold=None):
+    """Run a filter then a map over twenty-four leases in one pipeline.
+
+    Every fourth lease fails the filter. Returns the map's rows, the
+    leases each pass packed, the arena, and the answer.
+    """
     from helpers.fakes import cpu_arena, fake_pipeline, fake_readout, fake_torch
 
     from quail.backends.quail import QuailModelExecution
@@ -510,7 +513,7 @@ def test_a_map_after_a_filter_grows_its_pages_in_a_small_pool(monkeypatch):
     from quail.specs import DEVICES, MODELS
 
     gold = "March 3"
-    tables = make_vocabulary(LEASE, gold)
+    tables = make_vocabulary(LEASE, gold, *([first_gold] if first_gold else []))
     spec = make_map_spec(tables, max_answer_tokens=48, draft_tokens=2,
                          draft_policy="fixed", expected_answer_tokens=4)
     head, tail = spec.prompt_token_parts
@@ -530,6 +533,8 @@ def test_a_map_after_a_filter_grows_its_pages_in_a_small_pool(monkeypatch):
         model.documents[("c", index)] = LEASE
         model.gold[("c", index)] = gold
         model.filter_truth[("c", index)] = index % 4 != 3
+    if first_gold:
+        model.gold[("c", 0)] = first_gold
     tokens = tables.encode_ids(LEASE)
     question = tables.encode_ids(" question")
     graph = PhysicalGraph((
@@ -546,7 +551,9 @@ def test_a_map_after_a_filter_grows_its_pages_in_a_small_pool(monkeypatch):
               backend_name="quail", model="qwen3-4b-fp8", spec=spec),
     ), PortRef("ai-map:summary", "rows:c"))
     whole = len(head) + len(tokens) + len(tail) + 48 + 2 * 2
-    torch, arena = fake_torch(), cpu_arena(6 * -(-whole // 16))
+    torch = fake_torch()
+    arena = cpu_arena(256 if pool_documents is None
+                      else pool_documents * -(-whole // 16))
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
@@ -564,10 +571,86 @@ def test_a_map_after_a_filter_grows_its_pages_in_a_small_pool(monkeypatch):
              "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
              "documents": {"c": [tokens] * count}, "texts": {"c": [LEASE] * count}}
     report = execute_single_graph(
-        state, {"filter_limit": None, "retention": {}}, graph)
+        state, {"filter_limit": filter_limit, "retention": {}}, graph)
     table = report["_outputs"][PortRef("ai-map:summary", "rows:c")].to_pydict()
-    survivors = [index for index in range(count) if index % 4 != 3]
+    return table, passes, arena, gold
+
+
+def test_a_map_after_a_filter_grows_its_pages_in_a_small_pool(monkeypatch):
+    # a pool that holds six leases reserved for the whole answer limit:
+    # the map grows each survivor's pages as it writes, so more run at once
+    table, passes, arena, gold = _filter_then_map(monkeypatch, pool_documents=6)
+    survivors = [index for index in range(24) if index % 4 != 3]
     assert table["c"] == survivors
     assert table["summary"] == [gold] * len(survivors)
     assert max(len(keys) for keys in passes) > 6
     assert not arena.accounting.owned
+
+
+def test_a_limit_after_a_filter_returns_only_whole_answers(monkeypatch):
+    # the first lease's answer is longer, so it is still being written
+    # when two others end and the limit stops the run
+    longer = "March 3, 2027 at noon or the first business day after it"
+    table, _, arena, gold = _filter_then_map(monkeypatch, filter_limit=2,
+                                             first_gold=longer)
+    answers = dict(zip(table["c"], table["summary"]))
+    assert len(answers) >= 2
+    assert answers.pop(0, longer) == longer
+    assert set(answers.values()) == {gold}
+    assert not arena.accounting.owned
+
+
+def _run_maps(monkeypatch, count, num_maps, *, limit=None, keep_kv=False,
+              pool_documents=None, chunk_tokens=400):
+    """Put num_maps instructions to count copies of a lease; return each map's rows."""
+    from dataclasses import replace
+
+    from helpers.fakes import cpu_arena
+
+    gold = "March 3, 2027 at noon"
+    tables = make_vocabulary(LEASE, gold)
+    spec = make_map_spec(tables, max_answer_tokens=48, draft_tokens=0,
+                         draft_policy="fixed", expected_answer_tokens=4)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
+    state = _state(model, chunk_tokens=chunk_tokens)
+    state.loaded_model.vocabulary = tables
+    tokens = tables.encode_ids(LEASE)
+    if pool_documents is not None:
+        head, tail = spec.prompt_token_parts
+        whole = len(head) + len(tokens) + len(tail) + 48
+        state.loaded_model.arena = cpu_arena(pool_documents * -(-whole // 16))
+    original = MapStages.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        for key in self.keys:
+            model.documents[key] = LEASE
+            model.gold[key] = gold
+
+    monkeypatch.setattr(MapStages, "__init__", init)
+    specs = [spec] + [replace(spec, name=f"map{index}") for index in range(1, num_maps)]
+    nodes = [AiMap(node_id=f"ai-map:{each.name}", backend_name="quail",
+                   model="qwen3-4b-fp8", spec=each, keep_kv=keep_kv)
+             for each in specs]
+    inputs = {"document_ids": list(range(count)), "documents": {"c": [tokens] * count},
+              "texts": {"c": [LEASE] * count}, "limit": limit}
+    results = MapPart.execute_group(state, nodes, inputs)
+    rows = {each.name: results[f"ai-map:{each.name}"].outputs["rows:c"].to_pydict()
+            for each in specs}
+    return rows, gold
+
+
+def test_a_limit_over_several_maps_counts_documents(monkeypatch):
+    rows, gold = _run_maps(monkeypatch, 8, 2, limit=3)
+    assert len(rows["summary"]["c"]) >= 3
+    assert rows["summary"]["c"] == rows["map1"]["c"]
+    assert set(rows["summary"]["summary"]) == set(rows["map1"]["map1"]) == {gold}
+
+
+def test_branches_that_keep_kv_finish_in_a_small_pool(monkeypatch):
+    rows, gold = _run_maps(monkeypatch, 60, 2, keep_kv=True, pool_documents=5,
+                           chunk_tokens=160)
+    assert rows["summary"]["summary"] == rows["map1"]["map1"] == [gold] * 60

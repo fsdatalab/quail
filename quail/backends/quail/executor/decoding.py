@@ -271,15 +271,21 @@ class AnswerPart(DocumentAnswerPart):
         """
         state.gpu_timing = bool(inputs.get("gpu_timing", False))
         started = time.perf_counter()
-        part = cls(state, nodes, inputs["document_ids"], inputs, standalone=True)
+        # a limit counts documents, so their questions are asked in
+        # turn, not as branches whose anchors it would count
+        part = cls(state, nodes, inputs["document_ids"], inputs,
+                   standalone=inputs.get("limit") is None)
         stages = part.answer_stages
+        branches = getattr(stages, "branches", False)
         tree = getattr(stages, "prefix_tree", None)
         if tree is None and nodes[0].spec.share_prefixes:
             tree = shared_prefix_tree(nodes[0].spec.name, stages.prefixes,
                                       state.loaded_model.arena)
         results = execute_parts(
             state, [part], stages.prefixes, stages.keys,
-            keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
+            # a branch's settled pages are still shared with its
+            # siblings, so branches retain no KV
+            keep_kv=nodes[-1].keep_kv and not branches, prefix_tree=tree,
             limit=inputs.get("limit"),
             label=f"{stages.operator} "
                   f"{', '.join(node.spec.name for node in nodes)}")

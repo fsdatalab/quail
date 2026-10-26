@@ -81,6 +81,9 @@ class KVGrowth:
         self.running = {}      # anchor -> None, in admission order
         self._margins = None
         self._projection = None
+        # admits()'s projection with the anchor it accepted, kept once
+        # that anchor is admitted
+        self._accepted = None
         self.stalls = 0
         self.grown_pages = 0
         self.max_running = 0
@@ -109,6 +112,9 @@ class KVGrowth:
         self.kept_pages[anchor] = len(accounting.borrowed[key]) + lent_pages
         self.running[anchor] = None
         self.max_running = max(self.max_running, len(self.running))
+        accepted, self._accepted = self._accepted, None
+        self._projection = (accepted[1] if accepted is not None
+                            and accepted[0] == anchor else None)
         # admits() already counted this document in the projection; it
         # is the youngest, so its margin joins the end of the others
         if self._margins is not None:
@@ -174,6 +180,8 @@ class KVGrowth:
         if not short.any():
             return set()
         anchors, wanted = anchors[short], wanted[short]
+        # retained KV is evicted when a page is needed
+        free_pages += self.arena.retained_pages
         rank, base, _ = self._margin_base()
         ranks = rank[anchors]
         stalled = set()
@@ -226,7 +234,7 @@ class KVGrowth:
         return self._projection
 
     def admits(self, anchor: int, pages: int, free_pages: int) -> bool:
-        """Return whether a fresh document fits, and count it if so.
+        """Return whether a fresh document fits; admitted() then counts it.
 
         It fits when the pool stays safe with it admitted last and the
         projected growth, with it added, never comes within reserve
@@ -238,7 +246,8 @@ class KVGrowth:
             free_pages: The free pages before its admission.
         """
         _, base, total_frees = self._margin_base()
-        left = free_pages - pages
+        # retained KV is evicted when a page is needed
+        left = free_pages + self.arena.retained_pages - pages
         if len(base) and left + int(base.min()) < 0:
             return False
         if left + total_frees < int(self._pages(self.final[anchor])) - pages:
@@ -249,5 +258,6 @@ class KVGrowth:
         own = np.where(self.grid < remaining, self._pages(rows) - pages, -pages)
         if int((growth + own).max()) > left - self.reserve:
             return False
-        self._projection = growth + own
+        # counted once admitted(): the admission can still hold it
+        self._accepted = (anchor, growth + own)
         return True

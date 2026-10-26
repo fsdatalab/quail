@@ -71,3 +71,14 @@ def test_a_document_is_admitted_when_the_projected_peak_fits():
     _admit(arena, keys, growth, 1)
     model.left = {0: 16, 1: 64, 2: 64}
     assert not growth.admits(2, 2, arena.free_pages)
+
+
+def test_a_document_the_admission_holds_back_is_not_counted():
+    # admits() accepts a document, but the chunk has no room for it;
+    # asking again, as the next chunk does, must not count it twice
+    arena, keys, model, growth = _growth(16, 3)
+    _admit(arena, keys, growth, 0)
+    _admit(arena, keys, growth, 1)
+    model.left = {0: 16, 1: 64, 2: 64}
+    for _ in range(10):
+        assert growth.admits(2, 2, arena.free_pages)

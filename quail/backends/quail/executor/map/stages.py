@@ -469,14 +469,20 @@ class MapStages(AnswerStages):
         return StageRequests(Suffixes(fed, [len(fed)]), position=position)
 
     def finish(self) -> None:
-        """Answer every question the steps left open."""
+        """Answer every question the steps left open.
+
+        A document whose answers had not all ended, as a limit leaves
+        the ones in flight, is not returned.
+        """
+        ended = np.logical_and.reduce([state.done for state in self.decoder.states])
+        self._returned = self.decoder.states[0].asked & ended
         for q, state in enumerate(self.decoder.states):
             for index in np.flatnonzero(~state.done):
                 self.decoder.settle(self.documents[index], q)
 
     def asked(self) -> list:
-        """Return the indices of the documents the questions were asked of."""
-        return np.flatnonzero(self.decoder.states[0].asked).tolist()
+        """Return the indices of the documents whose every answer ended."""
+        return np.flatnonzero(self._returned).tolist()
 
     def answers(self, q: int, kept=None) -> list:
         """Return each document's answer for instruction q.
