@@ -15,12 +15,9 @@ class MapPart(AnswerPart):
     stages_type = MapStages
     operator = "AI.MAP"
     branches = True
-    # a round's rows join their pages and one causal paged call reads
-    # them with the document, rather than the tree path's call over
-    # the fresh rows, its read of the document, and their merge; maps
-    # put to a document at once also read its shared pages once for
-    # all of their branches (see attention_shared)
-    attention = "unified"
+    # the branches of one document read its pages once per pass (see
+    # Stage.document_reads); a model without tree attention runs unified
+    attention = "tree"
 
     def _answer_rows(self, node, q: int, kept, document_ids):
         """Return one map's written answers."""

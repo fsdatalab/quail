@@ -182,6 +182,13 @@ def test_two_maps_share_one_document_read(monkeypatch):
     # the tokens past the pages it borrows
     assert prefix_tokens[stages.keys[0]] == length
     assert prefix_tokens[stages.keys[1]] == length - shared
+    # on the tree path the two branches' rounds read the borrowed pages
+    # once, as one group, and each reads only its own pages beside it
+    together = [packed_spec["document_reads"] for packed_spec in packed
+                if len(packed_spec.get("keys", ())) == 2]
+    assert together
+    for groups, tokens in together:
+        assert groups.tolist() == [0, 0] and tokens.tolist() == [shared, shared]
 
 
 def test_map_answers_need_the_document_tokens_or_text():

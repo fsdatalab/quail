@@ -136,6 +136,9 @@ class Stage:
             RoundRequests, asked when the chunk is built in place of
             suffixes; suffixes is still asked for a document costs
             passed on.
+        document_reads: With rounds, on the tree path, whether the rounds
+            of documents that borrow one parent's pages read those pages
+            once, together, in a call beside call B.
         label: Name displayed in progress messages.
         paths: Optional trie paths and ancestor references from trie_paths().
         read_mask: Optional mask of the rows read in the sole paths
@@ -166,6 +169,7 @@ class Stage:
     launched: Callable | None = None
     costs: Callable | None = None
     rounds: Callable | None = None
+    document_reads: bool = False
     label: str = ""
     paths: list | None = None
     read_mask: Any = None

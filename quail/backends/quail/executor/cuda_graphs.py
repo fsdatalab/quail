@@ -208,6 +208,7 @@ class DecodeGraphs:
             return False
         reads = chunk.meta["reads"]
         if (reads is None or reads.get("nodes") is not None
+                or reads.get("documents") is not None
                 or reads["max_q"] > self.config.max_query_tokens
                 or reads["max_used"] > self.config.max_context_tokens
                 or reads["table"].shape[1] > (

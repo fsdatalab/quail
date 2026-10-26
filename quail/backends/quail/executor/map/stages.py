@@ -221,8 +221,8 @@ class MapStages(AnswerStages):
                   prepare=self._stage_prepare(None, tail=False),
                   launched=self._stage_launched(None, tail=False), ahead=self.ahead,
                   costs=self._stage_costs(None), rounds=self._stage_rounds(None),
-                  read_all_rows=True, single=True, append=True, repeats=True,
-                  label=f"{names} rounds"),
+                  document_reads=True, read_all_rows=True, single=True,
+                  append=True, repeats=True, label=f"{names} rounds"),
         ]
 
     def _tail_suffix(self, key):

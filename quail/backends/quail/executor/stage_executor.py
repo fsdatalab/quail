@@ -661,6 +661,8 @@ class StageExecutor:
             # a round's position replaces the appended-token bookkeeping
             spec = dict(rounds=requests, keys=[self.keys[a] for a in anchors],
                         feed_bound=self.stages[j].suffix_tokens)
+            if self.mode == "tree" and self.stages[j].document_reads:
+                spec["document_reads"] = self._document_reads(anchors)
             specs.append(spec)
             sources.extend(self.latest[anchors[index]]
                            for index in np.flatnonzero(requests.device_fed))
@@ -673,6 +675,30 @@ class StageExecutor:
         for a, tokens in appended.items():
             self.appended[a] = tokens
         return chunk, entries, following, group_entries, sources
+
+    def _document_reads(self, anchors):
+        """Return each round's document group and the tokens it reads there.
+
+        A borrower's group is its parent, and a parent is its own
+        group. A group reads the fewest tokens any of its members
+        borrows, in whole pages. A group with one round in the chunk
+        reads nothing apart: its pages stay in its call B read.
+        """
+        groups = np.empty(len(anchors), dtype=np.int64)
+        shared = np.zeros(len(anchors), dtype=np.int64)
+        for index, a in enumerate(anchors):
+            parent = self.borrowing.parent(a)
+            if parent is not None:
+                groups[index], shared[index] = parent, self.borrowing.shared(a)
+            else:
+                groups[index], shared[index] = a, self.lowest_borrow.get(a, 0)
+        _, inverse, sizes = np.unique(groups, return_inverse=True,
+                                      return_counts=True)
+        least = np.full(len(sizes), np.iinfo(np.int64).max, dtype=np.int64)
+        np.minimum.at(least, inverse, shared)
+        shared = least[inverse]
+        shared[sizes[inverse] < 2] = 0
+        return groups, shared
 
     def _ordered(self, part):
         """Return the groups with the bulk stages' rounds last."""

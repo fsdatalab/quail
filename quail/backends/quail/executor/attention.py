@@ -1019,6 +1019,17 @@ class Engine:
                 nodes["cu_q"], nodes["cu_k"], nodes["max_q"], nodes["max_k"],
                 causal=False)
             merge_partial(out_b, lse_b, nodes["b_index"], out_c, lse_c)
+        documents = reads.get("documents")
+        if documents is not None:
+            # the rows of a document's map branches over the pages
+            # they all borrow, read once and merged into their call B
+            # result, which read only each branch's own pages
+            out_d, lse_d = self._fa(
+                q_readers.index_select(0, documents["b_index"]), kp, vp,
+                documents["cu_q"], None, documents["max_q"],
+                documents["max_used"], causal=False,
+                block_table=documents["table"], seqused_k=documents["used"])
+            merge_partial(out_b, lse_b, documents["b_index"], out_d, lse_d)
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(

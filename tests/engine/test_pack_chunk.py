@@ -275,3 +275,53 @@ def test_rounds_packed_together_on_the_unified_path_follow_their_answers(monkeyp
     assert unified["used"].tolist() == [11, 11]
     assert unified["dst"].tolist() == (rows[first][8:11].tolist()
                                        + rows[second][10:11].tolist())
+
+
+def test_branch_rounds_read_their_document_pages_once(monkeypatch):
+    import numpy as np
+
+    from quail.backends.quail.executor.readout import RoundFeed
+    from quail.backends.quail.executor.stages import RoundRequests
+
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    page = arena.page_tokens
+    # two maps over one document: the first branch holds the document,
+    # and the second borrows its first two pages
+    first, second = ("d", 1), ("branch", ("d", 1), 1)
+    arena.activate(first, 2 * page + 3, capacity_tokens=3 * page)
+    arena.activate(second, 2 * page + 5, capacity_tokens=3 * page,
+                   borrow=(first, 2 * page))
+    document = arena.owned_pages(first)[:2]
+    assert arena.owned_pages(second)[:2] == document
+    rows = {key: arena.capacity_rows(key) for key in (first, second)}
+    requests = RoundRequests(
+        ids=np.array([0, 51, 52, 0]), lengths=np.array([3, 1]),
+        positions=np.array([2 * page + 3, 2 * page + 5]),
+        device_fed=np.array([True, True]))
+    chunk = chunk_mod.pack_chunk(
+        torch, arena, [dict(rounds=requests, keys=[first, second], feed_bound=3,
+                            document_reads=(np.array([0, 0]),
+                                            np.array([2 * page, 2 * page])))],
+        attention_mode="tree")
+    reads = chunk.meta["reads"]
+    # each branch's call B reads only the pages past the document's
+    assert reads["used"].tolist() == [3, 5]
+    assert reads["table"][:, 0].tolist() == [arena.owned_pages(first)[2],
+                                             arena.owned_pages(second)[2]]
+    # one read of the document's pages serves both branches' rows
+    documents = reads["documents"]
+    assert documents["b_index"].tolist() == [0, 1, 2, 3]
+    assert documents["cu_q"].tolist() == [0, 4]
+    assert documents["used"].tolist() == [2 * page]
+    assert documents["table"].tolist() == [document]
+    # the first round's source accepted one draft token and chose 50;
+    # the second's accepted none and chose 60
+    feed = RoundFeed(accepted=torch.tensor([0, 1]), chosen=torch.tensor([60, 50]))
+    chunk.apply_feed(torch, feed, [1, 0], page)
+    assert chunk.positions.tolist() == [2 * page + 5, 2 * page + 6, 2 * page + 7,
+                                        2 * page + 6]
+    assert reads["used"].tolist() == [5, 6]
+    assert chunk.meta["kv_dst"].tolist() == (
+        rows[first][2 * page + 5:2 * page + 8].tolist()
+        + rows[second][2 * page + 6:2 * page + 7].tolist())

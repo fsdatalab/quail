@@ -51,7 +51,6 @@ def bare_arena(arena, pages):
     arena.pinned = False
     arena._rows = {}
     arena._capacity_rows = {}
-    arena._capacity_rows_numpy = {}
     arena._sliding_rows = {}
     arena._base = {}
     arena._sliding_start = {}
