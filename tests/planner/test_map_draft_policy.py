@@ -1,7 +1,9 @@
 """The map draft policy and the n-gram cache it drafts from."""
 
+import numpy as np
+
 from quail.cost.draft_policy import MapDraftPolicy
-from quail.cost.ngram_cache import MAX_CONTINUATIONS, NgramCache, NgramMatch
+from quail.cost.ngram_cache import MAX_CONTINUATIONS, NgramCache
 
 
 def test_the_cache_prefers_the_longest_match():
@@ -35,23 +37,30 @@ def test_the_cache_caps_continuations_per_key():
     assert len(cache.continuations((1, 2))) == MAX_CONTINUATIONS
 
 
+def _length(policy, rho, written, rate, slack):
+    """One round's draft length when every hop has the same odds."""
+    room = min(policy.cap, policy.max_answer_tokens - written - 1)
+    return int(policy.chain_lengths(
+        np.array([rho]), np.array([written]), np.full((1, policy.cap), rate),
+        slack, np.array([room]))[0])
+
+
 def test_hit_rates_blend_the_count_share_with_observed_accepts():
     policy = MapDraftPolicy(cap=15, max_answer_tokens=64,
                             expected_answer_tokens=16)
-    match = NgramMatch(token=5, order=3, fan_out=2, share=0.8, own=True)
-    seed = policy.hit_rate(match)
-    assert seed == 0.8
-    cell = policy.cell(match)
-    for _ in range(100):
-        policy.observe(cell, False)
-    assert policy.hit_rate(match) < 0.1
+    match = dict(order=np.array([3]), fan_out=np.array([2]),
+                 own=np.array([True]), share=np.array([0.8]))
+    cells, seed = policy.odds_many(**match)
+    assert seed[0] == 0.8
+    policy.trials[cells[0]] += 100
+    assert policy.odds_many(**match)[1][0] < 0.1
 
 
 def test_chained_drafts_shrink_with_the_hit_rate():
     policy = MapDraftPolicy(cap=15, max_answer_tokens=64,
                             expected_answer_tokens=16)
-    sure = policy.chain_length(5.0, 1, [0.95] * 15, slack=3.0)
-    doubtful = policy.chain_length(5.0, 1, [0.3] * 15, slack=3.0)
+    sure = _length(policy, 5.0, 1, 0.95, slack=3.0)
+    doubtful = _length(policy, 5.0, 1, 0.3, slack=3.0)
     assert doubtful < sure
 
 
@@ -60,21 +69,18 @@ def test_slack_lengthens_the_draft():
     # guesses are worth feeding
     policy = MapDraftPolicy(cap=15, max_answer_tokens=64,
                             expected_answer_tokens=16)
-    busy = policy.chain_length(5.0, 1, [0.5] * 15, slack=0.0)
-    idle = policy.chain_length(5.0, 1, [0.5] * 15, slack=15.0)
+    busy = _length(policy, 5.0, 1, 0.5, slack=0.0)
+    idle = _length(policy, 5.0, 1, 0.5, slack=15.0)
     assert idle > busy
-    assert policy.copy_length(5.0, 1, slack=15.0) >= policy.copy_length(
-        5.0, 1, slack=0.0)
 
 
 def test_copy_misses_shrink_the_copied_draft():
     policy = MapDraftPolicy(cap=15, max_answer_tokens=256,
                             expected_answer_tokens=64)
-    seeded = policy.copy_length(17.0, 10, slack=0.0)
-    for _ in range(100):
-        policy.observe_copy(False)
+    seeded = _length(policy, 17.0, 10, policy.copy_rate(), slack=0.0)
+    policy.copy_trials += 100
     assert policy.copy_rate() < 0.1
-    assert policy.copy_length(17.0, 10, slack=0.0) <= 1
+    assert _length(policy, 17.0, 10, policy.copy_rate(), slack=0.0) <= 1
     assert seeded > 1
 
 
@@ -84,7 +90,6 @@ def test_the_kv_read_is_what_a_draft_amortizes():
     # with no read to save and no slack, no odds justify a draft
     policy = MapDraftPolicy(cap=15, max_answer_tokens=256,
                             expected_answer_tokens=64)
-    assert policy.chain_length(0.0, 10, [0.95] * 15, slack=0.0) == 0
-    assert policy.copy_length(0.0, 10, slack=0.0) == 0
-    assert policy.chain_length(3.6, 10, [0.5] * 15, slack=0.0) >= 1
-    assert policy.chain_length(3.6, 10, [0.1] * 15, slack=0.0) == 0
+    assert _length(policy, 0.0, 10, 0.95, slack=0.0) == 0
+    assert _length(policy, 3.6, 10, 0.5, slack=0.0) >= 1
+    assert _length(policy, 3.6, 10, 0.1, slack=0.0) == 0

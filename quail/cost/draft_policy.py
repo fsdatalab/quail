@@ -17,7 +17,7 @@ import math
 
 import numpy as np
 
-from quail.cost.ngram_cache import MATCH_ORDERS, MAX_CONTINUATIONS, NgramMatch
+from quail.cost.ngram_cache import MATCH_ORDERS, MAX_CONTINUATIONS
 
 # how many observations the seed of each curve weighs
 PRIOR_WEIGHT = 8
@@ -227,50 +227,10 @@ class MapDraftPolicy:
         self.copy_trials = 0
         self.copy_accepts = 0
 
-    def cell(self, match: NgramMatch) -> int:
-        """Return the acceptance table's cell for one cache match."""
-        return _CELLS[match.order, match.fan_out, match.own]
-
-    def hit_rate(self, match: NgramMatch) -> float:
-        """Return P(the model writes the match's token).
-
-        The seed is the continuation's count share in the cache,
-        blended by count with the drafts verified at the same cell.
-        """
-        return self.odds(match)[1]
-
-    def odds(self, match: NgramMatch) -> tuple:
-        """Return one cache match's cell and its hit rate, computed once."""
-        c = self.cell(match)
-        seed = PRIOR_WEIGHT * match.share
-        return c, (seed + self.accepts[c]) / (PRIOR_WEIGHT + self.trials[c])
-
-    def _room(self, written: int) -> int:
-        return min(self.cap, self.max_answer_tokens - written - 1)
-
     def copy_rate(self) -> float:
         """Return P(the model writes a copied draft's next token)."""
         return ((PRIOR_WEIGHT * COPY_RATE_SEED + self.copy_accepts)
                 / (PRIOR_WEIGHT + self.copy_trials))
-
-    def observe_copy(self, accepted: bool) -> None:
-        """Record whether a copied draft token was written."""
-        self.copy_trials += 1
-        self.copy_accepts += accepted
-
-    def copy_length(self, rho: float, written: int, slack: float) -> int:
-        """Return the draft length for a round copying from the document.
-
-        A copied draft writes while the model keeps quoting the
-        document and the answer goes on; the quoting odds are learned
-        per token from the verified rounds.
-
-        Args:
-            rho: The round's KV read, in fed tokens.
-            written: The answer's tokens so far.
-            slack: Fed tokens the current passes carry for free.
-        """
-        return self._best_length(rho, written, self.copy_rate(), slack)
 
     def odds_many(self, order: np.ndarray, fan_out: np.ndarray, own: np.ndarray,
                   share: np.ndarray) -> tuple:
@@ -282,7 +242,13 @@ class MapDraftPolicy:
 
     def chain_lengths(self, rho: np.ndarray, written: np.ndarray,
                       rates: np.ndarray, slack: float, room: np.ndarray) -> np.ndarray:
-        """Return chain_length for many rounds at once.
+        """Return each round's draft length with the least cost per written token.
+
+        The first slack draft tokens ride a pass below the ridge, so
+        they cost nothing; each one past the slack costs one token.
+        Draft token j writes when the answer goes on and every hop
+        through j wrote. A round whose best draft costs no less than
+        feeding no draft feeds none.
 
         Args:
             rho: Each round's KV read, in fed tokens.
@@ -293,8 +259,7 @@ class MapDraftPolicy:
             room: The most tokens each draft may have.
 
         Returns:
-            Per round, the draft length with the least cost per written
-            token, as _best_length picks it.
+            Per round, the draft length.
         """
         gamma = np.arange(1, self.cap + 1)
         levels = np.asarray(self.curve.levels())
@@ -311,68 +276,3 @@ class MapDraftPolicy:
         best = np.argmin(cost, axis=1) + 1
         best[np.min(cost, axis=1) >= rho + 1.0] = 0
         return best
-
-    def chain_length(self, rho: float, written: int, rates, slack: float) -> int:
-        """Return how many of a chained draft's tokens to feed.
-
-        Args:
-            rho: The round's KV read, in fed tokens.
-            written: The answer's tokens so far.
-            rates: Each hop's acceptance odds, in hop order; its length
-                bounds the draft.
-            slack: Fed tokens the current passes carry for free.
-        """
-        room = min(self._room(written), len(rates))
-        if room <= 0:
-            return 0
-        return self._best_length(rho, written, rates, slack, room=room)
-
-    def _best_length(self, rho: float, written: int, rates, slack: float,
-                     room: int | None = None) -> int:
-        """Return the draft length with the least cost per written token.
-
-        The first slack draft tokens ride a pass below the ridge, so
-        they cost nothing; each one past the slack costs one token.
-        Draft token j writes when the answer goes on and every hop
-        through j wrote. The arrays are at most cap plus one long, so
-        plain loops beat array allocation here.
-
-        Args:
-            rho: The round's KV read, in fed tokens.
-            written: The answer's tokens so far.
-            rates: Each hop's acceptance odds, in hop order; a float is
-                one rate for every hop, as a copied draft has.
-            slack: Fed tokens the current passes carry for free.
-            room: The most tokens the draft may have; None derives it
-                from the answer limit.
-        """
-        if room is None:
-            room = self._room(written)
-        if room <= 0:
-            return 0
-        uniform = rates if isinstance(rates, float) else None
-        levels = self.curve.levels()
-        base = levels[written]
-        writes = 1.0
-        chained = 1.0
-        best, best_cost = 0, rho + 1.0
-        for gamma in range(1, room + 1):
-            chained *= uniform if uniform is not None else rates[gamma - 1]
-            # survival at gamma tokens past written, 1 past a dead base
-            writes += chained * (levels[written + gamma] / base if base > 0
-                                 else 1.0)
-            extra = gamma - slack
-            cost = (rho + 1.0 + (extra if extra > 0 else 0.0)) / writes
-            if cost < best_cost:
-                best, best_cost = gamma, cost
-        return best
-
-    def observe(self, match_cell: int, accepted: bool) -> None:
-        """Record whether a chained draft token was written.
-
-        Args:
-            match_cell: The cell of the match that proposed the token.
-            accepted: Whether the model chose the token.
-        """
-        self.trials[match_cell] += 1
-        self.accepts[match_cell] += accepted
