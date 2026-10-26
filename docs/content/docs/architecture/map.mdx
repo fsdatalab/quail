@@ -1,0 +1,438 @@
+---
+title: AI.MAP
+---
+
+## Abstract
+
+`AI.MAP` writes a free-form answer to an instruction for each document
+in a table. The answers must equal greedy decoding, and their lengths
+are not known before the run. This page describes how Quail executes a
+map query on one GPU. Quail decodes every running answer in each
+forward pass and decides each pass one pass later, so the GPU never
+waits for the host. Quail copies likely next tokens from the document
+as drafts and verifies them in the same pass. Quail gives each answer
+KV pages as the answer grows, and it starts a new answer only while
+every running answer can still finish, so no answer is preempted. When
+several maps read one document, Quail reads the document's KV once for
+all of them.
+
+## 1. Introduction
+
+A map query has $N$ documents and $K$ instructions. It asks the model
+for $N \cdot K$ answers. E.g., a query with three instructions over
+5,000 movie reviews asks for 15,000 answers.
+
+Two properties make this workload different from a chat server:
+
+1. **The prompts share most of their tokens.** All $K$ prompts for one
+   document contain the same document. A review has about 300 tokens
+   and an instruction about 30.
+2. **Every request is known at the start.** The engine can choose the
+   order of the work, but it cannot know how long each answer is.
+
+Each decode step reads the KV of every token before it. For a map, most
+of that KV is the document. The cost of a step therefore depends on the
+document length more than on the step's own tokens. Quail uses this in
+three ways:
+
+- It writes several tokens per step when it can predict them
+  (Section 5).
+- It reads a document's KV once for all instructions on that document
+  (Section 6).
+- It runs as many answers at once as the KV pool can hold without the
+  risk of a stall (Section 4).
+
+## 2. Problem definition
+
+| Symbol | Meaning |
+| --- | --- |
+| $N$ | Number of documents |
+| $K$ | Number of instructions |
+| $L_k$ | Answer limit of instruction $k$, in tokens |
+| $P$ | Number of KV pages in the pool; a page holds 16 tokens |
+| $d$ | A document; $|d|$ is its length in tokens |
+
+**Input.** A table of $N$ documents, $K$ instructions, and a model.
+
+**Output.** For each document $d$ and instruction $k$, the answer that
+greedy decoding writes: at each position, the token with the highest
+probability, until the model ends its turn or the answer reaches $L_k$
+tokens.
+
+**Goal.** Return all answers in the least time.
+
+**Constraint.** The KV of all running answers must fit in $P$ pages.
+Answer lengths are unknown until each answer ends.
+
+The prompt for document $d$ and instruction $k$ is:
+
+```text
+[shared preamble] [d] Instruction: [instruction k] [answer cue]
+```
+
+The document comes before the instruction. The document's KV therefore
+does not depend on $k$, and all $K$ prompts can read the same KV.
+
+## 3. Execution model
+
+**Terms.** These terms have one meaning on this page.
+
+- A **branch** is one (document, instruction) pair. A query has
+  $N \cdot K$ branches.
+- A **page** is a block of KV for 16 tokens. A branch holds pages for
+  its own tokens. The $K$ branches of one document hold references to
+  the same document pages.
+- A **round** is one step of one branch: it feeds one chosen token and
+  zero or more draft tokens, and it reads one output row per fed token.
+- A **pass** is one forward pass of the model over a batch of rounds
+  and prompt prefills.
+- A **running** branch has started its answer and has not ended.
+
+Algorithm 1 is the main loop. Each line names the section that
+explains it.
+
+```text
+Algorithm 1: Execute a map query
+Input: documents D, instructions I, pool of P pages
+Output: an answer for each branch
+
+  queue  ← all branches, in document order
+  run    ← empty list of running branches, oldest first
+  pending ← none                    // the pass whose rows the host has not read
+  while queue or run or pending:
+      GROW(run)                                  // Section 4.3
+      while queue and ADMIT(head of queue, run): // Section 4.1, 4.2
+          move head of queue to the end of run
+      batch ← PACK(new branches, one round per branch in run)  // Section 6
+      launch batch on the GPU
+      queue the readout of batch on the GPU      // Section 5.3
+      if pending: DECIDE(pending)                // Section 5
+      pending ← batch
+      remove ended branches from run, and free their own pages
+```
+
+The GPU runs the passes in order. The host prepares pass $t+1$ and
+decides pass $t-1$ while the GPU runs pass $t$. Section 5.3 shows why
+the host can decide one pass late without making the GPU wait.
+
+## 4. Admission and KV growth
+
+The engine does not know answer lengths. If it reserves $L_k$ tokens of
+pages for every branch, most pages stay empty. If it reserves too few,
+a running branch can need a page that does not exist, and the engine
+must stop and restart some branch. Quail avoids both. A branch starts
+with pages for its prompt and two rounds, and it gets one more page
+when its next round needs one. Two checks decide when a new branch
+starts.
+
+### 4.1 The safety check
+
+For each running branch $b$, Quail keeps three numbers:
+
+- $\text{need}(b)$: pages that $b$ can still need, if its answer
+  reaches its limit.
+- $\text{free}(b)$: pages that $b$ returns to the pool when it ends.
+  Shared document pages are not counted while other branches read them.
+- the free pages of the pool, $F$.
+
+Order the running branches by start time, $b_1$ the oldest. Define the
+margin of $b_i$:
+
+$$
+m_i = F + \sum_{j<i} \text{free}(b_j) - \text{need}(b_i)
+$$
+
+**Invariant.** Every margin is at least 0.
+
+The invariant means that the branches can always finish in start
+order: $b_1$ can get all the pages it can need from $F$; when $b_1$
+ends, its pages let $b_2$ finish; and so on.
+
+```text
+Algorithm 2: ADMIT(b, run)
+  c ← pages that b takes now (its prompt and two rounds)
+  if F − c + min_i (m_i − F) < 0: return false        // an older branch could not finish
+  if F − c + Σ_j free(b_j) < need(b): return false     // b itself could not finish
+  if FORECAST(run ∪ {b}) > F − c − R: return false     // Section 4.2
+  return true
+```
+
+Quail stores $m_i - F$ for each branch, so a change of $F$ changes no
+stored value. A new branch joins at the end of the order, and its value
+is $\sum_j \text{free}(b_j) - \text{need}(b)$. Admission therefore adds
+one value; it does not recompute the others.
+
+### 4.2 The forecast
+
+The safety check assumes that every answer reaches its limit. Most
+answers end much earlier, so the safety check alone admits too few
+branches. The forecast estimates the pages that the running branches
+will use:
+
+1. For each instruction $k$, Quail estimates the distribution of answer
+   lengths with the Kaplan–Meier estimator. Ended answers are complete
+   observations. Running answers are censored observations: their
+   final length is at least their current length. Without the censored
+   observations, the estimate favors short answers, because short
+   answers end first.
+2. For each running branch, Quail takes the 90th percentile of its
+   remaining length, given the length it has written.
+3. Each branch grows by one token per pass until it reaches that
+   length, and then it returns $\text{free}(b)$ pages.
+4. Summed over branches, this gives the pages in use at each future
+   pass. FORECAST returns the peak of that sum.
+
+ADMIT requires the peak to stay at least $R$ pages below the pool size.
+$R$ is the most pages one branch can still grow. This reserve lets the
+oldest branch grow even when the forecast is too low.
+
+### 4.3 Growth
+
+Before each pass, GROW gives pages to the branches whose next round
+does not fit in the pages they hold.
+
+```text
+Algorithm 3: GROW(run)
+  for b in run, oldest first, if the next round of b needs g > 0 more pages:
+      if g ≤ F and, for every b_i older than b, m_i − g ≥ 0:
+          give g pages to b;  F ← F − g
+          // need(b) falls by g and free(b) rises by g: margins of b and
+          // younger branches do not change
+      else:
+          b skips this pass
+```
+
+A branch that skips a pass keeps its pages and tries again in the next
+pass.
+
+## 5. Decoding rounds
+
+### 5.1 Verification
+
+A round feeds a token $t_0$ and a draft $t_1, \ldots, t_\gamma$. The
+model returns an output row after each fed token. Row $i$ gives the
+greedy choice $c_i$ for the position after $t_i$. Quail accepts draft
+token $t_{i+1}$ only if $c_i = t_{i+1}$. Let $a$ be the number of
+accepted draft tokens. The round writes $t_1, \ldots, t_a$ and the
+choice $c_a$. The answer ends if a row prefers the end of the turn, or
+if the answer reaches $L_k$.
+
+### 5.2 Drafts
+
+Quail builds a draft in two ways:
+
+- **Copy from the document.** If the last written token, or the last
+  two, occur in the document, the draft is the document's tokens after
+  their first occurrence. Summaries often quote the document.
+- **Chain from answers.** An n-gram cache of the answers written so far
+  (orders 4, 3, and 2) predicts the next token from the last tokens.
+  Quail follows the cache from one prediction to the next. Answers to
+  one instruction often share phrases across documents.
+
+A round copies when it can and chains otherwise.
+
+Quail tracks the acceptance rate of each draft source and uses it as
+$r_i$, the probability that draft token $i$ is accepted given that
+token $i-1$ was accepted. A round costs one read of the branch's KV,
+expressed as $\rho$ fed tokens of compute. Fed tokens up to the pass's
+slack $s$ are free, because the pass is memory bound below that point.
+$S(w)$ is the probability that an answer with $w$ written tokens is
+still running. The adaptive policy chooses the draft length $\gamma$
+with the least cost per written token:
+
+$$
+\text{cost}(\gamma) =
+\frac{\rho + 1 + \max(\gamma - s, 0)}
+     {1 + \sum_{i=1}^{\gamma} \left(\prod_{j=1}^{i} r_j\right) \frac{S(w+i)}{S(w)}}
+$$
+
+If no $\gamma > 0$ costs less than $\gamma = 0$, the round feeds no
+draft.
+
+### 5.3 Device-fed rounds and the one-pass delay
+
+If the host must read pass $t$ before it builds the next round of a
+branch, the GPU waits for the host after each pass. Quail removes this
+wait. The readout of pass $t$ runs on the GPU and computes, for each
+round, the accepted count $a$ and the choice $c_a$. The round of pass
+$t+1$ is built on the host with a placeholder first token and a draft.
+On the GPU, before pass $t+1$ starts, index operations write $c_a$
+into the placeholder and move the round's positions, KV reads, and KV
+writes past the $a$ accepted tokens.
+
+```text
+Algorithm 4: DECIDE(pass t), on the host, while the GPU runs pass t+1
+  for each round r of pass t:
+      read a and c_a for r                    // copied after the readout of pass t
+      write the accepted tokens and c_a to the answer of r
+      if the answer ended: mark the branch to end
+      else: draft the round of pass t+2 from the answer so far
+```
+
+The draft of pass $t+1$ was chosen before the host knew $a$. If the
+model rejects part of it, Algorithm 4 drafts pass $t+2$ from the
+corrected answer, so a wrong draft costs one round, not more.
+
+## 6. Attention on the tree path
+
+Maps that run as branches use Quail's tree attention path, the path
+classification and filters use. A pass holds the rounds of many
+branches. Each attention layer makes these calls:
+
+1. **Call A, new rows.** One causal FlashAttention call over the
+   pass's new rows, read from the activations. Each round is its own
+   causal segment. The call returns the output $o_a$ and the
+   log-sum-exp $\ell_a$ of the attention scores.
+2. **Call B, resident KV.** One non-causal paged call. Each round
+   reads the KV already written for its branch. A round of a document
+   with two or more rounds in the pass reads only its branch's own
+   pages: the document tokens past the borrowed pages, its
+   instruction, and its answer. Any other round reads all of its
+   pages. The call returns $o_b$ and $\ell_b$.
+3. **Document read.** One more non-causal paged call, beside call B,
+   for each document with two or more rounds in the pass. It reads the
+   document's borrowed pages once, for the stacked rows of all the
+   document's rounds, and merges into those rows of call B by
+   log-sum-exp, as call C of classification merges its label paths.
+
+A fused Triton kernel then combines calls A and B exactly:
+
+$$
+o = \frac{e^{\ell_a} o_a + e^{\ell_b} o_b}{e^{\ell_a} + e^{\ell_b}}
+$$
+
+and quantizes $o$ for the next FP8 matrix multiplication. With $K$
+branches of one document in a pass, the document's KV is read once
+instead of $K$ times. A pass with no map branches makes only calls A
+and B, and call C for classification, as before.
+
+A map with one instruction, or maps after another operator, have no
+branches. They run on the unified path: each round's rows join its
+pages, and one causal paged call reads them with the document. A
+model without a tree path, such as the hybrid models, runs every map
+on the unified path, and each round reads all of its pages.
+
+Decode passes of up to 512 rows replay CUDA graphs. Quail captures the
+tree path's row buckets, 32 to 512 rows, twice: once as before, and
+once with the document read. A pass with the document read replays a
+graph with at least one row more than the pass, because the read's
+padding merges into that spare row. A larger pass runs without
+graphs.
+
+## 7. Properties
+
+**Exact answers.** A draft token is written only if the model's greedy
+choice at the row before it is that token (Section 5.1). Each answer is
+therefore the answer that greedy decoding writes with the same model
+and the same numerics. The numerics of a step depend slightly on the
+batch, so another engine's answers can differ. Section 9 reports the
+agreement with stock vLLM.
+
+**No deadlock.** Admission adds a branch only if every margin stays at
+least 0 (Algorithm 2). Growth gives pages to a branch only if every
+older margin stays at least 0 (Algorithm 3). Pages returned by an
+ended branch increase margins. The oldest branch has
+$m_1 = F - \text{need}(b_1) \ge 0$, so it can always grow, and it
+ends. By induction on start order, every branch ends.
+
+**No preemption.** No step of Algorithms 1 to 4 removes the KV of a
+running branch. A branch that cannot grow skips a pass.
+
+## 8. Maps after other operators
+
+A query can filter or classify documents before a map. Quail runs the
+operators in one pipeline: a document's KV stays in the pool while each
+operator asks its question. The map then asks its instructions one
+after another on the document's KV, not as branches. The filter and
+classification requests have a known size, so a document's first pages
+cover the largest of them and the map's first two rounds. The map grows
+its pages as in Section 4. Growth applies when exactly one operator in
+the pipeline writes answers.
+
+## 9. Evaluation
+
+**Setup.** One H100 SXM, Qwen3 4B fp8, quail-b IMDB reviews at scale
+factor 0.1 (5,000 reviews, about 300 tokens each). Query time excludes
+model startup.
+
+| Query | Tree path (s) | Unified path, earlier run (s) |
+| --- | --- | --- |
+| One map, 64-token limit | 28.8 | 23.4 |
+| Three maps | 137.1 | 84.2 |
+| Classification then one map | 105.8 | 74.0 |
+
+The tree-path times come from one run of the comparison cell
+(`experiments/cells/map_same_node.py`). The unified-path times come from
+an earlier run with a shared read on the unified path
+(`/results/ablations/map_same_node_qwen3-4b-fp8_sf0.1_20261026T040143Z.json`).
+
+**Attention alone.** Per layer, at 1,500 documents of 320 tokens with
+three maps and four-row rounds: unified 1,661 µs, tree 2,401 µs, tree
+with the document read 4,326 µs. At 150 documents of 7,500 tokens:
+unified 2,244 µs, tree 2,519 µs, tree with the document read 1,946 µs.
+With short documents the cost of each call grows with its number of
+sequences, not with the KV it reads, so the document read saves time
+only for long documents. Which path each map pipeline uses is still
+open.
+
+## 10. Related work
+
+- **Batched serving.** Orca [1] schedules each decode step across
+  requests, and vLLM [2] stores KV in pages. vLLM preempts a request
+  when the pool is full and computes its KV again later. Quail runs a
+  fixed set of requests and uses the safety check (Section 4.1) to
+  avoid preemption.
+- **Deadlock avoidance.** The safety check follows the banker's
+  algorithm [3]: grant a resource only if all processes can still
+  finish in some order.
+- **Speculative decoding.** Speculative decoding [4] verifies draft
+  tokens in one pass. Prompt lookup decoding [5] and REST [6] take
+  drafts from the prompt or a datastore instead of a draft model. Quail
+  copies drafts from the document and chooses each draft's length from
+  its cost (Section 5.2).
+- **Shared-prefix attention.** RadixAttention [7] reuses the KV of
+  shared prefixes. Hydragen [8] and cascade inference in FlashInfer [9]
+  compute attention over a shared prefix once for many queries and
+  combine the parts by log-sum-exp, as Section 6 does.
+- **Survival analysis.** The answer-length estimate uses the
+  Kaplan–Meier estimator [10].
+
+## 11. Code
+
+| Step | File | Function |
+| --- | --- | --- |
+| Algorithm 1 | [`stage_executor.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stage_executor.py) | `StageExecutor.run` |
+| Algorithms 2 and 3 | [`growth.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/growth.py) | `KVGrowth.admits`, `KVGrowth.grow` |
+| Answer-length estimate | [`map/decoder.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/decoder.py) | `MapDecoder.survival`, `MapDecoder.remaining` |
+| Algorithm 4, drafts | [`map/decoder.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/decoder.py) | `MapDecoder.round` |
+| Draft length | [`draft_policy.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/draft_policy.py) | `MapDraftPolicy.chain_lengths` |
+| Device-fed rounds | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py), [`chunk.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/chunk.py) | `round_feed`, `Chunk.apply_feed` |
+| Section 6 | [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py), [`chunk.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/chunk.py), [`cuda_graphs.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/cuda_graphs.py) | `Engine.attention_tree`, `pack_chunk`, `DecodeGraphs` |
+| Branches | [`map/stages.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/stages.py) | `MapStages` |
+
+## References
+
+1. Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and
+   Byung-Gon Chun. Orca: A Distributed Serving System for
+   Transformer-Based Generative Models. OSDI 2022.
+2. Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng,
+   Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. Efficient
+   Memory Management for Large Language Model Serving with
+   PagedAttention. SOSP 2023.
+3. Edsger W. Dijkstra. Een algorithme ter voorkoming van de dodelijke
+   omarming (EWD108). 1964–1965.
+4. Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast Inference from
+   Transformers via Speculative Decoding. ICML 2023.
+5. Apoorv Saxena. Prompt Lookup Decoding. 2023.
+6. Zhenyu He, Zexuan Zhong, Tianle Cai, Jason D. Lee, and Di He. REST:
+   Retrieval-Based Speculative Decoding. NAACL 2024.
+7. Lianmin Zheng et al. SGLang: Efficient Execution of Structured
+   Language Model Programs. NeurIPS 2024.
+8. Jordan Juravsky, Bradley Brown, Ryan Ehrlich, Daniel Y. Fu,
+   Christopher Ré, and Azalia Mirhoseini. Hydragen: High-Throughput LLM
+   Inference with Shared Prefixes. 2024.
+9. Zihao Ye et al. FlashInfer: Efficient and Customizable Attention
+   Engine for LLM Inference Serving. MLSys 2025.
+10. Edward L. Kaplan and Paul Meier. Nonparametric Estimation from
+    Incomplete Observations. Journal of the American Statistical
+    Association, 1958.
