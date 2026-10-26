@@ -587,6 +587,36 @@ class Engine:
                 tl.store(q_ptr + t * stride_q_t + h0 * D + offs,
                          tl.reshape(y, (D * GPB,)).to(q_ptr.dtype.element_ty))
 
+        # merges attention over a second key set into chosen rows of a
+        # first, in place, by log-sum-exp weights: merge_partial in one
+        # pass over the rows
+        @triton.jit
+        def merge_rows(out_ptr, lse_ptr, index_ptr, c_ptr, lc_ptr,
+                       stride_o_t, stride_o_h, stride_l_h, stride_l_t,
+                       stride_c_t, stride_c_h, stride_lc_h, stride_lc_t,
+                       D: tl.constexpr, GPB: tl.constexpr):
+            i = tl.program_id(0)
+            block = tl.program_id(1)
+            offs = tl.arange(0, D * GPB)
+            h0 = block * GPB
+            heads = h0 + tl.arange(0, GPB)
+            j = tl.load(index_ptr + i)
+            row = out_ptr + j * stride_o_t + h0 * stride_o_h + offs
+            o = tl.reshape(tl.load(row), (GPB, D)).to(tl.float32)
+            c = tl.reshape(tl.load(c_ptr + i * stride_c_t + h0 * stride_c_h
+                                   + offs), (GPB, D)).to(tl.float32)
+            lo = tl.load(lse_ptr + heads * stride_l_h + j * stride_l_t)
+            lc = tl.load(lc_ptr + heads * stride_lc_h + i * stride_lc_t)
+            top = tl.maximum(lo, lc)
+            wo = tl.exp(lo - top)
+            wc = tl.exp(lc - top)
+            total = wo + wc
+            merged = (o * wo[:, None] + c * wc[:, None]) / total[:, None]
+            tl.store(row, tl.reshape(merged, (D * GPB,)).to(
+                out_ptr.dtype.element_ty))
+            tl.store(lse_ptr + heads * stride_l_h + j * stride_l_t,
+                     top + tl.log(total))
+
         # gelu_tanh_and_mul fused with the per-row fp8 quantization the
         # next linear would run on its output
         @triton.jit
@@ -718,7 +748,8 @@ class Engine:
                          "scale_norm_quant": scale_add_rms_norm_quant,
                          "norm2": rms_norm2,
                          "kv_scatter": kv_row_scatter,
-                         "merge_quant": merge_attn_quant}
+                         "merge_quant": merge_attn_quant,
+                         "merge_rows": merge_rows}
         return self._kernels
 
     def custom_silu_quant(self, gate_up):
@@ -849,6 +880,30 @@ class Engine:
             q.stride(0), *scale_strides,
             D=dim, GPB=gpb, UE8M0=self.use_ue8m0, QUANT=self.is_fp8)
         return q, scales
+
+    def merge_document_read(self, out, lse, index, out_d, lse_d):
+        """Merge the document read into call B's rows, in place.
+
+        Computes what merge_partial does, in one kernel.
+
+        Args:
+            out: Call B's output, (rows, heads, dim), heads contiguous.
+            lse: Call B's log-sum-exp, (heads, rows).
+            index: Per document-read row, its row in out.
+            out_d: The document read's output, (index rows, heads, dim).
+            lse_d: The document read's log-sum-exp, (heads, index rows).
+        """
+        n, heads, dim = out_d.shape
+        gpb = 4
+        if heads % gpb or out.stride(1) != dim or out_d.stride(1) != dim:
+            raise ValueError("the merge takes contiguous heads in groups of 4")
+        if not n:
+            return
+        self._triton_kernels()["merge_rows"][(n, heads // gpb)](
+            out, lse, index, out_d, lse_d,
+            out.stride(0), out.stride(1), lse.stride(0), lse.stride(1),
+            out_d.stride(0), out_d.stride(1), lse_d.stride(0), lse_d.stride(1),
+            D=dim, GPB=gpb)
 
     # ---- the primitives a forward loop calls -------------------------
 
@@ -1029,7 +1084,8 @@ class Engine:
                 documents["cu_q"], None, documents["max_q"],
                 documents["max_used"], causal=False,
                 block_table=documents["table"], seqused_k=documents["used"])
-            merge_partial(out_b, lse_b, documents["b_index"], out_d, lse_d)
+            self.merge_document_read(out_b, lse_b, documents["b_index"],
+                                     out_d, lse_d)
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(
