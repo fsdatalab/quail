@@ -16,7 +16,7 @@ import queue
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from typing import Callable, Protocol
@@ -91,9 +91,16 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
 
     hooks = hooks or Hooks()
 
+    remaining = [None]     # the latest estimate, sent with each count
+
     def progress(label, done, total, unit):
         emit("progress", {"label": label, "done": done, "total": total,
-                          "unit": unit, "recorded_at": time.time()})
+                          "unit": unit, "remaining": remaining[0],
+                          "recorded_at": time.time()})
+
+    def on_remaining(estimate):
+        remaining[0] = {**asdict(estimate),
+                        "text": estimate.describe()}
 
     def answers(payload):
         emit("answers", payload)
@@ -138,6 +145,7 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
                     on_backend_ready=lambda: emit(
                         "model_ready", {"model": config.model}),
                     on_execution_ready=execution_ready,
+                    on_remaining=on_remaining,
                 )
                 manifest = write_result(result, job.artifact_dir)
             finally:

@@ -16,6 +16,7 @@ from quail.physical import (
     Recombine,
 )
 from quail.physical.pipelines import build_pipelines
+from quail.progress import running
 
 
 class NodeRuntime(Protocol):
@@ -122,7 +123,8 @@ class GenericRunner:
                         if port.source.node_id not in inside}
                     for member in pipeline}
                 started = time.perf_counter()
-                results = context.run_pipeline(pipeline, inputs, context)
+                with running(member.node_id for member in pipeline):
+                    results = context.run_pipeline(pipeline, inputs, context)
                 # a pipeline's wall is charged once, to its first member
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
@@ -151,9 +153,10 @@ class GenericRunner:
                     for input_port in node.inputs
                 }
                 started = time.perf_counter()
-                result = context.runtimes[node.runtime_key].execute(
-                    node, inputs, context
-                )
+                with running((node.node_id,)):
+                    result = context.runtimes[node.runtime_key].execute(
+                        node, inputs, context
+                    )
                 record(node, result, started)
                 continue
             record(node, result)

@@ -5,6 +5,7 @@ import os
 import time
 
 from quail.backends import BackendExecutionContext
+from quail.execution.remaining import RemainingTimeTracker
 from quail.execution.types import PhysicalRequest, PhysicalResponse
 from quail.logical import WithCTE
 from quail.physical import (
@@ -14,6 +15,7 @@ from quail.physical import (
     decode_graph,
 )
 from quail.planner.plan import Refusal, RefusalError
+from quail.progress import listening
 
 
 class _BackendState:
@@ -103,7 +105,8 @@ def _execute_physical(request, registry):
 
 
 def execute_query(query, physical_executor=None, plan=None,
-                  on_backend_ready=None, on_execution_ready=None):
+                  on_backend_ready=None, on_execution_ready=None,
+                  on_remaining=None):
     """Execute one query in its session's process.
 
     Args:
@@ -114,6 +117,8 @@ def execute_query(query, physical_executor=None, plan=None,
         on_backend_ready: Optional callback after model preparation.
         on_execution_ready: Optional callback after backend preparation and
             immediately before query execution.
+        on_remaining: Optional callable(RemainingTime) run with each
+            estimate of the time left, after it is logged.
     """
     if isinstance(query.logical.root, WithCTE):
         from quail.api.stages import execute_stages
@@ -121,7 +126,7 @@ def execute_query(query, physical_executor=None, plan=None,
         if plan is not None:
             raise RuntimeError("edited query stage plans are not supported")
         return execute_stages(query, physical_executor, on_backend_ready,
-                              on_execution_ready)
+                              on_execution_ready, on_remaining)
     total_started = time.perf_counter()
     if plan is not None:
         if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
@@ -157,10 +162,15 @@ def execute_query(query, physical_executor=None, plan=None,
     physical_prepare_s = time.perf_counter() - physical_prepare_started
     if on_execution_ready is not None:
         on_execution_ready()
+    remaining = RemainingTimeTracker.for_plan(plan.graph, plan.estimates,
+                                              on_remaining=on_remaining)
     started = time.perf_counter()
     if has_compute:
-        response = (physical_executor(request) if physical_executor is not None
-                    else _execute_physical(request, query.session.registry))
+        remaining.start()
+        with listening(remaining):
+            response = (physical_executor(request)
+                        if physical_executor is not None
+                        else _execute_physical(request, query.session.registry))
     else:
         response = PhysicalResponse(
             {}, {"wall_s": 0.0, "fresh_tokens": 0, "cached_tokens": 0})
@@ -179,6 +189,8 @@ def execute_query(query, physical_executor=None, plan=None,
         finish_s=round(finish_s, 4),
     )
     result.report["token_wait_s"] = round(query.token_wait_s, 4)
+    if has_compute:
+        result.report["remaining_time"] = remaining.report()
     result.report["worker_total_s"] = round(
         time.perf_counter() - total_started, 4)
     return result
