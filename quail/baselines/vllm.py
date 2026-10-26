@@ -239,47 +239,6 @@ class VLLMClient:
         )
 
 
-def vllm_capture_sizes(largest: int) -> tuple[int, ...]:
-    """Return vLLM's own spacing of CUDA graph capture sizes, up to largest.
-
-    1, 2, and 4, then every 8 tokens to 256, then every 16: a step is
-    padded by at most 16 tokens. vLLM builds the same list when it is
-    given only its largest size.
-
-    Args:
-        largest: The largest capture size.
-    """
-    sizes = (1, 2, 4, *range(8, 256, 8), *range(256, largest + 1, 16))
-    return tuple(size for size in sizes if size <= largest)
-
-
-def parse_capture_sizes(value: str) -> tuple[int, ...] | None:
-    """Return the capture sizes an experiment names.
-
-    Args:
-        value: "vllm" for vLLM's own default, which captures sizes up
-            to 512; "vllm-spacing:<largest>" for vLLM's spacing up to
-            largest; or comma-separated sizes, such as "8192".
-
-    Returns:
-        The sizes, increasing, or None for vLLM's own default.
-
-    Raises:
-        ValueError: The value names no sizes.
-    """
-    if value == "vllm":
-        return None
-    method, _, largest = value.partition(":")
-    if method == "vllm-spacing" and largest.isdigit() and int(largest) > 0:
-        return vllm_capture_sizes(int(largest))
-    parts = value.split(",")
-    if not all(part.strip().isdigit() and int(part) > 0 for part in parts):
-        raise ValueError(
-            f"capture sizes {value!r} are not 'vllm', "
-            "'vllm-spacing:<largest>', or comma-separated sizes")
-    return tuple(sorted({int(part) for part in parts}))
-
-
 class VLLMEngine:
     """Boot vLLM for a request backend, with Quail's tuned engine settings.
 

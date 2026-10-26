@@ -3,18 +3,22 @@
 One Modal function call runs both engines, one after the other, each
 in its own child process so each gets a fresh CUDA context and the
 whole GPU: Quail first, then vLLM. Each child records the GPU's UUID,
-and the result asserts the two match. The configurations are the four
-map quadrants of experiments/cells/map_quadrants.py, two with three
-maps over one table in one query: Quail runs the three as one map
-pipeline, and vLLM gets every (document, instruction) prompt in one
-generate call, and one classification then a map over the reviews:
-Quail runs the two in one pipeline, and vLLM gets each document's
-classification and map prompts together, the classification as one
-greedy token among the labels' letters. Quail runs the adaptive draft
-policy with GPU timing; vLLM decodes greedily without speculation,
-with its default CUDA graph capture sizes, prefix caching on, and its
-prefix cache reset before each configuration. Query time excludes
-model startup for both; startup is reported separately.
+and the result asserts the two match. The configurations are:
+
+- one short and one long map over the IMDB reviews and over the CUAD
+  contracts;
+- three maps over one table in one query, which Quail runs as one map
+  pipeline and vLLM gets as every (document, instruction) prompt in
+  one generate call;
+- a classification then a map over the reviews, which Quail runs in
+  one pipeline and vLLM gets as each document's two prompts together,
+  the classification as one greedy token among the labels' tokens.
+
+Quail runs the adaptive draft policy with GPU timing; vLLM decodes
+greedily without speculation, with its own CUDA graph capture sizes,
+prefix caching on, and its prefix cache reset before each
+configuration. Query time excludes model startup for both; startup
+is reported separately.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-map-same-node.log"
     uv run modal run --detach \
@@ -35,19 +39,15 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
-from bench.quailb_parallel import VOLUMES, app, image, results_vol
-from experiments.cells.map_quadrants import (
-    CONFIGURATIONS,
-    LONG_MAP,
-    RESULT_DIR,
-    SHORT_MAP,
-    _ensure_tables,
-    _run_one,
-    answer_stats,
-)
-from experiments.cells.map_vllm_baseline import _prompts
-from experiments.cells.map_vllm_baseline import _run_one as _run_vllm
+from bench.quailb_parallel import DATA_DIR, VOLUMES, app, image, results_vol
 
+RESULT_DIR = "/results/ablations"
+
+SHORT_MAP = ("Summarize the negative arguments the writer makes, "
+             "in one sentence.")
+LONG_MAP = ("Write a detailed summary of the document: the parties or "
+            "people involved, the main points they make, and anything "
+            "unresolved.")
 TOPIC_MAP = "Name the main topic of the document in a few words."
 
 TONE = ("tone", "What is the overall tone of this review?\n\n{0}",
@@ -55,9 +55,12 @@ TONE = ("tone", "What is the overall tone of this review?\n\n{0}",
 
 # (name, table, column, ((result column, instruction, max answer
 # tokens), ...), classification asked before the maps or None)
-SAME_NODE_CONFIGURATIONS = tuple(
-    (name, table, column, (("answer", instruction, cap),), None)
-    for name, table, column, instruction, cap in CONFIGURATIONS) + tuple(
+SAME_NODE_CONFIGURATIONS = (
+    ("imdb_short_map", "reviews", "body", (("answer", SHORT_MAP, 64),), None),
+    ("imdb_long_map", "reviews", "body", (("answer", LONG_MAP, 256),), None),
+    ("cuad_short_map", "contracts", "text", (("answer", SHORT_MAP, 64),), None),
+    ("cuad_long_map", "contracts", "text", (("answer", LONG_MAP, 256),), None),
+) + tuple(
     (name, table, column, (("negatives", SHORT_MAP, 64),
                            ("summary", LONG_MAP, 256),
                            ("topic", TOPIC_MAP, 32)), None)
@@ -67,6 +70,169 @@ SAME_NODE_CONFIGURATIONS = tuple(
 
 SINGLE_SUBMISSION = "stock vLLM, operator-at-a-time submission"
 MULTI_SUBMISSION = "stock vLLM, pipelining submission"
+
+
+def _ensure_tables(scale_factor: float, names) -> Path:
+    """Write the corpora parquets to the volume, as ensure_data does."""
+    import pyarrow.parquet as pq
+
+    import quail_b as benchmark
+    from quail_b.data import CORPUS_COLUMNS
+
+    directory = Path(DATA_DIR) / f"sf{scale_factor}"
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in sorted(set(names)):
+        path = directory / f"{name}.parquet"
+        if (path.exists() and set(CORPUS_COLUMNS[name])
+                <= set(pq.read_schema(path).names)):
+            continue
+        pq.write_table(benchmark.load_table(name, scale_factor=scale_factor),
+                       path)
+    results_vol.commit()
+    return directory
+
+
+def answer_stats(answers) -> dict:
+    """Return one map's empty answers, answer lengths, and a few samples."""
+    lengths = sorted(len(a or "") for a in answers)
+    return {
+        "num_documents": len(answers),
+        "num_empty_answers": sum(not a for a in answers),
+        "answer_chars": {"min": lengths[0], "median": lengths[len(lengths) // 2],
+                         "max": lengths[-1]},
+        "sample_answers": answers[:3],
+    }
+
+
+def classified_query(session, table, column, maps, classify=None):
+    """Return the query: an optional classification, then the maps.
+
+    Args:
+        session: The Quail session.
+        table: The table the operators read.
+        column: The document column.
+        maps: (result column, instruction, max answer tokens) per map.
+        classify: (result column, prompt template, labels), or None.
+    """
+    import quail
+
+    query = session.docs(table).alias("d")
+    names = []
+    if classify is not None:
+        name, template, labels = classify
+        query = query.ai_classify(quail.prompt(template, quail.col(f"d.{column}")),
+                                  list(labels), name=name)
+        names.append(name)
+    for name, instruction, _ in maps:
+        query = query.ai_map(f"d.{column}", instruction, name=name)
+    return query.select("d.id", *names, *(name for name, _, _ in maps))
+
+
+def _run_quail(session, table, column, maps, classify, usd_per_hour) -> dict:
+    """Run one configuration on Quail and return its measurements.
+
+    Args:
+        session: The Quail session.
+        table: The table the operators read.
+        column: The document column.
+        maps: (result column, instruction, max answer tokens) per map;
+            several maps go in one query, as one map pipeline.
+        classify: (result column, prompt template, labels) of a
+            classification asked before the maps, or None.
+        usd_per_hour: The GPU price.
+
+    Returns:
+        The query's timings and the first map's answer statistics and
+        inference metrics; with several maps, "maps" holds each one's;
+        with a classification, every document's label and answer.
+    """
+    from dataclasses import replace
+
+    from quail.physical import AiMap
+
+    query = classified_query(session, table, column, maps, classify)
+    caps = {name: cap for name, _, cap in maps}
+    plan = query.plan()
+    nodes = tuple(replace(node, spec=replace(
+        node.spec, max_answer_tokens=caps[node.spec.name]))
+        if isinstance(node, AiMap) else node for node in plan.nodes)
+    started = time.perf_counter()
+    result = query.run(plan=replace(plan, nodes=nodes))
+    wall = time.perf_counter() - started
+    report = result.report
+    inferences = report.get("backend_metrics", {}).get("inferences", [{}]) or [{}]
+    table_out = result.collect()
+    per_map = {}
+    for name, _, _ in maps:
+        per_map[name] = answer_stats(table_out.column(name).to_pylist())
+        per_map[name]["inference"] = next(
+            (inference for inference in inferences
+             if inference.get("output") == name), {})
+    measured = {
+        "wall_s": round(wall, 2),
+        "engine_wall_s": report.get("wall_s"),
+        "gpu_s": report.get("gpu_s"),
+        "chunks": report.get("chunks"),
+        "fresh_tokens": report.get("fresh_tokens"),
+        "usd_per_query": (report.get("wall_s") or wall) / 3600 * usd_per_hour,
+        **per_map[maps[0][0]],
+    }
+    if len(maps) > 1:
+        measured["maps"] = per_map
+    if classify is not None:
+        ids = table_out.column("d.id").to_pylist()
+        measured["labels"] = dict(zip(ids, table_out.column(classify[0]).to_pylist()))
+        measured["answers"] = dict(zip(ids, table_out.column(maps[0][0]).to_pylist()))
+    return measured
+
+
+def _prompts(directory, table, column, instruction, spec) -> list[str]:
+    """Render the map prompt text Quail shows, one string per document."""
+    import pyarrow.parquet as pq
+
+    from quail.logical.expressions import ColumnRef
+    from quail.logical.prompts import bind_map_prompt
+
+    prompt = bind_map_prompt((ColumnRef("d", table, column),), instruction,
+                             spec.turn)
+    texts = pq.read_table(directory / f"{table}.parquet").column(column)
+    return [prompt.preamble + prompt.tail.format(text.as_py())
+            for text in texts]
+
+
+def _run_vllm(client, prompts, cap, keep_answers=False) -> dict:
+    """Submit every prompt at once and measure the generation.
+
+    Args:
+        client: The booted vLLM client.
+        prompts: The prompt texts.
+        cap: The most answer tokens, one for every prompt or a list
+            with one per prompt.
+        keep_answers: Whether the result holds every answer, stripped,
+            in prompt order, under "answers".
+    """
+    params = ([client.decode_params(each) for each in cap]
+              if isinstance(cap, (list, tuple)) else client.decode_params(cap))
+    started = time.perf_counter()
+    outputs = client.generate(prompts, params, use_tqdm=False)
+    wall = time.perf_counter() - started
+    input_tokens = sum(len(output.prompt_token_ids) for output in outputs)
+    answers = [output.outputs[0].text for output in outputs]
+    output_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
+    lengths = sorted(len(answer.strip()) for answer in answers)
+    kept = {"answers": [answer.strip() for answer in answers]} if keep_answers else {}
+    return {
+        **kept,
+        "wall_s": round(wall, 2),
+        "input_tokens": input_tokens,
+        "input_tokens_per_second": round(input_tokens / wall, 1),
+        "output_tokens": output_tokens,
+        "num_documents": len(prompts),
+        "num_empty_answers": sum(not answer.strip() for answer in answers),
+        "answer_chars": {"min": lengths[0], "median": lengths[len(lengths) // 2],
+                         "max": lengths[-1]},
+        "sample_answers": [answer.strip() for answer in answers[:3]],
+    }
 
 
 def _gpu() -> str:
@@ -86,12 +252,8 @@ def _chosen(only: str) -> tuple:
                  if not names or config[0] in names)
 
 
-def _quail(model: str, directory: Path, configurations, profile_gpu=False) -> dict:
-    """Run the configurations on Quail; return the GPU, startup, and runs.
-
-    profile_gpu prints each configuration's kernel table and its passes
-    by size, as map_quadrants does.
-    """
+def _quail(model: str, directory: Path, configurations) -> dict:
+    """Run the configurations on Quail; return the GPU, startup, and runs."""
     import quail
     from bench.quailb import register_tables
     from quail.specs import H100_USD_PER_HOUR
@@ -104,9 +266,8 @@ def _quail(model: str, directory: Path, configurations, profile_gpu=False) -> di
         register_tables(session, directory)
         for name, table, column, maps, classify in configurations:
             print(f"quail: running {name}", flush=True)
-            run = _run_one(session, table, column, maps, "adaptive",
-                           H100_USD_PER_HOUR, profile_gpu=profile_gpu,
-                           classify=classify)
+            run = _run_quail(session, table, column, maps, classify,
+                             H100_USD_PER_HOUR)
             # the session boots the engine in its first query; the
             # engine's own wall time excludes that startup
             run["startup_s"] = round(run["wall_s"] - (run["engine_wall_s"] or 0.0), 2)
@@ -121,11 +282,11 @@ def _quail(model: str, directory: Path, configurations, profile_gpu=False) -> di
 
 def _vllm(model: str, directory: Path, configurations) -> dict:
     """Run the configurations on stock vLLM; return the GPU, boot, and runs."""
-    # the engine core runs in process, as map_vllm_baseline sets it: a
-    # spawned core would not see the gigatoken tokenizer registration
+    # the engine core runs in process: a spawned core would not see the
+    # gigatoken tokenizer registration
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ.pop("QUAIL_VLLM_SPECULATIVE", None)
-    from quail.baselines.vllm import VLLMEngine, parse_capture_sizes
+    from quail.baselines.vllm import VLLMEngine
     from quail.specs import H100_USD_PER_HOUR, MODELS
 
     spec = MODELS[model]
@@ -137,7 +298,8 @@ def _vllm(model: str, directory: Path, configurations) -> dict:
     result = {"engine": "stock vLLM", "gpu": _gpu(), "speculative": None,
               "capture_sizes": "vllm", "runs": {}}
     with ExitStack() as resources:
-        engine = VLLMEngine(capture_sizes=parse_capture_sizes("vllm"))
+        # vLLM's own CUDA graph capture sizes
+        engine = VLLMEngine(capture_sizes=None)
         settings, boot = engine.boot(spec, [0], resources=resources)
         result["boot"] = boot
         result["engine_settings"] = {
@@ -184,7 +346,6 @@ def _classify_prompt(model, directory, table, column, maps, classify) -> dict:
     """Return the classification's prompt tokens and label tokens from Quail's plan."""
     import quail
     from bench.quailb import register_tables
-    from experiments.cells.map_quadrants import classified_query
     from quail.physical import AiClassify
 
     with quail.Session(quail.EngineConfig(model=model, device="h100-sxm")) as session:
@@ -250,11 +411,9 @@ def _vllm_classify_map(client, directory, table, column, map_config, planned,
 _ENGINES = {"quail": _quail, "vllm": _vllm}
 
 
-def _child(engine: str, model: str, directory: str, only: str, out: str,
-           profile_gpu: str = "") -> None:
+def _child(engine: str, model: str, directory: str, only: str, out: str) -> None:
     """Run one engine in this process and write its result JSON to out."""
-    options = {"profile_gpu": True} if profile_gpu and engine == "quail" else {}
-    result = _ENGINES[engine](model, Path(directory), _chosen(only), **options)
+    result = _ENGINES[engine](model, Path(directory), _chosen(only))
     Path(out).write_text(json.dumps(result, default=str))
 
 
@@ -270,8 +429,7 @@ def _agreement(first: dict, second: dict) -> dict:
     }
 
 
-def _run_child(engine: str, model: str, directory: Path, only: str,
-               profile_gpu: bool = False) -> dict:
+def _run_child(engine: str, model: str, directory: Path, only: str) -> dict:
     """Run one engine in a fresh interpreter on this GPU; return its result."""
     with tempfile.TemporaryDirectory() as scratch:
         out = Path(scratch) / f"{engine}.json"
@@ -280,7 +438,7 @@ def _run_child(engine: str, model: str, directory: Path, only: str,
         started = time.perf_counter()
         subprocess.run(
             [sys.executable, "-m", "experiments.cells.map_same_node", engine,
-             model, str(directory), only, str(out), "1" if profile_gpu else ""],
+             model, str(directory), only, str(out)],
             check=True, env=environment)
         result = json.loads(out.read_text())
     result["process_s"] = round(time.perf_counter() - started, 2)
@@ -290,8 +448,7 @@ def _run_child(engine: str, model: str, directory: Path, only: str,
 @app.function(image=image, gpu="H100!", memory=98304, timeout=14400,
               volumes=VOLUMES)
 def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
-                  only: str = "", engines: str = "quail,vllm",
-                  profile_gpu: bool = False) -> str:
+                  only: str = "", engines: str = "quail,vllm") -> str:
     """Run the engines one after the other on this GPU; return the result's path.
 
     Args:
@@ -301,8 +458,6 @@ def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
             all seven.
         engines: Comma-separated engines to run, from "quail" and
             "vllm"; they run in that order.
-        profile_gpu: Print Quail's kernel table and passes by size per
-            configuration.
 
     Raises:
         RuntimeError: The engines ran on different GPUs.
@@ -320,8 +475,7 @@ def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
                     "engines": {}}
     for engine in chosen_engines:
         print(f"starting {engine}", flush=True)
-        measurements["engines"][engine] = _run_child(engine, model, directory, only,
-                                                     profile_gpu)
+        measurements["engines"][engine] = _run_child(engine, model, directory, only)
     for name in measurements["configurations"]:
         runs = [result["runs"].get(name, {})
                 for result in measurements["engines"].values()]
@@ -344,13 +498,12 @@ def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
 
 @app.local_entrypoint()
 def launch_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
-                     only: str = "", engines: str = "quail,vllm",
-                     profile_gpu: bool = False):
+                     only: str = "", engines: str = "quail,vllm"):
     call = map_same_node.spawn(model=model, scale_factor=scale_factor, only=only,
-                               engines=engines, profile_gpu=profile_gpu)
+                               engines=engines)
     print(f"function call id: {call.object_id}")
     print(call.get())
 
 
 if __name__ == "__main__":
-    _child(*sys.argv[1:7])
+    _child(*sys.argv[1:6])

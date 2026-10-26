@@ -60,29 +60,6 @@ class DecodeGraphConfig:
         return None
 
 
-def configured_graphs() -> DecodeGraphConfig:
-    """Return the capture limits, as the environment overrides them.
-
-    QUAIL_DECODE_GRAPH_ROWS lists the row buckets, comma-separated;
-    QUAIL_DECODE_GRAPH_QUERY_TOKENS is the longest query a captured
-    chunk may hold, and QUAIL_DECODE_GRAPH_CONTEXT_TOKENS the most
-    resident tokens a sequence reads; unset, the defaults apply.
-    """
-    import os
-
-    settings = {}
-    rows = os.environ.get("QUAIL_DECODE_GRAPH_ROWS")
-    if rows:
-        settings["row_buckets"] = tuple(int(part) for part in rows.split(","))
-    query = os.environ.get("QUAIL_DECODE_GRAPH_QUERY_TOKENS")
-    if query:
-        settings["max_query_tokens"] = int(query)
-    context = os.environ.get("QUAIL_DECODE_GRAPH_CONTEXT_TOKENS")
-    if context:
-        settings["max_context_tokens"] = int(context)
-    return DecodeGraphConfig(**settings)
-
-
 class DecodeBuffers:
     """Fixed GPU inputs for decode batches of up to rows rows, in any layout.
 
@@ -266,7 +243,7 @@ class DecodeGraphs:
     """
 
     def __init__(self, pipeline, *, config: DecodeGraphConfig | None = None):
-        self._config = configured_graphs() if config is None else config
+        self._config = DecodeGraphConfig() if config is None else config
         self.pipeline = pipeline
         self.enabled = True
         # per layout, bucket rows -> its captured graph, and the chunk

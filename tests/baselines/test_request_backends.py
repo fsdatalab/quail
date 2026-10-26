@@ -600,12 +600,7 @@ def test_an_experiment_can_turn_on_vllm_ngram_drafts(monkeypatch):
 
 
 def test_the_vllm_engine_captures_the_graphs_it_is_given():
-    from quail.baselines.vllm import (
-        SINGLE_CUDA_GRAPH,
-        VLLMEngine,
-        parse_capture_sizes,
-        vllm_capture_sizes,
-    )
+    from quail.baselines.vllm import SINGLE_CUDA_GRAPH, VLLMEngine
 
     default = VLLMEngine()
     assert default.kind == "vllm"
@@ -616,13 +611,3 @@ def test_the_vllm_engine_captures_the_graphs_it_is_given():
     own = VLLMEngine(capture_sizes=None)
     assert "compilation_config" not in own.llm_kwargs(QWEN3_4B_FP8)
     assert own.kind != default.kind
-    spaced = vllm_capture_sizes(8192)
-    assert spaced[:5] == (1, 2, 4, 8, 16)
-    assert spaced[-3:] == (8160, 8176, 8192)
-    assert max(b - a for a, b in zip(spaced, spaced[1:])) == 16
-    assert parse_capture_sizes("vllm") is None
-    assert parse_capture_sizes("vllm-spacing:8192") == spaced
-    assert parse_capture_sizes("8192") == SINGLE_CUDA_GRAPH
-    assert parse_capture_sizes("512,64") == (64, 512)
-    with pytest.raises(ValueError):
-        parse_capture_sizes("every:16")
