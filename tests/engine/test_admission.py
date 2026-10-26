@@ -579,3 +579,24 @@ def test_a_limit_paces_admission_by_the_parts_survival():
     sched.report(1, 0, 0, 1, [1])
     sched.report(2, 0, 0, 1, [1])
     assert sched.limit_reached() and sched.next_chunk(500) == []
+
+
+def test_work_left_follows_the_pass_rate_measured_at_each_stage():
+    # ten 100-token documents; a 10-token filter question, then a
+    # 50-token join request that only the filter's survivors ask
+    sched = JoinAdmission([100] * 10, [[10], [50]], 2000, arena_pages=1000,
+                          page_tokens=16)
+    assert sched.work() == (0, 1000 + 10 * (10 + 50)), \
+        "before any answer, every document is expected to pass"
+    groups = sched.next_chunk(1000)
+    assert len(groups) == 10
+    # prefixes packed; each document is half way through its question
+    assert sched.work() == (1000, 10 * (5 + 50))
+    for a in range(10):
+        sched.report(a, 0, 0, 1, [a < 2])
+    # two of ten passed: only they ask the join, each half way through it
+    assert sched.work() == (1100, 2 * 25)
+    for a, j, start, end, _ in sched.next_chunk(1000):
+        sched.report(a, j, start, end, [1])
+    assert sched.done()
+    assert sched.work() == (1200, 0)

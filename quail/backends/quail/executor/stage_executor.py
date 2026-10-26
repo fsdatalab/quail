@@ -268,7 +268,8 @@ class StageExecutor:
         total = (sum(self.sched.num_partners(a, j) for a in range(len(self.prefixes))
                      for j in range(k))
                  if self.counting_answers else len(self.prefixes))
-        self.progress = Progress(self.label, total=total, unit=unit)
+        self.progress = Progress(self.label, total=total, unit=unit,
+                                 work=self.sched.work)
         self.finished = 0
 
         self.readouts = ReadoutGroups(self.torch, self.stages)

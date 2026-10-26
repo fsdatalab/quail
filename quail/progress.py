@@ -139,11 +139,15 @@ class Progress:
     """Report a running count, logging at most once every `every` seconds.
 
     node_ids are the plan nodes running when the count was created,
-    from ``running()``; empty outside a query's operators.
+    from ``running()``; empty outside a query's operators. work, when
+    given, is called as each count reports and returns the tokens run
+    so far and the tokens still expected; ``work_done`` and
+    ``work_left`` hold its last answer.
     """
 
     def __init__(self, label: str, total: int | None = None,
-                 unit: str = "documents", every: float = 5.0, *, emit=say):
+                 unit: str = "documents", every: float = 5.0, *, emit=say,
+                 work=None):
         self.label = label
         self.total = total
         self.unit = unit
@@ -154,6 +158,8 @@ class Progress:
         self.finished = False
         self.started = time.perf_counter()
         self.elapsed = 0.0
+        self.work = work
+        self.work_done = self.work_left = None
         self._last = self.started
 
     def update(self, done: int) -> None:
@@ -175,6 +181,8 @@ class Progress:
 
     def _report(self, now: float) -> None:
         self.elapsed = now - self.started
+        if self.work is not None and _LISTENERS:
+            self.work_done, self.work_left = self.work()
         for listener in tuple(_LISTENERS):
             listener(self)
         if _SINK is not None:

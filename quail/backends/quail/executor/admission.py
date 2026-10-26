@@ -320,6 +320,14 @@ class JoinAdmission:
         anchor_partners = dict(anchor_partners or {})
         for a, prefix in enumerate(prefix_tokens):
             self._register(prefix, resident.get(a), anchor_partners.get(a))
+        # progress in request tokens, read by work() when progress reports
+        self.tokens_done = 0
+        self._prefix_left = sum(self._carried)
+        self._prefix_admitted = [0, 0]      # carried tokens, then packed
+        self._entered = [0] * k             # documents with requests at j
+        self._stage_tokens = [0] * k        # the tokens those requests ask
+        self._completed = [0] * k           # documents that finished stage j
+        self._passed = [0] * k
         # resident anchors first: they cost no prefix tokens and few
         # or no pages, so they never wait behind a page-blocked anchor
         n = len(self.prefix)
@@ -377,10 +385,43 @@ class JoinAdmission:
                 self._lists[a][j], self._cums[a][j] = self._partner_list(
                     a, j, lst)
             if self.num_partners(a, j):
+                self._enter_tokens(a, j)
                 return None
             # an empty row at the last stage, dropped otherwise
             self._stage[a] = _DONE
             return "finished" if j + 1 == k else "dropped"
+
+    def _enter_tokens(self, a, j):
+        self._entered[j] += 1
+        self._stage_tokens[j] += self.frame_rows[j] + int(self._cum_of(a, j)[-1])
+
+    def work(self) -> tuple[int, int]:
+        """Return the request tokens run so far and the tokens still expected.
+
+        A stage's tokens are the mean over the documents that entered
+        it, or every partner before one has. The share of documents
+        reaching a stage is the product of the pass rates measured at
+        the stages before it, 1 at a stage no document has finished.
+        A document in flight is counted half way through its stage, and
+        a queued document's prefix at the share of prefix tokens that
+        admitted documents packed rather than borrowed.
+        """
+        k = len(self.stages)
+        mean = [self._stage_tokens[j] / self._entered[j] if self._entered[j]
+                else self.frame_rows[j] + float(self._cum[j][-1])
+                for j in range(k)]
+        passing = [self._passed[j] / self._completed[j] if self._completed[j]
+                   else 1.0 for j in range(k)]
+        ahead = [0.0] * (k + 1)     # tokens a document entering j asks
+        for j in reversed(range(k)):
+            ahead[j] = mean[j] + passing[j] * ahead[j + 1]
+        carried, packed = self._prefix_admitted
+        left = (self._prefix_left * (packed / carried if carried else 1.0)
+                + (len(self.pending) - self._dead) * ahead[0])
+        for j in range(k):
+            in_stage = self._entered[j] - self._completed[j]
+            left += in_stage * (mean[j] / 2 + passing[j] * ahead[j + 1])
+        return self.tokens_done, int(left)
 
     def _partner_list(self, a, j, lst):
         """Return partner indices and cumulative request token counts for a stage.
@@ -644,6 +685,11 @@ class JoinAdmission:
             if not self._page_cost[a]:
                 self._zero_cost -= 1
             self._stage[a] = 0
+            self._prefix_left -= self._carried[a]
+            self._prefix_admitted[0] += self._carried[a]
+            self._prefix_admitted[1] += carried
+            self.tokens_done += carried
+            self._enter_tokens(a, 0)
             admitted.add(a)
             expected_rows += 1
             if self.groups is not None:
@@ -688,6 +734,9 @@ class JoinAdmission:
             row[start:end] = bits
             self._answer_counts[j][a] = end
         self.in_flight -= 1
+        cum = self._cum_of(a, j)
+        self.tokens_done += int(cum[end] - cum[start]) + (
+            self.frame_rows[j] if start == 0 else 0)
         k = len(self.stages)
         num_partners = self.num_partners(a, j)
         complete = end == num_partners
@@ -704,6 +753,8 @@ class JoinAdmission:
                 # is behind it on the stream and the next stage's
                 # frame write cannot race a read of this stage's
                 transitions.append((a, j, True))
+                self._completed[j] += 1
+                self._passed[j] += 1
                 settled = self._enter(a, j + 1)
                 if settled is None:
                     self.ready.append(a)
@@ -713,12 +764,15 @@ class JoinAdmission:
             elif complete and not self._true[a][j]:
                 self._stage[a] = _DONE
                 transitions.append((a, j, False))
+                self._completed[j] += 1
                 settlements.append(Settlement("dropped", a, False))
         if j == k - 1 and complete:
             self._stage[a] = _DONE
             if self._true[a][j]:
                 self.survivors += 1
             survived = bool(self._true[a][j])
+            self._completed[j] += 1
+            self._passed[j] += survived
             transitions.append((a, j, survived))
             settlements.append(Settlement("finished", a, survived))
         for settlement in settlements:

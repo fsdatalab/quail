@@ -260,3 +260,30 @@ def test_a_query_report_holds_each_operator_slowdown():
     assert [group["node_ids"] for group in report["groups"]] == [[filter_id]]
     assert report["groups"][0]["kind"] == "quail.ai_filter"
     assert report["history"], "an estimate was made while the filter ran"
+
+
+def test_tokens_measure_a_group_whose_cheap_rows_finish_first(clock):
+    # 80% of rows fail a filter in the first 10 s; the rest run a join
+    # until 60 s, while tokens run at a steady rate the whole time
+    tracker = tracker_for({"f": 10.0, "j": 20.0}, kinds={"j": "quail.ai_join"})
+    seconds, total, tokens = 60, 1000, 6000
+    work = {"done": 0}
+    with running(("f", "j")), listening(tracker):
+        progress = Progress(
+            "pipeline r", total=total, every=5.0, emit=lambda line: None,
+            work=lambda: (work["done"], tokens - work["done"]))
+        for step in range(1, seconds):
+            clock.now = float(step)
+            work["done"] = tokens * step // seconds
+            rows = (800 * min(step, 10) // 10
+                    + 200 * max(0, step - 10) // (seconds - 10))
+            progress.update(rows)
+        clock.now = float(seconds)
+        work["done"] = tokens
+        progress.done = total
+        progress.finish("pipeline r done")
+    report = tracker.report()
+    by_tokens = prediction_errors(report)
+    by_rows = prediction_errors(replay(report, use_work=False))
+    assert abs(by_tokens[0.25]) < 0.03 and abs(by_tokens[0.5]) < 0.03
+    assert by_rows[0.25] < -0.5, "finished rows say most of the work is done"

@@ -21,6 +21,11 @@ from pathlib import Path
 from quail.execution.remaining import FRACTIONS, prediction_errors, replay
 
 WITHIN = 0.15
+REPLAYS = {
+    "tokens where reported": {},
+    "rows, rate from the first finished row": {"use_work": False},
+    "rows, rate from the start": {"use_work": False, "rate_from_first": False},
+}
 
 
 def query_rows(directory: Path) -> list[dict]:
@@ -109,11 +114,11 @@ def main(directory: str) -> None:
     within, total = within_share(reports)
     print(f"\nwithin {WITHIN:.0%} of the time left: {within} of {total}")
     saved = [report for report in reports if "counts" in report]
-    if saved:
-        within, total = within_share(
-            replay(report, rate_from_first=False) for report in saved)
-        print(f"replayed with the rate measured from each group's start: "
-              f"{within} of {total}")
+    for name, options in REPLAYS.items():
+        if saved:
+            within, total = within_share(
+                replay(report, **options) for report in saved)
+            print(f"replayed, {name}: {within} of {total}")
 
 
 if __name__ == "__main__":
