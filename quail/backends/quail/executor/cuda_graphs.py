@@ -235,6 +235,88 @@ class DecodeBuffers:
             self._copy_shared(unified["shared"], n, rows)
 
 
+class PieceGraphs:
+    """Replay a pipeline's work between attention calls; run attention eagerly.
+
+    Everything but attention depends only on a pass's row count, so one
+    graph per piece and row bucket serves every pass of that size, of
+    any operator and attention layout. A pass copies its ids into the
+    padded buffers, replays piece 0, then for each layer runs attention
+    on its real rows and replays the next piece. Padded rows never
+    reach attention, so they read and write no KV.
+
+    The pipeline provides num_pieces, piece_widths(), piece(),
+    attention_piece(), and final_piece().
+    """
+
+    def __init__(self, pipeline, config: DecodeGraphConfig):
+        self.pipeline = pipeline
+        self.config = config
+        self.graphs = {}        # bucket rows -> one graph per piece
+        self.buffers = None
+        self.pool = None
+        self.replays = 0
+
+    def _views(self, rows):
+        ids, hidden, residual, qkv, out = self.buffers
+        return ids[:rows], hidden[:rows], residual[:rows], qkv[:rows], out[:rows]
+
+    def prepare(self, torch, stream):
+        """Capture every piece of every bucket, once; return whether it captured."""
+        if self.graphs:
+            return False
+        pipeline = self.pipeline
+        rows = self.config.row_buckets[-1]
+        width, qkv_width = pipeline.piece_widths()
+        dtype = pipeline.embed.weight.dtype
+
+        def rows_of(columns):
+            return torch.zeros((rows, columns), dtype=dtype, device="cuda")
+
+        self.buffers = (torch.zeros(rows, dtype=torch.int64, device="cuda"),
+                        rows_of(width), rows_of(width), rows_of(qkv_width),
+                        rows_of(width))
+        self.pool = torch.cuda.graph_pool_handle()
+        for index, bucket in enumerate(self.config.row_buckets):
+            views = self._views(bucket)
+            # the first bucket warms every kernel; the rest need one
+            # pass at their own shape
+            for _ in range(3 if index == 0 else 1):
+                for piece in range(pipeline.num_pieces):
+                    pipeline.piece(piece, *views)
+            stream.synchronize()
+            graphs = []
+            for piece in range(pipeline.num_pieces):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=self.pool, stream=stream):
+                    pipeline.piece(piece, *views)
+                graphs.append(graph)
+            self.graphs[bucket] = graphs
+        return True
+
+    def supports(self, chunk):
+        """Whether a pass's rows fit a captured bucket and its model has no state."""
+        return bool(self.graphs and 0 < chunk.tokens <= self.config.row_buckets[-1]
+                    and chunk.meta.get("canvas") is None
+                    and chunk.meta.get("gdn") is None)
+
+    def forward(self, chunk):
+        """Run a pass: the pieces replayed, attention eager on the real rows."""
+        n = chunk.tokens
+        bucket = self.config.bucket(n)
+        graphs = self.graphs[bucket]
+        ids, hidden, residual, qkv, out = self._views(bucket)
+        ids[:n].copy_(chunk.input_ids)
+        ids[n:].zero_()
+        chunk.meta["layer"] = 0
+        graphs[0].replay()
+        for index, graph in enumerate(graphs[1:]):
+            hidden[:n].copy_(self.pipeline.attention_piece(index, qkv[:n], chunk))
+            graph.replay()
+        self.replays += 1
+        return self.pipeline.final_piece(out[:n], residual[:n], chunk.final_indices)
+
+
 class DecodeGraphs:
     """Capture and replay bounded decode graphs for one pipeline and KV arena.
 
@@ -256,6 +338,9 @@ class DecodeGraphs:
         self.storage = None
         self.replays = 0
         self.capture_s = 0.0
+        # every other pass replays the work between attention calls
+        self.pieces = (PieceGraphs(pipeline, self._config)
+                       if hasattr(pipeline, "piece") else None)
 
     @property
     def config(self) -> DecodeGraphConfig:
@@ -282,15 +367,38 @@ class DecodeGraphs:
             layouts += ("unified", "shared")
         return layouts
 
+    def _prepare_pieces(self) -> bool:
+        """Capture the piece graphs once; they read no KV, so they outlive it."""
+        if self.pieces is None or not self.enabled:
+            return False
+        torch = self.pipeline.engine.torch
+        started = time.perf_counter()
+        stream = torch.cuda.Stream()
+        current = torch.cuda.current_stream()
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream), torch.inference_mode():
+            captured = self.pieces.prepare(torch, stream)
+        current.wait_stream(stream)
+        stream.synchronize()
+        if captured:
+            logger.info("captured %d piece graphs in %.2f s",
+                        sum(len(graphs) for graphs in self.pieces.graphs.values()),
+                        time.perf_counter() - started)
+        return captured
+
     def prepare(self):
-        """Capture every bucket of every layout on scratch KV, once per allocation."""
+        """Capture every bucket of every layout on scratch KV, once per allocation.
+
+        The piece graphs are captured on the first call.
+        """
+        pieces = self._prepare_pieces()
         engine = self.pipeline.engine
         arena, torch = engine.arena, engine.torch
         layouts = self.layouts()
         if not layouts:
-            return False
+            return pieces
         if self.storage is arena.k:
-            return False
+            return pieces
         self.invalidate()
         started = time.perf_counter()
         scratch = arena.alloc_temporary(arena.page_tokens)
@@ -391,4 +499,6 @@ class DecodeGraphs:
                 graph.replay()
                 self.replays += 1
                 return self.output.index_select(0, chunk.final_indices)
+        if self.pieces is not None and self.pieces.supports(chunk):
+            return self.pieces.forward(chunk)
         return self.pipeline.forward_chunk(chunk)

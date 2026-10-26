@@ -45,34 +45,87 @@ class Qwen3Pipeline(ModelPipeline):
                 layer.mlp.gate_up_proj, layer.mlp.down_proj)
 
     def forward_chunk(self, chunk):
-        engine = self.engine
-        meta = chunk.meta
-        meta["layer"] = 0
-        positions = chunk.positions
+        chunk.meta["layer"] = 0
         hidden = self.embed(chunk.input_ids)
         residual = None
         for layer in self.layers:
-            attn = layer.self_attn
+            qkv = self._before_attention(layer, hidden, residual)
             if residual is None:
                 residual = hidden
-                q_in, q_scale = engine.norm_quant(hidden, layer.input_layernorm)
-            else:
-                q_in, q_scale = engine.norm_quant(
-                    hidden, layer.input_layernorm, residual)
-            qkv = engine.gemm(q_in, q_scale, attn.qkv_proj)
-            q, k = engine.qk_norm_rope(qkv, positions, attn)
-            v = qkv[:, (engine.num_q_heads + engine.num_kv_heads)
-                    * engine.head_dim:]
-            o_in, o_scale = engine.attention(q, k, v, chunk)
-            hidden = engine.gemm(o_in, o_scale, attn.o_proj)
-            g_in, g_scale = engine.norm_quant(
-                hidden, layer.post_attention_layernorm, residual)
-            gate_up = engine.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
-            d_in, d_scale = engine.activation_quant(gate_up)
-            hidden = engine.gemm(d_in, d_scale, layer.mlp.down_proj)
-        final = chunk.final_indices
-        last_hidden = hidden.index_select(0, final)
-        last_residual = residual.index_select(0, final)
-        normed, _ = engine.fused_add_rms_norm(
-            last_hidden, last_residual, self.final_norm)
+            hidden = self._attention(layer, qkv, chunk)
+            hidden = self._after_attention(layer, hidden, residual)
+        return self._final_norm(hidden, residual, chunk.final_indices)
+
+    def _before_attention(self, layer, hidden, residual):
+        """Return the layer's QKV projection; a given residual takes hidden first."""
+        engine = self.engine
+        if residual is None:
+            q_in, q_scale = engine.norm_quant(hidden, layer.input_layernorm)
+        else:
+            q_in, q_scale = engine.norm_quant(hidden, layer.input_layernorm, residual)
+        return engine.gemm(q_in, q_scale, layer.self_attn.qkv_proj)
+
+    def _attention(self, layer, qkv, chunk):
+        """Return the layer's attention output projection over the chunk's KV."""
+        engine = self.engine
+        attn = layer.self_attn
+        q, k = engine.qk_norm_rope(qkv, chunk.positions, attn)
+        v = qkv[:, (engine.num_q_heads + engine.num_kv_heads) * engine.head_dim:]
+        o_in, o_scale = engine.attention(q, k, v, chunk)
+        return engine.gemm(o_in, o_scale, attn.o_proj)
+
+    def _after_attention(self, layer, hidden, residual):
+        """Return the layer's MLP output; the residual takes hidden first."""
+        engine = self.engine
+        g_in, g_scale = engine.norm_quant(
+            hidden, layer.post_attention_layernorm, residual)
+        gate_up = engine.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
+        d_in, d_scale = engine.activation_quant(gate_up)
+        return engine.gemm(d_in, d_scale, layer.mlp.down_proj)
+
+    def _final_norm(self, hidden, residual, final):
+        normed, _ = self.engine.fused_add_rms_norm(
+            hidden.index_select(0, final), residual.index_select(0, final),
+            self.final_norm)
         return normed
+
+    # ---- the pieces between attention calls, for PieceGraphs ----------------
+
+    @property
+    def num_pieces(self) -> int:
+        return len(self.layers) + 1
+
+    def piece_widths(self) -> tuple:
+        """Return the hidden width and the QKV projection's width."""
+        layer = self.layers[0]
+        return (self.embed.weight.shape[1],
+                layer.self_attn.qkv_proj.weight.shape[0])
+
+    def piece(self, index, ids, hidden, residual, qkv, out):
+        """Run the work between attention calls index - 1 and index.
+
+        Piece 0 embeds the ids and projects layer 0's QKV; piece i
+        finishes layer i - 1 from its attention output in hidden and
+        projects layer i's QKV; the last piece finishes the last layer
+        into out. Every argument is a buffer of the same rows; residual
+        is updated in place.
+        """
+        layers = self.layers
+        if index == 0:
+            embedded = self.embed(ids)
+            residual.copy_(embedded)
+            qkv.copy_(self._before_attention(layers[0], embedded, None))
+            return
+        after = self._after_attention(layers[index - 1], hidden, residual)
+        if index < len(layers):
+            qkv.copy_(self._before_attention(layers[index], after, residual))
+        else:
+            out.copy_(after)
+
+    def attention_piece(self, index, qkv, chunk):
+        """Return layer index's attention output projection, run eagerly."""
+        return self._attention(self.layers[index], qkv, chunk)
+
+    def final_piece(self, hidden, residual, final):
+        """Return the final norm of the rows final selects."""
+        return self._final_norm(hidden, residual, final)
