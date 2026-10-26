@@ -85,6 +85,9 @@ class AiMap(AiInference):
     """
 
     spec: MapSpec | None = None
+    # "unified" or "tree": the attention path the choose_attention_algorithm
+    # rule chose for the maps' branches; empty runs unified
+    attention: str = ""
 
     answer_kind: ClassVar[str] = "maps"
     spec_type: ClassVar[type[InferenceSpec]] = MapSpec
@@ -111,4 +114,5 @@ class AiMap(AiInference):
         return {
             **super().explain_fields(),
             "instruction": None if self.spec is None else self.spec.instruction,
+            "attention": self.attention or None,
         }

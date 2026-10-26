@@ -152,3 +152,24 @@ def test_ordering_by_a_map_answer(session):
     result = finish(query, Oracle(maps=SUMMARIES))
     rows = result.collect().to_pydict()
     assert rows["summary"] == sorted(SUMMARIES)[:2]
+
+
+def test_maps_over_one_table_plan_their_branches_on_the_tree_path(session):
+    # three maps read each 300-word review's KV in every decode pass;
+    # one read stacked for all three moves fewer bytes than three reads
+    words = " ".join(["slow"] * 300)
+    session.register("long_reviews", quail.DocumentProvider.from_table(pa.table({
+        "id": [0, 1, 2], "text": [words] * 3}), id_col="id"))
+    query = (session.docs("long_reviews").alias("r")
+             .ai_map("r.text", INSTRUCTION, name="negatives")
+             .ai_map("r.text", "Name the topic.", name="topic")
+             .ai_map("r.text", "List the actors named.", name="actors")
+             .select("r.id", "negatives", "topic", "actors"))
+    maps = [node for node in query.plan().nodes if isinstance(node, AiMap)]
+    assert [node.attention for node in maps] == ["tree"] * 3
+
+
+def test_a_single_map_plans_the_unified_path(session):
+    (node,) = [node for node in _summaries(session).plan().nodes
+               if isinstance(node, AiMap)]
+    assert node.attention == "unified"

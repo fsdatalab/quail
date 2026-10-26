@@ -126,10 +126,8 @@ def test_a_recurrent_model_replays_accepted_tokens(monkeypatch):
 def test_two_maps_share_one_document_read(monkeypatch):
     # two instructions over one table are put to the document at once:
     # the first branch computes the document, and the second borrows
-    # its whole pages and computes only the tokens past them; the
-    # document counts as long enough for the tree path's document read
-    from quail.backends.quail.executor.operators import map as map_part
-    monkeypatch.setattr(map_part, "DOCUMENT_READ_MIN_TOKENS", 0)
+    # its whole pages and computes only the tokens past them; the plan
+    # put the branches on the tree path
     text = LEASE
     gold = "March 3, 2027"
     tables = make_vocabulary(text, gold)
@@ -161,7 +159,8 @@ def test_two_maps_share_one_document_read(monkeypatch):
     def node(name):
         from dataclasses import replace
         return AiMap(node_id=f"ai-map:{name}", backend_name="quail",
-                     model="qwen3-4b-fp8", spec=replace(spec, name=name))
+                     model="qwen3-4b-fp8", spec=replace(spec, name=name),
+                     attention="tree")
 
     inputs = {"document_ids": [0], "documents": {"c": [tables.encode_ids(text)]},
               "texts": {"c": [text]}}
@@ -666,7 +665,7 @@ def test_branches_that_keep_kv_finish_in_a_small_pool(monkeypatch):
     assert rows["summary"]["summary"] == rows["map1"]["map1"] == [gold] * 60
 
 
-def test_maps_over_short_documents_run_unified_without_a_document_read(monkeypatch):
+def test_maps_the_plan_left_unified_read_no_document_apart(monkeypatch):
     packed = []
 
     def recording(torch, arena, specs, **kw):

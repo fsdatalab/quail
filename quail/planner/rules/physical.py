@@ -15,6 +15,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiMap,
     AiSaeFeatures,
     AiScore,
     Limit,
@@ -388,6 +389,9 @@ class ChooseAttentionAlgorithm(PhysicalRule):
     (filter_attention). A filter that does not share has one reader
     per node and stays on the unified path.
 
+    A map is annotated for its branches: the maps over one table are
+    the readers of each document, each with one decode round's rows.
+
     The choice is recomputed on every pass, so a plan first made on
     estimated lengths gets the path its exact tokens call for.
     """
@@ -430,6 +434,17 @@ class ChooseAttentionAlgorithm(PhysicalRule):
                     path = choose_attention_path(
                         model, device, readers=readers, reader_rows=rows,
                         node_tokens=_mean(lengths))
+            elif isinstance(node, AiMap):
+                path = "unified"
+                if tree_available:
+                    alias = node.spec.alias
+                    readers = sum(isinstance(other, AiMap)
+                                  and other.spec.alias == alias
+                                  for other in graph.nodes)
+                    path = choose_attention_path(
+                        model, device, readers=readers,
+                        reader_rows=1 + node.spec.draft_tokens,
+                        node_tokens=_mean(context.document_tokens.get(alias, ())))
             if path is not None and forced is not None:
                 path = forced
             if path is not None and path != node.attention:

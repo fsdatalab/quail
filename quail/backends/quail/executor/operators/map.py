@@ -1,17 +1,11 @@
 """Run a pipeline's maps and build their answer tables."""
 
-import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail.executor.decoding import AnswerPart
 from quail.backends.quail.executor.map import MapStages
 from quail.execution.rows import map_rows
 from quail.physical import AiMap
-
-# the KV per document the document read saves, (maps - 1) times its
-# tokens, at which the read pays for its extra attention calls: on an
-# H100 with three maps it breaks even near 4,000-token documents
-DOCUMENT_READ_MIN_TOKENS = 8_000
 
 
 class MapPart(AnswerPart):
@@ -26,18 +20,15 @@ class MapPart(AnswerPart):
     def attention(self) -> str:
         """The attention path for the pipeline's rounds.
 
-        Branches of long documents run on the tree path, where each
+        Branches run on the path the plan chose for the maps (the
+        choose_attention_algorithm rule); on the tree path each
         document's pages are read once per pass for all its branches
-        (see Stage.document_reads). Other pipelines run unified. A
-        model without tree attention runs unified either way.
+        (see Stage.document_reads). A pipeline without branches runs
+        unified, as does a model without tree attention.
         """
-        stages = self.answer_stages
-        if not getattr(stages, "branches", False):
+        if not getattr(self.answer_stages, "branches", False):
             return "unified"
-        tokens = float(np.mean([len(document.prefix)
-                                for document in stages.documents]))
-        saved = (len(stages.specs) - 1) * tokens
-        return "tree" if saved >= DOCUMENT_READ_MIN_TOKENS else "unified"
+        return self.node.attention or "unified"
 
     def _answer_rows(self, node, q: int, kept, document_ids):
         """Return one map's written answers."""
