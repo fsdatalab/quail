@@ -292,7 +292,7 @@ def _vllm(model: str, directory: Path, configurations) -> dict:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ.pop("QUAIL_VLLM_SPECULATIVE", None)
     from quail.baselines.vllm import VLLMEngine
-    from quail.specs import H100_USD_PER_HOUR, MODELS
+    from quail.specs import DEVICES, H100_USD_PER_HOUR, MODELS
 
     spec = MODELS[model]
     # the classification prompts are Quail's own, read from its plan
@@ -305,7 +305,8 @@ def _vllm(model: str, directory: Path, configurations) -> dict:
     with ExitStack() as resources:
         # vLLM's own CUDA graph capture sizes
         engine = VLLMEngine(capture_sizes=None)
-        settings, boot = engine.boot(spec, [0], resources=resources)
+        settings, boot = engine.boot(spec, [0], DEVICES["h100-sxm"],
+                                     resources=resources)
         result["boot"] = boot
         result["engine_settings"] = {
             key: value for key, value in settings["capacity"].items()
