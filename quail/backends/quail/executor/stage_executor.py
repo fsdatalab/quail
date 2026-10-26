@@ -315,7 +315,8 @@ class StageExecutor:
         self.pack_s = 0.0
         # host seconds per phase of the loop, and the readouts' GPU
         # event pairs, for telling host-bound passes from GPU-bound
-        self.host_s = {"admit": 0.0, "advance": 0.0, "launch": 0.0, "wait": 0.0,
+        self.host_s = {"admit": 0.0, "advance": 0.0, "launch": 0.0,
+                       "launch_graph": 0.0, "launch_eager": 0.0, "wait": 0.0,
                        "report": 0.0, "decide": 0.0, "submit": 0.0}
         self.readout_spans = []
         self.outstanding = []     # PendingAnswers in launch order
@@ -876,9 +877,14 @@ class StageExecutor:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
             e0.record()
+        graphs = self.pipeline.decode_graphs
+        replays = None if graphs is None else graphs.replays
         started = time.perf_counter()
         normed = forward_chunk(self.pipeline, self.arena, chunk)
-        self.host_s["launch"] += time.perf_counter() - started
+        launched = time.perf_counter() - started
+        self.host_s["launch"] += launched
+        replayed = graphs is not None and graphs.replays != replays
+        self.host_s["launch_graph" if replayed else "launch_eager"] += launched
         if self.gpu_timing:
             e1.record()
             self.spans.append((self._rows_by_stage(part), chunk.tokens, e0, e1))
@@ -921,6 +927,7 @@ class StageExecutor:
         run_started = time.perf_counter()
         graphs = self.pipeline.decode_graphs
         replays = 0 if graphs is None else graphs.replays
+        fallbacks = {} if graphs is None else dict(graphs.fallbacks)
         while True:
             # documents with nothing to send at their first stage never run
             for settlement in self.sched.take_settled():
@@ -997,6 +1004,11 @@ class StageExecutor:
             self.stats["run_s"] = round(time.perf_counter() - run_started, 3)
             self.stats["graph_replays"] = (0 if graphs is None
                                            else graphs.replays - replays)
+            self.stats["graph_fallbacks"] = (
+                {} if graphs is None else
+                {reason: count - fallbacks.get(reason, 0)
+                 for reason, count in graphs.fallbacks.items()
+                 if count != fallbacks.get(reason, 0)})
             if self.growth is not None:
                 self.stats["kv_growth"] = self.growth.stats()
         if self.spans:

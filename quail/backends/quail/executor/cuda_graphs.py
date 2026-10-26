@@ -231,6 +231,8 @@ class DecodeGraphs:
         self.pool = None
         self.storage = None
         self.replays = 0
+        # why passes ran without a graph: reason -> passes
+        self.fallbacks = {}
         self.capture_s = 0.0
         self.capture_bytes = 0
 
@@ -316,22 +318,27 @@ class DecodeGraphs:
                     self.capture_bytes / 2**30)
         return True
 
-    def supports(self, chunk):
-        """Whether the batch fits the captured tree-attention layout."""
-        if (not self.enabled or self.storage is not self.pipeline.engine.arena.k
-                or chunk.attention_mode != "tree"
-                or not 0 < chunk.tokens <= self.config.row_buckets[-1]
-                or chunk.meta.get("canvas") is not None
-                or chunk.meta["max_a"] > self.config.max_query_tokens):
-            return False
+    def refusal(self, chunk) -> str | None:
+        """Return why the batch fits no captured graph, or None when it fits."""
+        if not self.enabled or self.storage is not self.pipeline.engine.arena.k:
+            return "not captured"
+        if chunk.attention_mode != "tree":
+            return "unified path"
+        if not 0 < chunk.tokens <= self.config.row_buckets[-1]:
+            return "too many rows"
+        if chunk.meta.get("canvas") is not None:
+            return "canvas"
+        if chunk.meta["max_a"] > self.config.max_query_tokens:
+            return "long query"
         reads = chunk.meta["reads"]
         page_tokens = self.pipeline.engine.arena.page_tokens
         width = (self.config.max_context_tokens + page_tokens - 1) // page_tokens
         rounds = chunk.meta.get("rounds")
         if rounds is not None:
+            if reads is not None or chunk.meta["a_rows"] is not None:
+                return "rounds beside other rows"
             documents = rounds.get("documents") or {}
-            return (reads is None and chunk.meta["a_rows"] is None
-                    and chunk.tokens < self.config.row_buckets[-1]
+            fits = (chunk.tokens < self.config.row_buckets[-1]
                     and rounds["max_q"] <= self.config.max_query_tokens
                     and rounds["max_used"] <= self.config.max_context_tokens
                     and rounds["table"].shape[1] <= width
@@ -339,12 +346,20 @@ class DecodeGraphs:
                     and documents.get("max_used", 0)
                     <= self.config.max_context_tokens
                     and (not documents or documents["table"].shape[1] <= width))
-        if (reads is None or reads.get("nodes") is not None
-                or reads["max_q"] > self.config.max_query_tokens
+            return None if fits else "rounds past the limits"
+        if reads is None:
+            return "no resident reads"
+        if reads.get("nodes") is not None:
+            return "label paths"
+        if (reads["max_q"] > self.config.max_query_tokens
                 or reads["max_used"] > self.config.max_context_tokens
                 or reads["table"].shape[1] > width):
-            return False
-        return True
+            return "reads past the limits"
+        return None
+
+    def supports(self, chunk):
+        """Whether the batch fits the captured tree-attention layout."""
+        return self.refusal(chunk) is None
 
     def forward(self, chunk):
         """Replay a matching graph, falling back to the ordinary forward."""
@@ -357,4 +372,6 @@ class DecodeGraphs:
                     captured.graph.replay()
                     self.replays += 1
                     return captured.output.index_select(0, chunk.final_indices)
+        reason = self.refusal(chunk) or "no bucket"
+        self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1
         return self.pipeline.forward_chunk(chunk)

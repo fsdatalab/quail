@@ -172,3 +172,14 @@ def test_buffers_of_every_bucket_are_views_of_one_set():
     reading = DecodeBuffers(torch, 5, 16, device="cpu", documents=True, base=base)
     assert reading.chunk.meta["rounds"]["documents"]["table"].data_ptr() == (
         base.document_table.data_ptr())
+
+
+def test_a_pass_without_a_graph_counts_why():
+    source = rounds_chunk()
+    source.meta["a_rows"] = torch.tensor([0])
+    arena = SimpleNamespace(k=[], page_tokens=16)
+    graphs = DecodeGraphs(SimpleNamespace(
+        engine=SimpleNamespace(arena=arena), forward_chunk=lambda x: "eager"))
+    graphs.storage = arena.k
+    assert graphs.forward(source) == "eager"
+    assert graphs.fallbacks == {"rounds beside other rows": 1}
