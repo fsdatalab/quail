@@ -53,15 +53,20 @@ class KVGrowth:
         model: The operator's StageGrowth.
         prefix_tokens: Per anchor, its prefix length.
         final_tokens: Per anchor, the most rows its key can ever need.
+        initial_tokens: Rows past the prefix an admitted document's
+            pages cover; the model's initial_tokens when None.
     """
 
-    def __init__(self, arena, keys, model: StageGrowth, prefix_tokens, final_tokens):
+    def __init__(self, arena, keys, model: StageGrowth, prefix_tokens, final_tokens,
+                 initial_tokens=None):
         self.arena = arena
         self.keys = keys
         self.model = model
         self.page = arena.page_tokens
         self.prefix = np.asarray(prefix_tokens, dtype=np.int64)
         self.final = np.asarray(final_tokens, dtype=np.int64)
+        self.initial = (model.initial_tokens if initial_tokens is None
+                        else int(initial_tokens))
         num_anchors = len(self.final)
         horizon = int((self.final - self.prefix).max()) if num_anchors else 0
         # the projection's time axis, in rows written, a page apart
@@ -241,7 +246,7 @@ class KVGrowth:
             return False
         growth = self._projected()
         remaining = int(self.model.remaining(np.array([anchor], dtype=np.int64))[0])
-        rows = self.prefix[anchor] + self.model.initial_tokens + self.grid
+        rows = self.prefix[anchor] + self.initial + self.grid
         own = np.where(self.grid < remaining, self._pages(rows) - pages, -pages)
         if int((growth + own).max()) > left - self.reserve:
             return False

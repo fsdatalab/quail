@@ -166,6 +166,8 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
     document's pages as it goes.
     """
     stages = gated_stages(parts)
+    if growth is None:
+        growth = growing_stages(parts)
     paged = paged or state.loaded_model.pipeline.needs_pages
     if keep_kv and not paged:
         raise ValueError("retaining document KV requires arena writes")
@@ -193,6 +195,23 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
     complete_parts(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
             for node_id, result in part.results().items()}
+
+
+def growing_stages(parts):
+    """Return the StageGrowth of the one part whose KV grows as it writes.
+
+    Returns None unless exactly one part grows and no other part's
+    stage repeats: the other parts' requests are then sized when a
+    document is admitted.
+    """
+    growing = [part for part in parts
+               if getattr(getattr(part, "answer_stages", None), "grows", False)]
+    if len(growing) != 1:
+        return None
+    if any(stage.repeats for part in parts if part is not growing[0]
+           for stage in part.stages):
+        return None
+    return growing[0].answer_stages
 
 
 def gated_stages(parts) -> list:

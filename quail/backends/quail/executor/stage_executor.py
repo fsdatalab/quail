@@ -179,6 +179,9 @@ class StageExecutor:
                                    self.frames, self.stages, self.suffixes,
                                    self.canvas_rows)
                                if stage.single])
+        # what a document's fixed requests need: all but the stages
+        # that append every round, whose KV can grow as they write
+        fixed_extra = self.capacity_extra
         appended = sorted(
             (tuple(frame), int(suffixes.lengths.max()), stage.repeats)
             for frame, suffixes, stage in zip(self.frames, self.suffixes, self.stages)
@@ -193,8 +196,10 @@ class StageExecutor:
                     raise ValueError("a repeating append stage needs "
                                      "appended_tokens")
                 kept = max(kept, int(appended_tokens))
-            elif appended_tokens is not None:
-                kept = min(kept, int(appended_tokens))
+            else:
+                if appended_tokens is not None:
+                    kept = min(kept, int(appended_tokens))
+                fixed_extra = max(fixed_extra, len(frame) + kept)
             self.capacity_extra = max(self.capacity_extra, len(frame) + kept)
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
@@ -207,10 +212,11 @@ class StageExecutor:
             from quail.backends.quail.executor.growth import KVGrowth
 
             self.reserve_extra = min(self.capacity_extra,
-                                     max(frame_max, int(growth.initial_tokens)))
+                                     max(fixed_extra, int(growth.initial_tokens)))
             self.growth = KVGrowth(
                 self.arena, self.keys, growth, self.prefix_lengths,
-                [length + self.capacity_extra for length in self.prefix_lengths])
+                [length + self.capacity_extra for length in self.prefix_lengths],
+                initial_tokens=self.reserve_extra)
 
         resident = {}
         if self.paged:
@@ -902,7 +908,7 @@ class StageExecutor:
         feed = None
         if self.feeding and entries:
             feed = self.readouts.feed(handles, np.concatenate(following),
-                                      [rows for _, rows in entries])
+                                      entries, self.ahead)
         for (a, _, _, _, _), index in zip(part, group_entries):
             if index is not None:
                 self.latest[a] = (self.passes, index)

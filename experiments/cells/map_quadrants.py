@@ -153,7 +153,7 @@ def answer_stats(answers) -> dict:
 
 
 def _run_one(session, table, column, maps, draft_policy,
-             usd_per_hour, profile=False, profile_gpu=False) -> dict:
+             usd_per_hour, profile=False, profile_gpu=False, classify=None) -> dict:
     """Run one map configuration and return its measurements.
 
     Args:
@@ -169,6 +169,8 @@ def _run_one(session, table, column, maps, draft_policy,
         profile_gpu: Whether to trace the run with the torch profiler,
             print the kernels with the most GPU time, and summarize the
             chunks by size.
+        classify: (result column, prompt template, labels) of a
+            classification asked before the maps, or None.
 
     Returns:
         The query's timings and the first map's answer statistics and
@@ -181,10 +183,7 @@ def _run_one(session, table, column, maps, draft_policy,
 
     from quail.physical import AiMap
 
-    query = session.docs(table).alias("d")
-    for name, instruction, _ in maps:
-        query = query.ai_map(f"d.{column}", instruction, name=name)
-    query = query.select("d.id", *(name for name, _, _ in maps))
+    query = classified_query(session, table, column, maps, classify)
     caps = {name: cap for name, _, cap in maps}
     plan = query.plan()
     nodes = tuple(replace(
@@ -256,7 +255,35 @@ def _run_one(session, table, column, maps, draft_policy,
     }
     if len(maps) > 1:
         measured["maps"] = per_map
+    if classify is not None:
+        ids = table_out.column("d.id").to_pylist()
+        measured["labels"] = dict(zip(ids, table_out.column(classify[0]).to_pylist()))
+        measured["answers"] = dict(zip(ids, table_out.column(maps[0][0]).to_pylist()))
     return measured
+
+
+def classified_query(session, table, column, maps, classify=None):
+    """Return the query: an optional classification, then the maps.
+
+    Args:
+        session: The Quail session.
+        table: The table the operators read.
+        column: The document column.
+        maps: (result column, instruction, max answer tokens) per map.
+        classify: (result column, prompt template, labels), or None.
+    """
+    import quail
+
+    query = session.docs(table).alias("d")
+    names = []
+    if classify is not None:
+        name, template, labels = classify
+        query = query.ai_classify(quail.prompt(template, quail.col(f"d.{column}")),
+                                  list(labels), name=name)
+        names.append(name)
+    for name, instruction, _ in maps:
+        query = query.ai_map(f"d.{column}", instruction, name=name)
+    return query.select("d.id", *names, *(name for name, _, _ in maps))
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=14400,

@@ -494,3 +494,80 @@ def test_maps_with_different_answer_limits_run_as_branches(monkeypatch):
     written = [len(document_answers.written)
                for document_answers in stages.documents[0].answers]
     assert written == [2, 5]
+
+
+def test_a_map_after_a_filter_grows_its_pages_in_a_small_pool(monkeypatch):
+    # a filter then a map in one pipeline, twenty-four documents, and a
+    # pool that holds six reserved for the whole answer limit: the map
+    # grows each survivor's pages as it writes, so more run at once
+    from helpers.fakes import cpu_arena, fake_pipeline, fake_readout, fake_torch
+
+    from quail.backends.quail import QuailModelExecution
+    from quail.backends.quail.graph import execute_single_graph
+    from quail.builtins import built_in_registry
+    from quail.physical import AiFilter, PhysicalGraph, PortRef, Scan
+    from quail.physical.base import input_ports
+    from quail.specs import DEVICES, MODELS
+
+    gold = "March 3"
+    tables = make_vocabulary(LEASE, gold)
+    spec = make_map_spec(tables, max_answer_tokens=48, draft_tokens=2,
+                         draft_policy="fixed", expected_answer_tokens=4)
+    head, tail = spec.prompt_token_parts
+    passes = []
+
+    def recording(torch, arena, specs, **kw):
+        passes.append({key for packed_spec in specs
+                       for key in packed_spec.get("keys", [packed_spec.get("key")])})
+        return fake_pack(torch, arena, specs, **kw)
+
+    monkeypatch.setattr(chunk_mod, "pack_chunk", recording)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
+    count = 24
+    for index in range(count):
+        model.documents[("c", index)] = LEASE
+        model.gold[("c", index)] = gold
+        model.filter_truth[("c", index)] = index % 4 != 3
+    tokens = tables.encode_ids(LEASE)
+    question = tables.encode_ids(" question")
+    graph = PhysicalGraph((
+        Scan(node_id="input:c", alias="c", input_id="c"),
+        AiFilter(node_id="ai_filter:c",
+                 inputs=input_ports((PortRef("input:c", "rows:c"),)),
+                 alias="c", arena_writes=True,
+                 question_token_ids=tuple(question), written_position=0,
+                 question_tokens=len(question), preamble_tokens=len(head),
+                 document_head=tuple(head), selectivity=0.75,
+                 expected_rows=18.0),
+        AiMap(node_id="ai-map:summary",
+              inputs=input_ports((PortRef("ai_filter:c", "rows:c"),)),
+              backend_name="quail", model="qwen3-4b-fp8", spec=spec),
+    ), PortRef("ai-map:summary", "rows:c"))
+    whole = len(head) + len(tokens) + len(tail) + 48 + 2 * 2
+    torch, arena = fake_torch(), cpu_arena(6 * -(-whole // 16))
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.loaded_model.vocabulary = tables
+    execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+    execution.bind_query(
+        torch=torch, answer_rows=object(), chunk_tokens=400,
+        async_answers=fake_readout(
+            submit=lambda rows: [float(np.asarray(r).ravel()[0]) for r in rows],
+            result=lambda v: v, dtype=None))
+    state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                                    execution=execution,
+                                    spec=MODELS["qwen3-4b-fp8"]),
+             "runtimes": built_in_registry().runtimes,
+             "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
+             "documents": {"c": [tokens] * count}, "texts": {"c": [LEASE] * count}}
+    report = execute_single_graph(
+        state, {"filter_limit": None, "retention": {}}, graph)
+    table = report["_outputs"][PortRef("ai-map:summary", "rows:c")].to_pydict()
+    survivors = [index for index in range(count) if index % 4 != 3]
+    assert table["c"] == survivors
+    assert table["summary"] == [gold] * len(survivors)
+    assert max(len(keys) for keys in passes) > 6
+    assert not arena.accounting.owned

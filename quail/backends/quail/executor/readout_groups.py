@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from quail.backends.quail.executor.readout import RoundFeed
+
 
 class ReadoutGroups:
     """Stages grouped by readout, each group submitted once per chunk.
@@ -41,11 +43,42 @@ class ReadoutGroups:
             values[key] = self.readout_of[key].result(handle)
         return values
 
-    def feed(self, handles, following, counts):
-        """Return the chunk's RoundFeed from its one readout's handle."""
-        if not self.shared_readout:
-            raise ValueError("device-fed rounds need one readout for every stage")
-        return self.readout_of[0].feed(handles[0][1], following, counts)
+    def feed(self, handles, following, entries, ahead):
+        """Return the chunk's RoundFeed, indexed by the chunk's answers.
+
+        Args:
+            handles: The chunk's submit() handles.
+            following: Per answer row, the draft token fed after it, or -1.
+            entries: Per answer, its stage and rows.
+            ahead: Per stage, whether rounds are fed from its answers.
+        """
+        counts = np.fromiter((rows for _, rows in entries), dtype=np.int64,
+                             count=len(entries))
+        if self.shared_readout:
+            return self.readout_of[0].feed(handles[0][1], following, counts)
+        # each readout read only its own stages' rows: a group with a
+        # stage rounds are fed from computes its answers' feed, which is
+        # placed at those answers' places in the chunk
+        stage = np.fromiter((j for j, _ in entries), dtype=np.int64,
+                            count=len(entries))
+        group = np.asarray(self.group_key, dtype=np.int64)[stage]
+        fed = np.asarray(ahead, dtype=bool)[stage]
+        accepted = chosen = None
+        for key, handle in handles:
+            mine = group == key
+            if not fed[mine].any():
+                continue
+            rows = np.repeat(mine, counts)
+            part = self.readout_of[key].feed(handle, following[rows], counts[mine])
+            if accepted is None:
+                accepted = part.accepted.new_zeros(len(entries))
+                chosen = part.chosen.new_zeros(len(entries))
+            index = part.accepted.new_tensor(np.flatnonzero(mine))
+            accepted.index_copy_(0, index, part.accepted)
+            chosen.index_copy_(0, index, part.chosen)
+        if accepted is None:
+            return None
+        return RoundFeed(accepted=accepted, chosen=chosen)
 
     def _select_rows(self, normed, spans_j):
         index = np.concatenate([np.arange(start, end, dtype=np.int64)
