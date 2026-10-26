@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
-from quail.execution.ask_once import asked_once
+from quail.execution.deduplicate import asked_once
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.physical import (
     ExecutionLocation,
