@@ -919,6 +919,8 @@ class StageExecutor:
     def run(self):
         """Drive admission and drain the launched answer handles in order."""
         run_started = time.perf_counter()
+        graphs = self.pipeline.decode_graphs
+        replays = 0 if graphs is None else graphs.replays
         while True:
             # documents with nothing to send at their first stage never run
             for settlement in self.sched.take_settled():
@@ -993,6 +995,8 @@ class StageExecutor:
             self.stats["skipped_documents"] = len(self.sched.oversized)
             self.stats["host_s"] = {k: round(v, 3) for k, v in self.host_s.items()}
             self.stats["run_s"] = round(time.perf_counter() - run_started, 3)
+            self.stats["graph_replays"] = (0 if graphs is None
+                                           else graphs.replays - replays)
             if self.growth is not None:
                 self.stats["kv_growth"] = self.growth.stats()
         if self.spans:

@@ -126,7 +126,10 @@ def test_a_recurrent_model_replays_accepted_tokens(monkeypatch):
 def test_two_maps_share_one_document_read(monkeypatch):
     # two instructions over one table are put to the document at once:
     # the first branch computes the document, and the second borrows
-    # its whole pages and computes only the tokens past them
+    # its whole pages and computes only the tokens past them; the
+    # document counts as long enough for the tree path's document read
+    from quail.backends.quail.executor.operators import map as map_part
+    monkeypatch.setattr(map_part, "DOCUMENT_READ_MIN_TOKENS", 0)
     text = LEASE
     gold = "March 3, 2027"
     tables = make_vocabulary(text, gold)
@@ -608,7 +611,7 @@ def test_a_limit_after_a_filter_returns_only_whole_answers(monkeypatch):
 
 
 def _run_maps(monkeypatch, count, num_maps, *, limit=None, keep_kv=False,
-              pool_documents=None, chunk_tokens=400):
+              pool_documents=None, chunk_tokens=400, pack=fake_pack):
     """Put num_maps instructions to count copies of a lease; return each map's rows."""
     from dataclasses import replace
 
@@ -618,7 +621,7 @@ def _run_maps(monkeypatch, count, num_maps, *, limit=None, keep_kv=False,
     tables = make_vocabulary(LEASE, gold)
     spec = make_map_spec(tables, max_answer_tokens=48, draft_tokens=0,
                          draft_policy="fixed", expected_answer_tokens=4)
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", pack)
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
     monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
@@ -661,3 +664,18 @@ def test_branches_that_keep_kv_finish_in_a_small_pool(monkeypatch):
     rows, gold = _run_maps(monkeypatch, 60, 2, keep_kv=True, pool_documents=5,
                            chunk_tokens=160)
     assert rows["summary"]["summary"] == rows["map1"]["map1"] == [gold] * 60
+
+
+def test_maps_over_short_documents_run_unified_without_a_document_read(monkeypatch):
+    packed = []
+
+    def recording(torch, arena, specs, **kw):
+        packed.append(kw.get("attention_mode"))
+        packed.extend(spec for spec in specs if "rounds" in spec)
+        return fake_pack(torch, arena, specs, **kw)
+
+    rows, gold = _run_maps(monkeypatch, 4, 3, pack=recording)
+    assert rows["summary"]["summary"] == [gold] * 4
+    assert set(mode for mode in packed if isinstance(mode, str)) == {"unified"}
+    assert not any("document_reads" in spec for spec in packed
+                   if isinstance(spec, dict))

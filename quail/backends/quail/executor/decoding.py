@@ -391,6 +391,8 @@ class AnswerPart(DocumentAnswerPart):
                                    if first else 0.0),
                         "host_s": stats.get("host_s") if first else None,
                         "run_s": stats.get("run_s") if first else None,
+                        "graph_replays": (stats.get("graph_replays")
+                                          if first else None),
                         "readout_gpu_s": (stats.get("readout_gpu_s")
                                           if first else None),
                         "idle_gpu_s": (stats.get("idle_gpu_s")
