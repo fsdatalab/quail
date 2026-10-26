@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from quail.backends.quail.executor.chunk import device_arrays
 from quail.backends.quail.executor.readout import RoundFeed
 
 
@@ -73,7 +74,7 @@ class ReadoutGroups:
             if accepted is None:
                 accepted = part.accepted.new_zeros(len(entries))
                 chosen = part.chosen.new_zeros(len(entries))
-            index = part.accepted.new_tensor(np.flatnonzero(mine))
+            index = self._device_index(np.flatnonzero(mine), part.accepted)
             accepted.index_copy_(0, index, part.accepted)
             chosen.index_copy_(0, index, part.chosen)
         if accepted is None:
@@ -84,9 +85,14 @@ class ReadoutGroups:
         index = np.concatenate([np.arange(start, end, dtype=np.int64)
                                 for start, end in spans_j])
         if hasattr(normed, "index_select"):
-            return normed.index_select(
-                0, self.torch.from_numpy(index).to(normed.device, non_blocking=True))
+            return normed.index_select(0, self._device_index(index, normed))
         return [normed[r] for r in index]
+
+    def _device_index(self, index, like):
+        """Copy an int64 index to like's device without waiting for the stream."""
+        if like.device.type == "cuda":
+            return device_arrays(self.torch, [index], like.device)[0]
+        return like.new_tensor(np.asarray(index, dtype=np.int64)).long()
 
     def submit(self, normed, entries, rows_per_answer):
         """Submit answer rows to readouts and return handles by readout group.
