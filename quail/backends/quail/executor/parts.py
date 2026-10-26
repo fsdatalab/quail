@@ -308,12 +308,16 @@ def transition_reporter(parts):
     return report
 
 
+RUN_STATS = ("host_s", "run_s", "readout_gpu_s", "idle_gpu_s", "kv_growth")
+
+
 def complete_parts(parts, every, spans, tokens, stats):
     """Finalize pipeline parts and store each operator's result.
 
     The first part with stages receives document token costs, prefix-sharing
     counts, and packing time. Later parts receive their own frame and suffix
-    token costs. GPU time is apportioned by the rows each part processed.
+    token costs, and the run's RUN_STATS. GPU time is apportioned by the
+    rows each part processed.
 
     Args:
         parts: Pipeline parts in execution order.
@@ -323,6 +327,8 @@ def complete_parts(parts, every, spans, tokens, stats):
         stats: Packing time and prefix-sharing counts.
     """
     slices = _part_slices(parts)
+    # what the run measured as a whole, reported by every part
+    shared = {key: stats[key] for key in RUN_STATS if key in stats}
     own = [part.finish(every[low:high])
            for part, (low, high) in zip(parts, slices)]
     staged = [index for index, part in enumerate(parts) if part.stages]
@@ -331,7 +337,7 @@ def complete_parts(parts, every, spans, tokens, stats):
         part_spans = stage_spans(spans, low, high)
         part.complete(
             remainder if staged and index == staged[0] else (own[index] or 0),
-            part_spans, stats if staged and index == staged[0] else {},
+            part_spans, stats if staged and index == staged[0] else shared,
             low)
 
 
