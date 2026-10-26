@@ -1078,6 +1078,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                             f - view.start)
                     cu_q.append(cu_q[-1] + num_prefix_tokens)
 
+                # suffixes of one document, as a join's partners, read
+                # its whole pages once together and their own rows apart
+                share = 0
+                if not sliding and len(begins) > 1 and not spec["canvas"]:
+                    share = (f // page_tokens) * page_tokens
                 for s0, s1 in zip(begins.tolist(), ends.tolist()):
                     suffix_tokens = s1 - s0
                     remainders = [(f - view.start) % page_tokens for view in views]
@@ -1108,12 +1113,22 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                         pool.scatter_suffix(view, temp, s0, s1, f, remainder,
                                             page_tokens)
                         kept_pages = (f - view.start) // page_tokens
-                        pool.add_sequence(
-                            view.pages[:kept_pages] + temp.pages,
-                            f - view.start + suffix_tokens)
+                        if share:
+                            pool.add_sequence(temp.pages, remainder + suffix_tokens)
+                        else:
+                            pool.add_sequence(
+                                view.pages[:kept_pages] + temp.pages,
+                                f - view.start + suffix_tokens)
                     cu_q.append(cu_q[-1] + suffix_tokens)
                     if spec["canvas"]:
                         canvas_seq.append(len(cu_q) - 2)
+                if share:
+                    first, rows = int(begins[0]), int(ends[-1] - begins[0])
+                    shared_reads["rows"].append((first, rows))
+                    shared_reads["cu_q"].append(shared_reads["cu_q"][-1] + rows)
+                    shared_reads["keys"].append(key)
+                    shared_reads["used"].append(share)
+                    shared_reads["max_q"] = max(shared_reads["max_q"], rows)
 
             built = [pool.build(arena, stage, torch, staging, index)
                      for index, pool in enumerate(pools)]

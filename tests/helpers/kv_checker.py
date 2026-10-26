@@ -131,6 +131,26 @@ class HashModel:
 
         table = unified["table"].tolist()
         used = unified["used"].tolist()
+        # a row in a shared read reads its document's leading pages from
+        # the shared table and the rest from its own, which starts there
+        offset_of, shared_of = {}, {}
+        shared = unified.get("shared")
+        if shared is not None:
+            s_cu = shared["cu_q"].tolist()
+            s_rows = shared["rows"].tolist()
+            s_used = shared["used"].tolist()
+            s_table = shared["table"].tolist()
+            for g in range(len(s_cu) - 1):
+                for row in s_rows[s_cu[g]:s_cu[g + 1]]:
+                    offset_of[row] = s_used[g]
+                    shared_of[row] = g
+
+        def logical(i, row, k):
+            """The physical row holding position k for sequence i's row."""
+            offset = offset_of.get(row, 0)
+            if k < offset:
+                return phys(s_table, shared_of[row], k)
+            return phys(table, i, k - offset)
 
         def row_hash(row):
             if hashes[row] is not None:
@@ -139,16 +159,18 @@ class HashModel:
             count = cu[i + 1] - cu[i]
             view = used[i] - count + row - cu[i]
             position = positions[row]
-            assert view == position, "a query row's KV index is off"
+            assert view + offset_of.get(row, 0) == position, \
+                "a query row's KV index is off"
+            view = position
             # a join's frame entry does not keep its canvas row, whose
             # answer nothing reads
             unkept = ids[row] in self.canvas and row == cu[i + 1] - 1
-            assert unkept or full[0].get(phys(table, i, view)) == row, \
+            assert unkept or full[0].get(logical(i, row, view)) == row, \
                 "a query row is not written where it reads itself"
             previous = 0
             if view:
                 token, read_position, previous = value(
-                    self.full, full, phys(table, i, view - 1))
+                    self.full, full, logical(i, row, view - 1))
                 assert read_position == position - 1, \
                     f"row at {position} reads position {read_position} before it"
             hashes[row] = mix(previous, ids[row])
@@ -159,8 +181,10 @@ class HashModel:
         # the resident rows each sequence reads form one chain
         for i in range(len(cu) - 1):
             count = cu[i + 1] - cu[i]
-            self._check_chain(lambda v, i=i: value(
-                self.full, full, phys(table, i, v)), used[i] - count)
+            first = cu[i]
+            self._check_chain(lambda v, i=i, first=first: value(
+                self.full, full, logical(i, first, v)),
+                used[i] - count + offset_of.get(first, 0))
         if sliding is not None:
             s_table = unified["sliding"]["table"].tolist()
             s_used = unified["sliding"]["used"].tolist()
