@@ -162,8 +162,8 @@ def execute_query(query, physical_executor=None, plan=None,
     physical_prepare_s = time.perf_counter() - physical_prepare_started
     if on_execution_ready is not None:
         on_execution_ready()
-    remaining = RemainingTimeTracker(plan.graph, plan.estimates,
-                                     emit=on_remaining)
+    remaining = RemainingTimeTracker.for_plan(plan.graph, plan.estimates,
+                                              on_remaining=on_remaining)
     started = time.perf_counter()
     if has_compute:
         remaining.start()

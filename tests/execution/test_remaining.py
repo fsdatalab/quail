@@ -1,8 +1,8 @@
 """Time left while a query runs: the plan's SoL seconds corrected by progress."""
 
+import json
 import random
 import time
-from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
@@ -14,6 +14,7 @@ from quail.execution.remaining import (
     RemainingTimeTracker,
     duration,
     prediction_errors,
+    replay,
 )
 from quail.planner.plan import EngineConfig
 from quail.progress import Progress, listening, running
@@ -36,32 +37,28 @@ def clock(monkeypatch):
     return value
 
 
-def node(node_id, type_name, expected_rows=None):
-    return SimpleNamespace(node_id=node_id, type_name=type_name,
-                           expected_rows=expected_rows)
-
-
-def tracker_for(planned, kinds=None, expected_rows=None):
+def tracker_for(planned, kinds=None, expected_rows=None, **options):
     """A tracker over nodes priced at planned[node_id] SoL seconds."""
     kinds = kinds or {}
     expected_rows = expected_rows or {}
-    graph = SimpleNamespace(nodes=[
-        node(node_id, kinds.get(node_id, "quail.ai_filter"), expected_rows.get(node_id))
-        for node_id in planned])
-    return RemainingTimeTracker(
-        graph, {node_id: {"seconds": seconds}
-                for node_id, seconds in planned.items()})
+    return RemainingTimeTracker({
+        node_id: {"seconds": seconds,
+                  "kind": kinds.get(node_id, "quail.ai_filter"),
+                  "expected_rows": expected_rows.get(node_id)}
+        for node_id, seconds in planned.items()}, **options)
 
 
 def run_group(clock, tracker, node_ids, seconds, total=1000, rate=None,
-              every=5.0):
+              every=5.0, latency=0):
     """Count one group's work as it runs for seconds, reporting every 5 s.
 
     rate, when given, is a callable(step) -> a weight for that second's
     share of the work; the weights are scaled to finish at seconds.
+    latency is the seconds at the start before any row finishes.
     """
     steps = int(seconds)
-    weights = [rate(step) if rate else 1.0 for step in range(steps)]
+    weights = [0.0 if step < latency else rate(step) if rate else 1.0
+               for step in range(steps)]
     scale = total / sum(weights)
     with running(node_ids), listening(tracker):
         progress = Progress("op", total=total, every=every,
@@ -103,7 +100,7 @@ def test_a_running_operator_is_described_against_its_sol_seconds(clock):
     tracker = tracker_for({"f": 60.0, "j": 120.0},
                           kinds={"j": "quail.ai_join"})
     seen = []
-    tracker.emit = seen.append
+    tracker.on_remaining = seen.append
     with running(("f",)), listening(tracker):
         progress = Progress("op", total=100, every=0, emit=lambda line: None)
         clock.now = 45.0
@@ -151,7 +148,7 @@ def test_an_unknown_total_uses_the_planned_rows(clock):
     tracker = tracker_for({"j": 10.0}, kinds={"j": "quail.ai_join"},
                           expected_rows={"j": 100})
     seen = []
-    tracker.emit = seen.append
+    tracker.on_remaining = seen.append
     with running(("j",)), listening(tracker):
         progress = Progress("join", total=None, every=0,
                             emit=lambda line: None)
@@ -205,6 +202,25 @@ def test_a_noisy_rate_predicts_within_a_quarter_by_half_time(clock, seed):
                   rate=lambda step: noise.uniform(0.6, 1.4))
     errors = prediction_errors(tracker.report())
     assert abs(errors[0.5]) < 0.25, errors
+
+
+def test_seconds_before_the_first_finished_row_do_not_slow_the_rate(clock):
+    # rows finish only after every stage: none in the first 10 s of 60
+    tracker = tracker_for({"c": 30.0}, kinds={"c": "quail.ai_classify"})
+    run_group(clock, tracker, ("c",), seconds=60, latency=10)
+    report = tracker.report()
+    from_start = prediction_errors(replay(report, rate_from_first=False))
+    from_first = prediction_errors(report)
+    assert from_start[0.5] > 0.1, "the idle start lowers the rate all run"
+    assert abs(from_first[0.5]) < 0.03
+
+
+def test_a_saved_report_replays_to_the_same_estimates(clock):
+    tracker = tracker_for({"f": 10.0, "j": 20.0}, kinds={"j": "quail.ai_join"})
+    run_group(clock, tracker, ("f",), seconds=30)
+    run_group(clock, tracker, ("j",), seconds=20, latency=4)
+    report = json.loads(json.dumps(tracker.report()))
+    assert replay(report)["history"] == report["history"]
 
 
 def test_durations_read_as_seconds_minutes_and_hours():

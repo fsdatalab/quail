@@ -18,7 +18,9 @@ import json
 import sys
 from pathlib import Path
 
-from quail.execution.remaining import FRACTIONS, prediction_errors
+from quail.execution.remaining import FRACTIONS, prediction_errors, replay
+
+WITHIN = 0.15
 
 
 def query_rows(directory: Path) -> list[dict]:
@@ -42,8 +44,26 @@ def query_rows(directory: Path) -> list[dict]:
                 "errors": prediction_errors(report),
                 "groups": report["groups"],
                 "history": report["history"],
+                "report": report,
             }
     return list(rows.values())
+
+
+def left_errors(report: dict) -> list[tuple[float, float, float]]:
+    """Return (at, estimated left, actual left) for each estimate of a run.
+
+    The estimate made as the run finishes is left out.
+    """
+    finished = report["finished_seconds"]
+    return [(at, left, finished - at) for at, left in report["history"]
+            if finished - at >= 0.5]
+
+
+def within_share(reports) -> tuple[int, int]:
+    """Return how many estimates are within WITHIN of the time left, of all."""
+    errors = [(left - actual) / actual for report in reports
+              for _, left, actual in left_errors(report)]
+    return sum(abs(error) <= WITHIN for error in errors), len(errors)
 
 
 def _percent(value) -> str:
@@ -81,13 +101,19 @@ def main(directory: str) -> None:
     print("query | at s | estimated left s | actual left s | error s | error")
     print("--- | --- | --- | --- | --- | ---")
     for row in rows:
-        for at, left in row["history"]:
-            actual = row["finished_seconds"] - at
-            if actual < 0.5:
-                continue        # the last count lands as the run finishes
+        for at, left, actual in left_errors(row["report"]):
             print(" | ".join([
                 row["query"], f"{at:.1f}", f"{left:.1f}", f"{actual:.1f}",
                 f"{left - actual:+.1f}", _percent((left - actual) / actual)]))
+    reports = [row["report"] for row in rows]
+    within, total = within_share(reports)
+    print(f"\nwithin {WITHIN:.0%} of the time left: {within} of {total}")
+    saved = [report for report in reports if "counts" in report]
+    if saved:
+        within, total = within_share(
+            replay(report, rate_from_first=False) for report in saved)
+        print(f"replayed with the rate measured from each group's start: "
+              f"{within} of {total}")
 
 
 if __name__ == "__main__":

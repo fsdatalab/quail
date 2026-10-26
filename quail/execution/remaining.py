@@ -44,12 +44,19 @@ class RemainingTime:
 
 @dataclass
 class _Group:
-    """Plan nodes counted by one Progress: one node, or one pipeline."""
+    """Plan nodes counted by one Progress: one node, or one pipeline.
+
+    first is the elapsed seconds and count of the first report with a
+    finished row, or None before one.
+    """
 
     kind: str
     planned_seconds: float
     elapsed: float = 0.0
     fraction: float = 0.0
+    done: int = 0
+    total: int | None = None
+    first: tuple[float, int] | None = None
 
 
 def duration(seconds: float) -> str:
@@ -72,24 +79,39 @@ class RemainingTimeTracker:
     runs at a time, so a group that stops reporting when another starts
     has finished.
 
+    A running group's rate is measured from its first report with a
+    finished row, because rows in flight finish only after every stage
+    runs: the seconds before the first finished row add no count.
+
     Args:
-        graph: The physical graph that runs.
-        estimates: Node id -> its plan estimate entry; an entry with
-            ``seconds`` is priced.
-        emit: Optional callable run with each RemainingTime, after it
-            is logged.
+        nodes: Priced node id -> {"seconds", "kind", "expected_rows"}.
+        on_remaining: Optional callable run with each RemainingTime,
+            after it is logged.
+        rate_from_first: Measure a running group's rate from its first
+            finished row; False measures it from the group's start.
     """
 
-    def __init__(self, graph, estimates, emit=None):
-        self.nodes = {node.node_id: node for node in graph.nodes}
-        self.seconds = {
-            node_id: entry["seconds"] for node_id, entry in estimates.items()
-            if entry.get("seconds") and node_id in self.nodes}
-        self.planned_seconds = sum(self.seconds.values())
-        self.emit = emit
+    def __init__(self, nodes, on_remaining=None, rate_from_first=True):
+        self.nodes = dict(nodes)
+        self.planned_seconds = sum(node["seconds"] for node in self.nodes.values())
+        self.on_remaining = on_remaining
+        self.rate_from_first = rate_from_first
         self.started = time.perf_counter()
         self.groups: dict[tuple, _Group] = {}
         self.history: list[tuple[float, float]] = []
+        self.counts: list[list] = []
+
+    @classmethod
+    def for_plan(cls, graph, estimates,
+                 on_remaining=None) -> "RemainingTimeTracker":
+        """Return a tracker over the nodes of graph that estimates prices."""
+        return cls({
+            node.node_id: {
+                "seconds": estimates[node.node_id]["seconds"],
+                "kind": node.type_name,
+                "expected_rows": getattr(node, "expected_rows", None)}
+            for node in graph.nodes
+            if estimates.get(node.node_id, {}).get("seconds")}, on_remaining)
 
     def start(self) -> None:
         """Log the planner's SoL seconds as a lower bound."""
@@ -100,32 +122,55 @@ class RemainingTimeTracker:
 
     def __call__(self, progress) -> None:
         """Record one Progress count and report the new estimate."""
-        node_ids = tuple(node_id for node_id in progress.node_ids
-                         if node_id in self.seconds)
-        if not node_ids:
+        estimate = self.count(
+            time.perf_counter() - self.started, progress.node_ids,
+            progress.done, progress.total, progress.elapsed, progress.finished)
+        if estimate is None:
             return
-        total, planned_total = progress.total, False
-        if total is None:
-            total = getattr(self.nodes[node_ids[0]], "expected_rows", None)
-            planned_total = True
+        say(f"query: {estimate.describe()}")
+        if self.on_remaining is not None:
+            self.on_remaining(estimate)
+
+    def count(self, at, node_ids, done, total, elapsed, finished):
+        """Record one count made at seconds into the run.
+
+        Returns:
+            The new RemainingTime, or None when the count is not of a
+            priced node or no work has been measured yet.
+        """
+        node_ids = tuple(node_id for node_id in node_ids
+                         if node_id in self.nodes)
+        if not node_ids:
+            return None
+        self.counts.append([at, list(node_ids), done, total, elapsed, finished])
+        planned_total = total is None
+        if planned_total:
+            total = self.nodes[node_ids[0]]["expected_rows"]
         group = self.groups.get(node_ids)
         if group is None:
             for other in self.groups.values():
                 other.fraction = 1.0
             group = self.groups[node_ids] = _Group(
-                kind=_kind(self.nodes[node_id] for node_id in node_ids),
-                planned_seconds=sum(self.seconds[i] for i in node_ids))
-        group.elapsed = progress.elapsed
-        group.fraction = (1.0 if progress.finished
-                          else min(1.0, progress.done / total) if total else 0.0)
+                kind=_kind(self.nodes[node_id]["kind"] for node_id in node_ids),
+                planned_seconds=sum(self.nodes[i]["seconds"] for i in node_ids))
+        group.elapsed, group.done, group.total = elapsed, done, total
+        group.fraction = (1.0 if finished
+                          else min(1.0, done / total) if total else 0.0)
+        if group.first is None and done and not finished:
+            group.first = (elapsed, done)
         estimate = self.estimate(planned_total)
-        if estimate is None:
-            return
-        self.history.append(
-            (time.perf_counter() - self.started, estimate.seconds))
-        say(f"query: {estimate.describe()}")
-        if self.emit is not None:
-            self.emit(estimate)
+        if estimate is not None:
+            self.history.append((at, estimate.seconds))
+        return estimate
+
+    def _group_seconds(self, group) -> float:
+        """Seconds left for a running group with a measured count."""
+        if self.rate_from_first and group.first is not None:
+            first_elapsed, first_done = group.first
+            if group.done > first_done and group.elapsed > first_elapsed:
+                rate = (group.done - first_done) / (group.elapsed - first_elapsed)
+                return (group.total - group.done) / rate
+        return group.elapsed * (1 - group.fraction) / group.fraction
 
     def estimate(self, planned_total: bool = False) -> RemainingTime | None:
         """Return the time left, or None before any work is measured."""
@@ -144,24 +189,24 @@ class RemainingTimeTracker:
             if group.fraction >= 1.0:
                 continue
             if group.fraction:
-                seconds += group.elapsed * (1 - group.fraction) / group.fraction
+                seconds += self._group_seconds(group)
             else:
                 seconds += group.planned_seconds * slowdown
         started = {node_id for node_ids in self.groups for node_id in node_ids}
-        for node_id, planned in self.seconds.items():
+        for node_id, node in self.nodes.items():
             if node_id not in started:
-                elapsed, kind_planned = by_kind.get(
-                    _kind((self.nodes[node_id],)), (0.0, 0.0))
-                seconds += planned * (elapsed / kind_planned if kind_planned
-                                      else slowdown)
+                elapsed, kind_planned = by_kind.get(node["kind"], (0.0, 0.0))
+                seconds += node["seconds"] * (elapsed / kind_planned if kind_planned
+                                              else slowdown)
         return RemainingTime(seconds, self.planned_seconds, slowdown,
                              planned_total)
 
     def report(self) -> dict:
-        """Return each group's slowdown and the estimates made during the run."""
+        """Return the run's counts, each group's slowdown, and every estimate."""
         return {
             "planned_seconds": self.planned_seconds,
             "finished_seconds": time.perf_counter() - self.started,
+            "nodes": self.nodes,
             "groups": [
                 {"node_ids": list(node_ids), "kind": group.kind,
                  "planned_seconds": group.planned_seconds,
@@ -169,8 +214,25 @@ class RemainingTimeTracker:
                  "slowdown": (group.elapsed / group.planned_seconds
                               if group.fraction >= 1.0 else None)}
                 for node_ids, group in self.groups.items()],
+            "counts": self.counts,
             "history": [list(point) for point in self.history],
         }
+
+
+def replay(report: dict, **options) -> dict:
+    """Run a saved report's counts through a new tracker on the CPU.
+
+    Args:
+        report: A RemainingTimeTracker report saved after the run.
+        **options: RemainingTimeTracker options, such as rate_from_first.
+
+    Returns:
+        The report with the new tracker's estimates as its history.
+    """
+    tracker = RemainingTimeTracker(report["nodes"], **options)
+    for count in report["counts"]:
+        tracker.count(*count)
+    return {**report, "history": [list(point) for point in tracker.history]}
 
 
 def prediction_errors(report: dict, fractions=FRACTIONS) -> dict:
@@ -198,5 +260,5 @@ def prediction_errors(report: dict, fractions=FRACTIONS) -> dict:
     return errors
 
 
-def _kind(nodes) -> str:
-    return "+".join(dict.fromkeys(node.type_name for node in nodes))
+def _kind(kinds) -> str:
+    return "+".join(dict.fromkeys(kinds))
