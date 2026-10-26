@@ -66,14 +66,13 @@ class Deduplicated:
                 if not any(alias in self.keys for alias in aliases):
                     outputs[port.name] = value
                     continue
+                keys = self._keys(aliases)
                 if port.value_type is ValueType.JOIN_ANSWERS:
                     table = (value if isinstance(value, pa.Table)
                              else _join_answers_table(value))
-                    outputs[port.name] = _expanded(
-                        table, aliases, read, self._keys(aliases), pairs)
+                    outputs[port.name] = _expanded(table, aliases, read, keys, pairs)
                 elif port.value_type is ValueType.FILTER_ANSWERS:
-                    outputs[port.name] = _expanded(
-                        value, aliases, read, self._keys(aliases), None)
+                    outputs[port.name] = _expanded(value, aliases, read, keys, None)
                 elif isinstance(node, AiJoin):
                     # an AI join's anchor rows come from its expanded answers
                     joined = next(table for table in outputs.values()
@@ -81,12 +80,11 @@ class Deduplicated:
                     (anchor,) = aliases
                     outputs[port.name] = Rows({anchor: _join_survivors(
                         joined, anchor, node.semantics, read[anchor],
-                        len(self._keys(aliases)[anchor]))})
+                        len(keys[anchor]))})
                 else:
                     rows = (value if isinstance(value, Rows)
                             else Rows({aliases[0]: document_ids(value)}))
-                    table = _expanded(rows.table(), aliases, read,
-                                      self._keys(aliases),
+                    table = _expanded(rows.table(), aliases, read, keys,
                                       pairs if len(aliases) == 2 else None)
                     outputs[port.name] = Rows(
                         {alias: table.column(alias) for alias in aliases},
@@ -242,7 +240,8 @@ def _read_pairs(context, aliases, table, keys, every, pairs, node, port,
     """Record a pair input and reduce it to one pair of key documents each."""
     left, right = aliases
     for alias in aliases:
-        every.setdefault(alias, np.unique(table.column(alias).to_numpy()))
+        if alias not in every:
+            every[alias] = np.unique(table.column(alias).to_numpy())
     if not any(_key(context, alias, keys) for alias in aliases):
         return
     pairs[node.node_id] = table
