@@ -306,7 +306,7 @@ def oracle_executor(oracle: Oracle, functions=None, **report):
             state["columns"] = request.column_tables()
         result = execute_single_graph(state, {
             "filter_limit": None,
-            "ask_once": request.plan["settings"].get("ask_once", {})}, graph)
+            "deduplicate": request.plan["settings"].get("deduplicate", {})}, graph)
         outputs = result.pop("_outputs")
         return PhysicalResponse(outputs, {
             **result, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234, **report})

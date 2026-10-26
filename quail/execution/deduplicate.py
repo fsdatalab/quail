@@ -1,13 +1,14 @@
-"""Ask a group of model operators once per text, and answer every copy."""
+"""Deduplicate a group of model operators' inputs, and answer every copy."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pyarrow as pa
 
-from quail.catalog.pairs import key_documents
+from quail.catalog.pairs import columns_key
+from quail.catalog.tokens import FIRST_DOCUMENT
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeResult
 from quail.execution.result import true_answer_rows
@@ -19,7 +20,7 @@ MODEL_NODES = (AiFilter, AiJoin, AiInference)
 
 
 @dataclass
-class AskedOnce:
+class Deduplicated:
     """One group's inputs over key documents, and the expansion of its results.
 
     Attributes:
@@ -29,6 +30,7 @@ class AskedOnce:
         every: Alias -> the documents the group read from outside.
         pairs: Node id -> the pairs the node read from outside.
         inside: The ids of the group's nodes.
+        nodes: The group's nodes, in the order they run.
     """
 
     inputs: dict
@@ -36,8 +38,7 @@ class AskedOnce:
     every: dict
     pairs: dict
     inside: set
-    nodes: tuple = ()
-    answered: dict = field(default_factory=dict)
+    nodes: tuple
 
     def expanded(self, results: dict) -> dict:
         """Give every document, or pair, the answers of its key documents.
@@ -47,9 +48,11 @@ class AskedOnce:
         """
         current = dict(self.every)
         expanded = {}
+        # node id, port name -> the expanded output of an earlier member
+        earlier_outputs = {}
         for node in self.nodes:
             result = results[node.node_id]
-            pairs = self._pairs_read(node)
+            pairs = self._pairs_read(node, earlier_outputs)
             # every port stands for the documents the node read, before
             # its survivors become what the next node reads
             read = dict(current)
@@ -91,7 +94,7 @@ class AskedOnce:
                 if port.value_type is ValueType.ROWS and len(aliases) == 1:
                     current[aliases[0]] = document_ids(
                         outputs[port.name]).to_numpy()
-                self.answered[(node.node_id, port.name)] = outputs[port.name]
+                earlier_outputs[(node.node_id, port.name)] = outputs[port.name]
             metrics = result.metrics
             read = self._rows_read(node, pairs)
             if read is not None:
@@ -107,14 +110,14 @@ class AskedOnce:
         return {alias: self.keys.get(alias, _identity(self.every, alias))
                 for alias in aliases}
 
-    def _pairs_read(self, node):
+    def _pairs_read(self, node, earlier_outputs):
         """The pairs a node stands for: read from outside, or a join's inside."""
         if node.node_id in self.pairs:
             return self.pairs[node.node_id]
         for port in node.inputs:
             if (port.value_type is ValueType.JOIN_ANSWERS
                     and port.source.node_id in self.inside):
-                return true_answer_rows(self.answered[
+                return true_answer_rows(earlier_outputs[
                     (port.source.node_id, port.source.port)])
         return None
 
@@ -143,22 +146,23 @@ class AskedOnce:
         return tuple(node.aliases)
 
 
-def asked_once(graph, nodes, inputs, context) -> AskedOnce | None:
+def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
     """Reduce a group's outside inputs to one document, or pair, per key.
 
     Args:
         graph: The physical graph the group belongs to.
         nodes: The group's nodes, a pipeline or one node.
         inputs: Node id -> port name -> value, the group's outside inputs.
-        context: The execution context; its ``ask_once`` names, per
-            alias, the value column holding each document's key document.
+        context: The execution context; its ``deduplicate`` names, per
+            alias, the row columns documents are grouped by beside their
+            tokens.
 
     Returns:
         The reduced inputs and their expansion, or None when the group
-        reads no table asked once per text, or reads an input the
+        reads no deduplicated table, or reads an input the
         expansion cannot give back to every copy.
     """
-    if not context.ask_once or not any(
+    if not context.deduplicate or not any(
             isinstance(node, MODEL_NODES) for node in nodes):
         return None
     if any(isinstance(node, Foreign) for node in nodes) or any(
@@ -197,7 +201,7 @@ def asked_once(graph, nodes, inputs, context) -> AskedOnce | None:
             return None
     if not keys:
         return None
-    return AskedOnce(reduced, keys, every, pairs, inside, tuple(nodes))
+    return Deduplicated(reduced, keys, every, pairs, inside, tuple(nodes))
 
 
 def _is_pairs(port, value) -> bool:
@@ -208,12 +212,13 @@ def _is_pairs(port, value) -> bool:
 
 def _key(context, alias: str, keys: dict) -> bool:
     """Load an alias's key documents into keys; False when it has none."""
-    column = context.ask_once.get(alias)
-    if column is None:
+    if alias not in context.deduplicate:
         return False
     if alias not in keys:
-        keys[alias] = key_documents(
-            context.sources, alias, column).to_numpy().astype(np.int64)
+        columns = context.sources.get(columns_key(alias))
+        if columns is None or FIRST_DOCUMENT not in columns.column_names:
+            raise KeyError(f"{alias!r} needs its {FIRST_DOCUMENT!r} column")
+        keys[alias] = columns.column(FIRST_DOCUMENT).to_numpy().astype(np.int64)
     return True
 
 

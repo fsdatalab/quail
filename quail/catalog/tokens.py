@@ -432,33 +432,10 @@ class ColumnStore:
         self._resources.close()
 
 
-# each document's first document with the same tokens and, after a
-# colon, the same values in the named row columns
+# the value column holding each document's first document with the same
+# tokens and the same values in the row columns the deduplicate setting
+# names for its table
 FIRST_DOCUMENT = "__first_document"
-
-
-def first_document_column(columns=()) -> str:
-    """Name the value column holding each document's first document.
-
-    Args:
-        columns: Row columns a document's first document must also
-            equal it in, such as a filter's stop key.
-    """
-    if not columns:
-        return FIRST_DOCUMENT
-    return f"{FIRST_DOCUMENT}:{','.join(sorted(columns))}"
-
-
-def first_document_columns(name: str) -> tuple[str, ...] | None:
-    """The row columns a first document column name groups by, or None.
-
-    Returns None for a name that is not a first document column.
-    """
-    if name == FIRST_DOCUMENT:
-        return ()
-    if name.startswith(f"{FIRST_DOCUMENT}:"):
-        return tuple(name[len(FIRST_DOCUMENT) + 1:].split(","))
-    return None
 
 
 class TokenStore(Sequence):

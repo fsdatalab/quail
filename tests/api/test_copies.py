@@ -1,8 +1,8 @@
 """Model operators over copied documents are asked once per distinct text.
 
-The planner records, per table with copies, the value column holding
-each document's key document; the executor asks the key documents and
-gives every copy their answers. Each query here runs with and without
+The planner records, per table with copies, the row columns its
+documents are grouped by beside their tokens; the executor asks the key
+documents and gives every copy their answers. Each query here runs with and without
 that rule and must return the same rows.
 """
 
@@ -13,8 +13,7 @@ from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, fake_tok
 
 import quail
-from quail.catalog.tokens import first_document_column
-from quail.planner.rules.physical import ShouldAskOncePerText
+from quail.planner.rules.physical import ShouldDeduplicate
 
 BODIES = ["noisy room", "cold room", "noisy room", "slow lift", "noisy room",
           "cold room"]
@@ -52,26 +51,25 @@ def _short(session):
 def test_the_planner_names_a_key_column_for_a_table_with_copies():
     with _session() as session:
         plan = _planned(_short(session).select("r.id"))
-        assert plan.settings["ask_once"] == {"r": first_document_column(())}
+        assert plan.settings["deduplicate"] == {"r": ()}
         # a filter's stop key is read beside the tokens, so the key
         # document must match in it too
         plan = _planned(_short(session).distinct().select("r.hotel"))
-        assert plan.settings["ask_once"] == {
-            "r": first_document_column(("hotel",))}
+        assert plan.settings["deduplicate"] == {"r": ("hotel",)}
         session.register("lifts", quail.DocumentProvider.from_table(pa.table({
             "id": ["l0", "l1"], "body": ["slow lift", "fast lift"]}), id_col="id"))
         plan = _planned(
             session.docs("lifts").alias("l")
             .ai_filter(quail.prompt("Is {0} short?", quail.col("l.body")))
             .select("l.id"))
-        assert "ask_once" not in plan.settings
+        assert "deduplicate" not in plan.settings
 
 
-def test_explain_names_the_tables_asked_once_per_text():
+def test_explain_names_the_deduplicated_tables():
     with _session() as session:
         query = _short(session).distinct().select("r.hotel")
         _planned(query)
-        assert "ask once per text: r (by text and hotel)" in query.explain()
+        assert "deduplicate: r (by text and hotel)" in query.explain()
 
 
 def test_a_request_backend_asks_every_copy(monkeypatch):
@@ -79,19 +77,19 @@ def test_a_request_backend_asks_every_copy(monkeypatch):
             "id": [f"r{index}" for index in range(len(BODIES))],
             "body": BODIES}) as session:
         plan = _planned(_short(session).select("r.id"))
-        assert "ask_once" not in plan.settings
+        assert "deduplicate" not in plan.settings
 
 
 def test_the_rule_is_the_only_source_of_the_setting(monkeypatch):
-    monkeypatch.setattr(ShouldAskOncePerText, "rewrite",
+    monkeypatch.setattr(ShouldDeduplicate, "rewrite",
                         lambda self, graph, context: None)
     with _session() as session:
         plan = _planned(_short(session).select("r.id"))
-        assert "ask_once" not in plan.settings
+        assert "deduplicate" not in plan.settings
 
 
 TOPIC = {"noisy room": "noise", "cold room": "cold", "slow lift": "lift"}
-KEY = first_document_column(())
+KEY = ()
 
 
 def _matches(node, assignment):
@@ -106,7 +104,7 @@ def _run(build, oracle, rule=True, monkeypatch=None, session=_session):
     """The query's rows, its answer tables, its plan, and the oracle's calls."""
     with session() as session, monkeypatch.context() as patch:
         if not rule:
-            patch.setattr(ShouldAskOncePerText, "rewrite",
+            patch.setattr(ShouldDeduplicate, "rewrite",
                           lambda self, graph, context: None)
         query = build(session)
         plan = _planned(query)
@@ -159,7 +157,7 @@ def test_a_filter_over_copies_asks_once_per_text_and_returns_every_copy(
                 .select("r.id"))
 
     rows, _, plan = _both(build, grouped.oracle(), plain.oracle(), monkeypatch)
-    assert plan.settings["ask_once"] == {"r": KEY}
+    assert plan.settings["deduplicate"] == {"r": KEY}
     assert rows == [("r0",), ("r1",), ("r2",), ("r4",), ("r5",)]
     assert (grouped.documents, plain.documents) == ([0, 1, 3], list(range(6)))
 
@@ -263,7 +261,7 @@ def test_a_filter_with_a_stop_key_keeps_a_text_apart_under_each_key(
     plain_rows, plain_answers, _ = _run(build, oracle(False), False, monkeypatch,
                                         session)
     assert rows == plain_rows == [("h1",), ("h2",)]
-    assert plan.settings["ask_once"] == {"r": first_document_column(("hotel",))}
+    assert plan.settings["deduplicate"] == {"r": ("hotel",)}
     assert asked == {True: [0, 2, 4], False: [0, 2, 4, 5]}
     # a copy of an asked document gets its answer even where its stop key
     # group had stopped, so the plain run's answers are a subset
@@ -289,7 +287,7 @@ def test_a_join_over_key_pairs_asks_each_pair_of_texts_once(monkeypatch,
 
     rows, _, plan = _both(build, grouped.oracle(), plain.oracle(), monkeypatch)
     assert rows == [("r0", "n0"), ("r1", "n1"), ("r2", "n2")]
-    assert plan.settings["ask_once"] == {"n": KEY, "r": KEY}
+    assert plan.settings["deduplicate"] == {"n": KEY, "r": KEY}
     # the hotel pairs of the rooms: r0-n0, r1-n1, r1-n2, r2-n1, r2-n2,
     # r4-n3, r5-n0; their key documents' pairs: 0-0, 1-1, 1-0, 0-1, 0-3
     assert sorted(plain.pairs) == [(0, 0), (1, 1), (1, 2), (2, 1), (2, 2),

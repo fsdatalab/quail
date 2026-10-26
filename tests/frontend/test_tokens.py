@@ -225,8 +225,6 @@ def test_a_document_points_at_the_first_document_with_its_tokens(tmp_path):
 
 
 def test_a_first_document_with_row_columns_matches_their_values_too(tmp_path):
-    from quail.catalog.tokens import first_document_column, first_document_columns
-
     schema = pa.schema({"id": pa.string(), "body": pa.string()})
     batches = [pa.record_batch(
         [["a", "b", "c", "d"], ["ok", "ok", "ok", "no"]], schema=schema)]
@@ -240,6 +238,3 @@ def test_a_first_document_with_row_columns_matches_their_values_too(tmp_path):
     # a null, and a NaN, is one value like any other
     stars = pa.array([None, 1.0, None, 1.0])
     assert store.first_documents_with([hotel, stars]).to_pylist() == [0, 1, 0, 3]
-    assert first_document_columns(first_document_column(())) == ()
-    assert first_document_columns(first_document_column(("b", "a"))) == ("a", "b")
-    assert first_document_columns("hotel") is None
