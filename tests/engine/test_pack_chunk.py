@@ -196,8 +196,11 @@ def test_a_prefix_slice_reads_the_slices_before_it_and_writes_after_them(
     assert final.final_indices.tolist() == [8]
 
 
-def test_a_device_fed_round_follows_the_answer_before_it(monkeypatch):
+def test_rounds_packed_together_on_the_tree_path_follow_their_answers(monkeypatch):
+    import numpy as np
+
     from quail.backends.quail.executor.readout import RoundFeed
+    from quail.backends.quail.executor.stages import RoundRequests
 
     cpu_staging(monkeypatch)
     arena = plain_arena()
@@ -208,14 +211,11 @@ def test_a_device_fed_round_follows_the_answer_before_it(monkeypatch):
     # each round is packed at the first position of the round before
     # it, whose rows the GPU has not read out yet: a placeholder, then
     # the draft; the round before had at most three rows
+    requests = RoundRequests(
+        ids=np.array([0, 51, 52, 0]), lengths=np.array([3, 1]),
+        positions=np.array([6, 9]), device_fed=np.array([True, True]))
     chunk = chunk_mod.pack_chunk(
-        torch, arena,
-        [dict(key=first, prefix=None, f=6, suffixes=Suffixes.of([[0, 51, 52]]),
-              write_suffix_tokens=3, single=True, read_all_rows=True,
-              device_fed=True, feed_bound=3),
-         dict(key=second, prefix=None, f=9, suffixes=Suffixes.of([[0]]),
-              write_suffix_tokens=1, single=True, read_all_rows=True,
-              device_fed=True, feed_bound=3)],
+        torch, arena, [dict(rounds=requests, keys=[first, second], feed_bound=3)],
         attention_mode="tree")
     plan = dict(chunk.meta["feed"])["reads"]
     assert plan["first"].tolist() == [0, 3]

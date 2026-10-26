@@ -560,11 +560,6 @@ class StageExecutor:
                     key=key, prefix=None, f=position,
                     suffixes=sufs, read_all_rows=True,
                     write_suffix_tokens=kept, single=True)
-                if request.device_fed:
-                    # the round before it had at most the stage's most
-                    # tokens, so its accepted rows are bounded by them
-                    spec.update(device_fed=True, feed_bound=stage.suffix_tokens)
-                    sources.append(self.latest[a])
                 specs.append(spec)
                 entry(j, total, np.concatenate((sufs.ids[1:], _NO_FOLLOWING[:1])))
                 group_entries.append(len(entries) - 1)

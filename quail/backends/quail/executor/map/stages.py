@@ -34,9 +34,6 @@ from quail.backends.quail.executor.stages import RoundRequests, Stage, StageRequ
 from quail.backends.quail.executor.vocabulary import Vocabulary
 from quail.catalog.tokens import PrefixTree, concat_tokens
 
-# the first token of a device-fed round, which the GPU replaces
-_CHOSEN_ON_GPU = np.zeros(1, dtype=np.int64)
-_CHOSEN_ON_GPU.setflags(write=False)
 # the fraction of answers the KV projection expects to end within
 # its count: a higher value admits fewer documents and stalls fewer
 OCCUPANCY_QUANTILE = 0.9
@@ -459,11 +456,6 @@ class MapStages(AnswerStages):
             return Stage.SkipTo(self.question_starts[q + 1] if serial
                                 else len(self.stages))
         position = int(state.base[index])
-        if state.unreported[index]:
-            draft = state.draft[index, :state.draft_len[index]]
-            return StageRequests(
-                Suffixes(np.concatenate((_CHOSEN_ON_GPU, draft)), [1 + len(draft)]),
-                position=position, device_fed=True)
         fed = state.fed[index, :state.fed_len[index]].copy()
         if self.recurrent:
             previous = self.previous_fed[q].get(index, [])

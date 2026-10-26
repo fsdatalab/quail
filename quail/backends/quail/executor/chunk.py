@@ -541,13 +541,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     * paths: Trie paths and ancestor rows from trie_paths(). The document
       KV must already be resident.
     * canvas: Per-group answer canvas tokens, overriding the default canvas.
-    * device_fed: Whether the group is a decode round whose first token
-      and positions Chunk.apply_feed() sets on the GPU from the answer
-      before it; f is that answer's first position, and feed_bound the
-      most rows it could have accepted plus one, bounding the KV read.
     * rounds: A RoundRequests of many documents' decode rounds packed as
-      one group, with keys naming each one's document and feed_bound as
-      above; every row is read and kept. Not with a canvas or a
+      one group, with keys naming each one's document and feed_bound the
+      most rows a device-fed round's source could have accepted plus
+      one, bounding the KV read; every row is read and kept. Not with a canvas or a
       sliding pool. On the unified path, shared and share_groups give
       each round the leading pages its document shares with others and
       the group it shares them with: consecutive rounds of one group
@@ -718,13 +715,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if total > max_q:
                 max_q = total
             num_tokens = row0 + total
-            if g.get("device_fed"):
-                if kept != total:
-                    raise ValueError(
-                        f"group {key!r}: a device-fed round keeps every row")
-                fed_rounds.append((row0, total, "reads", len(read_keys) - 1,
-                                   len(kv_writes) - 1, 0))
-                fed_used = max(fed_used, f + int(g["feed_bound"]))
             continue
         if (plain_rounds and g.get("prefix") is None
                 and isinstance(sufs0, Suffixes) and len(sufs0) == 1
@@ -745,15 +735,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             multi_row = True
             num_tokens = row0 + total
             layout.append((g["key"], 1))
-            if g.get("device_fed"):
-                unified_fed[len(unified_groups)] = (row0, total,
-                                                    f + total + int(g["feed_bound"]))
             unified_groups.append((g["key"], f, row0, total, 0))
             continue
-        if g.get("device_fed"):
-            raise ValueError(
-                f"group {g['key']!r}: a device-fed round is one kept suffix "
-                f"over a resident document")
         fresh = g.get("prefix") is not None
         f = g["f"]
         key = g["key"]

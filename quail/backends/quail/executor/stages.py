@@ -43,10 +43,6 @@ class StageRequests:
         position: The position of the first suffix token in the
             document's sequence, or None to place it after what the
             earlier stages appended, less discard.
-        device_fed: Whether the first suffix token is a placeholder the
-            GPU replaces with the token the document's launched round
-            chose, placing the suffix after the tokens that round
-            accepted; position is then that round's first position.
     """
 
     suffixes: Any
@@ -54,7 +50,6 @@ class StageRequests:
     read_rows: list[int] | None = None
     discard: int = 0
     position: int | None = None
-    device_fed: bool = False
 
     def __post_init__(self):
         from quail.backends.quail.executor.chunk import Suffixes
