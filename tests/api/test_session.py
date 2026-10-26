@@ -170,9 +170,10 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     assert "   rows   " not in planned and "run:" not in planned
     header = next(line for line in text.splitlines() if "est. rows" in line)
     assert header.split() == ["est.", "rows", "rows", "est.", "pass", "pass",
-                              "est.", "time", "time", "fresh", "tokens"]
+                              "est.", "time", "time", "vs.", "SoL",
+                              "fresh", "tokens"]
     assert re.search(
-        r"AiFilter: r\s+3\s+4\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+60$",
+        r"AiFilter: r\s+3\s+4\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+\S+x\s+60$",
         text, re.M)
     # Both predicates have equal estimated cost and pass four of six rows.
     first = re.search(r"(?:1st: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"

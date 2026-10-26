@@ -84,7 +84,7 @@ def plan_stages(query):
 
 
 def execute_stages(query, physical_executor=None, on_backend_ready=None,
-                   on_execution_ready=None):
+                   on_execution_ready=None, on_remaining=None):
     """Run the physical dependency graph, replanning after materialization."""
     started = time.perf_counter()
     plan = query.plan()
@@ -109,7 +109,8 @@ def execute_stages(query, physical_executor=None, on_backend_ready=None,
             result = execute_query(
                 stage, physical_executor=physical_executor,
                 on_backend_ready=lambda: once(0),
-                on_execution_ready=lambda: once(1))
+                on_execution_ready=lambda: once(1),
+                on_remaining=on_remaining)
             if node.name:
                 result._materialized = result.collect()
                 result._num_rows = result._materialized.num_rows

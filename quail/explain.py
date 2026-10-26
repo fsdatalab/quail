@@ -164,6 +164,7 @@ _COLUMNS = (
     ("pass", "pass"),
     ("est_time", "est. time"),
     ("time", "time"),
+    ("slowdown", "vs. SoL"),
     ("tokens", "fresh tokens"),
 )
 
@@ -351,6 +352,17 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                    for child in {port.source.node_id for port in node.inputs})
     shared = {node.node_id: index for index, node in enumerate(
         (node for node in graph.topological_nodes() if uses[node.node_id] > 1), 1)}
+    # a pipeline's time is measured on its first member only
+    planned_seconds = {
+        node.node_id: estimates_by_node.get(node.node_id, {}).get("seconds")
+        for node in graph.nodes}
+    for pipeline in build_pipelines(graph).values():
+        if len(pipeline) > 1:
+            members = [planned_seconds[member.node_id] for member in pipeline]
+            planned_seconds[pipeline[0].node_id] = sum(
+                member for member in members if member)
+            for member in pipeline[1:]:
+                planned_seconds[member.node_id] = None
     visited = set()
     rows = []
     used_default = []
@@ -523,6 +535,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 measured = metrics[node.node_id]
                 cells["rows"] = f"{measured.output_rows:,}"
                 cells["time"] = _seconds(measured.wall_s)
+                planned = planned_seconds.get(node.node_id)
+                if planned and measured.wall_s:
+                    cells["slowdown"] = f"{measured.wall_s / planned:.3g}x"
                 if measured.fresh_tokens:
                     cells["tokens"] = f"{measured.fresh_tokens:,}"
                 if verbose:

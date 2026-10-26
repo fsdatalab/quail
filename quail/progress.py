@@ -48,6 +48,8 @@ if not logger.handlers:
 _QUIET = 0
 _SINK = None
 _ANSWER_SINK = None
+_RUNNING = ()
+_LISTENERS = []
 
 
 def set_progress_sink(sink, *, owner=None) -> None:
@@ -91,6 +93,31 @@ def answer_sink():
     return _ANSWER_SINK
 
 
+@contextlib.contextmanager
+def running(node_ids):
+    """Attribute the Progress counts created inside to these plan node ids."""
+    global _RUNNING
+    previous, _RUNNING = _RUNNING, tuple(node_ids)
+    try:
+        yield
+    finally:
+        _RUNNING = previous
+
+
+@contextlib.contextmanager
+def listening(listener):
+    """Call ``listener(progress)`` with each throttled count while inside.
+
+    Listeners run before the progress sink, from the thread that runs
+    the loop, so they must return quickly.
+    """
+    _LISTENERS.append(listener)
+    try:
+        yield
+    finally:
+        _LISTENERS.remove(listener)
+
+
 def say(message: str) -> None:
     """Log one progress message at INFO, unless inside quiet()."""
     if not _QUIET:
@@ -109,7 +136,11 @@ def quiet():
 
 
 class Progress:
-    """Report a running count, logging at most once every `every` seconds."""
+    """Report a running count, logging at most once every `every` seconds.
+
+    node_ids are the plan nodes running when the count was created,
+    from ``running()``; empty outside a query's operators.
+    """
 
     def __init__(self, label: str, total: int | None = None,
                  unit: str = "documents", every: float = 5.0, *, emit=say):
@@ -119,7 +150,10 @@ class Progress:
         self.every = every
         self.emit = emit
         self.done = 0
+        self.node_ids = _RUNNING
+        self.finished = False
         self.started = time.perf_counter()
+        self.elapsed = 0.0
         self._last = self.started
 
     def update(self, done: int) -> None:
@@ -129,15 +163,20 @@ class Progress:
         if now - self._last >= self.every:
             self._last = now
             self.emit(self._line(self.label, now))
-            self._report()
+            self._report(now)
 
     def finish(self, label: str, extra: str = "") -> None:
         """Log the final line under a past tense label."""
-        line = self._line(label, time.perf_counter())
+        now = time.perf_counter()
+        line = self._line(label, now)
         self.emit(f"{line}, {extra}" if extra else line)
-        self._report()
+        self.finished = True
+        self._report(now)
 
-    def _report(self) -> None:
+    def _report(self, now: float) -> None:
+        self.elapsed = now - self.started
+        for listener in tuple(_LISTENERS):
+            listener(self)
         if _SINK is not None:
             _SINK(self.label, self.done, self.total, self.unit)
 
