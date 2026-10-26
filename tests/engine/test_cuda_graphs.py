@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.backends.quail.executor.cuda_graphs import DecodeBuffers, DecodeGraphs
+from quail.backends.quail.executor.cuda_graphs import (
+    DecodeBuffers,
+    DecodeGraphConfig,
+    DecodeGraphs,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -183,3 +187,84 @@ def test_a_pass_without_a_graph_counts_why():
     graphs.storage = arena.k
     assert graphs.forward(source) == "eager"
     assert graphs.fallbacks == {"rounds beside other rows": 1}
+
+
+class TinyPipeline:
+    """Two layers whose attention mixes every real row of the pass."""
+
+    num_pieces = 3
+
+    def __init__(self):
+        generator = torch.Generator().manual_seed(0)
+        self.embed = torch.nn.Embedding(32, 4)
+        self.qkv = [torch.randn(4, 6, generator=generator) for _ in range(2)]
+        self.mlp = [torch.randn(4, 4, generator=generator) for _ in range(2)]
+        self.attended = []
+
+    def _before(self, index, hidden, residual):
+        if residual is not None:
+            residual.add_(hidden)
+            hidden = residual
+        return hidden @ self.qkv[index]
+
+    def _after(self, index, hidden, residual):
+        residual.add_(hidden)
+        return torch.tanh(residual @ self.mlp[index])
+
+    def piece_widths(self):
+        return 4, 6
+
+    def piece(self, index, ids, hidden, residual, qkv, out):
+        if index == 0:
+            embedded = self.embed(ids)
+            residual.copy_(embedded)
+            qkv.copy_(self._before(0, embedded, None))
+            return
+        after = self._after(index - 1, hidden, residual)
+        if index < 2:
+            qkv.copy_(self._before(index, after, residual))
+        else:
+            out.copy_(after)
+
+    def attention_piece(self, index, qkv, chunk):
+        self.attended.append(len(qkv))
+        return torch.cumsum(qkv[:, :4], dim=0) / len(qkv)
+
+    def final_piece(self, hidden, residual, final):
+        return (hidden + residual).index_select(0, final)
+
+    def forward_chunk(self, chunk):
+        hidden = self.embed(chunk.input_ids)
+        residual = None
+        for index in range(2):
+            qkv = self._before(index, hidden, residual)
+            if residual is None:
+                residual = hidden.clone()
+            hidden = self._after(index, self.attention_piece(index, qkv, chunk),
+                                 residual)
+        return self.final_piece(hidden, residual, chunk.final_indices)
+
+
+def test_piece_graphs_match_the_eager_pass_and_attend_only_real_rows():
+    from functools import partial
+
+    from quail.backends.quail.executor.cuda_graphs import PieceGraphs
+
+    with torch.no_grad():
+        pipeline = TinyPipeline()
+        pieces = PieceGraphs(pipeline, DecodeGraphConfig(row_buckets=(8,)))
+        pieces.buffers = (torch.zeros(8, dtype=torch.int64), torch.zeros(8, 4),
+                          torch.zeros(8, 4), torch.zeros(8, 6), torch.zeros(8, 4))
+        # a replay runs its piece over the bucket's padded rows
+        views = pieces._views(8)
+        pieces.graphs[8] = [SimpleNamespace(replay=partial(pipeline.piece, index,
+                                                           *views))
+                            for index in range(pipeline.num_pieces)]
+        source = SimpleNamespace(
+            tokens=5, input_ids=torch.tensor([3, 1, 4, 1, 5]),
+            final_indices=torch.tensor([2, 4]), meta={})
+        assert pieces.supports(source)
+        expected = pipeline.forward_chunk(source)
+        pipeline.attended.clear()
+        assert torch.allclose(pieces.forward(source), expected)
+        assert pipeline.attended == [5, 5]
