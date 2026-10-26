@@ -98,16 +98,8 @@ class MapAnswer:
                                   ].tolist()
 
     @property
-    def fed(self) -> list:
-        return self.state.fed[self.index, :self.state.fed_len[self.index]].tolist()
-
-    @property
     def done(self) -> bool:
         return bool(self.state.done[self.index])
-
-    @property
-    def asked(self) -> bool:
-        return bool(self.state.asked[self.index])
 
     @property
     def steps(self) -> int:
@@ -116,10 +108,6 @@ class MapAnswer:
     @property
     def fed_tokens(self) -> int:
         return int(self.state.fed_tokens[self.index])
-
-    @property
-    def discard(self) -> int:
-        return int(self.state.discard[self.index])
 
     @property
     def answer(self) -> str | None:

@@ -27,7 +27,8 @@ def _growth(pages, documents):
     arena = cpu_arena(pages)
     keys = [("d", index) for index in range(documents)]
     model = Answers()
-    growth = KVGrowth(arena, keys, model, [16] * documents, [80] * documents)
+    growth = KVGrowth(arena, keys, model, [16] * documents, [80] * documents,
+                      initial_tokens=model.initial_tokens)
     return arena, keys, model, growth
 
 

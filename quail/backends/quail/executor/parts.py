@@ -156,18 +156,17 @@ class SingleResultPart(ExecutionPart):
 
 def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
-                  paged=True, on_answers=None, growth=None) -> dict:
+                  paged=True, on_answers=None) -> dict:
     """Run prepared operator work together and collect per-node results.
 
     A limit ends the run once that many documents passed every part;
     documents are admitted only while the ones in flight are expected
-    to fall short of it, by the parts' selectivities. growth, the
-    parts' StageGrowth when their KV grows as they write, sizes each
-    document's pages as it goes.
+    to fall short of it, by the parts' selectivities. When one part's
+    KV grows as it writes, its StageGrowth sizes each document's pages
+    as it goes.
     """
     stages = gated_stages(parts)
-    if growth is None:
-        growth = growing_stages(parts)
+    growth = growing_stages(parts)
     paged = paged or state.loaded_model.pipeline.needs_pages
     if keep_kv and not paged:
         raise ValueError("retaining document KV requires arena writes")

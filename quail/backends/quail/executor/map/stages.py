@@ -434,11 +434,10 @@ class MapStages(AnswerStages):
         return max(0.0, ridge - decoding) / decoding
 
     def _tail_decide(self, q, anchor, row):
-        # decided by the chunk's prepare
+        # the chunk's prepare decides every round
         return True
 
-    def _step_decide(self, q, anchor, row):
-        return True
+    _step_decide = _tail_decide
 
     def _step_suffix(self, q, key):
         """Feed the chosen token, then the draft the chunk's prepare chose.

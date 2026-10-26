@@ -281,7 +281,6 @@ class AnswerPart(DocumentAnswerPart):
             state, [part], stages.prefixes, stages.keys,
             keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
             limit=inputs.get("limit"),
-            growth=stages if getattr(stages, "grows", False) else None,
             label=f"{stages.operator} "
                   f"{', '.join(node.spec.name for node in nodes)}")
         first = nodes[0].node_id
