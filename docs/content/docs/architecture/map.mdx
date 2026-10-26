@@ -1,0 +1,179 @@
+---
+title: AI.MAP
+---
+
+`AI.MAP` writes a free-form answer to an instruction for each document.
+Quail decodes the answers greedily, many documents at a time, over
+each document's KV. This page explains how one map query runs:
+
+- **Branches** put several maps to one document at once, sharing the
+  document's KV.
+- **The pass loop** decodes one round for every running answer in each
+  forward pass, and decides each round one pass later.
+- **Drafts** copy likely next tokens from the document, so a round can
+  write several tokens.
+- **KV growth and admission** give each answer pages as it writes, and
+  start new answers only while every running answer can still finish.
+- **Kernels** read a document's KV once for all of its branches.
+
+See [KV](/docs/architecture/kv) for paged KV and prefix sharing, and
+[Execution](/docs/architecture/execution) for pipelines.
+
+## The prompt
+
+A map's prompt is the document, then the instruction, then a cue that
+opens the answer:
+
+```text
+[shared preamble] [document] Instruction: <instruction> [answer cue]
+```
+
+The document comes before the instruction, so the document's KV does
+not depend on the instruction. Every map over the same document can
+read the same KV.
+
+## Branches
+
+A *branch* is one (document, map) pair. E.g., imagine a query
+with three maps over 5,000 reviews: negatives, a summary, and the main
+topic. It has 15,000 branches.
+
+- The first branch of a document computes the document's KV.
+- The other branches point at the same pages through the prefix tree;
+  they do not copy them.
+- Each branch has its own pages after the document, for its
+  instruction and the answer it writes.
+- Each branch has its own answer limit, so a 32-token topic and a
+  256-token summary run side by side.
+
+A map pipeline run on its own uses branches. A map that follows another
+operator in a pipeline asks its instructions one after another on the
+document's KV instead.
+
+## The pass loop
+
+Quail repeats one loop until every answer has ended:
+
+<Mermaid chart={`flowchart LR
+  G[Grow pages for the next rounds] --> A[Admit new branches]
+  A --> P[Pack prefills and one round per running branch]
+  P --> L[Launch the forward pass]
+  L --> R[Queue the readout]
+  R --> D[Decide the previous pass's rounds]
+  D --> G`} />
+
+1. **Grow.** Branches whose next round needs more rows get pages.
+2. **Admit.** New branches start while admission allows it.
+3. **Pack.** One batch holds the new branches' prefills and one decode
+   round for every running branch.
+4. **Launch.** The forward pass runs, usually as a CUDA graph replay.
+5. **Read out.** A kernel reduces each answer row to its stop
+   probability and its likeliest token, and copies them to the host.
+6. **Decide.** The host decides the previous pass's rounds: it checks
+   the drafts, writes the accepted tokens, and drafts the next round.
+
+The host decides one pass behind the GPU. A round's first token comes
+from the previous readout on the GPU (a *device-fed* round), so a
+branch runs in every pass without waiting for the host. The host's
+work is hidden while steps 1 to 6 take less time than one GPU pass.
+
+## Decoding and drafts
+
+Each round feeds the chosen token and a *draft*: tokens the answer is
+likely to write next. The rows after them check the draft in the same
+pass. A draft token is written exactly when the model would have chosen
+it one token at a time, so drafts change speed, not answers.
+
+- A draft is copied from the document where the last written tokens
+  occur, or chained from an n-gram cache of the answers written so far.
+- The `adaptive` policy sizes each draft from its acceptance odds, the
+  round's KV read, and how much room the pass has before the GPU turns
+  compute bound. The `fixed` policy copies up to `draft_tokens` from
+  the document.
+- An answer ends when the model ends its turn, or at its answer limit.
+
+## KV growth and admission
+
+Answer lengths are not known in advance. Reserving pages for every
+answer's limit would leave most of the pool empty; reserving too few
+would force a running answer to be thrown out and redone. Quail does
+neither.
+
+**Growth.** A branch starts with pages for its prompt, its instruction,
+and two rounds. Before each pass, a branch whose next round would not
+fit gets another page. The oldest branches get pages first.
+
+**Admission check 1: every running branch can still finish.** Line up
+the running branches oldest first, and assume each writes to its limit.
+The oldest grows from the free pages, finishes, and returns its pages;
+then the next, and so on. A new branch starts only if this still works
+with it added at the back of the line. A younger branch grows only
+while it still works for everyone older, so the run never has to
+preempt anyone.
+
+E.g., imagine 10 free pages and two running branches:
+
+- A, the oldest, may need 5 more pages and returns 2 when done.
+- B may need 4 more and returns 3 when done.
+- A new branch C takes 2 pages now (8 free), may need 6 more, and
+  returns 2.
+
+A needs 5 of 8 free pages, then returns 2. B needs 4, then returns 3.
+C needs 6. Every branch can finish, so C starts.
+
+**Admission check 2: the forecast.** Check 1 plans for every answer at
+its limit, which is too cautious. Quail also forecasts page use:
+
+- For each map it keeps a Kaplan–Meier estimate of answer lengths,
+  counting answers still being written, and uses its 90th percentile.
+- Each running branch grows to that length, one row per pass, then
+  frees its pages.
+- A new branch starts only if the peak of that forecast, with the new
+  branch added, leaves one branch's worst-case growth free.
+
+On the IMDB three-map query at scale factor 0.1, branches grew by
+78,012 pages, no branch ever waited for a page, and up to 1,440
+branches ran at once
+(`/results/ablations/map_same_node_qwen3-4b-fp8_sf0.1_20261025T074225Z.json`).
+
+### Maps after another operator
+
+A filter or classification followed by a map in one pipeline grows the
+map's pages the same way. The earlier operators' requests have a known
+size, so each document's first pages cover the largest of them and the
+map's first rounds. Growth applies when exactly one operator in the
+pipeline writes answers.
+
+## Attention and kernels
+
+Each layer of a decode pass makes two attention calls over paged KV:
+
+1. One unified FlashAttention call over every round in the batch. Each
+   round reads only its branch's own pages: its instruction and its
+   answer so far.
+2. One FlashAttention read of the shared document pages for each group
+   of sibling branches in the batch. Their queries are stacked, so the
+   document's KV is read once, not once per branch.
+
+A fused Triton kernel merges the two outputs by their log-sum-exp and
+quantizes the result for the next FP8 matrix multiply. The matrix
+multiplies use DeepGEMM; RMSNorm, QK-norm with RoPE, and SiLU each run
+fused with their quantization in Triton.
+
+Decode passes replay CUDA graphs captured for 32 batch sizes up to
+4,096 rows, in three layouts: tree, unified, and unified with shared
+reads.
+
+## Code
+
+- [`map/stages.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/stages.py):
+  branches, requests, and the growth model.
+- [`map/decoder.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/decoder.py):
+  verifying, writing, and drafting rounds in arrays.
+- [`growth.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/growth.py):
+  growth and both admission checks.
+- [`stage_executor.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stage_executor.py):
+  the pass loop.
+- [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py)
+  and [`cuda_graphs.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/cuda_graphs.py):
+  the shared reads and the decode graphs.

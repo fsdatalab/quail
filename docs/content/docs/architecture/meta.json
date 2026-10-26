@@ -6,7 +6,8 @@
     "optimizer",
     "physical-plans",
     "execution",
-    "kv"
+    "kv",
+    "map"
   ],
   "defaultOpen": false
 }
