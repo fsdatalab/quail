@@ -1,4 +1,10 @@
-"""Capture short tree-attention forwards in persistent CUDA buffers."""
+"""Capture tree-attention decode forwards in persistent CUDA buffers.
+
+Every graph reads views of one set of input buffers sized for the
+largest bucket and writes the same output rows, and the graphs share
+one memory pool, so the captures cost one set of inputs and one
+forward's temporaries however many buckets there are.
+"""
 
 import time
 from dataclasses import dataclass
@@ -7,11 +13,17 @@ from quail.backends.quail.executor.chunk import Chunk
 from quail.progress import logger
 
 
+def _default_buckets() -> tuple:
+    """Row buckets: finer where chunks are small, so little is padded."""
+    return ((32,) + tuple(range(64, 1025, 64)) + tuple(range(1152, 2049, 128))
+            + tuple(range(2304, 4097, 256)))
+
+
 @dataclass(frozen=True)
 class DecodeGraphConfig:
     """Capture shapes owned by one worker's decode graphs."""
 
-    row_buckets: tuple[int, ...] = (32, 64, 128, 256, 512)
+    row_buckets: tuple[int, ...] = _default_buckets()
     max_context_tokens: int = 65536
     max_query_tokens: int = 32
     # the rows of one document's map branches read together
@@ -41,29 +53,45 @@ class DecodeBuffers:
     With documents, the batch also carries the document read of map
     branches (see Stage.document_reads); its padding merges into call
     B's last row, which a batch with documents leaves unread.
+
+    Given a base of at least as many rows, every buffer is a view of
+    the base's first rows, so buffers of several sizes share storage.
     """
 
     def __init__(self, torch, rows, page_tokens, *,
                  config: DecodeGraphConfig | None = None, device="cuda",
-                 documents=False):
+                 documents=False, base=None):
         config = DecodeGraphConfig() if config is None else config
         self.rows = rows
-        self.indices = torch.arange(rows + 1, dtype=torch.int32, device=device)
+        width = (config.max_context_tokens + page_tokens - 1) // page_tokens
 
-        def zeros(shape, dtype=torch.int64):
+        def buffer(name, shape, dtype=torch.int64):
+            if base is not None:
+                return getattr(base, name)[:shape[0]]
             return torch.zeros(shape, dtype=dtype, device=device)
 
-        self.ids = zeros(rows)
-        self.positions = zeros(rows)
-        self.src = zeros(rows)
-        self.dst = zeros(rows)
-        self.cu_a = self.indices.clone()
-        self.read_rows = self.indices[:-1].to(torch.int64)
-        self.cu_q = self.indices.clone()
-        self.used = zeros(rows, torch.int32)
-        self.table = zeros((rows, (config.max_context_tokens + page_tokens - 1)
-                            // page_tokens), torch.int32)
-        self.source = zeros(rows, torch.int32)
+        self.indices = (base.indices[:rows + 1] if base is not None else
+                        torch.arange(rows + 1, dtype=torch.int32, device=device))
+        self.ids = buffer("ids", (rows,))
+        self.positions = buffer("positions", (rows,))
+        self.src = buffer("src", (rows,))
+        self.dst = buffer("dst", (rows,))
+        self.cu_a = buffer("cu_a", (rows + 1,), torch.int32)
+        self.read_rows = buffer("read_rows", (rows,))
+        self.cu_q = buffer("cu_q", (rows + 1,), torch.int32)
+        self.used = buffer("used", (rows,), torch.int32)
+        self.table = buffer("table", (rows, width), torch.int32)
+        self.source = buffer("source", (rows,), torch.int32)
+        self.finals = buffer("finals", (rows,))
+        self.document_index = buffer("document_index", (rows,))
+        self.document_cu = buffer("document_cu", (rows + 1,), torch.int32)
+        self.document_used = buffer("document_used", (rows,), torch.int32)
+        self.document_table = buffer("document_table", (rows, width), torch.int32)
+        if base is None:
+            for each in (self.cu_a, self.cu_q, self.document_cu):
+                each.copy_(self.indices)
+            for each in (self.read_rows, self.finals, self.document_index):
+                each.copy_(self.indices[:-1])
         reads = dict(rows=self.read_rows, cu_q=self.cu_q,
                      max_q=config.max_query_tokens, used=self.used,
                      max_used=config.max_context_tokens, table=self.table,
@@ -71,15 +99,13 @@ class DecodeBuffers:
         self.documents = None
         if documents:
             self.documents = dict(
-                b_index=self.indices[:-1].to(torch.int64),
-                cu_q=self.indices.clone(), max_q=config.max_document_rows,
-                used=zeros(rows, torch.int32),
-                max_used=config.max_context_tokens,
-                table=zeros(self.table.shape, torch.int32))
+                b_index=self.document_index, cu_q=self.document_cu,
+                max_q=config.max_document_rows, used=self.document_used,
+                max_used=config.max_context_tokens, table=self.document_table)
             reads["documents"] = self.documents
         self.chunk = Chunk(
             input_ids=self.ids, positions=self.positions,
-            final_indices=self.indices[:-1].to(torch.int64),
+            final_indices=self.finals,
             meta=dict(layer=0, canvas=None, unified=None,
                       kv_src=self.src, kv_dst=self.dst,
                       cu_a=self.cu_a, max_a=config.max_query_tokens,
@@ -95,9 +121,8 @@ class DecodeBuffers:
         self.used.fill_(1)
         self.table.fill_(page)
         self.source.copy_(self.indices[:-1])
-        if self.documents is not None:
-            self.documents["used"].fill_(1)
-            self.documents["table"].fill_(page)
+        self.document_used.fill_(1)
+        self.document_table.fill_(page)
 
     def _bounds(self, target, source, count):
         sequences = source.numel() - 1
@@ -172,9 +197,11 @@ class DecodeGraphs:
         self.graphs = []
         # the same buckets with the document read of map branches
         self.document_graphs = []
+        self.pool = None
         self.storage = None
         self.replays = 0
         self.capture_s = 0.0
+        self.capture_bytes = 0
 
     @property
     def config(self) -> DecodeGraphConfig:
@@ -185,6 +212,7 @@ class DecodeGraphs:
         """Release graphs before replacing their KV allocation."""
         self.graphs.clear()
         self.document_graphs.clear()
+        self.pool = None
         self.storage = None
 
     def prepare(self):
@@ -205,6 +233,7 @@ class DecodeGraphs:
         page = arena.owned_pages(key)[0]
         stream = torch.cuda.Stream()
         current = torch.cuda.current_stream()
+        reserved = torch.cuda.memory_reserved()
         try:
             for k, v in zip(arena.k, arena.v):
                 start = page * arena.page_tokens
@@ -212,20 +241,30 @@ class DecodeGraphs:
                 v[start:start + arena.page_tokens].zero_()
             stream.wait_stream(current)
             with torch.cuda.stream(stream), torch.inference_mode():
+                base = DecodeBuffers(torch, self.config.row_buckets[-1],
+                                     arena.page_tokens, config=self.config)
+                base.synthetic(page)
+                self.pool = torch.cuda.graph_pool_handle()
+                output = None   # every graph writes its rows here
                 for documents, graphs in ((False, self.graphs),
                                           (True, self.document_graphs)):
-                    for rows in self.config.row_buckets:
+                    for index, rows in enumerate(self.config.row_buckets):
                         buffers = DecodeBuffers(torch, rows, arena.page_tokens,
                                                 config=self.config,
-                                                documents=documents)
-                        buffers.synthetic(page)
-                        for _ in range(3):
-                            self.pipeline.forward_chunk(buffers.chunk)
+                                                documents=documents, base=base)
+                        # the first bucket warms every kernel; the rest
+                        # need one pass at their own shape
+                        for _ in range(3 if index == 0 else 1):
+                            out = self.pipeline.forward_chunk(buffers.chunk)
+                        if output is None:
+                            output = torch.empty((base.rows, *out.shape[1:]),
+                                                 dtype=out.dtype, device=out.device)
                         stream.synchronize()
                         graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph, stream=stream):
-                            output = self.pipeline.forward_chunk(buffers.chunk)
-                        graphs.append(CapturedDecode(buffers, graph, output))
+                        with torch.cuda.graph(graph, pool=self.pool, stream=stream):
+                            output[:rows].copy_(
+                                self.pipeline.forward_chunk(buffers.chunk))
+                        graphs.append(CapturedDecode(buffers, graph, output[:rows]))
             current.wait_stream(stream)
             stream.synchronize()
         except Exception:
@@ -235,8 +274,11 @@ class DecodeGraphs:
             arena.free_key(key)
         self.storage = arena.k
         self.capture_s = time.perf_counter() - started
-        logger.info("captured %d decode graphs in %.2f s",
-                    len(self.graphs) + len(self.document_graphs), self.capture_s)
+        self.capture_bytes = torch.cuda.memory_reserved() - reserved
+        logger.info("captured %d decode graphs of up to %d rows in %.2f s, "
+                    "holding %.2f GiB", len(self.graphs) + len(self.document_graphs),
+                    self.config.row_buckets[-1], self.capture_s,
+                    self.capture_bytes / 2**30)
         return True
 
     def supports(self, chunk):

@@ -77,7 +77,7 @@ def test_unsupported_batches_fall_back(unsupported):
         case "unified":
             source.attention_mode = "unified"
         case "many_tokens":
-            source.tokens = 513
+            source.tokens = 4097
         case "new_arena":
             arena.k = []
     assert graphs.forward(source) == "eager"
@@ -147,3 +147,15 @@ def test_a_document_read_replays_only_a_graph_with_a_spare_row():
     assert graphs.forward(source).equal(output[[2, 4]])
     # five rows need a six-row graph at least, so the eight-row one runs
     assert replayed == [8]
+
+
+def test_buffers_of_every_bucket_are_views_of_one_set():
+    base = DecodeBuffers(torch, 8, 16, device="cpu")
+    small = DecodeBuffers(torch, 5, 16, device="cpu", base=base)
+    small.copy(chunk())
+    # the small bucket's inputs land in the base's first rows
+    assert base.ids[:5].tolist() == [12, 13, 14, 15, 16]
+    assert small.table.data_ptr() == base.table.data_ptr()
+    reading = DecodeBuffers(torch, 5, 16, device="cpu", documents=True, base=base)
+    assert reading.chunk.meta["reads"]["documents"]["table"].data_ptr() == (
+        base.document_table.data_ptr())
