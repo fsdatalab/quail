@@ -1047,6 +1047,8 @@ class Engine:
         if meta["kv_src"] is not None:
             self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"],
                                 layer)
+        if meta.get("rounds") is not None:
+            return self._attention_rounds(q3, k3, v3, meta)
 
         out_a, lse_a = self._fa(
             q3, k3, v3, meta["cu_a"], meta["cu_a"],
@@ -1074,22 +1076,78 @@ class Engine:
                 nodes["cu_q"], nodes["cu_k"], nodes["max_q"], nodes["max_k"],
                 causal=False)
             merge_partial(out_b, lse_b, nodes["b_index"], out_c, lse_c)
-        documents = reads.get("documents")
-        if documents is not None:
-            # the rows of a document's map branches over the pages
-            # they all borrow, read once and merged into their call B
-            # result, which read only each branch's own pages
-            out_d, lse_d = self._fa(
-                q_readers.index_select(0, documents["b_index"]), kp, vp,
-                documents["cu_q"], None, documents["max_q"],
-                documents["max_used"], causal=False,
-                block_table=documents["table"], seqused_k=documents["used"])
-            self.merge_document_read(out_b, lse_b, documents["b_index"],
-                                     out_d, lse_d)
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(
             out_a, lse_a, out_b, lse_b, reads["source"])
+        meta["layer"] += 1
+        return q_out, scales
+
+    def _attention_rounds(self, q3, k3, v3, meta):
+        """The tree path for a pass holding map rounds (see Stage.document_reads).
+
+        Each round's KV is in its branch's pages already, so one causal
+        paged call reads the branch's own pages with the round's rows,
+        in place of calls A and B. A second call reads each document's
+        borrowed pages once for the rows of all its rounds, merged in
+        by log-sum-exp. Other rows of the pass take calls A and B.
+        """
+        n, H, D = q3.shape
+        layer = meta["layer"]
+        rounds = meta["rounds"]
+        kp, vp = self.arena.paged_kv(layer)
+        rows = rounds["rows"]
+        q_rounds = q3.index_select(0, rows)
+        out_r, lse_r = self._fa(
+            q_rounds, kp, vp, rounds["cu_q"], None, rounds["max_q"],
+            rounds["max_used"], causal=True, block_table=rounds["table"],
+            seqused_k=rounds["used"])
+        documents = rounds.get("documents")
+        if documents is not None:
+            out_d, lse_d = self._fa(
+                q_rounds.index_select(0, documents["b_index"]), kp, vp,
+                documents["cu_q"], None, documents["max_q"],
+                documents["max_used"], causal=False,
+                block_table=documents["table"], seqused_k=documents["used"])
+            self.merge_document_read(out_r, lse_r, documents["b_index"],
+                                     out_d, lse_d)
+        a_rows = meta["a_rows"]
+        reads = meta["reads"]
+        if a_rows is None and reads is None:
+            # every row is a round's, packed in order
+            meta["layer"] += 1
+            return self.quant(out_r.view(n, H * D))
+        out_a = out_r.new_empty((n, H, D))
+        lse_a = lse_r.new_empty((H, n))
+        if a_rows is not None:
+            out_s, lse_s = self._fa(
+                q3.index_select(0, a_rows), k3.index_select(0, a_rows),
+                v3.index_select(0, a_rows), meta["cu_a"], meta["cu_a"],
+                meta["max_a"], meta["max_a"], causal=True)
+            out_a.index_copy_(0, a_rows, out_s)
+            lse_a[:, a_rows] = lse_s
+        out_a.index_copy_(0, rows, out_r)
+        if reads is None:
+            meta["layer"] += 1
+            return self.quant(out_a.view(n, H * D))
+        # a round's row has no call B source, so the merge keeps out_a
+        q_readers = q3.index_select(0, reads["rows"])
+        out_b, lse_b = self._fa(
+            q_readers, kp, vp, reads["cu_q"], None,
+            reads["max_q"], reads["max_used"], causal=False,
+            block_table=reads["table"], seqused_k=reads["used"])
+        nodes = reads.get("nodes")
+        if nodes is not None:
+            out_c, lse_c = self._fa(
+                q3.index_select(0, nodes["rows"]),
+                k3.index_select(0, nodes["key_rows"]),
+                v3.index_select(0, nodes["key_rows"]),
+                nodes["cu_q"], nodes["cu_k"], nodes["max_q"], nodes["max_k"],
+                causal=False)
+            merge_partial(out_b, lse_b, nodes["b_index"], out_c, lse_c)
+        q_out, scales = self.merge_attn_quant(
+            out_a, lse_a.transpose(0, 1), out_b, lse_b.transpose(0, 1),
+            reads["source"])
         meta["layer"] += 1
         return q_out, scales
 

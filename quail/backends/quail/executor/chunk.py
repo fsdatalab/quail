@@ -80,6 +80,9 @@ class Chunk:
             if target == "unified":
                 unified = self.meta["unified"]
                 used, table, dst = unified["used"], unified["table"], unified["dst"]
+            elif target == "rounds":
+                rounds = self.meta["rounds"]
+                used, table, dst = rounds["used"], rounds["table"], self.meta["kv_dst"]
             else:
                 reads = self.meta["reads"]
                 used, table, dst = reads["used"], reads["table"], self.meta["kv_dst"]
@@ -305,7 +308,8 @@ def _feed_plan(fed_rounds, span_lengths) -> list:
         fed_rounds: Per round, in chunk order, (first row, rows, the
             reads it is a sequence of, its sequence there, its index
             among the KV write spans, and the leading pages its block
-            table skips). The reads are "reads" (call B) or "unified".
+            table skips). The reads are "reads" (call B), "rounds" (the
+            map rounds' causal read), or "unified".
         span_lengths: The rows of each KV write span, in order.
 
     Returns:
@@ -318,7 +322,7 @@ def _feed_plan(fed_rounds, span_lengths) -> list:
     offsets = np.cumsum(span_lengths)
     offsets = np.concatenate(([0], offsets[:-1]))
     parts = []
-    for target in ("reads", "unified"):
+    for target in ("reads", "unified", "rounds"):
         order = [index for index, entry in enumerate(fed_rounds)
                  if entry[2] == target]
         if not order:
@@ -499,10 +503,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     row_spans = []
     fresh_keys = []
     read_keys, read_used, cu_q = [], [], [0]
-    # call B sequences whose leading pages a document read covers:
-    # sequence -> pages skipped; and per document group, its pages,
-    # tokens, and the indices of its rows among call B's rows
-    read_skip = {}
+    # rounds of map branches (a group with document_reads) skip calls
+    # A and B: each reads its branch's own pages, its own rows among
+    # them, in one causal call; per document group, its pages, tokens,
+    # and the indices of its rows among those rounds' rows
+    round_rows, round_cu, round_keys, round_used, round_skip = [], [0], [], [], []
+    round_max_q = 0
+    round_fed_used = 0
+    round_spans = []
     document_groups = {}
     max_q = 0
     unified_groups = []
@@ -544,42 +552,56 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             starts = (row0 + begins).tolist()
             positions = rounds.positions.tolist()
             counts = lengths.tolist()
-            if tree_path:
+            shares = g.get("document_reads") if tree_path else None
+            if shares is not None:
                 first_write = len(kv_writes)
                 kv_writes.extend(zip(keys, starts, (row0 + ends).tolist(), positions))
-                reader_rows.append(np.arange(row0, row0 + total, dtype=np.int64))
-                first_reader = cu_q[-1]
-                cu_q.extend((cu_q[-1] + ends).tolist())
-                first_sequence = len(read_keys)
-                read_keys.extend(keys)
-                read_used.extend(positions)
-                if len(lengths) and int(lengths.max()) > max_q:
-                    max_q = int(lengths.max())
-                skips = [0] * len(keys)
-                shares = g.get("document_reads")
-                if shares is not None:
-                    page_tokens = arena.page_tokens
-                    for index, (group, shared) in enumerate(
-                            zip(*(column.tolist() for column in shares))):
-                        if not shared:
-                            continue
-                        if shared % page_tokens:
-                            raise ValueError(
-                                "a document read covers whole pages")
-                        skip = shared // page_tokens
-                        sequence = first_sequence + index
-                        skips[index] = read_skip[sequence] = skip
-                        read_used[sequence] -= shared
-                        pages, _, b_index = document_groups.setdefault(
+                round_spans.append((row0, row0 + total))
+                round_rows.append(np.arange(row0, row0 + total, dtype=np.int64))
+                first_reader = round_cu[-1]
+                round_cu.extend((round_cu[-1] + ends).tolist())
+                first_sequence = len(round_keys)
+                round_keys.extend(keys)
+                if len(lengths):
+                    round_max_q = max(round_max_q, int(lengths.max()))
+                page_tokens = arena.page_tokens
+                for index, (group, shared) in enumerate(
+                        zip(*(column.tolist() for column in shares))):
+                    if shared % page_tokens:
+                        raise ValueError("a document read covers whole pages")
+                    skip = shared // page_tokens
+                    round_skip.append(skip)
+                    # the round's own rows are written before it reads
+                    round_used.append(positions[index] + counts[index] - shared)
+                    if shared:
+                        _, _, b_index = document_groups.setdefault(
                             group, (arena.owned_pages(keys[index])[:skip],
                                     shared, []))
                         b_index.append(np.arange(
                             first_reader + begins[index],
                             first_reader + ends[index], dtype=np.int64))
                 for index in fed:
+                    fed_rounds.append((starts[index], counts[index], "rounds",
+                                       first_sequence + index,
+                                       first_write + index,
+                                       round_skip[first_sequence + index]))
+                    round_fed_used = max(round_fed_used, positions[index]
+                                         + counts[index] + bound
+                                         - int(shares[1][index]))
+            elif tree_path:
+                first_write = len(kv_writes)
+                kv_writes.extend(zip(keys, starts, (row0 + ends).tolist(), positions))
+                reader_rows.append(np.arange(row0, row0 + total, dtype=np.int64))
+                cu_q.extend((cu_q[-1] + ends).tolist())
+                first_sequence = len(read_keys)
+                read_keys.extend(keys)
+                read_used.extend(positions)
+                if len(lengths) and int(lengths.max()) > max_q:
+                    max_q = int(lengths.max())
+                for index in fed:
                     fed_rounds.append((starts[index], counts[index], "reads",
                                        first_sequence + index,
-                                       first_write + index, skips[index]))
+                                       first_write + index, 0))
                     fed_used = max(fed_used, positions[index] + bound)
             else:
                 for index, (key, start, f, count) in enumerate(
@@ -795,16 +817,20 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     "unified attention requires pages for a kept "
                     "group - an unpaged kept group has no KV to read")
     cu_a = np.concatenate(cu_a)
+    a_rows = None
+    if round_spans:
+        # call A covers only the rows outside the rounds' causal read
+        keep = np.ones(num_tokens, dtype=bool)
+        for first, end in round_spans:
+            keep[first:end] = False
+        counted = np.concatenate(([0], np.cumsum(keep)))
+        cu_a = np.unique(counted[cu_a])
+        a_rows = np.flatnonzero(keep)
 
     t = _tick(timing, "pack_py", t)
     reads = None
     if read_keys:
-        if read_skip:
-            table = arena.block_table_rows(
-                [arena.owned_pages(key)[read_skip.get(sequence, 0):]
-                 for sequence, key in enumerate(read_keys)])
-        else:
-            table, _ = arena.block_table(read_keys)
+        table, _ = arena.block_table(read_keys)
         t = _tick(timing, "pack_blocktable", t)
         rows = np.concatenate(reader_rows)
         # row -> its index in call B's output, -1 for rows that read
@@ -829,13 +855,28 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 max_k=int(np.diff(node_cu_k).max()),
                 # each node row's index among call B's rows
                 b_index=_staged(torch, source[q_rows], torch.int64, pinned))
+    elif node_q:
+        raise ValueError("path rows read their document in call B; "
+                         "the document needs arena pages")
+    rounds_read = None
+    if round_keys:
+        rows = np.concatenate(round_rows)
+        rounds_read = dict(
+            rows=_staged(torch, rows, torch.int64, pinned),
+            cu_q=_staged(torch, round_cu, torch.int32, pinned),
+            max_q=round_max_q,
+            used=_staged(torch, round_used, torch.int32, pinned),
+            max_used=max(max(round_used), round_fed_used),
+            table=arena.block_table_rows(
+                [arena.owned_pages(key)[skip:]
+                 for key, skip in zip(round_keys, round_skip)]))
         if document_groups:
             # one non-causal read per document group: its rows over
             # the pages every member borrows
             groups = list(document_groups.values())
             b_index = [np.concatenate(group[2]) for group in groups]
             cu_d = np.cumsum([0, *(len(index) for index in b_index)])
-            reads["documents"] = dict(
+            rounds_read["documents"] = dict(
                 b_index=_staged(torch, np.concatenate(b_index), torch.int64,
                                 pinned),
                 cu_q=_staged(torch, cu_d, torch.int32, pinned),
@@ -844,9 +885,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                              torch.int32, pinned),
                 max_used=max(group[1] for group in groups),
                 table=arena.block_table_rows([group[0] for group in groups]))
-    elif node_q:
-        raise ValueError("path rows read their document in call B; "
-                         "the document needs arena pages")
     t = _tick(timing, "pack_reads", t)
 
     unified = None
@@ -1056,6 +1094,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         unified=unified, canvas=canvas_meta, gdn=gdn,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
+    if rounds_read is not None:
+        meta.update(rounds=rounds_read, a_rows=(
+            _staged(torch, a_rows, torch.int64, pinned) if len(a_rows) else None))
     out = Chunk(
         input_ids=_staged_token_parts(
             torch, id_parts, num_tokens, pinned, staging),

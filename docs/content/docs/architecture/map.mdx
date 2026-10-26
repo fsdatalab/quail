@@ -277,34 +277,31 @@ corrected answer, so a wrong draft costs one round, not more.
 
 Maps that run as branches use Quail's tree attention path, the path
 classification and filters use. A pass holds the rounds of many
-branches. Each attention layer makes these calls:
+branches. A round's KV is written into its branch's pages at the start
+of each layer, so for a round's rows each attention layer makes two
+calls instead of the tree path's calls A and B:
 
-1. **Call A, new rows.** One causal FlashAttention call over the
-   pass's new rows, read from the activations. Each round is its own
-   causal segment. The call returns the output $o_a$ and the
-   log-sum-exp $\ell_a$ of the attention scores.
-2. **Call B, resident KV.** One non-causal paged call. Each round
-   reads the KV already written for its branch. A round of a document
-   with two or more rounds in the pass reads only its branch's own
-   pages: the document tokens past the borrowed pages, its
-   instruction, and its answer. Any other round reads all of its
-   pages. The call returns $o_b$ and $\ell_b$.
-3. **Document read.** One more non-causal paged call, beside call B,
-   for each document with two or more rounds in the pass. It reads the
-   document's borrowed pages once, for the stacked rows of all the
-   document's rounds, and merges into those rows of call B by
-   log-sum-exp, as call C of classification merges its label paths.
+1. **Own pages.** One causal paged FlashAttention call. Each round
+   reads its branch's own pages, which end with the round's own rows:
+   the document tokens past the borrowed pages, the instruction, the
+   answer so far, and the round. The call returns the output $o_r$
+   and the log-sum-exp $\ell_r$ of the attention scores.
+2. **Document read.** One non-causal paged call for each document
+   with two or more rounds in the pass. It reads the document's
+   borrowed pages once, for the stacked rows of all the document's
+   rounds, and returns $o_d$ and $\ell_d$.
 
-A fused Triton kernel then combines calls A and B exactly:
+A fused Triton kernel merges the two into each round row:
 
 $$
-o = \frac{e^{\ell_a} o_a + e^{\ell_b} o_b}{e^{\ell_a} + e^{\ell_b}}
+o = \frac{e^{\ell_r} o_r + e^{\ell_d} o_d}{e^{\ell_r} + e^{\ell_d}}
 $$
 
-and quantizes $o$ for the next FP8 matrix multiplication. With $K$
-branches of one document in a pass, the document's KV is read once
-instead of $K$ times. A pass with no map branches makes only calls A
-and B, and call C for classification, as before.
+With $K$ branches of one document in a pass, the document's KV is read
+once instead of $K$ times. Other rows of the same pass, such as a new
+branch's instruction, take calls A and B as usual. A pass with no map
+branches makes only calls A and B, and call C for classification, as
+before.
 
 The planner chooses the path by its speed-of-light estimate, the same
 roofline it uses for joins and filters (`choose_attention_path`): the
@@ -316,11 +313,13 @@ without a tree path, such as the hybrid models, run unified: each
 round's rows join its pages, and one causal paged call reads them with
 the document.
 
-Decode passes of up to 512 rows replay CUDA graphs. Quail captures the
-tree path's row buckets, 32 to 512 rows, twice: once as before, and
-once with the document read. A pass with the document read replays a
-graph with at least one row more than the pass, because the read's
-padding merges into that spare row. A larger pass runs without
+Decode passes of up to 4,096 rows replay CUDA graphs. Quail captures
+the tree path's 33 row buckets, 32 to 4,096 rows, twice: once for
+passes without map rounds, and once for passes of map rounds. The
+graphs share one set of input buffers and one memory pool. A pass of map rounds replays a graph with at
+least one row more than the pass, because the document read's padding
+merges into that spare row. A pass that mixes rounds with other rows
+runs without graphs. A larger pass runs without
 graphs.
 
 ## 7. Properties
@@ -375,9 +374,8 @@ three maps and four-row rounds: unified 1,661 µs, tree 2,401 µs, tree
 with the document read 4,326 µs. At 150 documents of 7,500 tokens:
 unified 2,244 µs, tree 2,519 µs, tree with the document read 1,946 µs.
 With short documents the cost of each call grows with its number of
-sequences, not with the KV it reads, so the tree path is far from its
-speed-of-light time there: call A, the reads of each branch's own
-pages, and the merge take most of it.
+sequences, not with the KV it reads. These figures predate the fused
+merge and the change that drops call A for round rows.
 
 ## 10. Related work
 

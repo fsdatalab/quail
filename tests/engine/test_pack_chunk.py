@@ -277,7 +277,7 @@ def test_rounds_packed_together_on_the_unified_path_follow_their_answers(monkeyp
                                        + rows[second][10:11].tolist())
 
 
-def test_branch_rounds_read_their_document_pages_once(monkeypatch):
+def test_branch_rounds_read_their_document_pages_once_without_call_a(monkeypatch):
     import numpy as np
 
     from quail.backends.quail.executor.readout import RoundFeed
@@ -304,13 +304,16 @@ def test_branch_rounds_read_their_document_pages_once(monkeypatch):
                             document_reads=(np.array([0, 0]),
                                             np.array([2 * page, 2 * page])))],
         attention_mode="tree")
-    reads = chunk.meta["reads"]
-    # each branch's call B reads only the pages past the document's
-    assert reads["used"].tolist() == [3, 5]
-    assert reads["table"][:, 0].tolist() == [arena.owned_pages(first)[2],
-                                             arena.owned_pages(second)[2]]
+    rounds = chunk.meta["rounds"]
+    # no call A or call B: each round reads the pages past the
+    # document's, its own rows among them, in one causal call
+    assert chunk.meta["reads"] is None and chunk.meta["a_rows"] is None
+    assert chunk.meta["cu_a"].tolist() == [0]
+    assert rounds["used"].tolist() == [6, 6]
+    assert rounds["table"][:, 0].tolist() == [arena.owned_pages(first)[2],
+                                              arena.owned_pages(second)[2]]
     # one read of the document's pages serves both branches' rows
-    documents = reads["documents"]
+    documents = rounds["documents"]
     assert documents["b_index"].tolist() == [0, 1, 2, 3]
     assert documents["cu_q"].tolist() == [0, 4]
     assert documents["used"].tolist() == [2 * page]
@@ -321,7 +324,40 @@ def test_branch_rounds_read_their_document_pages_once(monkeypatch):
     chunk.apply_feed(torch, feed, [1, 0], page)
     assert chunk.positions.tolist() == [2 * page + 5, 2 * page + 6, 2 * page + 7,
                                         2 * page + 6]
-    assert reads["used"].tolist() == [5, 6]
+    assert rounds["used"].tolist() == [8, 7]
     assert chunk.meta["kv_dst"].tolist() == (
         rows[first][2 * page + 5:2 * page + 8].tolist()
         + rows[second][2 * page + 6:2 * page + 7].tolist())
+
+
+def test_rows_beside_branch_rounds_keep_calls_a_and_b(monkeypatch):
+    import numpy as np
+
+    from quail.backends.quail.executor.stages import RoundRequests
+
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    page = arena.page_tokens
+    other, branch = ("d", 3), ("d", 1)
+    arena.activate(other, 5, capacity_tokens=page)
+    arena.activate(branch, page + 3, capacity_tokens=2 * page)
+    requests = RoundRequests(ids=np.array([51, 52]), lengths=np.array([2]),
+                             positions=np.array([page + 3]),
+                             device_fed=np.array([False]))
+    chunk = chunk_mod.pack_chunk(
+        torch, arena,
+        [dict(key=other, prefix=None, f=5, suffixes=Suffixes([70, 71, 72], [3]),
+              write_suffix_tokens=3),
+         dict(rounds=requests, keys=[branch], feed_bound=2,
+              document_reads=(np.array([0]), np.array([0])))],
+        attention_mode="tree")
+    meta = chunk.meta
+    # the suffix's three rows take call A and call B, as before
+    assert meta["a_rows"].tolist() == [0, 1, 2]
+    assert meta["cu_a"].tolist() == [0, 3]
+    assert meta["reads"]["rows"].tolist() == [0, 1, 2]
+    assert meta["reads"]["source"].tolist() == [0, 1, 2, -1, -1]
+    # the round's two rows read their pages causally, with no call A
+    assert meta["rounds"]["rows"].tolist() == [3, 4]
+    assert meta["rounds"]["used"].tolist() == [page + 5]
+    assert "documents" not in meta["rounds"]

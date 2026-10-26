@@ -103,31 +103,44 @@ def test_replay_returns_independent_output_storage():
     assert graphs.storage is None
 
 
-def test_document_read_padding_merges_only_into_an_unread_row():
-    # the chunk's two rounds are branches of one document: their five
-    # rows read its two pages once, beside their own call B reads
+def rounds_chunk():
+    # two map rounds of one document, three rows and two: each reads
+    # its own pages causally, and the five rows read the document once
     source = chunk()
-    source.meta["reads"]["documents"] = dict(
-        b_index=torch.arange(5), cu_q=torch.tensor([0, 5], dtype=torch.int32),
-        max_q=5, used=torch.tensor([32], dtype=torch.int32), max_used=32,
-        table=torch.tensor([[3, 4]], dtype=torch.int32))
+    meta = source.meta
+    meta["cu_a"] = torch.tensor([0], dtype=torch.int32)
+    meta["reads"] = None
+    meta["a_rows"] = None
+    meta["rounds"] = dict(
+        rows=torch.arange(5), cu_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+        max_q=3, used=torch.tensor([7, 11], dtype=torch.int32), max_used=11,
+        table=torch.tensor([[1], [2]], dtype=torch.int32),
+        documents=dict(b_index=torch.arange(5),
+                       cu_q=torch.tensor([0, 5], dtype=torch.int32), max_q=5,
+                       used=torch.tensor([32], dtype=torch.int32), max_used=32,
+                       table=torch.tensor([[3, 4]], dtype=torch.int32)))
+    return source
+
+
+def test_round_padding_reads_one_row_and_merges_only_into_an_unread_row():
     buffers = DecodeBuffers(torch, 8, 16, device="cpu", documents=True)
     buffers.synthetic(7)
-    buffers.copy(source)
-    documents = buffers.chunk.meta["reads"]["documents"]
-    # padding indices name call B's last row, past the five real ones
+    buffers.copy(rounds_chunk())
+    rounds = buffers.chunk.meta["rounds"]
+    assert rounds["cu_q"].tolist() == [0, 3, 5, 6, 7, 8, 8, 8, 8]
+    # a padded round's one row reads one row and writes no KV
+    assert rounds["used"].tolist() == [7, 11, 1, 1, 1, 1, 1, 1]
+    assert buffers.dst.tolist() == [20, 21, 22, 41, 42, -1, -1, -1]
+    documents = rounds["documents"]
+    # padding merges into the last row, past the five real ones
     assert documents["b_index"].tolist() == [0, 1, 2, 3, 4, 7, 7, 7]
     assert documents["cu_q"].tolist() == [0, 5, 6, 7, 8, 8, 8, 8, 8]
     assert documents["used"].tolist() == [32, 0, 0, 0, 0, 0, 0, 0]
     assert documents["table"][:1, :2].tolist() == [[3, 4]]
 
 
-def test_a_document_read_replays_only_a_graph_with_a_spare_row():
-    source = chunk()
-    source.meta["reads"]["documents"] = dict(
-        b_index=torch.arange(5), cu_q=torch.tensor([0, 5], dtype=torch.int32),
-        max_q=5, used=torch.tensor([32], dtype=torch.int32), max_used=32,
-        table=torch.tensor([[3, 4]], dtype=torch.int32))
+def test_a_pass_of_rounds_replays_only_a_graph_with_a_spare_row():
+    source = rounds_chunk()
     arena = SimpleNamespace(k=[], page_tokens=16)
     graphs = DecodeGraphs(SimpleNamespace(
         engine=SimpleNamespace(arena=arena), forward_chunk=lambda x: "eager"))
@@ -157,5 +170,5 @@ def test_buffers_of_every_bucket_are_views_of_one_set():
     assert base.ids[:5].tolist() == [12, 13, 14, 15, 16]
     assert small.table.data_ptr() == base.table.data_ptr()
     reading = DecodeBuffers(torch, 5, 16, device="cpu", documents=True, base=base)
-    assert reading.chunk.meta["reads"]["documents"]["table"].data_ptr() == (
+    assert reading.chunk.meta["rounds"]["documents"]["table"].data_ptr() == (
         base.document_table.data_ptr())

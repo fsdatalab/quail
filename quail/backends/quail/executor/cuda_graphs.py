@@ -96,20 +96,25 @@ class DecodeBuffers:
                      max_q=config.max_query_tokens, used=self.used,
                      max_used=config.max_context_tokens, table=self.table,
                      source=self.source)
+        meta = dict(layer=0, canvas=None, unified=None,
+                    kv_src=self.src, kv_dst=self.dst,
+                    cu_a=self.cu_a, max_a=config.max_query_tokens, reads=reads)
         self.documents = None
         if documents:
+            # every row is a map round's: one causal read of its own
+            # pages and one read of its document's pages
             self.documents = dict(
                 b_index=self.document_index, cu_q=self.document_cu,
                 max_q=config.max_document_rows, used=self.document_used,
                 max_used=config.max_context_tokens, table=self.document_table)
-            reads["documents"] = self.documents
+            meta.update(reads=None, a_rows=None, rounds=dict(
+                rows=self.read_rows, cu_q=self.cu_q,
+                max_q=config.max_query_tokens, used=self.used,
+                max_used=config.max_context_tokens, table=self.table,
+                documents=self.documents))
         self.chunk = Chunk(
             input_ids=self.ids, positions=self.positions,
-            final_indices=self.finals,
-            meta=dict(layer=0, canvas=None, unified=None,
-                      kv_src=self.src, kv_dst=self.dst,
-                      cu_a=self.cu_a, max_a=config.max_query_tokens,
-                      reads=reads),
+            final_indices=self.finals, meta=meta,
             attention_mode="tree", tokens=rows, layout=[])
 
     def synthetic(self, page):
@@ -134,6 +139,9 @@ class DecodeBuffers:
 
     def copy(self, chunk):
         """Copy real inputs and clear the unused rows of a captured batch."""
+        if self.documents is not None:
+            self._copy_rounds(chunk)
+            return
         n = chunk.tokens
         reads = chunk.meta["reads"]
         m = reads["rows"].numel()
@@ -158,20 +166,43 @@ class DecodeBuffers:
             writes = chunk.meta["kv_src"].numel()
             self.src[:writes].copy_(chunk.meta["kv_src"])
             self.dst[:writes].copy_(chunk.meta["kv_dst"])
-        if self.documents is not None:
-            documents = reads["documents"]
-            count = documents["b_index"].numel()
-            groups = documents["used"].numel()
-            index = self.documents["b_index"]
-            # call B's rows past the real ones are never merged into
-            # a real row, and a batch with documents has at least one
-            index.fill_(self.rows - 1)
-            index[:count].copy_(documents["b_index"])
-            self._bounds(self.documents["cu_q"], documents["cu_q"], count)
-            self.documents["used"].zero_()
-            self.documents["used"][:groups].copy_(documents["used"])
-            self.documents["table"][:groups, :documents["table"].shape[1]].copy_(
-                documents["table"])
+
+    def _copy_rounds(self, chunk):
+        """Copy a pass of map rounds; padded rounds read one row and write none."""
+        n = chunk.tokens
+        rounds = chunk.meta["rounds"]
+        sequences = rounds["used"].numel()
+        self.ids.zero_()
+        self.ids[:n].copy_(chunk.input_ids)
+        self.positions.zero_()
+        self.positions[:n].copy_(chunk.positions)
+        self._bounds(self.cu_a, chunk.meta["cu_a"], 0)
+        self._bounds(self.cu_q, rounds["cu_q"], n)
+        self.read_rows.copy_(self.finals)
+        self.used.fill_(1)
+        self.used[:sequences].copy_(rounds["used"])
+        self.table[:sequences, :rounds["table"].shape[1]].copy_(rounds["table"])
+        self.src.zero_()
+        self.dst.fill_(-1)
+        writes = chunk.meta["kv_src"].numel()
+        self.src[:writes].copy_(chunk.meta["kv_src"])
+        self.dst[:writes].copy_(chunk.meta["kv_dst"])
+        index = self.documents["b_index"]
+        # rows past the real ones are padding no real row reads, and a
+        # pass with documents has at least one
+        index.fill_(self.rows - 1)
+        self.documents["used"].zero_()
+        documents = rounds.get("documents")
+        if documents is None:
+            self._bounds(self.documents["cu_q"], rounds["cu_q"][:1], 0)
+            return
+        count = documents["b_index"].numel()
+        groups = documents["used"].numel()
+        index[:count].copy_(documents["b_index"])
+        self._bounds(self.documents["cu_q"], documents["cu_q"], count)
+        self.documents["used"][:groups].copy_(documents["used"])
+        self.documents["table"][:groups, :documents["table"].shape[1]].copy_(
+            documents["table"])
 
 
 @dataclass
@@ -296,25 +327,30 @@ class DecodeGraphs:
         reads = chunk.meta["reads"]
         page_tokens = self.pipeline.engine.arena.page_tokens
         width = (self.config.max_context_tokens + page_tokens - 1) // page_tokens
+        rounds = chunk.meta.get("rounds")
+        if rounds is not None:
+            documents = rounds.get("documents") or {}
+            return (reads is None and chunk.meta["a_rows"] is None
+                    and chunk.tokens < self.config.row_buckets[-1]
+                    and rounds["max_q"] <= self.config.max_query_tokens
+                    and rounds["max_used"] <= self.config.max_context_tokens
+                    and rounds["table"].shape[1] <= width
+                    and documents.get("max_q", 0) <= self.config.max_document_rows
+                    and documents.get("max_used", 0)
+                    <= self.config.max_context_tokens
+                    and (not documents or documents["table"].shape[1] <= width))
         if (reads is None or reads.get("nodes") is not None
                 or reads["max_q"] > self.config.max_query_tokens
                 or reads["max_used"] > self.config.max_context_tokens
                 or reads["table"].shape[1] > width):
-            return False
-        documents = reads.get("documents")
-        if documents is not None and (
-                documents["max_q"] > self.config.max_document_rows
-                or documents["max_used"] > self.config.max_context_tokens
-                or documents["table"].shape[1] > width
-                or chunk.tokens >= self.config.row_buckets[-1]):
             return False
         return True
 
     def forward(self, chunk):
         """Replay a matching graph, falling back to the ordinary forward."""
         if self.supports(chunk):
-            documents = chunk.meta["reads"].get("documents") is not None
-            # a batch with documents leaves call B's last row unread
+            documents = chunk.meta.get("rounds") is not None
+            # a pass of map rounds leaves its last padded row unread
             for captured in (self.document_graphs if documents else self.graphs):
                 if captured.buffers.rows >= chunk.tokens + documents:
                     captured.buffers.copy(chunk)
