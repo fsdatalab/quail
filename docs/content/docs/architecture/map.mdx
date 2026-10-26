@@ -221,12 +221,15 @@ if the answer reaches $L_k$.
 
 Quail builds a draft in two ways:
 
-- **Copy from the document.** If the last written tokens occur in the
-  document, the draft is the document's tokens after that occurrence.
-  Summaries and extractions often repeat phrases from the document.
+- **Copy from the document.** If the last written token, or the last
+  two, occur in the document, the draft is the document's tokens after
+  their first occurrence. Summaries often quote the document.
 - **Chain from answers.** An n-gram cache of the answers written so far
   (orders 4, 3, and 2) predicts the next token from the last tokens.
-  Quail follows the cache from one prediction to the next.
+  Quail follows the cache from one prediction to the next. Answers to
+  one instruction often share phrases across documents.
+
+A round copies when it can and chains otherwise.
 
 Quail tracks the acceptance rate of each draft source and uses it as
 $r_i$, the probability that draft token $i$ is accepted given that
@@ -342,37 +345,45 @@ model startup.
 
 | Query | Quail (s) | Stock vLLM (s) | vLLM time / Quail time |
 | --- | --- | --- | --- |
-| IMDB, one map, 64-token limit | 23.7 | 24.4 | 1.03 |
-| IMDB, one map, 256-token limit | 71.7 | 82.4 | 1.15 |
-| CUAD, one map, 64-token limit | 5.7 | 6.1 | 1.07 |
+| IMDB, one map, 64-token limit | 24.0 | 24.0 | 1.00 |
+| IMDB, one map, 256-token limit | 70.8 | 72.7 | 1.03 |
+| CUAD, one map, 64-token limit | 5.7 | 6.2 | 1.09 |
 | CUAD, one map, 256-token limit | 9.7 | 10.7 | 1.10 |
-| IMDB, three maps | 84.5 | 96.1 | 1.14 |
+| IMDB, three maps | 84.5 | 84.8 | 1.00 |
 | CUAD, three maps | 9.8 | 11.2 | 1.14 |
-| IMDB, classification then one map | 85.9 | 83.0 | 0.97 |
+| IMDB, classification then one map | 85.2 | 76.7 | 0.90 |
 
-The first six rows come from
-`/results/ablations/map_same_node_qwen3-4b-fp8_sf0.1_20261025T075617Z.json`,
-the last from
-`/results/ablations/map_same_node_qwen3-4b-fp8_sf0.1_20261026T015421Z.json`.
+Source:
+`/results/ablations/map_same_node_qwen3-4b-fp8_sf0.1_20261026T022441Z.json`.
 
 **Variance.** Stock vLLM's time varies between runs more than Quail's.
-In an earlier same-GPU run, stock vLLM took 84.8 s on IMDB with
-three maps and 74.4 s on IMDB with one 256-token map; Quail's times in
-both runs differ by less than 1 s.
+In an earlier same-GPU run, stock vLLM took 96.1 s on IMDB with three
+maps, 82.4 s on IMDB with one 256-token map, and 83.0 s on the
+classification-then-map query; Quail's times in the two runs differ by
+less than 1 s. One run per engine does not settle which of the IMDB
+results is typical.
 
 **Where the time goes.** On IMDB with three maps, the GPU passes take
-79.0 s of the 84.5 s. Up to 1,440 branches run at once; branches grow
-by 78,012 pages, and no branch skips a pass for lack of pages.
+79.1 s of the 84.5 s. On the classification-then-map query they take
+82.0 s of 85.2 s. In both, Quail's GPU work alone takes about as long
+as stock vLLM's whole query, so a faster Quail needs cheaper passes,
+not less host work.
 
-**Agreement.** On IMDB, classification then one map, the labels of the
+**Drafts.** On the classification-then-map query, rounds fed 58,757
+draft tokens and the model accepted 20,931 (36%). The answers hold
+about 1.26 million tokens, so drafts wrote under 2% of them. This page
+does not measure what each draft source contributes to query time.
+
+**Agreement.** On the classification-then-map query, the labels of the
 two engines agree on 98.3% of documents. The 256-token answers agree
 on their first 50 characters for 65% of documents and diverge later,
 as Section 7 explains.
 
-**Limits.** These runs use one model and one GPU type. The
-classification-then-map query is 3% slower than stock vLLM: its answers
-almost all reach the 256-token limit, which leaves drafts few tokens to
-save.
+**Limits.** These runs use one model and one GPU type. Quail is faster
+on the long CUAD contracts (9% to 14%), where a round's KV read is
+large and shared reads save most. On the short IMDB reviews the two
+engines are within the run-to-run variance, except the
+classification-then-map query, where Quail is 10% slower.
 
 ## 10. Related work
 
