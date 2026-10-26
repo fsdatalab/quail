@@ -19,6 +19,20 @@ from quail.backends.quail.executor.model_loading import answer_weights
 from quail.planner.prompt_lowering import true_false_ids
 
 
+def readout_rows(row, width: int) -> np.ndarray:
+    """Return a stage's answer as its rows of readout values.
+
+    Args:
+        row: One document's answer: the readout's values, or an object
+            array holding them.
+        width: The values in each readout row.
+    """
+    values = np.asarray(row)
+    if values.dtype == object:
+        values = np.asarray(values.reshape(-1)[0], dtype=np.float32)
+    return values.reshape(-1, width)
+
+
 class AnswerRows:
     """The retained output rows for one query's two answer classes.
 

@@ -88,6 +88,8 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
             replacement = "AI_EXTRACT("
         elif function == "SAE_FEATURES":
             replacement = "AI_SAE_FEATURES("
+        elif function == "MAP":
+            replacement = "AI_MAP("
         elif function == "IF" and dialect is SQLDialect.BQ:
             replacement = "AI_FILTER("
         if (
@@ -123,10 +125,11 @@ def _reject_forbidden(tree) -> None:
             "AI_SCORE",
             "AI_EXTRACT",
             "AI_SAE_FEATURES",
+            "AI_MAP",
         }:
             raise CompileError(
                 f"{name} is not supported; supported AI functions are "
-                "AI_FILTER, AI_SCORE, AI_CLASSIFY, AI_EXTRACT, and "
+                "AI_FILTER, AI_SCORE, AI_CLASSIFY, AI_EXTRACT, AI_MAP, and "
                 "AI_SAE_FEATURES"
             )
     # a subquery is legal in FROM, where it runs as its own stage, and
@@ -426,7 +429,7 @@ def _scopes(tree) -> list:
             if scope.scope_type not in (ScopeType.SUBQUERY, ScopeType.UDTF)]
 
 
-AI_FUNCTIONS = {"PROMPT", "AI_FILTER", "AI_SCORE", "AI_EXTRACT"}
+AI_FUNCTIONS = {"PROMPT", "AI_FILTER", "AI_SCORE", "AI_EXTRACT", "AI_MAP"}
 # the name sqlglot gives a select item that is not a column
 AUTO_ALIAS = re.compile(r"_col_\d+", re.IGNORECASE)
 
@@ -516,6 +519,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
     named, labels = _bind_label_names(b, columns)
     extracts = {}
     feature_columns = {}
+    maps = {}
     for column in columns:
         if aliased_call(column, "extract") is not None:
             extracts.setdefault(column.expression.aliases()[0], []).append(
@@ -524,6 +528,9 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
         if aliased_call(column, "features") is not None:
             feature_columns.setdefault(
                 column.expression.aliases()[0], []).append(
+                (column.expression, column.name))
+        elif aliased_call(column, "map") is not None:
+            maps.setdefault(column.expression.aliases()[0], []).append(
                 (column.expression, column.name)
             )
 
@@ -544,6 +551,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
             extract_filters=tuple(b.extract_tests.get(alias, ())),
             sae_features=tuple(feature_columns.get(alias, ())),
             schema=catalog.get(provider).schema(),
+            maps=tuple(maps.get(alias, ())),
         )
     for join in b.joins:
         logical.add_join(join)

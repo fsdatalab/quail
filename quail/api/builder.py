@@ -51,6 +51,11 @@ class BoundBuilder:
         self._inner.unnest(*names, outer=outer)
         return self
 
+    def ai_map(self, c, instruction, *, name, max_answer_tokens=256):
+        self._inner.ai_map(c, instruction, name=name,
+                           max_answer_tokens=max_answer_tokens)
+        return self
+
     def label_in(self, name, labels, selectivity=None):
         self._inner.label_in(name, labels, selectivity=selectivity)
         return self

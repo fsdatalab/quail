@@ -378,6 +378,49 @@ class ExpressionBinder:
         model_call = ModelCall(prompt, "features", pooling=pooling)
         model_call.validate()
         return model_call
+    def bind_ai_map(self, node, name: str) -> Alias:
+        """Parse an AI.MAP call and bind its document reference.
+
+        The call is ``AI.MAP(column, 'instruction')``.
+
+        Args:
+            node: The AI_MAP call.
+            name: The answer column's AS name.
+
+        Returns:
+            The map Alias.
+
+        Raises:
+            CompileError: The column or instruction is invalid.
+        """
+        args = list(node.expressions)
+        max_answer_tokens = 256
+        if len(args) == 3 and isinstance(args[-1], exp.Kwarg):
+            option = args.pop()
+            value = option.expression
+            if (str(option.this.name).lower() != "max_answer_tokens"
+                    or not isinstance(value, exp.Literal) or not value.is_int):
+                raise CompileError("AI.MAP takes max_answer_tokens => an integer")
+            max_answer_tokens = int(value.this)
+        if len(args) != 2:
+            raise CompileError(
+                "AI.MAP takes a document column and an instruction string")
+        if not isinstance(args[0], COLUMN_NODES):
+            raise CompileError(
+                f"AI.MAP's first argument is a document column, "
+                f"got {args[0].sql()}")
+        if not (isinstance(args[1], exp.Literal) and args[1].is_string):
+            raise CompileError(
+                f"AI.MAP's second argument is an instruction string, "
+                f"got {args[1].sql()}")
+        ref = self.resolve_value(args[0])
+        instruction = str(args[1].this)
+        prompt = self.prompts.bind("map", instruction, (ref,))
+        self.note_document_column(ref)
+        call = ModelCall(prompt, "map", instruction=instruction,
+                         max_answer_tokens=max_answer_tokens)
+        call.validate()
+        return Alias(call, name)
 
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:
         """Bind a score or classification to its model call."""

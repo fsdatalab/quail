@@ -36,6 +36,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SemanticSaeFeatures,
     Unnest,
     Window,
@@ -192,7 +193,7 @@ class LogicalPlan:
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, applies, classifies = [], {}, [], [], []
-        extracts, feature_calls, tested, aliases = [], [], {}, []
+        extracts, feature_calls, maps, tested, aliases = [], [], [], {}, []
         # the nodes above the projection read result rows, not documents
         nodes = LogicalPlan(self.projection).walk()
         for node in nodes:
@@ -219,6 +220,8 @@ class LogicalPlan:
                 extracts.append(node)
             elif isinstance(node, SemanticSaeFeatures):
                 feature_calls.append(node)
+            elif isinstance(node, SemanticMap):
+                maps.append(node)
         calls = {
             (node.alias, node.name): node.call
             for node in classifies
@@ -242,8 +245,10 @@ class LogicalPlan:
             if answers:
                 extract_filters[alias] = tuple(
                     ColumnTest(
-                        name=_extraction(node.condition.column.column, extracts).name,
-                        call=_extraction(node.condition.column.column, extracts).call,
+                        name=_extraction(node.condition.column.column, extracts,
+                                         maps).name,
+                        call=_extraction(node.condition.column.column, extracts,
+                                         maps).call,
                         condition=node.condition,
                         selectivity=node.selectivity,
                         position=len(filters.get(alias, ())) + len(labels) + index,
@@ -273,6 +278,7 @@ class LogicalPlan:
             classifies=tuple(classifies),
             extracts=tuple(extracts),
             sae_features=tuple(feature_calls),
+            maps=tuple(maps),
         )
 
 
@@ -295,6 +301,7 @@ class Operators:
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
     extracts: tuple = ()  # tuple[SemanticExtract, ...]
     sae_features: tuple = ()  # tuple[SemanticSaeFeatures, ...]
+    maps: tuple = ()  # tuple[SemanticMap, ...]
     label_filters: dict = field(default_factory=dict)
     #                     alias -> tuple[ColumnTest, ...] on labels
     extract_filters: dict = field(default_factory=dict)
@@ -331,9 +338,21 @@ class Operators:
         )
 
 
-def _extraction(column: str, extracts):
-    """Return the SemanticExtract computing an answer or span column."""
-    return next(node for node in extracts if column in (node.name, node.span_name))
+def _extraction(column: str, extracts, maps=()):
+    """Return the SemanticExtract computing an answer or span column.
+
+    Raises:
+        CompileError: The column is an AI.MAP answer, which no Filter
+            tests.
+    """
+    found = next(
+        (node for node in extracts if column in (node.name, node.span_name)), None)
+    if found is not None:
+        return found
+    if any(column == node.name for node in maps):
+        raise CompileError(
+            f"a filter on the AI.MAP answer {column!r} is not supported")
+    raise CompileError(f"no extraction computes the column {column!r}")
 
 
 def join_outer_input(join: "SemanticJoin") -> "LogicalNode":
@@ -409,6 +428,8 @@ def _projected_fields(project: Project, scans: dict) -> dict:
                 types[name + PROBABILITIES_SUFFIX] = PROBABILITIES_TYPE
         elif call.kind == "features":
             types[name] = FEATURE_LIST
+        elif call.kind == "map":
+            types[name] = pa.string()
         else:
             types[name] = pa.string()
             types[name + SPAN_SUFFIX] = SPAN_TYPE

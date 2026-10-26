@@ -75,6 +75,7 @@ class Query:
         self._unnests = []           # the list names of each unnest()
         self._unnest_outer = []      # whether each unnest() keeps empty rows
         self._unnest_tests = []      # RegularPredicate on their fields
+        self._maps = {}              # name -> Alias of an AI.MAP call
         self._regular_predicates = {}  # alias -> [RegularPredicate]
         # alias -> [(RegularPredicate on an answer or span, selectivity)]
         self._extract_filters = {}
@@ -363,10 +364,52 @@ class Query:
         self._extracts[name] = (struct, tuple(members))
         return self
 
+    def ai_map(self, c, instruction: str, *, name: str,
+               max_answer_tokens: int = 256) -> "Query":
+        """Write an answer to the instruction for each document.
+
+        The result column ``name`` holds the text the model writes for
+        the instruction over the document; use select() to return it.
+
+        For example, ``ai_map("r.text", "Summarize the negative
+        arguments the reviewer makes.", name="negatives")`` adds
+        ``negatives``, the summary written for each review.
+
+        Args:
+            c: The document column, as "alias.column" or a col().
+            instruction: The instruction the answer is written for.
+            max_answer_tokens: Maximum tokens in each answer.
+            name: Result column name, without a dot.
+
+        Returns:
+            This query builder, with the map added.
+
+        Raises:
+            CompileError: The name, column, or instruction is invalid,
+                or a pending join has no AI predicate yet.
+        """
+        if self._pending_join is not None:
+            raise CompileError(
+                "join() is waiting for the ai_filter over its pairs; "
+                "map before joining")
+        if not name or "." in name:
+            raise CompileError(
+                f"a map needs a column name without a dot, got {name!r}")
+        self._claim_name(name)
+        ref = self._resolve_value(col(c) if isinstance(c, str) else c)
+        bound = self._prompts.bind("map", instruction, (ref,))
+        call = ModelCall(bound, "map", instruction=instruction,
+                         max_answer_tokens=max_answer_tokens)
+        call.validate()
+        self._note_document_column(ref)
+        self._maps[name] = Alias(call, name)
+        return self
+
     def _claim_name(self, name: str) -> None:
         """Check that no earlier call, table alias, or source column uses the name."""
         if (name in self._labels or name in self._scores
                 or name in self._extracts or name in self._features
+                or name in self._maps
                 or any(name == n + SPAN_SUFFIX for n in self._extracts)
                 or name in self._scope()):
             raise CompileError(f"the name {name!r} is already used")
@@ -547,12 +590,13 @@ class Query:
                 raise CompileError(f"duplicate table alias {alias!r}")
             self._claim_name(alias)
             for name in (*other._labels, *other._scores, *other._extracts,
-                         *other._features):
+                         *other._features, *other._maps):
                 self._claim_name(name)
             self._labels.update(other._labels)
             self._scores.update(other._scores)
             self._extracts.update(other._extracts)
             self._features.update(other._features)
+            self._maps.update(other._maps)
             self._scope_.add_table(alias, provider)
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
@@ -825,7 +869,7 @@ class Query:
                 f"over its pairs; a plain join belongs in the database "
                 f"the ids came from")
         if not (self._joins or self._filters or self._labels or self._scores
-                or self._extracts or self._features):
+                or self._extracts or self._features or self._maps):
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "
                                "came from")
@@ -857,6 +901,8 @@ class Query:
                 columns.extend(members)
                 selected.append(struct.name)
                 continue
+            elif isinstance(c, str) and c in self._maps:
+                columns.append(self._maps[c])
             elif isinstance(c, str) and c == "*":
                 for alias, provider in self._tables:
                     for name in self._catalog.get(provider).columns:
@@ -875,7 +921,8 @@ class Query:
                   for name, _, _ in tests}
         wanted = [column for column in self._labels.values()
                   if column in columns or column.name in tested]
-        # an extraction is planned when the query returns its answer
+        # an extraction or a map is planned when the query returns its
+        # answer
         extracted = [column for column in columns
                      if aliased_call(column, "extract") is not None]
         for lists in self._unnests:
@@ -886,6 +933,8 @@ class Query:
         # a feature call is planned when the query returns its list
         featured = [column for column in columns
                     if aliased_call(column, "features") is not None]
+        mapped = [column for column in columns
+                  if aliased_call(column, "map") is not None]
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(
@@ -907,6 +956,9 @@ class Query:
                                    for column in featured
                                    if column.expression.aliases() == (alias,)),
                 schema=self._catalog.get(provider).schema(),
+                maps=tuple((column.expression, column.name)
+                           for column in mapped
+                           if column.expression.aliases() == (alias,)),
             )
         for join in self._joins:
             logical.add_join(join)

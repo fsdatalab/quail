@@ -23,13 +23,14 @@ from quail.backends.quail.reranker import (
     score_rows,
 )
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.rows import Rows, extraction_rows
+from quail.execution.rows import Rows, extraction_rows, map_rows
 from quail.execution.spans import locate_span
 from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
     AiJoin,
+    AiMap,
     AiSaeFeatures,
     AiScore,
     ClassifySpec,
@@ -54,6 +55,8 @@ class Oracle:
         features: A callable (spec, document) -> a feature list of
             {"feature", "strength"} mappings; None plants one feature
             per document, its id modulo 7 at strength id + 1.
+        maps: A callable (spec, document) -> the written text; or a
+            sequence indexed by document for every instruction.
         probabilities: Whether a classification reports label
             probabilities when its spec asks for them.
         retain: How many of a keep_kv filter's survivors the oracle
@@ -66,7 +69,7 @@ class Oracle:
     execute_pipeline = None
 
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
-                 answers=None, features=None, *, probabilities=False,
+                 answers=None, features=None, maps=None, *, probabilities=False,
                  retain=0, join_metrics=None, streams=False):
         self.filters = filters or {}
         self.joins = joins or {}
@@ -74,6 +77,7 @@ class Oracle:
         self.scores = scores or (lambda spec, ids: (sum(ids) + 1) / 10)
         self.answers = answers
         self.features = features
+        self.maps = maps
         self.probabilities = probabilities
         self.retain = retain
         self.join_metrics = join_metrics
@@ -94,6 +98,8 @@ class Oracle:
             return self._extract(node, inputs)
         if isinstance(node, AiSaeFeatures):
             return self._sae_features(node, inputs)
+        if isinstance(node, AiMap):
+            return self._map(node, inputs)
         if isinstance(node, AiClassify) and node.spec.partner is not None:
             return self._classify_joined(node, inputs)
         if isinstance(node, (AiScore, AiClassify)):
@@ -263,6 +269,20 @@ class Oracle:
         if callable(self.answers):
             return self.answers(spec, document)
         return None if self.answers is None else self.answers[document]
+
+    def _map(self, node, inputs) -> NodeResult:
+        spec = node.spec
+        ids = [int(document) for document in inputs["document_ids"]]
+        written = [self._map_answer(spec, document) for document in ids]
+        return NodeResult(
+            {node.rows_port: map_rows(spec.alias, spec.name, ids, written)},
+            NodeMetrics(input_rows=len(ids), output_rows=len(ids),
+                        evaluated_documents=len(ids)))
+
+    def _map_answer(self, spec, document):
+        if callable(self.maps):
+            return self.maps(spec, document)
+        return None if self.maps is None else self.maps[document]
 
     def _reranker(self) -> RerankerModelExecution:
         return RerankerModelExecution(GpuContext(

@@ -14,6 +14,11 @@ from quail.logical.nodes.extract import (
 )
 from quail.logical.nodes.filter import Filter, SemanticFilter, above_unnest
 from quail.logical.nodes.join import Join, SemanticJoin
+from quail.logical.nodes.map import (
+    SemanticMap,
+    mapped_above_joins,
+    semantic_maps,
+)
 from quail.logical.nodes.relational import Aggregate, Project, Result, Window
 from quail.logical.nodes.sae_features import (
     FEATURE_LIST,
@@ -45,9 +50,12 @@ __all__ = [
     "SemanticJoin",
     "SemanticSaeFeatures",
     "Unnest",
+    "SemanticMap",
     "classifications",
     "feature_calls",
     "classified_above_joins",
     "extracted_above_joins",
     "extractions",
+    "mapped_above_joins",
+    "semantic_maps",
 ]

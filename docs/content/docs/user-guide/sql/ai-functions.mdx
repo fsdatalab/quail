@@ -20,6 +20,7 @@ Square brackets mark optional arguments.
 | [`AI.SCORE(prompt[, options])`](#aiscore) | Returns a score from 0 to 1 for a model question. |
 | [`AI.CLASSIFY(input, categories[, options])`](#aiclassify) | Assigns one of the supplied labels. |
 | [`AI.EXTRACT(input, questions)`](#aiextract) | Copies answers from a document and returns their positions. |
+| [`AI.MAP(column, instruction)`](#aimap) | Writes an answer for each document. |
 | [`AI.SAE_FEATURES(prompt, pooling)`](#aisae_features) | Returns the sparse autoencoder features of a prompt. |
 | [`HINT(condition, options)`](#planning-hints) | Sets the estimated pass fraction for a label or answer condition. |
 
@@ -409,6 +410,30 @@ set the expected fraction of documents that pass, or pass
 
 For the Python form, see
 [`ai_extract()`](/docs/user-guide/python-api/ai-functions#ai_extract).
+
+## AI.MAP
+
+`AI.MAP` writes one text answer per document. Its arguments are a
+text column and an instruction string. An `AS` name is required.
+
+For example, imagine a `reviews` table with a `text` column:
+
+```sql
+SELECT r.id,
+       AI.MAP(r.text, 'Summarize this review in one sentence.',
+              max_answer_tokens => 64) AS summary
+FROM reviews r
+```
+
+The model chooses its most likely token at each step. An answer ends
+at a stop token or the token limit. `max_answer_tokens` defaults to 256
+and must be a positive integer. A token limit can cut an answer
+mid-sentence. The answer can contain words that are not in the document.
+
+This function requires the Quail backend and an autoregressive model.
+Rerankers, Decision models, and DiffusionGemma are unsupported. Use a
+[CTE](/docs/user-guide/sql/sql-functions#with) to pass an answer to
+another AI function.
 
 ## AI.SAE_FEATURES
 

@@ -34,3 +34,11 @@ def _subtree(node) -> tuple:
         nodes.extend(_subtree(child))
     nodes.append(node)
     return tuple(nodes)
+
+
+def _result_schema(node) -> tuple[ColumnRef, ...]:
+    """Append one document operator's result column to its input schema."""
+    fields = node.input.output_schema()
+    provider = next((field.provider for field in fields if field.alias == node.alias),
+                    "")
+    return fields + (ColumnRef(node.alias, provider, node.name),)

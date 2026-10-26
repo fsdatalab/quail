@@ -213,6 +213,33 @@ def extraction_refusal(context) -> Refusal | None:
                    needed=1, available=0, unit="queries")
 
 
+def map_refusal(context) -> Refusal | None:
+    """Check whether the model supports map planning.
+
+    A map decodes the answer token by token from the model's next-token
+    probabilities, which a reranker, a decision model, and a diffusion
+    model with an answer canvas do not give.
+
+    Args:
+        context: Planning context with the tokenizer and model specification.
+
+    Returns:
+        A Refusal describing missing support, or None if planning can proceed.
+    """
+    model = context.model
+    if context.backend != "quail":
+        reason = "AI.MAP requires the quail backend"
+    elif context.tokenizer is None:
+        reason = "AI.MAP planning needs the model's tokenizer"
+    elif model.role in ("reranker", "decision") or model.canvas_tokens:
+        reason = (f"AI.MAP decodes its answer from next-token "
+                  f"probabilities, which {model.name!r} does not give")
+    else:
+        return None
+    return Refusal(reasons=(reason,), constraint="unsupported_map_query",
+                   needed=1, available=0, unit="queries")
+
+
 class ClassifyRefusedError(Exception):
     """A classification cannot run within the selected execution constraints."""
 
@@ -331,6 +358,15 @@ def validate_query(plan, operators, context, model, device, gpus):
                 constraint="unsupported_extract_query",
                 needed=1, available=0, unit="queries")
         refusal = extraction_refusal(context)
+        if refusal is not None:
+            return refusal
+    if operators.maps:
+        if context is None:
+            return Refusal(
+                reasons=("AI.MAP planning needs a planning context",),
+                constraint="unsupported_map_query",
+                needed=1, available=0, unit="queries")
+        refusal = map_refusal(context)
         if refusal is not None:
             return refusal
     join_applies = {}

@@ -8,11 +8,10 @@ from typing import ClassVar
 import pyarrow as pa
 
 from quail.logical.expressions import (
-    ColumnRef,
     CompileError,
     _explain,
 )
-from quail.logical.nodes.base import LogicalNode, _subtree
+from quail.logical.nodes.base import LogicalNode, _result_schema, _subtree
 
 # the Arrow type of one feature list
 FEATURE_LIST = pa.list_(
@@ -52,12 +51,7 @@ class SemanticSaeFeatures:
     def expressions(self) -> tuple:
         return (self.call,)
 
-    def output_schema(self) -> tuple[ColumnRef, ...]:
-        fields = self.input.output_schema()
-        provider = next(
-            (field.provider for field in fields if field.alias == self.alias), ""
-        )
-        return fields + (ColumnRef(self.alias, provider, self.name),)
+    output_schema = _result_schema
 
     def validate(self) -> None:
         self.call.validate()

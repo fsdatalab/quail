@@ -18,11 +18,13 @@ from quail.logical import effective_selectivity
 from quail.planner.operators.classify import classify_builder, classify_scoring
 from quail.planner.operators.extract import extract_spec
 from quail.planner.operators.filter import prepare_filter_costs
+from quail.planner.operators.map import map_spec
 from quail.planner.operators.sae_features import sae_features_spec
 from quail.planner.validation import ClassifyRefusedError
 
 ASK, CLASSIFY, EXTRACT = "ask", "classify", "extract"
 FEATURES = "features"
+MAP = "map"
 
 
 @dataclass(frozen=True)
@@ -30,9 +32,9 @@ class TableStep:
     """One step of a table's sequence and its costs.
 
     Attributes:
-        kind: ASK, CLASSIFY, or EXTRACT.
+        kind: ASK, CLASSIFY, EXTRACT, or MAP.
         key: The ask's written position, the classification's call, or
-            the extraction's name.
+            the extraction's or map's name.
         selectivity: The fraction of documents the step keeps: the
             product of its tests' selectivities, 1 without a test.
         first: Seconds at a live count, the documents read afresh.
@@ -102,6 +104,11 @@ class PlanPricing:
                              max_pooling=max_pooling)
                      for resident in (False, True))
 
+    def map(self, node) -> tuple:
+        """Return a map's (first, later) costs at a live count."""
+        return tuple(partial(_map_seconds, self.context, node, resident)
+                     for resident in (False, True))
+
     def document_head(self, prompt):
         """Return the token ids a prompt shows the document under."""
         return tuple(self.context.lowered(prompt).preamble_token_ids)
@@ -153,6 +160,12 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
         steps.append(TableStep(
             FEATURES, node.name, 1.0, first, later,
             document_head=pricing.document_head(node.call.prompt)))
+    for node in operators.maps:
+        if node.alias != alias:
+            continue
+        first, later = pricing.map(node)
+        steps.append(TableStep(MAP, node.name, 1.0, first, later,
+                               document_head=pricing.document_head(node.call.prompt)))
     return steps
 
 
@@ -191,4 +204,10 @@ def _features_seconds(context, node, resident, expected_rows,
     return sae_features_spec(context, node.call, node.name, expected_rows,
                              resident=resident,
                              max_pooling=max_pooling).estimated_seconds
+
+
+def _map_seconds(context, node, resident, expected_rows) -> float:
+    """Price a map at a live count."""
+    return map_spec(context, node.call, node.name, expected_rows,
+                    resident=resident).estimated_seconds
 

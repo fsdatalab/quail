@@ -140,6 +140,12 @@ def extraction_rows(alias, name, span_name, document_ids, answers, spans) -> Row
                 pa.table({name: pa.array(answers, pa.string()), span_name: span_array}))
 
 
+def map_rows(alias, name, document_ids, answers) -> Rows:
+    """Build the rows of a map: its written answers."""
+    return Rows({alias: document_ids},
+                pa.table({name: pa.array(answers, pa.string())}))
+
+
 def as_table(value):
     """Return rows as their table, and any other value as it is."""
     return value.table() if isinstance(value, Rows) else value

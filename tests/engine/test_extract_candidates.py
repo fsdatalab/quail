@@ -12,7 +12,7 @@ from quail.backends.quail.executor.extract.candidates import (
     first_tokens,
     make_streams,
 )
-from quail.backends.quail.executor.extract.vocabulary import Vocabulary
+from quail.backends.quail.executor.vocabulary import Vocabulary
 from quail.catalog.tokens import GigatokenEncoder
 
 

@@ -19,6 +19,7 @@ Select a row to jump to its arguments and examples.
 | [`ai_score(prompt, name=...)`](#ai_score) | Adds a score from 0 to 1 for each document. |
 | [`ai_classify(prompt, labels, ...)`](#ai_classify) | Assigns one of the supplied labels. |
 | [`ai_extract(column, questions, ...)`](#ai_extract) | Copies answers from a document and returns their positions. |
+| [`ai_map(column, instruction, ...)`](#ai_map) | Writes an answer for each document. |
 | [`ai_sae_features(prompt, ...)`](#ai_sae_features) | Returns the sparse autoencoder features of a prompt. |
 
 </div>
@@ -193,6 +194,31 @@ set the expected fraction of documents that pass.
 
 See [`AI.EXTRACT`](/docs/user-guide/sql/ai-functions#aiextract) for output examples
 and supported queries.
+
+## ai_map
+
+`ai_map(column, instruction, *, name, max_answer_tokens=256)` writes
+one text answer per document. The answer can contain words that are
+not in the document.
+
+For example, imagine a `reviews` table with a `text` column. Summarize
+each review in one sentence:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_map("r.text", "Summarize this review in one sentence.",
+            name="summary", max_answer_tokens=64)
+    .select("r.id", "summary")
+)
+table = query.collect()
+```
+
+The model chooses its most likely token at each step. An answer ends
+at a stop token or `max_answer_tokens`, which must be a positive integer.
+A token limit can cut an answer mid-sentence. This function requires the
+Quail backend and an autoregressive model; rerankers, Decision models,
+and DiffusionGemma are unsupported.
 
 ## ai_sae_features
 

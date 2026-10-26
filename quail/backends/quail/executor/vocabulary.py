@@ -1,4 +1,4 @@
-"""The vocabulary index an extraction reads: each token's word and its spellings.
+"""The vocabulary index for answer decoding: each token's word and its spellings.
 
 A document token may be written without its leading space, in another
 case, or as a prefix token followed by the rest of the word. The index
@@ -23,7 +23,7 @@ def same_word(token) -> str:
 
 
 class Vocabulary:
-    """One model's tokenizer and the vocabulary index its extractions read.
+    """One model's tokenizer, token variants, and stop tokens.
 
     Args:
         tokenizer: A Gigatoken encoder or a tokenizer supplied by the caller.
@@ -68,7 +68,8 @@ class Vocabulary:
         if tokenizer.eos_token_id is not None:
             stops.add(int(tokenizer.eos_token_id))
         if not stops:
-            raise ValueError("AI.EXTRACT needs a turn close or an end-of-text token")
+            raise ValueError(
+                "answer decoding needs a turn close or an end-of-text token")
         self.stop_ids = tuple(sorted(stops))
         self.is_stop = np.zeros(len(self.vocab), dtype=bool)
         self.is_stop[list(self.stop_ids)] = True
