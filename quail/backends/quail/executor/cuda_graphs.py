@@ -233,7 +233,9 @@ class DecodeGraphs:
         page = arena.owned_pages(key)[0]
         stream = torch.cuda.Stream()
         current = torch.cuda.current_stream()
-        reserved = torch.cuda.memory_reserved()
+        # device-wide free memory: the caching allocator may release
+        # cached blocks while capturing, which hides the pool's growth
+        free, _ = torch.cuda.mem_get_info()
         try:
             for k, v in zip(arena.k, arena.v):
                 start = page * arena.page_tokens
@@ -274,7 +276,7 @@ class DecodeGraphs:
             arena.free_key(key)
         self.storage = arena.k
         self.capture_s = time.perf_counter() - started
-        self.capture_bytes = torch.cuda.memory_reserved() - reserved
+        self.capture_bytes = free - torch.cuda.mem_get_info()[0]
         logger.info("captured %d decode graphs of up to %d rows in %.2f s, "
                     "holding %.2f GiB", len(self.graphs) + len(self.document_graphs),
                     self.config.row_buckets[-1], self.capture_s,
