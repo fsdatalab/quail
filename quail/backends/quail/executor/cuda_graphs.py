@@ -233,8 +233,10 @@ class DecodeGraphs:
         page = arena.owned_pages(key)[0]
         stream = torch.cuda.Stream()
         current = torch.cuda.current_stream()
-        # device-wide free memory: the caching allocator may release
-        # cached blocks while capturing, which hides the pool's growth
+        # capturing empties the allocator's cache, which would hide the
+        # pool's growth; empty it first so the difference is the graphs'
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         free, _ = torch.cuda.mem_get_info()
         try:
             for k, v in zip(arena.k, arena.v):
