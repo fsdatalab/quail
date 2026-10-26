@@ -8,7 +8,9 @@ Pull a run's records from the results volume, then pass the directory:
 For each query, prints the planner's SoL seconds, the measured
 execution seconds, their ratio, each operator group's slowdown, the
 first estimate made, and the error of the predicted finish at 10%,
-25%, and 50% of the execution. Runs on the CPU from the saved
+25%, and 50% of the execution. Then, for every estimate made during
+the run, prints the seconds left it gave beside the seconds that were
+actually left. Runs on the CPU from the saved
 ``remaining_time`` measurement.
 """
 
@@ -39,6 +41,7 @@ def query_rows(directory: Path) -> list[dict]:
                 "first_estimate": first,
                 "errors": prediction_errors(report),
                 "groups": report["groups"],
+                "history": report["history"],
             }
     return list(rows.values())
 
@@ -74,6 +77,17 @@ def main(directory: str) -> None:
                 f"{group['planned_seconds']:.2f}",
                 f"{group['measured_seconds']:.1f}",
                 "x" if slowdown is None else f"{slowdown:.1f}x"]))
+    print()
+    print("query | at s | estimated left s | actual left s | error s | error")
+    print("--- | --- | --- | --- | --- | ---")
+    for row in rows:
+        for at, left in row["history"]:
+            actual = row["finished_seconds"] - at
+            if actual < 0.5:
+                continue        # the last count lands as the run finishes
+            print(" | ".join([
+                row["query"], f"{at:.1f}", f"{left:.1f}", f"{actual:.1f}",
+                f"{left - actual:+.1f}", _percent((left - actual) / actual)]))
 
 
 if __name__ == "__main__":
