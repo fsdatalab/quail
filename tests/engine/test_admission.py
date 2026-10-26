@@ -590,8 +590,8 @@ def test_work_left_follows_the_pass_rate_measured_at_each_stage():
         "before any answer, every document is expected to pass"
     groups = sched.next_chunk(1000)
     assert len(groups) == 10
-    # prefixes packed; each document is half way through its question
-    assert sched.work() == (1000, 10 * (5 + 50))
+    # launched, not answered: prefixes still count as work left
+    assert sched.work() == (0, 1000 + 10 * (5 + 50))
     for a in range(10):
         sched.report(a, 0, 0, 1, [a < 2])
     # two of ten passed: only they ask the join, each half way through it

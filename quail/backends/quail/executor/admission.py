@@ -324,6 +324,8 @@ class JoinAdmission:
         self.tokens_done = 0
         self._prefix_left = sum(self._carried)
         self._prefix_admitted = [0, 0]      # carried tokens, then packed
+        self._packed = [0] * len(self.prefix)   # until the first answer
+        self._prefix_in_flight = 0
         self._entered = [0] * k             # documents with requests at j
         self._stage_tokens = [0] * k        # the tokens those requests ask
         self._completed = [0] * k           # documents that finished stage j
@@ -402,9 +404,10 @@ class JoinAdmission:
         it, or every partner before one has. The share of documents
         reaching a stage is the product of the pass rates measured at
         the stages before it, 1 at a stage no document has finished.
-        A document in flight is counted half way through its stage, and
-        a queued document's prefix at the share of prefix tokens that
-        admitted documents packed rather than borrowed.
+        A document in flight is counted half way through its stage, its
+        prefix as done once its first answers are read, and a queued
+        document's prefix at the share of prefix tokens that admitted
+        documents packed rather than borrowed.
         """
         k = len(self.stages)
         mean = [self._stage_tokens[j] / self._entered[j] if self._entered[j]
@@ -417,6 +420,7 @@ class JoinAdmission:
             ahead[j] = mean[j] + passing[j] * ahead[j + 1]
         carried, packed = self._prefix_admitted
         left = (self._prefix_left * (packed / carried if carried else 1.0)
+                + self._prefix_in_flight
                 + (len(self.pending) - self._dead) * ahead[0])
         for j in range(k):
             in_stage = self._entered[j] - self._completed[j]
@@ -688,7 +692,8 @@ class JoinAdmission:
             self._prefix_left -= self._carried[a]
             self._prefix_admitted[0] += self._carried[a]
             self._prefix_admitted[1] += carried
-            self.tokens_done += carried
+            self._packed[a] = carried
+            self._prefix_in_flight += carried
             self._enter_tokens(a, 0)
             admitted.add(a)
             expected_rows += 1
@@ -737,6 +742,10 @@ class JoinAdmission:
         cum = self._cum_of(a, j)
         self.tokens_done += int(cum[end] - cum[start]) + (
             self.frame_rows[j] if start == 0 else 0)
+        if j == 0 and start == 0:
+            # a prefix is done once its chunk's answers are read
+            self.tokens_done += self._packed[a]
+            self._prefix_in_flight -= self._packed[a]
         k = len(self.stages)
         num_partners = self.num_partners(a, j)
         complete = end == num_partners
