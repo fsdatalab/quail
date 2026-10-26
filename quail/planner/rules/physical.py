@@ -435,11 +435,6 @@ class ChooseAttentionAlgorithm(PhysicalRule):
         return PhysicalGraph(tuple(nodes), graph.root)
 
 
-# the share of a table's documents that must copy another's tokens
-# before deduplicating it is worth a key column
-MIN_COPIES = 0.01
-
-
 class ShouldDeduplicate(PhysicalRule):
     """Deduplicate the tables model operators read: record each one's row columns.
 
@@ -451,7 +446,7 @@ class ShouldDeduplicate(PhysicalRule):
     and gives each document, or pair, the answers of its key documents.
     The rule leaves the request backends, diffusion models, whose answers
     depend on a document's row as well as its tokens, and tables where
-    fewer than MIN_COPIES of the documents copy another's tokens.
+    no document copies another's tokens.
     """
 
     name = "should_deduplicate"
@@ -487,9 +482,7 @@ def _model_aliases(graph) -> set[str]:
 
 
 def _copied(context, alias: str) -> bool:
-    """Whether enough of an alias's documents copy another's tokens."""
+    """Whether any of an alias's documents copies another's tokens."""
     lengths = context.document_tokens.get(alias)
     store = None if lengths is None else lengths.store
-    if store is None or not len(store):
-        return False
-    return store.num_copies >= MIN_COPIES * len(store)
+    return store is not None and store.num_copies > 0
