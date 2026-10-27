@@ -53,6 +53,9 @@ CUDA_GRAPH_CAPTURE_SIZE = 8_192
 # the capture sizes the stock vLLM baseline runs with: one graph, so
 # vLLM pads every step of up to 8,192 tokens to 8,192
 SINGLE_CUDA_GRAPH = (CUDA_GRAPH_CAPTURE_SIZE,)
+# set to "vllm" to boot the tuned baselines with vLLM's own capture
+# sizes: a decode-heavy query pads each step to a size near its batch
+CAPTURE_SIZES_ENV = "QUAIL_VLLM_CAPTURE_SIZES"
 # vLLM caps a diffusion model at 8 sequences per step whenever the
 # setting is 128 or more, sized for its 256-row canvas; one row needs
 # no cap, so stay just under the trigger.
@@ -349,9 +352,12 @@ class VLLMEngine:
                              else min(MAX_SEQUENCES,
                                       spec.max_num_seqs or MAX_SEQUENCES)),
         }
-        if self.capture_sizes is not None:
+        capture_sizes = self.capture_sizes
+        if os.environ.get(CAPTURE_SIZES_ENV) == "vllm":
+            capture_sizes = None
+        if capture_sizes is not None:
             kwargs["compilation_config"] = {
-                "cudagraph_capture_sizes": list(self.capture_sizes)}
+                "cudagraph_capture_sizes": list(capture_sizes)}
         if spec.moe_backend is not None:
             kwargs["moe_backend"] = spec.moe_backend
         speculative = os.environ.get("QUAIL_VLLM_SPECULATIVE")

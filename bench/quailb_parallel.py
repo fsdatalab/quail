@@ -14,6 +14,7 @@ function and every family call running if the local process disconnects.
 """
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,13 +97,22 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
     The family's result, without the per-method suites, is saved
     under `families/` in the run directory.
     """
+    import quail_b as benchmark
     from bench.process_isolation import run_backend_group_in_fresh_process
+    from quail.baselines.vllm import CAPTURE_SIZES_ENV
     from quail_b.queries import query_family_name
 
     query_ids = tuple(
         query_id.strip() for query_id in query_ids_csv.split(",")
         if query_id.strip())
     family = query_family_name(query_ids)
+    # map answers are decoded token by token: vLLM's own graph sizes fit
+    # its decode batches, while the filter graph pads each to 8,192 tokens
+    decodes = any(benchmark.get_query(query_id).info.maps for query_id in query_ids)
+    if decodes:
+        os.environ[CAPTURE_SIZES_ENV] = "vllm"
+    else:
+        os.environ.pop(CAPTURE_SIZES_ENV, None)
     process_results = []
     suites = {}
     for methods in process_groups:
@@ -139,6 +149,7 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
         "gpu": modal_gpu_type(device, gpus),
         "gpu_uuids": sorted(gpu_uuids),
         "process_groups": [list(methods) for methods in process_groups],
+        "vllm_capture_sizes": "vllm default" if decodes else "8192 only",
         "process_cleanup": [
             {"methods": process_result["methods"],
              **process_result["process_cleanup"]}

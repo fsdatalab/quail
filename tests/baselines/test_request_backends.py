@@ -660,3 +660,14 @@ def test_the_vllm_plugin_registers_gigatoken_in_each_engine_process(monkeypatch)
     assert tokenizers.tokenizers["gigatoken"] == (
         "quail.baselines.vllm", "GigatokenVLLMTokenizer")
     assert renderers.renderers["gigatoken"] == ("vllm.renderers.hf", "HfRenderer")
+
+
+def test_a_decode_run_boots_the_tuned_baselines_with_vllms_own_graphs(monkeypatch):
+    from quail.baselines.vllm import CAPTURE_SIZES_ENV
+
+    engine = VLLMEngine()
+    monkeypatch.delenv(CAPTURE_SIZES_ENV, raising=False)
+    assert engine.llm_kwargs(QWEN3_4B_FP8, H100_SXM)["compilation_config"] == {
+        "cudagraph_capture_sizes": [8_192]}
+    monkeypatch.setenv(CAPTURE_SIZES_ENV, "vllm")
+    assert "compilation_config" not in engine.llm_kwargs(QWEN3_4B_FP8, H100_SXM)
