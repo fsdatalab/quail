@@ -50,7 +50,7 @@ def _digest(output) -> str:
 
     digest = hashlib.sha256()
     tables = {**output.filter_answers, **output.join_answers,
-              **(output.classify_answers or {})}
+              **(output.classify_answers or {}), **(output.map_answers or {})}
     for name in sorted(tables):
         table = tables[name]
         rows = sorted(json.dumps(list(row.values()), default=str)
@@ -88,7 +88,14 @@ def _gpu_gaps(prof, top: int) -> dict:
             covered = k_end
             previous = name
     gaps.sort(reverse=True)
+    by_kernel = {}
+    for k_start, k_end, name in kernels:
+        total, calls = by_kernel.get(name[:80], (0.0, 0))
+        by_kernel[name[:80]] = total + k_end - k_start, calls + 1
+    ranked = sorted(by_kernel.items(), key=lambda item: -item[1][0])
     return {
+        "kernels": [{"name": name, "s": round(total / 1e6, 4), "calls": calls}
+                    for name, (total, calls) in ranked[:top]],
         "span_s": (end - start) / 1e6, "busy_s": busy / 1e6,
         "idle_s": (end - start - busy) / 1e6,
         "gaps": [{"ms": round(gap / 1e3, 2), "at_ms": round(at / 1e3, 1),
@@ -304,7 +311,7 @@ def child(arguments: str) -> None:
     from quail_b.benchmark import load_benchmark
 
     args = json.loads(arguments)
-    query_id, scale_factor, modes, top = (args["query_id"], args["sf"], args["modes"],
+    query_id, scale_factor, modes, top = (args["query_id"], args["scale_factor"], args["modes"],
                                 args["top"])
     print(f"quail from {quail.__file__}", flush=True)
     window = {}
@@ -353,7 +360,7 @@ def child(arguments: str) -> None:
                            collection_id=args["collection_id"] or None)
     spec = suite.queries[0]
     tables = {relation.table: suite.tables[relation.table]
-              for relation in spec._info.relations}
+              for relation in spec.info.relations}
     config = quail.EngineConfig(gpus=1, model=args["model"], backend="quail",
                                 device="h100-sxm", gpu_timing=True)
     with quail.Session(config) as session:
