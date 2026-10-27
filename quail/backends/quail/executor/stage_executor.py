@@ -106,6 +106,8 @@ class StageExecutor:
         self.label = label
         self.gpu_timing = gpu_timing
         self.decoder = decoder
+        if decoder is not None:
+            decoder.staging = staging
         # the stages whose answers the decoder writes, in map order
         self.answer_maps = {j: q for q, j in enumerate(
             j for j, stage in enumerate(stages) if stage.answer_tokens)}

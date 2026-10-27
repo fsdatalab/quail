@@ -89,6 +89,9 @@ class MapDecoder:
         # per slot, the map its answers are for, or None when each
         # stage names its map
         self.slot_maps = None
+        # the run's InputStaging, whose pinned buffers carry the index
+        # arrays to the GPU without the host waiting on the stream
+        self.staging = None
 
     # ---- documents entering and leaving -----------------------------------
 
@@ -190,13 +193,19 @@ class MapDecoder:
         rows.shared_used = shared[firsts].astype(np.int32)
         return rows
 
+    def _upload(self, name: str, values) -> object:
+        """Copy an int64 index array to the device without blocking the host."""
+        values = np.asarray(values, dtype=np.int64)
+        if self.staging is None:
+            return self.torch.from_numpy(values).to(self.device)
+        return self.staging.copy(name, values, self.torch.int64)
+
     def feed(self, chunk) -> None:
         """Copy each decode row's input token from the token buffer."""
         rows = chunk.decode_rows
         if rows is None:
             return
-        torch = self.torch
-        slots = torch.from_numpy(rows.slots).to(self.device, non_blocking=True)
+        slots = self._upload("decode_slots", rows.slots)
         start = chunk.tokens - len(rows)
         chunk.input_ids[start:].copy_(self.next_token.index_select(0, slots))
         self.fed[rows.slots] += 1
@@ -226,16 +235,15 @@ class MapDecoder:
             np.empty(0, dtype=np.int64) if rows is None else self.fed[rows.slots]])
         selected = []
         if len(first_rows):
-            index = torch.from_numpy(np.asarray(first_rows, dtype=np.int64))
-            selected.append(normed.index_select(0, index.to(normed.device,
-                                                             non_blocking=True)))
+            selected.append(normed.index_select(
+                0, self._upload("first_rows", first_rows)))
         if count:
             selected.append(normed[normed.shape[0] - count:])
         hidden = selected[0] if len(selected) == 1 else torch.cat(selected)
         chosen = torch.argmax(
             torch.nn.functional.linear(hidden.to(self.head.dtype), self.head), dim=1)
-        slots = torch.from_numpy(documents).to(self.device, non_blocking=True)
-        self.next_token.index_copy_(0, slots, chosen)
+        self.next_token.index_copy_(0, self._upload("chosen_slots", documents),
+                                    chosen)
         host = torch.empty(len(documents), dtype=torch.int64,
                            pin_memory=self.head.is_cuda)
         host.copy_(chosen, non_blocking=True)
