@@ -885,6 +885,8 @@ class Engine:
         v3 = v.contiguous().view(n, KH, D)
         if chunk.attention_mode == "tree":
             return self.attention_tree(q3, k3, v3, chunk.meta)
+        if chunk.meta.get("shared") is not None:
+            return self.attention_shared(q3, k3, v3, chunk.meta)
         return self.quant(self.attention_unified(q3, k3, v3, chunk.meta))
 
     # ---- attention: the two workload paths --------------------------
@@ -1023,6 +1025,39 @@ class Engine:
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(
             out_a, lse_a, out_b, lse_b, reads["source"])
+        meta["layer"] += 1
+        return q_out, scales
+
+    def attention_shared(self, q3, k3, v3, meta):
+        """The unified call, plus one stacked read of shared pages, merged.
+
+        Every row reads its own pages in the causal paged call, after
+        its KV is written there. The rows of each group of branches
+        then read the group's shared pages once, together, in a
+        non-causal paged call, and each such row's two results merge by
+        their log-sum-exp weights. Takes (rows, heads, dim) tensors and
+        returns the input pair for o_proj.
+        """
+        layer = meta["layer"]
+        unified, shared = meta["unified"], meta["shared"]
+        if unified["src"].numel():
+            self.kv_row_scatter(k3, v3, unified["src"], unified["dst"], layer)
+        if unified["tail_src"] is not None:
+            k_pool, v_pool = self.arena.layer_kv(layer)
+            self.kv_row_scatter(k_pool, v_pool,
+                                unified["tail_src"], unified["tail_dst"], layer)
+        kp, vp = self.arena.paged_kv(layer)
+        out_a, lse_a = self._fa(
+            q3, kp, vp, unified["cu_q"], None, unified["max_q"],
+            unified["max_used"], causal=True, block_table=unified["table"],
+            seqused_k=unified["used"])
+        out_b, lse_b = self._fa(
+            q3.index_select(0, shared["rows"]), kp, vp, shared["cu_q"], None,
+            shared["max_q"], shared["max_used"], causal=False,
+            block_table=shared["table"], seqused_k=shared["used"])
+        q_out, scales = self.merge_attn_quant(
+            out_a, lse_a.transpose(0, 1), out_b, lse_b.transpose(0, 1),
+            shared["source"])
         meta["layer"] += 1
         return q_out, scales
 

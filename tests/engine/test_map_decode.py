@@ -36,13 +36,14 @@ class TokenModel(HashModel):
 
     def __init__(self, arena):
         super().__init__(arena, answers={}, canvas=())
+        self.shared_reads = 0   # passes whose rows read shared pages together
 
     def forward_chunk(self, chunk):
         ids = chunk.input_ids.tolist()
         positions = chunk.positions.tolist()
         hashes = [None] * len(ids)
         if chunk.attention_mode == "unified":
-            self._unified(chunk.meta["unified"], ids, positions, hashes)
+            self._unified(self._whole(chunk.meta), ids, positions, hashes)
         else:
             self._tree(chunk.meta, ids, positions, hashes)
         rows = chunk.final_indices.tolist()
@@ -50,6 +51,32 @@ class TokenModel(HashModel):
         out[torch.arange(len(rows)),
             torch.tensor([next_token(hashes[row]) for row in rows])] = 1.0
         return out
+
+
+    def _whole(self, meta):
+        """The unified call as one sequence per row, shared pages first.
+
+        A row that reads its group's shared pages in a second call
+        reads them, then its own pages, as one logical sequence.
+        """
+        unified, shared = meta["unified"], meta["shared"]
+        if shared is None:
+            return unified
+        self.shared_reads += 1
+        cu = unified["cu_q"].tolist()
+        sequence = {cu[i]: i for i in range(len(cu) - 1) if cu[i + 1] - cu[i] == 1}
+        table = [list(row) for row in unified["table"].tolist()]
+        used = unified["used"].tolist()
+        rows, groups = shared["rows"].tolist(), shared["cu_q"].tolist()
+        tokens = shared["used"].tolist()
+        for g, pages in enumerate(shared["table"].tolist()):
+            pages = pages[:-(-tokens[g] // self.page)]
+            for row in rows[groups[g]:groups[g + 1]]:
+                table[sequence[row]] = pages + table[sequence[row]]
+                used[sequence[row]] += tokens[g]
+        width = max(map(len, table))
+        return dict(unified, used=torch.tensor(used), table=torch.tensor(
+            [row + [0] * (width - len(row)) for row in table]))
 
 
 class Bits:
@@ -186,6 +213,8 @@ def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path
         got = [answer.tolist() for answer in decoder.answers(
             q, maps._slots(q, ids))]
         assert got == [greedy(document + tail, limit) for document in documents]
-    # the branches of a document borrow its prompt's whole pages
+    # the branches of a document borrow its prompt's whole pages, and
+    # read them once together on the unified path
     assert stats["borrowed_tokens"] > 0
+    assert (path == "unified") == (model.shared_reads > 0)
     assert not arena.accounting.owned

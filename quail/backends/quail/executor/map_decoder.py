@@ -77,6 +77,10 @@ class MapDecoder:
         self.stopped = np.zeros(n, dtype=bool)         # read a stop token
         self.pages = np.zeros((n, 1), dtype=np.int32)  # its pages, padded
         self.num_pages = np.zeros(n, dtype=np.int64)
+        # the branches of one document form a group, named by its first
+        # branch, and share its first shared[group] tokens' pages
+        self.group = np.arange(n, dtype=np.int64)
+        self.shared = np.zeros(n, dtype=np.int64)
         self.device = head.device
         self.next_token = torch.zeros(n, dtype=torch.int64, device=self.device)
         self.copies = deque()
@@ -88,7 +92,8 @@ class MapDecoder:
 
     # ---- documents entering and leaving -----------------------------------
 
-    def start(self, document: int, map_index: int, position: int, pages) -> None:
+    def start(self, document: int, map_index: int, position: int, pages,
+              parent: int | None = None, shared_tokens: int = 0) -> None:
         """Begin an answer whose first token the current pass chooses.
 
         Args:
@@ -98,6 +103,8 @@ class MapDecoder:
                 right after its prompt.
             pages: The document's page ids in logical order; they must
                 cover the prompt and the answer's limit.
+            parent: The slot whose whole pages this one borrows, or None.
+            shared_tokens: The tokens it borrows from the parent.
         """
         if self.map[document] >= 0:
             raise ValueError(f"document {document} is already writing an answer")
@@ -114,6 +121,13 @@ class MapDecoder:
         self.origin[document] = position
         self.fed[document] = 0
         self.stopped[document] = False
+        self.group[document] = document
+        self.shared[document] = 0
+        if parent is not None and shared_tokens:
+            # the parent reads the same pages as shared from now on
+            self.group[document] = self.group[parent]
+            self.shared[document] = shared_tokens
+            self.shared[self.group[parent]] = shared_tokens
 
     @property
     def active(self) -> bool:
@@ -145,10 +159,36 @@ class MapDecoder:
             raise AssertionError("an answer's row is past its pages")
         width = int(self.num_pages[running].max())
         table = self.pages[running, :width]
-        write_rows = (table[np.arange(len(running)), page].astype(np.int64)
+        index = np.arange(len(running))
+        write_rows = (table[index, page].astype(np.int64)
                       * self.page_tokens + positions % self.page_tokens)
-        return DecodeRows(positions=positions, write_rows=write_rows,
+        rows = DecodeRows(positions=positions, write_rows=write_rows,
                           page_table=table, slots=running)
+        # the rows of a group with two or more running branches read
+        # its shared pages once, together
+        groups, shared = self.group[running], self.shared[running]
+        _, inverse, counts = np.unique(groups, return_inverse=True,
+                                       return_counts=True)
+        together = (shared > 0) & (counts[inverse] > 1)
+        if not together.any():
+            return rows
+        skip = np.where(together, shared // self.page_tokens, 0)
+        columns = skip[:, None] + np.arange(width)
+        rows.own_table = np.where(
+            columns < self.num_pages[running][:, None],
+            table[index[:, None], np.minimum(columns, width - 1)], 0
+        ).astype(np.int32)
+        rows.own_lengths = positions + 1 - np.where(together, shared, 0)
+        member = np.flatnonzero(together)
+        order = member[np.argsort(groups[member], kind="stable")]
+        starts = np.flatnonzero(np.r_[True, np.diff(groups[order]) != 0])
+        rows.shared_rows = order
+        rows.shared_cu = np.r_[starts, len(order)].astype(np.int32)
+        firsts = order[starts]
+        most = int((shared[firsts] // self.page_tokens).max())
+        rows.shared_table = table[firsts, :most].astype(np.int32)
+        rows.shared_used = shared[firsts].astype(np.int32)
+        return rows
 
     def feed(self, chunk) -> None:
         """Copy each decode row's input token from the token buffer."""

@@ -120,6 +120,7 @@ class MapPart(ExecutionPart):
         self._decoder = None
         self.asked = [np.zeros(len(self.ids), dtype=bool) for _ in self.nodes]
         self.branches = branches
+        self._results = {}
         tails = []
         for node in self.nodes:
             head, tail = node.spec.prompt_token_parts
@@ -158,7 +159,6 @@ class MapPart(ExecutionPart):
                 append=True, single=True, readout=NoAnswers(), decide=decide,
                 answer_tokens=node.spec.max_answer_tokens,
                 label=f"map {node.spec.name}"))
-        self._results = {}
 
     @property
     def decoder(self):

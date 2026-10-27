@@ -511,7 +511,9 @@ class StageExecutor:
                 self.decoder.start(
                     a, self.answer_maps[j],
                     self.prefix_lengths[a] + len(self.frames[j]) + self.appended[a],
-                    self.arena.owned_pages(self.keys[a]))
+                    self.arena.owned_pages(self.keys[a]),
+                    parent=self.borrowing.parent(a),
+                    shared_tokens=self.borrowing.shared(a))
         return chunk, entries, [(row, a) for row, a, _ in firsts]
 
     def _settle(self, settlement):

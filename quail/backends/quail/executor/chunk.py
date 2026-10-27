@@ -64,6 +64,11 @@ class DecodeRows:
     the answer's own pages, and reads the answer's pages through its
     position in one causal paged attention call.
 
+    The branches of one document may read its shared pages together:
+    then each such row reads only its own pages in the causal call,
+    and its group's rows read the shared pages once, stacked, in a
+    second call whose result is merged into theirs.
+
     Attributes:
         positions: Rotary position of each row, which is also where its
             KV is written in the answer's sequence.
@@ -71,12 +76,26 @@ class DecodeRows:
         page_table: Per row, the answer's page ids in logical order,
             padded on the right.
         slots: Per row, where its input token sits in the token buffer.
+        own_table: Per row, the pages its causal call reads: its pages
+            past the shared ones, or all of them.
+        own_lengths: Per row, the KV tokens its causal call reads.
+        shared_rows: The rows that read shared pages, grouped, or an
+            empty array.
+        shared_cu: Cumulative row counts of the groups, from 0.
+        shared_table: Per group, its shared pages.
+        shared_used: Per group, its shared tokens.
     """
 
     positions: np.ndarray
     write_rows: np.ndarray
     page_table: np.ndarray
     slots: np.ndarray
+    own_table: np.ndarray | None = None
+    own_lengths: np.ndarray | None = None
+    shared_rows: np.ndarray | None = None
+    shared_cu: np.ndarray | None = None
+    shared_table: np.ndarray | None = None
+    shared_used: np.ndarray | None = None
 
     def __len__(self) -> int:
         return len(self.positions)
@@ -304,7 +323,10 @@ class _PoolBuilder:
 
     def add_block(self, rows: DecodeRows, r0: int):
         """Add one one-row sequence per decode row, starting at input row r0."""
-        self.blocks.append((rows.page_table, rows.positions + 1))
+        if rows.own_table is None:
+            self.blocks.append((rows.page_table, rows.positions + 1))
+        else:
+            self.blocks.append((rows.own_table, rows.own_lengths))
         self.src.append(np.arange(r0, r0 + len(rows), dtype=np.int64))
         self.dst.append(rows.write_rows)
 
@@ -899,9 +921,24 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             for key in temporary_keys:
                 arena.free_key(key)
             raise
+    shared = None
+    if (unified is not None and decode is not None
+            and decode.shared_rows is not None and len(decode.shared_rows)):
+        rows = decode_row0 + decode.shared_rows
+        source = np.full(num_tokens, -1, dtype=np.int32)
+        source[rows] = np.arange(len(rows), dtype=np.int32)
+        shared = dict(
+            rows=stage("shared_rows", rows, torch.int64),
+            cu_q=stage("shared_cu_q", decode.shared_cu, torch.int32),
+            max_q=int(np.diff(decode.shared_cu).max()),
+            table=stage("shared_table", decode.shared_table, torch.int32).view(
+                *decode.shared_table.shape),
+            used=stage("shared_used", decode.shared_used, torch.int32),
+            max_used=int(decode.shared_used.max()),
+            source=stage("shared_source", source, torch.int32))
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
-        unified=unified, canvas=canvas_meta, gdn=gdn,
+        unified=unified, canvas=canvas_meta, gdn=gdn, shared=shared,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
     out = Chunk(
