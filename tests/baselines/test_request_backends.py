@@ -279,8 +279,11 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
                     assert os.environ[key] == "0"
                     raise RuntimeError("boot failed")
             assert os.environ.get(key) == previous
+            # the engine core runs in this process, where the gigatoken
+            # tokenizer is registered
             with engine_environment(QWEN3_4B_FP8):
-                assert os.environ.get(key) == previous
+                assert os.environ[key] == "0"
+            assert os.environ.get(key) == previous
     assert len(cleared) == 16
     qwen = engine.llm_kwargs(QWEN3_4B_FP8, H100_SXM)
     assert qwen["max_num_batched_tokens"] == 25_305

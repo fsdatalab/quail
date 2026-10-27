@@ -95,8 +95,10 @@ def engine_environment(spec):
     # constructor, and caches what it read; its public LLM API has no
     # per-instance override
     envs.disable_envs_cache()
-    if spec.vision_tower or spec.canvas_tokens == 1:
-        os.environ[key] = "0"
+    # the engine runs in this process: a separate engine core process
+    # has no gigatoken tokenizer registered, and vLLM loads only its
+    # plugins' entry points there
+    os.environ[key] = "0"
     try:
         yield
     finally:
