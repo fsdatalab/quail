@@ -66,6 +66,25 @@ DIFFUSION_LOGPROBS = -1
 DIFFUSION_TEXT_TOKENS = 16
 
 
+def register_gigatoken() -> None:
+    """Register Gigatoken as vLLM's "gigatoken" tokenizer mode.
+
+    vLLM's engine core runs in a spawned process, which has its own
+    registries, so this is also a vLLM general plugin
+    (pyproject.toml's vllm.general_plugins entry point), which vLLM
+    loads in every process it starts.
+    """
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers import TokenizerRegistry
+
+    registered = ("quail.baselines.vllm", "GigatokenVLLMTokenizer")
+    if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
+        TokenizerRegistry.register("gigatoken", *registered)
+    renderer = ("vllm.renderers.hf", "HfRenderer")
+    if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
+        RENDERER_REGISTRY.register("gigatoken", *renderer)
+
+
 class GigatokenVLLMTokenizer:
     """Load Gigatoken through vLLM's tokenizer registry."""
 
@@ -350,17 +369,8 @@ class VLLMEngine:
             return boot_decision(
                 spec, self.llm_kwargs(spec, device), resources=resources)
         from vllm import LLM, SamplingParams
-        from vllm.renderers.registry import RENDERER_REGISTRY
-        from vllm.tokenizers import TokenizerRegistry
 
-        registered = (
-            "quail.baselines.vllm", "GigatokenVLLMTokenizer"
-        )
-        if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
-            TokenizerRegistry.register("gigatoken", *registered)
-        renderer = ("vllm.renderers.hf", "HfRenderer")
-        if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
-            RENDERER_REGISTRY.register("gigatoken", *renderer)
+        register_gigatoken()
 
         path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
