@@ -980,6 +980,35 @@ class JoinAdmission:
         self._settle_group(a, settlement.survived)
         return AdmissionReport((settlement,), ((a, j, True),))
 
+    def report_many(self, anchors, j):
+        """Record one answer for each of many anchors at an ahead stage.
+
+        Equivalent to report(a, j, 0, 1, row) for each anchor in turn.
+        An anchor whose next request is already launched needs nothing
+        more, so the common case costs one count.
+
+        Returns:
+            An AdmissionReport of every anchor's settlements and transitions.
+        """
+        if not self.ahead[j]:
+            raise ValueError(f"stage {j} is not an ahead stage")
+        self.in_flight -= len(anchors)
+        stage, ahead = self._stage, self._ahead
+        settlements, transitions = [], []
+        for a in anchors:
+            if stage[a] != j or a in ahead:
+                continue
+            self.ready.remove(a)
+            (_, settled), = self._enter_many([a], j if self.repeats[j] else j + 1)
+            if settled is None:
+                self.ready.append(a)
+                continue
+            settlement = Settlement(settled, a, bool(self._true[a][-1]))
+            self._settle_group(a, settlement.survived)
+            settlements.append(settlement)
+            transitions.append((a, j, True))
+        return AdmissionReport(tuple(settlements), tuple(transitions))
+
     def _settle_group(self, a, survived):
         """Free the anchor's group for its next anchor, or skip the rest.
 

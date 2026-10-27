@@ -387,7 +387,10 @@ class MapStages(AnswerStages):
         state = self.decoder.states[q]
         index = np.asarray(documents, dtype=np.int64)
         width = self.readout.width
-        arrays = [self._rows(row) for row in rows]
+        # a batched run hands over each round's rows as its own array;
+        # a single group, wrapped as the admission keeps it
+        arrays = [row if isinstance(row, np.ndarray) and row.ndim == 2
+                  and row.dtype != object else self._rows(row) for row in rows]
         stacked = np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
         stacked = np.ascontiguousarray(stacked, dtype=np.float32).reshape(-1, width)
         num_rows = np.fromiter((len(array) for array in arrays), dtype=np.int64,

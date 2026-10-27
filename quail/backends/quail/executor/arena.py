@@ -25,11 +25,36 @@ the same methods:
 """
 
 import math
+from itertools import chain
 
 import numpy as np
 
 from quail.backends.quail.executor.pages import PageArena, _evict_event
 from quail.progress import answer_sink
+
+# forward passes between reads of the device's memory use
+DEVICE_SAMPLE_PASSES = 16
+
+
+def block_table_array(pages, pad_to=None) -> np.ndarray:
+    """Return page lists as one int32 table, each row padded with zeros.
+
+    The lists are joined once and scattered into the table, so a table
+    of thousands of rows costs a few array passes, not a loop per page.
+    """
+    lengths = np.fromiter((len(p) for p in pages), dtype=np.int64,
+                          count=len(pages))
+    width = int(lengths.max()) if len(lengths) else 0
+    if pad_to:
+        width = max(width, pad_to)
+    table = np.zeros((len(pages), width), dtype=np.int32)
+    total = int(lengths.sum())
+    if total:
+        flat = np.fromiter(chain.from_iterable(pages), dtype=np.int32, count=total)
+        row = np.repeat(np.arange(len(pages)), lengths)
+        column = np.arange(total) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+        table[row, column] = flat
+    return table
 
 
 class KVArena:
@@ -235,13 +260,18 @@ class KVArena:
         (seconds, pages in use, retained pages, resident keys,
         checkpoint slots in use, device MiB in use, torch MiB allocated,
         tokens in the chunk, groups in the chunk, keys evicted so far).
+        Device memory is read every DEVICE_SAMPLE_PASSES passes and
+        repeated between reads.
         """
         import time
 
         torch = getattr(self, "torch", None)
         if torch is None or not torch.cuda.is_available():
             return
-        free, total = torch.cuda.mem_get_info()
+        # a device memory query costs about 0.75 ms of host time
+        if not len(self.memory_trace) % DEVICE_SAMPLE_PASSES:
+            self._device_memory = torch.cuda.mem_get_info()
+        free, total = self._device_memory
         accounting = self.accounting
         self.memory_trace.append((
             round(time.perf_counter(), 4),
@@ -829,15 +859,7 @@ class KVArena:
 
     def block_table_rows(self, pages, pad_to=None):
         """A block table from explicit physical page rows."""
-        torch = self.torch
-        width = max(len(p) for p in pages)
-        if pad_to:
-            width = max(width, pad_to)
-        flat = []
-        for p in pages:
-            flat.extend(p)
-            flat.extend([0] * (width - len(p)))
-        table = torch.tensor(flat, dtype=torch.int32,
-                             pin_memory=self.pinned).view(len(pages), width) \
-            .to(self.device, non_blocking=self.pinned)
-        return table
+        table = self.torch.from_numpy(block_table_array(pages, pad_to))
+        if self.pinned:
+            table = table.pin_memory()
+        return table.to(self.device, non_blocking=self.pinned)

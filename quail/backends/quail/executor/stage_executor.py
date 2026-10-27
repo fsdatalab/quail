@@ -739,11 +739,33 @@ class StageExecutor:
         groups = entry.groups[entry.at:entry.at + entry.step]
         values, position = entry.values, entry.positions
         transitions = []
-        group_rows = []
+        # per group, its rows; a run of one bulk stage's rounds is one
+        # item, (end of the run, stage, anchors, their rows)
+        items = []
         prepared = {}
-        for a, j, start, end, _ in groups:
+        index = 0
+        while index < len(groups):
+            a, j, start, end, carried = groups[index]
+            if self.bulk[j] and not carried and self.ahead[j]:
+                last = index + 1
+                while (last < len(groups) and groups[last][1] == j
+                       and not groups[last][4]):
+                    last += 1
+                key = self.readouts.group_key[j]
+                count = last - index
+                rows = values[key][position[key]:position[key] + count]
+                position[key] += count
+                anchors = [group[0] for group in groups[index:last]]
+                stage_anchors, stage_rows = prepared.setdefault(j, ([], []))
+                stage_anchors.extend(anchors)
+                # each round's rows, already one array per round
+                stage_rows.extend(rows)
+                items.append((last, j, anchors, rows))
+                index = last
+                continue
+            index += 1
             if end == start:
-                group_rows.append(None)     # a prefix slice has no answer
+                items.append(None)     # a prefix slice has no answer
                 continue
             key = self.readouts.group_key[j]
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
@@ -751,18 +773,32 @@ class StageExecutor:
             count = end - start
             rows = values[key][position[key]:position[key] + count]
             position[key] += count
-            group_rows.append(rows)
+            items.append(rows)
             if self.stages[j].prepare is not None:
-                anchors, stage_rows = prepared.setdefault(j, ([], []))
-                anchors.append(a)
+                stage_anchors, stage_rows = prepared.setdefault(j, ([], []))
+                stage_anchors.append(a)
                 stage_rows.append(rows)
         started = time.perf_counter()
         for j, (anchors, stage_rows) in prepared.items():
             self.stages[j].prepare(anchors, stage_rows)
         self.host_s["decide"] += time.perf_counter() - started
-        for (a, j, start, end, _), rows in zip(groups, group_rows):
-            if end == start:
+        index = 0
+        for item in items:
+            if isinstance(item, tuple):
+                index, j, anchors, rows = item
+                result = self.sched.report_many(anchors, j)
+                if self.on_answers is not None:
+                    for a, row in zip(anchors, rows):
+                        self.on_answers(a, j, 0, 1, [row])
+                for settlement in result.settlements:
+                    self._event(settlement)
+                transitions.extend(result.transitions)
+                continue
+            a, j, start, end, _ = groups[index]
+            index += 1
+            if item is None:
                 continue        # a prefix slice: nothing was asked
+            rows = item
             if (self.stages[j].own_suffixes and not self.ahead[j]
                     and end == self.sched.num_partners(a, j)):
                 # the request was packed; a repeating stage asks anew,

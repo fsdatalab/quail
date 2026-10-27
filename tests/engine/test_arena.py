@@ -172,3 +172,11 @@ def test_the_arena_allocates_its_pools_once_and_views_them_per_layer(monkeypatch
     with pytest.raises(MemoryError, match="out of memory"):
         arena.resize(5)
     assert arena.k is None and len(allocations) == 2
+
+
+def test_a_block_table_lists_each_rows_pages_then_zeros():
+    from quail.backends.quail.executor.arena import block_table_array
+
+    table = block_table_array([[4, 7], [], [9, 2, 5]], pad_to=4)
+    assert table.dtype.name == "int32"
+    assert table.tolist() == [[4, 7, 0, 0], [0, 0, 0, 0], [9, 2, 5, 0]]

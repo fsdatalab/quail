@@ -676,3 +676,32 @@ def test_an_ahead_stage_asks_the_anchors_next_round_before_its_answer_arrives():
     report = sched.report(0, 1, 0, 1, [1])
     assert not report.settlements and not report.transitions
     assert sched.done() and sched.survivors == 1
+
+
+def test_answers_reported_together_at_an_ahead_stage_match_one_by_one():
+    # three anchors repeat one ahead stage; their rounds' answers are
+    # reported in one call or one call each, and both leave the same
+    # queue, settlements, and rounds in flight
+    def build():
+        ended = set()
+
+        def partners(a):
+            return lambda stage: SKIP if a in ended else [0]
+
+        sched = JoinAdmission([50, 50, 50], [[10]], 250, arena_pages=100,
+                              page_tokens=16,
+                              anchor_partners={a: partners(a) for a in range(3)},
+                              repeats=[True], ahead=[True])
+        assert [group[0] for group in sched.next_chunk(100)] == [0, 1, 2]
+        ended.add(1)
+        return sched
+
+    together, alone = build(), build()
+    report = together.report_many([0, 1, 2], 0)
+    reports = [alone.report(a, 0, 0, 1, [1]) for a in range(3)]
+    assert report.settlements == tuple(
+        settlement for each in reports for settlement in each.settlements)
+    assert report.transitions == tuple(
+        transition for each in reports for transition in each.transitions)
+    assert list(together.ready) == list(alone.ready)
+    assert together.in_flight == alone.in_flight == 0
