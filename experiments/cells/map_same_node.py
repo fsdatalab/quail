@@ -269,8 +269,8 @@ def _quail(model: str, directory: Path, configurations, attention=None) -> dict:
     from bench.quailb import register_tables
     from quail.specs import H100_USD_PER_HOUR
 
-    result = {"engine": "Quail" if attention is None else f"Quail, {attention} attention",
-              "gpu": _gpu(), "runs": {}}
+    label = "Quail" if attention is None else f"Quail, {attention} attention"
+    result = {"engine": label, "gpu": _gpu(), "runs": {}}
     with quail.Session(quail.EngineConfig(
             model=model, device="h100-sxm", backend="quail",
             gpu_timing=True, attention=attention)) as session:
