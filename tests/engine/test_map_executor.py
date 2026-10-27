@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from helpers.extract_fakes import HEAD, LEASE, TAIL, make_vocabulary
 from helpers.fakes import fake_pack
 
@@ -516,14 +517,20 @@ def test_a_limit_after_a_filter_returns_only_whole_answers(monkeypatch):
 
 
 def _run_maps(monkeypatch, count, num_maps, *, limit=None, keep_kv=False,
-              pool_documents=None, chunk_tokens=400, pack=fake_pack):
-    """Put num_maps instructions to count copies of a lease; return each map's rows."""
+              pool_documents=None, chunk_tokens=400, pack=fake_pack, metrics=None,
+              golds=None, attention=""):
+    """Put num_maps instructions to count copies of a lease; return each map's rows.
+
+    metrics, when given, receives the first map's metric extension;
+    golds, when given, is each document's answer.
+    """
     from dataclasses import replace
 
     from helpers.fakes import cpu_arena
 
     gold = "March 3, 2027 at noon"
-    tables = make_vocabulary(LEASE, gold)
+    golds = [gold] * count if golds is None else golds
+    tables = make_vocabulary(LEASE, *set(golds))
     spec = make_map_spec(tables, max_answer_tokens=48, expected_answer_tokens=4)
     monkeypatch.setattr(chunk_mod, "pack_chunk", pack)
     model = ScriptedModel(tables, {}, {}, 4)
@@ -540,20 +547,23 @@ def _run_maps(monkeypatch, count, num_maps, *, limit=None, keep_kv=False,
 
     def init(self, *args, **kwargs):
         original(self, *args, **kwargs)
-        for key in self.keys:
+        for a, key in enumerate(self.keys):
             model.documents[key] = LEASE
-            model.gold[key] = gold
+            model.gold[key] = golds[int(self.anchor_document[a])]
 
     monkeypatch.setattr(MapStages, "__init__", init)
     specs = [spec] + [replace(spec, name=f"map{index}") for index in range(1, num_maps)]
     nodes = [AiMap(node_id=f"ai-map:{each.name}", backend_name="quail",
-                   model="qwen3-4b-fp8", spec=each, keep_kv=keep_kv)
+                   model="qwen3-4b-fp8", spec=each, keep_kv=keep_kv,
+                   attention=attention)
              for each in specs]
     inputs = {"document_ids": list(range(count)), "documents": {"c": [tokens] * count},
               "texts": {"c": [LEASE] * count}, "limit": limit}
     results = MapPart.execute_group(state, nodes, inputs)
     rows = {each.name: results[f"ai-map:{each.name}"].outputs["rows:c"].to_pydict()
             for each in specs}
+    if metrics is not None:
+        metrics.update(results["ai-map:summary"].metrics.extension)
     return rows, gold
 
 
@@ -568,6 +578,22 @@ def test_branches_that_keep_kv_finish_in_a_small_pool(monkeypatch):
     rows, gold = _run_maps(monkeypatch, 60, 2, keep_kv=True, pool_documents=5,
                            chunk_tokens=160)
     assert rows["summary"]["summary"] == rows["map1"]["map1"] == [gold] * 60
+
+
+@pytest.mark.parametrize("attention", ["unified", "tree"])
+def test_a_full_pool_preempts_a_document_and_every_answer_still_returns(
+        monkeypatch, attention):
+    # the first answers are short, so the admission expects short
+    # answers and fills the pool; the long answers after them run out
+    # of pages, and a document gives up its pages and starts again
+    metrics = {}
+    long = " ".join(["March 3, 2027 at noon"] * 3)
+    golds = ["March 3"] * 12 + [long] * 12
+    rows, _ = _run_maps(monkeypatch, 24, 2, pool_documents=3, chunk_tokens=160,
+                        metrics=metrics, golds=golds, attention=attention)
+    assert rows["summary"]["summary"] == rows["map1"]["map1"] == golds
+    assert metrics["kv_growth"]["preemptions"] > 0
+    assert metrics["pass_rows"]["running"]["p90"] > 0
 
 
 def test_maps_the_plan_left_unified_read_no_document_apart(monkeypatch):

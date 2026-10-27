@@ -10,8 +10,10 @@ are not known before the run. This page describes how Quail executes a
 map query on one GPU. Quail decodes every running answer in each
 forward pass and decides each pass one pass later, so the GPU never
 waits for the host. Quail gives each answer
-KV pages as the answer grows, and it starts a new answer only while
-every running answer can still finish, so no answer is preempted. When
+KV pages as the answer grows, and it starts a new answer while the
+forecast of the running answers still fits the pool, to keep each
+pass full. When the pool runs out, one document gives up its pages and
+starts again later. When
 several maps read one document, Quail reads the document's KV once for
 all of them.
 
@@ -38,8 +40,8 @@ three ways:
   (Section 5).
 - It reads a document's KV once for all instructions on that document
   (Section 6).
-- It runs as many answers at once as the KV pool can hold without the
-  risk of a stall (Section 4).
+- It runs as many answers at once as the KV pool is forecast to hold,
+  and preempts a document when the forecast was too low (Section 4).
 
 ## 2. Problem definition
 
@@ -119,10 +121,16 @@ the host can decide one pass late without making the GPU wait.
 The engine does not know answer lengths. If it reserves $L_k$ tokens of
 pages for every branch, most pages stay empty. If it reserves too few,
 a running branch can need a page that does not exist, and the engine
-must stop and restart some branch. Quail avoids both. A branch starts
-with pages for its prompt and two rounds, and it gets one more page
-when its next round needs one. Two checks decide when a new branch
-starts.
+must stop and restart some branch. A branch starts with pages for its
+prompt and two rounds, and it gets one more page when its next round
+needs one.
+
+A map that runs alone admits by the forecast (Section 4.2) and
+preempts when the forecast was too low (Section 4.4): a full batch
+matters more than a few restarted documents. A map after other
+operators (Section 8) cannot restart a document without asking the
+other operators again, so it also keeps the safety check (Section 4.1)
+and never preempts.
 
 ### 4.1 The safety check
 
@@ -181,9 +189,14 @@ will use:
 4. Summed over branches, this gives the pages in use at each future
    pass. FORECAST returns the peak of that sum.
 
-ADMIT requires the peak to stay at least $R$ pages below the pool size.
-$R$ is the most pages one branch can still grow. This reserve lets the
-oldest branch grow even when the forecast is too low.
+With the safety check, ADMIT requires the peak to stay at least $R$
+pages below the pool size. $R$ is the most pages one branch can still
+grow. This reserve lets the oldest branch grow even when the forecast
+is too low.
+
+A map that runs alone skips the first two checks of Algorithm 2 and
+sets $R = 0$: a branch starts when its pages fit and the forecast peak
+fits the free pages.
 
 ### 4.3 Growth
 
@@ -202,7 +215,28 @@ Algorithm 3: GROW(run)
 ```
 
 A branch that skips a pass keeps its pages and tries again in the next
-pass.
+pass. A map that runs alone skips the margin test: branches grow
+oldest first while pages are free.
+
+### 4.4 Preemption
+
+When no branch can run a pass and nothing is on the GPU, a map that
+runs alone preempts one document:
+
+```text
+Algorithm 5: PREEMPT(run)
+  candidates ← documents with a branch in run, except the oldest
+               document, whose running branches are past their prompts
+  d ← the candidate with the fewest answer tokens written per page its
+      running branches free; ties go to the youngest
+  free the pages of d's running branches
+  forget their answers, and put them at the head of the queue
+```
+
+The victim usually is the youngest document. A long document admitted
+recently also loses little work for many pages. A preempted branch
+starts again from its prompt, as vLLM's recompute preemption does. Its
+finished sibling branches keep their answers.
 
 ## 5. Decoding rounds
 
@@ -294,15 +328,19 @@ writes with the same model and the same numerics. The numerics of a step depend 
 batch, so another engine's answers can differ. Section 9 reports the
 agreement with stock vLLM.
 
-**No deadlock.** Admission adds a branch only if every margin stays at
-least 0 (Algorithm 2). Growth gives pages to a branch only if every
-older margin stays at least 0 (Algorithm 3). Pages returned by an
-ended branch increase margins. The oldest branch has
-$m_1 = F - \text{need}(b_1) \ge 0$, so it can always grow, and it
-ends. By induction on start order, every branch ends.
+**No deadlock, with the safety check.** Admission adds a branch only
+if every margin stays at least 0 (Algorithm 2). Growth gives pages to a
+branch only if every older margin stays at least 0 (Algorithm 3).
+Pages returned by an ended branch increase margins. The oldest branch
+has $m_1 = F - \text{need}(b_1) \ge 0$, so it can always grow, and it
+ends. By induction on start order, every branch ends. No branch is
+preempted.
 
-**No preemption.** No step of Algorithms 1 to 4 removes the KV of a
-running branch. A branch that cannot grow skips a pass.
+**Progress, with preemption.** When no branch can run, Algorithm 5
+frees a younger document's pages. It never chooses the oldest
+document, so the oldest document gets the freed pages first (growth
+runs oldest first) and ends, provided one document's answers fit the
+pool.
 
 ## 8. Maps after other operators
 
@@ -344,9 +382,9 @@ merge and the change that drops call A for round rows.
 
 - **Batched serving.** Orca [1] schedules each decode step across
   requests, and vLLM [2] stores KV in pages. vLLM preempts a request
-  when the pool is full and computes its KV again later. Quail runs a
-  fixed set of requests and uses the safety check (Section 4.1) to
-  avoid preemption.
+  when the pool is full and computes its KV again later; a map that
+  runs alone does the same (Section 4.4). After other operators, Quail
+  uses the safety check (Section 4.1) to avoid preemption.
 - **Deadlock avoidance.** The safety check follows the banker's
   algorithm [3]: grant a resource only if all processes can still
   finish in some order.
@@ -363,6 +401,7 @@ merge and the change that drops call A for round rows.
 | --- | --- | --- |
 | Algorithm 1 | [`stage_executor.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stage_executor.py) | `StageExecutor.run` |
 | Algorithms 2 and 3 | [`growth.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/growth.py) | `KVGrowth.admits`, `KVGrowth.grow` |
+| Algorithm 5 | [`growth.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/growth.py), [`stage_executor.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stage_executor.py) | `KVGrowth.victim`, `StageExecutor._preempt` |
 | Answer-length estimate | [`map/decoder.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/decoder.py) | `MapDecoder.survival`, `MapDecoder.remaining` |
 | Algorithm 4 | [`map/decoder.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/decoder.py) | `MapDecoder.round` |
 | Device-fed rounds | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py), [`chunk.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/chunk.py) | `round_feed`, `Chunk.apply_feed` |

@@ -338,7 +338,7 @@ def transition_reporter(parts):
 
 
 RUN_STATS = ("host_s", "run_s", "graph_replays", "graph_fallbacks",
-             "readout_gpu_s", "idle_gpu_s", "kv_growth")
+             "readout_gpu_s", "idle_gpu_s", "kv_growth", "pass_rows")
 
 
 def complete_parts(parts, every, spans, tokens, stats):

@@ -1009,6 +1009,63 @@ class JoinAdmission:
             transitions.append((a, j, True))
         return AdmissionReport(tuple(settlements), tuple(transitions))
 
+    def preemptible(self, a) -> bool:
+        """Return whether an admitted anchor may be put back in the queue now.
+
+        It must be past its prefix slices, with nothing in flight and
+        no request asked ahead.
+        """
+        return (0 <= self._stage[a] and not self.in_flight and a not in self._ahead
+                and a not in self.prefilling and a not in self.slices)
+
+    def queued(self, a) -> bool:
+        """Return whether the anchor waits in the queue, not yet admitted."""
+        return self._stage[a] == -1
+
+    def requeue(self, anchors):
+        """Put admitted anchors back at the front of the queue, as never admitted.
+
+        The caller frees their KV and resets their requests first; each
+        anchor is asked for its first stage's requests again.
+
+        Args:
+            anchors: The anchors, in the order they are to be admitted
+                again; each must be preemptible().
+
+        Raises:
+            ValueError: An anchor is not preemptible, or stop groups
+                are in use.
+        """
+        if self.groups is not None:
+            raise ValueError("an admission with stop groups cannot requeue")
+        if not all(self.preemptible(a) for a in anchors):
+            raise ValueError("only a preemptible anchor can be requeued")
+        k = len(self.stages)
+        requeued = set(anchors)
+        self.ready = deque(a for a in self.ready if a not in requeued)
+        for a in anchors:
+            self.stalled.discard(a)
+            self._stage[a] = -1
+            self._next[a] = 0
+            self._true[a] = [False] * k
+            self._prefilled[a] = 0
+            for j in range(k):
+                self.answers[j].pop(a, None)
+                self._answer_counts[j].pop(a, None)
+                self._page_cums.pop((a, j), None)
+            if self._lazy[a] is not None:
+                for j in range(1, k):
+                    self._lists[a][j] = self._cums[a][j] = None
+                self._lists[a][0], self._cums[a][0] = self._partner_list(
+                    a, 0, self._lazy[a](0))
+            if not self._page_cost[a]:
+                self._zero_cost += 1
+            self.borrowing.admitted.discard(a)
+            choice = self.borrowing.chosen.pop(a, None)
+            if choice is not None:
+                self.borrowing.borrowed_tokens -= choice[1]
+        self.pending.extendleft(reversed(anchors))
+
     def _settle_group(self, a, survived):
         """Free the anchor's group for its next anchor, or skip the rest.
 

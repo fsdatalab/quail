@@ -86,6 +86,25 @@ def lowest_borrows(borrowing):
     return lowest
 
 
+def pass_quantiles(pass_rows) -> dict:
+    """Summarize per-pass counts: mean and 10th, 50th, and 90th percentiles.
+
+    Args:
+        pass_rows: Per pass, (rows packed, decode-round rows, running
+            anchors).
+    """
+    if not pass_rows:
+        return {}
+    table = np.asarray(pass_rows, dtype=np.float64)
+    out = {}
+    for column, name in enumerate(("rows", "round_rows", "running")):
+        values = table[:, column]
+        p10, p50, p90 = np.percentile(values, [10, 50, 90]).tolist()
+        out[name] = {"mean": round(float(values.mean()), 1), "p10": p10,
+                     "p50": p50, "p90": p90}
+    return out
+
+
 class StageExecutor:
     """Admission state, packed inputs, pending answers, and metrics for one run."""
 
@@ -213,10 +232,15 @@ class StageExecutor:
 
             self.reserve_extra = min(self.capacity_extra,
                                      max(fixed_extra, int(growth.initial_tokens)))
+            # a document can restart only when the growing operator
+            # owns every stage, so no other operator's answers repeat
+            own = {id(stage) for stage in getattr(growth, "stages", ())}
+            preempts = (stop_groups is None and hasattr(growth, "restart")
+                        and all(id(stage) in own for stage in stages))
             self.growth = KVGrowth(
                 self.arena, self.keys, growth, self.prefix_lengths,
                 [length + self.capacity_extra for length in self.prefix_lengths],
-                initial_tokens=self.reserve_extra)
+                initial_tokens=self.reserve_extra, preempts=preempts)
 
         resident = {}
         if self.paged:
@@ -305,6 +329,10 @@ class StageExecutor:
                 self.borrowing.can_borrow)
         # The admission detaches residents from borrowing: they pack no prefix.
         self.borrowers = self.borrowing.borrowers()
+        self.children = {}
+        for child, parent in enumerate(self.borrowing.tree_parent):
+            if parent is not None:
+                self.children.setdefault(parent, []).append(child)
         self.lowest_borrow = lowest_borrows(self.borrowing)
         self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]
 
@@ -321,6 +349,8 @@ class StageExecutor:
         self.readout_spans = []
         self.outstanding = []     # PendingAnswers in launch order
         self.passes = 0
+        # per pass: rows packed, decode-round rows, and running anchors
+        self.pass_rows = []
         # per anchor, the pass and answer index of its latest launched
         # request: the source of its next device-fed round
         self.latest = {}
@@ -851,6 +881,53 @@ class StageExecutor:
             if self.growth is not None:
                 self.growth.settled(a)
 
+    def _preemptible(self, anchors) -> bool:
+        """Return whether a document's running anchors may restart now.
+
+        Each must be past its prefix, with an answer still being written.
+        """
+        if not all(self.sched.preemptible(a) for a in anchors):
+            return False
+        return bool((self.growth.model.remaining(
+            np.asarray(anchors, dtype=np.int64)) > 0).all())
+
+    def _preempt(self) -> bool:
+        """Free one running document's pages and queue it again from its start.
+
+        Called when nothing can run: no running document can grow and
+        nothing is in flight. Returns False when the run cannot preempt.
+        """
+        if self.growth is None or not self.growth.preempts or self.outstanding:
+            return False
+        anchors = self.growth.victim(self._preemptible)
+        if not anchors:
+            return False
+        # borrowers before the parent whose pages they read; a hold
+        # for a borrower still queued is placed again on readmission
+        for a in reversed(anchors):
+            key = self.keys[a]
+            self.arena.drop_holds([key])
+            if self.arena.is_resident(key):
+                self.arena.free_key(key)
+            self._held_parents.discard(a)
+            self._reserved_parents.pop(a, None)
+            self.latest.pop(a, None)
+            self.appended[a] = 0
+            for j in range(1, len(self.stages)):
+                self.own.pop((j, a), None)
+        self.growth.preempted(anchors)
+        self.growth.model.restart(np.asarray(anchors, dtype=np.int64))
+        self.sched.requeue(anchors)
+        # a readmitted parent holds its pages for the borrowers that
+        # will pack again, not for the ones that finished
+        for a in anchors:
+            if a < len(self.borrowers) and self.borrowers[a]:
+                self.borrowers[a] = sum(
+                    1 for child in self.children.get(a, ())
+                    if self.sched.queued(child))
+        self._log_memory_event("preempt", groups=len(anchors))
+        return True
+
     def _log_memory_event(self, kind, **detail):
         log = getattr(self.arena, "log_event", None)
         if log is not None:
@@ -909,6 +986,10 @@ class StageExecutor:
                              [index for _, index in sources], self.arena.page_tokens)
         self.pack_s += time.perf_counter() - started
         self.tokens += chunk.tokens
+        self.pass_rows.append((
+            chunk.tokens,
+            sum(1 for _, j, _, _, carried in part if self.bulk[j] and not carried),
+            0 if self.growth is None else len(self.growth.running)))
         if self.gpu_timing:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
@@ -1000,6 +1081,8 @@ class StageExecutor:
                 # pages: the children pack their whole prefixes
                 if self.arena.drop_holds(self.held):
                     continue
+                if self._preempt():
+                    continue
                 raise AssertionError(
                     f"nothing buildable and nothing in flight; "
                     f"{len(self.sched.stalled)} documents wait for KV pages")
@@ -1047,6 +1130,7 @@ class StageExecutor:
                  if count != fallbacks.get(reason, 0)})
             if self.growth is not None:
                 self.stats["kv_growth"] = self.growth.stats()
+            self.stats["pass_rows"] = pass_quantiles(self.pass_rows)
         if self.spans:
             self.torch.cuda.synchronize()
             if self.stats is not None:

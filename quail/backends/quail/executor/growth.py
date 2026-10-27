@@ -17,6 +17,14 @@ need them. Two rules decide who gets pages:
   pass. The oldest running document can always grow, so the run always
   makes progress, and nothing is preempted.
 
+When the operator can restart a document (StageGrowth.restart), the
+pool is not kept safe. Admission keeps the batch full instead: a fresh
+document is admitted when its pages fit and the projection still fits
+the pool, and documents grow oldest first while pages are free. When
+no running document can grow, the stage executor preempts one: it
+frees the document's pages and queues it again from its start
+(victim()).
+
 The growth model is the operator's view of its documents; see
 StageGrowth.
 """
@@ -36,12 +44,19 @@ class StageGrowth(Protocol):
     """
 
     initial_tokens: int
+    anchor_document: np.ndarray
 
     def remaining(self, anchors: np.ndarray) -> np.ndarray:
         """Return the rows each document is expected to still write."""
 
     def capacities(self, anchors: np.ndarray) -> np.ndarray:
         """Return the rows each document's pages must cover for its next request."""
+
+    def written(self, anchors: np.ndarray) -> np.ndarray:
+        """Return the answer tokens each anchor has written."""
+
+    def restart(self, anchors: np.ndarray) -> None:
+        """Forget the anchors' answers, so they are asked again from the start."""
 
 
 class KVGrowth:
@@ -55,10 +70,12 @@ class KVGrowth:
         final_tokens: Per anchor, the most rows its key can ever need.
         initial_tokens: Rows past the prefix an admitted document's
             pages cover.
+        preempts: Whether the caller preempts a document when none can
+            grow; admission and growth then keep no pages back.
     """
 
     def __init__(self, arena, keys, model: StageGrowth, prefix_tokens, final_tokens,
-                 initial_tokens: int):
+                 initial_tokens: int, preempts: bool = False):
         self.arena = arena
         self.keys = keys
         self.model = model
@@ -66,6 +83,7 @@ class KVGrowth:
         self.prefix = np.asarray(prefix_tokens, dtype=np.int64)
         self.final = np.asarray(final_tokens, dtype=np.int64)
         self.initial = int(initial_tokens)
+        self.preempts = bool(preempts)
         num_anchors = len(self.final)
         horizon = int((self.final - self.prefix).max()) if num_anchors else 0
         # the projection's time axis, in rows written, a page apart
@@ -73,7 +91,7 @@ class KVGrowth:
         # pages the projection leaves free at its peak: the most one
         # document can still grow, so the oldest grows without
         # stalling the others
-        self.reserve = int(self._pages(horizon))
+        self.reserve = 0 if self.preempts else int(self._pages(horizon))
         # rows each anchor's pages cover, and pages its finish does not
         # free: the ones it borrowed and the ones it lent to borrowers
         self.capacity = np.zeros(num_anchors, dtype=np.int64)
@@ -87,14 +105,15 @@ class KVGrowth:
         self.stalls = 0
         self.grown_pages = 0
         self.max_running = 0
+        self.preemptions = 0
 
     def _pages(self, rows):
         return -(-np.asarray(rows, dtype=np.int64) // self.page)
 
     def stats(self) -> dict:
-        """Return the stalls, the pages grown, and the most running documents."""
+        """Return the stalls, pages grown, most running documents, and preemptions."""
         return {"stalls": self.stalls, "grown_pages": self.grown_pages,
-                "max_running": self.max_running}
+                "max_running": self.max_running, "preemptions": self.preemptions}
 
     # ---- the running documents ----------------------------------------------
 
@@ -163,7 +182,8 @@ class KVGrowth:
         """Grow the documents whose next request needs more rows.
 
         Documents grow oldest first. One grows only while every older
-        document's margin stays at least zero; the others wait.
+        document's margin stays at least zero, or, when the caller
+        preempts, while pages are free; the others wait.
 
         Args:
             anchors: The documents whose next request may be packed.
@@ -190,7 +210,8 @@ class KVGrowth:
             position = int(ranks[index])
             gain = int(self._pages(rows) - self._pages(self.capacity[anchor]))
             older = base[:position]
-            unsafe = len(older) and free_pages + int(older.min()) < gain
+            unsafe = (not self.preempts and len(older)
+                      and free_pages + int(older.min()) < gain)
             if gain > free_pages or unsafe:
                 stalled.add(anchor)
                 continue
@@ -238,19 +259,26 @@ class KVGrowth:
 
         It fits when the pool stays safe with it admitted last and the
         projected growth, with it added, never comes within reserve
-        pages of the pages left.
+        pages of the pages left. When the caller preempts, only the
+        projection is checked, with no reserve.
 
         Args:
             anchor: The fresh document.
             pages: The pages its admission takes now.
             free_pages: The free pages before its admission.
         """
-        _, base, total_frees = self._margin_base()
+        if self.preempts:
+            base, total_frees = (), 0
+        else:
+            _, base, total_frees = self._margin_base()
         # retained KV is evicted when a page is needed
         left = free_pages + self.arena.retained_pages - pages
-        if len(base) and left + int(base.min()) < 0:
+        if left < 0:
             return False
-        if left + total_frees < int(self._pages(self.final[anchor])) - pages:
+        if not self.preempts and len(base) and left + int(base.min()) < 0:
+            return False
+        if not self.preempts and (
+                left + total_frees < int(self._pages(self.final[anchor])) - pages):
             return False
         growth = self._projected()
         remaining = int(self.model.remaining(np.array([anchor], dtype=np.int64))[0])
@@ -261,3 +289,51 @@ class KVGrowth:
         # counted once admitted(): the admission can still hold it
         self._accepted = (anchor, growth + own)
         return True
+
+    # ---- preemption --------------------------------------------------------
+
+    def victim(self, eligible) -> list:
+        """Choose the running document to preempt; return its anchors.
+
+        The victim loses the fewest answer tokens per page its anchors
+        free; ties go to the youngest. The oldest running document is
+        never chosen, so the run makes progress.
+
+        Args:
+            eligible: Callable(anchors) -> bool; whether a document's
+                anchors may be preempted now.
+
+        Returns:
+            The victim's anchors in admission order, or [] when no
+            document may be preempted.
+        """
+        running = list(self.running)
+        if not running:
+            return []
+        document = self.model.anchor_document
+        members = {}
+        for anchor in running:
+            members.setdefault(int(document[anchor]), []).append(anchor)
+        oldest = int(document[running[0]])
+        accounting = self.arena.accounting
+        best, best_score = None, None
+        # youngest first, so the first of equal scores is kept
+        for d in reversed(list(members)):
+            anchors = members[d]
+            if d == oldest or not eligible(anchors):
+                continue
+            pages = sum(len(accounting.table_pages(self.keys[a]))
+                        - len(accounting.borrowed[self.keys[a]]) for a in anchors)
+            lost = int(self.model.written(np.asarray(anchors, dtype=np.int64)).sum())
+            score = lost / max(pages, 1)
+            if best_score is None or score < best_score:
+                best, best_score = anchors, score
+        return [] if best is None else best
+
+    def preempted(self, anchors) -> None:
+        """Forget preempted anchors whose pages were freed."""
+        for anchor in anchors:
+            self.settled(anchor)
+            self.capacity[anchor] = 0
+            self.kept_pages[anchor] = 0
+        self.preemptions += 1

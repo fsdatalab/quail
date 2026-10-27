@@ -405,6 +405,7 @@ class AnswerPart(DocumentAnswerPart):
                         "idle_gpu_s": (stats.get("idle_gpu_s")
                                        if first else None),
                         "kv_growth": stats.get("kv_growth") if first else None,
+                        "pass_rows": stats.get("pass_rows") if first else None,
                         "branches": bool(branches)}))
         self._results = results
         self.result_value = self._results[self.node.node_id]

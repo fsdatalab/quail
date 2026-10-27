@@ -296,6 +296,21 @@ class MapStages(AnswerStages):
             out[positions] = np.where(state.done[documents], 0, need)
         return out
 
+    def written(self, anchors) -> np.ndarray:
+        """Return the answer tokens each anchor has written."""
+        anchors = np.asarray(anchors, dtype=np.int64)
+        out = np.zeros(len(anchors), dtype=np.int64)
+        for q, positions, documents in self._split(anchors, None):
+            out[positions] = self.decoder.states[q].num_written[documents]
+        return out
+
+    def restart(self, anchors) -> None:
+        """Forget the anchors' unfinished answers, so they are asked again."""
+        for q, _, documents in self._split(anchors, None):
+            self.decoder.restart(q, documents)
+            for index in documents.tolist():
+                self.previous_fed[q].pop(index, None)
+
     # ---- a chunk's rounds, decided together ---------------------------------
 
     def _stage_prepare(self, q, tail: bool):

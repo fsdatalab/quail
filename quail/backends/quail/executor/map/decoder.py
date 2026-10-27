@@ -262,6 +262,22 @@ class MapDecoder:
             self._fresh[q] = cached
         return cached[1]
 
+    def restart(self, q: int, index: np.ndarray) -> None:
+        """Forget the documents' unfinished answers to instruction q.
+
+        Their steps and fed tokens are kept, as work done.
+        """
+        state = self.states[q]
+        if state.done[index].any():
+            raise ValueError("a settled answer cannot restart")
+        self._versions[q] += 1
+        state.num_written[index] = 0
+        state.asked[index] = False
+        state.fed[index] = 0
+        state.started[index] = False
+        state.unreported[index] = 0
+        state.base[index] = 0
+
     def settle(self, document: MapDocument, q: int) -> None:
         """Set the instruction's answer for the document: its written text."""
         state = self.states[q]
