@@ -13,6 +13,7 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.extract import load_vocabulary
 from quail.backends.quail.executor.model_loading import load_model
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import (
@@ -176,6 +177,10 @@ class LoadedGpu:
                                     model_name=self.spec.hf_name,
                                     model=self.model)
                 tier = warm["tier"]
+                if self.spec.role not in ("reranker", "decision"):
+                    # AI.EXTRACT and AI.MAP read the tokenizer's vocabulary;
+                    # loading it is startup, not query time
+                    load_vocabulary(self.execution)
             graphs = self.pipeline.decode_graphs
             if graphs is not None and graphs.prepare():
                 tier = tier or "graphs"
