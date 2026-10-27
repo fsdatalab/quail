@@ -183,3 +183,60 @@ def test_a_pass_without_a_graph_counts_why():
     graphs.storage = arena.k
     assert graphs.forward(source) == "eager"
     assert graphs.fallbacks == {"rounds beside other rows": 1}
+
+
+def unified_chunk():
+    # two map rounds on the unified path, one row each: each writes its
+    # token's KV and reads its key's pages in one causal call
+    source = chunk()
+    source.attention_mode = "unified"
+    source.tokens = 2
+    source.input_ids = torch.tensor([12, 13])
+    source.positions = torch.tensor([6, 9])
+    source.final_indices = torch.tensor([0, 1])
+    meta = source.meta
+    meta.update(kv_src=None, kv_dst=None, reads=None, canvas=None, gdn=None)
+    meta["unified"] = dict(
+        src=torch.tensor([0, 1]), dst=torch.tensor([22, 41]), tail_src=None,
+        tail_dst=None, used=torch.tensor([7, 10], dtype=torch.int32),
+        table=torch.tensor([[1], [2]], dtype=torch.int32),
+        cu_q=torch.tensor([0, 1, 2], dtype=torch.int32), max_q=1, max_used=10)
+    return source
+
+
+def test_unified_padding_reads_one_row_and_writes_no_kv():
+    buffers = DecodeBuffers(torch, 6, 16, device="cpu", unified=True)
+    buffers.synthetic(7)
+    buffers.copy(unified_chunk())
+    unified = buffers.chunk.meta["unified"]
+    assert buffers.chunk.attention_mode == "unified"
+    assert buffers.ids.tolist() == [12, 13, 0, 0, 0, 0]
+    assert unified["cu_q"].tolist() == [0, 1, 2, 3, 4, 5, 6]
+    assert unified["used"].tolist() == [7, 10, 1, 1, 1, 1]
+    assert unified["dst"].tolist() == [22, 41, -1, -1, -1, -1]
+    assert unified["table"][:2, :1].tolist() == [[1], [2]]
+
+
+def test_a_unified_pass_replays_a_unified_graph():
+    source = unified_chunk()
+    arena = SimpleNamespace(k=[], page_tokens=16)
+    graphs = DecodeGraphs(SimpleNamespace(
+        engine=SimpleNamespace(arena=arena), forward_chunk=lambda x: "eager"))
+    graphs.storage = arena.k
+    output = torch.arange(4 * 3).reshape(4, 3)
+    replayed = []
+
+    def captured(name, **layout):
+        return SimpleNamespace(
+            buffers=DecodeBuffers(torch, 4, 16, device="cpu", **layout),
+            graph=SimpleNamespace(replay=lambda: replayed.append(name)),
+            output=output)
+
+    graphs.graphs = [captured("tree")]
+    graphs.unified_graphs = [captured("unified", unified=True)]
+    assert graphs.forward(source).equal(output[[0, 1]])
+    assert replayed == ["unified"]
+    # a pass writing a temporary suffix page has no captured layout
+    source.meta["unified"]["tail_src"] = torch.tensor([3])
+    assert graphs.forward(source) == "eager"
+    assert graphs.fallbacks == {"unified layout": 1}

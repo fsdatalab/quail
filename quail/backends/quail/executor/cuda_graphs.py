@@ -1,4 +1,8 @@
-"""Capture tree-attention decode forwards in persistent CUDA buffers.
+"""Capture decode forwards in persistent CUDA buffers.
+
+Three sets of graphs share the buckets: tree-attention passes, tree
+passes of map rounds with their document reads, and unified-attention
+passes.
 
 Every graph reads views of one set of input buffers sized for the
 largest bucket and writes the same output rows, and the graphs share
@@ -46,13 +50,14 @@ class DecodeGraphConfig:
 
 
 class DecodeBuffers:
-    """Fixed GPU inputs for a bounded tree-attention batch.
+    """Fixed GPU inputs for a bounded decode batch.
 
     Padding has no KV writes and no resident context. Every padded
     query forms a separate sequence so it cannot affect real rows.
     With documents, the batch also carries the document read of map
     branches (see Stage.document_reads); its padding merges into call
-    B's last row, which a batch with documents leaves unread.
+    B's last row, which a batch with documents leaves unread. A
+    unified batch writes its rows' KV and makes one causal paged call.
 
     Given a base of at least as many rows, every buffer is a view of
     the base's first rows, so buffers of several sizes share storage.
@@ -60,7 +65,7 @@ class DecodeBuffers:
 
     def __init__(self, torch, rows, page_tokens, *,
                  config: DecodeGraphConfig | None = None, device="cuda",
-                 documents=False, base=None):
+                 documents=False, unified=False, base=None):
         config = DecodeGraphConfig() if config is None else config
         self.rows = rows
         width = (config.max_context_tokens + page_tokens - 1) // page_tokens
@@ -112,10 +117,20 @@ class DecodeBuffers:
                 max_q=config.max_query_tokens, used=self.used,
                 max_used=config.max_context_tokens, table=self.table,
                 documents=self.documents))
+        self.unified = None
+        if unified:
+            self.unified = dict(
+                src=self.src, dst=self.dst, tail_src=None, tail_dst=None,
+                used=self.used, table=self.table, cu_q=self.cu_q,
+                max_q=config.max_query_tokens,
+                max_used=config.max_context_tokens)
+            meta.update(kv_src=None, kv_dst=None, reads=None,
+                        unified=self.unified, gdn=None)
         self.chunk = Chunk(
             input_ids=self.ids, positions=self.positions,
             final_indices=self.finals, meta=meta,
-            attention_mode="tree", tokens=rows, layout=[])
+            attention_mode="unified" if unified else "tree", tokens=rows,
+            layout=[])
 
     def synthetic(self, page):
         """Set independent one-token sequences reading one scratch KV row."""
@@ -142,6 +157,9 @@ class DecodeBuffers:
         if self.documents is not None:
             self._copy_rounds(chunk)
             return
+        if self.unified is not None:
+            self._copy_unified(chunk)
+            return
         n = chunk.tokens
         reads = chunk.meta["reads"]
         m = reads["rows"].numel()
@@ -166,6 +184,25 @@ class DecodeBuffers:
             writes = chunk.meta["kv_src"].numel()
             self.src[:writes].copy_(chunk.meta["kv_src"])
             self.dst[:writes].copy_(chunk.meta["kv_dst"])
+
+    def _copy_unified(self, chunk):
+        """Copy a unified pass; padded rows read one KV row and write none."""
+        n = chunk.tokens
+        unified = chunk.meta["unified"]
+        sequences = unified["used"].numel()
+        self.ids.zero_()
+        self.ids[:n].copy_(chunk.input_ids)
+        self.positions.zero_()
+        self.positions[:n].copy_(chunk.positions)
+        self._bounds(self.cu_q, unified["cu_q"], n)
+        self.used.fill_(1)
+        self.used[:sequences].copy_(unified["used"])
+        self.table[:sequences, :unified["table"].shape[1]].copy_(unified["table"])
+        self.src.zero_()
+        self.dst.fill_(-1)
+        writes = unified["src"].numel()
+        self.src[:writes].copy_(unified["src"])
+        self.dst[:writes].copy_(unified["dst"])
 
     def _copy_rounds(self, chunk):
         """Copy a pass of map rounds; padded rounds read one row and write none."""
@@ -228,6 +265,8 @@ class DecodeGraphs:
         self.graphs = []
         # the same buckets with the document read of map branches
         self.document_graphs = []
+        # the same buckets on the unified attention path
+        self.unified_graphs = []
         self.pool = None
         self.storage = None
         self.replays = 0
@@ -245,6 +284,7 @@ class DecodeGraphs:
         """Release graphs before replacing their KV allocation."""
         self.graphs.clear()
         self.document_graphs.clear()
+        self.unified_graphs.clear()
         self.pool = None
         self.storage = None
 
@@ -252,8 +292,7 @@ class DecodeGraphs:
         """Capture supported shapes using scratch KV, once per allocation."""
         engine = self.pipeline.engine
         arena, torch = engine.arena, engine.torch
-        if (not self.enabled or not self.pipeline.tree_attention
-                or engine.fa_version != 3 or arena.has_sliding):
+        if not self.enabled or engine.fa_version != 3 or arena.has_sliding:
             return False
         if self.storage is arena.k:
             return False
@@ -283,12 +322,16 @@ class DecodeGraphs:
                 base.synthetic(page)
                 self.pool = torch.cuda.graph_pool_handle()
                 output = None   # every graph writes its rows here
-                for documents, graphs in ((False, self.graphs),
-                                          (True, self.document_graphs)):
+                sets = [(False, False, self.unified_graphs)]
+                if self.pipeline.tree_attention:
+                    sets += [(False, True, self.graphs),
+                             (True, True, self.document_graphs)]
+                for documents, tree, graphs in sets:
                     for index, rows in enumerate(self.config.row_buckets):
                         buffers = DecodeBuffers(torch, rows, arena.page_tokens,
                                                 config=self.config,
-                                                documents=documents, base=base)
+                                                documents=documents,
+                                                unified=not tree, base=base)
                         # the first bucket warms every kernel; the rest
                         # need one pass at their own shape
                         for _ in range(3 if index == 0 else 1):
@@ -313,7 +356,9 @@ class DecodeGraphs:
         self.capture_s = time.perf_counter() - started
         self.capture_bytes = free - torch.cuda.mem_get_info()[0]
         logger.info("captured %d decode graphs of up to %d rows in %.2f s, "
-                    "holding %.2f GiB", len(self.graphs) + len(self.document_graphs),
+                    "holding %.2f GiB",
+                    len(self.graphs) + len(self.document_graphs)
+                    + len(self.unified_graphs),
                     self.config.row_buckets[-1], self.capture_s,
                     self.capture_bytes / 2**30)
         return True
@@ -322,10 +367,10 @@ class DecodeGraphs:
         """Return why the batch fits no captured graph, or None when it fits."""
         if not self.enabled or self.storage is not self.pipeline.engine.arena.k:
             return "not captured"
-        if chunk.attention_mode != "tree":
-            return "unified path"
         if not 0 < chunk.tokens <= self.config.row_buckets[-1]:
             return "too many rows"
+        if chunk.attention_mode != "tree":
+            return self._unified_refusal(chunk)
         if chunk.meta.get("canvas") is not None:
             return "canvas"
         if chunk.meta["max_a"] > self.config.max_query_tokens:
@@ -357,16 +402,38 @@ class DecodeGraphs:
             return "reads past the limits"
         return None
 
+    def _unified_refusal(self, chunk) -> str | None:
+        """Return why a unified batch fits no captured graph, or None."""
+        unified = chunk.meta.get("unified")
+        if not self.unified_graphs:
+            return "unified path"
+        if unified is None:
+            return "no pages"
+        if chunk.meta.get("canvas") is not None:
+            return "canvas"
+        if (chunk.meta.get("gdn") is not None or unified.get("tail_src") is not None
+                or "sliding" in unified):
+            return "unified layout"
+        page_tokens = self.pipeline.engine.arena.page_tokens
+        width = (self.config.max_context_tokens + page_tokens - 1) // page_tokens
+        if (unified["max_q"] > self.config.max_query_tokens
+                or unified["max_used"] > self.config.max_context_tokens
+                or unified["table"].shape[1] > width):
+            return "long query"
+        return None
+
     def supports(self, chunk):
-        """Whether the batch fits the captured tree-attention layout."""
+        """Whether the batch fits a captured layout."""
         return self.refusal(chunk) is None
 
     def forward(self, chunk):
         """Replay a matching graph, falling back to the ordinary forward."""
         if self.supports(chunk):
             documents = chunk.meta.get("rounds") is not None
+            graphs = (self.unified_graphs if chunk.attention_mode != "tree"
+                      else self.document_graphs if documents else self.graphs)
             # a pass of map rounds leaves its last padded row unread
-            for captured in (self.document_graphs if documents else self.graphs):
+            for captured in graphs:
                 if captured.buffers.rows >= chunk.tokens + documents:
                     captured.buffers.copy(chunk)
                     captured.graph.replay()
