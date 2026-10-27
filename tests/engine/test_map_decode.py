@@ -180,7 +180,7 @@ def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path
                anchor_keys=[(("d", q), d) for d in ids for q in range(len(tails))],
                attention_mode=path,
                prefix_tree=prefix_tree(prefixes, setup.page_tokens),
-               decoder=decoder, stats=stats)
+               decoder=decoder, stats=stats, gpu_timing=True)
     for q, (tail, limit) in enumerate(zip(tails, limits)):
         assert maps.asked[q].all()
         got = [answer.tolist() for answer in decoder.answers(

@@ -109,7 +109,8 @@ class StageExecutor:
         # the stages whose answers the decoder writes, in map order
         self.answer_maps = {j: q for q, j in enumerate(
             j for j, stage in enumerate(stages) if stage.answer_tokens)}
-        self.map_stages = np.asarray(list(self.answer_maps), dtype=np.int64)
+        # per document, the stage of the answer it writes now
+        self.answer_stage = np.zeros(len(anchor_prefixes), dtype=np.int64)
         if self.answer_maps and decoder is None:
             raise ValueError("stages with answer_tokens need a decoder")
         self.deferred = {}      # document -> its answer stage's group
@@ -506,6 +507,7 @@ class StageExecutor:
         if self.decoder is not None:
             self.decoder.feed(chunk)
             for _, a, j in firsts:
+                self.answer_stage[a] = j
                 self.decoder.start(
                     a, self.answer_maps[j],
                     self.prefix_lengths[a] + len(self.frames[j]) + self.appended[a],
@@ -667,11 +669,10 @@ class StageExecutor:
                 stage = entry[1]
                 by_stage[stage] = by_stage.get(stage, 0) + self._entry_rows(*entry)
             if decode is not None:
-                # a decode row counts toward its map's answer stage
-                maps = self.decoder.map[decode.slots]
-                for q, count in enumerate(np.bincount(maps).tolist()):
+                # a decode row counts toward its answer's stage
+                stages = self.answer_stage[decode.slots]
+                for j, count in enumerate(np.bincount(stages).tolist()):
                     if count:
-                        j = int(self.map_stages[q])
                         by_stage[j] = by_stage.get(j, 0) + count
             self.spans.append((by_stage, chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
