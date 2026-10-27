@@ -191,7 +191,8 @@ def test_lfm2_prompt_opens_with_the_beginning_of_text_token():
 def test_extract_preamble_text_drops_the_beginning_of_text_token():
     from types import SimpleNamespace
 
-    from quail.baselines.lowering import lower_extractions
+    from quail.baselines.lowering import lower_answers
+    from quail.baselines.nodes import RequestExtractSpec
 
     bos = LFM2_2_6B_BF16.bos_text
     prompt = SimpleNamespace(preamble=bos + "<|im_start|>user\n", tail="{0}?")
@@ -203,7 +204,8 @@ def test_extract_preamble_text_drops_the_beginning_of_text_token():
         lowered=lambda _: SimpleNamespace(
             tail_token_ids=[1], preamble_token_ids=[2]))
 
-    (spec,) = lower_extractions(context, [node])
+    (spec,) = lower_answers(context, [node], RequestExtractSpec,
+                            question=lambda node: node.call.question)
 
     assert spec.preamble_text == "<|im_start|>user\n"
     assert spec.preamble_token_ids == (2,)
