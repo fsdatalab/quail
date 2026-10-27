@@ -273,8 +273,8 @@ class EngineConfig:
     # draw is uncertain takes the rest. An autoregressive model reads
     # one answer whatever this says
     canvas_draws: int = 4
-    # one attention path, "tree" or "unified", forced for every filter
-    # and join; None lets the planner choose per node
+    # one attention path, "tree" or "unified", forced for every filter,
+    # join, and map; None lets the planner choose per node
     attention: str | None = None
 
 

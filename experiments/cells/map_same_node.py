@@ -30,6 +30,7 @@ volume; the function prints its path.
 """
 
 import json
+from functools import partial
 import os
 import subprocess
 import sys
@@ -259,16 +260,20 @@ def _chosen(only: str) -> tuple:
                  if not names or config[0] in names)
 
 
-def _quail(model: str, directory: Path, configurations) -> dict:
-    """Run the configurations on Quail; return the GPU, startup, and runs."""
+def _quail(model: str, directory: Path, configurations, attention=None) -> dict:
+    """Run the configurations on Quail; return the GPU, startup, and runs.
+
+    attention forces "tree" or "unified" attention; None lets the plan choose.
+    """
     import quail
     from bench.quailb import register_tables
     from quail.specs import H100_USD_PER_HOUR
 
-    result = {"engine": "Quail", "gpu": _gpu(), "runs": {}}
+    result = {"engine": "Quail" if attention is None else f"Quail, {attention} attention",
+              "gpu": _gpu(), "runs": {}}
     with quail.Session(quail.EngineConfig(
             model=model, device="h100-sxm", backend="quail",
-            gpu_timing=True)) as session:
+            gpu_timing=True, attention=attention)) as session:
         register_tables(session, directory)
         for name, table, column, maps, classify in configurations:
             print(f"quail: running {name}", flush=True)
@@ -418,7 +423,9 @@ def _vllm_classify_map(client, directory, table, column, map_config, planned,
     }
 
 
-_ENGINES = {"quail": _quail, "vllm": _vllm}
+_ENGINES = {"quail": _quail,
+            "quail-unified": partial(_quail, attention="unified"),
+            "vllm": _vllm}
 
 
 def _child(engine: str, model: str, directory: str, only: str, out: str) -> None:
@@ -473,13 +480,13 @@ def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
         scale_factor: The corpus scale factor.
         only: Comma-separated configuration names to run; empty runs
             all seven.
-        engines: Comma-separated engines to run, from "quail" and
-            "vllm"; they run in that order.
+        engines: Comma-separated engines to run, from "quail",
+            "quail-unified", and "vllm"; they run in that order.
 
     Raises:
         RuntimeError: The engines ran on different GPUs.
     """
-    chosen_engines = [engine for engine in ("quail", "vllm")
+    chosen_engines = [engine for engine in _ENGINES
                       if engine in {e.strip() for e in engines.split(",")}]
     if not chosen_engines:
         raise ValueError(f"no known engine in {engines!r}")
@@ -494,10 +501,15 @@ def map_same_node(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
         print(f"starting {engine}", flush=True)
         measurements["engines"][engine] = _run_child(engine, model, directory, only)
     for name in measurements["configurations"]:
-        runs = [result["runs"].get(name, {})
-                for result in measurements["engines"].values()]
-        if len(runs) == 2 and all("maps" in run for run in runs):
-            measurements.setdefault("agreement", {})[name] = _agreement(*runs)
+        engines_run = measurements["engines"]
+        if "vllm" not in engines_run:
+            continue
+        for engine in engines_run:
+            runs = [engines_run[engine]["runs"].get(name, {}),
+                    engines_run["vllm"]["runs"].get(name, {})]
+            if engine != "vllm" and all("maps" in run for run in runs):
+                measurements.setdefault("agreement", {}).setdefault(
+                    name, {})[engine] = _agreement(*runs)
     gpus = {engine: result["gpu"]
             for engine, result in measurements["engines"].items()}
     uuids = {gpu.split(",")[0] for gpu in gpus.values()}
