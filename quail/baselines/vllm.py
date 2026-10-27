@@ -49,7 +49,11 @@ def gpu_memory_utilization(device: DeviceSpec | None,
     return min(GPU_MEMORY_UTILIZATION, reserved)
 
 
-CUDA_GRAPH_CAPTURE_SIZE = 8_192
+# vLLM's default capture sizes (1, 2, 4, then every 8 to 256 and
+# every 16 to 512), which decode steps of up to 512 sequences replay,
+# and one graph for a full prefill step
+CUDA_GRAPH_CAPTURE_SIZES = (
+    [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16)) + [8_192])
 # vLLM caps a diffusion model at 8 sequences per step whenever the
 # setting is 128 or more, sized for its 256-row canvas; one row needs
 # no cap, so stay just under the trigger.
@@ -309,7 +313,7 @@ class VLLMEngine:
             "disable_log_stats": True,
             "tokenizer_mode": "gigatoken",
             "compilation_config": {
-                "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
+                "cudagraph_capture_sizes": CUDA_GRAPH_CAPTURE_SIZES
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
                              else min(MAX_SEQUENCES,

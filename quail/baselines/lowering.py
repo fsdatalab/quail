@@ -6,7 +6,6 @@ import re
 
 from quail.baselines.nodes import (
     RequestClassifySpec,
-    RequestExtractSpec,
     RequestFilterSpec,
     RequestJoinSpec,
 )
@@ -146,25 +145,32 @@ def lower_joins(context, joins, join_sequence) -> list[RequestJoinSpec]:
     return join_specs
 
 
-def lower_extractions(context, extracts) -> list[RequestExtractSpec]:
-    """Build one extract spec per AI.EXTRACT column."""
-    # each extraction decodes one answer per surviving document of its
-    # alias, after the joins; its prompt carries its own preamble, the
-    # model's extract turn, so it stays out of the shared one
-    extract_specs = []
-    for node in extracts:
-        extract_specs.append(RequestExtractSpec(
+def lower_answers(context, nodes, spec_type, **settings) -> list:
+    """Build one answer spec per AI.EXTRACT field or AI.MAP column.
+
+    Each decodes one answer per surviving document of its alias, after
+    the joins; its prompt carries its own preamble, the model's turn,
+    so it stays out of the shared one.
+
+    Args:
+        context: The planning context.
+        nodes: The SemanticExtract or SemanticMap nodes.
+        spec_type: RequestExtractSpec or RequestMapSpec.
+        settings: Callable(node) -> value per further spec field.
+    """
+    specs = []
+    for node in nodes:
+        lowered = context.lowered(node.call.prompt)
+        specs.append(spec_type(
             alias=node.alias, output=node.name,
-            question=node.call.question,
-            tail_token_ids=tuple(
-                context.lowered(node.call.prompt).tail_token_ids),
+            tail_token_ids=tuple(lowered.tail_token_ids),
             tail_text=re.sub(r"\{\d+\}", "", node.call.prompt.tail),
-            preamble_token_ids=tuple(
-                context.lowered(node.call.prompt).preamble_token_ids),
+            preamble_token_ids=tuple(lowered.preamble_token_ids),
             # vLLM adds the model's beginning-of-text token itself
             preamble_text=without_bos(node.call.prompt.preamble,
-                                      context.model.bos_text)))
-    return extract_specs
+                                      context.model.bos_text),
+            **{name: value(node) for name, value in settings.items()}))
+    return specs
 
 
 def request_preamble(context, prompts) -> tuple[tuple[int, ...], str]:

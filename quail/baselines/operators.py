@@ -306,6 +306,43 @@ def extract_fields(client, specs, bodies, texts, body_texts=None) -> list[dict]:
             for outputs in run["outputs"]]
 
 
+def map_documents(client, specs, bodies, body_texts=None) -> list[dict]:
+    """Write every map's answer over the same prompt bodies in one engine call.
+
+    The prompts go in document order, each document's maps together,
+    so the engine's prefix caching computes a document's KV once for
+    all of them. Each answer is greedy, up to the model's turn end or
+    its map's answer limit.
+
+    Args:
+        client: The engine client.
+        specs: The RequestMapSpecs over the bodies.
+        bodies: Token ids for each prompt before the tail, preamble included.
+        body_texts: The text of each prompt before the tail, for an
+            engine that tokenizes the prompt itself; None sends token ids.
+
+    Returns:
+        One dict per spec with its answers, in body order, and the
+        request and token counts; each reports the call's wall seconds.
+    """
+    prompts = [
+        body_texts[index] + spec.tail_text if body_texts is not None
+        else {"prompt_token_ids": body + token_list(spec.tail_token_ids)}
+        for index, body in enumerate(bodies) for spec in specs]
+    params = [client.decode_params(spec.max_answer_tokens)
+              for spec in specs] * len(bodies)
+    started = time.perf_counter()
+    outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
+    wall_s = time.perf_counter() - started
+    results = []
+    for q in range(len(specs)):
+        own = outputs[q::len(specs)]
+        results.append({
+            "answers": [output.outputs[0].text for output in own],
+            "wall_s": wall_s, "requests": len(own), **_generation_counts(own)})
+    return results
+
+
 def read_extractions(outputs, texts, wall_s: float) -> dict:
     """Read each output's phrase and locate it in its document's text."""
     answers, spans = [], []
