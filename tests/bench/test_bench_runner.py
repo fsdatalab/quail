@@ -338,6 +338,43 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
     assert pieces["extracts"][0]["tail"][-1] == "Phrase:"
 
 
+@pytest.mark.parametrize("query_id", [
+    "IMDB-MAP-1", "IMDB-MAP-2", "IMDB-MAP-3", "IMDB-MAP-4", "IMDB-MAP-5",
+    "CUAD-MAP-1", "CUAD-MAP-2", "CUAD-MAP-3"])
+def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path, query_id):
+    spec = get_query(query_id)
+    corpus = {"reviews": CORPUS["reviews"], "contracts": CONTRACTS}
+    oracle = Oracle(filters=lambda alias, document, position: document != 1,
+                    labels=lambda spec, ids: "negative")
+    with _session(tmp_path) as sess:
+        sess.register("contracts", DocumentProvider.from_table(
+            CONTRACTS, id_col="id"))
+        query = build_query(sess, spec)
+        result = execute_query(query, physical_executor=oracle_executor(
+            oracle, **_REPORT, store=None))
+        output = run_output(result, spec.info, corpus)
+        pieces = prompt_pieces(query, spec.info, {})
+        turn = sess.model.turn
+    (relation,) = spec.info.relations
+    alias = relation.alias
+    filtered = bool(spec.info.filters)
+    read = (["r0"] if relation.table == "reviews" else ["ct0", "ct2"]) \
+        if filtered else corpus[relation.table].column("id").to_pylist()
+    assert sorted(output.map_answers) == [m.id for m in spec.info.maps]
+    for operator in spec.info.maps:
+        answers = output.map_answers[operator.id].to_pydict()
+        assert answers[alias] == read
+        index = {"r0": 0, "r1": 1, "ct0": 0, "ct1": 1, "ct2": 2}
+        assert answers["answer"] == [f"{operator.output} {index[i]}" for i in read]
+        assert output.rows.column(operator.output).to_pylist() == answers["answer"]
+    # every map shows the document under the shared preamble, so a
+    # filter or classification before it in the pipeline leaves its KV
+    assert pieces["preamble"] == (turn[0] + quail.SHARED_PRE).split()
+    assert [piece["id"] for piece in pieces["maps"]] == [
+        m.id for m in spec.info.maps]
+    assert all(piece["tail"][-1] == "ANSWER:" for piece in pieces["maps"])
+
+
 def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
     spec = get_query("CUAD-1")
     span_type = pa.struct([("start", pa.int64()), ("end", pa.int64())])

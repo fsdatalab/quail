@@ -30,6 +30,7 @@ from quail.physical import (
     AiExtract,
     AiFilter,
     AiJoin,
+    AiMap,
     AiSaeFeatures,
     AiScore,
     ClassifySpec,
@@ -51,6 +52,8 @@ class Oracle:
         scores: A callable (spec, ids) -> the score of one row.
         answers: A callable (spec, document) -> the extracted text or
             None; or a sequence indexed by document for every question.
+        maps: A callable (spec, document) -> the written answer; None
+            writes the map's name and the document's index.
         features: A callable (spec, document) -> a feature list of
             {"feature", "strength"} mappings; None plants one feature
             per document, its id modulo 7 at strength id + 1.
@@ -66,7 +69,8 @@ class Oracle:
     execute_pipeline = None
 
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
-                 answers=None, features=None, *, probabilities=False,
+                 answers=None, features=None, maps=None, *,
+                 probabilities=False,
                  retain=0, join_metrics=None, streams=False):
         self.filters = filters or {}
         self.joins = joins or {}
@@ -74,6 +78,7 @@ class Oracle:
         self.scores = scores or (lambda spec, ids: (sum(ids) + 1) / 10)
         self.answers = answers
         self.features = features
+        self.maps = maps or (lambda spec, document: f"{spec.name} {document}")
         self.probabilities = probabilities
         self.retain = retain
         self.join_metrics = join_metrics
@@ -94,6 +99,8 @@ class Oracle:
             return self._extract(node, inputs)
         if isinstance(node, AiSaeFeatures):
             return self._sae_features(node, inputs)
+        if isinstance(node, AiMap):
+            return self._map(node, inputs)
         if isinstance(node, AiClassify) and node.spec.partner is not None:
             return self._classify_joined(node, inputs)
         if isinstance(node, (AiScore, AiClassify)):
@@ -251,6 +258,20 @@ class Oracle:
         return NodeResult(
             {node.rows_port: score_rows(rows, spec.aliases, spec.name,
                                         values, FEATURE_LIST)},
+            NodeMetrics(input_rows=len(ids), output_rows=len(ids),
+                        evaluated_documents=len(ids)))
+
+    def _map(self, node, inputs) -> NodeResult:
+        spec = node.spec
+        (value,) = inputs.values()
+        ids = [int(document) for document in (
+            value.ids[spec.aliases[0]].to_pylist() if isinstance(value, Rows)
+            else value)]
+        rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
+        return NodeResult(
+            {node.rows_port: score_rows(
+                rows, spec.aliases, spec.name,
+                [self.maps(spec, document) for document in ids], pa.string())},
             NodeMetrics(input_rows=len(ids), output_rows=len(ids),
                         evaluated_documents=len(ids)))
 

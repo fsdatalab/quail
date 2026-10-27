@@ -543,6 +543,8 @@ def bind_score_prompt(template: str, args: tuple,
 # phrase has no closing mark of its own, because a document may contain
 # any text mark.
 EXTRACT_QUESTION_LABEL = "\n\nQuestion: "
+# an AI.MAP template: the document, then the instruction
+MAP_TEMPLATE_HEAD = "{0}\n\n"
 EXTRACT_INSTRUCTION = (
     "Copy the words that answer the question from the document. Copy them "
     "exactly. Use the fewest words that answer it. If the document does not "
@@ -588,6 +590,53 @@ def bind_extract_prompt(args: tuple, question: str,
              + EXTRACT_PHRASE_CUE)
     return Prompt(template="{0}", args=tuple(args), preamble=preamble,
                   tail="{0}" + after, kind="extract")
+
+
+def bind_map_prompt(args: tuple, instruction: str,
+                    turn: tuple[str, str] = ("", "")) -> Prompt:
+    """Bind an AI.MAP prompt over one document column.
+
+    The prompt is the document label, the document, the instruction,
+    the model's turn text, and the cue that opens the answer, as
+    AI.EXTRACT's is, without its copying instruction and answer
+    template. The document's KV stays query independent.
+
+    Args:
+        args: One column reference.
+        instruction: What to write about each document.
+        turn: Chat text before the prompt and after the instruction.
+            Without it, a line break separates the instruction and the cue.
+
+    Returns:
+        A Prompt whose template is ``{0}`` followed by the instruction,
+        and whose tail is the text after the document.
+
+    Raises:
+        CompileError: The prompt reads more than one column, or the
+            instruction is empty or has a placeholder.
+    """
+    if len(args) != 1:
+        raise CompileError("AI.MAP reads one document column")
+    if (not isinstance(instruction, str) or not instruction.strip()
+            or "{" in instruction or "}" in instruction):
+        raise CompileError(
+            "AI.MAP needs an instruction with at least one word and no braces")
+    after = "\n\n" + instruction + (turn[1] or "\n") + ANSWER_CUE.lstrip("\n")
+    return Prompt(template=MAP_TEMPLATE_HEAD + instruction, args=tuple(args),
+                  preamble=turn[0] + SHARED_PRE, tail="{0}" + after, kind="map")
+
+
+def map_instruction(template: str) -> str:
+    """Return the instruction of an AI.MAP template, ``{0}`` and the instruction.
+
+    Raises:
+        CompileError: The template is not in that form.
+    """
+    if not template.startswith(MAP_TEMPLATE_HEAD):
+        raise CompileError(
+            f"an AI.MAP template is {MAP_TEMPLATE_HEAD!r} and the instruction, "
+            f"got {template!r}")
+    return template[len(MAP_TEMPLATE_HEAD):]
 
 
 def bind_join_prompt(template: str, args: tuple,

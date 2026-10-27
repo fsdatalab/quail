@@ -188,28 +188,32 @@ def has_extract(logical) -> bool:
     return any(isinstance(node, SemanticExtract) for node in logical.walk())
 
 
-def extraction_refusal(context) -> Refusal | None:
-    """Check whether the model supports extraction planning.
+def extraction_refusal(context, function: str = "AI.EXTRACT") -> Refusal | None:
+    """Check whether the model can write the answers of AI.EXTRACT or AI.MAP.
 
-    An extraction reads the model's next-token probabilities over the
-    document's own tokens, which a reranker, a decision model, and a
-    diffusion model with an answer canvas do not give.
+    Both decode the model's next tokens, which a reranker, a decision
+    model, and a diffusion model with an answer canvas do not give.
 
     Args:
-        context: Planning context with the tokenizer and model specification.
+        context: Planning context with the tokenizer and model
+            specification, or None.
+        function: The function whose plan is checked.
 
     Returns:
         A Refusal describing missing support, or None if planning can proceed.
     """
-    model = context.model
-    if context.tokenizer is None:
-        reason = "AI.EXTRACT planning needs the model's tokenizer"
+    constraint = f"unsupported_{function.removeprefix('AI.').lower()}_query"
+    model = None if context is None else context.model
+    if context is None:
+        reason = f"{function} planning needs a planning context"
+    elif context.tokenizer is None:
+        reason = f"{function} planning needs the model's tokenizer"
     elif model.role in ("reranker", "decision") or model.canvas_tokens:
-        reason = (f"AI.EXTRACT reads next-token probabilities over the "
-                  f"document's tokens, which {model.name!r} does not give")
+        reason = (f"{function} decodes the model's next tokens, which "
+                  f"{model.name!r} does not give")
     else:
         return None
-    return Refusal(reasons=(reason,), constraint="unsupported_extract_query",
+    return Refusal(reasons=(reason,), constraint=constraint,
                    needed=1, available=0, unit="queries")
 
 
@@ -323,14 +327,9 @@ def validate_query(plan, operators, context, model, device, gpus):
         refusal = classification_refusal(context)
         if refusal is not None:
             return refusal
-    extracts = operators.extracts
-    if extracts:
-        if context is None:
-            return Refusal(
-                reasons=("AI.EXTRACT planning needs a planning context",),
-                constraint="unsupported_extract_query",
-                needed=1, available=0, unit="queries")
-        refusal = extraction_refusal(context)
+    for function, nodes in (("AI.EXTRACT", operators.extracts),
+                            ("AI.MAP", operators.maps)):
+        refusal = extraction_refusal(context, function) if nodes else None
         if refusal is not None:
             return refusal
     join_applies = {}

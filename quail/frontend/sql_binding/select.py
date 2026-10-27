@@ -385,21 +385,24 @@ def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list
             structs.append(struct)
             columns.extend(members)
             continue
-        if _is_call(e, "AI_SAE_FEATURES"):
+        binders = {"AI_SAE_FEATURES": b.bind_ai_sae_features,
+                   "AI_MAP": b.bind_ai_map}
+        function = next((name for name in binders if _is_call(e, name)), None)
+        if function is not None:
             if not alias:
                 raise CompileError(
-                    "AI.SAE_FEATURES needs an AS name in SELECT")
-            columns.append(Alias(b.bind_ai_sae_features(e), alias))
+                    f"AI.{function[3:]} needs an AS name in SELECT")
+            columns.append(Alias(binders[function](e), alias))
             continue
         if any(
-            _is_call(call, "AI_SCORE") or _is_call(call, "AI_EXTRACT")
-            or _is_call(call, "AI_SAE_FEATURES")
+            any(_is_call(call, name)
+                for name in ("AI_SCORE", "AI_EXTRACT", *binders))
             or isinstance(call, exp.AIClassify)
             for call in e.walk()
         ):
             raise CompileError(
-                "AI.SCORE, AI.CLASSIFY, AI.EXTRACT, and AI.SAE_FEATURES in "
-                "SELECT must be direct expressions with an AS name"
+                "AI.SCORE, AI.CLASSIFY, AI.EXTRACT, AI.SAE_FEATURES, and "
+                "AI.MAP in SELECT must be direct expressions with an AS name"
             )
         if not isinstance(e, COLUMN_NODES):
             raise CompileError(

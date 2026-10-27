@@ -6,6 +6,7 @@ from quail.logical.builder import (
 )
 from quail.logical.expressions import (
     COLUMN_COMPARISONS,
+    DEFAULT_MAP_ANSWER_TOKENS,
     DEFAULT_SELECTIVITY,
     PROBABILITIES_SUFFIX,
     SCORE_COMPARISONS,
@@ -46,6 +47,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SemanticSaeFeatures,
     Unnest,
     Window,
@@ -92,6 +94,7 @@ __all__ = [
     "ColumnRef",
     "CompileError",
     "COLUMN_COMPARISONS",
+    "DEFAULT_MAP_ANSWER_TOKENS",
     "DEFAULT_SELECTIVITY",
     "Equality",
     "FEATURE_LIST",
@@ -125,6 +128,7 @@ __all__ = [
     "SemanticExtract",
     "SemanticFilter",
     "SemanticJoin",
+    "SemanticMap",
     "SemanticSaeFeatures",
     "SortKey",
     "WindowCall",

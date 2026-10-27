@@ -199,6 +199,11 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
                 needed=1, available=0, unit="backends")
         if refusal is not None:
             return refusal
+    if region.logical_plan.operators().maps:
+        return Refusal(
+            reasons=("AI.MAP runs on the Quail backend only",),
+            constraint="map_needs_quail_backend",
+            needed=1, available=0, unit="backends")
     if any(getattr(aliased_call(column), "probabilities", False)
            for column in region.logical_plan.projection.columns):
         return Refusal(

@@ -294,7 +294,9 @@ DEFAULT_SELECTIVITY = 0.2
 SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 
-MODEL_CALL_KINDS = ("boolean", "score", "label", "extract", "features")
+MODEL_CALL_KINDS = ("boolean", "score", "label", "extract", "features", "map")
+# the answer limit of an AI.MAP call written without one
+DEFAULT_MAP_ANSWER_TOKENS = 256
 # the token poolings of an AI.SAE_FEATURES call
 SAE_POOLINGS = ("last", "max")
 
@@ -333,6 +335,8 @@ class ModelCall:
     # a "features" call only: which tokens become the row's feature
     # list, "last" or "max"
     pooling: str = ""
+    # a "map" call only: the most tokens its answer may have
+    max_answer_tokens: int = 0
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -353,6 +357,11 @@ class ModelCall:
             raise CompileError("only an AI.EXTRACT call has a question")
         if self.kind != "features" and self.pooling:
             raise CompileError("only an AI.SAE_FEATURES call has a pooling")
+        if self.kind == "map" and (type(self.max_answer_tokens) is not int
+                                   or self.max_answer_tokens < 1):
+            raise CompileError("an AI.MAP answer limit is a positive integer")
+        if self.kind != "map" and self.max_answer_tokens:
+            raise CompileError("only an AI.MAP call has an answer limit")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)
         elif self.kind == "extract":
@@ -721,9 +730,10 @@ def validate_predicate(expression) -> None:
             raise CompileError(
                 "an AI.EXTRACT answer is a result column, not a predicate"
             )
-        if expression.kind == "features":
+        if expression.kind in ("features", "map"):
+            function = "AI.SAE_FEATURES" if expression.kind == "features" else "AI.MAP"
             raise CompileError(
-                "an AI.SAE_FEATURES list is a result column, not a predicate"
+                f"an {function} answer is a result column, not a predicate"
             )
         return
     raise CompileError(
@@ -771,9 +781,9 @@ def _explain(expression) -> str:
         call = aliased_call(expression)
         if call is None:
             return f"{column_name(expression.expression)} AS {expression.name}"
-        if call.kind in ("label", "extract"):
-            # the SemanticClassify or SemanticExtract below computes
-            # the column
+        if call.kind in ("label", "extract", "map"):
+            # the SemanticClassify, SemanticExtract, or SemanticMap
+            # below computes the column
             return expression.name
         return f"{_explain(call)} AS {expression.name}"
     if isinstance(expression, (ColumnRef, GetField, ScalarFunction)):
@@ -785,6 +795,9 @@ def _explain(expression) -> str:
     if expression.kind == "features":
         return (f"AI.SAE_FEATURES({expression.prompt.template!r}, "
                 f"pooling={expression.pooling!r})")
+    if expression.kind == "map":
+        return (f"AI.MAP({expression.prompt.template!r}, "
+                f"max_answer_tokens={expression.max_answer_tokens})")
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
     return f"{function}({expression.prompt.template!r})"
 

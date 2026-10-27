@@ -7,6 +7,7 @@ from quail.logical.prompts import (
     bind_classify_prompt,
     bind_extract_prompt,
     bind_join_prompt,
+    bind_map_prompt,
     bind_prompt,
     bind_sae_features_prompt,
     bind_score_prompt,
@@ -30,8 +31,10 @@ class PromptBinder:
         """Bind the prompt text for an operator.
 
         Args:
-            kind: Filter, join, score, label, or extract operator kind.
-            template: Prompt template, or the extraction question.
+            kind: Filter, join, score, label, extract, features, or map
+                operator kind.
+            template: Prompt template, the extraction question, or the map
+                instruction.
             args: Document column references in template order.
             labels: Classification labels.
             descriptions: Optional descriptions in label order.
@@ -47,6 +50,8 @@ class PromptBinder:
         layout = self.layout if self.model is None else self.model.prompt_layout
         if kind == "extract":
             return bind_extract_prompt(args, template, turn)
+        if kind == "map":
+            return bind_map_prompt(args, template, turn)
         if kind == "features":
             return bind_sae_features_prompt(template, args, turn)
         if kind == "label":
