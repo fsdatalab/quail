@@ -68,6 +68,16 @@ def _sqlglot_dialect(dialect: SQLDialect) -> str:
     return "bigquery" if dialect is SQLDialect.BQ else "snowflake"
 
 
+# AI.<name>( calls and the internal functions they are lowered to
+DOTTED_AI_FUNCTIONS = {
+    name: f"AI_{name}"
+    for name in ("SCORE", "CLASSIFY", "EXTRACT", "SAE_FEATURES", "MAP")
+}
+# the AI_<name>( functions a query may call directly
+SUPPORTED_AI_FUNCTIONS = ("AI_FILTER", "AI_SCORE", "AI_EXTRACT",
+                          "AI_SAE_FEATURES", "AI_MAP")
+
+
 def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
     """Lower dotted AI calls to internal function names."""
     tokenizer = sqlglot.Dialect.get_or_raise(_sqlglot_dialect(dialect)).tokenizer()
@@ -79,24 +89,16 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
     for index in range(len(tokens) - 3):
         head, dot, name, left = tokens[index : index + 4]
         function = name.text.upper()
-        replacement = None
-        if function == "SCORE":
-            replacement = "AI_SCORE("
-        elif function == "CLASSIFY":
-            replacement = "AI_CLASSIFY("
-        elif function == "EXTRACT":
-            replacement = "AI_EXTRACT("
-        elif function == "SAE_FEATURES":
-            replacement = "AI_SAE_FEATURES("
-        elif function == "IF" and dialect is SQLDialect.BQ:
-            replacement = "AI_FILTER("
+        internal = DOTTED_AI_FUNCTIONS.get(function)
+        if function == "IF" and dialect is SQLDialect.BQ:
+            internal = "AI_FILTER"
         if (
             head.text.upper() == "AI"
             and dot.text == "."
             and left.text == "("
-            and replacement is not None
+            and internal is not None
         ):
-            edits.append((head.start, left.end + 1, replacement))
+            edits.append((head.start, left.end + 1, internal + "("))
     for start, end, replacement in reversed(edits):
         sql = sql[:start] + replacement + sql[end:]
     return sql
@@ -118,16 +120,10 @@ def _reject_forbidden(tree) -> None:
         )
     for fn in tree.find_all(exp.Anonymous):
         name = str(fn.this).upper()
-        if name.startswith("AI_") and name not in {
-            "AI_FILTER",
-            "AI_SCORE",
-            "AI_EXTRACT",
-            "AI_SAE_FEATURES",
-        }:
+        if name.startswith("AI_") and name not in SUPPORTED_AI_FUNCTIONS:
             raise CompileError(
                 f"{name} is not supported; supported AI functions are "
-                "AI_FILTER, AI_SCORE, AI_CLASSIFY, AI_EXTRACT, and "
-                "AI_SAE_FEATURES"
+                f"AI_CLASSIFY, {', '.join(SUPPORTED_AI_FUNCTIONS)}"
             )
     # a subquery is legal in FROM, where it runs as its own stage, and
     # as the EXISTS form, checked structurally; any other is refused
@@ -426,7 +422,7 @@ def _scopes(tree) -> list:
             if scope.scope_type not in (ScopeType.SUBQUERY, ScopeType.UDTF)]
 
 
-AI_FUNCTIONS = {"PROMPT", "AI_FILTER", "AI_SCORE", "AI_EXTRACT"}
+AI_FUNCTIONS = {"PROMPT", "AI_FILTER", "AI_SCORE", "AI_EXTRACT", "AI_MAP"}
 # the name sqlglot gives a select item that is not a column
 AUTO_ALIAS = re.compile(r"_col_\d+", re.IGNORECASE)
 
@@ -514,18 +510,13 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
     _validate_query(b, joins, columns, selection.structs,
                     allow_relational=allow_relational)
     named, labels = _bind_label_names(b, columns)
-    extracts = {}
-    feature_columns = {}
+    # alias -> (call, name) of each extraction, feature call, and map
+    calls = {kind: {} for kind in ("extract", "features", "map")}
     for column in columns:
-        if aliased_call(column, "extract") is not None:
-            extracts.setdefault(column.expression.aliases()[0], []).append(
-                (column.expression, column.name)
-            )
-        if aliased_call(column, "features") is not None:
-            feature_columns.setdefault(
-                column.expression.aliases()[0], []).append(
-                (column.expression, column.name)
-            )
+        call = aliased_call(column, *calls)
+        if call is not None:
+            calls[call.kind].setdefault(call.aliases()[0], []).append(
+                (call, column.name))
 
     logical = LogicalPlanBuilder()
     for alias, provider in b.tables:
@@ -540,9 +531,10 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
                 (labels[alias][call], accepted, selectivity)
                 for call, accepted, selectivity in b.label_tests.get(alias, ())
             ),
-            extracts=tuple(extracts.get(alias, ())),
+            extracts=tuple(calls["extract"].get(alias, ())),
             extract_filters=tuple(b.extract_tests.get(alias, ())),
-            sae_features=tuple(feature_columns.get(alias, ())),
+            sae_features=tuple(calls["features"].get(alias, ())),
+            maps=tuple(calls["map"].get(alias, ())),
             schema=catalog.get(provider).schema(),
         )
     for join in b.joins:

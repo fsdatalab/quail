@@ -40,6 +40,7 @@ from quail.planner.operators.classify import (
 from quail.planner.operators.extract import emit_extract
 from quail.planner.operators.filter import emit_filter
 from quail.planner.operators.join import emit_join
+from quail.planner.operators.map import emit_map
 from quail.planner.operators.sae_features import emit_sae_features
 from quail.planner.operators.score import (
     ScoreLowering,
@@ -57,6 +58,7 @@ from quail.planner.search.table_steps import (
     CLASSIFY,
     EXTRACT,
     FEATURES,
+    MAP,
     resident_after,
 )
 from quail.planner.statistics.tables import summarize_alias
@@ -277,7 +279,7 @@ class GraphBuilder:
         for s in self.operators.scans:
             # a classification or extraction the planner lifted
             # above the joins is emitted after them
-            kinds = {ASK, FEATURES}
+            kinds = {ASK, FEATURES, MAP}
             if s.alias not in self.after_joins:
                 kinds.add(CLASSIFY)
             if s.alias not in self.extract_after:
@@ -300,7 +302,8 @@ class GraphBuilder:
         Args:
             alias: The table.
             expected_rows: The documents the first step reads.
-            kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT.
+            kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT,
+                FEATURES, MAP.
             port: The port the documents stand at before the steps.
 
         Returns:
@@ -333,14 +336,11 @@ class GraphBuilder:
                     self, alias, expected_rows, positions, port
                 )
                 row_ports += rows
-            elif kind == FEATURES:
-                port, rows = emit_sae_features(
-                    self, alias, expected_rows, positions, port,
-                    resident=resident)
-                row_ports += rows
             else:
-                port, rows = emit_extract(self, alias, expected_rows, positions, port,
-                                           resident=resident)
+                emit = {EXTRACT: emit_extract, FEATURES: emit_sae_features,
+                        MAP: emit_map}[kind]
+                port, rows = emit(self, alias, expected_rows, positions, port,
+                                  resident=resident)
                 row_ports += rows
             for step in run:
                 expected_rows *= step.selectivity

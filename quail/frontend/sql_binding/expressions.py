@@ -12,6 +12,7 @@ from quail.frontend.sql_binding.predicates import (
     unwrap_function,
 )
 from quail.logical import (
+    DEFAULT_MAP_ANSWER_TOKENS,
     Alias,
     CompileError,
     ExtractStruct,
@@ -378,6 +379,39 @@ class ExpressionBinder:
         model_call = ModelCall(prompt, "features", pooling=pooling)
         model_call.validate()
         return model_call
+
+    def bind_ai_map(self, node) -> ModelCall:
+        """Parse an AI.MAP call and bind its document reference.
+
+        The call is ``AI.MAP(column, 'instruction')``, with an optional
+        third argument, the answer limit in tokens.
+        """
+        args = list(node.expressions)
+        if len(args) not in (2, 3):
+            raise CompileError(
+                "AI.MAP takes a document column, an instruction string, and "
+                "an optional answer limit in tokens")
+        column, instruction, *limit = args
+        if not isinstance(column, COLUMN_NODES):
+            raise CompileError(
+                f"AI.MAP's first argument is a document column, got {column.sql()}")
+        if not (isinstance(instruction, exp.Literal) and instruction.is_string):
+            raise CompileError(
+                f"AI.MAP's second argument is an instruction string, "
+                f"got {instruction.sql()}")
+        if limit and not (isinstance(limit[0], exp.Literal)
+                          and not limit[0].is_string
+                          and limit[0].this.isdigit()):
+            raise CompileError(
+                f"AI.MAP's answer limit is a whole number of tokens, "
+                f"got {limit[0].sql()}")
+        ref = self.resolve_value(column)
+        prompt = self.prompts.bind("map", str(instruction.this), (ref,))
+        self.note_document_column(ref)
+        call = ModelCall(prompt, "map", max_answer_tokens=(
+            int(limit[0].this) if limit else DEFAULT_MAP_ANSWER_TOKENS))
+        call.validate()
+        return call
 
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:
         """Bind a score or classification to its model call."""

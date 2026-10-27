@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from quail.api.query import Query
+from quail.logical import DEFAULT_MAP_ANSWER_TOKENS
 
 if TYPE_CHECKING:
     from quail.api.session import Session
@@ -45,6 +46,12 @@ class BoundBuilder:
 
     def ai_sae_features(self, p, *, pooling, name):
         self._inner.ai_sae_features(p, pooling=pooling, name=name)
+        return self
+
+    def ai_map(self, c, instruction, *, name,
+               max_answer_tokens=DEFAULT_MAP_ANSWER_TOKENS):
+        self._inner.ai_map(c, instruction, name=name,
+                           max_answer_tokens=max_answer_tokens)
         return self
 
     def unnest(self, *names, outer=False):

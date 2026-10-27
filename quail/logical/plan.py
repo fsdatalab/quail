@@ -36,6 +36,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SemanticSaeFeatures,
     Unnest,
     Window,
@@ -192,7 +193,7 @@ class LogicalPlan:
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, applies, classifies = [], {}, [], [], []
-        extracts, feature_calls, tested, aliases = [], [], {}, []
+        extracts, feature_calls, map_calls, tested, aliases = [], [], [], {}, []
         # the nodes above the projection read result rows, not documents
         nodes = LogicalPlan(self.projection).walk()
         for node in nodes:
@@ -219,6 +220,8 @@ class LogicalPlan:
                 extracts.append(node)
             elif isinstance(node, SemanticSaeFeatures):
                 feature_calls.append(node)
+            elif isinstance(node, SemanticMap):
+                map_calls.append(node)
         calls = {
             (node.alias, node.name): node.call
             for node in classifies
@@ -273,6 +276,7 @@ class LogicalPlan:
             classifies=tuple(classifies),
             extracts=tuple(extracts),
             sae_features=tuple(feature_calls),
+            maps=tuple(map_calls),
         )
 
 
@@ -295,6 +299,7 @@ class Operators:
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
     extracts: tuple = ()  # tuple[SemanticExtract, ...]
     sae_features: tuple = ()  # tuple[SemanticSaeFeatures, ...]
+    maps: tuple = ()  # tuple[SemanticMap, ...]
     label_filters: dict = field(default_factory=dict)
     #                     alias -> tuple[ColumnTest, ...] on labels
     extract_filters: dict = field(default_factory=dict)
@@ -409,6 +414,8 @@ def _projected_fields(project: Project, scans: dict) -> dict:
                 types[name + PROBABILITIES_SUFFIX] = PROBABILITIES_TYPE
         elif call.kind == "features":
             types[name] = FEATURE_LIST
+        elif call.kind == "map":
+            types[name] = pa.string()
         else:
             types[name] = pa.string()
             types[name + SPAN_SUFFIX] = SPAN_TYPE

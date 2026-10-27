@@ -31,7 +31,7 @@ from quail.baselines.nodes import RequestExecution
 from quail.execution.result import answer_values
 from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt, bind_extract_prompt
-from quail.physical import AiClassify, AiExtract, AiSaeFeatures, AiScore
+from quail.physical import AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import lower_prompt
 from quail.progress import say
@@ -193,31 +193,27 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
                for alias in join.relations},
             "answer": answer_values(table),
         })
-    score_answers = {}
-    for operator in info.scores:
-        table = result.answer_tables["scores"][operator.output]
-        score_answers[operator.id] = pa.table({
-            operator.relation: id_column(
-                operator.relation, table.column(operator.relation)),
-            "score": table.column(operator.output).cast(pa.float64()),
-        })
-    features_answers = {}
-    for operator in info.sae_features:
-        table = result.answer_tables["features"][operator.output]
-        features_answers[operator.id] = pa.table({
-            operator.relation: id_column(
-                operator.relation, table.column(operator.relation)),
-            "features": table.column(operator.output),
-        })
-    extract_answers = {}
-    for operator in info.extracts:
-        name = _extract_name(info, operator)
-        table = result.answer_tables["extracts"][name]
-        extract_answers[operator.id] = pa.table({
-            operator.relation: id_column(
-                operator.relation, table.column(operator.relation)),
-            "answer": table.column(name).cast(pa.string()),
-        })
+
+    def answers(kind, operators, column, cast=None, name_of=None):
+        """Return operator ID -> its answer table, the ids and one column."""
+        tables = {}
+        for operator in operators:
+            name = operator.output if name_of is None else name_of(operator)
+            table = result.answer_tables[kind][name]
+            values = table.column(name)
+            tables[operator.id] = pa.table({
+                operator.relation: id_column(
+                    operator.relation, table.column(operator.relation)),
+                column: values if cast is None else values.cast(cast),
+            })
+        return tables
+
+    score_answers = answers("scores", info.scores, "score", pa.float64())
+    features_answers = answers("features", info.sae_features, "features")
+    map_answers = answers("maps", info.maps, "answer", pa.string())
+    extract_answers = answers(
+        "extracts", info.extracts, "answer", pa.string(),
+        name_of=lambda operator: _extract_name(info, operator))
     # quail-b checks that a plan selects ids, labels, scores, answer
     # structs, and measures; an answer struct brings its span struct,
     # which the benchmark does not take
@@ -234,7 +230,8 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         classify_answers=classify_answers or None,
         score_answers=score_answers or None,
         extract_answers=extract_answers or None,
-        features_answers=features_answers or None)
+        features_answers=features_answers or None,
+        map_answers=map_answers or None)
 
 
 def _alias_filters(info: PlanInfo, alias: str) -> list:
@@ -278,7 +275,7 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                      if lower(prompt).preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": [], "classifies": [], "scores": [],
-              "extracts": [], "features": []}
+              "extracts": [], "features": [], "maps": []}
     for alias, predicates in filters.items():
         written = _alias_filters(info, alias)
         for position, predicate in enumerate(predicates):
@@ -329,18 +326,20 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                 f"query reports no prompt pieces")
             return None
         pieces["extracts"].append({"id": operator.id, "tail": list(tail)})
-    for operator in info.sae_features:
-        node = next(node for node in query.plan().nodes
-                    if isinstance(node, AiSaeFeatures)
-                    and node.spec.name == operator.output)
-        head, tail = node.spec.prompt_token_parts
-        if not pieces["preamble"]:
-            pieces["preamble"] = list(head)
-        elif list(head) != pieces["preamble"]:
-            say(f"feature call {operator.id} has its own prompt head; the "
-                f"query reports no prompt pieces")
-            return None
-        pieces["features"].append({"id": operator.id, "tail": list(tail)})
+    for kind, operators, node_type in (("features", info.sae_features, AiSaeFeatures),
+                                       ("maps", info.maps, AiMap)):
+        for operator in operators:
+            node = next(node for node in query.plan().nodes
+                        if isinstance(node, node_type)
+                        and node.spec.name == operator.output)
+            head, tail = node.spec.prompt_token_parts
+            if not pieces["preamble"]:
+                pieces["preamble"] = list(head)
+            elif list(head) != pieces["preamble"]:
+                say(f"{operator.id} has its own prompt head; the query "
+                    f"reports no prompt pieces")
+                return None
+            pieces[kind].append({"id": operator.id, "tail": list(tail)})
     return pieces
 
 
