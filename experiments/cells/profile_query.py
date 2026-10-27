@@ -311,8 +311,8 @@ def child(arguments: str) -> None:
     from quail_b.benchmark import load_benchmark
 
     args = json.loads(arguments)
-    query_id, scale_factor, modes, top = (args["query_id"], args["scale_factor"], args["modes"],
-                                args["top"])
+    query_id, scale_factor = args["query_id"], args["scale_factor"]
+    modes, top = args["modes"], args["top"]
     print(f"quail from {quail.__file__}", flush=True)
     window = {}
 
