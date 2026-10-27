@@ -88,7 +88,8 @@ class StageExecutor:
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
-                 appended_tokens=None, gpu_timing=False, survival=None):
+                 appended_tokens=None, gpu_timing=False, survival=None,
+                 decoder=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -104,6 +105,15 @@ class StageExecutor:
         self.on_answers = on_answers
         self.label = label
         self.gpu_timing = gpu_timing
+        self.decoder = decoder
+        # the stages whose answers the decoder writes, in map order
+        self.answer_maps = {j: q for q, j in enumerate(
+            j for j, stage in enumerate(stages) if stage.answer_tokens)}
+        self.map_stages = np.asarray(list(self.answer_maps), dtype=np.int64)
+        if self.answer_maps and decoder is None:
+            raise ValueError("stages with answer_tokens need a decoder")
+        self.deferred = {}      # document -> its answer stage's group
+        self.answered = set()   # documents whose answers ended first
 
         k = len(self.stages)
         if not self.paged and (
@@ -143,6 +153,9 @@ class StageExecutor:
             attention_mode = "tree"
         self.mode = attention_path(
             self.pipeline, attention_mode, default_attention=default_attention)
+        if decoder is not None:
+            # decode rows read their own pages in one causal paged call
+            self.mode = "unified"
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
@@ -160,7 +173,7 @@ class StageExecutor:
                                    self.canvas_rows)
                                if stage.single])
         appended = sorted(
-            (tuple(frame), int(suffixes.lengths.max()))
+            (tuple(frame), int(suffixes.lengths.max()) + stage.answer_tokens)
             for frame, suffixes, stage in zip(self.frames, self.suffixes, self.stages)
             if stage.append)
         for frame, group in groupby(appended, key=lambda entry: entry[0]):
@@ -390,13 +403,19 @@ class StageExecutor:
         """Return whether the group packs its frame and suffix as one entry."""
         return self.stages[j].single and end - start == 1
 
-    def _build(self, chunk_groups):
-        """Pack a chunk and identify each entry's stage and answer row count."""
+    def _build(self, chunk_groups, decode=None):
+        """Pack a chunk and identify each entry's stage and answer row count.
+
+        Returns:
+            The chunk, its entries as (stage, answer rows), and the rows
+            that choose an answer's first token, as (row, document).
+        """
         from quail.backends.quail.executor.chunk import Suffixes, pack_chunk
 
         specs = []
         entries = []
         appended = {}
+        firsts = []
         for a, j, start, end, carried in chunk_groups:
             key = self.keys[a]
             f = self.prefix_lengths[a]
@@ -478,13 +497,23 @@ class StageExecutor:
                     write_suffix_tokens=kept,
                     single=self.stages[j].single and end - start == 1,
                     paths=self.stages[j].paths, **carry, **own))
+            if j in self.answer_maps and start == 0:
+                firsts.append((sum(n for _, n in entries) + rows - 1, a, j))
             entries.append((j, rows))
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
-            staging=self.staging, canvas=self.canvas, answer_row=self.answer_row)
+            staging=self.staging, canvas=self.canvas, answer_row=self.answer_row,
+            decode=decode)
         for a, tokens in appended.items():
             self.appended[a] = tokens
-        return chunk, entries
+        if self.decoder is not None:
+            self.decoder.feed(chunk)
+            for _, a, j in firsts:
+                self.decoder.start(
+                    a, self.answer_maps[j],
+                    self.prefix_lengths[a] + len(self.frames[j]) + self.appended[a],
+                    self.arena.owned_pages(self.keys[a]))
+        return chunk, entries, [(row, a) for row, a, _ in firsts]
 
     def _settle(self, settlement):
         anchor = settlement.anchor
@@ -516,22 +545,49 @@ class StageExecutor:
                 position[key] += 1        # the frame entry's answer means nothing
             count = end - start
             rows = values[key][position[key]:position[key] + count]
-            result = self.sched.report(a, j, start, end, rows)
-            if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
-                del self.own[(j, a)]
-            if self.on_answers is not None:
-                self.on_answers(a, j, start, end, rows)
-            for settlement in result.settlements:
-                self._event(settlement)
-            transitions.extend(result.transitions)
             position[key] += count
+            if j in self.answer_maps:
+                # the row stands until the decoder ends the answer
+                self.deferred[a] = (j, start, end, rows)
+                continue
+            transitions.extend(self._record(a, j, start, end, rows))
         entry.at += len(groups)
+        transitions.extend(self._record_answers())
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)
             if self.counting_answers else self.finished)
         if transitions and self.on_chunk is not None:
             self.on_chunk(transitions)
         self._release_skipped()
+
+    def _record(self, a, j, start, end, rows) -> list:
+        """Report a group's answers to the admission; return its transitions."""
+        result = self.sched.report(a, j, start, end, rows)
+        if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
+            del self.own[(j, a)]
+        if self.on_answers is not None:
+            self.on_answers(a, j, start, end, rows)
+        for settlement in result.settlements:
+            self._event(settlement)
+        return result.transitions
+
+    def _record_answers(self) -> list:
+        """Report the answer stage of each document whose answer ended."""
+        if self.decoder is None:
+            return []
+        self.decoder.harvest()
+        self.answered.update(a for a, _ in self.decoder.take_finished())
+        transitions = []
+        for a in sorted(self.answered & self.deferred.keys()):
+            self.answered.discard(a)
+            transitions.extend(self._record(a, *self.deferred.pop(a)))
+        return transitions
+
+    def _answers_landed(self):
+        """Report finished answers outside a chunk's own report."""
+        transitions = self._record_answers()
+        if transitions and self.on_chunk is not None:
+            self.on_chunk(transitions)
 
     def _report_next(self, partial=False):
         """Decide the oldest results, splitting append stages when no work is ready."""
@@ -574,12 +630,12 @@ class StageExecutor:
                                     else "rows")
             log(kind, **detail)
 
-    def _run_part(self, part):
+    def _run_part(self, part, decode=None):
         """Run one chunk of groups, halving it when its pages do not fit."""
         from quail.backends.quail.executor.chunk import ArenaFullError
 
         try:
-            self._run_one(part)
+            self._run_one(part, decode)
         except ArenaFullError as error:
             # retained KV nothing here reads makes room first
             need = self.arena.page_cost(sum(self._entry_rows(*e) for e in part))
@@ -587,19 +643,19 @@ class StageExecutor:
                 self._log_memory_event("evict_retry", groups=len(part))
                 logger.info("chunk of %d groups retried after evicting "
                             "retained KV", len(part))
-                self._run_part(part)
+                self._run_part(part, decode)
                 return
             if len(part) < 2:
                 raise
             self._log_memory_event("split", groups=len(part), reason=str(error))
             logger.info("chunk of %d groups split: %s", len(part), error)
             half = len(part) // 2
-            self._run_part(part[:half])
+            self._run_part(part[:half], decode)
             self._run_part(part[half:])
 
-    def _run_one(self, part):
+    def _run_one(self, part, decode=None):
         started = time.perf_counter()
-        chunk, entries = self._build(part)
+        chunk, entries, firsts = self._build(part, decode)
         self.pack_s += time.perf_counter() - started
         self.tokens += chunk.tokens
         if self.gpu_timing:
@@ -613,6 +669,13 @@ class StageExecutor:
             for entry in part:
                 stage = entry[1]
                 by_stage[stage] = by_stage.get(stage, 0) + self._entry_rows(*entry)
+            if decode is not None:
+                # a decode row counts toward its map's answer stage
+                maps = self.decoder.map[decode.slots]
+                for q, count in enumerate(np.bincount(maps).tolist()):
+                    if count:
+                        j = int(self.map_stages[q])
+                        by_stage[j] = by_stage.get(j, 0) + count
             self.spans.append((by_stage, chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
             self.arena.trim_window(key)
@@ -624,6 +687,9 @@ class StageExecutor:
             self._report_next()
         handles = self.readouts.submit(
             normed, entries, chunk.rows_per_answer)
+        if self.decoder is not None:
+            self.decoder.submit(normed, [row for row, _ in firsts],
+                                [a for _, a in firsts], chunk.decode_rows)
         self.outstanding.append(PendingAnswers(part, handles))
 
     def run(self):
@@ -632,6 +698,8 @@ class StageExecutor:
             # documents with nothing to send at their first stage never run
             for settlement in self.sched.take_settled():
                 self._event(settlement)
+            if self.decoder is not None:
+                self._answers_landed()
             if self.sched.done():
                 break
             if len(self.outstanding) > 1:
@@ -640,11 +708,22 @@ class StageExecutor:
                 # the free list is short for the next fresh document:
                 # retained KV nothing here reads makes room
                 self.arena.evict_retained(self.sched.blocked_pages)
+            decode = None if self.decoder is None else self.decoder.rows()
+            # the answers' rows come first; documents fill the rest
             groups = self.sched.next_chunk(
-                self.arena.free_pages if self.paged else 1 << 62)
+                self.arena.free_pages if self.paged else 1 << 62,
+                room=None if decode is None else max(
+                    0, self.sched.chunk_budget - len(decode)))
+            if not groups and decode is not None:
+                self._run_part([], decode)
+                continue
             if not groups:
                 if self.outstanding:
                     self._report_next(partial=True)
+                    continue
+                if self.decoder is not None and self.decoder.active:
+                    # every answer waits on a token still on its way
+                    self.decoder.harvest(wait=True)
                     continue
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):
@@ -654,7 +733,7 @@ class StageExecutor:
                 if self.arena.drop_holds(self.held):
                     continue
                 raise AssertionError("nothing buildable and nothing in flight")
-            self._run_part(groups)
+            self._run_part(groups, decode)
             # the packed children hold their parents' pages now
             for a, _, start, _, carried in groups:
                 parent = (self.borrowing.tree_parent[a]

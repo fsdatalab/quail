@@ -263,10 +263,7 @@ class Oracle:
 
     def _map(self, node, inputs) -> NodeResult:
         spec = node.spec
-        (value,) = inputs.values()
-        ids = [int(document) for document in (
-            value.ids[spec.aliases[0]].to_pylist() if isinstance(value, Rows)
-            else value)]
+        ids = [int(document) for document in inputs["document_ids"]]
         rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
         return NodeResult(
             {node.rows_port: score_rows(

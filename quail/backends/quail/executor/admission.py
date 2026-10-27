@@ -548,20 +548,21 @@ class JoinAdmission:
         self.in_flight += 1
         return end < self.num_partners(a, j)
 
-    def next_chunk(self, free_pages):
+    def next_chunk(self, free_pages, room=None):
         """Groups for the next chunk: [(anchor, stage, start, end, carried)].
 
         start and end index the anchor's own partner list at the
         stage; partner_indices() maps them to the stage's list.
         carried means the anchor's prefix tokens are packed and its KV
         written to its pages. free_pages is the arena's free list;
-        fresh anchors admit against it. Returns [] when nothing is
-        buildable.
+        fresh anchors admit against it. room is the chunk's tokens left
+        for groups, the chunk budget when None. Returns [] when nothing
+        is buildable.
         """
         self.blocked_pages = 0
         if self.limit_reached():
             return []
-        room = self.chunk_budget
+        room = self.chunk_budget if room is None else room
         groups = []
         continued = []
         deferred = []

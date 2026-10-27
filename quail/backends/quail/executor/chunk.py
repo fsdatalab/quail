@@ -37,6 +37,8 @@ class Chunk:
         rows_per_answer: Rows of final_indices each answer takes, one
             entry per suffix in chunk order, when some suffix reads
             more than its last row; None when every answer is one row.
+        decode_rows: The DecodeRows packed after the groups, or None.
+            Their rows come last in the chunk and in final_indices.
     """
 
     input_ids: Any
@@ -50,6 +52,34 @@ class Chunk:
     temporary_keys: tuple = ()
     fresh_keys: tuple = ()
     rows_per_answer: np.ndarray | None = None
+    decode_rows: Any = None
+
+
+@dataclass
+class DecodeRows:
+    """One row per running answer, appended after a chunk's groups.
+
+    Each row feeds the answer's last chosen token, which the GPU wrote
+    into a token buffer after the pass before, writes the row's KV into
+    the answer's own pages, and reads the answer's pages through its
+    position in one causal paged attention call.
+
+    Attributes:
+        positions: Rotary position of each row, which is also where its
+            KV is written in the answer's sequence.
+        write_rows: Arena row each row's KV is written to.
+        page_table: Per row, the answer's page ids in logical order,
+            padded on the right.
+        slots: Per row, where its input token sits in the token buffer.
+    """
+
+    positions: np.ndarray
+    write_rows: np.ndarray
+    page_table: np.ndarray
+    slots: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.positions)
 
 
 class ArenaFullError(RuntimeError):
@@ -265,10 +295,18 @@ class _PoolBuilder:
         self.dst = []
         self.tail_src = []
         self.tail_dst = []
+        # (page table, lengths) blocks of one-row sequences, after the rows
+        self.blocks = []
 
     def add_sequence(self, pages, kv_tokens):
         self.page_rows.append(pages)
         self.lengths.append(kv_tokens)
+
+    def add_block(self, rows: DecodeRows, r0: int):
+        """Add one one-row sequence per decode row, starting at input row r0."""
+        self.blocks.append((rows.page_table, rows.positions + 1))
+        self.src.append(np.arange(r0, r0 + len(rows), dtype=np.int64))
+        self.dst.append(rows.write_rows)
 
     def scatter_direct(self, view, r0, r1, logical_start):
         """Map input rows to the key's KV pages at the given logical position.
@@ -296,15 +334,25 @@ class _PoolBuilder:
 
     def build(self, arena, stage, torch, staging, index):
         tag = "" if index == 0 else "_sliding"
-        if staging is None:
+        lengths = np.concatenate(
+            [np.asarray(self.lengths, dtype=np.int64)]
+            + [block_lengths for _, block_lengths in self.blocks])
+        page_rows = self.page_rows + [
+            row for table, _ in self.blocks for row in table]
+        if staging is None and not self.blocks:
             table = arena.block_table_rows(self.page_rows)
         else:
-            width = max(map(len, self.page_rows))
-            block_table = np.zeros((len(self.page_rows), width), dtype=np.int32)
+            width = max([len(pages) for pages in self.page_rows]
+                        + [table.shape[1] for table, _ in self.blocks])
+            block_table = np.zeros((len(lengths), width), dtype=np.int32)
             for row, pages in enumerate(self.page_rows):
                 block_table[row, :len(pages)] = pages
+            row = len(self.page_rows)
+            for table, _ in self.blocks:
+                block_table[row:row + len(table), :table.shape[1]] = table
+                row += len(table)
             table = stage(f"block_table{tag}", block_table, torch.int32).view(
-                len(self.page_rows), width)
+                len(lengths), width)
         return dict(
             src=stage(f"unified_src{tag}", _concatenate(self.src), torch.int64),
             dst=stage(f"unified_dst{tag}", _concatenate(self.dst), torch.int64),
@@ -312,13 +360,15 @@ class _PoolBuilder:
                             torch.int64) if self.tail_src else None),
             tail_dst=(stage(f"tail_dst{tag}", _concatenate(self.tail_dst),
                             torch.int64) if self.tail_dst else None),
-            used=stage(f"unified_lengths{tag}", self.lengths, torch.int32),
-            table=table, page_rows=self.page_rows, used_host=self.lengths,
-            max_used=max(self.lengths))
+            used=stage(f"unified_lengths{tag}", lengths.astype(np.int32),
+                       torch.int32),
+            table=table, page_rows=page_rows, used_host=lengths.tolist(),
+            max_used=int(lengths.max()))
 
 
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
-               attention_mode, staging=None, canvas=(), answer_row=0):
+               attention_mode, staging=None, canvas=(), answer_row=0,
+               decode=None):
     """Pack scheduled document groups into tensors for one forward pass.
 
     Groups remain in scheduler order. Each group contains key, prefix, f
@@ -348,6 +398,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         staging: Optional reusable host and device transfer buffers.
         canvas: Default diffusion answer canvas token IDs.
         answer_row: Canvas row used for the answer when not reading all rows.
+        decode: DecodeRows to pack after the groups, or None. They run
+            the unified path; their input ids are placeholders the
+            caller fills on the GPU.
 
     Returns:
         A Chunk containing token tensors, attention metadata, and readout rows.
@@ -600,6 +653,22 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 raise ValueError(
                     "unified attention requires pages for a kept "
                     "group - an unpaged kept group has no KV to read")
+    decode_row0 = num_tokens
+    if decode is not None and not len(decode):
+        decode = None
+    if decode is not None:
+        if attention_mode != "unified" or arena.has_sliding or getattr(
+                arena, "num_state_slots", 0):
+            raise ValueError("decode rows run the unified attention path of "
+                             "a model with every-token attention only")
+        count = len(decode)
+        id_parts.append(np.zeros(count, dtype=np.int64))
+        position.append(np.asarray(decode.positions, dtype=np.int64))
+        finals.append(np.arange(num_tokens, num_tokens + count, dtype=np.int64))
+        rows_per_answer.append(np.ones(count, dtype=np.int64))
+        cu_a.append(np.arange(num_tokens + 1, num_tokens + count + 1,
+                              dtype=np.int64))
+        num_tokens += count
     cu_a = np.concatenate(cu_a)
 
     t = _tick(timing, "pack_py", t)
@@ -637,7 +706,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
     unified = None
     temporary_keys = []
-    if attention_mode == "unified" and unified_groups:
+    if attention_mode == "unified" and (unified_groups or decode is not None):
         if len(unified_groups) != len(layout):
             raise ValueError(
                 "a unified chunk cannot mix paged and unpaged "
@@ -733,6 +802,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     if spec["canvas"]:
                         canvas_seq.append(len(cu_q) - 2)
 
+            if decode is not None:
+                pools[0].add_block(decode, decode_row0)
+                cu_q.extend(range(cu_q[-1] + 1, cu_q[-1] + len(decode) + 1))
             built = [pool.build(arena, stage, torch, staging, index)
                      for index, pool in enumerate(pools)]
             unified = dict(
@@ -820,7 +892,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         layout=layout, row_spans=tuple(row_spans),
         temporary_keys=tuple(temporary_keys),
         fresh_keys=tuple(fresh_keys),
-        rows_per_answer=(np.concatenate(rows_per_answer) if multi_row else None))
+        rows_per_answer=(np.concatenate(rows_per_answer) if multi_row else None),
+        decode_rows=decode)
     _tick(timing, "pack_h2d", t)
     return out
 
