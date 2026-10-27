@@ -243,8 +243,13 @@ def test_a_request_backend_writes_each_maps_answers(monkeypatch, backend, calls)
         quail.backends.base.BackendExecutionContext(
             request=query._prepare_physical(), graph=plan.graph,
             registry=session.registry, gpus=1, runtime_state={}))
-    rows = query.finish(response).collect().sort_by("r.id").to_pydict()
+    result = query.finish(response)
+    rows = result.collect().sort_by("r.id").to_pydict()
     assert rows["summary"] == ["ok 64"] * 3
     assert rows["topic"] == ["ok 16"] * 3
     assert client.calls == calls
+    # each map's step counts its own three requests, once
+    steps = result.report["backend_metrics"]["steps"]
+    assert [(step["output"], step["requests"]) for step in steps] == [
+        ("summary", 3), ("topic", 3)]
     session.close()

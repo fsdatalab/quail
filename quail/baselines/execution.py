@@ -501,15 +501,14 @@ class RequestModelExecution:
                        if self.filter_submission == "operator-at-a-time"
                        else [specs])
             for batch in batches:
-                result = map_documents(
+                results = map_documents(
                     self.client, batch, self._map_bodies(node, alias, batch[0],
                                                          document_ids))
-                for spec, answers in zip(batch, result["answers"]):
+                for spec, result in zip(batch, results):
                     outputs[f"map_answers:{spec.output}"] = map_rows(
-                        alias, spec.output, document_ids, answers)
+                        alias, spec.output, document_ids, result["answers"])
                     steps.append(request_step(
-                        {**result, "answers": answers}, kind="map",
-                        alias=alias, output=spec.output,
+                        result, kind="map", alias=alias, output=spec.output,
                         num_in=len(document_ids), num_out=len(document_ids)))
 
     def _map_bodies(self, node, alias, spec, document_ids) -> list:

@@ -344,8 +344,8 @@ def map_documents(client, specs, bodies) -> dict:
             text for an engine that tokenizes the prompt itself.
 
     Returns:
-        A dict with one answer list per spec, the request and token
-        counts, and the generation seconds.
+        One result per spec: its answers, its request and token counts,
+        and the seconds of the whole run.
     """
     prompts, params = [], []
     limits = [client.decode_params(spec.max_answer_tokens) for spec in specs]
@@ -358,13 +358,16 @@ def map_documents(client, specs, bodies) -> dict:
     started = time.perf_counter()
     outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
     wall_s = time.perf_counter() - started
-    texts = [(output.outputs[0].text or "").strip() for output in outputs]
-    return {
-        "answers": [texts[index::len(specs)] for index in range(len(specs))],
-        "wall_s": wall_s,
-        "requests": len(outputs),
-        **_generation_counts(outputs),
-    }
+    results = []
+    for index in range(len(specs)):
+        own = outputs[index::len(specs)]
+        results.append({
+            "answers": [(output.outputs[0].text or "").strip() for output in own],
+            "wall_s": wall_s,
+            "requests": len(own),
+            **_generation_counts(own),
+        })
+    return results
 
 
 def allowed_members_by_anchor(anchor, partners, anchor_ids, members, pairs) -> list:
