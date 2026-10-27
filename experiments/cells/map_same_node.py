@@ -30,7 +30,6 @@ volume; the function prints its path.
 """
 
 import json
-from functools import partial
 import os
 import subprocess
 import sys
@@ -38,6 +37,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 from bench.quailb_parallel import DATA_DIR, VOLUMES, app, image, results_vol
