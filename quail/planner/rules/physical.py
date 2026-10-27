@@ -436,6 +436,15 @@ class ChooseAttentionAlgorithm(PhysicalRule):
                         node_tokens=_mean(lengths))
             elif isinstance(node, AiMap):
                 path = "unified"
+                # TODO: this picks tree for short documents, where
+                # unified measured faster: IMDB three maps (219-token
+                # median) ran 82.2 s unified and 88.6 s tree, while
+                # CUAD three maps (4,518-token median) ran 10.9 s
+                # unified and 10.7 s tree (in /results/ablations,
+                # map_same_node_qwen3-4b-fp8_sf0.1_20261027T074309Z.json).
+                # The estimate counts every map as reading the
+                # document for the whole run, but branches share it
+                # only while all of them are still writing.
                 if tree_available:
                     alias = node.spec.alias
                     readers = sum(isinstance(other, AiMap)
