@@ -62,6 +62,20 @@ def prior_inputs(node, parts, inputs):
     return priors, prior_tables
 
 
+def document_inputs(node, inputs, context, sequence=None, nodes=None):
+    """Return a one-table node's document ids and the tokenized documents.
+
+    The node's one input carries the documents' ids, or the rows of an
+    earlier operator over them.
+    """
+    if nodes is not None:
+        inputs = inputs[node.node_id]
+    (value,) = inputs.values()
+    ids = (value.ids[node.spec.aliases[0]].to_numpy()
+           if isinstance(value, Rows) else np.asarray(value, dtype=np.int64))
+    return {"document_ids": ids, "documents": context.state["documents"]}
+
+
 def join_prior_rows(rows: Rows, alias, priors, prior_tables) -> Rows:
     """Join columns from preceding operators onto the surviving documents."""
     prior_results = (part.results()[port.node_id].outputs[port.port]

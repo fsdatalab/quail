@@ -20,6 +20,7 @@ from quail.backends.quail.executor.operators.filter import FilterPart
 from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import run_stages
+from quail.catalog.tokens import prefix_tree
 
 VOCABULARY = 1024
 STOP = VOCABULARY - 1
@@ -147,4 +148,44 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
     assert decoder.rows_fed.min() > 0
     assert (question is None) == all(passed)
     assert not decoder.active
+    assert not arena.accounting.owned
+
+
+@pytest.mark.parametrize("path", ["unified", "tree"])
+@pytest.mark.parametrize("lag", [0, 3])
+def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path,
+                                                              lag):
+    cpu_staging(monkeypatch)
+    rng = np.random.default_rng(1)
+    documents = [rng.integers(20, 900, size=int(n)).tolist()
+                 for n in rng.integers(3, 60, size=10)]
+    tails = [[500, 501, 502], [600, 601], [650, 651, 652, 653]]
+    limits = [6, 4, 5]
+    setup = Setup(path=path, pages=300, budget=200)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk,
+                             tree_attention=True, canvas_ids=())
+    torch_ = events_torch(lag)
+    ids = list(range(len(documents)))
+    maps = MapPart(None, [map_node(f"m{q}", tail, limit)
+                          for q, (tail, limit) in enumerate(zip(tails, limits))],
+                   ids, 0, branches=True)
+    prefixes = [document for document in documents for _ in tails]
+    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), limits,
+                         [STOP], setup.page_tokens)
+    maps.decoder = decoder
+    stats = {}
+    run_stages(torch_, arena, pipeline, gated_stages([maps]), prefixes, setup.budget,
+               anchor_keys=[(("d", q), d) for d in ids for q in range(len(tails))],
+               attention_mode=path,
+               prefix_tree=prefix_tree(prefixes, setup.page_tokens),
+               decoder=decoder, stats=stats)
+    for q, (tail, limit) in enumerate(zip(tails, limits)):
+        assert maps.asked[q].all()
+        got = [answer.tolist() for answer in decoder.answers(
+            q, maps._slots(q, ids))]
+        assert got == [greedy(document + tail, limit) for document in documents]
+    # the branches of a document borrow its prompt's whole pages
+    assert stats["borrowed_tokens"] > 0
     assert not arena.accounting.owned

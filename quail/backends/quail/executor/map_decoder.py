@@ -82,6 +82,9 @@ class MapDecoder:
         self.copies = deque()
         self.finished = []      # (document, map) whose answers ended
         self.rows_fed = np.zeros(len(self.limits), dtype=np.int64)  # per map
+        # per slot, the map its answers are for, or None when each
+        # stage names its map
+        self.slot_maps = None
 
     # ---- documents entering and leaving -----------------------------------
 
@@ -98,6 +101,8 @@ class MapDecoder:
         """
         if self.map[document] >= 0:
             raise ValueError(f"document {document} is already writing an answer")
+        if self.slot_maps is not None:
+            map_index = int(self.slot_maps[document])
         pages = np.asarray(pages, dtype=np.int32)
         if len(pages) > self.pages.shape[1]:
             wider = np.zeros((len(self.map), len(pages)), dtype=np.int32)

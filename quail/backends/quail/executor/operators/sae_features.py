@@ -7,6 +7,7 @@ import pyarrow as pa
 
 from quail.backends.quail.executor.parts import (
     SingleResultPart,
+    document_inputs,
     join_prior_rows,
     prior_inputs,
 )
@@ -44,17 +45,7 @@ def _feature_column(lengths, indices, strengths) -> pa.ListArray:
 class SaeFeaturesPart(SingleResultPart):
     """One feature call's stage and result table within a pipeline."""
 
-    @staticmethod
-    def model_inputs(node, inputs, context, sequence=None, nodes=None):
-        if nodes is not None:
-            inputs = inputs[node.node_id]
-        # the one input carries the documents' ids, or the rows of an
-        # earlier operator over them
-        (value,) = inputs.values()
-        ids = (value.ids[node.spec.aliases[0]].to_numpy()
-               if isinstance(value, Rows)
-               else np.asarray(value, dtype=np.int64))
-        return {"document_ids": ids, "documents": context.state["documents"]}
+    model_inputs = staticmethod(document_inputs)
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
