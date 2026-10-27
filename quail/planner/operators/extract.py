@@ -5,17 +5,12 @@ from dataclasses import replace
 from quail.cost import budgets
 from quail.cost import extract as extract_cost
 from quail.cost.retention import coefficients
-from quail.logical import effective_selectivity
-from quail.physical import (
-    AiExtract,
-    ExtractSpec,
-    Filter,
-    PortRef,
-)
-from quail.physical.base import input_ports
+from quail.physical import AiExtract, ExtractSpec
 from quail.planner.operators.common import (
     bind_inference,
+    emit_calls,
     inference_node,
+    node_index,
 )
 
 
@@ -92,37 +87,17 @@ def emit_extract(builder, alias, expected_rows, names, port, resident=False) -> 
     """
     extracts = {node.name: node for node in builder.operators.extracts
                 if node.alias == alias}
-    calls = [extracts[name] for name in names]
-    tests = builder.operators.extract_filters.get(alias, ())
-    row_ports = []
-    for index, logical_node in enumerate(calls):
-        # the extractions of a table and the Filters on their answers
-        # run in one pipeline (quail.physical.pipelines): a document
-        # is read once for all of them, and a Filter drops it before
-        # the next question
-        spec = extract_spec(
-            builder.context,
-            logical_node.call,
-            logical_node.name,
-            expected_rows,
-            resident=resident or index > 0,
-        )
-        node = inference_node(
-            AiExtract, spec, (port,),
-            index=sum(isinstance(n, AiExtract) for n in builder.nodes),
-            backend="quail", model=builder.model.name)
-        builder.nodes.append(node)
-        port = PortRef(node.node_id, node.rows_port)
-        for test in tests:
-            if test.name != logical_node.name:
-                continue
-            filter_id = f"filter:{alias}:{test.position}"
-            builder.nodes.append(Filter(
-                node_id=filter_id, inputs=input_ports((port,)),
-                predicate=test.condition, aliases=(alias,),
-                selectivity=test.selectivity, written_position=test.position))
-            port = PortRef(filter_id, f"rows:{alias}")
-            expected_rows *= effective_selectivity(test.selectivity)
-        row_ports.append(port)
-    return port, row_ports
+    tests = {}
+    for test in builder.operators.extract_filters.get(alias, ()):
+        tests.setdefault(test.name, []).append(test)
 
+    def node_of(name, port, expected_rows, index):
+        logical_node = extracts[name]
+        spec = extract_spec(builder.context, logical_node.call, name,
+                            expected_rows, resident=resident or index > 0)
+        return inference_node(
+            AiExtract, spec, (port,), index=node_index(builder, AiExtract),
+            backend="quail", model=builder.model.name)
+
+    return emit_calls(builder, alias, expected_rows, port, names, node_of,
+                      tests=tests)
