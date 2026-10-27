@@ -761,4 +761,11 @@ class StageExecutor:
             self.stats["skipped_documents"] = len(self.sched.oversized)
         if self.spans:
             self.torch.cuda.synchronize()
+            # between forward passes the GPU runs readouts and uploads,
+            # and waits when the host is late
+            between = sum(max(0.0, end.elapsed_time(start))
+                          for (*_, end), (*_, start, _)
+                          in zip(self.spans, self.spans[1:])) / 1000.0
+            logger.info("%s: %d forward passes, %.3f s of GPU time between them",
+                        self.label, len(self.spans), between)
         return self.sched.answers, self.spans, self.tokens

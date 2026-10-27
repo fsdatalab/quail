@@ -38,7 +38,7 @@ CACHE_ENV = {
 # the images mount the quail source rather than install the project,
 # so this metadata declares the vLLM plugin pyproject.toml declares
 # (quail.baselines.vllm.register_gigatoken) for vLLM's processes to load
-PLUGIN_METADATA = (
+PLUGIN_METADATA_SCRIPT_TEXT = (
     "import pathlib, sysconfig; "
     "d = pathlib.Path(sysconfig.get_paths()['purelib']) "
     "/ 'quail_vllm_plugins-0.dist-info'; d.mkdir(exist_ok=True); "
@@ -73,7 +73,7 @@ def gpu_image(*local_dirs: tuple[str, str],
             a profiler a cell runs.
     """
     image = (_cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
-             .run_commands(f'python -c "{PLUGIN_METADATA}"'))
+             .run_commands(f'python -c "{PLUGIN_METADATA_SCRIPT_TEXT}"'))
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
     image = image.add_local_python_source("quail", "bench")

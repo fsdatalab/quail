@@ -224,17 +224,32 @@ class Suffixes:
         return Suffixes(self.ids[rows], lengths)
 
 
+# the passes a staged input buffer goes unused before the host refills
+# it; more than the passes the host builds ahead (map_decoder.IN_FLIGHT)
+STAGING_DEPTH = 4
+
+
 class InputStaging:
-    """Reuse CPU and GPU input buffers on the current CUDA stream."""
+    """Reuse CPU and GPU input buffers on the current CUDA stream.
+
+    Each name rotates through STAGING_DEPTH buffers. The CPU must not
+    overwrite a pinned buffer while its upload is pending, so it waits on
+    the buffer's last upload; with one buffer that upload belongs to the
+    pass just queued, and the host could never build more than one pass
+    ahead of the GPU. With a ring, the wait falls on an upload several
+    passes back, which has landed unless the host is that far ahead.
+    """
 
     def __init__(self, torch):
         self.torch = torch
-        self.buffers = {}
+        self.buffers = {}     # name -> the buffer in use: host, device, event
+        self.rings = {}       # name -> (next slot, list of buffers or None)
         self.fixed_tokens = {}
 
     def host(self, name, count, dtype):
         torch = self.torch
-        previous = self.buffers.get(name)
+        slot, ring = self.rings.get(name, (0, [None] * STAGING_DEPTH))
+        previous = ring[slot]
         if previous is not None:
             host, device, event = previous
             # The CPU must not overwrite a buffer while its transfer is pending.
@@ -243,7 +258,8 @@ class InputStaging:
             host = torch.empty(count, dtype=dtype, pin_memory=True)
             device = torch.empty(count, dtype=dtype, device="cuda")
             event = torch.cuda.Event()
-        self.buffers[name] = host, device, event
+        ring[slot] = self.buffers[name] = host, device, event
+        self.rings[name] = (slot + 1) % STAGING_DEPTH, ring
         return host[:count]
 
     def upload(self, name, count):
