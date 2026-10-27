@@ -74,22 +74,6 @@ def pages(tokens: int, page_tokens: int = PAGE_TOKENS) -> int:
 DECODE_GEMM_EFFICIENCY = 0.4
 
 
-def ridge_tokens(model: ModelSpec, device: DeviceSpec) -> float:
-    """Fed tokens per forward pass at which the weight work turns compute bound.
-
-    A pass of T tokens does 2 flops per weight per token and reads each
-    weight's bytes once, so compute passes memory at T = GEMM flops
-    times the weight's bytes over twice the HBM bytes per second; the
-    weight count cancels. The flops are the decode passes' achieved
-    rate. For a mixture-of-experts model each token reads a fraction
-    of the weights, so the true ridge is higher; the estimate stays a
-    safe lower bound for pricing a marginal token.
-    """
-    weight_bytes = 1.0 if model.weight_precision == "fp8" else 2.0
-    return (device.gemm_flops(model.weight_precision) * DECODE_GEMM_EFFICIENCY
-            * weight_bytes / (2.0 * device.hbm_bw))
-
-
 def round_cost_per_token(model: ModelSpec, device: DeviceSpec) -> float:
     """One document token's KV read per decode round, in fed tokens.
 

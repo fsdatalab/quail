@@ -14,7 +14,7 @@ and the result asserts the two match. The configurations are:
   one pipeline and vLLM gets as each document's two prompts together,
   the classification as one greedy token among the labels' tokens.
 
-Quail runs the adaptive draft policy with GPU timing; vLLM decodes
+Quail decodes one token per round with GPU timing; vLLM decodes
 greedily without speculation, with its own CUDA graph capture sizes,
 prefix caching on, and its prefix cache reset before each
 configuration. Query time excludes model startup for both; startup
@@ -265,8 +265,7 @@ def _quail(model: str, directory: Path, configurations) -> dict:
     from bench.quailb import register_tables
     from quail.specs import H100_USD_PER_HOUR
 
-    result = {"engine": "Quail", "gpu": _gpu(), "draft_policy": "adaptive",
-              "runs": {}}
+    result = {"engine": "Quail", "gpu": _gpu(), "runs": {}}
     with quail.Session(quail.EngineConfig(
             model=model, device="h100-sxm", backend="quail",
             gpu_timing=True)) as session:

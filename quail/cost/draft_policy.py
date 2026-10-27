@@ -1,23 +1,17 @@
-"""The draft length of each decode round, chosen from its cost and odds.
+"""The draft length of each extraction round, chosen from its cost and odds.
 
 A round feeds the chosen token and a draft, and pays one read of the
-document's KV however long the draft is; each policy picks the draft
+document's KV however long the draft is; the policy picks the draft
 length that costs the least per written token, under the answer-length
 curve learned from the answers that settle. An extraction's draft
 follows one of the document positions the answer so far fits, and its
-odds of writing are learned per count of live positions. A map's draft
-is copied from the document or chained from the n-gram cache, with the
-chain's per-hop odds learned per match length, fan-out range, and
-source, and a fed token priced by the forward pass: close to free
-below the compute-memory ridge, one token of compute above it.
+odds of writing are learned per count of live positions.
 """
 
 import bisect
 import math
 
 import numpy as np
-
-from quail.cost.ngram_cache import MATCH_ORDERS, MAX_CONTINUATIONS
 
 # how many observations the seed of each curve weighs
 PRIOR_WEIGHT = 8
@@ -155,124 +149,3 @@ class ExtractDraftPolicy:
         b = _bucket(num_streams)
         self.trials[b] += 1
         self.accepts[b] += accepted
-
-
-# the seed of the copy acceptance rate: a model that is quoting tends
-# to keep quoting, and the rate is corrected from verified rounds
-COPY_RATE_SEED = 0.8
-# the acceptance odds are learned per range of distinct continuations
-FAN_BUCKETS = (1, 2, 4, 8)
-_FAN_LOGS = [math.log1p(b) for b in FAN_BUCKETS]
-_SOURCES = 2    # the drafting document's own output, or a sibling's
-
-
-def _nearest_bucket(fan_out: int) -> int:
-    """Return the index of the fan-out range nearest on a log scale."""
-    x = math.log1p(fan_out)
-    i = bisect.bisect_left(_FAN_LOGS, x)
-    if i == 0 or i == len(_FAN_LOGS):
-        return min(i, len(_FAN_LOGS) - 1)
-    return i if _FAN_LOGS[i] - x < x - _FAN_LOGS[i - 1] else i - 1
-
-
-# the cache keeps at most a handful of continuations per key, so the
-# buckets of small fan-outs cover every lookup
-_SMALL_FAN_BUCKETS = tuple(_nearest_bucket(f) for f in range(64))
-
-
-def _fan_bucket(fan_out: int) -> int:
-    """Return the index of the fan-out range nearest on a log scale."""
-    if fan_out < len(_SMALL_FAN_BUCKETS):
-        return _SMALL_FAN_BUCKETS[fan_out]
-    return _nearest_bucket(fan_out)
-
-
-# (match order, fan-out, own) -> the acceptance table's cell; the
-# fan-out is at most MAX_CONTINUATIONS
-_CELLS = {
-    (order, fan_out, own): (
-        (index * len(FAN_BUCKETS) + _fan_bucket(fan_out)) * _SOURCES + int(own))
-    for index, order in enumerate(MATCH_ORDERS)
-    for fan_out in range(0, MAX_CONTINUATIONS + 1)
-    for own in (False, True)}
-# the same table indexed by (order, fan-out, own) arrays
-_CELL_TABLE = np.zeros((max(MATCH_ORDERS) + 1, MAX_CONTINUATIONS + 1, 2),
-                       dtype=np.int64)
-for (_order, _fan_out, _own), _cell in _CELLS.items():
-    _CELL_TABLE[_order, _fan_out, int(_own)] = _cell
-
-
-class MapDraftPolicy:
-    """Chooses each round's draft length for one instruction.
-
-    Args:
-        cap: The most draft tokens a round may feed.
-        max_answer_tokens: The answer limit; drafts stop before it.
-        expected_answer_tokens: The planner's guess at the mean answer
-            length, the seed of the answer-length curve until answers
-            settle.
-    """
-
-    def __init__(self, cap: int, max_answer_tokens: int,
-                 expected_answer_tokens: int):
-        self.cap = cap
-        self.max_answer_tokens = max_answer_tokens
-        self.curve = AnswerLengthCurve(max_answer_tokens, expected_answer_tokens)
-        cells = len(MATCH_ORDERS) * len(FAN_BUCKETS) * _SOURCES
-        self.trials = np.zeros(cells, dtype=np.int64)
-        self.accepts = np.zeros(cells, dtype=np.int64)
-        # copied drafts' verified tokens: unlike an extraction, a map's
-        # answer may leave the document at any token, so a copy is a
-        # per-token bet like a chain hop
-        self.copy_trials = 0
-        self.copy_accepts = 0
-
-    def copy_rate(self) -> float:
-        """Return P(the model writes a copied draft's next token)."""
-        return ((PRIOR_WEIGHT * COPY_RATE_SEED + self.copy_accepts)
-                / (PRIOR_WEIGHT + self.copy_trials))
-
-    def odds_many(self, order: np.ndarray, fan_out: np.ndarray, own: np.ndarray,
-                  share: np.ndarray) -> tuple:
-        """Return many cache matches' cells and hit rates at once."""
-        cells = _CELL_TABLE[order, fan_out, own.astype(np.int64)]
-        rates = ((PRIOR_WEIGHT * share + self.accepts[cells])
-                 / (PRIOR_WEIGHT + self.trials[cells]))
-        return cells, rates
-
-    def chain_lengths(self, rho: np.ndarray, written: np.ndarray,
-                      rates: np.ndarray, slack: float, room: np.ndarray) -> np.ndarray:
-        """Return each round's draft length with the least cost per written token.
-
-        The first slack draft tokens ride a pass below the ridge, so
-        they cost nothing; each one past the slack costs one token.
-        Draft token j writes when the answer goes on and every hop
-        through j wrote. A round whose best draft costs no less than
-        feeding no draft feeds none.
-
-        Args:
-            rho: Each round's KV read, in fed tokens.
-            written: Each answer's tokens so far.
-            rates: (rounds, cap) acceptance odds per hop, in hop order;
-                a hop past the draft's end has odds 0.
-            slack: Fed tokens the current passes carry for free.
-            room: The most tokens each draft may have.
-
-        Returns:
-            Per round, the draft length.
-        """
-        gamma = np.arange(1, self.cap + 1)
-        levels = np.asarray(self.curve.levels())
-        base = levels[written]
-        ahead = levels[np.minimum(written[:, None] + gamma[None, :],
-                                  self.max_answer_tokens)]
-        ratio = np.where(base[:, None] > 0, ahead / np.where(base > 0, base, 1.0)
-                         [:, None], 1.0)
-        chained = np.cumprod(rates, axis=1)
-        writes = 1.0 + np.cumsum(chained * ratio, axis=1)
-        extra = np.maximum(gamma - slack, 0.0)
-        cost = (rho[:, None] + 1.0 + extra[None, :]) / writes
-        cost[gamma[None, :] > room[:, None]] = np.inf
-        best = np.argmin(cost, axis=1) + 1
-        best[np.min(cost, axis=1) >= rho + 1.0] = 0
-        return best

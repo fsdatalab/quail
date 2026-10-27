@@ -19,21 +19,8 @@ class MapSpec(InferenceSpec):
     Attributes:
         instruction: The instruction the answer is written for.
         max_answer_tokens: Maximum tokens in a written answer.
-        draft_tokens: Tokens to verify after each chosen token; the
-            most per round under the adaptive policy. 0 feeds the
-            chosen token alone.
-        draft_policy: "adaptive" sizes each round's draft from its
-            acceptance odds, the round's KV read, and the pass's
-            slack; "fixed" copies up to draft_tokens from the document.
         expected_answer_tokens: The planner's guess at the mean answer
             length.
-        round_cost_per_token: One document token's KV read per round,
-            in fed tokens of compute; the planner sets it from the
-            model and device.
-        ridge_tokens: Fed tokens per forward pass at which the weight
-            work turns compute bound; the planner sets it from the
-            model and device. Below it a marginal draft token is close
-            to free.
         top_tokens: Vocabulary candidates returned by each GPU readout.
             Greedy decoding needs the likeliest token alone, so each
             row carries three values: the stop, the token, and its log
@@ -42,33 +29,20 @@ class MapSpec(InferenceSpec):
 
     instruction: str = ""
     max_answer_tokens: int = 256
-    draft_tokens: int = 15
-    draft_policy: str = "adaptive"
     expected_answer_tokens: int = 64
-    round_cost_per_token: float = 0.0
-    ridge_tokens: float = 0.0
     top_tokens: int = 1
 
     def __post_init__(self):
         for name in ("max_answer_tokens", "expected_answer_tokens", "top_tokens"):
             validate_integer_setting(name, getattr(self, name), minimum=1)
-        validate_integer_setting("draft_tokens", self.draft_tokens, minimum=0)
-        if self.draft_policy not in ("fixed", "adaptive"):
-            raise ValueError("draft_policy is 'fixed' or 'adaptive'")
-        for name in ("round_cost_per_token", "ridge_tokens"):
-            value = getattr(self, name)
-            if not isinstance(value, (int, float)) or value < 0:
-                raise ValueError(f"{name} is a nonnegative number")
 
     def same_decoding(self, other: "MapSpec") -> bool:
         """Return whether two maps can use the same decoder.
 
         Each map keeps its own answer limit and expected answer length;
-        the drafts, their pricing, and the readout are shared.
+        the readout is shared.
         """
-        return all(getattr(self, name) == getattr(other, name) for name in (
-            "draft_tokens", "draft_policy", "round_cost_per_token",
-            "ridge_tokens", "top_tokens"))
+        return self.top_tokens == other.top_tokens
 
     @property
     def alias(self) -> str:

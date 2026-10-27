@@ -390,7 +390,7 @@ class ChooseAttentionAlgorithm(PhysicalRule):
     per node and stays on the unified path.
 
     A map is annotated for its branches: the maps over one table are
-    the readers of each document, each with one decode round's rows.
+    the readers of each document, each with one decode row.
 
     The choice is recomputed on every pass, so a plan first made on
     estimated lengths gets the path its exact tokens call for.
@@ -443,7 +443,7 @@ class ChooseAttentionAlgorithm(PhysicalRule):
                                   for other in graph.nodes)
                     path = choose_attention_path(
                         model, device, readers=readers,
-                        reader_rows=1 + node.spec.draft_tokens,
+                        reader_rows=1,
                         node_tokens=_mean(context.document_tokens.get(alias, ())))
             if path is not None and forced is not None:
                 path = forced

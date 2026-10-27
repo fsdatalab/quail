@@ -9,8 +9,7 @@ in a table. The answers must equal greedy decoding, and their lengths
 are not known before the run. This page describes how Quail executes a
 map query on one GPU. Quail decodes every running answer in each
 forward pass and decides each pass one pass later, so the GPU never
-waits for the host. Quail copies likely next tokens from the document
-as drafts and verifies them in the same pass. Quail gives each answer
+waits for the host. Quail gives each answer
 KV pages as the answer grows, and it starts a new answer only while
 every running answer can still finish, so no answer is preempted. When
 several maps read one document, Quail reads the document's KV once for
@@ -82,8 +81,8 @@ does not depend on $k$, and all $K$ prompts can read the same KV.
 - A **page** is a block of KV for 16 tokens. A branch holds pages for
   its own tokens. The $K$ branches of one document hold references to
   the same document pages.
-- A **round** is one step of one branch: it feeds one chosen token and
-  zero or more draft tokens, and it reads one output row per fed token.
+- A **round** is one step of one branch: it feeds the token chosen
+  before it and reads one output row, which chooses the next token.
 - A **pass** is one forward pass of the model over a batch of rounds
   and prompt prefills.
 - A **running** branch has started its answer and has not ended.
@@ -105,14 +104,14 @@ Output: an answer for each branch
           move head of queue to the end of run
       batch ← PACK(new branches, one round per branch in run)  // Section 6
       launch batch on the GPU
-      queue the readout of batch on the GPU      // Section 5.3
+      queue the readout of batch on the GPU      // Section 5.2
       if pending: DECIDE(pending)                // Section 5
       pending ← batch
       remove ended branches from run, and free their own pages
 ```
 
 The GPU runs the passes in order. The host prepares pass $t+1$ and
-decides pass $t-1$ while the GPU runs pass $t$. Section 5.3 shows why
+decides pass $t-1$ while the GPU runs pass $t$. Section 5.2 shows why
 the host can decide one pass late without making the GPU wait.
 
 ## 4. Admission and KV growth
@@ -207,71 +206,36 @@ pass.
 
 ## 5. Decoding rounds
 
-### 5.1 Verification
+### 5.1 One token per round
 
-A round feeds a token $t_0$ and a draft $t_1, \ldots, t_\gamma$. The
-model returns an output row after each fed token. Row $i$ gives the
-greedy choice $c_i$ for the position after $t_i$. Quail accepts draft
-token $t_{i+1}$ only if $c_i = t_{i+1}$. Let $a$ be the number of
-accepted draft tokens. The round writes $t_1, \ldots, t_a$ and the
-choice $c_a$. The answer ends if a row prefers the end of the turn, or
-if the answer reaches $L_k$.
+A round feeds one token $t$, the token the round before it chose. The
+model returns one output row after it, and that row's greedy choice
+$c$ is the answer's next token. The answer ends if the row prefers the
+end of the turn, or if the answer reaches $L_k$. Rounds feed no draft
+tokens: on IMDB with three maps, copied and cached drafts wrote 1.7%
+of the answer tokens, which did not pay for the host work of building
+them.
 
-### 5.2 Drafts
-
-Quail builds a draft in two ways:
-
-- **Copy from the document.** If the last written token, or the last
-  two, occur in the document, the draft is the document's tokens after
-  their first occurrence. Summaries often quote the document.
-- **Chain from answers.** An n-gram cache of the answers written so far
-  (orders 4, 3, and 2) predicts the next token from the last tokens.
-  Quail follows the cache from one prediction to the next. Answers to
-  one instruction often share phrases across documents.
-
-A round copies when it can and chains otherwise.
-
-Quail tracks the acceptance rate of each draft source and uses it as
-$r_i$, the probability that draft token $i$ is accepted given that
-token $i-1$ was accepted. A round costs one read of the branch's KV,
-expressed as $\rho$ fed tokens of compute. Fed tokens up to the pass's
-slack $s$ are free, because the pass is memory bound below that point.
-$S(w)$ is the probability that an answer with $w$ written tokens is
-still running. The adaptive policy chooses the draft length $\gamma$
-with the least cost per written token:
-
-$$
-\text{cost}(\gamma) =
-\frac{\rho + 1 + \max(\gamma - s, 0)}
-     {1 + \sum_{i=1}^{\gamma} \left(\prod_{j=1}^{i} r_j\right) \frac{S(w+i)}{S(w)}}
-$$
-
-If no $\gamma > 0$ costs less than $\gamma = 0$, the round feeds no
-draft.
-
-### 5.3 Device-fed rounds and the one-pass delay
+### 5.2 Device-fed rounds and the one-pass delay
 
 If the host must read pass $t$ before it builds the next round of a
 branch, the GPU waits for the host after each pass. Quail removes this
 wait. The readout of pass $t$ runs on the GPU and computes, for each
-round, the accepted count $a$ and the choice $c_a$. The round of pass
-$t+1$ is built on the host with a placeholder first token and a draft.
-On the GPU, before pass $t+1$ starts, index operations write $c_a$
-into the placeholder and move the round's positions, KV reads, and KV
-writes past the $a$ accepted tokens.
+round, the choice $c$. The round of pass $t+1$ is built on the host
+with a placeholder token. On the GPU, before pass $t+1$ starts, index
+operations write $c$ into the placeholder and move the round's
+position, KV read, and KV write one token on.
 
 ```text
 Algorithm 4: DECIDE(pass t), on the host, while the GPU runs pass t+1
   for each round r of pass t:
-      read a and c_a for r                    // copied after the readout of pass t
-      write the accepted tokens and c_a to the answer of r
+      read c for r                            // copied after the readout of pass t
+      write c to the answer of r
       if the answer ended: mark the branch to end
-      else: draft the round of pass t+2 from the answer so far
 ```
 
-The draft of pass $t+1$ was chosen before the host knew $a$. If the
-model rejects part of it, Algorithm 4 drafts pass $t+2$ from the
-corrected answer, so a wrong draft costs one round, not more.
+The round of pass $t+1$ for an answer that pass $t$ ended decides
+nothing; its row is dropped.
 
 ## 6. Attention on the tree path
 
@@ -324,10 +288,9 @@ graphs.
 
 ## 7. Properties
 
-**Exact answers.** A draft token is written only if the model's greedy
-choice at the row before it is that token (Section 5.1). Each answer is
-therefore the answer that greedy decoding writes with the same model
-and the same numerics. The numerics of a step depend slightly on the
+**Exact answers.** Each round writes the model's greedy choice at its
+row (Section 5.1), so each answer is the answer that greedy decoding
+writes with the same model and the same numerics. The numerics of a step depend slightly on the
 batch, so another engine's answers can differ. Section 9 reports the
 agreement with stock vLLM.
 
@@ -387,17 +350,12 @@ merge and the change that drops call A for round rows.
 - **Deadlock avoidance.** The safety check follows the banker's
   algorithm [3]: grant a resource only if all processes can still
   finish in some order.
-- **Speculative decoding.** Speculative decoding [4] verifies draft
-  tokens in one pass. Prompt lookup decoding [5] and REST [6] take
-  drafts from the prompt or a datastore instead of a draft model. Quail
-  copies drafts from the document and chooses each draft's length from
-  its cost (Section 5.2).
-- **Shared-prefix attention.** RadixAttention [7] reuses the KV of
-  shared prefixes. Hydragen [8] and cascade inference in FlashInfer [9]
+- **Shared-prefix attention.** RadixAttention [4] reuses the KV of
+  shared prefixes. Hydragen [5] and cascade inference in FlashInfer [6]
   compute attention over a shared prefix once for many queries and
   combine the parts by log-sum-exp, as Section 6 does.
 - **Survival analysis.** The answer-length estimate uses the
-  Kaplan–Meier estimator [10].
+  Kaplan–Meier estimator [7].
 
 ## 11. Code
 
@@ -406,8 +364,7 @@ merge and the change that drops call A for round rows.
 | Algorithm 1 | [`stage_executor.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stage_executor.py) | `StageExecutor.run` |
 | Algorithms 2 and 3 | [`growth.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/growth.py) | `KVGrowth.admits`, `KVGrowth.grow` |
 | Answer-length estimate | [`map/decoder.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/decoder.py) | `MapDecoder.survival`, `MapDecoder.remaining` |
-| Algorithm 4, drafts | [`map/decoder.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/decoder.py) | `MapDecoder.round` |
-| Draft length | [`draft_policy.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/draft_policy.py) | `MapDraftPolicy.chain_lengths` |
+| Algorithm 4 | [`map/decoder.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/decoder.py) | `MapDecoder.round` |
 | Device-fed rounds | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py), [`chunk.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/chunk.py) | `round_feed`, `Chunk.apply_feed` |
 | Section 6 | [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py), [`chunk.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/chunk.py), [`cuda_graphs.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/cuda_graphs.py) | `Engine.attention_tree`, `pack_chunk`, `DecodeGraphs` |
 | Branches | [`map/stages.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/map/stages.py) | `MapStages` |
@@ -423,18 +380,13 @@ merge and the change that drops call A for round rows.
    PagedAttention. SOSP 2023.
 3. Edsger W. Dijkstra. Een algorithme ter voorkoming van de dodelijke
    omarming (EWD108). 1964–1965.
-4. Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast Inference from
-   Transformers via Speculative Decoding. ICML 2023.
-5. Apoorv Saxena. Prompt Lookup Decoding. 2023.
-6. Zhenyu He, Zexuan Zhong, Tianle Cai, Jason D. Lee, and Di He. REST:
-   Retrieval-Based Speculative Decoding. NAACL 2024.
-7. Lianmin Zheng et al. SGLang: Efficient Execution of Structured
+4. Lianmin Zheng et al. SGLang: Efficient Execution of Structured
    Language Model Programs. NeurIPS 2024.
-8. Jordan Juravsky, Bradley Brown, Ryan Ehrlich, Daniel Y. Fu,
+5. Jordan Juravsky, Bradley Brown, Ryan Ehrlich, Daniel Y. Fu,
    Christopher Ré, and Azalia Mirhoseini. Hydragen: High-Throughput LLM
    Inference with Shared Prefixes. 2024.
-9. Zihao Ye et al. FlashInfer: Efficient and Customizable Attention
+6. Zihao Ye et al. FlashInfer: Efficient and Customizable Attention
    Engine for LLM Inference Serving. MLSys 2025.
-10. Edward L. Kaplan and Paul Meier. Nonparametric Estimation from
+7. Edward L. Kaplan and Paul Meier. Nonparametric Estimation from
     Incomplete Observations. Journal of the American Statistical
     Association, 1958.

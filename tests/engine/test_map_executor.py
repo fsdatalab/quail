@@ -53,30 +53,16 @@ def _map_one(monkeypatch, text, gold, *extra, recurrent=False, on_state=None,
 
 def test_a_map_writes_text_the_document_does_not_contain(monkeypatch):
     # the answer mixes document words with new ones; every round feeds
-    # the chosen token, with a draft only where the document continues it
+    # the token chosen before it
     gold = "The lease ends March 3"
     asked, _, _ = _map_one(monkeypatch, LEASE, gold)
     assert asked.answer == gold
     assert asked.done
 
 
-def test_a_draft_copied_from_the_document_settles_in_few_rounds(monkeypatch):
-    # the answer is a run of document text: after its first token the
-    # draft copies the rest, so one round verifies the whole run
+def test_each_round_writes_one_token(monkeypatch):
     gold = "March 3, 2027 at noon"
-    asked, _, _ = _map_one(monkeypatch, LEASE, gold, draft_tokens=15,
-                           draft_policy="fixed")
-    assert asked.answer == gold
-    written = len(asked.written)
-    # the cue chooses the first token; the round launched before that
-    # choice is decided feeds it alone; one round copies the rest; one
-    # round reads the stop
-    assert asked.steps <= 4, (asked.steps, written)
-
-
-def test_without_a_draft_each_round_writes_one_token(monkeypatch):
-    gold = "March 3, 2027 at noon"
-    asked, _, _ = _map_one(monkeypatch, LEASE, gold, draft_tokens=0)
+    asked, _, _ = _map_one(monkeypatch, LEASE, gold)
     assert asked.answer == gold
     assert asked.steps == len(asked.written) + 1
 
@@ -87,32 +73,9 @@ def test_an_immediate_turn_end_writes_an_empty_answer(monkeypatch):
     assert asked.written == []
 
 
-def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
-    # " five" occurs twice. The round launched before the cue's choice
-    # is decided feeds that choice, " five", alone. The round after is
-    # drafted once " five" is known: the document continues it with
-    # " days or five years", the GPU's choice is expected to be
-    # " days", and the draft is what follows. The model chooses
-    # " years" instead, so the round feeds it with a draft the choice
-    # refutes, and the answer ends at its row.
-    text = "or five days or five years"
-    asked, model, key = _map_one(monkeypatch, text, "five years",
-                                 draft_policy="fixed")
-    assert asked.answer == "five years"
-    tables = model.tables
-    five, or_, years = (tables.encode_ids(w)[0] for w in (" five", " or", " years"))
-    fed = [suffix for k, suffix, _, _, _ in model.packed if k == key]
-    assert fed[1] == [five]
-    assert fed[2][:2] == [years, or_]
-    # one more round was launched before the end was decided; its
-    # rows decide nothing
-    assert len(fed) == 4 and len(fed[3]) == 1
-
-
 def test_the_answer_stops_at_the_limit(monkeypatch):
     gold = "March 3, 2027 at noon"
-    asked, _, _ = _map_one(monkeypatch, LEASE, gold, max_answer_tokens=3,
-                           draft_tokens=0)
+    asked, _, _ = _map_one(monkeypatch, LEASE, gold, max_answer_tokens=3)
     assert len(asked.written) == 3
     assert asked.done
 
@@ -213,62 +176,7 @@ def test_readout_rows_unwrap_object_arrays():
     assert readout_rows(values, 9).shape == (2, 9)
 
 
-def test_an_adaptive_copy_draft_runs_long_below_the_ridge(monkeypatch):
-    # with the pass below the ridge, a marginal draft token is free:
-    # the policy copies the whole run and the answer settles in a few
-    # rounds, as the fixed policy would
-    gold = "March 3, 2027 at noon"
-    asked, _, _ = _map_one(monkeypatch, LEASE, gold, draft_tokens=15,
-                           ridge_tokens=4096.0)
-    assert asked.answer == gold
-    assert asked.steps <= 4
-
-
-def test_a_sibling_answer_seeds_the_cache_draft(monkeypatch):
-    # two documents share one gold answer the second document's text
-    # does not contain: the first answer fills the cache, and the
-    # second drafts from it
-    gold = "March 3, 2027 at noon"
-    text_without_gold = "No dates here."
-    tables = make_vocabulary(LEASE, text_without_gold, gold)
-    spec = make_map_spec(tables, draft_tokens=15, ridge_tokens=4096.0)
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4)
-    monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
-    state = _state(model, chunk_tokens=120)
-    state.loaded_model.vocabulary = tables
-    stages = MapStages(state, [spec], tables, [0, 1],
-                       [tables.encode_ids(LEASE),
-                        tables.encode_ids(text_without_gold)])
-    for document, text in zip(stages.documents, (LEASE, text_without_gold)):
-        model.documents[document.key] = text
-        model.gold[document.key] = gold
-    run_stages(state.torch, state.loaded_model.arena,
-               state.loaded_model.pipeline, stages.stages, stages.prefixes,
-               state.chunk_tokens, anchor_keys=stages.keys,
-               appended_tokens=stages.appended_tokens)
-    stages.finish()
-    answers = [document.answers[0] for document in stages.documents]
-    assert [answer.answer for answer in answers] == [gold, gold]
-    assert len(stages.decoder.cache)
-    # the cache drafts were verified, so the policy recorded trials
-    assert stages.decoder.policies[0].trials.sum() > 0
-
-
-def test_rejected_copies_teach_the_policy_to_stop_drafting(monkeypatch):
-    # every written token is in the document, but the model never
-    # follows the document's continuation: the copy rate falls and the
-    # rounds stop paying for long drafts
-    text = "red one red two red three red four red five red six"
-    gold = "red red red red red red red red red red red red"
-    asked, _, _ = _map_one(monkeypatch, text, gold, draft_tokens=15,
-                           max_answer_tokens=24)
-    # each round feeds the chosen token and at most a few draft tokens
-    assert asked.fed_tokens <= 3 * asked.steps + 24
-
-
-def test_a_document_reserves_kv_for_the_whole_answer_and_a_draft(monkeypatch):
+def test_a_document_reserves_kv_for_the_whole_answer(monkeypatch):
     # the rounds repeat one stage, so the reservation comes from the
     # answer cap, not from the stages' suffixes summed
     reserved = {}
@@ -285,11 +193,11 @@ def test_a_document_reserves_kv_for_the_whole_answer_and_a_draft(monkeypatch):
 
     gold = "The lease ends March 3 2027 at noon and rent is due"
     asked, _, key = _map_one(monkeypatch, LEASE, gold, on_state=record,
-                             max_answer_tokens=12, draft_tokens=3)
+                             max_answer_tokens=12)
     assert asked.answer and len(asked.written) == 12
     tokens, capacity = reserved[key]
-    # the prompt, then the tail's frame and cue, the answer, and a draft
-    assert capacity - tokens >= len(TAIL.split()) + 12 + 3
+    # the prompt, then the tail's frame and cue, and the answer
+    assert capacity - tokens >= len(TAIL.split()) + 12
 
 
 def test_a_long_document_is_prefilled_in_slices_and_answers_the_same(monkeypatch):
@@ -359,7 +267,7 @@ def test_a_live_document_runs_in_every_pass(monkeypatch):
 
     golds = ["March 3, 2027 at noon", "five years"]
     tables = make_vocabulary(LEASE, TERM, *golds)
-    spec = make_map_spec(tables, draft_tokens=0)
+    spec = make_map_spec(tables)
     passes = []
 
     def recording(torch, arena, specs, **kw):
@@ -405,8 +313,7 @@ def test_a_small_pool_runs_more_documents_when_pages_grow_as_they_write(monkeypa
 
     gold = "March 3"
     tables = make_vocabulary(LEASE, gold)
-    spec = make_map_spec(tables, max_answer_tokens=48, draft_tokens=2,
-                         draft_policy="fixed", expected_answer_tokens=4)
+    spec = make_map_spec(tables, max_answer_tokens=48, expected_answer_tokens=4)
     passes = []
 
     def recording(torch, arena, specs, **kw):
@@ -471,7 +378,7 @@ def test_maps_with_different_answer_limits_run_as_branches(monkeypatch):
     # they share one pipeline, and each answer stops at its own limit
     gold = "March 3, 2027 at noon"
     tables = make_vocabulary(LEASE, gold)
-    short = make_map_spec(tables, max_answer_tokens=2, draft_tokens=0)
+    short = make_map_spec(tables, max_answer_tokens=2)
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
@@ -523,8 +430,7 @@ def _filter_then_map(monkeypatch, *, pool_documents=None, filter_limit=None,
 
     gold = "March 3"
     tables = make_vocabulary(LEASE, gold, *([first_gold] if first_gold else []))
-    spec = make_map_spec(tables, max_answer_tokens=48, draft_tokens=2,
-                         draft_policy="fixed", expected_answer_tokens=4)
+    spec = make_map_spec(tables, max_answer_tokens=48, expected_answer_tokens=4)
     head, tail = spec.prompt_token_parts
     passes = []
 
@@ -618,8 +524,7 @@ def _run_maps(monkeypatch, count, num_maps, *, limit=None, keep_kv=False,
 
     gold = "March 3, 2027 at noon"
     tables = make_vocabulary(LEASE, gold)
-    spec = make_map_spec(tables, max_answer_tokens=48, draft_tokens=0,
-                         draft_policy="fixed", expected_answer_tokens=4)
+    spec = make_map_spec(tables, max_answer_tokens=48, expected_answer_tokens=4)
     monkeypatch.setattr(chunk_mod, "pack_chunk", pack)
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)

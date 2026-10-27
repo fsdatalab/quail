@@ -111,7 +111,7 @@ class AnswerStages:
                   launched=self._stage_launched(q, tail=True), ahead=self.ahead,
                   single=True, append=True, label=f"{name} tail"),
             Stage(suffixes=partial(self._step_suffix, q),
-                  suffix_tokens=(1 + self.spec.draft_tokens)
+                  suffix_tokens=(1 + self.draft_tokens)
                   * (2 if self.recurrent else 1), frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
                   prepare=self._stage_prepare(q, tail=False),
@@ -144,7 +144,12 @@ class AnswerStages:
         The cue, and the answer's tokens with the last round's draft
         past them.
         """
-        return 1 + self.spec.max_answer_tokens + self.spec.draft_tokens
+        return 1 + self.spec.max_answer_tokens + self.draft_tokens
+
+    @property
+    def draft_tokens(self) -> int:
+        """The most draft tokens a round feeds after its chosen token."""
+        return self.spec.draft_tokens
 
     def _readout(self, state):
         """The readout of every row: the stop, then the top tokens."""

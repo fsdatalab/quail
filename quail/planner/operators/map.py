@@ -16,7 +16,7 @@ def map_spec(context, call, name, expected_rows, resident=False) -> MapSpec:
 
     The specification carries the token ids of the prompt around the
     document. The cost reuses the extraction estimate: a map runs the
-    same rounds, with the map's answer limit and draft length, and its
+    same rounds, with the map's answer limit and no draft, and its
     answer lengths are assumed geometric with the expected mean. The
     documents' KV is priced as computed afresh unless the map shares a
     pipeline with the step before it, which read the documents.
@@ -33,15 +33,12 @@ def map_spec(context, call, name, expected_rows, resident=False) -> MapSpec:
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
     model, device = context.model, context.device
-    round_cost_per_token = budgets.round_cost_per_token(model, device)
     spec = bind_inference(
         MapSpec, call.prompt, name=name,
         expected_rows=expected_rows, estimated_seconds=0.0,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
-        instruction=call.instruction,
-        round_cost_per_token=round_cost_per_token,
-        ridge_tokens=budgets.ridge_tokens(model, device))
+        instruction=call.instruction)
     cost = extract_cost.estimate(
         expected_rows,
         lengths,
@@ -52,9 +49,9 @@ def map_spec(context, call, name, expected_rows, resident=False) -> MapSpec:
         device=context.device,
         resident=resident,
         max_answer_tokens=spec.max_answer_tokens,
-        draft_tokens=spec.draft_tokens,
+        draft_tokens=0,
         draft_policy="fixed",
-        round_cost_per_token=spec.round_cost_per_token,
+        round_cost_per_token=budgets.round_cost_per_token(model, device),
         gpus=context.gpus,
         assumptions=extract_cost.ExtractAssumptions(spec.expected_answer_tokens),
         memo=context.memo,

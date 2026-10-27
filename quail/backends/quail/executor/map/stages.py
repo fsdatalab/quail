@@ -3,8 +3,8 @@
 The maps of one pipeline run as one stage list, with the shared
 decode-round shape of quail.backends.quail.executor.decoding: each
 instruction is a tail stage, whose row chooses the answer's first
-token, then rounds that feed the chosen token and a draft and verify
-them. A chunk's rounds are decided together, in arrays, before the
+token, then rounds that each feed the token chosen before. A chunk's
+rounds are decided together, in arrays, before the
 admission asks about each document. On the tree and unified paths the
 stages run ahead of their answers: a document's next round is
 launched before the one before it is decided, and the GPU puts the
@@ -68,6 +68,8 @@ class MapStages(AnswerStages):
     """
 
     operator = "map"
+    # a round feeds the chosen token alone
+    draft_tokens = 0
 
     def __init__(self, state, specs, vocabulary: Vocabulary, document_ids,
                  documents, texts=None, readout=None, pipeline_head=None,
@@ -99,14 +101,9 @@ class MapStages(AnswerStages):
                               for tail in self.tails]
         self.tail_lengths = np.array([len(tail) for tail in self.tails],
                                      dtype=np.int64)
-        # a recurrent model replays each round's accepted tokens, so
-        # its rounds wait for their answers
+        # a recurrent model replays each round's token, so its rounds
+        # wait for their answers
         self.ahead = not self.recurrent
-        # answers not asked yet, and answers between their first ask
-        # and their settling, for the draft policy's slack
-        per_document = len(self.specs) if self.branches else 1
-        self.num_queued_documents = len(self.documents) * per_document
-        self.num_decoding_documents = 0
         self._build()
 
     def _prepare_document(self, index, document_id, stored, text) -> MapDocument:
@@ -125,16 +122,11 @@ class MapStages(AnswerStages):
                     f"AI.MAP needs the tokens or the text of {alias!r}")
             shown = text.as_py() if hasattr(text, "as_py") else str(text)
             stored = self.vocabulary.encode_ids(shown)
-        tokens = (stored.numpy() if hasattr(stored, "numpy")
-                  else np.asarray(stored, dtype=np.int64))
         key = (("map", alias), int(document_id))
         if self.head == self.pipeline_head:
             key = (alias, int(document_id))
         prefix = concat_tokens(self.head, stored)
-        # the round's KV read covers the prompt through the first tail
-        rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
-        return MapDocument(index=index, prefix=prefix, tokens=tokens, key=key,
-                           rho=rho)
+        return MapDocument(index=index, prefix=prefix, key=key)
 
     def _anchors(self, page_tokens: int) -> None:
         """Lay out the anchors: one per document, or one per branch.
@@ -201,7 +193,7 @@ class MapStages(AnswerStages):
 
     def _build(self) -> None:
         # a recurrent model's replay needs each document's previous
-        # round, which the arrays overwrite when the next is drafted
+        # round, which the arrays overwrite when the next is decided
         self.previous_fed = [{} for _ in self.specs]
         if not self.branches:
             super()._build()
@@ -216,7 +208,7 @@ class MapStages(AnswerStages):
                   launched=self._stage_launched(None, tail=True), ahead=self.ahead,
                   single=True, append=True, label=f"{names} tails"),
             Stage(suffixes=partial(self._step_suffix, None),
-                  suffix_tokens=1 + self.spec.draft_tokens,
+                  suffix_tokens=1,
                   readout=self.readout, decide=partial(self._step_decide, None),
                   prepare=self._stage_prepare(None, tail=False),
                   launched=self._stage_launched(None, tail=False), ahead=self.ahead,
@@ -236,12 +228,12 @@ class MapStages(AnswerStages):
         """The most tokens an instruction leaves in KV after its frame.
 
         The cue (a branch's whole tail, which has no frame), the
-        answer, a round's draft past it, and the round launched before
-        the answer's end was decided.
+        answer, and the round launched before the answer's end was
+        decided.
         """
         tail = int(self.tail_lengths.max()) if self.branches else 1
         answer = max(spec.max_answer_tokens for spec in self.specs)
-        return tail + answer + 2 * self.spec.draft_tokens
+        return tail + answer + 1
 
     # ---- the growth model ---------------------------------------------------
 
@@ -258,10 +250,10 @@ class MapStages(AnswerStages):
     def initial_tokens(self) -> int:
         """Rows past the prefix a document's pages cover when admitted.
 
-        Its tail, and the two rounds that can be in flight before its
-        pages first grow, each at most a chosen token and a draft.
+        Its tail, and the two one-token rounds that can be in flight
+        before its pages first grow.
         """
-        return int(self.tail_lengths.max()) + 2 * (1 + self.spec.draft_tokens)
+        return int(self.tail_lengths.max()) + 2
 
     def remaining(self, anchors) -> np.ndarray:
         """Return the rows each anchor is expected to still write.
@@ -270,7 +262,7 @@ class MapStages(AnswerStages):
         when not yet asked, and a round in flight.
         """
         anchors = np.asarray(anchors, dtype=np.int64)
-        round_rows = 1 + self.spec.draft_tokens
+        round_rows = 1
         if len(anchors) == 1:
             # the admission asks about one fresh anchor at a time
             q = int(self.anchor_question[anchors[0]])
@@ -291,16 +283,14 @@ class MapStages(AnswerStages):
     def capacities(self, anchors) -> np.ndarray:
         """Return the rows each anchor's pages must cover for its next request.
 
-        A device-fed round lands past the tokens the round before it
-        accepts, at most a chosen token and a draft.
+        A device-fed round lands one token past the round before it.
         """
         anchors = np.asarray(anchors, dtype=np.int64)
         out = np.zeros(len(anchors), dtype=np.int64)
         for q, positions, documents in self._split(anchors, None):
             state = self.decoder.states[q]
-            device_fed, lengths = self._round_lengths(q, documents)
-            rounds = (state.base[documents] + lengths
-                      + np.where(device_fed, 1 + self.spec.draft_tokens, 0))
+            device_fed = state.unreported[documents] > 0
+            rounds = state.base[documents] + 1 + device_fed
             tails = self.prefix_lengths[documents] + self.tail_lengths[q]
             need = np.where(state.started[documents], rounds, tails)
             out[positions] = np.where(state.done[documents], 0, need)
@@ -323,13 +313,6 @@ class MapStages(AnswerStages):
                                     self.cue_positions[question][documents])
         return launched
 
-    def _round_lengths(self, q: int, index: np.ndarray) -> tuple:
-        """Return (device_fed, lengths) of the documents' next rounds."""
-        state = self.decoder.states[q]
-        device_fed = state.unreported[index] > 0
-        return device_fed, np.where(device_fed, 1 + state.draft_len[index],
-                                    state.fed_len[index])
-
     def _stage_costs(self, q):
         if self.recurrent:
             return None
@@ -338,8 +321,7 @@ class MapStages(AnswerStages):
             out = np.zeros(len(anchors), dtype=np.int64)
             for question, positions, documents in self._split(anchors, q):
                 state = self.decoder.states[question]
-                _, lengths = self._round_lengths(question, documents)
-                out[positions] = np.where(state.done[documents], -1, lengths)
+                out[positions] = np.where(state.done[documents], -1, 1)
             return out
         return costs
 
@@ -347,42 +329,34 @@ class MapStages(AnswerStages):
         """The rounds of many anchors at once, as _step_suffix builds one."""
         if self.recurrent:
             return None
-        width = 1 + self.spec.draft_tokens
 
         def rounds(anchors):
             count = len(anchors)
-            tokens = np.zeros((count, width), dtype=np.int64)
-            lengths = np.zeros(count, dtype=np.int64)
+            tokens = np.zeros(count, dtype=np.int64)
             positions = np.zeros(count, dtype=np.int64)
             device_fed = np.zeros(count, dtype=bool)
             for question, at, documents in self._split(anchors, q):
                 state = self.decoder.states[question]
-                fed, length = self._round_lengths(question, documents)
-                # a device-fed round: the placeholder, then the pending
-                # draft; otherwise the round's known tokens
-                ahead = np.concatenate(
-                    (np.zeros((len(documents), 1), dtype=np.int64),
-                     state.draft[documents]), axis=1)
-                tokens[at] = np.where(fed[:, None], ahead, state.fed[documents])
-                lengths[at] = length
+                fed = state.unreported[documents] > 0
+                # a device-fed round's token is a placeholder the GPU
+                # replaces with the one the round before it chose
+                tokens[at] = np.where(fed, 0, state.fed[documents])
                 positions[at] = state.base[documents]
                 device_fed[at] = fed
-            hop = np.arange(width)
-            return RoundRequests(ids=tokens[hop[None, :] < lengths[:, None]],
-                                 lengths=lengths, positions=positions,
-                                 device_fed=device_fed)
+            return RoundRequests(ids=tokens, lengths=np.ones(count, dtype=np.int64),
+                                 positions=positions, device_fed=device_fed)
         return rounds
 
     def _prepare_rounds(self, q: int, tail: bool, documents, rows) -> None:
-        """Verify a chunk's rounds for instruction q and draft the next ones.
+        """Decide a chunk's rounds for instruction q.
 
         Args:
             q: The instruction's index.
             tail: Whether the rows follow the cue, choosing each
                 answer's first token, rather than a round's fed tokens.
             documents: The documents' indices.
-            rows: Each document's readout rows, as the admission hands
-                them over.
+            rows: Each document's readout row, as the admission hands
+                it over.
         """
         state = self.decoder.states[q]
         index = np.asarray(documents, dtype=np.int64)
@@ -402,9 +376,6 @@ class MapStages(AnswerStages):
             same = (not self.recurrent and not self.branches and q > 0
                     and self.tails[q] == self.tails[q - 1])
             state.fed_tokens[index] += 1 if same else len(self.tails[q])
-            if q == 0 or self.branches:
-                self.num_queued_documents -= len(index)
-                self.num_decoding_documents += len(index)
         else:
             state.fed_tokens[index] += num_rows
         keep = ~state.done[index]
@@ -416,25 +387,7 @@ class MapStages(AnswerStages):
                 return
             stacked = stacked[np.repeat(keep, num_rows)]
             num_rows = num_rows[keep]
-        ended = self.decoder.round(q, index, stacked, num_rows, self._slack())
-        if q == len(self.specs) - 1 or self.branches:
-            self.num_decoding_documents -= ended
-
-    def _slack(self) -> float:
-        """Fed tokens one answer's round can add below the ridge, for free.
-
-        While answers wait for their first ask, their prefills fill
-        the passes, so no token is free. Afterwards the decoding
-        answers' rounds are the passes' work: what is left under the
-        ridge is split across them. This reads the pipeline's own
-        queue, not the whole batch, so it understates the pass when
-        other operators share it.
-        """
-        ridge = self.spec.ridge_tokens
-        decoding = self.num_decoding_documents
-        if not ridge or self.num_queued_documents > 0 or decoding <= 0:
-            return 0.0
-        return max(0.0, ridge - decoding) / decoding
+        self.decoder.round(q, index, stacked)
 
     def _tail_decide(self, q, anchor, row):
         # the chunk's prepare decides every round
@@ -443,13 +396,10 @@ class MapStages(AnswerStages):
     _step_decide = _tail_decide
 
     def _step_suffix(self, q, key):
-        """Feed the chosen token, then the draft the chunk's prepare chose.
+        """Feed the token the round before chose.
 
-        While the round before is on the stream, the GPU puts the
-        token it chooses first and the request carries the draft of
-        the round after it. A recurrent model replays the accepted
-        tokens to advance its checkpoint, so they are fed again and
-        written as the suffix.
+        A recurrent model replays the round before's token to advance
+        its checkpoint, so it is fed again and written as the suffix.
         """
         serial = q is not None
         q, index = self._locate(key, q)
@@ -458,10 +408,9 @@ class MapStages(AnswerStages):
             return Stage.SkipTo(self.question_starts[q + 1] if serial
                                 else len(self.stages))
         position = int(state.base[index])
-        fed = state.fed[index, :state.fed_len[index]].copy()
+        fed = state.fed[index:index + 1].copy()
         if self.recurrent:
-            previous = self.previous_fed[q].get(index, [])
-            accepted = previous[:len(previous) - int(state.discard[index])]
+            accepted = self.previous_fed[q].get(index, [])
             tokens = fed.tolist()
             self.previous_fed[q][index] = tokens
             state.fed_tokens[index] += len(accepted)
@@ -506,13 +455,4 @@ class MapStages(AnswerStages):
             "steps": int(state.steps.sum()),
             "answer_tokens": int(state.num_written.sum()),
             "suffix_tokens": int(state.fed_tokens.sum()),
-            **self._draft_counts(q),
         }
-
-    def _draft_counts(self, q: int) -> dict:
-        """Return the instruction's chained-draft trials and accepts."""
-        if self.decoder.policies is None:
-            return {"draft_trials": 0, "draft_accepts": 0}
-        policy = self.decoder.policies[q]
-        return {"draft_trials": int(policy.trials.sum()),
-                "draft_accepts": int(policy.accepts.sum())}
