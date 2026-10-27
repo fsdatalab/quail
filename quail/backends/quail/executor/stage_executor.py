@@ -768,4 +768,7 @@ class StageExecutor:
                           in zip(self.spans, self.spans[1:])) / 1000.0
             logger.info("%s: %d forward passes, %.3f s of GPU time between them",
                         self.label, len(self.spans), between)
+        if self.decoder is not None:
+            logger.info("%s: decode rows read KV tokens %s", self.label,
+                        self.decoder.read_tokens)
         return self.sched.answers, self.spans, self.tokens

@@ -87,6 +87,9 @@ class MapDecoder:
         self.copies = deque()
         self.finished = []      # (document, map) whose answers ended
         self.rows_fed = np.zeros(len(self.limits), dtype=np.int64)  # per map
+        # KV tokens the decode rows read: in all, alone, through their
+        # own pages beside a shared read, and through shared reads
+        self.read_tokens = dict(all=0, alone=0, own=0, shared=0)
         # per slot, the map its answers are for, or None when each
         # stage names its map
         self.slot_maps = None
@@ -210,6 +213,20 @@ class MapDecoder:
         self.fed[rows.slots] += 1
         self.rows_fed += np.bincount(self.map[rows.slots],
                                      minlength=len(self.limits))
+        self._count_reads(rows, chunk.meta.get("shared") is not None)
+
+    def _count_reads(self, rows, shared: bool) -> None:
+        reads = self.read_tokens
+        lengths = rows.positions + 1
+        reads["all"] += int(lengths.sum())
+        if not shared:
+            reads["alone"] += int(lengths.sum())
+            return
+        member = np.zeros(len(lengths), dtype=bool)
+        member[rows.shared_rows] = True
+        reads["alone"] += int(lengths[~member].sum())
+        reads["own"] += int(rows.own_lengths[member].sum())
+        reads["shared"] += int(rows.shared_used.sum())
 
     def submit(self, normed, first_rows, first_documents, rows) -> None:
         """Choose the next token of each answer row and send it to the host.
