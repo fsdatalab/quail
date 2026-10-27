@@ -1,0 +1,12 @@
+[project]
+name = "quail-vllm-gigatoken"
+version = "0.1.0"
+description = "Register Quail's gigatoken tokenizer mode in every vLLM process."
+requires-python = ">=3.12"
+
+[project.entry-points."vllm.general_plugins"]
+gigatoken = "quail_vllm_gigatoken:register"
+
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"

@@ -84,6 +84,23 @@ class GigatokenVLLMTokenizer:
         return tokenizer
 
 
+def register_gigatoken() -> None:
+    """Register the gigatoken tokenizer mode with vLLM in this process.
+
+    vLLM's engine core runs in a process of its own, where the
+    quail-vllm-gigatoken plugin (plugins/vllm-gigatoken) calls this.
+    """
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers import TokenizerRegistry
+
+    registered = ("quail.baselines.vllm", "GigatokenVLLMTokenizer")
+    if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
+        TokenizerRegistry.register("gigatoken", *registered)
+    renderer = ("vllm.renderers.hf", "HfRenderer")
+    if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
+        RENDERER_REGISTRY.register("gigatoken", *renderer)
+
+
 @contextmanager
 def engine_environment(spec):
     """Scope vLLM's process selection to construction of one engine."""
@@ -95,10 +112,8 @@ def engine_environment(spec):
     # constructor, and caches what it read; its public LLM API has no
     # per-instance override
     envs.disable_envs_cache()
-    # the engine runs in this process: a separate engine core process
-    # has no gigatoken tokenizer registered, and vLLM loads only its
-    # plugins' entry points there
-    os.environ[key] = "0"
+    if spec.vision_tower or spec.canvas_tokens == 1:
+        os.environ[key] = "0"
     try:
         yield
     finally:
@@ -368,18 +383,8 @@ class VLLMEngine:
             return boot_decision(
                 spec, self.llm_kwargs(spec, device), resources=resources)
         from vllm import LLM, SamplingParams
-        from vllm.renderers.registry import RENDERER_REGISTRY
-        from vllm.tokenizers import TokenizerRegistry
 
-        registered = (
-            "quail.baselines.vllm", "GigatokenVLLMTokenizer"
-        )
-        if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
-            TokenizerRegistry.register("gigatoken", *registered)
-        renderer = ("vllm.renderers.hf", "HfRenderer")
-        if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
-            RENDERER_REGISTRY.register("gigatoken", *renderer)
-
+        register_gigatoken()
         path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
         with engine_environment(spec), diffusion_canvas(spec) as canvas_ids:

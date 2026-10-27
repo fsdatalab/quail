@@ -6,6 +6,7 @@ not in the wheel, so the benchmark runner imports inside a container.
 
 import os
 from importlib.metadata import version
+from pathlib import Path
 
 import modal
 
@@ -37,6 +38,9 @@ CACHE_ENV = {
 
 # local variables copied into the image when set
 FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
+# the vLLM plugin that registers gigatoken in vLLM's engine process
+VLLM_PLUGIN_DIR = Path(__file__).resolve().parents[2] / "plugins" / "vllm-gigatoken"
+VLLM_PLUGIN_REMOTE = "/opt/quail-vllm-gigatoken"
 
 
 def _cuda_base() -> modal.Image:
@@ -59,7 +63,9 @@ def gpu_image(*local_dirs: tuple[str, str],
         packages: Extra packages installed before the mounts, such as
             a profiler a cell runs.
     """
-    image = _cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
+    image = (_cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
+             .add_local_dir(VLLM_PLUGIN_DIR, VLLM_PLUGIN_REMOTE, copy=True)
+             .uv_pip_install(VLLM_PLUGIN_REMOTE, uv_version=UV_VERSION))
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
     image = image.add_local_python_source("quail", "bench")

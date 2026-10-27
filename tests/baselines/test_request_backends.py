@@ -279,11 +279,8 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
                     assert os.environ[key] == "0"
                     raise RuntimeError("boot failed")
             assert os.environ.get(key) == previous
-            # the engine core runs in this process, where the gigatoken
-            # tokenizer is registered
             with engine_environment(QWEN3_4B_FP8):
-                assert os.environ[key] == "0"
-            assert os.environ.get(key) == previous
+                assert os.environ.get(key) == previous
     assert len(cleared) == 16
     qwen = engine.llm_kwargs(QWEN3_4B_FP8, H100_SXM)
     assert qwen["max_num_batched_tokens"] == 25_305
@@ -632,3 +629,34 @@ def test_an_experiment_can_turn_on_vllm_ngram_drafts(monkeypatch):
     for value in ("ngram", "ngram:0", "eagle:5"):
         with pytest.raises(ValueError):
             speculative_config(value)
+
+
+def test_the_vllm_plugin_registers_gigatoken_in_each_engine_process(monkeypatch):
+    import importlib.util
+    import tomllib
+    from pathlib import Path
+
+    class Registry:
+        def __init__(self):
+            self.tokenizers = self.renderers = {}
+
+        def register(self, name, module, cls):
+            self.tokenizers[name] = (module, cls)
+
+    tokenizers, renderers = Registry(), Registry()
+    monkeypatch.setitem(sys.modules, "vllm.tokenizers",
+                        SimpleNamespace(TokenizerRegistry=tokenizers))
+    monkeypatch.setitem(sys.modules, "vllm.renderers.registry",
+                        SimpleNamespace(RENDERER_REGISTRY=renderers))
+    root = Path(__file__).resolve().parents[2] / "plugins" / "vllm-gigatoken"
+    project = tomllib.loads((root / "pyproject.toml").read_text())
+    (target,) = project["project"]["entry-points"]["vllm.general_plugins"].values()
+    assert target == "quail_vllm_gigatoken:register"
+    spec = importlib.util.spec_from_file_location(
+        "quail_vllm_gigatoken", root / "quail_vllm_gigatoken" / "__init__.py")
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    plugin.register()
+    assert tokenizers.tokenizers["gigatoken"] == (
+        "quail.baselines.vllm", "GigatokenVLLMTokenizer")
+    assert renderers.renderers["gigatoken"] == ("vllm.renderers.hf", "HfRenderer")
