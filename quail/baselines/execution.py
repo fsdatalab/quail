@@ -17,6 +17,7 @@ from quail.baselines.operators import (
     extract_fields,
     filter_answers,
     join_answers,
+    map_documents,
     operator_at_a_time_filter,
     pipelined_filter,
     request_step,
@@ -32,7 +33,7 @@ from quail.baselines.request_scheduling import (
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import answer_values
-from quail.execution.rows import Rows, extraction_rows
+from quail.execution.rows import Rows, extraction_rows, map_rows
 from quail.physical import PhysicalNode
 
 
@@ -118,6 +119,7 @@ class RequestModelExecution:
         self._execute_joins(node, survivors, outputs, steps)
         self._execute_joined_classifications(node, survivors, outputs, steps)
         self._execute_extractions(node, survivors, outputs, steps)
+        self._execute_maps(node, survivors, outputs, steps)
 
         for alias in node.aliases:
             outputs[f"rows:{alias}"] = Rows({alias: document_ids(survivors[alias])})
@@ -481,3 +483,45 @@ class RequestModelExecution:
                     unanswered=result["unanswered"],
                     unaligned=result["unaligned"],
                 ))
+
+    def _execute_maps(self, node, survivors, outputs, steps):
+        """Submit maps and collect their written answers.
+
+        Operator-at-a-time submission sends one map's requests at a
+        time. Pipelined submission sends every map's requests together,
+        document by document, so prefix caching shares each document's
+        KV across its maps.
+        """
+        groups = {}
+        for spec in node.maps:
+            groups.setdefault(spec.alias, []).append(spec)
+        for alias, specs in groups.items():
+            document_ids = list(survivors[alias])
+            batches = ([[spec] for spec in specs]
+                       if self.filter_submission == "operator-at-a-time"
+                       else [specs])
+            for batch in batches:
+                result = map_documents(
+                    self.client, batch, self._map_bodies(node, alias, batch[0],
+                                                         document_ids))
+                for spec, answers in zip(batch, result["answers"]):
+                    outputs[f"map_answers:{spec.output}"] = map_rows(
+                        alias, spec.output, document_ids, answers)
+                    steps.append(request_step(
+                        {**result, "answers": answers}, kind="map",
+                        alias=alias, output=spec.output,
+                        num_in=len(document_ids), num_out=len(document_ids)))
+
+    def _map_bodies(self, node, alias, spec, document_ids) -> list:
+        """Return each document's prompt before a map's tail, as ids or text."""
+        preamble = token_list(spec.preamble_token_ids or node.preamble_token_ids)
+        if self.submit_text:
+            texts = self.document_texts.get(alias)
+            if texts is None:
+                raise ValueError(f"AI.MAP needs the text of {alias!r}, which "
+                                 f"the scan did not load")
+            preamble_text = spec.preamble_text or node.preamble_text
+            return [preamble_text + text_value(texts, document)
+                    for document in document_ids]
+        return [preamble + token_list(self.documents[alias][document])
+                for document in document_ids]

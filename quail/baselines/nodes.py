@@ -2,7 +2,7 @@
 
 A request backend submits one prompt per document or pair to vLLM or
 SGLang. Its whole model work is one ``RequestExecution`` node holding
-the filter, join, classification, and extraction specs, in the order
+the filter, join, classification, extraction, and map specs, in the order
 the engine runs them. The Quail engine plans one node per operator
 instead; see ``quail.physical.nodes``.
 """
@@ -103,6 +103,30 @@ class RequestExtractSpec:
         """Return the name of the span column."""
         return self.output + "_span"
 
+@dataclass(frozen=True)
+class RequestMapSpec:
+    """Specification for one written answer per document.
+
+    The tail_token_ids follow the document and contain the instruction
+    and the answer cue. The answer is the text the model writes, greedily,
+    until it ends its turn or reaches max_answer_tokens. The preamble
+    precedes the document: the model's turn and the document label.
+    """
+
+    alias: str
+    output: str
+    instruction: str
+    tail_token_ids: tuple[Token, ...]
+    # the tail's text, for an engine that tokenizes prompts itself
+    tail_text: str = ""
+    preamble_token_ids: tuple[Token, ...] = ()
+    preamble_text: str = ""
+    max_answer_tokens: int = 256
+
+    def __post_init__(self):
+        validate_integer_setting("max_answer_tokens", self.max_answer_tokens)
+
+
 def _short_text(text: str, limit: int = 60) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
@@ -120,6 +144,7 @@ class RequestExecution(PhysicalNode):
     joins: tuple[RequestJoinSpec, ...] = ()
     classifies: tuple[RequestClassifySpec, ...] = ()
     extracts: tuple[RequestExtractSpec, ...] = ()
+    maps: tuple[RequestMapSpec, ...] = ()
 
     type_name: ClassVar[str] = "quail.request_execution"
     runtime_key: ClassVar[str] = type_name
@@ -187,6 +212,15 @@ class RequestExecution(PhysicalNode):
             )
             for spec in self.extracts
         )
+        outputs.extend(
+            OutputPort(
+                f"map_answers:{spec.output}",
+                ValueType.ROWS,
+                schema=(spec.alias, spec.output),
+                answer=AnswerOutput("maps", spec.output, (spec.alias, spec.output)),
+            )
+            for spec in self.maps
+        )
         return tuple(outputs)
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -206,4 +240,8 @@ class RequestExecution(PhysicalNode):
             fields[f"classify {spec.output}"] = list(spec.labels)
         for spec in self.extracts:
             fields[f"extract {spec.output}"] = f"question={spec.question!r}"
+        for spec in self.maps:
+            fields[f"map {spec.output}"] = (
+                f"instruction={_short_text(spec.instruction)!r}, "
+                f"max_answer_tokens={spec.max_answer_tokens}")
         return fields

@@ -591,17 +591,18 @@ def bind_extract_prompt(args: tuple, question: str,
                   tail="{0}" + after, kind="extract")
 
 
-# AI.MAP: the document, the instruction, and the answer cue. The
-# prompt ends at the cue; the model writes the answer freely and ends
-# its turn. The document's KV stays query independent: every text that
-# depends on the instruction follows it.
-MAP_INSTRUCTION_LABEL = "\n\nInstruction: "
-MAP_ANSWER_CUE = "Answer:"
+# AI.MAP: the document, the instruction, and the answer cue, in
+# QUAIL-B's raw-v1 map layout. The prompt ends at the cue; the model
+# writes the answer freely and ends its turn. The document's KV stays
+# query independent: every text that depends on the instruction
+# follows it.
+MAP_INSTRUCTION_SEPARATOR = "\n\n"
+MAP_ANSWER_CUE = "ANSWER:"
 
 
 def render_map_instruction(instruction: str) -> str:
     """Return the text after the document: the instruction alone."""
-    return MAP_INSTRUCTION_LABEL + instruction
+    return MAP_INSTRUCTION_SEPARATOR + instruction
 
 
 def bind_map_prompt(args: tuple, instruction: str,

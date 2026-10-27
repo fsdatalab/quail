@@ -9,6 +9,7 @@ from quail.baselines.nodes import (
     RequestExtractSpec,
     RequestFilterSpec,
     RequestJoinSpec,
+    RequestMapSpec,
 )
 from quail.logical import (
     filter_question_text,
@@ -165,6 +166,28 @@ def lower_extractions(context, extracts) -> list[RequestExtractSpec]:
             preamble_text=without_bos(node.call.prompt.preamble,
                                       context.model.bos_text)))
     return extract_specs
+
+
+def lower_maps(context, maps) -> list[RequestMapSpec]:
+    """Build one map spec per AI.MAP column."""
+    # each map writes one answer per surviving document of its alias,
+    # after the joins; its prompt carries its own preamble, as an
+    # extraction's does
+    map_specs = []
+    for node in maps:
+        prompt = context.lowered(node.call.prompt)
+        map_specs.append(RequestMapSpec(
+            alias=node.alias, output=node.name,
+            instruction=node.call.instruction,
+            tail_token_ids=tuple(prompt.tail_token_ids),
+            tail_text=re.sub(r"\{\d+\}", "", node.call.prompt.tail),
+            preamble_token_ids=tuple(prompt.preamble_token_ids),
+            # vLLM adds the model's beginning-of-text token itself
+            preamble_text=without_bos(node.call.prompt.preamble,
+                                      context.model.bos_text),
+            **({"max_answer_tokens": node.call.max_answer_tokens}
+               if node.call.max_answer_tokens else {})))
+    return map_specs
 
 
 def request_preamble(context, prompts) -> tuple[tuple[int, ...], str]:

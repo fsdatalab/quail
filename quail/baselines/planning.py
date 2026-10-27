@@ -7,6 +7,7 @@ from quail.baselines.lowering import (
     lower_extractions,
     lower_filters,
     lower_joins,
+    lower_maps,
     request_preamble,
 )
 from quail.baselines.nodes import RequestExecution
@@ -113,6 +114,7 @@ def plan_request_backend(
     classify_specs = lower_classifications(context, operators, decides)
     join_specs = lower_joins(context, joins, join_sequence)
     extract_specs = lower_extractions(context, operators.extracts)
+    map_specs = lower_maps(context, operators.maps)
     prompts = [
         *(predicate.prompt for spec in filter_specs
           for predicate in ask_filters[spec.alias]),
@@ -132,11 +134,12 @@ def plan_request_backend(
         joins=tuple(join_specs),
         classifies=tuple(classify_specs),
         extracts=tuple(extract_specs),
+        maps=tuple(map_specs),
     )
     nodes.append(request_node)
 
     nodes.extend(_result_nodes(
-        region, request_node, aliases, join_specs, extract_specs,
+        region, request_node, aliases, join_specs, extract_specs, map_specs,
         operators.labels))
 
     true_ids, false_ids = true_false_token_ids(context.tokenizer)
@@ -199,6 +202,14 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
                 needed=1, available=0, unit="backends")
         if refusal is not None:
             return refusal
+    if region.logical_plan.operators().maps and not (
+            scores_labels and not context.model.canvas_tokens):
+        return Refusal(
+            reasons=(f"AI.MAP on {backend_name} decodes each answer as text, "
+                     f"which its engine does not return for "
+                     f"{context.model.name!r}",),
+            constraint="map_needs_quail_backend",
+            needed=1, available=0, unit="backends")
     if any(getattr(aliased_call(column), "probabilities", False)
            for column in region.logical_plan.projection.columns):
         return Refusal(
@@ -309,7 +320,7 @@ def _order_filters_and_joins(context, operators, ask_filters, stats,
 
 
 def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
-                  label_plan) -> list:
+                  map_specs, label_plan) -> list:
     """Return the nodes that turn the request node's answers into result rows."""
     nodes = []
     full_joins = [spec for spec in join_specs if spec.semantics == "full"]
@@ -342,7 +353,9 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
         for name in label_plan.projected.values()
     ) + tuple(
         PortRef(request_node.node_id, f"extract_answers:{spec.output}")
-        for spec in extract_specs)
+        for spec in extract_specs) + tuple(
+        PortRef(request_node.node_id, f"map_answers:{spec.output}")
+        for spec in map_specs)
     columns = []
     for column in region.logical_plan.projection.columns:
         columns.append(column_name(column))

@@ -364,7 +364,8 @@ class Query:
         self._extracts[name] = (struct, tuple(members))
         return self
 
-    def ai_map(self, c, instruction: str, *, name: str) -> "Query":
+    def ai_map(self, c, instruction: str, *, name: str,
+               max_answer_tokens: int | None = None) -> "Query":
         """Write an answer to the instruction for each document.
 
         The result column ``name`` holds the text the model writes for
@@ -378,6 +379,8 @@ class Query:
             c: The document column, as "alias.column" or a col().
             instruction: The instruction the answer is written for.
             name: Result column name, without a dot.
+            max_answer_tokens: The most tokens an answer may have;
+                None leaves the default limit.
 
         Returns:
             This query builder, with the map added.
@@ -396,7 +399,8 @@ class Query:
         self._claim_name(name)
         ref = self._resolve_value(col(c) if isinstance(c, str) else c)
         bound = self._prompts.bind("map", instruction, (ref,))
-        call = ModelCall(bound, "map", instruction=instruction)
+        call = ModelCall(bound, "map", instruction=instruction,
+                         max_answer_tokens=max_answer_tokens or 0)
         call.validate()
         self._note_document_column(ref)
         self._maps[name] = Alias(call, name)

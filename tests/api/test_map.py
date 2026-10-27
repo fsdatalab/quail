@@ -50,6 +50,23 @@ def test_the_map_prompt_ends_in_the_answer_cue():
     assert INSTRUCTION not in prompt.preamble
 
 
+def test_the_map_prompt_is_quail_b_raw_layout():
+    from quail_b.rendering import render_map_prompt
+
+    prompt = bind_map_prompt((quail.col("r.text"),), INSTRUCTION)
+    text = prompt.preamble + REVIEWS[0] + prompt.tail.removeprefix("{0}")
+    assert text == render_map_prompt("{0}\n\n" + INSTRUCTION, REVIEWS[0])
+
+
+def test_a_map_answer_limit_reaches_the_plan(session):
+    query = (session.docs("reviews").alias("r")
+             .ai_map("r.text", INSTRUCTION, name="summary", max_answer_tokens=32)
+             .select("r.id", "summary"))
+    (node,) = [node for node in query.plan().nodes if isinstance(node, AiMap)]
+    assert node.spec.max_answer_tokens == 32
+    assert node.spec.expected_answer_tokens == 32
+
+
 def test_a_map_runs_over_the_filter_survivors(session):
     query = (session.docs("reviews").alias("r")
              .ai_filter(quail.prompt("Is {0} negative?", quail.col("r.text")))
@@ -173,3 +190,61 @@ def test_a_single_map_plans_the_unified_path(session):
     (node,) = [node for node in _summaries(session).plan().nodes
                if isinstance(node, AiMap)]
     assert node.attention == "unified"
+
+
+class _MapClient:
+    """Writes 'ok N' for each prompt, N its answer limit; records each call."""
+
+    accepts_text = False
+
+    def __init__(self):
+        self.calls = []
+
+    def decode_params(self, max_tokens, stop=None):
+        return ("decode", max_tokens)
+
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        from types import SimpleNamespace
+
+        self.calls.append([limit for _, limit in sampling_params])
+        return [SimpleNamespace(
+            prompt_token_ids=prompt["prompt_token_ids"], num_cached_tokens=0,
+            outputs=[SimpleNamespace(text=f" ok {limit} ", token_ids=[1, 2])])
+            for prompt, (_, limit) in zip(prompts, sampling_params)]
+
+    def reset_prefix_cache(self):
+        return True
+
+
+@pytest.mark.parametrize("backend,calls", [
+    # one map at a time, then every map of a document together
+    ("stock_vllm", [[64] * 3, [16] * 3]),
+    ("pipelined_vllm", [[64, 16] * 3]),
+])
+def test_a_request_backend_writes_each_maps_answers(monkeypatch, backend, calls):
+    from helpers import baselines as request_tests
+
+    session = request_tests._session(
+        backend, reviews={"id": [0, 1, 2], "text": REVIEWS})
+    query = (session.docs("reviews").alias("r")
+             .ai_map("r.text", INSTRUCTION, name="summary", max_answer_tokens=64)
+             .ai_map("r.text", "Name the topic.", name="topic",
+                     max_answer_tokens=16)
+             .select("r.id", "summary", "topic"))
+    client = _MapClient()
+    boot = {"client": client, "sampling_params": object(),
+            "capacity": request_tests.CAPACITY}
+    monkeypatch.setattr(
+        "quail.baselines.vllm.VLLMEngine.boot",
+        lambda self, spec, allowed_ids, *, device, resources: (
+            boot, {"kind": "cold", "boot_s": 0.1}))
+    plan = query.plan()
+    response = session.registry.backend(backend).execute_request(
+        quail.backends.base.BackendExecutionContext(
+            request=query._prepare_physical(), graph=plan.graph,
+            registry=session.registry, gpus=1, runtime_state={}))
+    rows = query.finish(response).collect().sort_by("r.id").to_pydict()
+    assert rows["summary"] == ["ok 64"] * 3
+    assert rows["topic"] == ["ok 16"] * 3
+    assert client.calls == calls
+    session.close()

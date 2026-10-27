@@ -65,10 +65,15 @@ tokens.
 **Constraint.** The KV of all running answers must fit in $P$ pages.
 Answer lengths are unknown until each answer ends.
 
-The prompt for document $d$ and instruction $k$ is:
+The prompt for document $d$ and instruction $k$ is QUAIL-B's `raw-v1`
+map layout, wrapped in the model's chat turn:
 
 ```text
-[shared preamble] [d] Instruction: [instruction k] [answer cue]
+DOCUMENT:
+[d]
+
+[instruction k]
+ANSWER:
 ```
 
 The document comes before the instruction. The document's KV therefore

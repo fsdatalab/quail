@@ -330,6 +330,43 @@ def read_extractions(outputs, texts, wall_s: float) -> dict:
     }
 
 
+def map_documents(client, specs, bodies) -> dict:
+    """Write each map's answer for every prompt body, in one engine run.
+
+    The requests go document by document, a document's maps together,
+    so prefix caching can share its KV across them. Each map decodes
+    greedily until the model ends its turn or reaches its answer limit.
+
+    Args:
+        client: The engine client.
+        specs: The RequestMapSpecs of one table.
+        bodies: Each document's prompt before the tails: token ids, or
+            text for an engine that tokenizes the prompt itself.
+
+    Returns:
+        A dict with one answer list per spec, the request and token
+        counts, and the generation seconds.
+    """
+    prompts, params = [], []
+    limits = [client.decode_params(spec.max_answer_tokens) for spec in specs]
+    for body in bodies:
+        for spec, limit in zip(specs, limits):
+            prompts.append(body + spec.tail_text if isinstance(body, str)
+                           else {"prompt_token_ids": body
+                                 + token_list(spec.tail_token_ids)})
+            params.append(limit)
+    started = time.perf_counter()
+    outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
+    wall_s = time.perf_counter() - started
+    texts = [(output.outputs[0].text or "").strip() for output in outputs]
+    return {
+        "answers": [texts[index::len(specs)] for index in range(len(specs))],
+        "wall_s": wall_s,
+        "requests": len(outputs),
+        **_generation_counts(outputs),
+    }
+
+
 def allowed_members_by_anchor(anchor, partners, anchor_ids, members, pairs) -> list:
     """Per anchor, the member indices its equality conditions allow."""
     position = partners.index(pair_partner(anchor, partners))

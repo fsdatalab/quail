@@ -333,8 +333,10 @@ class ModelCall:
     # a "features" call only: which tokens become the row's feature
     # list, "last" or "max"
     pooling: str = ""
-    # a "map" call only: the instruction the answer is written for
+    # a "map" call only: the instruction the answer is written for, and
+    # the most tokens an answer may have; 0 leaves the planner's limit
     instruction: str = ""
+    max_answer_tokens: int = 0
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -355,7 +357,7 @@ class ModelCall:
             raise CompileError("only an AI.EXTRACT call has a question")
         if self.kind != "features" and self.pooling:
             raise CompileError("only an AI.SAE_FEATURES call has a pooling")
-        if self.kind != "map" and self.instruction:
+        if self.kind != "map" and (self.instruction or self.max_answer_tokens):
             raise CompileError("only an AI.MAP call has an instruction")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)
@@ -367,6 +369,10 @@ class ModelCall:
                 f"got {self.pooling!r}")
         elif self.kind == "map":
             validate_instruction(self.instruction)
+            if (type(self.max_answer_tokens) is not int
+                    or self.max_answer_tokens < 0):
+                raise CompileError(
+                    "AI.MAP max_answer_tokens must be a positive integer")
 
 
 def validate_question(question: str) -> None:

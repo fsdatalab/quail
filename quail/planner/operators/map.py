@@ -38,7 +38,7 @@ def map_spec(context, call, name, expected_rows, resident=False) -> MapSpec:
         expected_rows=expected_rows, estimated_seconds=0.0,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
-        instruction=call.instruction)
+        instruction=call.instruction, **_answer_limits(call))
     cost = extract_cost.estimate(
         expected_rows,
         lengths,
@@ -57,6 +57,15 @@ def map_spec(context, call, name, expected_rows, resident=False) -> MapSpec:
         memo=context.memo,
     )
     return replace(spec, estimated_seconds=cost.seconds)
+
+
+def _answer_limits(call) -> dict:
+    """Return a map call's answer limit and expected length, when it sets one."""
+    if not call.max_answer_tokens:
+        return {}
+    expected = min(MapSpec.expected_answer_tokens, call.max_answer_tokens)
+    return {"max_answer_tokens": call.max_answer_tokens,
+            "expected_answer_tokens": expected}
 
 
 def emit_map(builder, alias, expected_rows, names, port, resident=False) -> tuple:

@@ -31,7 +31,7 @@ from quail.baselines.nodes import RequestExecution
 from quail.execution.result import answer_values
 from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt, bind_extract_prompt
-from quail.physical import AiClassify, AiExtract, AiSaeFeatures, AiScore
+from quail.physical import AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import lower_prompt
 from quail.progress import say
@@ -218,6 +218,14 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
                 operator.relation, table.column(operator.relation)),
             "answer": table.column(name).cast(pa.string()),
         })
+    map_answers = {}
+    for operator in info.maps:
+        table = result.answer_tables["maps"][operator.output]
+        map_answers[operator.id] = pa.table({
+            operator.relation: id_column(
+                operator.relation, table.column(operator.relation)),
+            "answer": table.column(operator.output).cast(pa.string()),
+        })
     # quail-b checks that a plan selects ids, labels, scores, answer
     # structs, and measures; an answer struct brings its span struct,
     # which the benchmark does not take
@@ -234,7 +242,8 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         classify_answers=classify_answers or None,
         score_answers=score_answers or None,
         extract_answers=extract_answers or None,
-        features_answers=features_answers or None)
+        features_answers=features_answers or None,
+        map_answers=map_answers or None)
 
 
 def _alias_filters(info: PlanInfo, alias: str) -> list:
@@ -278,7 +287,7 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                      if lower(prompt).preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": [], "classifies": [], "scores": [],
-              "extracts": [], "features": []}
+              "extracts": [], "features": [], "maps": []}
     for alias, predicates in filters.items():
         written = _alias_filters(info, alias)
         for position, predicate in enumerate(predicates):
@@ -341,6 +350,15 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                 f"query reports no prompt pieces")
             return None
         pieces["features"].append({"id": operator.id, "tail": list(tail)})
+    for operator in info.maps:
+        head, tail = _map_parts(query.plan(), operator.output)
+        if not pieces["preamble"]:
+            pieces["preamble"] = list(head)
+        elif list(head) != pieces["preamble"]:
+            say(f"map {operator.id} has its own prompt head; the query "
+                f"reports no prompt pieces")
+            return None
+        pieces["maps"].append({"id": operator.id, "tail": list(tail)})
     return pieces
 
 
@@ -363,6 +381,22 @@ def _extract_parts(plan, output: str) -> tuple:
                 if spec.output == output:
                     return spec.preamble_token_ids, spec.tail_token_ids
     raise ValueError(f"the plan has no extraction named {output!r}")
+
+
+def _map_parts(plan, output: str) -> tuple:
+    """Return a map's head and tail token ids from a plan.
+
+    The Quail backend plans an AiMap node; a request backend carries
+    the map in its RequestExecution node's specs.
+    """
+    for node in plan.nodes:
+        if isinstance(node, AiMap) and node.spec.name == output:
+            return node.spec.prompt_token_parts
+        if isinstance(node, RequestExecution):
+            for spec in node.maps:
+                if spec.output == output:
+                    return spec.preamble_token_ids, spec.tail_token_ids
+    raise ValueError(f"the plan has no map named {output!r}")
 
 
 def _pair_pieces(prompt, anchor) -> dict:

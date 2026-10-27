@@ -201,3 +201,35 @@ def test_request_benchmark_counts_prompt_tokens_without_decode_tokens(monkeypatc
     session = SimpleNamespace(config=SimpleNamespace(backend="stock_vllm"))
     actual = quailb.run_query(session, SimpleNamespace(info=None), {})
     assert actual.measurements["input_tokens"] == 100
+
+
+def test_map_drafts_plan_on_quail_and_vllm_and_report_their_tails(tmp_path):
+    from bench.quailb import build_query, prompt_pieces
+    from quail_b.queries import get_query
+
+    _standin_sets(tmp_path)
+    ids = [f"IMDB-MAP-{i}" for i in range(1, 6)] + [
+        f"CUAD-MAP-{i}" for i in range(1, 4)]
+    for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
+        with quail.Session(
+            EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
+                         device="h100-sxm"),
+            tokenizer=letter_tokens,
+        ) as sess:
+            register_tables(sess, tmp_path)
+            for qid in ids:
+                spec = get_query(qid)
+                query = build_query(sess, spec)
+                plan = query.plan()
+                case = f"{backend} {qid}"
+                if backend == "pipelined_sglang":
+                    # its engine returns no decoded text
+                    assert isinstance(plan, Refusal), case
+                    continue
+                if backend != "quail" and qid == "CUAD-MAP-3":
+                    assert plan.constraint == "sort_needs_quail_backend", case
+                    continue
+                assert not isinstance(plan, Refusal), f"{case} refused: {plan}"
+                pieces = prompt_pieces(query, spec.info, {})
+                assert [item["id"] for item in pieces["maps"]] == [
+                    operator.id for operator in spec.info.maps], case
