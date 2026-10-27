@@ -184,7 +184,10 @@ def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path
                                                               lag):
     cpu_staging(monkeypatch)
     rng = np.random.default_rng(1)
-    documents = [rng.integers(20, 900, size=int(n)).tolist()
+    # every document starts with the same preamble, longer than a page,
+    # so a branch may borrow it from another document's branch
+    preamble = list(range(1, 21))
+    documents = [preamble + rng.integers(20, 900, size=int(n)).tolist()
                  for n in rng.integers(3, 60, size=10)]
     tails = [[500, 501, 502], [600, 601], [650, 651, 652, 653]]
     limits = [6, 4, 5]

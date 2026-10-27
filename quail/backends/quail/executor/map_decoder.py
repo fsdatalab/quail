@@ -77,10 +77,11 @@ class MapDecoder:
         self.stopped = np.zeros(n, dtype=bool)         # read a stop token
         self.pages = np.zeros((n, 1), dtype=np.int32)  # its pages, padded
         self.num_pages = np.zeros(n, dtype=np.int64)
-        # the branches of one document form a group, named by its first
-        # branch, and share its first shared[group] tokens' pages
-        self.group = np.arange(n, dtype=np.int64)
-        self.shared = np.zeros(n, dtype=np.int64)
+        # a slot borrows its first borrowed[slot] tokens' pages from
+        # parent[slot]; lead[slot] is the most any slot borrows from it
+        self.parent = np.arange(n, dtype=np.int64)
+        self.borrowed = np.zeros(n, dtype=np.int64)
+        self.lead = np.zeros(n, dtype=np.int64)
         self.device = head.device
         self.next_token = torch.zeros(n, dtype=torch.int64, device=self.device)
         self.copies = deque()
@@ -124,13 +125,13 @@ class MapDecoder:
         self.origin[document] = position
         self.fed[document] = 0
         self.stopped[document] = False
-        self.group[document] = document
-        self.shared[document] = 0
+        self.parent[document] = document
+        self.borrowed[document] = 0
+        self.lead[document] = 0
         if parent is not None and shared_tokens:
-            # the parent reads the same pages as shared from now on
-            self.group[document] = self.group[parent]
-            self.shared[document] = shared_tokens
-            self.shared[self.group[parent]] = shared_tokens
+            self.parent[document] = parent
+            self.borrowed[document] = shared_tokens
+            self.lead[parent] = max(self.lead[parent], shared_tokens)
 
     @property
     def active(self) -> bool:
@@ -167,11 +168,18 @@ class MapDecoder:
                       * self.page_tokens + positions % self.page_tokens)
         rows = DecodeRows(positions=positions, write_rows=write_rows,
                           page_table=table, slots=running)
-        # the rows of a group with two or more running branches read
-        # its shared pages once, together
-        groups, shared = self.group[running], self.shared[running]
-        _, inverse, counts = np.unique(groups, return_inverse=True,
-                                       return_counts=True)
+        # a group is a slot and the slots that borrow the most from it,
+        # whose first pages are the same; its rows read those pages once
+        # together when two or more of them run. A slot both borrowing
+        # and lent from takes the group with the longer shared pages
+        parents = self.parent[running]
+        as_child = np.where(self.borrowed[running] == self.lead[parents],
+                            self.borrowed[running], 0)
+        as_parent = self.lead[running]
+        groups = np.where(as_parent >= as_child, running, parents)
+        shared = np.maximum(as_parent, as_child)
+        _, inverse, counts = np.unique(np.where(shared > 0, groups, -1 - index),
+                                       return_inverse=True, return_counts=True)
         together = (shared > 0) & (counts[inverse] > 1)
         if not together.any():
             return rows
