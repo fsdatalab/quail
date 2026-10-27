@@ -259,7 +259,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         decoder: A MapDecoder writing the answers of the stages with
             answer_tokens, or None. A document's row at such a stage is
             reported once its answer ends; until then the decoder packs
-            one row for it per pass, and the run uses unified attention.
+            one row for it per pass.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is

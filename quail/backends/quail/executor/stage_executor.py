@@ -153,9 +153,6 @@ class StageExecutor:
             attention_mode = "tree"
         self.mode = attention_path(
             self.pipeline, attention_mode, default_attention=default_attention)
-        if decoder is not None:
-            # decode rows read their own pages in one causal paged call
-            self.mode = "unified"
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
         self.canvas_rows = [len(self.canvas) if stage.canvas is None

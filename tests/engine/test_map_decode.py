@@ -40,7 +40,10 @@ class TokenModel(HashModel):
         ids = chunk.input_ids.tolist()
         positions = chunk.positions.tolist()
         hashes = [None] * len(ids)
-        self._unified(chunk.meta["unified"], ids, positions, hashes)
+        if chunk.attention_mode == "unified":
+            self._unified(chunk.meta["unified"], ids, positions, hashes)
+        else:
+            self._tree(chunk.meta, ids, positions, hashes)
         rows = chunk.final_indices.tolist()
         out = torch.zeros(len(rows), VOCABULARY)
         out[torch.arange(len(rows)),
@@ -99,17 +102,19 @@ def events_torch(lag):
     return torch_
 
 
+@pytest.mark.parametrize("path", ["unified", "tree"])
 @pytest.mark.parametrize("lag", [0, 3])
 @pytest.mark.parametrize("budget", [40, 400])
 @pytest.mark.parametrize("question", [None, [700, 701]])
-def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag):
+def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
+                                           path):
     cpu_staging(monkeypatch)
     rng = np.random.default_rng(0)
     documents = [rng.integers(20, 900, size=int(n)).tolist()
                  for n in rng.integers(3, 30, size=12)]
     tails = [[500, 501, 502], [600, 601]]
     limits = [6, 4]
-    setup = Setup(path="unified", pages=200, budget=budget)
+    setup = Setup(path=path, pages=200, budget=budget)
     arena = make_arena(setup)
     model = TokenModel(arena)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk,
@@ -126,7 +131,7 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag):
                          [STOP], setup.page_tokens)
     maps.decoder = decoder
     run_stages(torch_, arena, pipeline, gated_stages(parts), documents, budget,
-               anchor_keys=[("d", i) for i in ids], attention_mode="unified",
+               anchor_keys=[("d", i) for i in ids], attention_mode=path,
                decoder=decoder)
     passed = [question is None
               or next_token(chain(document + question)) % 2 == 1

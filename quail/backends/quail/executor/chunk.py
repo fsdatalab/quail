@@ -657,11 +657,18 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     if decode is not None and not len(decode):
         decode = None
     if decode is not None:
-        if attention_mode != "unified" or arena.has_sliding or getattr(
-                arena, "num_state_slots", 0):
-            raise ValueError("decode rows run the unified attention path of "
-                             "a model with every-token attention only")
+        if arena.has_sliding or getattr(arena, "num_state_slots", 0):
+            raise ValueError("decode rows read a model with every-token "
+                             "attention only")
         count = len(decode)
+        if tree_path:
+            # each row reads its resident rows in call B and itself in
+            # call A
+            reader_rows.append(np.arange(num_tokens, num_tokens + count,
+                                         dtype=np.int64))
+            cu_q.extend(range(cu_q[-1] + 1, cu_q[-1] + count + 1))
+            read_used.extend(np.asarray(decode.positions).tolist())
+            max_q = max(max_q, 1)
         id_parts.append(np.zeros(count, dtype=np.int64))
         position.append(np.asarray(decode.positions, dtype=np.int64))
         finals.append(np.arange(num_tokens, num_tokens + count, dtype=np.int64))
@@ -673,8 +680,18 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
     t = _tick(timing, "pack_py", t)
     reads = None
-    if read_keys:
-        table, _ = arena.block_table(read_keys)
+    tree_decode = decode is not None and tree_path
+    if read_keys or tree_decode:
+        if not tree_decode:
+            table, _ = arena.block_table(read_keys)
+        else:
+            pages = [arena.owned_pages(key) for key in read_keys]
+            width = max([len(row) for row in pages] + [decode.page_table.shape[1]])
+            flat = np.zeros((len(pages) + len(decode), width), dtype=np.int32)
+            for row, own in enumerate(pages):
+                flat[row, :len(own)] = own
+            flat[len(pages):, :decode.page_table.shape[1]] = decode.page_table
+            table = stage("read_table", flat, torch.int32).view(*flat.shape)
         t = _tick(timing, "pack_blocktable", t)
         rows = np.concatenate(reader_rows)
         # row -> its index in call B's output, -1 for rows that read
@@ -823,16 +840,20 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # row pairs: the attention pass scatters them with a single kernel
     # launch per layer (kv_row_scatter)
     kv_src = kv_dst = None
-    if kv_writes:
+    if kv_writes or tree_decode:
         src, dst_parts = [], []
         for key, r0, r1, dest in kv_writes:
             src.append(np.arange(r0, r1, dtype=np.int64))
             rows = arena.capacity_rows(key)[dest:dest + (r1 - r0)]
             if rows.numel() != r1 - r0:
                 raise AssertionError("KV write exceeds reserved rows")
-            dst_parts.append(rows)
+            dst_parts.append(rows.numpy())
+        if tree_decode:
+            src.append(np.arange(decode_row0, decode_row0 + len(decode),
+                                 dtype=np.int64))
+            dst_parts.append(np.asarray(decode.write_rows, dtype=np.int64))
         kv_src = _staged(torch, np.concatenate(src), torch.int64, pinned)
-        kv_dst = _staged(torch, torch.cat(dst_parts), torch.int64,
+        kv_dst = _staged(torch, np.concatenate(dst_parts), torch.int64,
                          pinned)
     t = _tick(timing, "pack_kv", t)
 
