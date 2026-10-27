@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from quail.cost import budgets
 from quail.cost.extract import estimate as extract_estimate
 from quail.cost.score import score_fixed_tokens
@@ -28,7 +30,7 @@ from quail.physical import (
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.operators.classify import classify_scoring
-from quail.planner.statistics.prefixes import page_tree
+from quail.planner.statistics.prefixes import key_documents, page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
@@ -124,16 +126,21 @@ class PlanPricer:
         window = self.context.model.sliding_window
         question = node.question_tokens
         mean_prefix = self._mean_prefix(node)
+        # a copy of an earlier document is not asked
+        keys = key_documents(self.context, node.alias)
+        asked = node.expected_rows * (1.0 if keys is None else keys.mean())
         if resident:
-            return ask(mean_prefix, question, window=window) * node.expected_rows
+            return ask(mean_prefix, question, window=window) * asked
         shared = self._shared(node, node.alias)
         if shared is None:
-            return scan(mean_prefix, question, window=window) * node.expected_rows
+            return scan(mean_prefix, question, window=window) * asked
         lengths = self.context.document_tokens[node.alias]
         if not len(lengths):
             return Work()
         work = Work()
-        for length, shared in zip(lengths, shared):
+        for index, (length, shared) in enumerate(zip(lengths, shared)):
+            if keys is not None and not keys[index]:
+                continue
             prefix = node.preamble_tokens + int(length)
             # a borrowed prefix includes the prompt head the documents share
             borrowed = shared + node.preamble_tokens if shared else 0
@@ -169,10 +176,28 @@ class PlanPricer:
         spec = node.spec
         alias = spec.aliases[0] if len(spec.aliases) == 1 else None
         shared = None if alias is None else self._shared(node, alias)
-        if shared is None or not spec.estimated_seconds:
-            return spec.estimated_seconds
-        return spec.estimated_seconds * self._fresh_fraction(node, alias, shared,
-                                                             resident)
+        seconds = spec.estimated_seconds
+        if shared is not None and seconds:
+            seconds *= self._fresh_fraction(node, alias, shared, resident)
+        keys = None if alias is None else key_documents(self.context, alias)
+        if keys is not None and seconds:
+            seconds *= self._asked_fraction(node, alias, keys, shared)
+        return seconds
+
+    def _asked_fraction(self, node, alias: str, keys, shared) -> float:
+        """The share of a node's fresh tokens that its key documents compute.
+
+        A copy is not asked. Under prefix sharing a copy already borrows
+        almost all of its document, so the copies save their prompt
+        tokens; without it they save their whole document too.
+        """
+        lengths = np.asarray(self.context.document_tokens[alias], dtype=np.float64)
+        fixed = sum(map(len, node.spec.prompt_token_parts))
+        fresh = lengths + fixed
+        if shared is not None:
+            fresh = fresh - np.asarray(shared, dtype=np.float64)
+        total = fresh.sum()
+        return float(fresh[keys].sum() / total) if total else 1.0
 
     def _fresh_fraction(self, node, alias: str, shared, resident: bool) -> float:
         context, spec = self.context, node.spec

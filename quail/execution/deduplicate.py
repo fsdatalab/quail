@@ -7,12 +7,12 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pyarrow as pa
 
-from quail.catalog.pairs import columns_key
+from quail.catalog.pairs import columns_key, pair_ids_table, pair_keys
 from quail.catalog.tokens import FIRST_DOCUMENT
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeResult
 from quail.execution.result import true_answer_rows
-from quail.execution.rows import Rows
+from quail.execution.rows import Rows, rows_of
 from quail.execution.types import _join_answers_table
 from quail.physical import AiFilter, AiInference, AiJoin, Foreign, ValueType
 
@@ -66,7 +66,7 @@ class Deduplicated:
                 if not any(alias in self.keys for alias in aliases):
                     outputs[port.name] = value
                     continue
-                keys = self._keys(aliases)
+                keys = self._keys(aliases, pairs)
                 if port.value_type is ValueType.JOIN_ANSWERS:
                     table = (value if isinstance(value, pa.Table)
                              else _join_answers_table(value))
@@ -82,8 +82,7 @@ class Deduplicated:
                         joined, anchor, node.semantics, read[anchor],
                         len(keys[anchor]))})
                 else:
-                    rows = (value if isinstance(value, Rows)
-                            else Rows({aliases[0]: document_ids(value)}))
+                    rows = rows_of(value, aliases[0])
                     table = _expanded(rows.table(), aliases, read, keys,
                                       pairs if len(aliases) == 2 else None)
                     outputs[port.name] = Rows(
@@ -104,9 +103,21 @@ class Deduplicated:
             expanded[node.node_id] = NodeResult(outputs, metrics)
         return expanded
 
-    def _keys(self, aliases) -> dict:
-        return {alias: self.keys.get(alias, _identity(self.every, alias))
-                for alias in aliases}
+    def _keys(self, aliases, pairs) -> dict:
+        """Each alias's key documents; a table without copies is its own key."""
+        keys = {}
+        for alias in aliases:
+            if alias in self.keys:
+                keys[alias] = self.keys[alias]
+                continue
+            # cover every id the answers or the pairs can name
+            known = [self.every.get(alias, np.zeros(0, dtype=np.int64))]
+            if pairs is not None and alias in pairs.column_names:
+                known.append(pairs.column(alias).to_numpy())
+            size = max((int(ids.max()) + 1 for ids in known if len(ids)),
+                       default=0)
+            keys[alias] = np.arange(size, dtype=np.int64)
+        return keys
 
     def _pairs_read(self, node, earlier_outputs):
         """The pairs a node stands for: read from outside, or a join's inside."""
@@ -182,9 +193,15 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
         if _is_pairs(port, value):
             if isinstance(graph.node(port.source.node_id), Foreign):
                 return None
+            aliases = (value.aliases if isinstance(value, Rows)
+                       else tuple(value.column_names))
             table = value.table() if isinstance(value, Rows) else value
-            _read_pairs(context, tuple(table.column_names[:2]), table, keys,
-                        every, pairs, node, port, reduced)
+            # a pair input may carry only its two id columns: other
+            # values could differ between copies
+            if len(aliases) != 2 or table.num_columns != 2:
+                return None
+            _read_pairs(context, aliases, table, keys, every, pairs, node,
+                        port, reduced)
         elif port.value_type is ValueType.ROWS:
             alias = (value.aliases[0] if isinstance(value, Rows)
                      else port.source.port.split(":", 1)[1])
@@ -193,8 +210,10 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
                 return None
             every[alias] = ids
             if _key(context, alias, keys):
-                reduced[node.node_id][port.name] = _reduced_rows(
-                    value, alias, ids, keys[alias])
+                value = _reduced_rows(value, alias, ids, keys[alias])
+                if value is None:
+                    return None
+                reduced[node.node_id][port.name] = value
         else:
             return None
     if not keys:
@@ -220,15 +239,18 @@ def _key(context, alias: str, keys: dict) -> bool:
     return True
 
 
-def _identity(every: dict, alias: str) -> np.ndarray:
-    size = int(every[alias].max(initial=-1)) + 1 if alias in every else 0
-    return np.arange(size, dtype=np.int64)
-
-
 def _reduced_rows(value, alias: str, ids, keys):
-    """One row per key document, carrying the first copy's values."""
-    kept, first = np.unique(keys[ids], return_index=True)
+    """One row per key document, or None when copies carry different values.
+
+    Every copy gets its key document's row back, so a value column is
+    only kept when each copy holds the same value as its key's row.
+    Otherwise the group runs without deduplication.
+    """
+    kept, first, inverse = np.unique(keys[ids], return_index=True,
+                                     return_inverse=True)
     if isinstance(value, Rows) and value.values.num_columns:
+        if not value.values.take(first[inverse]).equals(value.values):
+            return None
         rows = value.take(first)
         return Rows({alias: pa.array(kept, pa.int32())}, rows.values)
     kept = pa.array(kept, pa.int32())
@@ -248,15 +270,11 @@ def _read_pairs(context, aliases, table, keys, every, pairs, node, port,
     sides = []
     for alias in aliases:
         documents = table.column(alias).to_numpy()
-        mapped = keys[alias] if alias in keys else _identity(every, alias)
-        sides.append(mapped[documents].astype(np.uint64))
-    anchors, partners = sides
-    # one uint64 per pair: the left key, then the right
-    kept = np.sort((anchors << np.uint64(32)) | partners)
-    kept = kept[np.concatenate(([True], kept[1:] != kept[:-1]))]
-    columns = {left: (kept >> np.uint64(32)).astype(np.int32),
-               right: (kept & np.uint64(0xFFFFFFFF)).astype(np.int32)}
-    value = pa.table(columns)
+        mapped = keys[alias][documents] if alias in keys else documents
+        sides.append(mapped)
+    kept = np.unique(_pair_keys(*sides))
+    value = pair_ids_table(left, right, np.column_stack(
+        (kept >> 32, kept & 0xFFFFFFFF)))
     if port.value_type is ValueType.ROWS:
         value = Rows({alias: value.column(alias) for alias in aliases})
     reduced[node.node_id][port.name] = value
@@ -302,9 +320,9 @@ def _expanded(table: pa.Table, aliases, every, keys, pairs) -> pa.Table:
 
 
 def _pair_keys(anchors, partners) -> np.ndarray:
-    """One uint64 per pair: the anchor's id, then the partner's."""
-    return ((anchors.astype(np.uint64) << np.uint64(32))
-            | partners.astype(np.uint64))
+    """One int64 per pair: the anchor's id, then the partner's."""
+    return pair_keys(pa.array(anchors, pa.int64()),
+                     pa.array(partners, pa.int64())).to_numpy()
 
 
 def _matches(wanted, answered) -> tuple[np.ndarray, np.ndarray]:
@@ -313,7 +331,10 @@ def _matches(wanted, answered) -> tuple[np.ndarray, np.ndarray]:
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
     if answered.dtype.kind == "i" and answered.min() >= 0:
         size = int(max(answered.max(), wanted.max(initial=-1))) + 1
-        if np.bincount(answered, minlength=size).max() == 1:
+        # a position table only for document ids, not for pair keys,
+        # whose range is far larger than their count
+        if (size <= 4 * (len(answered) + len(wanted))
+                and np.bincount(answered, minlength=size).max() == 1):
             # one answer row per key: look each key up by position
             row_of = np.full(size, -1, dtype=np.int64)
             row_of[answered] = np.arange(len(answered))

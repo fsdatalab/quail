@@ -33,7 +33,7 @@ from quail.planner.search.statistics import (
     cached_statistics,
     expected_rows_after_filters,
 )
-from quail.planner.statistics.prefixes import page_tree
+from quail.planner.statistics.prefixes import key_documents, page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
@@ -461,14 +461,13 @@ class ShouldDeduplicate(PhysicalRule):
         if context is None:
             return None
         context.settings.pop("deduplicate", None)
-        model = context.model
-        if context.backend != "quail" or model is None or model.canvas_tokens:
+        if context.backend != "quail":
             return None
         stop_keys = {node.alias: node.stop_key for node in graph.nodes
                      if isinstance(node, AiFilter)}
         chosen = {alias: tuple(stop_keys.get(alias, ()))
                   for alias in sorted(_model_aliases(graph))
-                  if _copied(context, alias)}
+                  if key_documents(context, alias) is not None}
         if chosen:
             context.settings["deduplicate"] = chosen
         return None
@@ -485,10 +484,3 @@ def _model_aliases(graph) -> set[str]:
         elif isinstance(node, AiInference) and node.spec is not None:
             aliases.update(node.spec.aliases)
     return aliases
-
-
-def _copied(context, alias: str) -> bool:
-    """Whether any of an alias's documents copies another's tokens."""
-    lengths = context.document_tokens.get(alias)
-    store = None if lengths is None else lengths.store
-    return store is not None and store.num_copies > 0

@@ -6,6 +6,7 @@ documents and gives every copy their answers. Each query here runs with and with
 that rule and must return the same rows.
 """
 
+import numpy as np
 import pyarrow as pa
 import pytest
 from helpers.baselines import _session as _request_session
@@ -282,3 +283,32 @@ def test_a_self_join_asks_each_pair_of_texts_once(monkeypatch):
     # the pairs of their key documents 0, 1, and 3, on either side
     assert sorted(grouped) == [(0, 0), (0, 1), (0, 3), (1, 0), (1, 1), (1, 3),
                                (3, 0), (3, 1), (3, 3)]
+
+
+def test_copies_with_different_carried_values_are_not_merged():
+    from quail.execution.deduplicate import _reduced_rows
+    from quail.execution.rows import Rows
+
+    ids = np.array([0, 1, 2])
+    keys = np.array([0, 1, 0])
+    same = Rows({"r": ids}, pa.table({"label": ["a", "b", "a"]}))
+    reduced = _reduced_rows(same, "r", ids, keys)
+    assert reduced.ids["r"].to_pylist() == [0, 1]
+    assert reduced.column("label").to_pylist() == ["a", "b"]
+    # r2 copies r0's text but carries its own value, which a merged row
+    # would overwrite with r0's
+    different = Rows({"r": ids}, pa.table({"stars": [5, 3, 1]}))
+    assert _reduced_rows(different, "r", ids, keys) is None
+
+
+def test_the_planner_prices_only_the_documents_it_asks(monkeypatch):
+    from quail.planner.graph import pricing
+
+    with _session() as session:
+        query = _short(session).select("r.id")
+        deduplicated = _planned(query).estimated_seconds
+    monkeypatch.setattr(pricing, "key_documents", lambda context, alias: None)
+    with _session() as session:
+        every = _planned(_short(session).select("r.id")).estimated_seconds
+    # 3 of the 6 reviews are copies
+    assert deduplicated < every

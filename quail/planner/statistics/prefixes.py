@@ -2,7 +2,29 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 from quail.catalog.tokens import PrefixTree, prefix_tree
+
+
+def key_documents(context, alias: str):
+    """Which of an alias's documents the model is asked about, or None.
+
+    With deduplication, the model reads only the first document of
+    each text; its copies get that answer. None means every document is
+    read: the table has no copies, or the model is a diffusion model,
+    whose answers depend on more than the text. A filter's stop key can
+    make a copy its own key document; this ignores that.
+    """
+    model = context.model
+    if model is None or model.canvas_tokens:
+        return None
+    lengths = context.document_tokens.get(alias)
+    store = None if lengths is None else lengths.store
+    if store is None or not store.num_copies:
+        return None
+    first = store.first_documents.to_numpy()
+    return first == np.arange(len(first))
 
 
 def document_shared_tokens(store) -> list[int]:
