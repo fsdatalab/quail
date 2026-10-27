@@ -318,7 +318,8 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
             return None
         pieces["scores"].append({"id": operator.id, "tail": list(tail)})
     for operator in info.extracts:
-        head, tail = _extract_parts(query.plan(), _extract_name(info, operator))
+        head, tail = _answer_parts(query.plan(), _extract_name(info, operator),
+                                   AiExtract, "extracts")
         if not pieces["preamble"]:
             pieces["preamble"] = list(head)
         elif list(head) != pieces["preamble"]:
@@ -329,10 +330,7 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
     for kind, operators, node_type in (("features", info.sae_features, AiSaeFeatures),
                                        ("maps", info.maps, AiMap)):
         for operator in operators:
-            node = next(node for node in query.plan().nodes
-                        if isinstance(node, node_type)
-                        and node.spec.name == operator.output)
-            head, tail = node.spec.prompt_token_parts
+            head, tail = _answer_parts(query.plan(), operator.output, node_type, kind)
             if not pieces["preamble"]:
                 pieces["preamble"] = list(head)
             elif list(head) != pieces["preamble"]:
@@ -348,20 +346,21 @@ def _extract_name(info: PlanInfo, operator) -> str:
     return f"{info.struct_of(operator).name}.{operator.output}"
 
 
-def _extract_parts(plan, output: str) -> tuple:
-    """Return an extraction's plain head and tail token ids from a plan.
+def _answer_parts(plan, output: str, node_type, kind: str) -> tuple:
+    """Return an answer column's plain head and tail token ids from a plan.
 
-    The Quail backend plans an AiExtract node; a request backend
-    carries the extraction in its RequestExecution node's specs.
+    The Quail backend plans a node of node_type; a request backend
+    carries the column in its RequestExecution node's specs of kind,
+    "extracts" or "maps".
     """
     for node in plan.nodes:
-        if isinstance(node, AiExtract) and node.spec.name == output:
+        if isinstance(node, node_type) and node.spec.name == output:
             return node.spec.prompt_token_parts
         if isinstance(node, RequestExecution):
-            for spec in node.extracts:
+            for spec in getattr(node, kind, ()):
                 if spec.output == output:
                     return spec.preamble_token_ids, spec.tail_token_ids
-    raise ValueError(f"the plan has no extraction named {output!r}")
+    raise ValueError(f"the plan has no {kind} column named {output!r}")
 
 
 def _pair_pieces(prompt, anchor) -> dict:

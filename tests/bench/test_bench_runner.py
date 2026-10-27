@@ -411,6 +411,37 @@ def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
     assert pieces["extracts"][0]["tail"][-1] == _token_ids(":")[-1]
 
 
+def test_stock_vllm_reports_maps_and_their_pieces(tmp_path):
+    spec = get_query("CUAD-MAP-2")
+
+    def nodes(graph, request):
+        model = next(
+            node for node in graph.nodes if isinstance(node, RequestExecution))
+        return {model.node_id: NodeResult({
+            "rows:c": [0, 1, 2],
+            **{f"map_answers:{operator.output}": pa.table({
+                "c": pa.array([0, 1, 2], pa.int32()),
+                operator.output: pa.array(
+                    [f"{operator.output} {i}" for i in range(3)], pa.string()),
+            }) for operator in spec.info.maps},
+        })}
+
+    with _session(tmp_path, backend="stock_vllm") as sess:
+        sess.register("contracts", DocumentProvider.from_table(
+            CONTRACTS, id_col="id"))
+        query = build_query(sess, spec)
+        result = _execute(query, nodes, cached_tokens=0)
+        output = run_output(result, spec.info, {"contracts": CONTRACTS})
+        pieces = prompt_pieces(query, spec.info, {})
+    for operator in spec.info.maps:
+        assert output.map_answers[operator.id].to_pydict() == {
+            "c": ["ct0", "ct1", "ct2"],
+            "answer": [f"{operator.output} {i}" for i in range(3)]}
+    assert [item["id"] for item in pieces["maps"]] == [
+        operator.id for operator in spec.info.maps]
+    assert pieces["maps"][0]["tail"][-1] == _token_ids(":")[-1]
+
+
 def test_benchmark_results_and_scoring(tmp_path):
     with _session(tmp_path) as sess:
         quail_result = _run(_query(sess), [1, 0])
