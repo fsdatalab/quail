@@ -65,7 +65,7 @@ def gpu_image(*local_dirs: tuple[str, str],
     """
     image = (_cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
              .add_local_dir(VLLM_PLUGIN_DIR, "/opt/quail-vllm-plugin", copy=True)
-             .run_commands("python -m pip install --no-deps /opt/quail-vllm-plugin"))
+             .uv_pip_install("/opt/quail-vllm-plugin", uv_version=UV_VERSION))
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
     image = image.add_local_python_source("quail", "bench")
