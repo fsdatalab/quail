@@ -19,7 +19,7 @@ from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.operators.classify import ClassifyPart
 from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
-from quail.backends.quail.executor.operators.map import MapPart
+from quail.backends.quail.executor.operators.map import MapPart, execute_maps
 from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
@@ -396,3 +396,48 @@ def test_fused_document_operators_equal_running_each_operator_alone(
             row[node.spec.name] = answer
     assert len(separate) > 2
     assert fused == separate[:limit]
+
+
+@pytest.mark.parametrize("keep_kv", [False, True])
+def test_map_results_keep_only_document_kv_when_requested(monkeypatch, keep_kv):
+    cpu_staging(monkeypatch)
+    monkeypatch.setattr("quail.backends.quail.executor.parts.input_staging",
+                        lambda state: None)
+    documents = [list(range(1, 31)), list(range(10, 40)), list(range(20, 50))]
+    setup = Setup(path="unified", pages=200, budget=200)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=())
+    torch_ = events_torch(3)
+
+    def batch_decode(tokens, skip_special_tokens=True):
+        return [" ".join(str(int(token)) for token in answer) for answer in tokens]
+
+    state = SimpleNamespace(
+        torch=torch_, chunk_tokens=setup.budget, loaded_model=SimpleNamespace(
+            arena=arena, pipeline=pipeline, input_staging=None,
+            model=SimpleNamespace(quail_full_head=torch.eye(VOCABULARY)),
+            vocabulary=SimpleNamespace(stop_ids=[STOP], tokenizer=SimpleNamespace(
+                batch_decode=batch_decode))))
+    nodes = [map_node(f"m{q}", tail, limit, "tree")
+             for q, (tail, limit) in enumerate(zip(
+                 [[500, 501], [600, 601], [650, 651]], [1, 7, 9]))]
+    for node in nodes:
+        node.node_id = node.spec.name
+        node.spec.aliases = ("d",)
+        node.rows_port = "rows:d"
+        node.document_head = ()
+        node.share_prefixes = False
+        node.keep_kv = keep_kv
+    results = execute_maps(state, nodes, {
+        "document_ids": [0, 1, 2], "documents": {"d": documents}, "limit": 2})
+    for node in nodes:
+        result = results[node.node_id]
+        rows = result.outputs[node.rows_port]
+        assert rows.ids["d"].to_pylist() == [0, 1]
+        want = batch_decode([greedy(document + list(node.spec.prompt_token_parts[1]),
+                                    node.spec.max_answer_tokens)
+                             for document in documents[:2]])
+        assert rows.column(node.spec.name).to_pylist() == want
+        assert result.metrics.output_rows == 2
+    assert set(arena.accounting.owned) == ({("d", 0), ("d", 1)} if keep_kv else set())
