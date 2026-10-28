@@ -452,16 +452,17 @@ class StageExecutor:
         decoder = self.decoder
         while True:
             running = decoder.running()
-            positions = decoder.origin[running] + decoder.fed[running]
+            positions = (decoder.origin[running] + decoder.fed[running]
+                         + decoder.row_counts(running) - 1)
             growing = running[positions >= decoder.num_pages[running]
                               * self.arena.page_tokens]
             if not len(growing):
                 return
-            # one row a pass: each growing answer needs exactly one page
+            # Copy drafts can cross more than one page.
             added = self.arena.grow_pages([self.keys[a] for a in growing.tolist()])
             if added is not None:
                 decoder.add_pages(growing, added)
-                return
+                continue
             victim = int(decoder.eviction_order()[0])
             for detached in decoder.pause(victim):
                 self.borrowing.chosen.pop(int(detached), None)

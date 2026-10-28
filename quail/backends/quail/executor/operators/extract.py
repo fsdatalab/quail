@@ -10,6 +10,8 @@ from quail.backends.quail.executor.extract import (
     ExtractionStages,
     load_vocabulary,
 )
+from quail.backends.quail.executor.extract.stages import ExtractionInputs
+from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import (
     ExecutionPart,
     execute_parts,
@@ -106,7 +108,7 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
     return results
 
 
-class ExtractPart(ExecutionPart):
+class RecurrentExtractPart(ExecutionPart):
     """Extraction stages and per-question results for the shared executor."""
 
     combine = True
@@ -218,3 +220,91 @@ class ExtractPart(ExecutionPart):
     def results(self) -> dict:
         """Return the answer table and metrics for each extraction."""
         return self._results
+
+
+class ExtractPart(MapPart):
+    """Extraction fields decoded as document branches by MapDecoder."""
+
+    execute_group = staticmethod(execute_extractions)
+    model_inputs = staticmethod(RecurrentExtractPart.model_inputs)
+    tested_columns = RecurrentExtractPart.tested_columns
+
+    def __new__(cls, state, nodes, ids, inputs, first=0):
+        if getattr(state.loaded_model.arena, "num_state_slots", 0):
+            return RecurrentExtractPart(state, nodes, ids, inputs)
+        return super().__new__(cls)
+
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        first_node = parts[0].node if parts else nodes[0]
+        part = cls(state, nodes, ids, {
+            "documents": context.state["documents"],
+            "texts": context.state.get("texts", {}),
+            "pipeline_head": first_node.document_head},
+            first=sum(len(part.answer_limits) for part in parts))
+        alias = part.node.spec.alias
+        if any(document.key != (alias, document_id)
+               for document, document_id in zip(part.extraction.documents, part.ids)):
+            raise ValueError("AI.EXTRACT needs the pipeline's document tokens and head")
+        return part
+
+    def __init__(self, state, nodes, ids, inputs, first=0):
+        if any(not isinstance(node, AiExtract) for node in nodes):
+            raise TypeError("an extraction pipeline holds AiExtract nodes only")
+        alias = nodes[0].spec.alias
+        texts = inputs.get("texts", {}).get(alias)
+        if texts is None:
+            raise ValueError(f"AI.EXTRACT needs the text of {alias!r}")
+        super().__init__(state, nodes, ids, first)
+        self.extraction = ExtractionInputs(
+            state, [node.spec for node in nodes], load_vocabulary(state), self.ids,
+            inputs["documents"][alias], texts,
+            pipeline_head=inputs.get("pipeline_head", self.node.document_head),
+            document_positions=inputs.get("document_positions"))
+
+    @MapPart.decoder.setter
+    def decoder(self, decoder):
+        MapPart.decoder.fset(self, decoder)
+        decoder.configure_copy(self.first, self.slots, self.extraction,
+                               [node.spec for node in self.nodes])
+
+    def answers(self, q, kept=None):
+        slots = self.slots[q] if kept is None else self.slots[q, kept]
+        return self.decoder.output_answers(self.first + q, slots)
+
+    def tested_values(self, column, positions):
+        q, span = next((q, column == node.spec.span_name)
+                       for q, node in enumerate(self.nodes)
+                       if column in (node.spec.name, node.spec.span_name))
+        values, spans = self.answers(q, positions)
+        if not span:
+            return pa.array(values, pa.string())
+        return pa.array([None if value is None else dict(start=value[0], end=value[1])
+                         for value in spans],
+                        pa.struct([("start", pa.int32()), ("end", pa.int32())]))
+
+    def finish(self, every):
+        fed = super().finish(every)
+        self.counts = []
+        for q, node in enumerate(self.nodes):
+            lengths = self.decoder.lengths[self.first + q][self.slots[q]]
+            self.counts.append(dict(
+                none=int((lengths <= 0).sum()),
+                steps=int(self.decoder.steps[self.first + q][self.slots[q]].sum()),
+                answer_tokens=int(np.maximum(0, lengths).sum()),
+                suffix_tokens=(int(self.asked[q].sum())
+                               * len(node.spec.prompt_token_parts[1]) + self.fed[q])))
+        return fed
+
+    def complete(self, fresh, spans, stats, offset):
+        selected = stage_spans(spans, offset, offset + 1)
+        total = sum(count["suffix_tokens"] for count in self.counts)
+
+        def own(q):
+            return (gpu_seconds(selected) * self.counts[q]["suffix_tokens"]
+                    / max(1, total), len(selected))
+
+        self._results = extraction_results(
+            self.nodes, self, self.ids, fresh=fresh, counts=self.counts,
+            own=own, stats=stats, kept=np.flatnonzero(self.asked[0]))
+        self.result_value = self._results[self.node.node_id]

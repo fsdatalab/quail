@@ -57,12 +57,11 @@ class Chunk:
 
 @dataclass
 class DecodeRows:
-    """One row per running answer, appended after a chunk's groups.
+    """Running answers' token and copy-draft rows after a chunk's groups.
 
-    Each row feeds the answer's last chosen token, which the GPU wrote
-    into a token buffer after the pass before, writes the row's KV into
-    the answer's own pages, and reads the answer's pages through its
-    position in one causal paged attention call.
+    Each row feeds a chosen or drafted token, writes its KV into the
+    answer's own pages, and reads those pages through its position in
+    one causal paged attention call. Slots repeat for copy drafts.
 
     The branches of one document may read its shared pages together:
     then each such row reads only its own pages in the causal call,

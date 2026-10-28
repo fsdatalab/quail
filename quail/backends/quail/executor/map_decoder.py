@@ -1,29 +1,17 @@
-"""Greedy decoding of AI.MAP answers, one row per running answer per pass.
+"""Map and extraction answers through the same decode-row scheduler.
 
-A document's map prompt runs as a stage of its pipeline. The stage's
-last row chooses the answer's first token; from the next pass on, the
-document has one decode row per pass until its answer ends. Each pass:
-
-* the host lays out every running answer's row with array operations:
-  its position, the arena row its KV is written to, and its pages;
-* the GPU copies each answer's last chosen token into the row's input,
-  so a pass launches before the host has read the pass before it;
-* after the forward pass, the GPU takes the argmax of each answer row
-  over the whole vocabulary, writes it to the token buffer, and copies
-  the tokens to pinned host memory without blocking;
-* the host reads the copies that have landed, appends the tokens to
-  the answers, and ends the answers that wrote a stop token or reached
-  their limit.
-
-The host learns of an answer's end a pass or two after the GPU writes
-it, so an ended answer may feed one or two more rows. Their tokens are
-dropped, and their KV lands in rows the answer's reservation covers.
+A prompt's final row chooses its first answer token. Map answers then feed
+one row per pass; extraction answers feed that token and document-copy drafts.
+Token choice and draft verification run on the GPU. One nonblocking copy per
+pass returns tokens and surviving document positions. Copy answers wait for
+their previous result before laying out rows at the accepted prefix's end.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -105,6 +93,62 @@ class MapDecoder:
         self.slot_maps = {}
         # whether a document's branches read its shared pages together
         self.share = False
+        self.copy_constraints = {}
+        self.constrained = np.zeros(len(self.limits), dtype=bool)
+        self.copy_document = np.full(n, -1, dtype=np.int64)
+        self.copy_sources = np.full(n, -1, dtype=np.int64)
+        self.num_streams = np.zeros(n, dtype=np.int64)
+        self.steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
+        self.drafts = np.zeros(n, dtype=np.int64)
+
+    def configure_copy(self, first, slots, documents, specs):
+        """Constrain extraction fields to their document's token streams."""
+        from quail.backends.quail.executor.extract.copy import CopyConstraint
+        from quail.cost.draft_policy import LIVE_BUCKETS
+
+        constraint = CopyConstraint(self.torch, self.device, documents, specs[0])
+        for q, spec in enumerate(specs):
+            self.constrained[first + q] = True
+            self.copy_document[slots[q]] = np.arange(len(documents.documents))
+            self.copy_constraints[first + q] = SimpleNamespace(
+                constraint=constraint, spec=spec,
+                alive=constraint.stream_ids >= 0,
+                source=self.torch.zeros(len(slots[q]), dtype=self.torch.int64,
+                                        device=self.device),
+                sources=np.full(len(self.map), -1, dtype=np.int64),
+                trials=np.zeros(len(LIVE_BUCKETS)), accepts=np.zeros(len(LIVE_BUCKETS)),
+                rho=np.array([document.rho for document in documents.documents]))
+
+    def row_counts(self, running):
+        """Return one chosen-token row and each answer's copy draft rows."""
+        from quail.backends.quail.executor.extract.copy import draft_lengths
+
+        counts = np.ones(len(running), dtype=np.int64)
+        for q, state in self.copy_constraints.items():
+            mine = self.map[running] == q
+            slots = running[mine]
+            if not len(slots):
+                continue
+            constraint = state.constraint
+            source = self.copy_sources[slots]
+            position, option = constraint.position[source], constraint.option[source]
+            written = self.written[q][slots]
+            size = draft_lengths(state.spec, self.lengths[q], written,
+                                 self.num_streams[slots],
+                                 state.rho[self.copy_document[slots]],
+                                 state.trials, state.accepts)
+            remaining = (1 + constraint.filler_lengths[option]
+                         + constraint.position_lengths[position] - written)
+            counts[mine] += np.minimum(size, np.maximum(0, remaining))
+        self.drafts[running] = counts - 1
+        return counts
+
+    def output_answers(self, map_index, slots):
+        """Return extraction text and original character spans for a field."""
+        state = self.copy_constraints[map_index]
+        return state.constraint.output_answers(
+            self.copy_document[slots], state.sources[slots],
+            self.lengths[map_index][slots])
 
     # ---- documents entering and leaving -----------------------------------
 
@@ -130,6 +174,9 @@ class MapDecoder:
         self.origin[document] = position
         self.fed[document] = 0
         self.stopped[document] = False
+        self.copy_sources[document] = -1
+        self.num_streams[document] = 0
+        self.drafts[document] = 0
         self.parent[document] = document
         self.borrowed[document] = 0
         self.lead[document] = 0
@@ -175,6 +222,7 @@ class MapDecoder:
         self.set_pages(document, pages)
         self.fed[document] = self.written[self.map[document]][document]
         self.paused[document] = False
+        self.drafts[document] = 0
 
     def eviction_order(self):
         """Running slots ordered by longest expected remaining answer first."""
@@ -204,7 +252,9 @@ class MapDecoder:
     def running(self):
         """Slots whose next decode row can choose another token."""
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
-        return running[~self.stopped[running]
+        ready = (~self.constrained[self.map[running]]
+                 | (self.inflight[running] == 0))
+        return running[ready & ~self.stopped[running]
                        & (self.fed[running] + 1 < self.limits[self.map[running]])]
 
     @property
@@ -220,7 +270,7 @@ class MapDecoder:
     # ---- one pass --------------------------------------------------------
 
     def rows(self) -> DecodeRows | None:
-        """Lay out this pass's decode rows, one per answer that may continue.
+        """Lay out each continuing answer's chosen token and optional copy drafts.
 
         An answer continues while no stop token has been read and its
         tokens, counting the one this row writes, stay within its limit.
@@ -228,7 +278,11 @@ class MapDecoder:
         running = self.running()
         if not len(running):
             return None
-        positions = self.origin[running] + self.fed[running]
+        counts = self.row_counts(running)
+        offsets = (np.arange(int(counts.sum()))
+                   - np.repeat(np.cumsum(counts) - counts, counts))
+        running = np.repeat(running, counts)
+        positions = self.origin[running] + self.fed[running] + offsets
         page = positions // self.page_tokens
         if (page >= self.num_pages[running]).any():
             raise AssertionError("an answer's row is past its pages")
@@ -282,8 +336,19 @@ class MapDecoder:
         torch = self.torch
         slots = torch.from_numpy(rows.slots).to(self.device, non_blocking=True)
         start = chunk.tokens - len(rows)
-        chunk.input_ids[start:].copy_(self.next_token.index_select(0, slots))
-        self.fed[rows.slots] += 1
+        inputs = self.next_token.index_select(0, slots)
+        for q, state in self.copy_constraints.items():
+            mine = np.flatnonzero(self.map[rows.slots] == q)
+            if not len(mine):
+                continue
+            selected = rows.slots[mine]
+            local = state.constraint.tensor(self.copy_document[selected])
+            at = state.constraint.tensor(rows.positions[mine] - self.origin[selected])
+            tokens = state.constraint.tokens_at(state.source[local], at)
+            inputs[state.constraint.tensor(mine)] = tokens
+        chunk.input_ids[start:].copy_(inputs)
+        plain = rows.slots[~self.constrained[self.map[rows.slots]]]
+        self.fed[plain] += 1
         self.rows_fed += np.bincount(self.map[rows.slots],
                                      minlength=len(self.limits))
         self._count_reads(rows, chunk.meta.get("shared") is not None)
@@ -321,7 +386,8 @@ class MapDecoder:
         # Recomputed prompts continue after their saved tokens, not at token zero.
         indices = np.concatenate([
             self.fed[np.asarray(first_documents, dtype=np.int64)],
-            np.empty(0, dtype=np.int64) if rows is None else self.fed[rows.slots]])
+            np.empty(0, dtype=np.int64) if rows is None else
+            rows.positions - self.origin[rows.slots] + 1])
         selected = []
         if len(first_rows):
             index = torch.from_numpy(np.asarray(first_rows, dtype=np.int64))
@@ -330,13 +396,27 @@ class MapDecoder:
         if count:
             selected.append(normed[normed.shape[0] - count:])
         hidden = selected[0] if len(selected) == 1 else torch.cat(selected)
-        chosen = torch.argmax(
-            torch.nn.functional.linear(hidden.to(self.head.dtype), self.head), dim=1)
-        slots = torch.from_numpy(documents).to(self.device, non_blocking=True)
-        self.next_token.index_copy_(0, slots, chosen)
-        host = torch.empty(len(documents), dtype=torch.int64,
+        values = torch.full((len(documents), 4), -1, dtype=torch.int64,
+                            device=self.device)
+        plain = np.flatnonzero(~self.constrained[self.map[documents]])
+        if len(plain):
+            index = torch.from_numpy(plain).to(self.device, non_blocking=True)
+            logits = torch.nn.functional.linear(
+                hidden[index].to(self.head.dtype), self.head)
+            chosen = torch.argmax(logits, dim=1)
+            values[index, 0] = chosen
+            slots = torch.from_numpy(documents[plain]).to(self.device,
+                                                         non_blocking=True)
+            self.next_token.index_copy_(0, slots, chosen)
+        for q, state in self.copy_constraints.items():
+            mine = np.flatnonzero(self.map[documents] == q)
+            if len(mine):
+                index = state.constraint.tensor(mine)
+                values[index] = self._constrain(
+                    state, hidden[index], documents[mine], indices[mine])
+        host = torch.empty(values.shape, dtype=torch.int64,
                            pin_memory=self.head.is_cuda)
-        host.copy_(chosen, non_blocking=True)
+        host.copy_(values, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
         self.copies.append(_Copy(event, host, documents, indices,
@@ -345,6 +425,41 @@ class MapDecoder:
         while len(self.copies) > IN_FLIGHT:
             self._read(self.copies.popleft())
 
+    def _constrain(self, state, hidden, documents, indices):
+        torch, constraint = self.torch, state.constraint
+        slots, first, counts = np.unique(
+            documents, return_index=True, return_counts=True)
+        local = constraint.tensor(self.copy_document[slots])
+        streams = constraint.stream_ids[local]
+        alive = state.alive[local]
+        source = state.source[local]
+        active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
+        out = torch.full((len(documents), 4), -2, dtype=torch.int64, device=self.device)
+        for step in range(int(counts.max())):
+            valid = step < counts
+            row = np.minimum(first + step, len(documents) - 1)
+            at = constraint.tensor(indices[row])
+            selected = constraint.tensor(row)
+            logits = torch.nn.functional.linear(
+                hidden[selected].to(self.head.dtype), self.head)
+            chosen, ended, keep = constraint.choose(logits, streams, alive, at)
+            use = active & constraint.tensor(valid)
+            writes = use & ~ended
+            alive = torch.where(writes[:, None], keep, alive)
+            following = constraint.source(streams, alive)
+            hit = chosen == constraint.tokens_at(source, at)
+            values = torch.stack((torch.where(ended, -1, chosen), following,
+                                  alive.sum(dim=1), hit.to(torch.int64)), dim=1)
+            # Only valid rows may scatter; padded rows can alias a real row.
+            valid_index = constraint.tensor(np.flatnonzero(valid))
+            out[selected[valid_index]] = torch.where(
+                use[valid_index, None], values[valid_index], -2)
+            active &= writes & hit & (at + 1 < state.spec.max_answer_tokens)
+            source = following
+        state.alive[local] = alive
+        state.source[local] = source
+        return out
+
     def harvest(self, wait: bool = False) -> None:
         """Read every copy that has landed, or every copy when wait is set."""
         while self.copies and (wait or self.copies[0].event.query()):
@@ -352,27 +467,48 @@ class MapDecoder:
 
     def _read(self, copy: _Copy) -> None:
         copy.event.synchronize()
-        tokens = copy.host.numpy()
+        values = copy.host.numpy()
         documents, indices, maps = copy.documents, copy.indices, copy.maps
         np.subtract.at(self.inflight, documents, 1)
-        # rows of an answer that already ended carry nothing new, even
-        # when the document has started its next map's answer since
-        current = (self.map[documents] == maps) & ~self.stopped[documents]
-        documents, indices, tokens, maps = (
-            documents[current], indices[current], tokens[current], maps[current])
+        current = ((self.map[documents] == maps) & ~self.stopped[documents]
+                   & (values[:, 0] != -2))
+        documents, indices, values, maps = (
+            documents[current], indices[current], values[current], maps[current])
+        tokens = values[:, 0]
+        constrained = self.constrained[maps]
+        stop = np.where(constrained, tokens == -1, np.isin(tokens, self.stop_ids))
+        ended = stop | (indices + 1 >= self.limits[maps])
         for q in np.unique(maps).tolist():
             mine = maps == q
-            self.tokens[q][documents[mine], indices[mine]] = tokens[mine]
-            self.written[q][documents[mine]] = indices[mine] + 1
-        stop = np.isin(tokens, self.stop_ids)
+            writes = mine & (~stop if q in self.copy_constraints else True)
+            self.tokens[q][documents[writes], indices[writes]] = tokens[writes]
+            np.maximum.at(self.written[q], documents[writes], indices[writes] + 1)
+            done = mine & ended
+            self.lengths[q][documents[done]] = indices[done] + ~stop[done]
+            if q in self.copy_constraints:
+                self._read_copy(q, documents[mine], indices[mine], values[mine])
         self.stopped[documents[stop]] = True
-        ended = stop | (indices + 1 >= self.limits[maps])
-        for document, index, q, at_stop in zip(
-                documents[ended].tolist(), indices[ended].tolist(),
-                maps[ended].tolist(), stop[ended].tolist()):
-            self.lengths[q][document] = index if at_stop else index + 1
-            self.map[document] = -1
-            self.finished.append((document, q))
+        self.map[documents[ended]] = -1
+        self.finished.extend(zip(documents[ended].tolist(), maps[ended].tolist()))
+
+    def _read_copy(self, q, documents, indices, values):
+        from quail.cost.draft_policy import LIVE_BUCKETS
+
+        slots, first, inverse = np.unique(
+            documents, return_index=True, return_inverse=True)
+        last = np.zeros(len(slots), dtype=np.int64)
+        np.maximum.at(last, inverse, np.arange(len(documents)))
+        state = self.copy_constraints[q]
+        observed = ((self.num_streams[slots] > 1) & (self.drafts[slots] > 0)
+                    & (values[first, 0] >= 0) & (indices[first] + 1 < self.limits[q]))
+        buckets = np.abs(np.log1p(self.num_streams[slots, None])
+                         - np.log1p(LIVE_BUCKETS)).argmin(1)
+        np.add.at(state.trials, buckets[observed], 1)
+        np.add.at(state.accepts, buckets[observed], values[first[observed], 3] > 0)
+        self.copy_sources[slots] = state.sources[slots] = values[last, 1]
+        self.num_streams[slots] = values[last, 2]
+        self.fed[slots] = np.maximum(0, self.written[q][slots] - 1)
+        self.steps[q][slots] += 1
 
     def answers(self, map_index: int, documents) -> list[np.ndarray]:
         """Return each document's answer tokens for one map."""

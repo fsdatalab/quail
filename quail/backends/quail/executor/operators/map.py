@@ -117,7 +117,8 @@ class MapPart(ExecutionPart):
                 raise ValueError("an AI.MAP tail ends in its answer cue")
             tails.append(list(tail))
         def requests(key):
-            q = key[0][1] - self.first if isinstance(key[0], tuple) else 0
+            branch = isinstance(key[0], tuple) and isinstance(key[0][1], int)
+            q = key[0][1] - self.first if branch else 0
             return StageRequests([tails[q]])
 
         def decide(anchor, row):
@@ -176,7 +177,7 @@ class MapPart(ExecutionPart):
         self._decoder = decoder
         decoder.slot_maps[self.first] = {
             anchor: self.first + q for anchor, (q, _) in self.branch_of.items()}
-        decoder.share |= self.nodes[0].attention == "tree"
+        decoder.share |= getattr(self.nodes[0], "attention", "") == "tree"
 
     def _slots(self, q: int, documents) -> np.ndarray:
         """The decoder slots of map q's answers over the documents."""
