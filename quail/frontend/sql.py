@@ -203,7 +203,7 @@ def _validate_query(
         )
 
     if (not allow_relational and not b.joins and not b.filters
-            and not b.label_tests and not projected):
+            and not b.label_tests and not b.tested_calls and not projected):
         raise CompileError(
             "the query has no AI predicate; a plain "
             "scan belongs in the database the ids came "
@@ -228,10 +228,11 @@ def _bind_label_names(b: ExpressionBinder, columns: tuple[ColumnRef | Alias, ...
         asks = len(b.filters.get(alias, ()))
         for index, (call, _, _) in enumerate(tests):
             labels.setdefault(alias, {}).setdefault(
-                call, named.get(call, f"__label_{alias}_{asks + index}")
+                call, named.get(call, b.tested_calls.get(
+                    call, f"__label_{alias}_{asks + index}"))
             )
-    for call, name in named.items():
-        if len(call.aliases()) == 1:
+    for call, name in {**named, **b.tested_calls}.items():
+        if call.kind == "label" and len(call.aliases()) == 1:
             labels.setdefault(call.aliases()[0], {}).setdefault(call, name)
 
     return named, labels
@@ -518,6 +519,12 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
             calls[call.kind].setdefault(call.aliases()[0], []).append(
                 (call, column.name))
 
+    for call, name in b.tested_calls.items():
+        if call.kind in calls:
+            entries = calls[call.kind].setdefault(call.aliases()[0], [])
+            if (call, name) not in entries:
+                entries.append((call, name))
+
     logical = LogicalPlanBuilder()
     for alias, provider in b.tables:
         logical.add_scan(
@@ -532,7 +539,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
                 for call, accepted, selectivity in b.label_tests.get(alias, ())
             ),
             extracts=tuple(calls["extract"].get(alias, ())),
-            column_filters=tuple(b.extract_tests.get(alias, ())),
+            column_filters=tuple(b.column_tests.get(alias, ())),
             sae_features=tuple(calls["features"].get(alias, ())),
             maps=tuple(calls["map"].get(alias, ())),
             schema=catalog.get(provider).schema(),

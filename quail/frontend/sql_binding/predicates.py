@@ -1,9 +1,9 @@
 """Parse the plain tests of WHERE and ON: one column against literals.
 
 A plain test reads a source column, applied at the scan, or a column
-an AI.CLASSIFY or AI.EXTRACT in SELECT computes, named by its AS
-alias as DuckDB allows (``WHERE lease.end_date IS NOT NULL``) or by
-repeating the call. Either way the model runs once.
+a column operator computes, named by its AS alias as DuckDB allows
+(``WHERE lease.end_date IS NOT NULL``) or by repeating the call.
+Either way the model runs once.
 """
 
 from __future__ import annotations
@@ -91,10 +91,20 @@ def unwrap_function(node) -> tuple[exp.Expression, str | None]:
     return (node.this, function) if function else (node, None)
 
 
+def column_call(node) -> str | None:
+    """Return the binder method for a column-operator call, or None."""
+    if isinstance(node, exp.AIClassify):
+        return "bind_ai_classify"
+    if isinstance(node, exp.Anonymous):
+        return {"AI_EXTRACT": "bind_ai_extract", "AI_MAP": "bind_ai_map",
+                "AI_SAE_FEATURES": "bind_ai_sae_features"}.get(str(node.this).upper())
+    return None
+
+
 def _operand(node) -> tuple[exp.Expression, str | None] | None:
     """Return the column a test reads and the function around it, or None."""
     node, function = unwrap_function(node)
-    if isinstance(node, (exp.Column, exp.Dot)):
+    if isinstance(node, (exp.Column, exp.Dot)) or column_call(node) is not None:
         return node, function
     return None
 
@@ -203,15 +213,9 @@ def column_path(column: exp.Column) -> tuple[str, ...]:
 
 
 def ai_aliases(tree: exp.Select) -> dict:
-    """Return the AS names of the AI.CLASSIFY and AI.EXTRACT calls in SELECT."""
-    names = {}
-    for item in tree.expressions:
-        if isinstance(item, exp.Alias) and (
-                isinstance(item.this, exp.AIClassify)
-                or (isinstance(item.this, exp.Anonymous)
-                    and str(item.this.this).upper() == "AI_EXTRACT")):
-            names[item.alias] = item.this
-    return names
+    """Return the AS names of the column-operator calls in SELECT."""
+    return {item.alias: item.this for item in tree.expressions
+            if isinstance(item, exp.Alias) and column_call(item.this) is not None}
 
 
 def bind_plain_test(b, test: PlainTest, tables=None) -> RegularPredicate:
@@ -231,6 +235,32 @@ def bind_plain_test(b, test: PlainTest, tables=None) -> RegularPredicate:
                                  test.comparison, test.value)
     predicate.validate()
     return predicate
+
+
+def column_test(b, test: PlainTest, selected: dict) -> tuple | None:
+    """Resolve a plain test of a column-operator result."""
+    method = column_call(test.operand)
+    if method is None:
+        return extract_test(b, test, selected)
+    if method == "bind_ai_extract":
+        raise CompileError("test a field of AI.EXTRACT, such as lease.end_date")
+    call = getattr(b, method)(test.operand)
+    if method == "bind_ai_classify":
+        call, _, _ = call
+    if len(call.aliases()) != 1:
+        raise CompileError("a filter on a label tests a one-document classification")
+    (alias,) = call.aliases()
+    name = next((name for name, node in selected.items() if node == test.operand),
+                f"__column_{alias}_{len(b.tested_calls)}")
+    name = b.tested_calls.setdefault(call, name)
+    predicate = RegularPredicate(
+        column_expression(ColumnRef(alias, dict(b.tables)[alias], name),
+                          (), test.function), test.comparison, test.value)
+    if call.kind == "features":
+        predicate.validate()
+    else:
+        predicate.validate_text_column()
+    return alias, predicate
 
 
 def extract_test(b, test: PlainTest, selected: dict) -> tuple | None:

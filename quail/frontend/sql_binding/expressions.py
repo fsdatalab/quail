@@ -84,8 +84,8 @@ class ExpressionBinder:
         self.label_tests: dict[
             str, list[tuple[ModelCall, tuple[str, ...], float | None]]
         ] = {}
-        # alias -> (RegularPredicate on an answer or span, selectivity)
-        self.extract_tests: dict[str, list[tuple[RegularPredicate, float | None]]] = {}
+        self.column_tests: dict[str, list[tuple[RegularPredicate, float | None]]] = {}
+        self.tested_calls: dict[ModelCall, str] = {}
         self.joins: list[JoinSpec] = []
         self.unnest_tests: list[RegularPredicate] = []
 

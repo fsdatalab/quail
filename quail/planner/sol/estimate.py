@@ -246,7 +246,11 @@ def _refuse_unpriced(logical) -> None:
                     f"filters")
     for tests in operators.column_filters.values():
         for test in tests:
-            if test.condition.column.column.endswith(SPAN_SUFFIX):
+            if test.call.kind == "features":
+                raise NotImplementedError(
+                    "the speed of light estimate has no oracle for SAE feature tests")
+            if (test.call.kind == "extract"
+                    and test.condition.column.column.endswith(SPAN_SUFFIX)):
                 raise NotImplementedError(
                     f"the speed of light estimate does not price the test "
                     f"{test.condition} of an answer's span; the answer "

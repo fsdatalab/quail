@@ -195,6 +195,13 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
             constraint="sort_needs_quail_backend",
             needed=1, available=0, unit="backends")
     operators = region.logical_plan.operators()
+    if any(test.call.kind == "label" and (
+            test.condition.comparison != "in" or test.condition.function is not None)
+           for tests in operators.column_filters.values() for test in tests):
+        return Refusal(
+            reasons=("plain label tests other than IN run on the Quail backend only",),
+            constraint="label_test_needs_quail_backend",
+            needed=1, available=0, unit="backends")
     for function, present in (("AI.EXTRACT", has_extract(region.logical_plan)),
                               ("AI.MAP", bool(operators.maps))):
         if not present:

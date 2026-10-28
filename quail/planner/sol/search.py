@@ -435,14 +435,16 @@ class Search:
         for test in self.column_filters.get(alias, ()):
             if test.call != call:
                 continue
-            accepted = set(test.condition.value)
-            passed = [row for row in rows
-                      if self.label(call.prompt, {alias: row}) in accepted]
+            answers = {row: self.label(call.prompt, {alias: row}) for row in rows}
+            passed = self.answer_survivors(test.condition, rows, answers)
+            membership = test.condition.comparison == "in"
+            details = ({"accepted": list(test.condition.value)} if membership
+                       else {"condition": str(test.condition)})
             stages.append(_stage(
-                LABEL_IN, alias, call.prompt.template, test.position,
+                LABEL_IN if membership else ANSWER_TEST,
+                alias, call.prompt.template, test.position,
                 0, test.selectivity, rows, passed, Work(),
-                name=self.labels.names[call],
-                accepted=list(test.condition.value)))
+                name=self.labels.names[call], **details))
             rows = passed
         return rows, stage_work
 

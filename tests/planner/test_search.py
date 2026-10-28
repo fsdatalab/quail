@@ -276,3 +276,26 @@ def test_a_filter_after_a_barrier_is_priced_over_the_kv_the_sequence_kept(
     assert first.expected_rows == second.expected_rows == 20
     assert work.tokens == pytest.approx(
         20 * (second.question_tokens + (0 if retain else prefix)))
+
+
+def test_map_answer_tests_follow_maps_on_both_sides_of_join_placement(query):
+    from quail.physical import AiMap, Filter
+    from quail.physical.pipelines import build_pipelines
+
+    mapped = query.session.sql(
+        "SELECT d.id, q.id, AI.MAP(d.text, 'Name the topic.', 16) AS topic "
+        "FROM documents d JOIN questions q "
+        "ON AI_FILTER(PROMPT('Does {0} answer {1}?', d.text, q.text)) "
+        "WHERE HINT(topic = 'leases', {'selectivity': 0.25})")
+    context = context_for(mapped)
+    candidates = search_candidates(mapped._logical_input, context,
+                                   mapped.session.registry)
+    assert len(candidates) == 2
+    for candidate in candidates:
+        (node,) = [node for node in candidate.graph.nodes if isinstance(node, AiMap)]
+        (test,) = [node for node in candidate.graph.nodes if isinstance(node, Filter)]
+        assert test.inputs[0].source.node_id == node.node_id
+        assert test.selectivity == 0.25
+        pipeline = next(members for members in build_pipelines(candidate.graph).values()
+                        if node in members)
+        assert pipeline[pipeline.index(node) + 1] == test

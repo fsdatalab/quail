@@ -39,6 +39,7 @@ from quail.logical.expressions import (
     column_references,
     source_columns,
 )
+from quail.logical.nodes.column import SemanticColumn
 
 
 def _column_refs(expression) -> tuple[ColumnRef, ...]:
@@ -117,11 +118,9 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for expression in expressions:
             for ref in _column_refs(expression):
                 needed.setdefault(ref.alias, {})[ref.column] = None
-        if isinstance(node, (SemanticClassify, SemanticExtract, SemanticMap)):
-            # the columns a classification, extraction, or map adds are not
-            # read below it
-            for field in node.output_schema()[len(node.input.output_schema()):]:
-                needed.get(field.alias, {}).pop(field.column, None)
+        if isinstance(node, SemanticColumn):
+            for name in node.added_columns:
+                needed.get(node.alias, {}).pop(name, None)
         if isinstance(node, Scan):
             columns = tuple(
                 column for column in needed.get(node.alias, ())
