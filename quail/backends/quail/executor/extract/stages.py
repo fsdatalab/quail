@@ -26,7 +26,7 @@ from quail.backends.quail.executor.stages import Stage, StageRequests
 from quail.catalog.tokens import concat_tokens
 
 
-class ExtractionStages:
+class ExtractionInputs:
     """The stages of one pipeline's extractions and the answers they produce.
 
     Args:
@@ -85,6 +85,43 @@ class ExtractionStages:
         self.document_ids = document_ids[self.document_order]
         self.prefixes = [document.prefix for document in self.documents]
         self.keys = [document.key for document in self.documents]
+
+    def _prepare(self, index, document_id, text, ids, stored) -> Document:
+        """Build a document's prefix: the head and its text.
+
+        The key names the document under the extraction's head, so a
+        later extraction of the same table reads the KV this one
+        leaves resident. A document shown under the query's shared
+        head, whose tokens are the table's, keeps the table's key, so
+        the KV a filter wrote is read.
+        """
+        alias = self.specs[0].alias
+        key = (("extract", alias), int(document_id))
+        shared = self.head == self.pipeline_head
+        tokens = ids.numpy()
+        same_tokens = stored is ids
+        if shared and stored is not None and not same_tokens:
+            prior = stored.numpy() if hasattr(stored, "numpy") else np.asarray(stored)
+            same_tokens = np.array_equal(prior, tokens)
+        if shared and stored is not None and same_tokens:
+            key = (alias, int(document_id))
+        prefix = concat_tokens(self.head, ids)
+        scan = DocumentTokens.from_tokens(
+            self.vocabulary, tokens, ids.character_offsets, len(self.head))
+        # the round's KV read covers the prompt through the first tail
+        rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
+        return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,
+                        answers=[AnswerState() for _ in self.specs], rho=rho)
+
+
+class ExtractionStages(ExtractionInputs):
+    """Per-round extraction for models with recurrent state."""
+
+    def __init__(self, state, specs, vocabulary, document_ids, documents, texts,
+                 readout=None, pipeline_head=None, document_positions=None):
+        super().__init__(state, specs, vocabulary, document_ids, documents, texts,
+                         pipeline_head=pipeline_head,
+                         document_positions=document_positions)
         self.readout = self._readout(state) if readout is None else readout
         self.decoder = Decoder(vocabulary, self.readout.k, self.readout.width,
                                len(self.specs), self.spec)
@@ -132,33 +169,6 @@ class ExtractionStages:
         return AsyncTopLogprobs(torch, torch.nn.functional, head,
                                 self.spec.top_tokens, [self.vocabulary.stop_ids],
                                 ragged=True)
-
-    def _prepare(self, index, document_id, text, ids, stored) -> Document:
-        """Build a document's prefix: the head and its text.
-
-        The key names the document under the extraction's head, so a
-        later extraction of the same table reads the KV this one
-        leaves resident. A document shown under the query's shared
-        head, whose tokens are the table's, keeps the table's key, so
-        the KV a filter wrote is read.
-        """
-        alias = self.specs[0].alias
-        key = (("extract", alias), int(document_id))
-        shared = self.head == self.pipeline_head
-        tokens = ids.numpy()
-        same_tokens = stored is ids
-        if shared and stored is not None and not same_tokens:
-            prior = stored.numpy() if hasattr(stored, "numpy") else np.asarray(stored)
-            same_tokens = np.array_equal(prior, tokens)
-        if shared and stored is not None and same_tokens:
-            key = (alias, int(document_id))
-        prefix = concat_tokens(self.head, ids)
-        scan = DocumentTokens.from_tokens(
-            self.vocabulary, tokens, ids.character_offsets, len(self.head))
-        # the round's KV read covers the prompt through the first tail
-        rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
-        return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,
-                        answers=[AnswerState() for _ in self.specs], rho=rho)
 
     # ---- the tail, then the answer, a round of tokens at a time ------------
 
