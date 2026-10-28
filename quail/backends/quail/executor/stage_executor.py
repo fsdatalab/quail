@@ -442,9 +442,14 @@ class StageExecutor:
         return self.stages[j].single and end - start == 1
 
     def _grow_answers(self):
-        """Grow next decode rows, evicting harvested answers when pages run out."""
+        """Grow next decode rows, evicting answers when pages run out.
+
+        An evicted answer frees its pages at once, with no wait on the
+        GPU: passes run in order, so no later pass writes a freed page
+        before the passes that read it end. Its tokens still on their way
+        land as usual, and it recomputes once they have (_replays).
+        """
         decoder = self.decoder
-        harvested = False
         while True:
             running = decoder.running()
             positions = decoder.origin[running] + decoder.fed[running]
@@ -457,14 +462,6 @@ class StageExecutor:
             if added is not None:
                 decoder.add_pages(growing, added)
                 return
-            if not harvested:
-                # In-flight argmax results must land before an answer loses its KV.
-                decoder.harvest(wait=True)
-                while self.outstanding:
-                    self._report_next()
-                self._answers_landed()
-                harvested = True
-                continue
             victim = int(decoder.eviction_order()[0])
             for detached in decoder.pause(victim):
                 self.borrowing.chosen.pop(int(detached), None)
@@ -477,9 +474,16 @@ class StageExecutor:
     def _replays(self, room):
         """Pack queued recomputations into the room left beside decode rows."""
         replays = []
-        for a, start in self.recomputing.items():
+        decoder = self.decoder
+        for a, start in list(self.recomputing.items()):
             if not room:
                 break
+            if decoder.map[a] < 0:
+                # its answer ended in a token that landed after eviction
+                del self.recomputing[a]
+                continue
+            if decoder.inflight[a]:
+                continue    # its last tokens are still on their way
             q = self.decoder.map[a]
             written = int(self.decoder.written[q][a])
             length = int(self.decoder.origin[a]) + written
@@ -492,7 +496,7 @@ class StageExecutor:
                 if not self.arena.reserve(
                         key, self.prefix_lengths[a], capacity_tokens=capacity,
                         extension=self._extends):
-                    continue
+                    break       # the pool is short; the rest wait in order
             end = min(length, start + room)
             replays.append((a, start, end))
             room -= end - start

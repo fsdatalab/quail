@@ -612,7 +612,8 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     # several always outgrow it
     if num_maps > 1:
         assert stats["num_evictions"] > 0
-    assert (stats["recomputed_tokens"] > 0) == (stats["num_evictions"] > 0)
+    # an evicted answer whose last token in flight ends it needs no recompute
+    assert stats["recomputed_tokens"] == 0 or stats["num_evictions"] > 0
     assert not decoder.active
     assert not arena.accounting.owned
 

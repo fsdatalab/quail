@@ -432,7 +432,7 @@ def child(arguments: str) -> None:
                 print(text.getvalue(), flush=True)
 
 
-@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+@app.function(image=image, gpu="H100!", memory=98304, timeout=6 * 3600,
               volumes=VOLUMES)
 def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                   model: str, modes: list[str], top: int, repeats: int,
@@ -495,6 +495,10 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                         record = json.loads(line[7:])
                         record.update(version=name, repeat=repeat)
                         lines.append(json.dumps(record))
+                        # saved as each finishes, so a lost client loses nothing
+                        with open(f"{PROFILE_DIR}/{tag}.jsonl", "a") as saved:
+                            saved.write(lines[-1] + "\n")
+                        results_vol.commit()
                 print(f"{query_id} on {name}: process "
                       f"{time.perf_counter() - started:.1f} s", flush=True)
     results_vol.commit()

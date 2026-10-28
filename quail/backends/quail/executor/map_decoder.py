@@ -93,6 +93,9 @@ class MapDecoder:
         self.device = head.device
         self.next_token = torch.zeros(n, dtype=torch.int64, device=self.device)
         self.copies = deque()
+        # per slot, the token copies on their way to the host that hold
+        # one of its tokens; an evicted answer recomputes once it has none
+        self.inflight = np.zeros(n, dtype=np.int64)
         self.finished = []      # (document, map) whose answers ended
         self.rows_fed = np.zeros(len(self.limits), dtype=np.int64)  # per map
         # KV tokens the decode rows read: in all, alone, through their
@@ -338,6 +341,7 @@ class MapDecoder:
         event.record()
         self.copies.append(_Copy(event, host, documents, indices,
                                  self.map[documents].copy()))
+        np.add.at(self.inflight, documents, 1)
         while len(self.copies) > IN_FLIGHT:
             self._read(self.copies.popleft())
 
@@ -350,6 +354,7 @@ class MapDecoder:
         copy.event.synchronize()
         tokens = copy.host.numpy()
         documents, indices, maps = copy.documents, copy.indices, copy.maps
+        np.subtract.at(self.inflight, documents, 1)
         # rows of an answer that already ended carry nothing new, even
         # when the document has started its next map's answer since
         current = (self.map[documents] == maps) & ~self.stopped[documents]
