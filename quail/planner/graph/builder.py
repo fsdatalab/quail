@@ -455,13 +455,14 @@ class GraphBuilder:
 
     def _emit_result(self, port_by_alias, row_ports, joins, score_pairs):
         """Connect result operators to surviving rows and answers."""
+        filtered_after = ((self.extract_after | self.map_after)
+                          & self.operators.column_filters.keys())
         if score_pairs is not None:
             sink_inputs = (score_pairs,)
         elif (len(joins.answers) == 1
               and len(self.operator_order.join_sequence) == 1
-              and not self.after_joins):
-            # one full join and nothing after it: its true pairs are the
-            # result rows, so no recombination is needed
+              and not (self.after_joins or filtered_after)):
+            # A later classification or column filter can remove joined rows.
             sink_inputs = (joins.answers[0],)
         elif joins.answers:
             self.nodes.append(Recombine(

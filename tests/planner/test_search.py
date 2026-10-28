@@ -279,6 +279,8 @@ def test_a_filter_after_a_barrier_is_priced_over_the_kv_the_sequence_kept(
 
 
 def test_map_answer_tests_follow_maps_on_both_sides_of_join_placement(query):
+    from helpers.oracle import Oracle, finish
+
     from quail.physical import AiMap, Filter
     from quail.physical.pipelines import build_pipelines
 
@@ -299,3 +301,11 @@ def test_map_answer_tests_follow_maps_on_both_sides_of_join_placement(query):
         pipeline = next(members for members in build_pipelines(candidate.graph).values()
                         if node in members)
         assert pipeline[pipeline.index(node) + 1] == test
+        mapped._plan = replace(mapped.plan(), nodes=candidate.graph.nodes,
+                               root=candidate.graph.root,
+                               logical_plan=candidate.logical_plan)
+        oracle = Oracle(
+            joins=lambda node, assignment: True,
+            maps=lambda spec, document: "leases" if document == 1 else "other")
+        assert finish(mapped, oracle).collect().to_pylist() == [
+            {"d.id": 1, "q.id": 0, "topic": "leases"}]
