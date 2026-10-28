@@ -7,6 +7,7 @@ read its own prompt and answer so far at the right positions and
 wrote its KV where the next row reads it.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,10 +20,16 @@ from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.operators.classify import ClassifyPart
 from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
+from quail.backends.quail.executor.operators.join import prepare_join_inputs
 from quail.backends.quail.executor.operators.map import MapPart, execute_maps
 from quail.backends.quail.executor.parts import gated_stages
+from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
+from quail.execution.rows import Rows
+from quail.execution.runner import ExecutionContext
+from quail.physical import AiJoin, AiMap, MapSpec, PortRef
+from quail.physical.base import input_ports
 
 VOCABULARY = 1024
 STOP = VOCABULARY - 1
@@ -398,6 +405,21 @@ def test_fused_document_operators_equal_running_each_operator_alone(
     assert fused == separate[:limit]
 
 
+def batch_decode(tokens, skip_special_tokens=True):
+    return [" ".join(str(int(token)) for token in answer) for answer in tokens]
+
+
+def map_state(setup, arena, forward_chunk):
+    pipeline = fake_pipeline(forward_chunk=forward_chunk, canvas_ids=())
+    return SimpleNamespace(
+        torch=events_torch(3), chunk_tokens=setup.budget, async_answers=Bits(),
+        loaded_model=SimpleNamespace(
+            arena=arena, pipeline=pipeline, input_staging=None,
+            model=SimpleNamespace(quail_full_head=torch.eye(VOCABULARY)),
+            vocabulary=SimpleNamespace(stop_ids=[STOP], tokenizer=SimpleNamespace(
+                batch_decode=batch_decode))))
+
+
 @pytest.mark.parametrize("keep_kv", [False, True])
 def test_map_results_keep_only_document_kv_when_requested(monkeypatch, keep_kv):
     cpu_staging(monkeypatch)
@@ -407,18 +429,7 @@ def test_map_results_keep_only_document_kv_when_requested(monkeypatch, keep_kv):
     setup = Setup(path="unified", pages=200, budget=200)
     arena = make_arena(setup)
     model = TokenModel(arena)
-    pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=())
-    torch_ = events_torch(3)
-
-    def batch_decode(tokens, skip_special_tokens=True):
-        return [" ".join(str(int(token)) for token in answer) for answer in tokens]
-
-    state = SimpleNamespace(
-        torch=torch_, chunk_tokens=setup.budget, loaded_model=SimpleNamespace(
-            arena=arena, pipeline=pipeline, input_staging=None,
-            model=SimpleNamespace(quail_full_head=torch.eye(VOCABULARY)),
-            vocabulary=SimpleNamespace(stop_ids=[STOP], tokenizer=SimpleNamespace(
-                batch_decode=batch_decode))))
+    state = map_state(setup, arena, model.forward_chunk)
     nodes = [map_node(f"m{q}", tail, limit, "tree")
              for q, (tail, limit) in enumerate(zip(
                  [[500, 501], [600, 601], [650, 651]], [1, 7, 9]))]
@@ -441,3 +452,100 @@ def test_map_results_keep_only_document_kv_when_requested(monkeypatch, keep_kv):
         assert rows.column(node.spec.name).to_pylist() == want
         assert result.metrics.output_rows == 2
     assert set(arena.accounting.owned) == ({("d", 0), ("d", 1)} if keep_kv else set())
+
+
+@pytest.mark.parametrize("num_maps", [1, 2, 3])
+@pytest.mark.parametrize("pages", [8, 300])
+@pytest.mark.parametrize("frame", [(), (700, 701, 702)])
+def test_maps_feed_only_document_kv_to_every_join_partner(
+        monkeypatch, num_maps, pages, frame):
+    cpu_staging(monkeypatch)
+    monkeypatch.setattr("quail.backends.quail.executor.parts.input_staging",
+                        lambda state: None)
+    rng = np.random.default_rng(13)
+    documents = [rng.integers(20, 400, size=24).tolist() for _ in range(5)]
+    partners = [rng.integers(20, 400, size=n).tolist() + [950 + p]
+                for p, n in enumerate([6, 12, 18, 24, 30, 36])]
+    ids = list(range(len(documents)))
+    setup = Setup(path="unified", pages=pages, budget=80)
+    nodes = []
+    source = PortRef("input:d", "rows:d")
+    for q, (tail, limit) in enumerate(zip(
+            [[500, 501], [600, 601], [650, 651]], [6, 7, 9])):
+        if q == num_maps:
+            break
+        node = AiMap(
+            node_id=f"map:{q}", inputs=input_ports((source,)), attention="tree",
+            spec=MapSpec(name=f"m{q}", aliases=("d",), query_template="",
+                         arguments=(), expected_rows=len(ids), estimated_seconds=0,
+                         prompt_token_parts=((), tuple(tail)),
+                         max_answer_tokens=limit))
+        nodes.append(node)
+        source = PortRef(node.node_id, node.rows_port)
+    join = AiJoin(
+        node_id="join", anchor="d", partners=("p",), attention="unified",
+        inputs=input_ports((source, PortRef("input:p", "rows:p"))),
+        frame_token_ids=frame, label_token_ids=(("p", ()),))
+    nodes.append(join)
+
+    def run(nodes):
+        arena = make_arena(setup)
+        model = TokenModel(arena)
+        seen = set()
+
+        def forward_chunk(chunk):
+            normed = model.forward_chunk(chunk)
+            meta = model._whole(chunk.meta)
+            dependent_pages = set()
+            for key, owned in arena.accounting.owned.items():
+                if isinstance(key, tuple) and isinstance(key[0], tuple):
+                    parent = (key[0][0], key[1])
+                    dependent_pages.update(set(owned) - set(arena.owned_pages(parent)))
+            for i, end in enumerate(meta["cu_q"][1:]):
+                last = int(chunk.input_ids[end - 1])
+                if not 950 <= last < 950 + len(partners):
+                    continue
+                used = int(meta["used"][i])
+                table = meta["table"][i].tolist()[:-(-used // setup.page_tokens)]
+                assert not dependent_pages.intersection(table)
+                physical = [page * setup.page_tokens + offset
+                            for page in table for offset in range(setup.page_tokens)]
+                tokens = model.full.token[physical[:used]].tolist()
+                d = documents.index(tokens[:24])
+                p = last - 950
+                assert tokens == documents[d] + list(frame) + partners[p]
+                seen.add((d, p))
+            return normed
+
+        state = map_state(setup, arena, forward_chunk)
+        context = ExecutionContext(
+            runtimes={}, model_inputs=prepare_join_inputs,
+            model_result=lambda *args: None,
+            state={"documents": {"d": documents, "p": partners},
+                   "gpu": state.loaded_model, "retention": {},
+                   "joins_started": False, "kv_stats": {
+                       "join_anchor_hits": 0, "join_anchor_misses": 0}})
+        sources = {"input:d": Rows({"d": ids}),
+                   "input:p": Rows({"p": list(range(len(partners)))})}
+        inputs = {node.node_id: {
+            port.name: sources[port.source.node_id] for port in node.inputs
+            if port.source.node_id in sources} for node in nodes}
+        results = execute_pipeline(state, nodes, inputs, context)
+        assert seen == {(d, p) for d in ids for p in range(len(partners))}
+        assert not arena.accounting.owned
+        return results
+
+    fused = run(nodes)
+    for node in nodes[:-1]:
+        assert fused[node.node_id].metrics.extension["decode_rows"] > 0
+        rows = fused[node.node_id].outputs[node.rows_port]
+        assert rows.ids["d"].to_pylist() == ids
+        assert rows.column(node.spec.name).to_pylist() == batch_decode([
+            greedy(document + list(node.spec.prompt_token_parts[1]),
+                   node.spec.max_answer_tokens) for document in documents])
+    separate = run([replace(join, inputs=input_ports((
+        PortRef("input:d", "rows:d"), PortRef("input:p", "rows:p"))))])
+    got = fused[join.node_id].outputs["join_answers:0"]["rows"]
+    assert got == separate[join.node_id].outputs["join_answers:0"]["rows"]
+    assert got == {d: [next_token(chain(document + list(frame) + partner)) % 2
+                      for partner in partners] for d, document in enumerate(documents)}

@@ -101,6 +101,7 @@ class MapPart(ExecutionPart):
     def __init__(self, state, nodes, ids, first, priors=(), prior_tables=()):
         self.state = state
         self.nodes = list(nodes)
+        self.node = self.nodes[0]
         self.ids = np.asarray(ids, dtype=np.int64)
         self.first = first          # the pipeline's index of the first map
         self.priors = priors

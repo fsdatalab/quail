@@ -464,7 +464,7 @@ class StageExecutor:
             kept = int(sufs.lengths.sum()) if append else 0
             if request is not None and request.write_suffix_tokens is not None:
                 kept = request.write_suffix_tokens
-            if append or (self.writes[j] and start == 0):
+            if append or (rewinds and start == 0):
                 appended[a] = path + kept
             if self.writes[j] and start == 0 and self._merged(j, start, end):
                 # the frame and the one suffix are one entry; the
@@ -520,7 +520,7 @@ class StageExecutor:
 
     def _settle(self, settlement):
         anchor = settlement.anchor
-        if self.on_settled is None:
+        if self.on_settled is None or anchor in self.sched.dependencies:
             if self.arena.is_resident(self.keys[anchor]):
                 self.arena.free_key(self.keys[anchor])
         else:
