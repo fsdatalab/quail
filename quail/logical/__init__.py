@@ -55,6 +55,7 @@ from quail.logical.nodes import (
     above_unnest,
     classified_above_joins,
     extracted_above_joins,
+    mapped_above_joins,
 )
 from quail.logical.plan import (
     LabelWork,
@@ -141,6 +142,7 @@ __all__ = [
     "column_name",
     "effective_selectivity",
     "extracted_above_joins",
+    "mapped_above_joins",
     "filter_question_text",
     "has_score",
     "is_score",

@@ -133,3 +133,23 @@ def test_a_map_after_a_classification_shares_its_pipeline(session):
 def test_a_malformed_map_is_refused(session, sql, message):
     with pytest.raises(CompileError, match=message):
         session.sql(sql).plan()
+
+
+def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
+    from quail.logical import LogicalPlan
+    from quail.planner.rules.tree_transforms import lift_maps
+
+    session.register("films", DocumentProvider.from_table(
+        pa.table({"id": [7, 8], "plot": ["a heist", "a romance"]}), id_col="id"))
+    query = session.sql(
+        f"SELECT r.id, f.id, AI.MAP(r.body, '{SUMMARY}', 32) AS summary "
+        "FROM reviews r JOIN films f ON "
+        "AI_FILTER(PROMPT('Is review {0} about film {1}?', r.body, f.plot))")
+    root = query.logical.root
+    # as written the map runs below the join, on every review; the
+    # placement rule also offers it above the join, like a classification
+    written = [type(node).__name__ for node in LogicalPlan(root).walk()]
+    assert written.index("SemanticMap") < written.index("SemanticJoin")
+    lifted = [type(node).__name__ for node in LogicalPlan(lift_maps(root)).walk()]
+    assert lifted.index("SemanticJoin") < lifted.index("SemanticMap")
+    LogicalPlan(lift_maps(root)).validate()

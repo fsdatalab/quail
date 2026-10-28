@@ -25,6 +25,7 @@ from quail.logical import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SortKey,
     Window,
     above_unnest,
@@ -102,7 +103,7 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
             refs = _refs_of(node.columns)
         elif isinstance(node, Join):
             refs = _refs_of(node.on)
-        elif isinstance(node, SemanticExtract):
+        elif isinstance(node, (SemanticExtract, SemanticMap)):
             refs = _refs_of(node.call.prompt.args)
         elif isinstance(node, Scan):
             refs = _refs_of(node.predicates)
@@ -116,8 +117,8 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for expression in expressions:
             for ref in _column_refs(expression):
                 needed.setdefault(ref.alias, {})[ref.column] = None
-        if isinstance(node, (SemanticClassify, SemanticExtract)):
-            # the columns a classification or extraction adds are not
+        if isinstance(node, (SemanticClassify, SemanticExtract, SemanticMap)):
+            # the columns a classification, extraction, or map adds are not
             # read below it
             for field in node.output_schema()[len(node.input.output_schema()):]:
                 needed.get(field.alias, {}).pop(field.column, None)
@@ -151,7 +152,7 @@ def _lets_through(node, alias: str) -> bool:
         return node.semantics == "full"
     if isinstance(node, SemanticClassify):
         return len(node.call.aliases()) == 2 or node.alias != alias
-    if isinstance(node, SemanticExtract):
+    if isinstance(node, (SemanticExtract, SemanticMap)):
         return node.alias != alias
     if isinstance(node, Apply):
         return node.ids != "pairs" and node.aliases[0] != alias
@@ -225,12 +226,13 @@ def _label_sequence(node) -> tuple:
     """Split a table's sequence at its classifications and extractions.
 
     Returns:
-        The node below the table's lowest SemanticClassify or
-        SemanticExtract, and the SemanticClassify, label filter, and
-        SemanticExtract nodes above it, lowest first.
+        The node below the table's lowest SemanticClassify,
+        SemanticExtract, or SemanticMap, and those nodes and the label
+        filters above it, lowest first.
     """
     lifted = []
-    while isinstance(node, (SemanticClassify, SemanticExtract, Filter)):
+    while isinstance(node, (SemanticClassify, SemanticExtract, SemanticMap,
+                            Filter)):
         lifted.append(node)
         node = node.input
     return node, tuple(reversed(lifted))
@@ -238,27 +240,29 @@ def _label_sequence(node) -> tuple:
 
 def _sequence_alias(node) -> str:
     """Return the table alias a classification, extraction, or label filter reads."""
-    if isinstance(node, (SemanticClassify, SemanticExtract)):
+    if isinstance(node, (SemanticClassify, SemanticExtract, SemanticMap)):
         return node.alias
     return node.condition.column.alias
 
 
 def lift_maps(root: LogicalNode) -> LogicalNode | None:
-    """Move every joined table's classifications and extractions above the joins.
+    """Move a joined table's classifications, extractions, and maps above joins.
 
     Each one-table SemanticClassify of a table that a SemanticJoin
     reads, with the Filters on its label column, and each
-    SemanticExtract of such a table, leaves the table's sequence and
+    SemanticExtract or SemanticMap of such a table, leaves the table's
+    sequence and
     moves above the topmost join, under the root Project, in scan
     order. A classification or extraction of a table that no join
     reads stays, as does one below an Apply, whose function sees the
     rows it was written on, and one of a gate's inner table (an exists
     or anti join's partner), whose filters decide which anchors pass.
-    The map operators here are SemanticClassify and SemanticExtract.
+    The column operators here are SemanticClassify, SemanticExtract, and
+    SemanticMap; above the joins each runs on the documents they keep.
     The planner prices the rewritten plan alongside the original plan.
 
     Returns:
-        The rewritten root, or None when no classification or extraction moved.
+        The rewritten root, or None when no column operator moved.
     """
     # the result rows above the Project, an Unnest chain among them, hold
     # no document operators

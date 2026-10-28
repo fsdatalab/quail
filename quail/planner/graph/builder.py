@@ -13,6 +13,7 @@ from quail.logical import (
     extracted_above_joins,
     has_score,
     is_score,
+    mapped_above_joins,
     oriented_join_conditions,
 )
 from quail.logical.expressions import aliased_call
@@ -167,6 +168,7 @@ class GraphBuilder:
         self.classified = {alias for _, alias in self.operators.labels.calls}
         self.after_joins = classified_above_joins(plan.root)
         self.extract_after = extracted_above_joins(plan.root)
+        self.map_after = mapped_above_joins(plan.root)
         self.projected_scores = score_projections(plan)
         self.alias_applies = {}
         self.join_applies = {}
@@ -279,11 +281,13 @@ class GraphBuilder:
         for s in self.operators.scans:
             # a classification or extraction the planner lifted
             # above the joins is emitted after them
-            kinds = {ASK, FEATURES, MAP}
+            kinds = {ASK, FEATURES}
             if s.alias not in self.after_joins:
                 kinds.add(CLASSIFY)
             if s.alias not in self.extract_after:
                 kinds.add(EXTRACT)
+            if s.alias not in self.map_after:
+                kinds.add(MAP)
             port_by_alias[s.alias], rows = self._emit_steps(
                 s.alias,
                 float(stats[s.alias].num_documents),
@@ -417,7 +421,7 @@ class GraphBuilder:
         # classifications after the joins run over the documents the joins
         # matched: a document with at least one true pair, expected as the
         # join selectivity times the partners it met, at most every document
-        for alias in sorted(self.after_joins | self.extract_after):
+        for alias in sorted(self.after_joins | self.extract_after | self.map_after):
             met = sum(
                 effective_selectivity(join.selectivity)
                 * (self.pair_fractions or {}).get(position, 1.0)
@@ -431,6 +435,8 @@ class GraphBuilder:
                 kinds.add(CLASSIFY)
             if alias in self.extract_after:
                 kinds.add(EXTRACT)
+            if alias in self.map_after:
+                kinds.add(MAP)
             port_by_alias[alias], rows = self._emit_steps(
                 alias, self.operator_order.expected_rows[alias] * min(1.0, met), kinds,
                 port_by_alias[alias])
