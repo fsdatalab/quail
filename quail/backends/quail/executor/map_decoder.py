@@ -164,12 +164,14 @@ class MapDecoder:
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         scores = np.zeros(len(self.map))
+        written = np.zeros(len(self.map), dtype=np.int64)
         for q in np.unique(self.map[running]):
             curve = remaining_tokens(self.lengths[q], self.written[q],
                                      self.expected_tokens[q], int(self.limits[q]))
             mine = running[self.map[running] == q]
-            scores[mine] = curve[self.written[q][mine]]
-        return running[np.argsort(-scores[running], kind="stable")]
+            written[mine] = self.written[q][mine]
+            scores[mine] = curve[written[mine]]
+        return running[np.lexsort((running, written[running], -scores[running]))]
 
     def running(self):
         """Slots whose next decode row can choose another token."""
@@ -349,7 +351,7 @@ class MapDecoder:
                 for document in documents]
 
 
-def map_decoder(state, limits, num_documents: int) -> MapDecoder:
+def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapDecoder:
     """Return a decoder for a pipeline's maps on the loaded model."""
     from quail.backends.quail.executor.extract import load_vocabulary
     from quail.backends.quail.executor.model_loading import full_output_head
@@ -357,4 +359,4 @@ def map_decoder(state, limits, num_documents: int) -> MapDecoder:
     return MapDecoder(
         state.torch, full_output_head(state.loaded_model.model), num_documents,
         limits, load_vocabulary(state).stop_ids,
-        state.loaded_model.arena.page_tokens)
+        state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens)

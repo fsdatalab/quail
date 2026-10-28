@@ -187,6 +187,10 @@ class MapPart(ExecutionPart):
     def answer_limits(self) -> tuple:
         return tuple(node.spec.max_answer_tokens for node in self.nodes)
 
+    @property
+    def expected_answer_tokens(self) -> tuple:
+        return tuple(node.spec.expected_answer_tokens for node in self.nodes)
+
     def finish(self, every) -> int:
         """Return the tokens the maps fed: their tails and their decode rows."""
         tails = sum(int(asked.sum()) * len(node.spec.prompt_token_parts[1])

@@ -115,6 +115,9 @@ class StageExecutor:
             raise ValueError("stages with answer_tokens need a decoder")
         self.deferred = {}      # document -> its answer stage's group
         self.answered = set()   # documents whose answers ended first
+        self.recomputing = {}   # evicted slot -> tokens prefilled since readmission
+        self.num_evictions = 0
+        self.recomputed_tokens = 0
 
         k = len(self.stages)
         if not self.paged and (
@@ -171,7 +174,7 @@ class StageExecutor:
                                    self.canvas_rows)
                                if stage.single])
         appended = sorted(
-            (tuple(frame), int(suffixes.lengths.max()) + stage.answer_tokens)
+            (tuple(frame), int(suffixes.lengths.max()))
             for frame, suffixes, stage in zip(self.frames, self.suffixes, self.stages)
             if stage.append)
         for frame, group in groupby(appended, key=lambda entry: entry[0]):
@@ -179,6 +182,10 @@ class StageExecutor:
             if appended_tokens is not None:
                 kept = min(kept, int(appended_tokens))
             self.capacity_extra = max(self.capacity_extra, len(frame) + kept)
+        if self.answer_maps:
+            # One extra page lets a readmitted answer progress before growing again.
+            self.capacity_extra += min(self.arena.page_tokens,
+                                       int(self.decoder.limits.max()) - 1)
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
 
@@ -403,7 +410,65 @@ class StageExecutor:
         """Return whether the group packs its frame and suffix as one entry."""
         return self.stages[j].single and end - start == 1
 
-    def _build(self, chunk_groups, decode=None):
+    def _grow_answers(self):
+        """Grow next decode rows, evicting harvested answers when pages run out."""
+        decoder = self.decoder
+        harvested = False
+        while True:
+            running = decoder.running()
+            positions = decoder.origin[running] + decoder.fed[running]
+            growing = running[positions >= decoder.num_pages[running]
+                              * self.arena.page_tokens]
+            if not len(growing):
+                return
+            a = int(growing[0])
+            key = self.keys[a]
+            capacity = int(decoder.origin[a] + decoder.fed[a] + 1)
+            if self.arena.activate(key, self.prefix_lengths[a],
+                                   capacity_tokens=capacity) is not None:
+                decoder.set_pages(a, self.arena.owned_pages(key))
+                continue
+            if not harvested:
+                # In-flight argmax results must land before an answer loses its KV.
+                decoder.harvest(wait=True)
+                while self.outstanding:
+                    self._report_next()
+                self._answers_landed()
+                harvested = True
+                continue
+            victim = int(decoder.eviction_order()[0])
+            decoder.pause(victim)
+            key = self.keys[victim]
+            self.arena.drop_holds((key,))
+            self.arena.free_key(key)
+            self.recomputing[victim] = 0
+            self.num_evictions += 1
+
+    def _replays(self, room):
+        """Pack queued recomputations into the room left beside decode rows."""
+        replays = []
+        for a, start in self.recomputing.items():
+            if not room:
+                break
+            q = self.decoder.map[a]
+            written = int(self.decoder.written[q][a])
+            length = int(self.decoder.origin[a]) + written
+            key = self.keys[a]
+            if not self.arena.is_resident(key):
+                reserve = min(self.arena.page_tokens,
+                              int(self.decoder.limits[q]) - written - 1)
+                capacity = max(self.prefix_lengths[a] + self.capacity_extra,
+                               length + reserve)
+                if not self.arena.reserve(
+                        key, self.prefix_lengths[a], capacity_tokens=capacity,
+                        extension=self._extends):
+                    continue
+            end = min(length, start + room)
+            replays.append((a, start, end))
+            room -= end - start
+        return replays, room
+
+    def _build(self, chunk_groups, decode=None, replays=()):
         """Pack a chunk and identify each entry's stage and answer row count.
 
         Returns:
@@ -500,15 +565,38 @@ class StageExecutor:
             if j in self.answer_maps and start == 0:
                 firsts.append((sum(n for _, n in entries) + rows - 1, a, j))
             entries.append((j, rows))
+        resumed = []
+        for a, start, end in replays:
+            j = int(self.answer_stage[a])
+            q = self.decoder.map[a]
+            written = self.decoder.written[q][a]
+            prompt = np.concatenate((self.prefixes[a], self.frame_ids[j],
+                                     self._suffixes_of(j, a).ids,
+                                     self.decoder.tokens[q][a, :written]))
+            ids = prompt[start:end]
+            specs.append(dict(key=self.keys[a], prefix=None, f=start,
+                              suffixes=Suffixes(ids, [len(ids)]),
+                              write_suffix_tokens=len(ids), single=True))
+            if end == len(prompt):
+                resumed.append(a)
+                firsts.append((sum(n for _, n in entries), a, j))
+            entries.append((j, 1))
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
             staging=self.staging, canvas=self.canvas, answer_row=self.answer_row,
             decode=decode)
         for a, tokens in appended.items():
             self.appended[a] = tokens
+        for a, start, end in replays:
+            self.recomputing[a] = end
+            self.recomputed_tokens += end - start
         if self.decoder is not None:
             self.decoder.feed(chunk)
             for _, a, j in firsts:
+                if a in resumed:
+                    self.decoder.resume(a, self.arena.owned_pages(self.keys[a]))
+                    del self.recomputing[a]
+                    continue
                 self.answer_stage[a] = j
                 self.decoder.start(
                     a, self.answer_maps[j],
@@ -635,12 +723,12 @@ class StageExecutor:
                                     else "rows")
             log(kind, **detail)
 
-    def _run_part(self, part, decode=None):
+    def _run_part(self, part, decode=None, replays=()):
         """Run one chunk of groups, halving it when its pages do not fit."""
         from quail.backends.quail.executor.chunk import ArenaFullError
 
         try:
-            self._run_one(part, decode)
+            self._run_one(part, decode, replays)
         except ArenaFullError as error:
             # retained KV nothing here reads makes room first
             need = self.arena.page_cost(sum(self._entry_rows(*e) for e in part))
@@ -648,19 +736,19 @@ class StageExecutor:
                 self._log_memory_event("evict_retry", groups=len(part))
                 logger.info("chunk of %d groups retried after evicting "
                             "retained KV", len(part))
-                self._run_part(part, decode)
+                self._run_part(part, decode, replays)
                 return
             if len(part) < 2:
                 raise
             self._log_memory_event("split", groups=len(part), reason=str(error))
             logger.info("chunk of %d groups split: %s", len(part), error)
             half = len(part) // 2
-            self._run_part(part[:half], decode)
+            self._run_part(part[:half], decode, replays)
             self._run_part(part[half:])
 
-    def _run_one(self, part, decode=None):
+    def _run_one(self, part, decode=None, replays=()):
         started = time.perf_counter()
-        chunk, entries, firsts = self._build(part, decode)
+        chunk, entries, firsts = self._build(part, decode, replays)
         self.pack_s += time.perf_counter() - started
         self.tokens += chunk.tokens
         if self.gpu_timing:
@@ -674,6 +762,9 @@ class StageExecutor:
             for entry in part:
                 stage = entry[1]
                 by_stage[stage] = by_stage.get(stage, 0) + self._entry_rows(*entry)
+            for a, start, end in replays:
+                stage = int(self.answer_stage[a])
+                by_stage[stage] = by_stage.get(stage, 0) + end - start
             if decode is not None:
                 # a decode row counts toward its answer's stage
                 stages = self.answer_stage[decode.slots]
@@ -712,21 +803,23 @@ class StageExecutor:
                 # the free list is short for the next fresh document:
                 # retained KV nothing here reads makes room
                 self.arena.evict_retained(self.sched.blocked_pages)
+            if self.decoder is not None:
+                self._grow_answers()
             decode = None if self.decoder is None else self.decoder.rows()
-            # the answers' rows come first; documents fill the rest
+            # Answers keep their rows; recomputations and new prompts fill the rest.
+            room = self.sched.chunk_budget - (0 if decode is None else len(decode))
+            replays, room = self._replays(max(0, room))
             groups = self.sched.next_chunk(
-                self.arena.free_pages if self.paged else 1 << 62,
-                room=None if decode is None else max(
-                    0, self.sched.chunk_budget - len(decode)))
-            if not groups and decode is not None:
-                self._run_part([], decode)
+                self.arena.free_pages if self.paged else 1 << 62, room=room)
+            if not groups and (decode is not None or replays):
+                self._run_part([], decode, replays)
                 continue
             if not groups:
                 if self.outstanding:
                     self._report_next(partial=True)
                     continue
-                if self.decoder is not None and self.decoder.active:
-                    # every answer waits on a token still on its way
+                if self.decoder is not None and self.decoder.copies:
+                    # Every answer waits on a token still on its way.
                     self.decoder.harvest(wait=True)
                     continue
                 if (self.sched.blocked_pages
@@ -737,7 +830,7 @@ class StageExecutor:
                 if self.arena.drop_holds(self.held):
                     continue
                 raise AssertionError("nothing buildable and nothing in flight")
-            self._run_part(groups, decode)
+            self._run_part(groups, decode, replays)
             # the packed children hold their parents' pages now
             for a, _, start, _, carried in groups:
                 parent = (self.borrowing.tree_parent[a]
@@ -763,6 +856,8 @@ class StageExecutor:
             self.stats["borrowed_tokens"] = self.borrowing.borrowed_tokens
             self.stats["pack_s"] = self.pack_s
             self.stats["skipped_documents"] = len(self.sched.oversized)
+            self.stats["num_evictions"] = self.num_evictions
+            self.stats["recomputed_tokens"] = self.recomputed_tokens
         if self.spans:
             self.torch.cuda.synchronize()
             # between forward passes the GPU runs readouts and uploads,
@@ -773,6 +868,8 @@ class StageExecutor:
             logger.info("%s: %d forward passes, %.3f s of GPU time between them",
                         self.label, len(self.spans), between)
         if self.decoder is not None:
+            logger.info("%s: %d answer evictions, %d recomputed tokens", self.label,
+                        self.num_evictions, self.recomputed_tokens)
             logger.info("%s: decode rows read KV tokens %s", self.label,
                         self.decoder.read_tokens)
         return self.sched.answers, self.spans, self.tokens

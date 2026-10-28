@@ -212,7 +212,9 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
     limits = [limit for part in parts for limit in part.answer_limits]
     decoder = None
     if limits:
-        decoder = map_decoder(state, limits, len(prefixes))
+        expected_tokens = [expected for part in parts if part.answer_limits
+                           for expected in part.expected_answer_tokens]
+        decoder = map_decoder(state, limits, len(prefixes), expected_tokens)
         for part in parts:
             if part.answer_limits:
                 part.decoder = decoder

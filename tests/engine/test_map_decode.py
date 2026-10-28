@@ -122,7 +122,8 @@ def greedy(prompt, limit):
 
 def map_node(name, tail, limit, attention=""):
     return SimpleNamespace(attention=attention, spec=SimpleNamespace(
-        name=name, prompt_token_parts=((), tuple(tail)), max_answer_tokens=limit))
+        name=name, prompt_token_parts=((), tuple(tail)), max_answer_tokens=limit,
+        expected_answer_tokens=min(64, limit)))
 
 
 def events_torch(lag):
@@ -557,3 +558,94 @@ def test_maps_feed_only_document_kv_to_every_join_partner(
     assert got == separate[join.node_id].outputs["join_answers:0"]["rows"]
     assert got == {d: [next_token(chain(document + list(frame) + partner)) % 2
                       for partner in partners] for d, document in enumerate(documents)}
+
+
+@pytest.mark.parametrize("num_maps", [1, 2, 3])
+@pytest.mark.parametrize("limit", [None, 2])
+@pytest.mark.parametrize("lag", [0, 3])
+@pytest.mark.parametrize("budget", [20, 200])
+def test_evicted_answers_recompute_exactly_with_gates_and_limits(
+        monkeypatch, num_maps, limit, lag, budget):
+    cpu_staging(monkeypatch)
+    monkeypatch.setattr(__name__ + ".next_token", lambda h: 10 + h % 900)
+    rng = np.random.default_rng(19)
+    documents = [rng.integers(20, 400, size=8).tolist() for _ in range(12)]
+    ids = list(range(len(documents)))
+    tails = [[500, 501], [600, 601], [650, 651]][:num_maps]
+    limits = [24, 20, 28][:num_maps]
+    setup = Setup(path="unified", pages=16, page_tokens=4, budget=budget)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=())
+    torch_ = events_torch(lag)
+    classification, condition = classification_and_condition(ids)
+    maps = MapPart(None, [map_node(f"m{q}", tail, answer_limit, "tree")
+                          for q, (tail, answer_limit) in enumerate(zip(tails, limits))],
+                   ids, 0)
+    stages = gated_stages([classification, condition, maps])
+    prefixes, keys, tree, dependencies = maps.branch_inputs(
+        documents, [("d", i) for i in ids], None, setup.page_tokens, 1)
+    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), limits,
+                         [STOP], setup.page_tokens)
+    maps.decoder = decoder
+    stats = {}
+    run_stages(torch_, arena, pipeline, stages, prefixes, budget,
+               anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
+               decoder=decoder, stats=stats, limit=limit)
+    asked = np.flatnonzero(maps.asked[0])
+    assert len(asked) >= (limit or 1)
+    assert all(classification.plan.labels[a] == "keep" for a in asked)
+    for q, (tail, answer_limit) in enumerate(zip(tails, limits)):
+        np.testing.assert_array_equal(maps.asked[q], maps.asked[0])
+        got = [answer.tolist() for answer in decoder.answers(q, maps._slots(q, asked))]
+        assert got == [greedy(documents[a] + tail, answer_limit) for a in asked]
+    assert stats["num_evictions"] > 0
+    assert stats["recomputed_tokens"] > 0
+    assert not decoder.active
+    assert not arena.accounting.owned
+
+
+def test_prompt_reservations_admit_more_than_full_answer_limits(monkeypatch):
+    cpu_staging(monkeypatch)
+    setup = Setup(path="unified", pages=20, page_tokens=4, budget=200)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    admitted = []
+
+    def forward_chunk(chunk):
+        admitted.append(len(chunk.fresh_keys))
+        return model.forward_chunk(chunk)
+
+    pipeline = fake_pipeline(forward_chunk=forward_chunk, canvas_ids=())
+    torch_ = events_torch(3)
+    documents = [list(range(20 + a, 28 + a)) for a in range(4)]
+    maps = MapPart(None, [map_node("answer", [500, 501], 80)], range(4), 0)
+    prefixes, keys, tree, dependencies = maps.branch_inputs(
+        documents, [("d", a) for a in range(4)], None, setup.page_tokens, 0)
+    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), 4, [80], [STOP], 4)
+    maps.decoder = decoder
+    stats = {}
+    run_stages(torch_, arena, pipeline, gated_stages([maps]), prefixes, 200,
+               anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
+               decoder=decoder, stats=stats)
+    # Reserving an 80-token answer would not admit even one prompt here.
+    assert admitted[0] == 4
+    assert stats["skipped_documents"] == 0
+    assert [answer.tolist() for answer in decoder.answers(0, range(4))] == [
+        greedy(document + [500, 501], 80) for document in documents]
+    assert not arena.accounting.owned
+
+
+def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 4,
+                         [24, 6], [STOP], 4, expected_tokens=[12, 3])
+    for a, q in enumerate([0, 0, 1, 1]):
+        decoder.start(a, q, 8, [0, 1, 2])
+    decoder.written[0][:2] = [2, 23]
+    decoder.written[1][2:] = [1, 5]
+    order = decoder.eviction_order().tolist()
+    assert order[0] == 0
+    assert order.index(2) < order.index(1)
+    assert order.index(2) < order.index(3)
+    decoder.pause(0)
+    assert 0 not in decoder.eviction_order()
