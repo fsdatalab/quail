@@ -113,6 +113,7 @@ class ExecutionPart(ABC):
     # the answer limits of the maps the part runs, in order; the
     # pipeline's MapDecoder writes their answers into part.decoder
     answer_limits = ()
+    answer_dependencies = ()
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
@@ -258,6 +259,7 @@ def gated_stages(parts) -> list:
         implementation.prepare_group(list(group))
     stages = []
     pending = []
+    dependencies = []
     for part in parts[1:]:
         if part.stages and not part.stages[0].rewind:
             # an operator's first request follows the document, in
@@ -267,9 +269,12 @@ def gated_stages(parts) -> list:
     for part in parts:
         if not part.stages:
             pending.append(part.gate)
+            dependencies.extend(part.answer_dependencies)
             continue
         first = part.stages[0]
         if pending:
+            first.answer_dependencies = tuple(dict.fromkeys(dependencies))
+            dependencies = []
             gates = list(pending)
             asked = first.suffixes if first.own_suffixes else first.requests
 
@@ -294,7 +299,8 @@ def gated_stages(parts) -> list:
 
         # a document that passes the trailing conditions skips this
         # stage and counts as a survivor, with nothing asked
-        terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish)
+        terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish,
+                         answer_dependencies=tuple(dict.fromkeys(dependencies)))
         parts[-1].stages = [terminal]
         stages.append(terminal)
     writes = frame_writes(stages)

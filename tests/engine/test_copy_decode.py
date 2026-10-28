@@ -333,8 +333,9 @@ def test_map_and_copy_fields_can_reuse_a_slot_without_changing_saved_spans():
 
 
 @pytest.mark.parametrize("map_first", [False, True])
+@pytest.mark.parametrize("gated", [False, True])
 def test_maps_and_extracts_share_branches_without_changing_results(
-    monkeypatch, map_first
+    monkeypatch, map_first, gated
 ):
     from helpers.fakes import cpu_staging
     from helpers.kv_checker import Setup, chain, make_arena
@@ -347,9 +348,12 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     )
 
     from quail.backends.quail.executor.operators.extract import ExtractPart
+    from quail.backends.quail.executor.operators.filter import ConditionGate
     from quail.backends.quail.executor.operators.map import MapPart
     from quail.backends.quail.executor.parts import execute_parts
-    from quail.physical import AiExtract
+    from quail.logical import ColumnRef, RegularPredicate
+    from quail.physical import AiExtract, Filter, PortRef
+    from quail.physical.base import input_ports
 
     cpu_staging(monkeypatch)
     monkeypatch.setattr(
@@ -386,10 +390,26 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         {"documents": {"c": tokens}, "texts": {"c": texts}},
         first=int(map_first),
     )
-    node = map_node("summary", [10, 11], 6, "tree")
-    node.node_id, node.rows_port, node.spec.aliases = "map", "rows:c", ("c",)
-    maps = MapPart(state, [node], ids, 0 if map_first else 2)
+
+    def mapped(name, first):
+        node = map_node(name, [10, 11], 6, "tree")
+        node.node_id, node.rows_port, node.spec.aliases = name, "rows:c", ("c",)
+        return MapPart(state, [node], ids, first)
+
+    maps = mapped("summary", 0 if map_first else 2)
     parts = [maps, extracts] if map_first else [extracts, maps]
+    after = mapped("after", 3)
+    if gated:
+        condition = Filter(
+            node_id="condition",
+            aliases=("c",),
+            written_position=0,
+            inputs=input_ports((PortRef("extract:1", "rows:c"),)),
+            predicate=RegularPredicate(
+                ColumnRef("c", "contracts", "answer1"), "is not null"
+            ),
+        )
+        parts.extend([ConditionGate(condition, extracts, extracts), after])
     results = execute_parts(
         state,
         parts,
@@ -409,7 +429,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
                 break
             expected.append(token)
         assert (
-            results["map"].outputs["rows:c"].column("summary")[d].as_py()
+            results["summary"].outputs["rows:c"].column("summary")[d].as_py()
             == batch_decode([expected])[0]
         )
         for q in range(2):
@@ -434,5 +454,123 @@ def test_maps_and_extracts_share_branches_without_changing_results(
                 if answer.span is None
                 else dict(start=answer.span[0], end=answer.span[1])
             )
+    if gated:
+        expected = [
+            document.answers[1].answer is not None
+            for document in extracts.extraction.documents
+        ]
+        assert any(expected)
+        assert after.asked[0].tolist() == expected
     assert len(set(maps.slots.flat) & set(extracts.slots.flat)) == 0
     assert not arena.accounting.owned
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_later_questions_wait_only_for_the_answer_their_condition_reads(
+    monkeypatch, gated
+):
+    from helpers.fakes import cpu_staging, fake_pipeline
+    from helpers.kv_checker import Setup, chain, make_arena
+    from test_map_decode import Bits, TokenModel, map_node, next_token
+
+    from quail.backends.quail.executor.operators.extract import ExtractPart
+    from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
+    from quail.backends.quail.executor.operators.map import MapPart, branch_parts
+    from quail.backends.quail.executor.parts import gated_stages
+    from quail.backends.quail.executor.stages import run_stages
+    from quail.logical import ColumnRef, RegularPredicate
+    from quail.physical import AiExtract
+
+    cpu_staging(monkeypatch)
+    text = " ".join(["five"] * 80)
+    spec, vocabulary = make_spec(text)
+    spec = replace(spec, max_answer_tokens=32, draft_tokens=0, top_tokens=4)
+    setup = Setup(path="unified", pages=200, budget=512)
+    arena = make_arena(setup)
+    state = SimpleNamespace(
+        loaded_model=SimpleNamespace(arena=arena, vocabulary=vocabulary)
+    )
+    nodes = [
+        AiExtract(
+            node_id=f"extract:{q}",
+            backend_name="quail",
+            model="qwen3-4b-fp8",
+            spec=replace(
+                spec,
+                name=f"answer{q}",
+                prompt_token_parts=(spec.prompt_token_parts[0], (600 + q, 610 + q)),
+            ),
+        )
+        for q in range(3)
+    ]
+    extracts = ExtractPart(
+        state, nodes, [0], {"documents": {"c": None}, "texts": {"c": [text]}}, first=1
+    )
+    parent = MapPart(state, [map_node("parent", [500, 501], 1)], [0], 0)
+    parts = [parent, extracts]
+    if gated:
+        condition = SimpleNamespace(
+            column="answer1",
+            predicate=RegularPredicate(
+                ColumnRef("c", "contracts", "answer1"), "is not null"
+            ),
+        )
+        parts.append(ConditionGate(condition, extracts, extracts))
+    question = [760, 761]
+    parts.append(FilterPart(SimpleNamespace(question_token_ids=question), [0], Bits()))
+    parts = branch_parts(parts)
+    stages = gated_stages(parts)
+    prefix = list(map(int, extracts.extraction.prefixes[0]))
+    prefixes, keys, tree, dependencies = parts[0].branch_inputs(
+        extracts.extraction.prefixes,
+        extracts.extraction.keys,
+        None,
+        setup.page_tokens,
+        0,
+    )
+    word = vocabulary.encode_ids(" five")[0]
+    head = torch.zeros(len(vocabulary.vocab), 1024)
+    head[word, :] = 1
+    stop_column = next_token(chain(prefix + [601, 611] + [word] * 3))
+    head[:, stop_column] = 0
+    head[vocabulary.stop_ids[0], stop_column] = 1
+    torch_ = events_torch(0)
+    decoder = MapDecoder(
+        torch_,
+        head,
+        len(prefixes),
+        parts[0].answer_limits,
+        vocabulary.stop_ids,
+        setup.page_tokens,
+    )
+    parts[0].decoder = decoder
+    model = TokenModel(arena)
+    observed = []
+
+    def forward(chunk):
+        tokens = chunk.input_ids.tolist()
+        if any(tokens[i : i + 2] == question for i in range(len(tokens) - 1)):
+            observed.append(
+                [int(decoder.lengths[q + 1][extracts.slots[q, 0]]) for q in range(3)]
+            )
+        return model.forward_chunk(chunk)
+
+    run_stages(
+        torch_,
+        arena,
+        fake_pipeline(forward_chunk=forward, canvas_ids=()),
+        stages,
+        prefixes,
+        setup.budget,
+        anchor_keys=keys,
+        prefix_tree=tree,
+        dependencies=dependencies,
+        decoder=decoder,
+    )
+    assert len(observed) == 1
+    assert observed[0] == [-1, 3 if gated else -1, -1]
+    assert [int(decoder.lengths[q + 1][extracts.slots[q, 0]]) for q in range(3)] == [
+        32,
+        3,
+        32,
+    ]

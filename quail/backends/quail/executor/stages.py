@@ -100,6 +100,7 @@ class Stage:
             after the stage's request, as AI.MAP's answer; admission
             reserves pages for them.
         answer_index: Index of this stage's first map in the decoder.
+        answer_dependencies: Decoder fields this stage's requests read.
     """
 
     DROP = DROP
@@ -123,6 +124,7 @@ class Stage:
     suffix_tokens: int = 0
     answer_tokens: int = 0
     answer_index: int = 0
+    answer_dependencies: tuple[int, ...] = ()
 
     def __post_init__(self):
         if self.own_suffixes:

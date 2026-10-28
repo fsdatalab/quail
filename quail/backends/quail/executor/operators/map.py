@@ -182,6 +182,8 @@ class MapPart(ExecutionPart):
     def bind_decoder(self, decoder):
         """Attach answer storage after the branch slots have been assigned."""
         self._decoder = decoder
+        for q, slots in enumerate(self.slots):
+            decoder.answer_slots[self.first + q] = slots
         decoder.share |= any(getattr(node, "attention", "") == "tree"
                              for node in self.nodes)
 

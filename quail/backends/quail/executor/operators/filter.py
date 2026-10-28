@@ -126,6 +126,15 @@ class ConditionGate(SingleResultPart):
                          for index, document in enumerate(producer.ids)}
         self.accepted = {}
 
+    @property
+    def answer_dependencies(self):
+        if not self.producer.answer_limits:
+            return ()
+        return tuple(self.producer.first + q
+                     for q, node in enumerate(self.producer.nodes)
+                     if self.node.column in (node.spec.name,
+                                              getattr(node.spec, "span_name", None)))
+
     def gate(self, key):
         # values settle as chunks finish, so each is tested as its
         # document arrives; a repeated value, such as a label, is

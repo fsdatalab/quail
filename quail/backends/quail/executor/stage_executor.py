@@ -114,6 +114,7 @@ class StageExecutor:
         if self.answer_maps and decoder is None:
             raise ValueError("stages with answer_tokens need a decoder")
         self.deferred = {}      # document -> its answer stage's group
+        self.waiting_reports = []
         self.answered = set()   # documents whose answers ended first
         self.recomputing = {}   # evicted slot -> tokens prefilled since readmission
         self.num_evictions = 0
@@ -687,7 +688,15 @@ class StageExecutor:
         self._release_skipped()
 
     def _record(self, a, j, start, end, rows) -> list:
-        """Report a group's answers to the admission; return its transitions."""
+        """Report a group's answers once the next stage's inputs are ready."""
+        if a not in self.sched.dependencies and j + 1 < len(self.stages):
+            waiting = self.stages[j + 1].answer_dependencies
+            if any(self.decoder.lengths[q][self.decoder.answer_slots[q][a]] < 0
+                   for q in waiting):
+                # A readout may reuse its host buffer before the dependency ends.
+                self.waiting_reports.append(
+                    (a, j, start, end, np.array(rows, copy=True)))
+                return []
         result = self.sched.report(a, j, start, end, rows)
         if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
             del self.own[(j, a)]
@@ -714,6 +723,9 @@ class StageExecutor:
     def _answers_landed(self):
         """Report finished answers outside a chunk's own report."""
         transitions = self._record_answers()
+        waiting, self.waiting_reports = self.waiting_reports, []
+        for entry in waiting:
+            transitions.extend(self._record(*entry))
         if transitions and self.on_chunk is not None:
             self.on_chunk(transitions)
 

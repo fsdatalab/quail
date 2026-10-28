@@ -91,6 +91,7 @@ class MapDecoder:
         self.read_tokens = dict(all=0, alone=0, own=0, shared=0)
         # Per answer stage, each branch's map index.
         self.slot_maps = {}
+        self.answer_slots = {}
         # whether a document's branches read its shared pages together
         self.share = False
         self.copy_constraints = {}
