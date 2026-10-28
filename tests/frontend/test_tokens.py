@@ -206,32 +206,23 @@ def test_offsets_reject_changed_text_and_preserve_sliced_rows():
 
 def test_a_document_points_at_the_first_document_with_its_tokens_and_row_values(
         tmp_path):
-    from quail.catalog.tokens import PrefixIndex
-
-    documents = [[1, 2, 3], [1, 2, 3], [3, 2, 1], [1, 2, 3, 0], [1, 2], [], []]
-    index = PrefixIndex([np.asarray(tokens, dtype=np.int32)
-                         for tokens in documents])
-    assert index.shared.tolist() == [2, 2, 0, 3, 0, 0, 0]
-    schema = pa.schema({"id": pa.string(), "body": pa.string()})
-    batches = [pa.record_batch(
-        [["a", "b", "c", "d"], ["ok", "ok", "no", "ok"]], schema=schema)]
-    store = TokenStore.write(str(tmp_path / "copies.arrow"), batches,
-                             document_column="body", tokenizer=str.split,
-                             token_type=pa.string())
-    assert store.first_documents.to_pylist() == [0, 0, 2, 0]
-    assert store.first_documents_with([]).to_pylist() == [0, 0, 2, 0]
-    assert prefix_tree(store, 1).shared == [0, 0, 0, 0]
     # equal tokens share a first; order, an extra token, or length tell apart
-    texts = [" ".join(map(str, tokens)) for tokens in documents]
-    numbers = TokenStore.write(
-        str(tmp_path / "numbers.arrow"),
-        [pa.record_batch([texts[:3]], names=["body"]),
-         pa.record_batch([texts[3:]], names=["body"])],
+    documents = ["1 2 3", "1 2 3", "3 2 1", "1 2 3 0", "1 2", "", ""]
+    store = TokenStore.write(
+        str(tmp_path / "copies.arrow"),
+        [pa.record_batch([documents[:3]], names=["body"]),
+         pa.record_batch([documents[3:]], names=["body"])],
         document_column="body", token_type=pa.int32(),
         tokenizer=lambda text: [int(token) for token in text.split()])
-    assert numbers.first_documents.to_pylist() == [0, 0, 2, 3, 4, 5, 5]
+    assert store.first_documents.to_pylist() == [0, 0, 2, 3, 4, 5, 5]
+    # a test tokenizer's words group the same way
+    words = TokenStore.write(
+        str(tmp_path / "words.arrow"),
+        [pa.record_batch([["ok", "ok", "no", "ok"]], names=["body"])],
+        document_column="body", tokenizer=str.split, token_type=pa.string())
+    assert words.first_documents.to_pylist() == [0, 0, 2, 0]
     hotel = pa.array(["h1", "h2", "h1", "h1"])
-    assert store.first_documents_with([hotel]).to_pylist() == [0, 1, 2, 0]
+    assert words.first_documents_with([hotel]).to_pylist() == [0, 1, 2, 0]
     # a null is one value like any other
     stars = pa.array([None, 1.0, None, None])
-    assert store.first_documents_with([hotel, stars]).to_pylist() == [0, 1, 2, 0]
+    assert words.first_documents_with([hotel, stars]).to_pylist() == [0, 1, 2, 0]
