@@ -564,19 +564,24 @@ def test_maps_feed_only_document_kv_to_every_join_partner(
 @pytest.mark.parametrize("limit", [None, 2])
 @pytest.mark.parametrize("lag", [0, 3])
 @pytest.mark.parametrize("budget", [20, 200])
+@pytest.mark.parametrize("stop_modulus", [0, 19])
+@pytest.mark.parametrize("path", ["unified", "tree"])
 def test_evicted_answers_recompute_exactly_with_gates_and_limits(
-        monkeypatch, num_maps, limit, lag, budget):
+        monkeypatch, num_maps, limit, lag, budget, stop_modulus, path):
     cpu_staging(monkeypatch)
-    monkeypatch.setattr(__name__ + ".next_token", lambda h: 10 + h % 900)
+    monkeypatch.setattr(__name__ + ".next_token", lambda h: (
+        STOP if stop_modulus and h % stop_modulus == 0 else 10 + h % 900))
     rng = np.random.default_rng(19)
-    documents = [rng.integers(20, 400, size=8).tolist() for _ in range(12)]
+    documents = [[20, 21, 22, 23] + rng.integers(20, 400, size=4).tolist()
+                 for _ in range(12)]
     ids = list(range(len(documents)))
     tails = [[500, 501], [600, 601], [650, 651]][:num_maps]
     limits = [24, 20, 28][:num_maps]
-    setup = Setup(path="unified", pages=16, page_tokens=4, budget=budget)
+    setup = Setup(path=path, pages=16, page_tokens=4, budget=budget)
     arena = make_arena(setup)
     model = TokenModel(arena)
-    pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=())
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=(),
+                             tree_attention=True)
     torch_ = events_torch(lag)
     classification, condition = classification_and_condition(ids)
     maps = MapPart(None, [map_node(f"m{q}", tail, answer_limit, "tree")
@@ -584,14 +589,15 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
                    ids, 0)
     stages = gated_stages([classification, condition, maps])
     prefixes, keys, tree, dependencies = maps.branch_inputs(
-        documents, [("d", i) for i in ids], None, setup.page_tokens, 1)
+        documents, [("d", i) for i in ids], prefix_tree(documents, setup.page_tokens),
+        setup.page_tokens, 1)
     decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), limits,
                          [STOP], setup.page_tokens)
     maps.decoder = decoder
     stats = {}
     run_stages(torch_, arena, pipeline, stages, prefixes, budget,
                anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
-               decoder=decoder, stats=stats, limit=limit)
+               decoder=decoder, stats=stats, limit=limit, attention_mode=path)
     asked = np.flatnonzero(maps.asked[0])
     assert len(asked) >= (limit or 1)
     assert all(classification.plan.labels[a] == "keep" for a in asked)
