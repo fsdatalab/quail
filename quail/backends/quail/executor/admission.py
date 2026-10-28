@@ -248,6 +248,7 @@ class JoinAdmission:
         self.dependents = {}
         # released dependents not yet admitted, in release order
         self.waiting = deque()
+        self._released = set()   # dependents whose parent launched their stage
         self._counted = set()   # documents counted toward the limit
         for anchor, (parent, stage) in self.dependencies.items():
             self.dependents.setdefault((parent, stage), []).append(anchor)
@@ -569,7 +570,9 @@ class JoinAdmission:
         """Record a launched group; True when the stream continues."""
         self._next[a] = end
         if (a, j) in self.dependents:
-            self.waiting.extend(self.dependents[(a, j)])
+            released = set(self.dependents[(a, j)]) - self._released
+            self.waiting.extend(sorted(released))
+            self._released.update(released)
         self.in_flight += 1
         return end < self.num_partners(a, j)
 
@@ -784,7 +787,7 @@ class JoinAdmission:
         """
         for stage in range(len(self.stages)):
             for dependent in self.dependents.get((a, stage), ()):
-                if self._stage[dependent] != -1:
+                if self._stage[dependent] != -1 or dependent in self._released:
                     continue
                 self._stage[dependent] = _DONE
                 self._skipped.append(dependent)

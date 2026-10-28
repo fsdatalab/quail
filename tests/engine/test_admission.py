@@ -612,3 +612,17 @@ def test_dependents_wait_for_their_parent_and_price_only_the_unshared_tokens(kep
     assert sched.survivors == 0
     sched.report(0, 1, 0, 1, [True])
     assert sched.survivors == 1 and sched.done()
+
+
+def test_a_released_dependent_runs_after_its_parent_finishes():
+    sched = JoinAdmission(
+        [2, 2], [[2]], 4, arena_pages=4, page_tokens=16,
+        dependencies={1: (0, 0)}, limit=1)
+    assert sched.next_chunk(4) == [(0, 0, 0, 1, True)]
+    sched.report(0, 0, 0, 1, [True])
+    assert not sched.take_settled()
+    assert not sched.survivors
+    assert sched.next_chunk(4) == [(1, 0, 0, 1, True)]
+    sched.report(1, 0, 0, 1, [True])
+    assert sched.survivors == 1
+    assert sched.done()
