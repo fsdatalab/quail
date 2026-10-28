@@ -31,6 +31,7 @@ from quail.physical import (
     Project,
     Recombine,
     Scan,
+    Sort,
 )
 from quail.physical.base import input_ports
 from quail.planner import (
@@ -184,11 +185,13 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
             constraint="apply_needs_quail_backend",
             needed=1, available=0, unit="backends")
     root = region.logical_plan.result
-    if root.order or root.distinct or root.offset \
+    projected = {column_name(column)
+                 for column in region.logical_plan.projection.columns}
+    if any(key.name not in projected for key in root.order) \
             or isinstance(root.input, (LogicalAggregate, LogicalWindow)):
         return Refusal(
-            reasons=("ORDER BY, DISTINCT, OFFSET, GROUP BY, and window "
-                     "functions run on the Quail backend only",),
+            reasons=("GROUP BY, window functions, and ORDER BY on a column "
+                     "the query does not return run on the Quail backend only",),
             constraint="sort_needs_quail_backend",
             needed=1, available=0, unit="backends")
     operators = region.logical_plan.operators()
@@ -370,10 +373,20 @@ def _result_nodes(region, request_node, aliases, join_specs, answer_specs,
         columns=tuple(columns),
         structs=region.logical_plan.projection.packing(),
     ))
-    if region.logical_plan.result.limit is not None:
+    root = region.logical_plan.result
+    if root.order or root.distinct or root.offset:
+        # the coordinator sorts the returned rows, as on the Quail backend
+        nodes.append(Sort(
+            node_id="sort",
+            inputs=input_ports((PortRef("project", "rows"),)),
+            keys=tuple((key.name, key.descending, key.nulls_first)
+                       for key in root.order),
+            columns=tuple(columns), distinct=root.distinct,
+            offset=root.offset, fetch=root.limit))
+    elif root.limit is not None:
         nodes.append(Limit(
             node_id="limit",
             inputs=input_ports((PortRef("project", "rows"),)),
-            count=region.logical_plan.result.limit,
+            count=root.limit,
         ))
     return nodes

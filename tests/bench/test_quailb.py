@@ -140,8 +140,18 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                              or isinstance(root.input, Aggregate))
                 assert sorts <= (qid in relational), case
                 if backend != "quail" and sorts:
-                    assert isinstance(plan, Refusal), case
-                    assert plan.constraint == "sort_needs_quail_backend", case
+                    # a request backend sorts returned rows on the
+                    # coordinator, but runs no GROUP BY or window
+                    if isinstance(root.input, Aggregate):
+                        assert isinstance(plan, Refusal), case
+                        assert plan.constraint == "sort_needs_quail_backend", case
+                        continue
+                    if isinstance(plan, Refusal):
+                        # refused for its AI functions, not its sort
+                        assert plan.constraint != "sort_needs_quail_backend", case
+                    else:
+                        assert any(node.type_name == "quail.sort"
+                                   for node in plan.graph.nodes), case
                     continue
                 if backend == "pipelined_sglang" and qid in classify:
                     assert isinstance(plan, Refusal), case
