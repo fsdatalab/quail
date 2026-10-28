@@ -113,6 +113,7 @@ class KVArena:
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU
         self._capacity_rows = {}  # key -> every row in the claimed pages
+        self._stale_rows = set()  # keys grown since their rows were built
         self._sliding_rows = {}   # key -> every row in its sliding pages
         self._base = {}       # key -> tokens the window is anchored below
         self._sliding_start = {}  # key -> logical row of its first sliding page
@@ -389,6 +390,7 @@ class KVArena:
         return self.torch.from_numpy(rows.reshape(-1)[:tokens])
 
     def _refresh_rows(self, key, logical_tokens=None):
+        self._stale_rows.discard(key)
         logical = (self.accounting.tokens[key]
                    if logical_tokens is None else logical_tokens)
         capacity = len(self.accounting.table_pages(key)) * self.page_tokens
@@ -536,6 +538,20 @@ class KVArena:
             self.accounting.pin(key)
         return pages
 
+    def grow_pages(self, keys):
+        """Give each key one more page; None, changing nothing, when short.
+
+        The keys are answers about to write past their last page. One call for every growing answer of a pass; a key's row index
+        is rebuilt only when something reads it.
+        """
+        if self.sliding is not None:
+            raise ValueError("answers grow pages on full-attention models only")
+        self._evict_for_pages(len(keys), 0)
+        added = self.accounting.grow_pages(keys)
+        if added is not None:
+            self._stale_rows.update(keys)
+        return added
+
     def reserve(self, key, tokens, *, capacity_tokens, borrow=None,
                 extension=False, share_points=()):
         """Reserve KV pages and checkpoint slots for one admitted document.
@@ -669,6 +685,7 @@ class KVArena:
         self._trimmed.discard(key)
         self._rows.pop(key)
         self._capacity_rows.pop(key)
+        self._stale_rows.discard(key)
         self._sliding_rows.pop(key, None)
         self._base.pop(key, None)
         self._sliding_start.pop(key, None)
@@ -796,6 +813,8 @@ class KVArena:
 
     def capacity_rows(self, key):
         """Row index tensor (CPU) over every row in the key's pages."""
+        if key in self._stale_rows:
+            self._refresh_rows(key)
         return self._capacity_rows[key]
 
     def capacity_rows_sliding(self, key):

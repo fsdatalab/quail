@@ -142,6 +142,16 @@ class MapDecoder:
         self.pages[document, :len(pages)] = pages
         self.num_pages[document] = len(pages)
 
+    def add_pages(self, documents, pages) -> None:
+        """Append one page to each listed slot's table."""
+        width = int(self.num_pages[documents].max()) + 1
+        if width > self.pages.shape[1]:
+            wider = np.zeros((len(self.map), width), dtype=np.int32)
+            wider[:, :self.pages.shape[1]] = self.pages
+            self.pages = wider
+        self.pages[documents, self.num_pages[documents]] = pages
+        self.num_pages[documents] += 1
+
     def pause(self, document):
         """Pause an answer and return slots whose shared-page identity changed."""
         self.paused[document] = True

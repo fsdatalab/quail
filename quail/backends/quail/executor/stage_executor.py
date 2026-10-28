@@ -117,6 +117,9 @@ class StageExecutor:
         self.answered = set()   # documents whose answers ended first
         self.recomputing = {}   # evicted slot -> tokens prefilled since readmission
         self.num_evictions = 0
+        # per pass: its rows, and whether documents were still queued
+        self.pass_rows = []
+        self.pass_queued = []
         self.recomputed_tokens = 0
 
         k = len(self.stages)
@@ -421,13 +424,11 @@ class StageExecutor:
                               * self.arena.page_tokens]
             if not len(growing):
                 return
-            a = int(growing[0])
-            key = self.keys[a]
-            capacity = int(decoder.origin[a] + decoder.fed[a] + 1)
-            if self.arena.activate(key, self.prefix_lengths[a],
-                                   capacity_tokens=capacity) is not None:
-                decoder.set_pages(a, self.arena.owned_pages(key))
-                continue
+            # one row a pass: each growing answer needs exactly one page
+            added = self.arena.grow_pages([self.keys[a] for a in growing.tolist()])
+            if added is not None:
+                decoder.add_pages(growing, added)
+                return
             if not harvested:
                 # In-flight argmax results must land before an answer loses its KV.
                 decoder.harvest(wait=True)
@@ -752,6 +753,8 @@ class StageExecutor:
         chunk, entries, firsts = self._build(part, decode, replays)
         self.pack_s += time.perf_counter() - started
         self.tokens += chunk.tokens
+        self.pass_rows.append(chunk.tokens)
+        self.pass_queued.append(bool(self.sched.pending or self.sched.waiting))
         if self.gpu_timing:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
@@ -868,6 +871,15 @@ class StageExecutor:
                           in zip(self.spans, self.spans[1:])) / 1000.0
             logger.info("%s: %d forward passes, %.3f s of GPU time between them",
                         self.label, len(self.spans), between)
+        if self.pass_rows:
+            rows = np.asarray(self.pass_rows)
+            # a pass under half the budget while documents wait in the
+            # queue is one admission left short
+            thin = (rows < self.sched.chunk_budget // 2) & np.asarray(self.pass_queued)
+            logger.info("%s: %d passes of %d rows on average (budget %d); %d under "
+                        "half the budget with documents queued", self.label,
+                        len(rows), int(rows.mean()), self.sched.chunk_budget,
+                        int(thin.sum()))
         if self.decoder is not None:
             logger.info("%s: %d answer evictions, %d recomputed tokens", self.label,
                         self.num_evictions, self.recomputed_tokens)

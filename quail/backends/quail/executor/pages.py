@@ -283,6 +283,17 @@ class PageArena:
             self.holds[page] += 1
         return need
 
+    def grow_pages(self, keys) -> list | None:
+        """Give each key one more page; None when the free list is short."""
+        if len(keys) > len(self.free):
+            return None
+        added = self.free[len(self.free) - len(keys):][::-1]
+        del self.free[len(self.free) - len(keys):]
+        for key, page in zip(keys, added):
+            self.owned[key].append(page)
+            self.holds[page] += 1
+        return added
+
     def row_indices(self, key, tokens=None):
         """Flat row positions of the document's tokens inside a pool.
 
