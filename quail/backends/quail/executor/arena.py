@@ -541,8 +541,9 @@ class KVArena:
     def grow_pages(self, keys):
         """Give each key one more page; None, changing nothing, when short.
 
-        The keys are answers about to write past their last page. One call for every growing answer of a pass; a key's row index
-        is rebuilt only when something reads it.
+        The keys are answers about to write past their last page, all of
+        a pass's in one call; a key's row index is rebuilt only when
+        something reads it.
         """
         if self.sliding is not None:
             raise ValueError("answers grow pages on full-attention models only")
