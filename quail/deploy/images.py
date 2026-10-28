@@ -6,6 +6,7 @@ not in the wheel, so the benchmark runner imports inside a container.
 
 import os
 from importlib.metadata import version
+from pathlib import Path
 
 import modal
 
@@ -35,18 +36,8 @@ CACHE_ENV = {
 }
 
 
-# the images mount the quail source rather than install the project,
-# so this metadata declares the vLLM plugin pyproject.toml declares
-# (quail.baselines.vllm.register_gigatoken) for vLLM's processes to load
-PLUGIN_METADATA_SCRIPT_TEXT = (
-    "import pathlib, sysconfig; "
-    "d = pathlib.Path(sysconfig.get_paths()['purelib']) "
-    "/ 'quail_vllm_plugins-0.dist-info'; d.mkdir(exist_ok=True); "
-    "(d / 'METADATA').write_text("
-    "'Metadata-Version: 2.1\\nName: quail-vllm-plugins\\nVersion: 0\\n'); "
-    "(d / 'entry_points.txt').write_text("
-    "'[vllm.general_plugins]\\n"
-    "quail_gigatoken = quail.baselines.vllm:register_gigatoken\\n')")
+# the package that declares Quail's vLLM plugin, installed in the images
+VLLM_PLUGIN_DIR = Path(__file__).parent / "vllm_plugin"
 
 # local variables copied into the image when set
 FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
@@ -73,7 +64,8 @@ def gpu_image(*local_dirs: tuple[str, str],
             a profiler a cell runs.
     """
     image = (_cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
-             .run_commands(f'python -c "{PLUGIN_METADATA_SCRIPT_TEXT}"'))
+             .add_local_dir(VLLM_PLUGIN_DIR, "/opt/quail-vllm-plugin", copy=True)
+             .run_commands("python -m pip install --no-deps /opt/quail-vllm-plugin"))
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
     image = image.add_local_python_source("quail", "bench")

@@ -1,0 +1,17 @@
+# Declares Quail's vLLM plugin, which registers the gigatoken tokenizer
+# in every vLLM process (quail.baselines.vllm.register_gigatoken). The
+# GPU images install this package; they mount the quail source rather
+# than install the project, so the project's own metadata is absent.
+[project]
+name = "quail-vllm-plugin"
+version = "0"
+
+[project.entry-points."vllm.general_plugins"]
+quail_gigatoken = "quail.baselines.vllm:register_gigatoken"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []

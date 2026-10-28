@@ -30,11 +30,6 @@ server = [
 [project.scripts]
 quail-server = "quail.server.__main__:main"
 
-# vLLM loads its general plugins in every process it starts, its
-# spawned engine core included
-[project.entry-points."vllm.general_plugins"]
-quail_gigatoken = "quail.baselines.vllm:register_gigatoken"
-
 [project.urls]
 Documentation = "https://fsdatalab.github.io/quail"
 Repository = "https://github.com/fsdatalab/quail"
