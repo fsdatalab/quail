@@ -73,5 +73,5 @@ def probe(scale_factor: float, num_documents: int) -> str:
 
 @app.local_entrypoint()
 def probe_lengths(scale_factor: float = 0.1, num_documents: int = 1000):
-    ensure_data.remote(scale_factor, ["IMDB-MAP-1"], "")
+    ensure_data.remote(scale_factor, ["IMDB-20"], "")
     print(probe.remote(scale_factor, num_documents))

@@ -1,6 +1,6 @@
 """Time the attention calls of one decode pass of several maps on one GPU.
 
-Shapes follow CUAD-MAP-2 on Qwen3 4B: documents of about 7,500 tokens,
+Shapes follow CUAD-18 on Qwen3 4B: documents of about 7,500 tokens,
 three branches each, one decode row per branch, 8 KV heads of 128.
 Each case runs one layer's call; the KV bytes it must read set its
 memory-bound floor.

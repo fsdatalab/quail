@@ -339,8 +339,8 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
 
 
 @pytest.mark.parametrize("query_id", [
-    "IMDB-MAP-1", "IMDB-MAP-2", "IMDB-MAP-3", "IMDB-MAP-4", "IMDB-MAP-5",
-    "CUAD-MAP-1", "CUAD-MAP-2", "CUAD-MAP-3"])
+    "IMDB-20", "IMDB-21", "IMDB-22", "IMDB-23", "IMDB-24", "IMDB-25", "IMDB-26",
+    "IMDB-27", "IMDB-28", "CUAD-17", "CUAD-18", "CUAD-19", "CUAD-20"])
 def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path, query_id):
     spec = get_query(query_id)
     corpus = {"reviews": CORPUS["reviews"], "contracts": CONTRACTS}
@@ -360,6 +360,8 @@ def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path, query_id):
     filtered = bool(spec.info.filters)
     read = (["r0"] if relation.table == "reviews" else ["ct0", "ct2"]) \
         if filtered else corpus[relation.table].column("id").to_pylist()
+    if query_id == "IMDB-28":
+        read = []   # every review is labeled negative; only mixed ones are mapped
     assert sorted(output.map_answers) == [m.id for m in spec.info.maps]
     for operator in spec.info.maps:
         answers = output.map_answers[operator.id].to_pydict()
@@ -412,7 +414,7 @@ def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
 
 
 def test_stock_vllm_reports_maps_and_their_pieces(tmp_path):
-    spec = get_query("CUAD-MAP-2")
+    spec = get_query("CUAD-18")
 
     def nodes(graph, request):
         model = next(
