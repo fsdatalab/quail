@@ -1,4 +1,7 @@
-"""The Quail executor's AI.EXTRACT: its steps on a scripted model."""
+"""Recurrent AI.EXTRACT stages on a scripted model.
+
+The shared full-attention decoder is exercised in test_copy_decode.py.
+"""
 
 from collections import Counter
 from dataclasses import replace
@@ -47,6 +50,13 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS, QWEN3_4B_FP8
+
+
+@pytest.fixture(autouse=True)
+def recurrent_extraction_path(monkeypatch):
+    from quail.backends.quail.executor.operators import extract
+
+    monkeypatch.setattr(extract, "ExtractPart", extract.RecurrentExtractPart)
 
 
 @pytest.mark.parametrize(("scores", "stop", "chosen", "done"), [
