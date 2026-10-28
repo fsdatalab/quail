@@ -21,10 +21,11 @@ def key_documents(context, alias: str):
         return None
     lengths = context.document_tokens.get(alias)
     store = None if lengths is None else lengths.store
-    if store is None or not store.num_copies:
+    if store is None:
         return None
     first = store.first_documents.to_numpy()
-    return first == np.arange(len(first))
+    keys = first == np.arange(len(first))
+    return None if keys.all() else keys
 
 
 def document_shared_tokens(store) -> list[int]:

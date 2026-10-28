@@ -548,12 +548,6 @@ class TokenStore(Sequence):
         return pa.array(first[inverse], pa.int32())
 
     @property
-    def num_copies(self) -> int:
-        """Documents whose tokens equal an earlier document's."""
-        first = self.first_documents.to_numpy()
-        return int(np.count_nonzero(first != np.arange(len(first))))
-
-    @property
     def arrow_array(self) -> pa.ChunkedArray:
         """Return the stored token batches without copying their buffers."""
         return pa.chunked_array(

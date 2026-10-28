@@ -220,7 +220,6 @@ def test_a_document_points_at_the_first_document_with_its_tokens_and_row_values(
                              token_type=pa.string())
     assert store.first_documents.to_pylist() == [0, 0, 2, 0]
     assert store.first_documents_with([]).to_pylist() == [0, 0, 2, 0]
-    assert store.num_copies == 2
     assert prefix_tree(store, 1).shared == [0, 0, 0, 0]
     # equal tokens share a first; order, an extra token, or length tell apart
     texts = [" ".join(map(str, tokens)) for tokens in documents]
