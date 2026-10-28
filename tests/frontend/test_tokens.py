@@ -211,8 +211,6 @@ def test_a_document_points_at_the_first_document_with_its_tokens_and_row_values(
     documents = [[1, 2, 3], [1, 2, 3], [3, 2, 1], [1, 2, 3, 0], [1, 2], [], []]
     index = PrefixIndex([np.asarray(tokens, dtype=np.int32)
                          for tokens in documents])
-    # equal tokens share a first; order, an extra token, or length tell apart
-    assert index.first_documents.tolist() == [0, 0, 2, 3, 4, 5, 5]
     assert index.shared.tolist() == [2, 2, 0, 3, 0, 0, 0]
     schema = pa.schema({"id": pa.string(), "body": pa.string()})
     batches = [pa.record_batch(
@@ -224,6 +222,15 @@ def test_a_document_points_at_the_first_document_with_its_tokens_and_row_values(
     assert store.first_documents_with([]).to_pylist() == [0, 0, 2, 0]
     assert store.num_copies == 2
     assert prefix_tree(store, 1).shared == [0, 0, 0, 0]
+    # equal tokens share a first; order, an extra token, or length tell apart
+    texts = [" ".join(map(str, tokens)) for tokens in documents]
+    numbers = TokenStore.write(
+        str(tmp_path / "numbers.arrow"),
+        [pa.record_batch([texts[:3]], names=["body"]),
+         pa.record_batch([texts[3:]], names=["body"])],
+        document_column="body", token_type=pa.int32(),
+        tokenizer=lambda text: [int(token) for token in text.split()])
+    assert numbers.first_documents.to_pylist() == [0, 0, 2, 3, 4, 5, 5]
     hotel = pa.array(["h1", "h2", "h1", "h1"])
     assert store.first_documents_with([hotel]).to_pylist() == [0, 1, 2, 0]
     # a null is one value like any other

@@ -438,6 +438,28 @@ class ColumnStore:
 FIRST_DOCUMENT = "__first_document"
 
 
+def token_keys(tokens: pa.ChunkedArray) -> pa.ChunkedArray:
+    """Each document's tokens as one binary value, to group equal documents.
+
+    Integer tokens are viewed as their bytes without copying the token
+    buffer; the words of a test tokenizer are joined.
+    """
+    chunks = []
+    for chunk in tokens.chunks:
+        values = chunk.values
+        if not pa.types.is_integer(values.type):
+            # a word holds no control character, so the join is exact
+            chunks.append(pc.binary_join(chunk, "\x00").cast(pa.large_binary()))
+            continue
+        width = values.type.byte_width
+        offsets = (chunk.offsets.to_numpy().astype(np.int64)
+                   + values.offset) * width
+        chunks.append(pa.Array.from_buffers(
+            pa.large_binary(), len(chunk),
+            [None, pa.py_buffer(offsets), values.buffers()[1]]))
+    return pa.chunked_array(chunks, pa.large_binary())
+
+
 class TokenStore(Sequence):
     """Provide random token access from one memory mapped Arrow file."""
 
@@ -511,20 +533,22 @@ class TokenStore(Sequence):
         A document whose tokens no earlier document has is its own first.
         """
         if self._first_documents is None:
-            self._first_documents = pa.array(
-                self.prefix_index.first_documents, pa.int32())
+            self._first_documents = self.first_documents_with([])
         return self._first_documents
 
     def first_documents_with(self, columns) -> pa.Array:
         """Each document's first document with its tokens and its row values.
 
+        The documents are grouped by hashing their token bytes, like a
+        GROUP BY, so no prefix index is built.
+
         Args:
             columns: Arrow arrays, one value per document; two documents
                 share a first document only if they are equal in each.
         """
-        if not columns:
-            return self.first_documents
-        groups = group_ids([self.first_documents, *columns])
+        if not len(self):
+            return pa.array([], pa.int32())
+        groups = group_ids([token_keys(self.arrow_array), *columns])
         first = np.empty(groups.max() + 1, dtype=np.int64)
         # assigned in reverse, so each group keeps its lowest row
         first[groups[::-1]] = np.arange(len(groups))[::-1]
@@ -775,13 +799,8 @@ class PrefixIndex:
             common = _array_common_prefix
         self.order = sorted(range(n), key=keys.__getitem__)
         self.shared = np.zeros(n, dtype=np.int64)
-        # equal keys are equal token sequences, adjacent in the order;
-        # the stable sort puts the lowest position of a run first
-        self.first_documents = np.arange(n, dtype=np.int32)
         # Every document computes its final token, including exact duplicates.
         for previous, index in zip(self.order, self.order[1:]):
-            if keys[index] == keys[previous]:
-                self.first_documents[index] = self.first_documents[previous]
             self.shared[index] = min(common(arrays[previous], arrays[index]),
                                      max(len(arrays[index]) - 1, 0))
         self._trees = {}
