@@ -89,7 +89,7 @@ class StageExecutor:
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
                  appended_tokens=None, gpu_timing=False, survival=None,
-                 decoder=None, dependencies=None):
+                 decoder=None, dependencies=None, knee_rows=0):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -120,6 +120,7 @@ class StageExecutor:
         # per pass: its rows, and whether documents were still queued
         self.pass_rows = []
         self.pass_queued = []
+        self.knee_rows = knee_rows
         self.recomputed_tokens = 0
 
         k = len(self.stages)
@@ -901,13 +902,14 @@ class StageExecutor:
                         self.label, len(self.spans), between)
         if self.pass_rows:
             rows = np.asarray(self.pass_rows)
-            # a pass under half the budget while documents wait in the
+            # a pass under the compute knee while documents wait in the
             # queue is one admission left short
-            thin = (rows < self.sched.chunk_budget // 2) & np.asarray(self.pass_queued)
-            logger.info("%s: %d passes of %d rows on average (budget %d); %d under "
-                        "half the budget with documents queued", self.label,
-                        len(rows), int(rows.mean()), self.sched.chunk_budget,
-                        int(thin.sum()))
+            thin = (rows < self.knee_rows) & np.asarray(self.pass_queued)
+            logger.info("%s: %d passes, rows per pass median %d, 10th percentile "
+                        "%d; %d under the %d-row compute knee with documents "
+                        "queued", self.label, len(rows), int(np.median(rows)),
+                        int(np.percentile(rows, 10)), int(thin.sum()),
+                        self.knee_rows)
         if self.decoder is not None:
             logger.info("%s: %d answer evictions, %d recomputed tokens", self.label,
                         self.num_evictions, self.recomputed_tokens)

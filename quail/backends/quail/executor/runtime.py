@@ -11,6 +11,7 @@ from quail.backends.quail.executor.operators.score import QuailScorer
 from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.reranker import RerankerModelExecution
+from quail.cost.budgets import compute_knee
 from quail.physical import AiClassify, AiScore, PhysicalNode
 
 
@@ -73,7 +74,13 @@ class QuailModelExecution:
             answer_rows=answer_rows,
             chunk_tokens=chunk_tokens,
             score_readout=async_scores,
+            knee_rows=self._knee_rows(),
         )
+
+    def _knee_rows(self) -> int:
+        """Rows at which a pass becomes compute-bound, 0 without a device."""
+        device = getattr(self.context, "device", None)
+        return 0 if device is None else int(compute_knee(self.context.model, device))
 
     def execute(
         self,

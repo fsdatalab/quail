@@ -5,6 +5,9 @@ sample (Python stack sampling), trace (torch.profiler), and timeline
 (executor-step and GPU event timing). Each run prints timing, allocation,
 and result-digest fields. The env option sets child-process variables.
 
+Pass QUAIL_OVERRIDES=module:NAME=json-value;... in env to set module
+constants in the child, such as an executor constant under test.
+
 Set QUAIL_BEFORE_SOURCE to a directory containing an earlier copy of
 quail to compare both versions on the same GPU. Run order alternates
 between repetitions.
@@ -293,6 +296,17 @@ class Sampler:
                 "quail_inclusive_ms": ranked(inclusive)}
 
 
+def _apply_overrides(text: str) -> None:
+    """Set module constants from "module:NAME=value;..." for one run."""
+    import importlib
+
+    for item in filter(None, text.split(";")):
+        target, value = item.split("=", 1)
+        module, name = target.split(":")
+        setattr(importlib.import_module(module), name, json.loads(value))
+        print(f"override {module}.{name} = {value}", flush=True)
+
+
 def child(arguments: str) -> None:
     """Run one query several times in a fresh session; print a RESULT line per run.
 
@@ -311,6 +325,7 @@ def child(arguments: str) -> None:
     from quail_b.benchmark import load_benchmark
 
     args = json.loads(arguments)
+    _apply_overrides(os.environ.get("QUAIL_OVERRIDES", ""))
     query_id, scale_factor = args["query_id"], args["scale_factor"]
     modes, top = args["modes"], args["top"]
     print(f"quail from {quail.__file__}", flush=True)

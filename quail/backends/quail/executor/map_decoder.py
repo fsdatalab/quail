@@ -32,6 +32,9 @@ from quail.backends.quail.executor.chunk import DecodeRows
 # copies of chosen tokens kept in flight before the host waits on the
 # oldest; two lets the host read a pass's tokens while the next runs
 IN_FLIGHT = 2
+# the share of a map's answers whose whole length admission reserves; a
+# longer answer grows its pages and may be evicted. 1.0 reserves the limit
+ANSWER_QUANTILE = 0.9
 
 
 @dataclass
@@ -186,12 +189,13 @@ class MapDecoder:
         return running[np.lexsort((running, written[running], -scores[running]))]
 
     def answer_reserve(self) -> np.ndarray:
-        """Per map, the tokens 90% of its answers stay within, as known now."""
+        """Per map, the tokens ANSWER_QUANTILE of its answers stay within."""
         from quail.backends.quail.executor.answer_survival import quantile_tokens
 
         return np.array([
             quantile_tokens(self.lengths[q], self.written[q],
-                            self.expected_tokens[q], int(self.limits[q]))
+                            self.expected_tokens[q], int(self.limits[q]),
+                            ANSWER_QUANTILE)
             for q in range(len(self.limits))], dtype=np.int64)
 
     def running(self):

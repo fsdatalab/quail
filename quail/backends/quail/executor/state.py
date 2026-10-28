@@ -51,6 +51,8 @@ class QueryExecutionState:
     # rows; None scores yes against no over answer_rows
     score_readout: Any = None
     gpu_timing: bool = False
+    # rows at which a pass's dense projections become compute-bound
+    knee_rows: int = 0
 
 
 class GpuRuntime(Protocol):
