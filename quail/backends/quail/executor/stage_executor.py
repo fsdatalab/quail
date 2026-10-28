@@ -437,7 +437,8 @@ class StageExecutor:
                 harvested = True
                 continue
             victim = int(decoder.eviction_order()[0])
-            decoder.pause(victim)
+            for detached in decoder.pause(victim):
+                self.borrowing.chosen.pop(int(detached), None)
             key = self.keys[victim]
             self.arena.drop_holds((key,))
             self.arena.free_key(key)

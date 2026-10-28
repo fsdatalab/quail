@@ -655,3 +655,49 @@ def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
     assert order.index(2) < order.index(3)
     decoder.pause(0)
     assert 0 not in decoder.eviction_order()
+
+
+def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
+        monkeypatch):
+    cpu_staging(monkeypatch)
+    monkeypatch.setattr(__name__ + ".next_token", lambda h: 10 + h % 900)
+    documents = [list(range(20, 24)) + list(range(30 + a, 34 + a))
+                 for a in range(8)]
+    ids = list(range(len(documents)))
+    setup = Setup(path="unified", pages=20, page_tokens=4, budget=24)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=())
+    torch_ = events_torch(3)
+    tails = [[500, 501], [600, 601], [650, 651], [670, 671]]
+    limits = [16, 28, 20, 24]
+    nodes = [map_node(f"m{q}", tail, answer_limit, "tree")
+             for q, (tail, answer_limit) in enumerate(zip(tails, limits))]
+    first = MapPart(None, nodes[:2], ids, 0)
+    second = MapPart(None, nodes[2:], ids, 2)
+    question = [750, 751]
+    parts = [first, FilterPart(SimpleNamespace(question_token_ids=question), ids,
+                               Bits(), 0), second]
+    stages = gated_stages(parts)
+    prefixes, keys, tree, dependencies = first.branch_inputs(
+        documents, [("d", a) for a in ids], prefix_tree(documents, 4), 4, 0)
+    prefixes, keys, tree, added = second.branch_inputs(prefixes, keys, tree, 4, 2)
+    dependencies.update(added)
+    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), limits,
+                         [STOP], 4)
+    first.decoder = second.decoder = decoder
+    stats = {}
+    run_stages(torch_, arena, pipeline, stages, prefixes, setup.budget,
+               anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
+               decoder=decoder, stats=stats)
+    passed = [bool(next_token(chain(document + question)) % 2)
+              for document in documents]
+    for q, (tail, answer_limit) in enumerate(zip(tails, limits)):
+        part, index = (first, q) if q < 2 else (second, q - 2)
+        np.testing.assert_array_equal(part.asked[index], True if q < 2 else passed)
+        asked = np.flatnonzero(part.asked[index])
+        got = [answer.tolist() for answer in decoder.answers(
+            q, part._slots(index, asked))]
+        assert got == [greedy(documents[a] + tail, answer_limit) for a in asked]
+    assert stats["num_evictions"] > 0
+    assert not arena.accounting.owned

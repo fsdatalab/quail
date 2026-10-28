@@ -55,6 +55,7 @@ class MapDecoder:
         limits: Per map, the most tokens its answer may have.
         stop_ids: Token ids that end an answer.
         page_tokens: Tokens per arena page.
+        expected_tokens: Prior mean answer lengths, or min(64, limit) per map.
     """
 
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
@@ -142,7 +143,7 @@ class MapDecoder:
         self.num_pages[document] = len(pages)
 
     def pause(self, document):
-        """Pause a fully harvested answer before freeing its pages."""
+        """Pause an answer and return slots whose shared-page identity changed."""
         self.paused[document] = True
         children = np.flatnonzero(self.parent == document)
         self.parent[children] = children
@@ -151,6 +152,7 @@ class MapDecoder:
         self.borrowed[document] = 0
         self.lead.fill(0)
         np.maximum.at(self.lead, self.parent, self.borrowed)
+        return np.union1d(children, [document])
 
     def resume(self, document, pages):
         """Continue after prefilling the prompt and every saved answer token."""
@@ -290,7 +292,7 @@ class MapDecoder:
         documents = np.concatenate([
             np.asarray(first_documents, dtype=np.int64),
             np.empty(0, dtype=np.int64) if rows is None else rows.slots])
-        # a first row writes token 0; a decode row fed f - 1 rows writes token f
+        # Recomputed prompts continue after their saved tokens, not at token zero.
         indices = np.concatenate([
             self.fed[np.asarray(first_documents, dtype=np.int64)],
             np.empty(0, dtype=np.int64) if rows is None else self.fed[rows.slots]])
