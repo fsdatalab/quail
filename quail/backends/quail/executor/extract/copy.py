@@ -8,6 +8,7 @@ from quail.backends.quail.executor.extract.candidates import (
     Stream,
     ensure_tokens,
 )
+from quail.backends.quail.executor.extract.trace import TRACE_WIDTH, trace_path
 from quail.cost.draft_policy import LIVE_BUCKETS, PRIOR_WEIGHT
 
 
@@ -22,88 +23,309 @@ def _padded(values, dtype=np.int64):
 class CopyConstraint:
     """Tokenized document positions shared by a pipeline's extraction fields.
 
-    Tokenization happens before decoding. Each spelling shares the continuation
-    after its document token with every other spelling of that token.
+    Continuations are prepared after the first token is chosen, only for starts
+    it can reach. Fields and spellings share each prepared continuation.
     """
 
     def __init__(self, torch, device, documents, spec):
         self.torch, self.device, self.spec = torch, device, spec
         self.documents = documents
+        self.trace = trace_path()
+        self.trace_width = TRACE_WIDTH if self.trace is not None else 0
         vocabulary = self.vocabulary = documents.vocabulary
-        options, fillers, positions, streams, keys = [], [], [], [], []
-        self.num_keys = 1
-        for document in documents.documents:
+        options, filler_tokens, filler_chars = [], [], []
+        position_keys, option_keys = [], []
+        position_local_keys, option_local_keys = [], []
+        key0 = 0
+        characters, ends, position_tokens, position_documents = [], [], [], []
+        streams, keys, option_rows = [], [], []
+        option0 = position0 = 0
+        for d, document in enumerate(documents.documents):
             scan = document.scan
             index = scan.candidates = CandidateIndex.of(scan, vocabulary)
-            normalized = scan.normalized = SqueezedText(document.text)
-            option0, position0 = len(options), len(positions)
-            options.extend(index.token.tolist())
-            fillers.extend(
-                vocabulary.filler(int(scan.tokens[index.anchor[k]]), int(n))
-                for k, n in zip(index.segment, index.length)
-            )
-            positions.extend(
-                Stream(
-                    int(a),
-                    [int(t)],
-                    [int(b)],
-                    document.text,
-                    normalized=normalized,
-                    first_window_chars=spec.first_window_chars,
-                    window_chars=spec.window_chars,
-                )
-                for a, b, t in zip(scan.starts, scan.ends, scan.tokens)
-            )
-            local = []
-            for at, k in enumerate(index.inverse):
-                start = index.offsets[k]
-                end = (
-                    index.offsets[k + 1]
-                    if k + 1 < len(index.kids)
-                    else len(index.token)
-                )
-                local.extend(
-                    (position0 + at, option0 + j, int(k)) for j in range(start, end)
-                )
-            streams.append(local)
+            options.append(index.token)
+            position_keys.append(index.inverse + key0)
+            option_keys.append(index.segment + key0)
+            position_local_keys.append(index.inverse)
+            option_local_keys.append(index.segment)
+            key0 += len(index.kids)
+            filler_tokens.append(scan.tokens[index.anchor[index.segment]])
+            filler_chars.append(index.length)
+            characters.append(scan.starts)
+            ends.append(scan.ends)
+            position_tokens.append(scan.tokens)
+            position_documents.append(np.full(len(scan.tokens), d, dtype=np.int64))
+            streams.append(np.arange(position0, position0 + len(scan.tokens)))
             keys.append(len(index.kids))
-        num_tokens = spec.max_answer_tokens + spec.draft_tokens
-        ensure_tokens(positions, num_tokens - 1, vocabulary)
-        for stream in positions:
-            del stream.stream[num_tokens:]
-            del stream.ends[num_tokens:]
+            option_rows.append(np.arange(option0, option0 + len(index.token)))
+            option0 += len(index.token)
+            position0 += len(scan.tokens)
         self.num_keys = max(1, max(keys, default=0))
-        self.characters = np.array([s.char for s in positions], dtype=np.int64)
-        self.ends = _padded([s.ends[: spec.max_answer_tokens] for s in positions])
-        self.filler_lengths = np.array(list(map(len, fillers)), dtype=np.int64)
-        self.position_lengths = np.array([len(s.stream) - 1 for s in positions])
-        bounds = np.r_[0, np.cumsum(list(map(len, streams)))]
-        self.streams = _padded(
-            [list(range(start, end)) for start, end in zip(bounds[:-1], bounds[1:])]
+        self.characters = np.concatenate(characters) if position0 else np.array([0])
+        self.position_ends = np.concatenate(ends) if position0 else np.array([0])
+        self.position_tokens = (
+            np.concatenate(position_tokens) if position0 else np.array([0])
         )
-        flat = np.array([s for row in streams for s in row], dtype=np.int64)
-        # Index zero is also the harmless gather target for padded positions.
-        if not len(flat):
-            flat = np.zeros((1, 3), dtype=np.int64)
-            options, fillers, positions = [0], [[]], [Stream(0, [0], [0], "")]
-            self.characters = np.array([0])
-            self.ends = np.array([[0]])
-            self.filler_lengths = np.array([0])
-            self.position_lengths = np.array([0])
-        self.position, self.option, self.key = flat.T
+        self.position_documents = (
+            np.concatenate(position_documents) if position0 else np.array([0])
+        )
+        self.option_tokens = np.concatenate(options) if option0 else np.array([0])
+        self.filler_tokens = np.concatenate(filler_tokens) if option0 else np.array([0])
+        self.filler_chars = np.concatenate(filler_chars) if option0 else np.array([0])
+        self.option_rows = _padded(option_rows)
+        self.position_keys = (
+            np.concatenate(position_keys) if position0 else np.array([0])
+        )
+        lookup = (np.concatenate(option_keys) if option0 else np.array([0])) * len(
+            vocabulary.vocab
+        ) + self.option_tokens
+        self.option_order = np.argsort(lookup)
+        self.option_lookup = lookup[self.option_order]
+        self.filler_lengths = np.full(len(self.option_tokens), -1, dtype=np.int64)
+        self.position_lengths = np.zeros(len(self.characters), dtype=np.int64)
+        self.position_rows = np.full(len(self.characters), -1, dtype=np.int64)
+        counts = np.array(list(map(len, position_tokens)), dtype=np.int64)
+        self.position_offsets = np.r_[0, np.cumsum(counts)]
+        self.max_positions = max(1, int(counts.max(initial=0)))
+        self.mask_words = -(-self.max_positions // 64)
+        self.position_offsets_device = self.tensor(self.position_offsets)
+        self.mask_bits = self.tensor(np.arange(64))
+        self.positions = []
+        self.exhausted = np.zeros(len(self.characters), dtype=bool)
+        self.prepared = np.empty(0, dtype=np.int64)
+        self.num_positions = 0
+        self.num_options = len(self.option_tokens)
+        positions = _padded(streams)
+        self.streams = np.where(positions >= 0, positions * self.num_options, -1)
         self.stream_ids = self.tensor(self.streams)
-        self.position_ids = self.tensor(self.position)
-        self.option_ids = self.tensor(self.option)
-        self.key_ids = self.tensor(self.key)
-        self.first_tokens = self.tensor(options)
-        self.fillers = self.tensor(_padded(fillers))
-        self.num_fillers = self.tensor(self.filler_lengths)
-        self.continuations = self.tensor(
-            _padded([s.stream[1:] for s in positions], dtype=np.int32)
+        self.option_rows_device = self.tensor(self.option_rows)
+        self.key_ids = self.tensor(
+            np.concatenate(position_local_keys) if position0 else np.array([0])
         )
+        self.option_key_ids = self.tensor(
+            np.concatenate(option_local_keys) if option0 else np.array([0])
+        )
+        self.first_tokens = self.tensor(self.option_tokens)
+        self.fillers = torch.full(
+            (len(self.option_tokens), 1), -1, dtype=torch.int64, device=device
+        )
+        self.num_fillers = torch.zeros(
+            len(self.option_tokens), dtype=torch.int64, device=device
+        )
+        self.continuations = torch.full(
+            (1, spec.max_answer_tokens + spec.draft_tokens),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.ends = np.full((1, spec.max_answer_tokens), -1, dtype=np.int64)
+        self.continuations_host = np.full(self.continuations.shape, -1, dtype=np.int32)
+        self.fillers_host = np.full(self.fillers.shape, -1, dtype=np.int64)
+        self.changed = np.zeros(len(self.characters), dtype=bool)
+        self.position_rows_device = self.tensor(self.position_rows.copy())
         self.characters_device = self.tensor(self.characters)
         self.is_stop = self.tensor(vocabulary.is_stop)
         self.stop_ids = self.tensor(vocabulary.stop_ids)
+
+    def _prepare_fillers(self, documents, tokens):
+        width = len(self.vocabulary.vocab)
+        pairs = np.setdiff1d(np.unique(documents * width + tokens), self.prepared)
+        if not len(pairs):
+            return
+        self.prepared = np.union1d(self.prepared, pairs)
+        documents, tokens = np.divmod(pairs, width)
+        options = self.option_rows[documents]
+        matches = (options >= 0) & (
+            self.option_tokens[np.maximum(options, 0)] == tokens[:, None]
+        )
+        options = np.unique(options[matches])
+        missing = options[self.filler_lengths[options] < 0]
+        fillers = [
+            self.vocabulary.filler(
+                int(self.filler_tokens[option]), int(self.filler_chars[option])
+            )
+            for option in missing
+        ]
+        if len(missing):
+            lengths = np.array(list(map(len, fillers)), dtype=np.int64)
+            self.filler_lengths[missing] = lengths
+            size = max(self.fillers.shape[1], int(lengths.max()))
+            if size > self.fillers.shape[1]:
+                wider = self.torch.full(
+                    (len(self.option_tokens), size),
+                    -1,
+                    dtype=self.torch.int64,
+                    device=self.device,
+                )
+                wider[:, : self.fillers.shape[1]] = self.fillers
+                self.fillers = wider
+                wider_host = np.full(
+                    (len(self.option_tokens), size), -1, dtype=np.int64
+                )
+                wider_host[:, : self.fillers_host.shape[1]] = self.fillers_host
+                self.fillers_host = wider_host
+            values = _padded(fillers)
+            self.fillers_host[missing, : values.shape[1]] = values
+            selected = self.tensor(missing)
+            self.fillers[selected, : values.shape[1]] = self.tensor(values)
+            self.num_fillers[selected] = self.tensor(lengths)
+
+    def packed_positions(self, streams, alive, documents):
+        """Pack surviving document positions into 64-bit words for the host copy."""
+        torch = self.torch
+        positions = (
+            (streams.clamp_min(0) // self.num_options)
+            - self.position_offsets_device[documents, None]
+        ).clamp_min(0)
+        mask = torch.zeros(
+            (len(alive), self.mask_words * 64), dtype=torch.int64, device=self.device
+        )
+        mask.scatter_reduce_(1, positions, alive.to(torch.int64), reduce="amax")
+        return (mask.reshape(len(alive), self.mask_words, 64) << self.mask_bits).sum(
+            dim=2
+        )
+
+    def prepare(self, documents, tokens, masks, written, drafts, sources):
+        """Prepare only continuations that can verify the next copy draft.
+
+        A row after a rejected draft is never accepted. Later verification rows
+        therefore need only positions matching the draft's earlier tokens.
+        """
+        if not len(documents):
+            return
+        self._prepare_fillers(documents, tokens)
+        source_positions, source_options = np.divmod(sources, self.num_options)
+        self._extend(
+            source_positions,
+            np.maximum(0, written - 1 + drafts - self.filler_lengths[source_options]),
+        )
+        remaining = (
+            1
+            + self.filler_lengths[source_options]
+            + self.position_lengths[source_positions]
+            - written
+        )
+        drafts = np.minimum(drafts, np.maximum(0, remaining))
+        mask = np.unpackbits(
+            np.ascontiguousarray(masks).view(np.uint8), axis=1, bitorder="little"
+        )[:, : self.max_positions]
+        answers, columns = np.nonzero(mask)
+        positions = self.position_offsets[documents[answers]] + columns
+        lookup = (
+            self.position_keys[positions] * len(self.vocabulary.vocab) + tokens[answers]
+        )
+        options = self.option_order[np.searchsorted(self.option_lookup, lookup)]
+        for step in range(int(drafts.max(initial=0)) + 1):
+            at = written[answers] + step
+            valid = (step <= drafts[answers]) & (at < self.spec.max_answer_tokens)
+            positions, options, answers, at = (
+                positions[valid],
+                options[valid],
+                answers[valid],
+                at[valid],
+            )
+            if not len(positions):
+                break
+            self._extend(positions, np.maximum(0, at - self.filler_lengths[options]))
+            expected = self._tokens(
+                source_positions[answers], source_options[answers], at
+            )
+            following = self._tokens(positions, options, at)
+            keep = (following >= 0) & (following == expected)
+            positions, options, answers = positions[keep], options[keep], answers[keep]
+        self._upload()
+
+    def _tokens(self, positions, options, at):
+        sizes = self.filler_lengths[options]
+        following = at - sizes - 1
+        rows = np.maximum(self.position_rows[positions], 0)
+        continuation = self.continuations_host[
+            rows, np.clip(following, 0, self.continuations_host.shape[1] - 1)
+        ]
+        filler = self.fillers_host[
+            options, np.clip(at - 1, 0, self.fillers_host.shape[1] - 1)
+        ]
+        return np.where(
+            at == 0,
+            self.option_tokens[options],
+            np.where(at <= sizes, filler, continuation),
+        )
+
+    def _extend(self, positions, at):
+        positions, inverse = np.unique(positions, return_inverse=True)
+        needed = np.zeros(len(positions), dtype=np.int64)
+        np.maximum.at(needed, inverse, at)
+        pending = (self.position_rows[positions] < 0) | (
+            (self.position_lengths[positions] < needed) & ~self.exhausted[positions]
+        )
+        positions, needed = positions[pending], needed[pending]
+        if not len(positions):
+            return
+        streams = []
+        for position in positions:
+            row = self.position_rows[position]
+            if row < 0:
+                document = self.documents.documents[self.position_documents[position]]
+                scan = document.scan
+                if scan.normalized is None:
+                    scan.normalized = SqueezedText(document.text)
+                row = len(self.positions)
+                self.position_rows[position] = row
+                self.positions.append(
+                    Stream(
+                        int(self.characters[position]),
+                        [int(self.position_tokens[position])],
+                        [int(self.position_ends[position])],
+                        document.text,
+                        normalized=scan.normalized,
+                        first_window_chars=self.spec.first_window_chars,
+                        window_chars=self.spec.window_chars,
+                    )
+                )
+            streams.append(self.positions[row])
+        ensure_tokens(streams, needed, self.vocabulary)
+        rows = self.position_rows[positions]
+        self.num_positions = len(self.positions)
+        num_tokens = self.spec.max_answer_tokens + self.spec.draft_tokens
+        if self.num_positions > len(self.ends):
+            capacity = max(self.num_positions, 2 * len(self.ends))
+            ends = np.full((capacity, self.ends.shape[1]), -1, dtype=np.int64)
+            ends[: len(self.ends)] = self.ends
+            self.ends = ends
+            wider = np.full((capacity, num_tokens), -1, dtype=np.int32)
+            wider[: len(self.continuations_host)] = self.continuations_host
+            self.continuations_host = wider
+        tokens = _padded([stream.stream[1:num_tokens] for stream in streams], np.int32)
+        ends = _padded(
+            [stream.ends[: self.spec.max_answer_tokens] for stream in streams]
+        )
+        self.position_lengths[positions] = np.array(
+            [min(num_tokens, len(s.stream)) - 1 for s in streams]
+        )
+        self.exhausted[positions] = [stream.exhausted for stream in streams]
+        self.ends[rows, : ends.shape[1]] = ends
+        self.continuations_host[rows, : tokens.shape[1]] = tokens
+        self.changed[positions] = True
+
+    def _upload(self):
+        positions = np.flatnonzero(self.changed)
+        if not len(positions):
+            return
+        rows = self.position_rows[positions]
+        if len(self.continuations_host) > len(self.continuations):
+            wider = self.torch.full(
+                self.continuations_host.shape,
+                -1,
+                dtype=self.torch.int32,
+                device=self.device,
+            )
+            wider[: len(self.continuations)] = self.continuations
+            self.continuations = wider
+        self.position_rows_device[self.tensor(positions)] = self.tensor(rows)
+        self.continuations[self.tensor(rows)] = self.tensor(
+            self.continuations_host[rows]
+        )
+        self.changed[positions] = False
 
     def tensor(self, value):
         return self.torch.as_tensor(value).to(self.device, non_blocking=True)
@@ -113,11 +335,12 @@ class CopyConstraint:
         torch = self.torch
         valid = streams >= 0
         streams = streams.clamp_min(0)
-        position, option = self.position_ids[streams], self.option_ids[streams]
+        position, option = streams // self.num_options, streams % self.num_options
         size = self.num_fillers[option]
         following = at - size - 1
         continuation = self.continuations[
-            position, following.clamp(0, self.continuations.shape[1] - 1)
+            self.position_rows_device[position].clamp_min(0),
+            following.clamp(0, self.continuations.shape[1] - 1),
         ]
         continuation = torch.where(
             following < self.continuations.shape[1], continuation, -1
@@ -133,7 +356,7 @@ class CopyConstraint:
             -1,
         )
 
-    def choose(self, logits, streams, alive, at):
+    def choose(self, logits, streams, alive, at, documents, first=True):
         """Choose allowed tokens, stopping before a token leaves the document."""
         torch = self.torch
         logits = logits.float()
@@ -143,51 +366,98 @@ class CopyConstraint:
         scores.scatter_(1, top_ids, top_values)
         stop = torch.logsumexp(logits.index_select(1, self.stop_ids), dim=1)
         top = top_ids[:, 0]
+        possible = alive
+        if first:
+            options = self.option_rows_device[documents]
+            option = options.clamp_min(0)
+            key = self.option_key_ids[option]
+            values = scores.gather(1, self.first_tokens[option])
+            values = torch.where(options >= 0, values, -float("inf"))
+            if self.trace is not None:
+                first_choices = self.first_tokens[option], values, options >= 0
+            maxima = torch.full(
+                (len(at), self.num_keys), -float("inf"), device=self.device
+            )
+            maxima.scatter_reduce_(1, key, values, reduce="amax", include_self=True)
+            ranked = torch.where(
+                values == maxima.gather(1, key), option, self.num_options
+            )
+            best_option = torch.full(
+                (len(at), self.num_keys),
+                self.num_options,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            best_option.scatter_reduce_(
+                1, key, ranked, reduce="amin", include_self=True
+            )
+            best_option.clamp_max_(self.num_options - 1)
+            first_key = maxima.argmax(dim=1)
+            first_token = self.first_tokens[
+                best_option.gather(1, first_key[:, None])
+            ].squeeze(1)
+            position = streams.clamp_min(0) // self.num_options
+            keys = self.key_ids[position]
+            initial = position * self.num_options + best_option.gather(1, keys)
+            initial = torch.where(streams >= 0, initial, -1)
+            streams.copy_(torch.where(at[:, None] == 0, initial, streams))
+            possible = alive & ((at[:, None] > 0) | maxima.gather(1, keys).isfinite())
         tokens = self.tokens_at(streams, at[:, None])
         values = scores.gather(1, tokens.clamp_min(0))
-        values = torch.where(alive & (tokens >= 0), values, -float("inf"))
-        key = self.key_ids[streams.clamp_min(0)]
-        maxima = torch.full((len(at), self.num_keys), -float("inf"), device=self.device)
-        maxima.scatter_reduce_(1, key, values, reduce="amax", include_self=True)
-        option = self.option_ids[streams.clamp_min(0)]
-        ranked = torch.where(
-            values == maxima.gather(1, key), option, len(self.first_tokens)
-        )
-        best_option = torch.full(
-            (len(at), self.num_keys),
-            len(self.first_tokens),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        best_option.scatter_reduce_(1, key, ranked, reduce="amin", include_self=True)
-        first_key = maxima.argmax(dim=1)
-        first_option = best_option.gather(1, first_key[:, None]).squeeze(1)
-        first = self.first_tokens[first_option.clamp_max(len(self.first_tokens) - 1)]
+        allowed = possible & (tokens >= 0)
+        values = torch.where(allowed, values, -float("inf"))
         best = values.max(dim=1).values
         following = (
             torch.where(values == best[:, None], tokens, logits.shape[1])
             .min(dim=1)
             .values
         )
-        chosen = torch.where(at == 0, first, following)
-        preferred = (option == best_option.gather(1, key)) & values.isfinite()
-        allows = torch.where(at[:, None] == 0, preferred, alive) & (
-            tokens == top[:, None]
-        )
+        chosen = torch.where(at == 0, first_token, following) if first else following
+        allows = (allowed & (tokens == top[:, None])).any(dim=1)
         leaves = (
             (top_values[:, 0] > torch.maximum(best, stop))
-            & ~allows.any(dim=1)
+            & ~allows
             & ~self.is_stop[top]
         )
         ended = leaves | torch.where(at == 0, stop > best, stop >= best)
-        ended |= (at > 0) & ~(alive & (tokens >= 0)).any(dim=1)
-        keep = alive & (tokens == chosen[:, None])
-        keep &= (at[:, None] != 0) | preferred
+        ended |= (at > 0) & ~allowed.any(dim=1)
+        keep = allowed & (tokens == chosen[:, None])
+        if self.trace is not None:
+            runner, runner_lp = self._runner(tokens, values, allowed, chosen)
+            if first:
+                initial, initial_lp = self._runner(*first_choices, chosen)
+                runner = torch.where(at == 0, initial, runner)
+                runner_lp = torch.where(at == 0, initial_lp, runner_lp)
+            self.trace_values = torch.stack(
+                (
+                    torch.where(best.isfinite(), chosen, -1).float(),
+                    torch.where(runner_lp.isfinite(), runner, -1).float(),
+                    best - runner_lp,
+                    best,
+                    stop,
+                    top.float(),
+                    top_values[:, 0],
+                ),
+                dim=1,
+            )
         return chosen, ended, keep
+
+    def _runner(self, tokens, values, allowed, chosen):
+        torch = self.torch
+        others = allowed & (tokens != chosen[:, None])
+        score = torch.where(others, values, -float("inf")).max(dim=1).values
+        runner = (
+            torch.where(
+                others & (values == score[:, None]), tokens, len(self.vocabulary.vocab)
+            )
+            .min(dim=1)
+            .values
+        )
+        return runner, score
 
     def source(self, streams, alive):
         """Return the first surviving position in document order."""
-        chars = self.characters_device[self.position_ids[streams.clamp_min(0)]]
+        chars = self.characters_device[(streams.clamp_min(0) // self.num_options)]
         chars = self.torch.where(alive, chars, np.iinfo(np.int64).max)
         return streams.gather(1, chars.argmin(dim=1)[:, None]).squeeze(1)
 
@@ -199,10 +469,14 @@ class CopyConstraint:
                 values.append(None)
                 spans.append(None)
                 continue
-            position, option = self.position[source], self.option[source]
+            position, option = divmod(source, self.num_options)
             start = int(self.characters[position])
-            index = max(0, length - 1 - self.filler_lengths[option])
-            end = int(self.ends[position, index])
+            index = max(0, length - 1 - max(0, self.filler_lengths[option]))
+            end = int(
+                self.position_ends[position]
+                if index == 0
+                else self.ends[self.position_rows[position], index]
+            )
             text = self.documents.documents[document].text
             while start < end and text[start].isspace():
                 start += 1

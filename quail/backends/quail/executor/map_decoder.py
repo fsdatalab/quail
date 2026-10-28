@@ -95,6 +95,9 @@ class MapDecoder:
         # whether a document's branches read its shared pages together
         self.share = False
         self.copy_constraints = {}
+        self.copy_words = 0
+        self.copy_trace_words = 0
+        self.copy_trace = None
         self.constrained = np.zeros(len(self.limits), dtype=bool)
         self.copy_document = np.full(n, -1, dtype=np.int64)
         self.copy_sources = np.full(n, -1, dtype=np.int64)
@@ -108,15 +111,22 @@ class MapDecoder:
         from quail.cost.draft_policy import LIVE_BUCKETS
 
         constraint = CopyConstraint(self.torch, self.device, documents, specs[0])
+        self.copy_words = max(self.copy_words, constraint.mask_words)
+        self.copy_trace_words = max(self.copy_trace_words, constraint.trace_width)
+        self.copy_trace = constraint.trace or self.copy_trace
         for q, spec in enumerate(specs):
             self.constrained[first + q] = True
             self.copy_document[slots[q]] = np.arange(len(documents.documents))
             self.copy_constraints[first + q] = SimpleNamespace(
                 constraint=constraint, spec=spec,
                 alive=constraint.stream_ids >= 0,
+                streams=constraint.stream_ids.clone(),
                 source=self.torch.zeros(len(slots[q]), dtype=self.torch.int64,
                                         device=self.device),
                 sources=np.full(len(self.map), -1, dtype=np.int64),
+                masks=np.zeros((len(slots[q]), constraint.mask_words), dtype=np.int64),
+                prepared_written=np.full(len(slots[q]), -1, dtype=np.int64),
+                prepared_drafts=np.zeros(len(slots[q]), dtype=np.int64),
                 trials=np.zeros(len(LIVE_BUCKETS)), accepts=np.zeros(len(LIVE_BUCKETS)),
                 rho=np.array([document.rho for document in documents.documents]))
 
@@ -132,12 +142,21 @@ class MapDecoder:
                 continue
             constraint = state.constraint
             source = self.copy_sources[slots]
-            position, option = constraint.position[source], constraint.option[source]
+            position, option = np.divmod(source, constraint.num_options)
             written = self.written[q][slots]
             size = draft_lengths(state.spec, self.lengths[q], written,
                                  self.num_streams[slots],
                                  state.rho[self.copy_document[slots]],
                                  state.trials, state.accepts)
+            local = self.copy_document[slots]
+            prepare = ((state.prepared_written[local] != written)
+                       | (state.prepared_drafts[local] < size))
+            constraint.prepare(
+                local[prepare], self.tokens[q][slots[prepare], 0],
+                state.masks[local[prepare]], written[prepare], size[prepare],
+                source[prepare])
+            state.prepared_written[local[prepare]] = written[prepare]
+            state.prepared_drafts[local[prepare]] = size[prepare]
             remaining = (1 + constraint.filler_lengths[option]
                          + constraint.position_lengths[position] - written)
             counts[mine] += np.minimum(size, np.maximum(0, remaining))
@@ -397,7 +416,8 @@ class MapDecoder:
         if count:
             selected.append(normed[normed.shape[0] - count:])
         hidden = selected[0] if len(selected) == 1 else torch.cat(selected)
-        values = torch.full((len(documents), 4), -1, dtype=torch.int64,
+        width = 4 + self.copy_words + self.copy_trace_words
+        values = torch.full((len(documents), width), -1, dtype=torch.int64,
                             device=self.device)
         plain = np.flatnonzero(~self.constrained[self.map[documents]])
         if len(plain):
@@ -428,22 +448,26 @@ class MapDecoder:
 
     def _constrain(self, state, hidden, documents, indices):
         torch, constraint = self.torch, state.constraint
-        slots, first, counts = np.unique(
-            documents, return_index=True, return_counts=True)
+        slots, first, inverse, counts = np.unique(
+            documents, return_index=True, return_inverse=True, return_counts=True)
         local = constraint.tensor(self.copy_document[slots])
-        streams = constraint.stream_ids[local]
+        streams = state.streams[local]
         alive = state.alive[local]
         source = state.source[local]
         active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
-        out = torch.full((len(documents), 4), -2, dtype=torch.int64, device=self.device)
+        width = 4 + self.copy_words + self.copy_trace_words
+        out = torch.full((len(documents), width), -2,
+                         dtype=torch.int64, device=self.device)
         for step in range(int(counts.max())):
             valid = step < counts
             row = np.minimum(first + step, len(documents) - 1)
-            at = constraint.tensor(indices[row])
+            at = constraint.tensor(np.where(valid, indices[row], 1))
             selected = constraint.tensor(row)
             logits = torch.nn.functional.linear(
                 hidden[selected].to(self.head.dtype), self.head)
-            chosen, ended, keep = constraint.choose(logits, streams, alive, at)
+            chosen, ended, keep = constraint.choose(
+                logits, streams, alive, at, local,
+                first=bool((valid & (indices[row] == 0)).any()))
             use = active & constraint.tensor(valid)
             writes = use & ~ended
             alive = torch.where(writes[:, None], keep, alive)
@@ -453,12 +477,18 @@ class MapDecoder:
                                   alive.sum(dim=1), hit.to(torch.int64)), dim=1)
             # Only valid rows may scatter; padded rows can alias a real row.
             valid_index = constraint.tensor(np.flatnonzero(valid))
-            out[selected[valid_index]] = torch.where(
+            out[selected[valid_index], :4] = torch.where(
                 use[valid_index, None], values[valid_index], -2)
+            if self.copy_trace is not None:
+                bits = constraint.trace_values.view(torch.int32).to(torch.int64)
+                out[selected[valid_index], 4 + self.copy_words:] = bits[valid_index]
             active &= writes & hit & (at + 1 < state.spec.max_answer_tokens)
             source = following
         state.alive[local] = alive
+        state.streams[local] = streams
         state.source[local] = source
+        packed = constraint.packed_positions(streams, alive, local)
+        out[:, 4:4 + constraint.mask_words] = packed[constraint.tensor(inverse)]
         return out
 
     def harvest(self, wait: bool = False) -> None:
@@ -500,6 +530,15 @@ class MapDecoder:
         last = np.zeros(len(slots), dtype=np.int64)
         np.maximum.at(last, inverse, np.arange(len(documents)))
         state = self.copy_constraints[q]
+        if self.copy_trace is not None:
+            from quail.backends.quail.executor.extract.trace import write_choices
+
+            traces = values[:, 4 + self.copy_words:].astype(np.int32).view(np.float32)
+            selected = [state.constraint.documents.documents[d]
+                        for d in self.copy_document[documents]]
+            write_choices(self.copy_trace, selected, q, indices, values[:, 0], traces)
+        state.masks[self.copy_document[slots]] = values[
+            last, 4:4 + state.constraint.mask_words]
         observed = ((self.num_streams[slots] > 1) & (self.drafts[slots] > 0)
                     & (values[first, 0] >= 0) & (indices[first] + 1 < self.limits[q]))
         buckets = np.abs(np.log1p(self.num_streams[slots, None])

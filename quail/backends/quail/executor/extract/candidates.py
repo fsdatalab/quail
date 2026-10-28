@@ -180,8 +180,9 @@ def extend_streams(streams: list, vocabulary: Vocabulary) -> None:
 
 def ensure_tokens(streams: list, at: int, vocabulary: Vocabulary) -> None:
     """Tokenize windows together until each live stream reaches the requested token."""
-    while pending := [stream for stream in streams
-                      if at >= len(stream.stream) and not stream.exhausted]:
+    limits = np.broadcast_to(at, (len(streams),))
+    while pending := [stream for stream, limit in zip(streams, limits)
+                      if limit >= len(stream.stream) and not stream.exhausted]:
         extend_streams(pending, vocabulary)
 
 
