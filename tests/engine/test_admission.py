@@ -579,3 +579,36 @@ def test_a_limit_paces_admission_by_the_parts_survival():
     sched.report(1, 0, 0, 1, [1])
     sched.report(2, 0, 0, 1, [1])
     assert sched.limit_reached() and sched.next_chunk(500) == []
+
+
+@pytest.mark.parametrize("kept", [False, True])
+def test_dependents_wait_for_their_parent_and_price_only_the_unshared_tokens(kept):
+    requested = []
+
+    def requests(stage):
+        requested.append(stage)
+        return None
+
+    sched = JoinAdmission(
+        [38, 38], [[2], [3]], 40, arena_pages=20, page_tokens=16,
+        tree=PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32]),
+        dependencies={1: (0, 1)}, anchor_partners={1: requests},
+        limit=1, survival=1.0)
+    assert not sched.oversized
+    assert not requested
+    assert sched.next_chunk(20) == [(0, 0, 0, 1, True)]
+    sched.report(0, 0, 0, 1, [kept])
+    if not kept:
+        assert sched.take_settled() == [Settlement("dropped", 1, False)]
+        assert sched.done()
+        assert 1 not in sched.borrowing.admitted
+        assert not requested
+        return
+    assert sched.next_chunk(20) == [(0, 1, 0, 1, False), (1, 1, 0, 1, True)]
+    assert requested == [1]
+    assert sched.borrowing.shared(1) == 32
+    assert sched._live() == 1
+    sched.report(1, 1, 0, 1, [True])
+    assert sched.survivors == 0
+    sched.report(0, 1, 0, 1, [True])
+    assert sched.survivors == 1 and sched.done()
