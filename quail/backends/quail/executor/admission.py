@@ -248,6 +248,7 @@ class JoinAdmission:
         self.dependents = {}
         # released dependents not yet admitted, in release order
         self.waiting = deque()
+        self._counted = set()   # documents counted toward the limit
         for anchor, (parent, stage) in self.dependencies.items():
             self.dependents.setdefault((parent, stage), []).append(anchor)
         self.advance = advance
@@ -767,8 +768,7 @@ class JoinAdmission:
                 settlements.append(Settlement("dropped", a, False))
         if (dependent or j == k - 1) and complete:
             self._stage[a] = _DONE
-            if self._true[a][j] and not dependent:
-                self.survivors += 1
+            self._count_survivor(self.dependencies[a][0] if dependent else a)
             survived = bool(self._true[a][j])
             transitions.append((a, j, survived))
             settlements.append(Settlement("finished", a, survived))
@@ -818,10 +818,20 @@ class JoinAdmission:
         return sum(1 for a, stage in enumerate(self._stage)
                    if stage >= 0 and a not in self.dependencies)
 
-    def dependents_done(self, anchor, stage) -> bool:
-        """Whether every dependent at this stage has finished or was dropped."""
-        return all(self._stage[a] == _DONE
-                   for a in self.dependents.get((anchor, stage), ()))
+    def _count_survivor(self, document) -> None:
+        """Count a document toward the limit once it and its branches ended.
+
+        Each branch settles and frees its pages at its own end; only the
+        count waits, so a limit never takes a document with an answer
+        still being written.
+        """
+        if (self._stage[document] != _DONE or not self._true[document][-1]
+                or document in self._counted):
+            return
+        if all(self._stage[a] == _DONE for stage in range(len(self.stages))
+               for a in self.dependents.get((document, stage), ())):
+            self._counted.add(document)
+            self.survivors += 1
 
     def limit_reached(self) -> bool:
         """Return whether enough documents survived to stop new admissions."""

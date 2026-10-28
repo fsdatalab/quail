@@ -309,10 +309,6 @@ def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(
 
     def settled(anchor, survived, row):
         if anchor < len(documents) and survived:
-            # under a limit a document settles only once every answer ended
-            assert limit is None or all(
-                decoder.lengths[q][maps.slots[q, anchor]] >= 0
-                for q in range(len(tails)))
             survivors.append(anchor)
         arena.free_key(keys[anchor])
 
@@ -321,7 +317,10 @@ def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(
                anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
                decoder=decoder, on_settled=settled, stats=stats,
                limit=limit, survival=1.0)
-    assert len(survivors) == (labels.count("keep") if limit is None else limit)
+    # a branch settles at its own end, so documents in flight when the
+    # limit is reached still finish; the limit counts whole documents
+    assert (len(survivors) == labels.count("keep") if limit is None
+            else limit <= len(survivors) <= labels.count("keep"))
     assert "drop" in labels
     for q, (tail, answer_limit) in enumerate(zip(tails, limits)):
         assert set(np.flatnonzero(maps.asked[q])) == set(survivors)
@@ -444,16 +443,20 @@ def test_map_results_keep_only_document_kv_when_requested(monkeypatch, keep_kv):
         node.keep_kv = keep_kv
     results = execute_maps(state, nodes, {
         "document_ids": [0, 1, 2], "documents": {"d": documents}, "limit": 2})
+    kept = results[nodes[0].node_id].outputs[nodes[0].rows_port].ids["d"].to_pylist()
+    # the limit's two documents, and any in flight when it was reached
+    assert kept[:2] == [0, 1]
     for node in nodes:
         result = results[node.node_id]
         rows = result.outputs[node.rows_port]
-        assert rows.ids["d"].to_pylist() == [0, 1]
-        want = batch_decode([greedy(document + list(node.spec.prompt_token_parts[1]),
+        assert rows.ids["d"].to_pylist() == kept
+        want = batch_decode([greedy(documents[d] + list(node.spec.prompt_token_parts[1]),
                                     node.spec.max_answer_tokens)
-                             for document in documents[:2]])
+                             for d in kept])
         assert rows.column(node.spec.name).to_pylist() == want
-        assert result.metrics.output_rows == 2
-    assert set(arena.accounting.owned) == ({("d", 0), ("d", 1)} if keep_kv else set())
+        assert result.metrics.output_rows == len(kept)
+    assert set(arena.accounting.owned) == ({("d", d) for d in kept} if keep_kv
+                                           else set())
 
 
 @pytest.mark.parametrize("num_maps", [1, 2, 3])

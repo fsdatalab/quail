@@ -581,13 +581,9 @@ class StageExecutor:
         self.decoder.harvest()
         self.answered.update(a for a, _ in self.decoder.take_finished())
         transitions = []
-        for a in sorted(self.answered & self.deferred.keys(), reverse=True):
-            # under a limit a document counts once all its answers end;
-            # otherwise it settles at its own answer's end and its pages
-            # outside the ones its branches borrow free at once
-            if (self.sched.limit is not None
-                    and not self.sched.dependents_done(a, self.deferred[a][0])):
-                continue
+        # each branch settles at its own answer's end and frees its pages;
+        # admission counts a document toward a limit once all have ended
+        for a in sorted(self.answered & self.deferred.keys()):
             self.answered.discard(a)
             transitions.extend(self._record(a, *self.deferred.pop(a)))
         return transitions
