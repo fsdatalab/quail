@@ -148,20 +148,25 @@ class MapDecoder:
                                  self.num_streams[slots],
                                  state.rho[self.copy_document[slots]],
                                  state.trials, state.accepts)
-            local = self.copy_document[slots]
-            prepare = ((state.prepared_written[local] != written)
-                       | (state.prepared_drafts[local] < size))
-            constraint.prepare(
-                local[prepare], self.tokens[q][slots[prepare], 0],
-                state.masks[local[prepare]], written[prepare], size[prepare],
-                source[prepare])
-            state.prepared_written[local[prepare]] = written[prepare]
-            state.prepared_drafts[local[prepare]] = size[prepare]
+            self._prepare_copy(state, q, slots, written, size)
             remaining = (1 + constraint.filler_lengths[option]
                          + constraint.position_lengths[position] - written)
             counts[mine] += np.minimum(size, np.maximum(0, remaining))
         self.drafts[running] = counts - 1
         return counts
+
+    def _prepare_copy(self, state, q, slots, written, drafts):
+        local = self.copy_document[slots]
+        prepare = ((written > 0) & ((state.prepared_written[local] != written)
+                                   | (state.prepared_drafts[local] < drafts)))
+        if not prepare.any():
+            return
+        state.constraint.prepare(
+            local[prepare], self.tokens[q][slots[prepare], 0],
+            state.masks[local[prepare]], written[prepare], drafts[prepare],
+            state.sources[slots[prepare]])
+        state.prepared_written[local[prepare]] = written[prepare]
+        state.prepared_drafts[local[prepare]] = drafts[prepare]
 
     def output_answers(self, map_index, slots):
         """Return extraction text and original character spans for a field."""
@@ -450,6 +455,9 @@ class MapDecoder:
         torch, constraint = self.torch, state.constraint
         slots, first, inverse, counts = np.unique(
             documents, return_index=True, return_inverse=True, return_counts=True)
+        # A replay can choose a token before the slot packs another decode row.
+        self._prepare_copy(state, int(self.map[slots[0]]), slots, indices[first],
+                           np.zeros(len(slots), dtype=np.int64))
         local = constraint.tensor(self.copy_document[slots])
         streams = state.streams[local]
         alive = state.alive[local]

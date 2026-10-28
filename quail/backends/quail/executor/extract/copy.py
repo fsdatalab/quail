@@ -106,12 +106,11 @@ class CopyConstraint:
             np.concatenate(option_local_keys) if option0 else np.array([0])
         )
         self.first_tokens = self.tensor(self.option_tokens)
-        self.fillers = torch.full(
-            (len(self.option_tokens), 1), -1, dtype=torch.int64, device=device
-        )
-        self.num_fillers = torch.zeros(
-            len(self.option_tokens), dtype=torch.int64, device=device
-        )
+        self.filler_rows = np.full(self.num_options, -1, dtype=np.int64)
+        self.filler_rows_device = self.tensor(self.filler_rows.copy())
+        self.num_filler_rows = 0
+        self.fillers = torch.full((1, 1), -1, dtype=torch.int64, device=device)
+        self.num_fillers = torch.zeros(1, dtype=torch.int64, device=device)
         self.continuations = torch.full(
             (1, spec.max_answer_tokens + spec.draft_tokens),
             -1,
@@ -149,24 +148,35 @@ class CopyConstraint:
         if len(missing):
             lengths = np.array(list(map(len, fillers)), dtype=np.int64)
             self.filler_lengths[missing] = lengths
+            rows = np.arange(self.num_filler_rows, self.num_filler_rows + len(missing))
+            self.num_filler_rows += len(missing)
             size = max(self.fillers.shape[1], int(lengths.max()))
-            if size > self.fillers.shape[1]:
+            capacity = (
+                len(self.fillers)
+                if self.num_filler_rows <= len(self.fillers)
+                else max(self.num_filler_rows, 2 * len(self.fillers))
+            )
+            if capacity > len(self.fillers) or size > self.fillers.shape[1]:
                 wider = self.torch.full(
-                    (len(self.option_tokens), size),
-                    -1,
-                    dtype=self.torch.int64,
-                    device=self.device,
+                    (capacity, size), -1, dtype=self.torch.int64, device=self.device
                 )
-                wider[:, : self.fillers.shape[1]] = self.fillers
+                wider[: len(self.fillers), : self.fillers.shape[1]] = self.fillers
                 self.fillers = wider
-                wider_host = np.full(
-                    (len(self.option_tokens), size), -1, dtype=np.int64
+                wider_host = np.full((capacity, size), -1, dtype=np.int64)
+                wider_host[: len(self.fillers_host), : self.fillers_host.shape[1]] = (
+                    self.fillers_host
                 )
-                wider_host[:, : self.fillers_host.shape[1]] = self.fillers_host
                 self.fillers_host = wider_host
+                counts = self.torch.zeros(
+                    capacity, dtype=self.torch.int64, device=self.device
+                )
+                counts[: len(self.num_fillers)] = self.num_fillers
+                self.num_fillers = counts
             values = _padded(fillers)
-            self.fillers_host[missing, : values.shape[1]] = values
-            selected = self.tensor(missing)
+            self.filler_rows[missing] = rows
+            self.fillers_host[rows, : values.shape[1]] = values
+            selected = self.tensor(rows)
+            self.filler_rows_device[self.tensor(missing)] = selected
             self.fillers[selected, : values.shape[1]] = self.tensor(values)
             self.num_fillers[selected] = self.tensor(lengths)
 
@@ -243,7 +253,8 @@ class CopyConstraint:
             rows, np.clip(following, 0, self.continuations_host.shape[1] - 1)
         ]
         filler = self.fillers_host[
-            options, np.clip(at - 1, 0, self.fillers_host.shape[1] - 1)
+            np.maximum(self.filler_rows[options], 0),
+            np.clip(at - 1, 0, self.fillers_host.shape[1] - 1),
         ]
         return np.where(
             at == 0,
@@ -336,7 +347,8 @@ class CopyConstraint:
         valid = streams >= 0
         streams = streams.clamp_min(0)
         position, option = streams // self.num_options, streams % self.num_options
-        size = self.num_fillers[option]
+        filler_row = self.filler_rows_device[option].clamp_min(0)
+        size = self.num_fillers[filler_row]
         following = at - size - 1
         continuation = self.continuations[
             self.position_rows_device[position].clamp_min(0),
@@ -345,7 +357,7 @@ class CopyConstraint:
         continuation = torch.where(
             following < self.continuations.shape[1], continuation, -1
         )
-        filler = self.fillers[option, (at - 1).clamp(0, self.fillers.shape[1] - 1)]
+        filler = self.fillers[filler_row, (at - 1).clamp(0, self.fillers.shape[1] - 1)]
         return torch.where(
             valid,
             torch.where(
