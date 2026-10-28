@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail.catalog.selection import group_ids
 from quail.logical.expressions import evaluate_expression
 
 
@@ -431,6 +432,28 @@ class ColumnStore:
         self._resources.close()
 
 
+def token_keys(tokens: pa.ChunkedArray) -> pa.ChunkedArray:
+    """Each document's tokens as one binary value, to group equal documents.
+
+    Integer tokens are viewed as their bytes without copying the token
+    buffer; the words of a test tokenizer are joined.
+    """
+    chunks = []
+    for chunk in tokens.chunks:
+        values = chunk.values
+        if not pa.types.is_integer(values.type):
+            # a word holds no control character, so the join is exact
+            chunks.append(pc.binary_join(chunk, "\x00").cast(pa.large_binary()))
+            continue
+        width = values.type.byte_width
+        offsets = (chunk.offsets.to_numpy().astype(np.int64)
+                   + values.offset) * width
+        chunks.append(pa.Array.from_buffers(
+            pa.large_binary(), len(chunk),
+            [None, pa.py_buffer(offsets), values.buffers()[1]]))
+    return pa.chunked_array(chunks, pa.large_binary())
+
+
 class TokenStore(Sequence):
     """Provide random token access from one memory mapped Arrow file."""
 
@@ -461,6 +484,7 @@ class TokenStore(Sequence):
             self._lengths = TokenLengths(
                 pa.chunked_array(self._length_batches, type=pa.int64()), self)
             self._prefix_index = None
+            self._first_documents = None
             self._resources = resources.pop_all()
 
     @classmethod
@@ -497,6 +521,33 @@ class TokenStore(Sequence):
         return self._prefix_index
 
     @property
+    def first_documents(self) -> pa.Array:
+        """Return each document's first document with the same tokens, as int32.
+
+        A document whose tokens no earlier document has is its own first.
+        """
+        if self._first_documents is None:
+            self._first_documents = self.first_documents_with([])
+        return self._first_documents
+
+    def first_documents_with(self, columns) -> pa.Array:
+        """Each document's first document with its tokens and its row values.
+
+        The documents are grouped by hashing their token bytes, like a
+        GROUP BY, so no prefix index is built.
+
+        Args:
+            columns: Arrow arrays, one value per document; two documents
+                share a first document only if they are equal in each.
+        """
+        if not len(self):
+            return pa.array([], pa.int32())
+        groups = group_ids([token_keys(self.arrow_array), *columns])
+        _, first, inverse = np.unique(groups, return_index=True,
+                                      return_inverse=True)
+        return pa.array(first[inverse], pa.int32())
+
+    @property
     def arrow_array(self) -> pa.ChunkedArray:
         """Return the stored token batches without copying their buffers."""
         return pa.chunked_array(
@@ -516,6 +567,7 @@ class TokenStore(Sequence):
     def close(self) -> None:
         """Close the memory mapped Arrow file."""
         self._prefix_index = None
+        self._first_documents = None
         self._resources.close()
 
     def select(self, indices) -> "TokenSelection":

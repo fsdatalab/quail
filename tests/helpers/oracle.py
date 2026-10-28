@@ -23,6 +23,7 @@ from quail.backends.quail.reranker import (
     score_rows,
 )
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.result import true_answer_rows
 from quail.execution.rows import Rows, extraction_rows
 from quail.execution.spans import locate_span
 from quail.physical import (
@@ -60,6 +61,9 @@ class Oracle:
             retains in the arena, as the executor would.
         join_metrics: Metrics every join stage reports beside its rows.
         streams: Whether a score call reports each row as it is scored.
+        pipelines: Whether the executor groups operators into pipelines,
+            as the GPU executor does; the oracle then runs a pipeline's
+            nodes in order.
     """
 
     # the oracle runs one node at a time; a pipeline falls back to that
@@ -67,7 +71,7 @@ class Oracle:
 
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
                  answers=None, features=None, *, probabilities=False,
-                 retain=0, join_metrics=None, streams=False):
+                 retain=0, join_metrics=None, streams=False, pipelines=False):
         self.filters = filters or {}
         self.joins = joins or {}
         self.labels = labels
@@ -82,8 +86,23 @@ class Oracle:
         self.texts = {}
         self.documents = {}
         self.calls = []       # (spec name, rows) of every score or label call
+        if pipelines:
+            self.execute_pipeline = self._execute_pipeline
 
     # ---- the executor's model execution interface ----------------
+
+    def _execute_pipeline(self, nodes, inputs, context) -> dict:
+        """Run a pipeline's nodes in order, each reading the one before it."""
+        results = {}
+        for node in nodes:
+            node_inputs = dict(inputs[node.node_id])
+            for port in node.inputs:
+                if port.source.node_id in results:
+                    node_inputs[port.name] = results[
+                        port.source.node_id].outputs[port.source.port]
+            results[node.node_id] = context.runtimes[node.runtime_key].execute(
+                node, node_inputs, context)
+        return results
 
     def execute(self, node, inputs) -> NodeResult:
         if isinstance(node, AiFilter):
@@ -170,8 +189,16 @@ class Oracle:
 
     def _filter(self, node, inputs) -> NodeResult:
         document_ids = list(inputs["document_ids"])
-        answers = {local: [self._filter_answer(node, document)]
-                   for local, document in enumerate(document_ids)}
+        groups = inputs.get("stop_groups")
+        stopped = set()
+        answers = {}
+        for local, document in enumerate(document_ids):
+            # the scheduler skips a stop key group once one of it survived
+            if groups is not None and groups[local] in stopped:
+                continue
+            answers[local] = [self._filter_answer(node, document)]
+            if groups is not None and answers[local][0]:
+                stopped.add(groups[local])
         if inputs.get("document_done") is not None:
             # the real loop reports a chunk's finished documents by position
             inputs["document_done"]([
@@ -209,17 +236,23 @@ class Oracle:
     def _classify_joined(self, node, inputs) -> NodeResult:
         """Label the pairs a join kept; a pair without a label has no row."""
         (answers,) = inputs["score_inputs"].values()
-        pairs = []
-        for local, row in answers["rows"].items():
-            anchor = answers["anchor_index"][local]
-            members = (answers["anchor_partners"] or {}).get(local)
-            for position, bit in enumerate(row):
-                if not bit:
-                    continue
-                member = position if members is None else members[position]
-                (partner,) = answers["partner_index"][member]
-                pairs.append((int(anchor), int(partner)))
         spec = node.spec
+        pairs = []
+        if isinstance(answers, pa.Table):
+            # the join's answers over every pair, as a table
+            kept = true_answer_rows(answers)
+            pairs = list(zip(*(kept.column(alias).to_pylist()
+                               for alias in spec.aliases)))
+        else:
+            for local, row in answers["rows"].items():
+                anchor = answers["anchor_index"][local]
+                members = (answers["anchor_partners"] or {}).get(local)
+                for position, bit in enumerate(row):
+                    if not bit:
+                        continue
+                    member = position if members is None else members[position]
+                    (partner,) = answers["partner_index"][member]
+                    pairs.append((int(anchor), int(partner)))
         labels = {pair: self._label(spec, pair) for pair in pairs}
         labeled = [pair for pair in pairs if labels[pair] is not None]
         rows = np.asarray(labeled, dtype=np.int32).reshape(-1, 2)
@@ -297,7 +330,9 @@ def oracle_executor(oracle: Oracle, functions=None, **report):
         oracle.arena = state["gpu"].arena
         if getattr(request, "relations", None):
             state["columns"] = request.column_tables()
-        result = execute_single_graph(state, {"filter_limit": None}, graph)
+        result = execute_single_graph(state, {
+            "filter_limit": None,
+            "deduplicate": request.plan["settings"].get("deduplicate", {})}, graph)
         outputs = result.pop("_outputs")
         return PhysicalResponse(outputs, {
             **result, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234, **report})

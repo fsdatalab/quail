@@ -11,7 +11,7 @@ import pyarrow as pa
 
 from quail.api.execute import execute_query
 from quail.catalog import inputs
-from quail.catalog.pairs import columns_key, estimate_pair_fraction
+from quail.catalog.pairs import FIRST_DOCUMENT, columns_key, estimate_pair_fraction
 from quail.catalog.providers import ScanRequest
 from quail.catalog.selection import selected_rows
 from quail.catalog.tokens import TokenLengths
@@ -472,7 +472,9 @@ class Query:
         """One value table per alias whose columns the executor reads.
 
         A scan's regular predicates, a HashJoin, an apply(), and a stop key
-        read values; the tables carry the columns they name.
+        read values; the tables carry the columns they name. A table the
+        plan deduplicates also carries FIRST_DOCUMENT, computed from the
+        tokens and the row columns the deduplicate setting lists for it.
         """
         needed = {}
         operators = self.logical.operators()
@@ -491,11 +493,17 @@ class Query:
         for alias, key in filter_stop_keys(self.logical).items():
             for column in key:
                 needed.setdefault(alias, {})[column] = None
+        deduplicated = self.plan().settings.get("deduplicate", {})
+        for alias in deduplicated:
+            needed.setdefault(alias, {})
         tables = {}
         for alias, columns in needed.items():
             store = self._token_inputs[alias]
-            tables[columns_key(alias)] = pa.table(
-                {name: store.column(name) for name in columns})
+            values = {name: store.column(name) for name in columns}
+            if alias in deduplicated:
+                values[FIRST_DOCUMENT] = store.tokens.first_documents_with(
+                    [store.column(column) for column in deduplicated[alias]])
+            tables[columns_key(alias)] = pa.table(values)
         return tables
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:

@@ -69,6 +69,15 @@ class AiJoin(PhysicalNode):
     # prefix (the should_share_prefixes rule)
     share_prefixes: bool = False
 
+    def keeps(self, matched):
+        """Which anchors the join keeps, given whether each matched a partner.
+
+        An anti join keeps the anchors that matched none; any other
+        join keeps those that matched. ``matched`` is a bool or a NumPy
+        bool array.
+        """
+        return matched != (self.semantics == "anti")
+
     type_name: ClassVar[str] = "quail.ai_join"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR

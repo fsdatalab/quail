@@ -122,16 +122,16 @@ def test_filters_over_a_materialized_label_share_one_pipeline(session):
         WHERE AI.IF(PROMPT('kept: {0}', l.kind))
     """, dialect="bq", order="as_written")
     assert [name for name, _ in query.logical.stages() if name] == ["kinds"]
+    # equal labels get equal answers: the executor asks each text once
     oracle = Oracle(
-        labels=["lease", "deed", "lease"],
-        filters=lambda alias, document, position: (
-            [True, False, True] if position == 0 else [True, False, False])[document])
+        labels=["lease", "deed", "deed"],
+        filters=lambda alias, document, position: [True, False, False][document])
     result, recorder = run(query, oracle)
     assert result.collect().column("result_id").to_pylist() == [1]
     assert [list(request.inputs) for request in recorder.requests] == [
         ["c"], ["k"]]
     # the label column is text in the CTE's table, and the filter read it
-    assert recorder.documents["k"] == [[["lease"], ["deed"], ["lease"]]]
+    assert recorder.documents["k"] == [[["lease"], ["deed"], ["deed"]]]
     from quail.physical.pipelines import build_pipelines
 
     graph = query.plan().nodes[-1].graph

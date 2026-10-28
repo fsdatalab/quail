@@ -695,6 +695,9 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
+        for alias, columns in sorted(physical.settings.get("deduplicate", {}).items()):
+            grouping = " and ".join(("text", *columns))
+            lines.append(f"  deduplicate: {alias} (by {grouping})")
         lines.extend("  " + line for line in architecture_lines(
             physical.model))
     lines.append("")

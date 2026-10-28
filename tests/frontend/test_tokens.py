@@ -202,3 +202,27 @@ def test_offsets_reject_changed_text_and_preserve_sliced_rows():
     assert documents[2].character_offsets.tolist() == [[0, 1], [0, 1]]
     empty = pa.array([], type=pa.large_list(pa.int32()))
     assert mapper(empty, pa.array([], type=pa.string())).to_pylist() == []
+
+
+def test_a_document_points_at_the_first_document_with_its_tokens_and_row_values(
+        tmp_path):
+    # equal tokens share a first; order, an extra token, or length tell apart
+    documents = ["1 2 3", "1 2 3", "3 2 1", "1 2 3 0", "1 2", "", ""]
+    store = TokenStore.write(
+        str(tmp_path / "copies.arrow"),
+        [pa.record_batch([documents[:3]], names=["body"]),
+         pa.record_batch([documents[3:]], names=["body"])],
+        document_column="body", token_type=pa.int32(),
+        tokenizer=lambda text: [int(token) for token in text.split()])
+    assert store.first_documents.to_pylist() == [0, 0, 2, 3, 4, 5, 5]
+    # a test tokenizer's words group the same way
+    words = TokenStore.write(
+        str(tmp_path / "words.arrow"),
+        [pa.record_batch([["ok", "ok", "no", "ok"]], names=["body"])],
+        document_column="body", tokenizer=str.split, token_type=pa.string())
+    assert words.first_documents.to_pylist() == [0, 0, 2, 0]
+    hotel = pa.array(["h1", "h2", "h1", "h1"])
+    assert words.first_documents_with([hotel]).to_pylist() == [0, 1, 2, 0]
+    # a null is one value like any other
+    stars = pa.array([None, 1.0, None, None])
+    assert words.first_documents_with([hotel, stars]).to_pylist() == [0, 1, 2, 0]
