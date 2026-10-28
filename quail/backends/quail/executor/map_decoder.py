@@ -58,10 +58,12 @@ class MapDecoder:
     """
 
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
-                 page_tokens: int):
+                 page_tokens: int, expected_tokens=None):
         self.torch = torch
         self.head = head
         self.limits = np.asarray(limits, dtype=np.int64)
+        self.expected_tokens = (np.minimum(64, self.limits) if expected_tokens is None
+                                else np.asarray(expected_tokens, dtype=np.float64))
         self.page_tokens = page_tokens
         n = num_documents
         self.stop_ids = np.asarray(sorted(stop_ids), dtype=np.int64)
@@ -70,6 +72,8 @@ class MapDecoder:
         self.tokens = [np.zeros((n, int(limit)), dtype=np.int32)
                        for limit in self.limits]
         self.lengths = [np.full(n, -1, dtype=np.int64) for _ in self.limits]
+        self.written = [np.zeros(n, dtype=np.int64) for _ in self.limits]
+        self.paused = np.zeros(n, dtype=bool)
         # the answer each document is writing now
         self.map = np.full(n, -1, dtype=np.int64)      # its map, -1 for none
         self.origin = np.zeros(n, dtype=np.int64)      # its first decode position
@@ -106,8 +110,7 @@ class MapDecoder:
             map_index: The map the answer is for.
             position: The position of the answer's first decode row,
                 right after its prompt.
-            pages: The document's page ids in logical order; they must
-                cover the prompt and the answer's limit.
+            pages: The document's page ids in logical order.
             parent: The slot whose whole pages this one borrows, or None.
             shared_tokens: The tokens it borrows from the parent.
         """
@@ -115,13 +118,7 @@ class MapDecoder:
             raise ValueError(f"document {document} is already writing an answer")
         if map_index in self.slot_maps:
             map_index = self.slot_maps[map_index][document]
-        pages = np.asarray(pages, dtype=np.int32)
-        if len(pages) > self.pages.shape[1]:
-            wider = np.zeros((len(self.map), len(pages)), dtype=np.int32)
-            wider[:, :self.pages.shape[1]] = self.pages
-            self.pages = wider
-        self.pages[document, :len(pages)] = pages
-        self.num_pages[document] = len(pages)
+        self.set_pages(document, pages)
         self.map[document] = map_index
         self.origin[document] = position
         self.fed[document] = 0
@@ -133,6 +130,52 @@ class MapDecoder:
             self.parent[document] = parent
             self.borrowed[document] = shared_tokens
             self.lead[parent] = max(self.lead[parent], shared_tokens)
+
+    def set_pages(self, document, pages):
+        """Update one slot's table after allocation or growth."""
+        pages = np.asarray(pages, dtype=np.int32)
+        if len(pages) > self.pages.shape[1]:
+            wider = np.zeros((len(self.map), len(pages)), dtype=np.int32)
+            wider[:, :self.pages.shape[1]] = self.pages
+            self.pages = wider
+        self.pages[document, :len(pages)] = pages
+        self.num_pages[document] = len(pages)
+
+    def pause(self, document):
+        """Pause a fully harvested answer before freeing its pages."""
+        self.paused[document] = True
+        children = np.flatnonzero(self.parent == document)
+        self.parent[children] = children
+        self.borrowed[children] = 0
+        self.parent[document] = document
+        self.borrowed[document] = 0
+        self.lead.fill(0)
+        np.maximum.at(self.lead, self.parent, self.borrowed)
+
+    def resume(self, document, pages):
+        """Continue after prefilling the prompt and every saved answer token."""
+        self.set_pages(document, pages)
+        self.fed[document] = self.written[self.map[document]][document]
+        self.paused[document] = False
+
+    def eviction_order(self):
+        """Running slots ordered by longest expected remaining answer first."""
+        from quail.backends.quail.executor.answer_survival import remaining_tokens
+
+        running = np.flatnonzero((self.map >= 0) & ~self.paused)
+        scores = np.zeros(len(self.map))
+        for q in np.unique(self.map[running]):
+            curve = remaining_tokens(self.lengths[q], self.written[q],
+                                     self.expected_tokens[q], int(self.limits[q]))
+            mine = running[self.map[running] == q]
+            scores[mine] = curve[self.written[q][mine]]
+        return running[np.argsort(-scores[running], kind="stable")]
+
+    def running(self):
+        """Slots whose next decode row can choose another token."""
+        running = np.flatnonzero((self.map >= 0) & ~self.paused)
+        return running[~self.stopped[running]
+                       & (self.fed[running] + 1 < self.limits[self.map[running]])]
 
     @property
     def active(self) -> bool:
@@ -152,10 +195,7 @@ class MapDecoder:
         An answer continues while no stop token has been read and its
         tokens, counting the one this row writes, stay within its limit.
         """
-        running = np.flatnonzero(self.map >= 0)
-        limits = self.limits[self.map[running]]
-        running = running[~self.stopped[running]
-                          & (self.fed[running] + 1 < limits)]
+        running = self.running()
         if not len(running):
             return None
         positions = self.origin[running] + self.fed[running]
@@ -250,7 +290,7 @@ class MapDecoder:
             np.empty(0, dtype=np.int64) if rows is None else rows.slots])
         # a first row writes token 0; a decode row fed f - 1 rows writes token f
         indices = np.concatenate([
-            np.zeros(len(first_rows), dtype=np.int64),
+            self.fed[np.asarray(first_documents, dtype=np.int64)],
             np.empty(0, dtype=np.int64) if rows is None else self.fed[rows.slots]])
         selected = []
         if len(first_rows):
@@ -291,6 +331,7 @@ class MapDecoder:
         for q in np.unique(maps).tolist():
             mine = maps == q
             self.tokens[q][documents[mine], indices[mine]] = tokens[mine]
+            self.written[q][documents[mine]] = indices[mine] + 1
         stop = np.isin(tokens, self.stop_ids)
         self.stopped[documents[stop]] = True
         ended = stop | (indices + 1 >= self.limits[maps])
