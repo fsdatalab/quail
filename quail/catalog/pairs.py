@@ -16,6 +16,9 @@ import pyarrow.compute as pc
 from quail.catalog.selection import equality_keys
 
 COLUMNS_PREFIX = "columns:"
+# the value column a deduplicated table carries: each row's first row
+# with the same tokens and the same deduplicate setting columns
+FIRST_DOCUMENT = "__first_document"
 
 
 def pair_keys(anchors, partners):

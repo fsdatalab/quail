@@ -301,14 +301,23 @@ def test_copies_with_different_carried_values_are_not_merged():
     assert _reduced_rows(different, "r", ids, keys) is None
 
 
-def test_the_planner_prices_only_the_documents_it_asks(monkeypatch):
+def _every_pair(session):
+    return (session.docs("reviews").alias("r")
+            .ai_join(session.docs("notes").alias("n"),
+                     quail.prompt("Does {0} match {1}?", quail.col("r.body"),
+                                  quail.col("n.body")), anchor="r")
+            .select("r.id"))
+
+
+@pytest.mark.parametrize("build", [
+    lambda session: _short(session).select("r.id"), _every_pair])
+def test_the_planner_prices_only_the_documents_it_asks(monkeypatch, build):
     from quail.planner.graph import pricing
 
     with _session() as session:
-        query = _short(session).select("r.id")
-        deduplicated = _planned(query).estimated_seconds
+        deduplicated = _planned(build(session)).estimated_seconds
     monkeypatch.setattr(pricing, "key_documents", lambda context, alias: None)
     with _session() as session:
-        every = _planned(_short(session).select("r.id")).estimated_seconds
+        every = _planned(build(session)).estimated_seconds
     # 3 of the 6 reviews are copies
     assert deduplicated < every

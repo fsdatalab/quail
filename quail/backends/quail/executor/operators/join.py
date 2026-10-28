@@ -163,7 +163,7 @@ class JoinPart(ExecutionPart):
                     anchor_ids if j == 0 else id_positions(results[
                         nodes[j - 1].node_id].outputs[f"rows:{node.anchor}"]),
                     dtype=np.int64)
-                survivors = candidates[~np.isin(candidates, matched)]
+                survivors = candidates[member.keeps(np.isin(candidates, matched))]
             answer = {
                 "rows": rows,
                 "anchor_index": anchor_ids,

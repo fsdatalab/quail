@@ -432,12 +432,6 @@ class ColumnStore:
         self._resources.close()
 
 
-# the value column holding each document's first document with the same
-# tokens and the same values in the row columns the deduplicate setting
-# names for its table
-FIRST_DOCUMENT = "__first_document"
-
-
 def token_keys(tokens: pa.ChunkedArray) -> pa.ChunkedArray:
     """Each document's tokens as one binary value, to group equal documents.
 
@@ -549,10 +543,9 @@ class TokenStore(Sequence):
         if not len(self):
             return pa.array([], pa.int32())
         groups = group_ids([token_keys(self.arrow_array), *columns])
-        first = np.empty(groups.max() + 1, dtype=np.int64)
-        # assigned in reverse, so each group keeps its lowest row
-        first[groups[::-1]] = np.arange(len(groups))[::-1]
-        return pa.array(first[groups], pa.int32())
+        _, first, inverse = np.unique(groups, return_index=True,
+                                      return_inverse=True)
+        return pa.array(first[inverse], pa.int32())
 
     @property
     def num_copies(self) -> int:

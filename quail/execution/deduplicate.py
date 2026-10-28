@@ -7,8 +7,12 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pyarrow as pa
 
-from quail.catalog.pairs import columns_key, pair_ids_table, pair_keys
-from quail.catalog.tokens import FIRST_DOCUMENT
+from quail.catalog.pairs import (
+    FIRST_DOCUMENT,
+    columns_key,
+    pair_ids_table,
+    pair_keys,
+)
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeResult
 from quail.execution.result import true_answer_rows
@@ -78,9 +82,11 @@ class Deduplicated:
                     joined = next(table for table in outputs.values()
                                   if isinstance(table, pa.Table))
                     (anchor,) = aliases
-                    outputs[port.name] = Rows({anchor: _join_survivors(
-                        joined, anchor, node.semantics, read[anchor],
-                        len(keys[anchor]))})
+                    reached = np.sort(read[anchor])
+                    matched = np.isin(reached, true_answer_rows(joined)
+                                      .column(anchor).to_numpy())
+                    outputs[port.name] = Rows(
+                        {anchor: reached[node.keeps(matched)].astype(np.int32)})
                 else:
                     rows = rows_of(value, aliases[0])
                     table = _expanded(rows.table(), aliases, read, keys,
@@ -350,12 +356,3 @@ def _matches(wanted, answered) -> tuple[np.ndarray, np.ndarray]:
     order = np.argsort(index, kind="stable")
     return index[order], rows[order]
 
-
-def _join_survivors(joined: pa.Table, anchor, semantics, reached,
-                    num_documents: int) -> np.ndarray:
-    """The anchors an AI join keeps, from its answers over every pair."""
-    matched = np.zeros(num_documents, dtype=bool)
-    matched[true_answer_rows(joined).column(anchor).to_numpy()] = True
-    if semantics == "anti":
-        return np.sort(reached[~matched[reached]]).astype(np.int32)
-    return np.flatnonzero(matched).astype(np.int32)

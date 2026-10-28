@@ -103,9 +103,14 @@ class PlanPricer:
                 if node.alias in anchored and last_filters[node.alias] == node.node_id:
                     entry.update(self._release_recompute(node))
             elif isinstance(node, AiJoin):
-                price = NodePrice(
-                    work=self.stage_works.get(node.written_position, Work())
-                )
+                work = self.stage_works.get(node.written_position, Work())
+                if not node.pairs_from:
+                    # over every pair, the model is asked once per pair
+                    # of distinct texts; pairs from a hash join are
+                    # still priced in full
+                    for alias in (node.anchor, *node.partners):
+                        work = work * self._distinct(alias)
+                price = NodePrice(work=work)
                 entry["seconds"] = self._seconds(price.work)
             elif isinstance(node, (AiScore, AiClassify, AiExtract,
                                    AiSaeFeatures)) \
@@ -128,7 +133,7 @@ class PlanPricer:
         mean_prefix = self._mean_prefix(node)
         # a copy of an earlier document is not asked
         keys = key_documents(self.context, node.alias)
-        asked = node.expected_rows * (1.0 if keys is None else keys.mean())
+        asked = node.expected_rows * self._distinct(node.alias)
         if resident:
             return ask(mean_prefix, question, window=window) * asked
         shared = self._shared(node, node.alias)
@@ -147,6 +152,11 @@ class PlanPricer:
             work += (ask(borrowed, prefix + question - borrowed, window=window)
                      if shared else scan(prefix, question, window=window))
         return work * (node.expected_rows / len(lengths))
+
+    def _distinct(self, alias: str) -> float:
+        """The share of an alias's documents the model is asked about."""
+        keys = key_documents(self.context, alias)
+        return 1.0 if keys is None else float(keys.mean())
 
     def _mean_prefix(self, node: AiFilter) -> float:
         return (
