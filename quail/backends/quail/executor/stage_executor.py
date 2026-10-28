@@ -89,7 +89,7 @@ class StageExecutor:
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
                  appended_tokens=None, gpu_timing=False, survival=None,
-                 decoder=None):
+                 decoder=None, dependencies=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -107,8 +107,8 @@ class StageExecutor:
         self.gpu_timing = gpu_timing
         self.decoder = decoder
         # the stages whose answers the decoder writes, in map order
-        self.answer_maps = {j: q for q, j in enumerate(
-            j for j, stage in enumerate(stages) if stage.answer_tokens)}
+        self.answer_maps = {j: stage.answer_index for j, stage in enumerate(stages)
+                            if stage.answer_tokens}
         # per document, the stage of the answer it writes now
         self.answer_stage = np.zeros(len(anchor_prefixes), dtype=np.int64)
         if self.answer_maps and decoder is None:
@@ -225,6 +225,7 @@ class StageExecutor:
             stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
             reserve=self._reserve if self.paged else None,
+            dependencies=dependencies,
         )
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
@@ -278,7 +279,8 @@ class StageExecutor:
         self.counting_answers = count_answers
         total = (sum(self.sched.num_partners(a, j) for a in range(len(self.prefixes))
                      for j in range(k))
-                 if self.counting_answers else len(self.prefixes))
+                 if self.counting_answers
+                 else len(self.prefixes) - len(self.sched.dependencies))
         self.progress = Progress(self.label, total=total, unit=unit)
         self.finished = 0
 
@@ -527,7 +529,7 @@ class StageExecutor:
 
     def _event(self, settlement):
         # Progress counts settled documents: a dropped one is done too.
-        self.finished += 1
+        self.finished += int(settlement.anchor not in self.sched.dependencies)
         if settlement.kind == "finished":
             self._settle(settlement)
         elif self.arena.is_resident(self.keys[settlement.anchor]):
@@ -579,7 +581,9 @@ class StageExecutor:
         self.decoder.harvest()
         self.answered.update(a for a, _ in self.decoder.take_finished())
         transitions = []
-        for a in sorted(self.answered & self.deferred.keys()):
+        for a in sorted(self.answered & self.deferred.keys(), reverse=True):
+            if not self.sched.dependents_done(a, self.deferred[a][0]):
+                continue
             self.answered.discard(a)
             transitions.extend(self._record(a, *self.deferred.pop(a)))
         return transitions

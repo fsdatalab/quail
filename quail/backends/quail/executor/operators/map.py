@@ -1,16 +1,9 @@
-"""AI.MAP through the shared document scheduler.
+"""AI.MAP branches through the shared document scheduler.
 
-Each map is one stage of its pipeline: the stage writes the map's
-instruction after the document, in place of what the operator before
-it appended, and its last row chooses the answer's first token. The
-pipeline's MapDecoder writes the rest of the answer one row per pass,
-and the stage's row is reported once the answer ends, so a limit
-counts only documents with a whole answer.
-
-Maps that run on their own over one table run as branches instead:
-each (document, map) pair is its own sequence, the branches of a
-document borrow its prompt's whole pages from the first branch, and
-every branch decodes in the same passes.
+The document runs the first map after the earlier stages keep it.
+Dependent anchors run the other maps at the same stage, borrowing the
+document's whole pages. Each branch decodes one row per pass. The
+document's stage is reported only after every branch's answer ends.
 """
 
 import time
@@ -24,14 +17,14 @@ from quail.backends.quail.executor.parts import (
     ExecutionPart,
     document_inputs,
     execute_parts,
+    execution_prefix_tree,
     gpu_seconds,
     join_prior_rows,
     prior_inputs,
-    shared_prefix_tree,
     stage_spans,
 )
 from quail.backends.quail.executor.stages import Stage, StageRequests
-from quail.catalog.tokens import DocumentPrefixes
+from quail.catalog.tokens import DocumentKeys, DocumentPrefixes, PrefixTree
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
 
@@ -69,17 +62,15 @@ def execute_maps(state, nodes, inputs) -> dict:
     state.gpu_timing = bool(inputs.get("gpu_timing", False))
     ids = np.asarray(inputs["document_ids"], dtype=np.int64)
     (alias,) = nodes[0].spec.aliases
-    part = MapPart(state, nodes, ids, 0, branches=True)
-    count = len(nodes)
+    part = MapPart(state, nodes, ids, 0)
     prefixes = DocumentPrefixes(nodes[0].document_head,
-                                inputs["documents"][alias], np.repeat(ids, count))
-    keys = [((alias, q), int(document_id))
-            for document_id in ids for q in range(count)]
+                                inputs["documents"][alias], ids)
     results = execute_parts(
-        state, [part], prefixes, keys, keep_kv=nodes[-1].keep_kv,
-        prefix_tree=(shared_prefix_tree(nodes[0].spec.name, prefixes,
-                                        state.loaded_model.arena)
-                     if count > 1 or nodes[0].spec.share_prefixes else None),
+        state, [part], prefixes, DocumentKeys(alias, ids),
+        keep_kv=nodes[-1].keep_kv,
+        prefix_tree=execution_prefix_tree(nodes[0], prefixes,
+                                          state.loaded_model.arena),
+        limit=inputs.get("limit"),
         label=f"map {', '.join(node.spec.name for node in nodes)}")
     first = nodes[0].node_id
     results[first] = replace(results[first], metrics=replace(
@@ -88,19 +79,17 @@ def execute_maps(state, nodes, inputs) -> dict:
 
 
 class MapPart(ExecutionPart):
-    """One pipeline's consecutive maps and their answer tables.
-
-    With branches, the part's sequences are (document, map) pairs,
-    document-major, and its one stage feeds each pair its own map's
-    tail; otherwise its sequences are the documents and each map is a
-    stage.
-    """
+    """One pipeline's consecutive maps, decoded as branches at one stage."""
 
     combine = True
     attention = "unified"
     execute_group = staticmethod(execute_maps)
 
-    model_inputs = staticmethod(document_inputs)
+    @staticmethod
+    def model_inputs(node, inputs, context, sequence=None, nodes=None):
+        return {**document_inputs(node, inputs, context, sequence, nodes),
+                "limit": context.state.get("filter_limit"),
+                "gpu_timing": context.state.get("gpu_timing", False)}
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
@@ -109,8 +98,7 @@ class MapPart(ExecutionPart):
         first = sum(len(part.answer_limits) for part in parts)
         return cls(state, nodes, ids, first, priors, prior_tables)
 
-    def __init__(self, state, nodes, ids, first, priors=(), prior_tables=(),
-                 branches=False):
+    def __init__(self, state, nodes, ids, first, priors=(), prior_tables=()):
         self.state = state
         self.nodes = list(nodes)
         self.ids = np.asarray(ids, dtype=np.int64)
@@ -119,7 +107,7 @@ class MapPart(ExecutionPart):
         self.prior_tables = prior_tables
         self._decoder = None
         self.asked = [np.zeros(len(self.ids), dtype=bool) for _ in self.nodes]
-        self.branches = branches
+        self.slots = np.arange(len(self.ids), dtype=np.int64)[None, :]
         self._results = {}
         tails = []
         for node in self.nodes:
@@ -127,38 +115,55 @@ class MapPart(ExecutionPart):
             if len(tail) < 2:
                 raise ValueError("an AI.MAP tail ends in its answer cue")
             tails.append(list(tail))
-        if branches:
-            count = len(self.nodes)
+        def requests(key):
+            q = key[0][1] - self.first if isinstance(key[0], tuple) else 0
+            return StageRequests([tails[q]])
 
-            def requests(key):
-                return StageRequests([tails[key[0][1]]])
+        def decide(anchor, row):
+            q, document = self.branch_of[anchor]
+            self.asked[q][document] = True
+            return True
 
-            def decide(anchor, row):
-                self.asked[anchor % count][anchor // count] = True
-                return True
+        self.branch_of = {a: (0, a) for a in range(len(self.ids))}
+        self.stages = [Stage(
+            suffixes=requests, suffix_tokens=max(map(len, tails)),
+            rewind=True, append=True, single=True, readout=NoAnswers(),
+            decide=decide, answer_tokens=max(self.answer_limits),
+            answer_index=self.first,
+            label=f"maps {', '.join(n.spec.name for n in self.nodes)}")]
 
-            # each branch's tail is its own suffix; the cue's row
-            # chooses the answer's first token
-            self.stages = [Stage(
-                suffixes=requests, suffix_tokens=max(map(len, tails)),
-                append=True, single=True, readout=NoAnswers(), decide=decide,
-                answer_tokens=max(self.answer_limits),
-                label=f"maps {', '.join(n.spec.name for n in self.nodes)}")]
-            return
-        self.stages = []
-        for q, (node, tail) in enumerate(zip(self.nodes, tails)):
-
-            def decide(anchor, row, q=q):
-                self.asked[q][anchor] = True
-                return True
-
-            # the tail but its cue is the frame; the cue's row chooses
-            # the answer's first token
-            self.stages.append(Stage(
-                suffixes=[[tail[-1]]], frame=list(tail[:-1]), rewind=True,
-                append=True, single=True, readout=NoAnswers(), decide=decide,
-                answer_tokens=node.spec.max_answer_tokens,
-                label=f"map {node.spec.name}"))
+    def branch_inputs(self, prefixes, keys, tree, page_tokens, stage):
+        """Append dependent anchors and their direct document borrows."""
+        num_anchors = len(prefixes)
+        num_documents = len(self.ids)
+        num_dependents = num_documents * (len(self.nodes) - 1)
+        self.slots = np.vstack((
+            np.arange(num_documents, dtype=np.int64),
+            np.arange(num_anchors, num_anchors + num_dependents, dtype=np.int64
+                      ).reshape(num_documents, len(self.nodes) - 1).T))
+        dependencies = {}
+        keys = list(keys)
+        parents = [None] * num_anchors if tree is None else list(tree.parent)
+        shared = [0] * num_anchors if tree is None else list(tree.shared)
+        order = list(range(num_anchors) if tree is None else tree.order)
+        positions = list(range(num_anchors))
+        for document in range(num_documents):
+            alias, document_id = keys[document]
+            for q in range(1, len(self.nodes)):
+                anchor = int(self.slots[q, document])
+                self.branch_of[anchor] = (q, document)
+                dependencies[anchor] = (document, stage)
+                keys.append(((alias, self.first + q), document_id))
+                positions.append(document)
+                parents.append(document)
+                shared.append(max(0, len(prefixes[document]) - 1)
+                              // page_tokens * page_tokens)
+        order = [a for parent in order
+                 for a in (parent, *(
+                     self.slots[1:, parent].tolist()
+                     if parent < num_documents else ()))]
+        return (DocumentPrefixes((), prefixes, positions), keys,
+                PrefixTree(order, parents, shared), dependencies)
 
     @property
     def decoder(self):
@@ -168,18 +173,14 @@ class MapPart(ExecutionPart):
     @decoder.setter
     def decoder(self, decoder):
         self._decoder = decoder
-        if self.branches:
-            # a branch writes the answer of its own map
-            decoder.slot_maps = np.tile(
-                np.arange(self.first, self.first + len(self.nodes)), len(self.ids))
-            # the planner's path: tree reads a document's shared pages
-            # once per pass for all its branches
-            decoder.share = self.nodes[0].attention == "tree"
+        decoder.slot_maps[self.first] = {
+            anchor: self.first + q for anchor, (q, _) in self.branch_of.items()}
+        decoder.share |= self.nodes[0].attention == "tree"
 
     def _slots(self, q: int, documents) -> np.ndarray:
         """The decoder slots of map q's answers over the documents."""
         documents = np.asarray(documents, dtype=np.int64)
-        return documents * len(self.nodes) + q if self.branches else documents
+        return self.slots[q, documents]
 
     @property
     def answer_limits(self) -> tuple:
@@ -207,15 +208,17 @@ class MapPart(ExecutionPart):
             rows = Rows({alias: self.ids[asked].astype(np.int32)},
                         pa.table({spec.name: pa.array(answers, pa.string())}))
             rows = join_prior_rows(rows, alias, self.priors, self.prior_tables)
-            selected = stage_spans(spans, offset + q, offset + q + 1)
+            selected = stage_spans(spans, offset, offset + 1)
+            fresh_tokens = fresh - sum(own[1:]) if q == 0 else own[q]
             tail = len(spec.prompt_token_parts[1])
             self._results[node.node_id] = NodeResult(
                 {node.rows_port: rows},
                 NodeMetrics(
                     input_rows=len(asked), output_rows=len(asked),
                     evaluated_documents=len(asked),
-                    fresh_tokens=fresh - sum(own[1:]) if q == 0 else own[q],
-                    gpu_s=gpu_seconds(selected), chunks=len(selected),
+                    fresh_tokens=fresh_tokens,
+                    gpu_s=gpu_seconds(selected) * fresh_tokens / max(1, fresh),
+                    chunks=len(selected),
                     extension={
                         "output": spec.name, "aliases": list(spec.aliases),
                         "input_rows": len(asked),

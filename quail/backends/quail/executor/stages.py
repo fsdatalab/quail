@@ -99,6 +99,7 @@ class Stage:
         answer_tokens: Tokens a decoder writes into the document's KV
             after the stage's request, as AI.MAP's answer; admission
             reserves pages for them.
+        answer_index: Index of this stage's first map in the decoder.
     """
 
     DROP = DROP
@@ -121,6 +122,7 @@ class Stage:
     canvas_rows: int = 0
     suffix_tokens: int = 0
     answer_tokens: int = 0
+    answer_index: int = 0
 
     def __post_init__(self):
         if self.own_suffixes:
@@ -203,7 +205,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
                on_answers=None, stop_groups=None, appended_tokens=None,
-               gpu_timing=False, survival=None, decoder=None):
+               gpu_timing=False, survival=None, decoder=None, dependencies=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -256,6 +258,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         appended_tokens: The most tokens the append stages leave after
             a document's frame, when stages discard tokens earlier ones
             added; None sums every append stage's longest suffix.
+        dependencies: Dependent anchor -> (document anchor, start stage).
+            A dependent starts only after that document launches the stage,
+            finishes there, and never counts toward a limit.
         decoder: A MapDecoder writing the answers of the stages with
             answer_tokens, or None. A document's row at such a stage is
             reported once its answer ends; until then the decoder packs
@@ -280,7 +285,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,
         appended_tokens=appended_tokens, gpu_timing=gpu_timing,
-        decoder=decoder,
+        decoder=decoder, dependencies=dependencies,
     ).run()
 
 

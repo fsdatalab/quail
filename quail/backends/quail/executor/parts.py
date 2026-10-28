@@ -191,6 +191,13 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
     to fall short of it, by the parts' selectivities.
     """
     stages = gated_stages(parts)
+    dependencies = {}
+    for part, (low, _) in zip(parts, _part_slices(parts)):
+        if part.answer_limits:
+            prefixes, anchor_keys, prefix_tree, added = part.branch_inputs(
+                prefixes, anchor_keys, prefix_tree,
+                state.loaded_model.arena.page_tokens, low)
+            dependencies.update(added)
     paged = paged or state.loaded_model.pipeline.needs_pages
     if keep_kv and not paged:
         raise ValueError("retaining document KV requires arena writes")
@@ -200,7 +207,7 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
                     if part.on_settled is not None), None)
     if settled is None:
         settled = settle_documents(state.loaded_model.arena, anchor_keys, prefixes,
-                                   keep_kv, state.chunk_tokens)
+                                   keep_kv, state.chunk_tokens, dependencies)
     stats = {}
     limits = [limit for part in parts for limit in part.answer_limits]
     decoder = None
@@ -224,7 +231,7 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
             stop_groups=stop_groups, paged=paged,
             on_chunk=transition_reporter(parts), on_answers=on_answers,
             appended_tokens=max(part.appended_tokens for part in parts) or None,
-            decoder=decoder)
+            decoder=decoder, dependencies=dependencies)
     complete_parts(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
             for node_id, result in part.results().items()}
@@ -258,7 +265,7 @@ def gated_stages(parts) -> list:
         first = part.stages[0]
         if pending:
             gates = list(pending)
-            asked = first.requests
+            asked = first.suffixes if first.own_suffixes else first.requests
 
             def guarded(key, gates=gates, asked=asked):
                 for gate in gates:
@@ -266,7 +273,10 @@ def gated_stages(parts) -> list:
                         return Stage.DROP
                 return None if asked is None else asked(key)
 
-            first.requests = guarded
+            if first.own_suffixes:
+                first.suffixes = guarded
+            else:
+                first.requests = guarded
             pending = []
         stages.extend(part.stages)
     if pending and stages:
@@ -400,7 +410,8 @@ def gpu_seconds(spans) -> float:
         for rows, tokens, start, end in spans if tokens) / 1000.0
 
 
-def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
+def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int,
+                     dependencies=()):
     """Return a callback that applies the final operator's KV retention setting."""
     if keep_kv and arena.retention_cap_pages is None:
         arena.retention_cap_pages = max(
@@ -410,7 +421,7 @@ def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
         key = keys[anchor]
         if not arena.is_resident(key):
             return
-        if survived and keep_kv:
+        if survived and keep_kv and anchor not in dependencies:
             arena.retain(key, len(prefixes[anchor]))
         else:
             arena.free_key(key)

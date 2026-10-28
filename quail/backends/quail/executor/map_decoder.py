@@ -90,9 +90,8 @@ class MapDecoder:
         # KV tokens the decode rows read: in all, alone, through their
         # own pages beside a shared read, and through shared reads
         self.read_tokens = dict(all=0, alone=0, own=0, shared=0)
-        # per slot, the map its answers are for, or None when each
-        # stage names its map
-        self.slot_maps = None
+        # Per answer stage, each branch's map index.
+        self.slot_maps = {}
         # whether a document's branches read its shared pages together
         self.share = False
 
@@ -114,8 +113,8 @@ class MapDecoder:
         """
         if self.map[document] >= 0:
             raise ValueError(f"document {document} is already writing an answer")
-        if self.slot_maps is not None:
-            map_index = int(self.slot_maps[document])
+        if map_index in self.slot_maps:
+            map_index = self.slot_maps[map_index][document]
         pages = np.asarray(pages, dtype=np.int32)
         if len(pages) > self.pages.shape[1]:
             wider = np.zeros((len(self.map), len(pages)), dtype=np.int32)
