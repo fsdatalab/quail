@@ -335,23 +335,11 @@ def _matches(wanted, answered) -> tuple[np.ndarray, np.ndarray]:
     """Return positions (i, j) with wanted[i] == answered[j], ordered by i."""
     if not len(answered) or not len(wanted):
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
-    if answered.dtype.kind == "i" and answered.min() >= 0:
-        size = int(max(answered.max(), wanted.max(initial=-1))) + 1
-        # a position table only for document ids, not for pair keys,
-        # whose range is far larger than their count
-        if (size <= 4 * (len(answered) + len(wanted))
-                and np.bincount(answered, minlength=size).max() == 1):
-            # one answer row per key: look each key up by position
-            row_of = np.full(size, -1, dtype=np.int64)
-            row_of[answered] = np.arange(len(answered))
-            rows = row_of[wanted]
-            index = np.flatnonzero(rows >= 0)
-            return index, rows[index]
     common = np.result_type(wanted, answered)
     joined = pa.table({"key": wanted.astype(common),
                        "i": np.arange(len(wanted))}).join(
         pa.table({"key": answered.astype(common),
-                  "j": np.arange(len(answered))}), keys="key")
+                  "j": np.arange(len(answered))}), keys="key", join_type="inner")
     index, rows = (joined.column(name).to_numpy() for name in ("i", "j"))
     order = np.argsort(index, kind="stable")
     return index[order], rows[order]

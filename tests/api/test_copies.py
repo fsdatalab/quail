@@ -321,3 +321,11 @@ def test_the_planner_prices_only_the_documents_it_asks(monkeypatch, build):
         every = _planned(build(session)).estimated_seconds
     # 3 of the 6 reviews are copies
     assert deduplicated < every
+
+
+def test_a_key_without_an_answer_matches_nothing():
+    from quail.execution.deduplicate import _matches
+
+    # pair keys, one of them never answered, as when a join stops early
+    index, rows = _matches(np.array([1 << 40, 2 << 40]), np.array([1 << 40]))
+    assert (index.tolist(), rows.tolist()) == ([0], [0])
