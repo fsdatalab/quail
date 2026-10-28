@@ -246,7 +246,8 @@ class JoinAdmission:
             raise ValueError("answer_dtype must match stage_suffixes")
         self.dependencies = dict(dependencies or {})
         self.dependents = {}
-        self.released = set()
+        # released dependents not yet admitted, in release order
+        self.waiting = deque()
         for anchor, (parent, stage) in self.dependencies.items():
             self.dependents.setdefault((parent, stage), []).append(anchor)
         self.advance = advance
@@ -340,7 +341,8 @@ class JoinAdmission:
         self.pending.extend(a for a in range(n)
                             if a in resident and self._stage[a] == -1)
         self.pending.extend(a for a in fresh_order
-                            if a not in resident and self._stage[a] == -1)
+                            if a not in resident and self._stage[a] == -1
+                            and a not in self.dependencies)
         for a in resident:
             self.borrowing.detach(a)
         if self.groups is not None:
@@ -566,7 +568,7 @@ class JoinAdmission:
         """Record a launched group; True when the stream continues."""
         self._next[a] = end
         if (a, j) in self.dependents:
-            self.released.add((a, j))
+            self.waiting.extend(self.dependents[(a, j)])
         self.in_flight += 1
         return end < self.num_partners(a, j)
 
@@ -616,46 +618,47 @@ class JoinAdmission:
         admitted = set()
         paced = self.limit is not None and self.survival is not None
         expected_rows = self._live() if paced else 0
-        while self.pending and room >= self._min_fresh:
-            enough = limited or (paced and self.survivors
-                                 + expected_rows * self.survival >= self.limit)
-            if enough and not self.dependencies:
-                break
-            a = self.pending.popleft()
-            if self._stage[a] == _DONE:
-                self._dead -= 1
-                continue
-            dependency = self.dependencies.get(a)
-            if dependency is None:
-                if enough:
-                    held.append(a)
-                    continue
-                j = 0
-            else:
-                if dependency not in self.released:
-                    held.append(a)
-                    continue
+        held_waiting = []
+        while (self.waiting or self.pending) and room >= self._min_fresh:
+            dependency = None
+            if self.waiting:
+                a = self.waiting.popleft()
+                if self._stage[a] == _DONE:
+                    continue        # dropped with its document
+                dependency = self.dependencies[a]
                 j = dependency[1]
                 if self._stage[a] == -1:
+                    # its requests are asked once, when it is first released
                     settled = self._enter(a, j)
                     if settled is not None:
+                        self._stage[a] = _DONE
                         self._settled.append(Settlement(settled, a, False))
                         self._skipped.append(a)
                         continue
                     self._first[a] = self._first_cost(a, j, 0)
+            else:
+                if limited or (paced and self.survivors
+                               + expected_rows * self.survival >= self.limit):
+                    break       # the anchors in flight should reach the limit
+                a = self.pending.popleft()
+                if self._stage[a] == _DONE:
+                    self._dead -= 1     # skipped by its group's survivor
+                    continue
+                j = 0
+            hold = held_waiting if dependency is not None else held
             if self.groups is not None and self._group_busy.get(
                     self.groups[a], 0) >= self._group_width:
-                held.append(a)      # the group's anchors in flight are enough
+                hold.append(a)      # the group's anchors in flight are enough
                 continue
             borrow = self.borrowing.decide(a, admitted)
             if borrow == Borrowing.WAIT:
-                held.append(a)      # its parent is still queued
+                hold.append(a)      # its parent is still queued
                 continue
             need = (self._page_cost[a] if borrow is None
                     else self.page_cost(self.prefix[a] - borrow[1] + self._extra))
-            if blocked and need and dependency is None:
-                held.append(a)
-                if not self._zero_cost and not self.dependencies:
+            if blocked and need:
+                hold.append(a)
+                if not self._zero_cost:
                     break
                 continue
             required = need + max(0, self._page_reserve - temporary_pages)
@@ -664,24 +667,24 @@ class JoinAdmission:
             if required > free_pages:
                 blocked = True
                 self.blocked_pages = required - free_pages
-                held.append(a)
-                if not self._zero_cost and not self.dependencies:
+                hold.append(a)
+                if not self._zero_cost:
                     break
                 continue
             carried = (self._carried[a] if borrow is None
                        else self.prefix[a] - borrow[1])
             if carried + self._first[a] > room:
-                held.append(a)      # chunk room only; retry next chunk
+                hold.append(a)      # chunk room only; retry next chunk
                 continue
             end, tokens, pages = self._take(
                 a, j, 0, room - carried, free_pages - need)
             if end == 0:
-                held.append(a)
+                hold.append(a)
                 self.blocked_pages = (
                     need + self._suffix_page_cost(a, j, 0) - free_pages)
                 break
             if self.reserve is not None and not self.reserve(a, borrow):
-                held.append(a)
+                hold.append(a)
                 break
             temporary_pages += pages
             groups.append((a, j, 0, end, carried > 0))
@@ -700,6 +703,7 @@ class JoinAdmission:
             if self._launch(a, j, end):
                 continued.append(a)
         self.pending.extendleft(reversed(held))
+        self.waiting.extendleft(reversed(held_waiting))
         self.ready.extendleft(reversed(continued))
         self.ready.extendleft(reversed(deferred))
         return groups
@@ -783,7 +787,6 @@ class JoinAdmission:
                 if self._stage[dependent] != -1:
                     continue
                 self._stage[dependent] = _DONE
-                self._dead += 1
                 self._skipped.append(dependent)
                 self._settled.append(Settlement("dropped", dependent, False))
         if self.groups is None:
@@ -835,8 +838,11 @@ class JoinAdmission:
         out.extend(a for a in self.pending if self._stage[a] != -1)
         for a in out:
             self._stage[a] = _DONE
+        for a in self.waiting:
+            self._stage[a] = _DONE      # released but never admitted: no KV
         self.ready.clear()
         self.pending.clear()
+        self.waiting.clear()
         self._dead = 0
         return out
 
@@ -846,4 +852,5 @@ class JoinAdmission:
         if self.limit_reached():
             return not self.in_flight and not self._settled
         return len(self.pending) == self._dead and not self.ready \
-            and not self.in_flight and not self._settled
+            and not self.in_flight and not self._settled \
+            and all(self._stage[a] == _DONE for a in self.waiting)

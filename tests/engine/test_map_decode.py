@@ -309,8 +309,10 @@ def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(
 
     def settled(anchor, survived, row):
         if anchor < len(documents) and survived:
-            assert all(decoder.lengths[q][maps.slots[q, anchor]] >= 0
-                       for q in range(len(tails)))
+            # under a limit a document settles only once every answer ended
+            assert limit is None or all(
+                decoder.lengths[q][maps.slots[q, anchor]] >= 0
+                for q in range(len(tails)))
             survivors.append(anchor)
         arena.free_key(keys[anchor])
 
@@ -500,7 +502,10 @@ def test_maps_feed_only_document_kv_to_every_join_partner(
             for key, owned in arena.accounting.owned.items():
                 if isinstance(key, tuple) and isinstance(key[0], tuple):
                     parent = (key[0][0], key[1])
-                    dependent_pages.update(set(owned) - set(arena.owned_pages(parent)))
+                    # a document can settle before its branches end
+                    document_pages = (arena.owned_pages(parent)
+                                      if arena.is_resident(parent) else ())
+                    dependent_pages.update(set(owned) - set(document_pages))
             for i, end in enumerate(meta["cu_q"][1:]):
                 last = int(chunk.input_ids[end - 1])
                 if not 950 <= last < 950 + len(partners):
