@@ -172,6 +172,9 @@ class MapPart(ExecutionPart):
             # a branch writes the answer of its own map
             decoder.slot_maps = np.tile(
                 np.arange(self.first, self.first + len(self.nodes)), len(self.ids))
+            # the planner's path: tree reads a document's shared pages
+            # once per pass for all its branches
+            decoder.share = self.nodes[0].attention == "tree"
 
     def _slots(self, q: int, documents) -> np.ndarray:
         """The decoder slots of map q's answers over the documents."""

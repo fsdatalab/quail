@@ -78,6 +78,19 @@ def test_maps_over_one_table_share_a_pipeline_and_its_kv(session):
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
 
 
+def test_the_planner_reads_long_documents_once_for_their_maps(session):
+    words = " ".join(f"w{i}" for i in range(2000))
+    session.register("long", DocumentProvider.from_table(
+        pa.table({"id": [1, 2], "body": [words, words + " end"]}), id_col="id"))
+    one = session.sql(f"SELECT l.id, AI.MAP(l.body, '{SUMMARY}', 64) AS s "
+                      "FROM long l")
+    assert [node.attention for node in _maps(one.plan())] == ["unified"]
+    two = session.sql(f"SELECT l.id, AI.MAP(l.body, '{SUMMARY}', 64) AS s, "
+                      f"AI.MAP(l.body, '{TOPIC}', 64) AS t FROM long l")
+    # two branches read each 2,000-token document; once is cheaper
+    assert [node.attention for node in _maps(two.plan())] == ["tree", "tree"]
+
+
 def test_a_map_after_a_filter_reads_only_its_survivors(session):
     query = session.sql(
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 64) AS summary FROM reviews r "

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from quail.cost.answers import expected_branches, prior_survival
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
 from quail.physical import (
@@ -369,6 +370,27 @@ class ShouldSharePrefixes(PhysicalRule):
         return PhysicalGraph(tuple(nodes), graph.root)
 
 
+def _map_attention(graph: PhysicalGraph, context) -> dict:
+    """The attention path for the maps over each table, by alias.
+
+    The maps over one table are one document's branches: each reads the
+    document's pages and its own. A branch's pass has one row, and the
+    readers of the document in a pass are the branches still writing,
+    on average expected_branches of their prior survival curves.
+    """
+    curves = {}
+    for node in graph.nodes:
+        if isinstance(node, AiMap) and node.spec is not None:
+            curves.setdefault(node.spec.aliases[0], []).append(prior_survival(
+                node.spec.expected_answer_tokens, node.spec.max_answer_tokens))
+    return {
+        alias: choose_attention_path(
+            context.model, context.device, readers=expected_branches(group),
+            reader_rows=1.0,
+            node_tokens=_mean(context.document_tokens.get(alias, ())))
+        for alias, group in curves.items()}
+
+
 def _mean(values) -> float:
     values = list(values)
     return sum(values) / len(values) if values else 0.0
@@ -404,10 +426,13 @@ class ChooseAttentionAlgorithm(PhysicalRule):
             raise ValueError(
                 f"attention must be 'tree' or 'unified', got {forced!r}")
         tree_available = tree_attention_allowed(model)
+        map_paths = _map_attention(graph, context) if tree_available else {}
         nodes = []
         changed = False
         for node in graph.nodes:
             path = None
+            if isinstance(node, AiMap) and node.spec is not None:
+                path = map_paths.get(node.spec.aliases[0], "unified")
             if isinstance(node, AiFilter):
                 lengths = context.document_tokens.get(node.alias)
                 store = None if lengths is None else lengths.store

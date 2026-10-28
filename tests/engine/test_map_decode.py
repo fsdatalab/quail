@@ -106,8 +106,8 @@ def greedy(prompt, limit):
     return tokens
 
 
-def map_node(name, tail, limit):
-    return SimpleNamespace(spec=SimpleNamespace(
+def map_node(name, tail, limit, attention=""):
+    return SimpleNamespace(attention=attention, spec=SimpleNamespace(
         name=name, prompt_token_parts=((), tuple(tail)), max_answer_tokens=limit))
 
 
@@ -180,8 +180,9 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
 
 @pytest.mark.parametrize("path", ["unified", "tree"])
 @pytest.mark.parametrize("lag", [0, 3])
+@pytest.mark.parametrize("planned", ["unified", "tree"])
 def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path,
-                                                              lag):
+                                                              lag, planned):
     cpu_staging(monkeypatch)
     rng = np.random.default_rng(1)
     # every document starts with the same preamble, longer than a page,
@@ -198,7 +199,7 @@ def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path
                              tree_attention=True, canvas_ids=())
     torch_ = events_torch(lag)
     ids = list(range(len(documents)))
-    maps = MapPart(None, [map_node(f"m{q}", tail, limit)
+    maps = MapPart(None, [map_node(f"m{q}", tail, limit, planned)
                           for q, (tail, limit) in enumerate(zip(tails, limits))],
                    ids, 0, branches=True)
     prefixes = [document for document in documents for _ in tails]
@@ -217,7 +218,7 @@ def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path
             q, maps._slots(q, ids))]
         assert got == [greedy(document + tail, limit) for document in documents]
     # the branches of a document borrow its prompt's whole pages, and
-    # read them once together on the unified path
+    # read them once together on a unified pass when the planner chose tree
     assert stats["borrowed_tokens"] > 0
-    assert (path == "unified") == (model.shared_reads > 0)
+    assert (path == "unified" and planned == "tree") == (model.shared_reads > 0)
     assert not arena.accounting.owned

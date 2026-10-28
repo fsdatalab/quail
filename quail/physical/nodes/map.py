@@ -40,6 +40,10 @@ class AiMap(AiInference):
     """
 
     spec: MapSpec | None = None
+    # "unified" or "tree": the attention path the choose_attention_algorithm
+    # rule chose for the maps' branches; tree reads a document's shared
+    # pages once for all its branches in a pass
+    attention: str = ""
 
     answer_kind: ClassVar[str] = "maps"
     spec_type: ClassVar[type[InferenceSpec]] = MapSpec
@@ -64,4 +68,5 @@ class AiMap(AiInference):
             **super().explain_fields(),
             "max_answer_tokens": (None if self.spec is None
                                   else self.spec.max_answer_tokens),
+            "attention": self.attention,
         }

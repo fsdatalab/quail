@@ -93,6 +93,8 @@ class MapDecoder:
         # per slot, the map its answers are for, or None when each
         # stage names its map
         self.slot_maps = None
+        # whether a document's branches read its shared pages together
+        self.share = False
 
     # ---- documents entering and leaving -----------------------------------
 
@@ -168,6 +170,8 @@ class MapDecoder:
                       * self.page_tokens + positions % self.page_tokens)
         rows = DecodeRows(positions=positions, write_rows=write_rows,
                           page_table=table, slots=running)
+        if not self.share:
+            return rows
         # a group is a slot and the slots that borrow the most from it,
         # whose first pages are the same; its rows read those pages once
         # together when two or more of them run. A slot both borrowing
