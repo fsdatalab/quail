@@ -6,7 +6,9 @@ sample (Python stack sampling), trace (torch.profiler), and timeline
 and result-digest fields. The env option sets child-process variables.
 
 Pass QUAIL_OVERRIDES=module:NAME=json-value;... in env to set module
-constants in the child, such as an executor constant under test.
+constants in the child, such as an executor constant under test, or
+QUAIL_SWEEP=overrides|overrides|... to run each set as its own version
+in one container, alternating order between repetitions.
 
 Set QUAIL_BEFORE_SOURCE to a directory containing an earlier copy of
 quail to compare both versions on the same GPU. Run order alternates
@@ -454,17 +456,24 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
         Collected RESULT lines from all query processes.
     """
     env_items = [item for item in env.split(",") if item]
-    versions = [("after", "/root")]
+    # (name, source root, extra child variables) per code version
+    versions = [("after", "/root", {})]
     if Path(BEFORE_REMOTE, "quail").is_dir():
-        versions.insert(0, ("before", BEFORE_REMOTE))
+        versions.insert(0, ("before", BEFORE_REMOTE, {}))
+    sweep = dict(item.split("=", 1) for item in env_items).get("QUAIL_SWEEP")
+    if sweep:
+        # one version per override set, all in this container, so the
+        # settings share one GPU and host
+        versions = [(overrides, "/root", {"QUAIL_OVERRIDES": overrides})
+                    for overrides in sweep.split("|")]
     Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
     lines = []
     for repeat in range(repeats):
         order = versions if repeat % 2 == 0 else versions[::-1]
         for query_id in query_ids:
-            for name, root in order:
-                prefix = (f"{PROFILE_DIR}/{tag}-{query_id}-{model}-{name}"
-                          f"-r{repeat}")
+            for name, root, extra in order:
+                prefix = (f"{PROFILE_DIR}/{tag}-{query_id}-{model}-"
+                          f"{name.replace('/', '_').replace(':', '_')}-r{repeat}")
                 arguments = json.dumps(
                     dict(
                         query_id=query_id,
@@ -480,7 +489,7 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                            "import sys, profile_query; "
                            "profile_query.child(sys.argv[1])", arguments]
                 child_env = {**os.environ,
-                       **dict(item.split("=", 1) for item in env_items),
+                       **dict(item.split("=", 1) for item in env_items), **extra,
                        "PYTHONPATH": f"{root}:/root:" + os.environ.get(
                            "PYTHONPATH", "")}
                 started = time.perf_counter()
