@@ -134,7 +134,7 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
                                document_head=pricing.document_head(
                                    predicates[position].prompt)))
     tests = {}
-    for test in operators.label_filters.get(alias, ()):
+    for test in operators.column_filters.get(alias, ()):
         tests.setdefault(test.call, []).append(test.selectivity)
     for call, owner in operators.labels.calls:
         if owner != alias or len(call.aliases()) != 1:
@@ -143,30 +143,18 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
         steps.append(TableStep(CLASSIFY, call, _survival(tests.get(call, ())),
                                first, later,
                                document_head=pricing.document_head(call.prompt)))
-    tests = {}
-    for test in operators.extract_filters.get(alias, ()):
-        tests.setdefault(test.name, []).append(test.selectivity)
-    for node in operators.extracts:
-        if node.alias != alias:
-            continue
-        first, later = pricing.extract(node)
-        steps.append(TableStep(EXTRACT, node.name, _survival(tests.get(node.name, ())),
-                               first, later,
-                               document_head=pricing.document_head(node.call.prompt)))
-    for node in operators.sae_features:
-        if node.alias != alias:
-            continue
-        first, later = pricing.features(node)
-        steps.append(TableStep(
-            FEATURES, node.name, 1.0, first, later,
-            document_head=pricing.document_head(node.call.prompt)))
-    for node in operators.maps:
-        if node.alias != alias:
-            continue
-        first, later = pricing.map(node)
-        steps.append(TableStep(
-            MAP, node.name, 1.0, first, later,
-            document_head=pricing.document_head(node.call.prompt)))
+    for kind, nodes in (
+        (EXTRACT, operators.extracts),
+        (FEATURES, operators.sae_features),
+        (MAP, operators.maps),
+    ):
+        for node in nodes:
+            if node.alias != alias:
+                continue
+            first, later = getattr(pricing, kind)(node)
+            steps.append(TableStep(
+                kind, node.name, _survival(tests.get(node.call, ())), first, later,
+                document_head=pricing.document_head(node.call.prompt)))
     return steps
 
 

@@ -142,9 +142,8 @@ class Search:
             operators.scans, operators.filters, operators.joins
         )
         self.labels = operators.labels
-        self.label_filters = operators.label_filters
+        self.column_filters = operators.column_filters
         self.extracts = operators.extracts
-        self.extract_filters = operators.extract_filters
         self.sae_features = operators.sae_features
         self.max_pooling = {node.alias for node in self.sae_features
                             if node.pooling == "max"}
@@ -433,7 +432,7 @@ class Search:
             CLASSIFY, alias, call.prompt.template, None,
             self.lower(call.prompt).tail_tokens, None, rows, rows,
             stage_work, name=self.labels.names[call], answer_rows=len(rows)))
-        for test in self.label_filters.get(alias, ()):
+        for test in self.column_filters.get(alias, ()):
             if test.call != call:
                 continue
             accepted = set(test.condition.value)
@@ -489,7 +488,7 @@ class Search:
         stages.append(_stage(
             EXTRACT, alias, node.call.prompt.template, None, tail, None, rows,
             rows, stage_work, name=node.name, answer_rows=answer_rows))
-        for test in self.extract_filters.get(alias, ()):
+        for test in self.column_filters.get(alias, ()):
             if test.name != node.name:
                 continue
             passed = self.answer_survivors(test.condition, rows, answers)

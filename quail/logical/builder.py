@@ -78,7 +78,7 @@ class LogicalPlanBuilder:
         label_filters: tuple = (),
         regular_predicates: tuple = (),
         extracts: tuple = (),
-        extract_filters: tuple = (),
+        column_filters: tuple = (),
         sae_features: tuple = (),
         maps: tuple = (),
         schema=None,
@@ -102,9 +102,9 @@ class LogicalPlanBuilder:
                 classification's label column, in written order.
             extracts: (call, name) per extraction, in order. They sit
                 above the classifications and label filters.
-            extract_filters: (RegularPredicate, selectivity) per Filter
-                on an extraction's answer or span column, in written
-                order. Each sits right above the extraction it tests.
+            column_filters: (RegularPredicate, selectivity) per Filter
+                on a computed column, in written order. Each sits right
+                above the operator it tests.
             sae_features: (call, name) per AI.SAE_FEATURES call, in
                 order. They sit above the extractions.
             maps: (call, name) per AI.MAP call, in order. They sit
@@ -135,6 +135,17 @@ class LogicalPlanBuilder:
                 columns=tuple(columns),
                 aliases=(alias,),
             )
+        tests = list(column_filters)
+
+        def add_column(node, node_type, call, name):
+            column = node_type(node, call, name)
+            node = column
+            for predicate, selectivity in column_filters:
+                if predicate.column.column in column.added_columns:
+                    node = Filter(node, predicate, selectivity)
+                    tests.remove((predicate, selectivity))
+            return node
+
         calls = {name: call for call, name in labels}
         classified = []
         for name, values, selectivity in label_filters:
@@ -149,7 +160,7 @@ class LogicalPlanBuilder:
                     f"the filter on {name!r} lists {unknown}, which are not "
                     f"among its labels {list(calls[name].labels)}")
             if calls[name] not in classified:
-                node = SemanticClassify(node, calls[name], name)
+                node = add_column(node, SemanticClassify, calls[name], name)
                 classified.append(calls[name])
             node = Filter(
                 node,
@@ -158,24 +169,16 @@ class LogicalPlanBuilder:
             )
         for call, name in labels:
             if call not in classified:
-                node = SemanticClassify(node, call, name)
+                node = add_column(node, SemanticClassify, call, name)
                 classified.append(call)
-        tests = list(extract_filters)
-        for call, name in extracts:
-            extraction = SemanticExtract(node, call, name)
-            node = extraction
-            for predicate, selectivity in extract_filters:
-                if predicate.column.column in (name, extraction.span_name):
-                    node = Filter(node, predicate, selectivity)
-                    tests.remove((predicate, selectivity))
+        for node_type, calls in ((SemanticExtract, extracts),
+                                 (SemanticSaeFeatures, sae_features),
+                                 (SemanticMap, maps)):
+            for call, name in calls:
+                node = add_column(node, node_type, call, name)
         if tests:
             raise CompileError(
-                f"the filter {tests[0][0]} tests an extraction the query "
-                f"does not return")
-        for call, name in sae_features:
-            node = SemanticSaeFeatures(node, call, name)
-        for call, name in maps:
-            node = SemanticMap(node, call, name)
+                f"the filter {tests[0][0]} tests a column the query does not return")
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:

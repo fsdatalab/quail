@@ -938,7 +938,7 @@ class Query:
                 extracts=tuple((column.expression, column.name)
                                for column in extracted
                                if column.expression.aliases() == (alias,)),
-                extract_filters=tuple(self._extract_filters.get(alias, ())),
+                column_filters=tuple(self._extract_filters.get(alias, ())),
                 sae_features=returned("features", alias),
                 maps=returned("map", alias),
                 schema=self._catalog.get(provider).schema(),

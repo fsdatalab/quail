@@ -475,10 +475,6 @@ def emit_classify(builder, alias, expected_rows, calls, port) -> tuple:
     """
     table = classify_builder(builder.context, alias, "quail")
     labels = builder.operators.labels
-    tests = {}
-    for test in builder.operators.label_filters.get(alias, ()):
-        tests.setdefault(test.call, []).append(test)
-
     def node_of(call, port, expected_rows, _index):
         spec, work = table.prepare(call, labels.names[call], expected_rows)
         if builder.scoring is not None:
@@ -486,7 +482,7 @@ def emit_classify(builder, alias, expected_rows, calls, port) -> tuple:
         return table.node(spec, port, node_index(builder, AiClassify))
 
     return emit_calls(builder, alias, expected_rows, port, calls, node_of,
-                      tests=tests, projected=lambda call: call in labels.projected)
+                      projected=lambda call: call in labels.projected)
 
 
 def joined_calls(labels: LabelWork) -> list:

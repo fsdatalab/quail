@@ -706,7 +706,7 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     assert [node.selectivity for node in tests] == [0.5, 0.5, 0.5, 0.5]
     operators = built.logical.operators()
     assert [(test.name, test.position)
-            for test in operators.extract_filters["c"]] == [
+            for test in operators.column_filters["c"]] == [
         ("lease.ends", 0), ("lease.ends", 1), ("lease.ends", 2),
         ("lease.rent", 3)]
     plan = built.plan()
@@ -774,13 +774,13 @@ def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
                     "CONTAINS(lease.ends, 'MARCH') AND STARTSWITH(lease.ends, 'M') "
                     "AND NOT ENDSWITH(lease.ends, '.') AND lease.ends RLIKE 'M.*'")
     conditions = [str(test.condition)
-                  for test in bq.logical.operators().extract_filters["c"]]
+                  for test in bq.logical.operators().column_filters["c"]]
     assert conditions == [
         "c.lease.ends regex '20..'", "c.lease.ends icontains 'MARCH'",
         "c.lease.ends starts with 'M'", "c.lease.ends not ends with '.'",
         "c.lease.ends not like 'x%'"]
     conditions = [str(test.condition)
-                  for test in snowflake.logical.operators().extract_filters["c"]]
+                  for test in snowflake.logical.operators().column_filters["c"]]
     assert conditions == [
         "c.lease.ends regex '^(?:20..)$'", "c.lease.ends contains 'MARCH'",
         "c.lease.ends starts with 'M'", "c.lease.ends not ends with '.'",

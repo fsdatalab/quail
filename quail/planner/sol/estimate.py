@@ -244,7 +244,7 @@ def _refuse_unpriced(logical) -> None:
                     f"the speed of light estimate does not price the filter "
                     f"{expression} on {alias!r}; it prices AI.IF and label "
                     f"filters")
-    for tests in operators.extract_filters.values():
+    for tests in operators.column_filters.values():
         for test in tests:
             if test.condition.column.column.endswith(SPAN_SUFFIX):
                 raise NotImplementedError(

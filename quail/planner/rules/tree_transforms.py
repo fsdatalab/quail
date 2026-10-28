@@ -313,7 +313,7 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
 def _filtered_alias(operators: Operators) -> str | None:
     """Return the one alias whose AI.IF predicates are the only model calls."""
     if (operators.joins or operators.classifies or operators.applies
-            or operators.projections or operators.label_filters
+            or operators.projections or operators.column_filters
             or len(operators.filters) != 1):
         return None
     (alias,) = operators.filters

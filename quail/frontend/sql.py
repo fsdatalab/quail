@@ -532,7 +532,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
                 for call, accepted, selectivity in b.label_tests.get(alias, ())
             ),
             extracts=tuple(calls["extract"].get(alias, ())),
-            extract_filters=tuple(b.extract_tests.get(alias, ())),
+            column_filters=tuple(b.extract_tests.get(alias, ())),
             sae_features=tuple(calls["features"].get(alias, ())),
             maps=tuple(calls["map"].get(alias, ())),
             schema=catalog.get(provider).schema(),

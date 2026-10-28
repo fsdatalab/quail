@@ -51,7 +51,7 @@ def inference_node(node_type, spec, sources, *, index, backend, model):
 
 
 def emit_calls(builder, alias, expected_rows, port, calls, node_of, *,
-               tests=None, projected=None) -> tuple:
+               projected=None) -> tuple:
     """Emit one table's calls in run order, each followed by its Filters.
 
     The calls run in one pipeline (quail.physical.pipelines): a document
@@ -66,7 +66,6 @@ def emit_calls(builder, alias, expected_rows, port, calls, node_of, *,
         calls: The calls, in run order.
         node_of: Builds a call's node from (call, port, expected_rows,
             index); index counts the calls emitted before it.
-        tests: Call -> the Filters on its answer, in written order.
         projected: Whether SELECT returns a call's answer; None returns
             every call's.
 
@@ -74,7 +73,9 @@ def emit_calls(builder, alias, expected_rows, port, calls, node_of, *,
         Where the documents stand after the calls, and the rows ports
         of the answers SELECT returns.
     """
-    tests = tests or {}
+    tests = {}
+    for test in builder.operators.column_filters.get(alias, ()):
+        tests.setdefault(test.name, []).append(test)
     row_ports = []
     for index, call in enumerate(calls):
         node = node_of(call, port, expected_rows, index)
@@ -82,7 +83,7 @@ def emit_calls(builder, alias, expected_rows, port, calls, node_of, *,
         port = PortRef(node.node_id, node.rows_port)
         if projected is None or projected(call):
             row_ports.append(port)
-        for test in tests.get(call, ()):
+        for test in tests.get(node.spec.name, ()):
             filter_id = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
                 node_id=filter_id, inputs=input_ports((port,)),

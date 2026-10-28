@@ -87,10 +87,6 @@ def emit_extract(builder, alias, expected_rows, names, port, resident=False) -> 
     """
     extracts = {node.name: node for node in builder.operators.extracts
                 if node.alias == alias}
-    tests = {}
-    for test in builder.operators.extract_filters.get(alias, ()):
-        tests.setdefault(test.name, []).append(test)
-
     def node_of(name, port, expected_rows, index):
         logical_node = extracts[name]
         spec = extract_spec(builder.context, logical_node.call, name,
@@ -99,5 +95,4 @@ def emit_extract(builder, alias, expected_rows, names, port, resident=False) -> 
             AiExtract, spec, (port,), index=node_index(builder, AiExtract),
             backend="quail", model=builder.model.name)
 
-    return emit_calls(builder, alias, expected_rows, port, names, node_of,
-                      tests=tests)
+    return emit_calls(builder, alias, expected_rows, port, names, node_of)

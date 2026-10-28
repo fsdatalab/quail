@@ -208,11 +208,14 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
                          f"{context.model.name!r}",),
                 constraint=f"{function[3:].lower()}_needs_quail_backend",
                 needed=1, available=0, unit="backends")
-        if refusal is None and function == "AI.EXTRACT" and operators.extract_filters:
+        kind = function[3:].lower()
+        tested = any(test.call.kind == kind
+                     for tests in operators.column_filters.values() for test in tests)
+        if refusal is None and tested:
             refusal = Refusal(
-                reasons=(f"a filter on an AI.EXTRACT answer runs on the "
+                reasons=(f"a filter on an {function} answer runs on the "
                          f"Quail backend only, not {backend_name}",),
-                constraint="extract_filter_needs_quail_backend",
+                constraint=f"{kind}_filter_needs_quail_backend",
                 needed=1, available=0, unit="backends")
         if refusal is not None:
             return refusal
