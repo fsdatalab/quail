@@ -450,8 +450,8 @@ def test_map_results_keep_only_document_kv_when_requested(monkeypatch, keep_kv):
         result = results[node.node_id]
         rows = result.outputs[node.rows_port]
         assert rows.ids["d"].to_pylist() == kept
-        want = batch_decode([greedy(documents[d] + list(node.spec.prompt_token_parts[1]),
-                                    node.spec.max_answer_tokens)
+        tail = list(node.spec.prompt_token_parts[1])
+        want = batch_decode([greedy(documents[d] + tail, node.spec.max_answer_tokens)
                              for d in kept])
         assert rows.column(node.spec.name).to_pylist() == want
         assert result.metrics.output_rows == len(kept)
