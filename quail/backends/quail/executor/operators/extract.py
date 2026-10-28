@@ -262,9 +262,8 @@ class ExtractPart(MapPart):
             pipeline_head=inputs.get("pipeline_head", self.node.document_head),
             document_positions=inputs.get("document_positions"))
 
-    @MapPart.decoder.setter
-    def decoder(self, decoder):
-        MapPart.decoder.fset(self, decoder)
+    def bind_decoder(self, decoder):
+        super().bind_decoder(decoder)
         decoder.configure_copy(self.first, self.slots, self.extraction,
                                [node.spec for node in self.nodes])
 

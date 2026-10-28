@@ -330,3 +330,109 @@ def test_map_and_copy_fields_can_reuse_a_slot_without_changing_saved_spans():
     assert decoder.answers(2, [0])[0].tolist() == [stray]
     assert decoder.output_answers(1, [0]) == (["five"], [(0, 4)])
     assert decoder.steps[1].tolist() == [2]
+
+
+@pytest.mark.parametrize("map_first", [False, True])
+def test_maps_and_extracts_share_branches_without_changing_results(
+    monkeypatch, map_first
+):
+    from helpers.fakes import cpu_staging
+    from helpers.kv_checker import Setup, chain, make_arena
+    from test_map_decode import (
+        TokenModel,
+        batch_decode,
+        map_node,
+        map_state,
+        next_token,
+    )
+
+    from quail.backends.quail.executor.operators.extract import ExtractPart
+    from quail.backends.quail.executor.operators.map import MapPart
+    from quail.backends.quail.executor.parts import execute_parts
+    from quail.physical import AiExtract
+
+    cpu_staging(monkeypatch)
+    monkeypatch.setattr(
+        "quail.backends.quail.executor.parts.input_staging", lambda state: None
+    )
+    texts = ["five days or five years", "five years", "lease for five days"]
+    spec, vocabulary = make_spec(*texts, "five days years lease", "or", "for")
+    vocabulary.tokenizer.batch_decode = batch_decode
+    spec = replace(spec, max_answer_tokens=6, draft_tokens=3, top_tokens=4)
+    setup = Setup(path="unified", pages=24, page_tokens=4, budget=128)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    state = map_state(setup, arena, model.forward_chunk)
+    state.gpu_timing = False
+    state.loaded_model.vocabulary = vocabulary
+    head = torch.zeros(len(vocabulary.vocab), 1024)
+    pool = [*vocabulary.encode_ids("five days years lease"), *vocabulary.stop_ids]
+    head[np.array(pool)[np.arange(1024) % len(pool)], np.arange(1024)] = 1
+    state.loaded_model.model.quail_full_head = head
+    ids = np.arange(len(texts))
+    tokens = vocabulary.document_batch(texts, [None] * len(texts))
+    extracts = ExtractPart(
+        state,
+        [
+            AiExtract(
+                node_id=f"extract:{q}",
+                backend_name="quail",
+                model="qwen3-4b-fp8",
+                spec=replace(spec, name=f"answer{q}"),
+            )
+            for q in range(2)
+        ],
+        ids,
+        {"documents": {"c": tokens}, "texts": {"c": texts}},
+        first=int(map_first),
+    )
+    node = map_node("summary", [10, 11], 6, "tree")
+    node.node_id, node.rows_port, node.spec.aliases = "map", "rows:c", ("c",)
+    maps = MapPart(state, [node], ids, 0 if map_first else 2)
+    parts = [maps, extracts] if map_first else [extracts, maps]
+    results = execute_parts(
+        state,
+        parts,
+        extracts.extraction.prefixes,
+        extracts.extraction.keys,
+        keep_kv=False,
+    )
+    reference = Decoder(vocabulary, 4, 9, 2, spec)
+    for d, document in enumerate(extracts.extraction.documents):
+        prefix = list(map(int, document.prefix))
+        expected = []
+        for _ in range(6):
+            token = int(
+                head[:, next_token(chain(prefix + [10, 11] + expected))].argmax()
+            )
+            if token in vocabulary.stop_ids:
+                break
+            expected.append(token)
+        assert (
+            results["map"].outputs["rows:c"].column("summary")[d].as_py()
+            == batch_decode([expected])[0]
+        )
+        for q in range(2):
+            answer = document.answers[q]
+            prompt = prefix + list(spec.prompt_token_parts[1])
+            while not answer.done:
+                logits = head[:, next_token(chain(prompt + answer.written))]
+                lp = logits - logits.logsumexp(dim=0)
+                top, selected = lp.topk(4)
+                row = torch.cat(
+                    (
+                        lp[list(vocabulary.stop_ids)].logsumexp(dim=0)[None],
+                        selected.float(),
+                        top,
+                    )
+                ).numpy()
+                reference.choose(document, q, row)
+            output = results[f"extract:{q}"].outputs["rows:c"]
+            assert output.column(f"answer{q}")[d].as_py() == answer.answer
+            assert output.column(f"answer{q}_span")[d].as_py() == (
+                None
+                if answer.span is None
+                else dict(start=answer.span[0], end=answer.span[1])
+            )
+    assert len(set(maps.slots.flat) & set(extracts.slots.flat)) == 0
+    assert not arena.accounting.owned

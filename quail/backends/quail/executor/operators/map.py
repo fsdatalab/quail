@@ -8,6 +8,7 @@ document's stage is reported only after every branch's answer ends.
 
 import time
 from dataclasses import replace
+from itertools import groupby
 
 import numpy as np
 import pyarrow as pa
@@ -174,10 +175,15 @@ class MapPart(ExecutionPart):
 
     @decoder.setter
     def decoder(self, decoder):
-        self._decoder = decoder
+        self.bind_decoder(decoder)
         decoder.slot_maps[self.first] = {
             anchor: self.first + q for anchor, (q, _) in self.branch_of.items()}
-        decoder.share |= getattr(self.nodes[0], "attention", "") == "tree"
+
+    def bind_decoder(self, decoder):
+        """Attach answer storage after the branch slots have been assigned."""
+        self._decoder = decoder
+        decoder.share |= any(getattr(node, "attention", "") == "tree"
+                             for node in self.nodes)
 
     def _slots(self, q: int, documents) -> np.ndarray:
         """The decoder slots of map q's answers over the documents."""
@@ -239,3 +245,52 @@ class MapPart(ExecutionPart):
 
     def results(self) -> dict:
         return self._results
+
+
+class AnswerBranches(MapPart):
+    """Adjacent map and extraction fields sharing one branching stage."""
+
+    def __init__(self, parts):
+        self.parts = parts
+        first = parts[0]
+        super().__init__(first.state, [node for part in parts for node in part.nodes],
+                         first.ids, first.first)
+        self.asked = [asked for part in parts for asked in part.asked]
+
+    def branch_inputs(self, prefixes, keys, tree, page_tokens, stage):
+        result = super().branch_inputs(prefixes, keys, tree, page_tokens, stage)
+        for part in self.parts:
+            start = part.first - self.first
+            part.slots = self.slots[start:start + len(part.nodes)]
+        return result
+
+    def bind_decoder(self, decoder):
+        super().bind_decoder(decoder)
+        for part in self.parts:
+            part.bind_decoder(decoder)
+
+    def finish(self, every):
+        self.own = [part.finish(every) for part in self.parts]
+        return sum(self.own)
+
+    def complete(self, fresh, spans, stats, offset):
+        for index, part in enumerate(self.parts):
+            tokens = fresh - sum(self.own[1:]) if index == 0 else self.own[index]
+            share = tokens / max(1, fresh)
+            selected = [({j: n * share for j, n in rows.items()}, total, start, end)
+                        for rows, total, start, end in spans]
+            part.complete(tokens, selected, stats if index == 0 else {}, offset)
+
+    def results(self):
+        return {key: value for part in self.parts
+                for key, value in part.results().items()}
+
+
+def branch_parts(parts):
+    """Coalesce adjacent answer parts without crossing dependent conditions."""
+    combined = []
+    for answers, group in groupby(parts, lambda part: isinstance(part, MapPart)):
+        members = list(group)
+        combined.extend([AnswerBranches(members)] if answers and len(members) > 1
+                        else members)
+    return combined

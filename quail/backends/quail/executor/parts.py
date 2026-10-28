@@ -190,6 +190,9 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
     documents are admitted only while the ones in flight are expected
     to fall short of it, by the parts' selectivities.
     """
+    from quail.backends.quail.executor.operators.map import branch_parts
+
+    parts = branch_parts(parts)
     stages = gated_stages(parts)
     dependencies = {}
     for part, (low, _) in zip(parts, _part_slices(parts)):
