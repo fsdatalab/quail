@@ -333,9 +333,9 @@ def test_map_and_copy_fields_can_reuse_a_slot_without_changing_saved_spans():
 
 
 @pytest.mark.parametrize("map_first", [False, True])
-@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("tested", [None, "extract", "map"])
 def test_maps_and_extracts_share_branches_without_changing_results(
-    monkeypatch, map_first, gated
+    monkeypatch, map_first, tested
 ):
     from helpers.fakes import cpu_staging
     from helpers.kv_checker import Setup, chain, make_arena
@@ -399,17 +399,21 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     maps = mapped("summary", 0 if map_first else 2)
     parts = [maps, extracts] if map_first else [extracts, maps]
     after = mapped("after", 3)
-    if gated:
+    if tested:
+        producer = extracts if tested == "extract" else maps
+        column = "answer1" if tested == "extract" else "summary"
+        source = "extract:1" if tested == "extract" else "summary"
         condition = Filter(
             node_id="condition",
             aliases=("c",),
             written_position=0,
-            inputs=input_ports((PortRef("extract:1", "rows:c"),)),
+            inputs=input_ports((PortRef(source, "rows:c"),)),
             predicate=RegularPredicate(
-                ColumnRef("c", "contracts", "answer1"), "is not null"
-            ),
+                ColumnRef("c", "contracts", column),
+                "is not null" if tested == "extract" else "<>",
+                None if tested == "extract" else ""),
         )
-        parts.extend([ConditionGate(condition, extracts, extracts), after])
+        parts.extend([ConditionGate(condition, producer, producer), after])
     results = execute_parts(
         state,
         parts,
@@ -454,24 +458,25 @@ def test_maps_and_extracts_share_branches_without_changing_results(
                 if answer.span is None
                 else dict(start=answer.span[0], end=answer.span[1])
             )
-    if gated:
-        expected = [
-            document.answers[1].answer is not None
-            for document in extracts.extraction.documents
-        ]
+    if tested:
+        expected = ([document.answers[1].answer is not None
+                     for document in extracts.extraction.documents]
+                    if tested == "extract" else [bool(value) for value in
+                        results["summary"].outputs["rows:c"].column("summary").to_pylist()])
         assert any(expected)
         assert after.asked[0].tolist() == expected
     assert len(set(maps.slots.flat) & set(extracts.slots.flat)) == 0
     assert not arena.accounting.owned
 
 
+@pytest.mark.parametrize("kind", ["extract", "map"])
 @pytest.mark.parametrize("gated", [False, True])
 def test_later_questions_wait_only_for_the_answer_their_condition_reads(
-    monkeypatch, gated
+    monkeypatch, gated, kind
 ):
     from helpers.fakes import cpu_staging, fake_pipeline
     from helpers.kv_checker import Setup, chain, make_arena
-    from test_map_decode import Bits, TokenModel, map_node, next_token
+    from test_map_decode import Bits, TokenModel, batch_decode, map_node, next_token
 
     from quail.backends.quail.executor.operators.extract import ExtractPart
     from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
@@ -506,8 +511,11 @@ def test_later_questions_wait_only_for_the_answer_their_condition_reads(
     extracts = ExtractPart(
         state, nodes, [0], {"documents": {"c": None}, "texts": {"c": [text]}}, first=1
     )
+    vocabulary.tokenizer.batch_decode = batch_decode
+    producer = extracts if kind == "extract" else MapPart(state, [
+        map_node(f"answer{q}", [600 + q, 610 + q], 32) for q in range(3)], [0], 1)
     parent = MapPart(state, [map_node("parent", [500, 501], 1)], [0], 0)
-    parts = [parent, extracts]
+    parts = [parent, producer]
     if gated:
         condition = SimpleNamespace(
             column="answer1",
@@ -515,7 +523,7 @@ def test_later_questions_wait_only_for_the_answer_their_condition_reads(
                 ColumnRef("c", "contracts", "answer1"), "is not null"
             ),
         )
-        parts.append(ConditionGate(condition, extracts, extracts))
+        parts.append(ConditionGate(condition, producer, producer))
     question = [760, 761]
     parts.append(FilterPart(SimpleNamespace(question_token_ids=question), [0], Bits()))
     parts = branch_parts(parts)
@@ -551,7 +559,7 @@ def test_later_questions_wait_only_for_the_answer_their_condition_reads(
         tokens = chunk.input_ids.tolist()
         if any(tokens[i : i + 2] == question for i in range(len(tokens) - 1)):
             observed.append(
-                [int(decoder.lengths[q + 1][extracts.slots[q, 0]]) for q in range(3)]
+                [int(decoder.lengths[q + 1][producer.slots[q, 0]]) for q in range(3)]
             )
         return model.forward_chunk(chunk)
 
@@ -569,7 +577,7 @@ def test_later_questions_wait_only_for_the_answer_their_condition_reads(
     )
     assert len(observed) == 1
     assert observed[0] == [-1, 3 if gated else -1, -1]
-    assert [int(decoder.lengths[q + 1][extracts.slots[q, 0]]) for q in range(3)] == [
+    assert [int(decoder.lengths[q + 1][producer.slots[q, 0]]) for q in range(3)] == [
         32,
         3,
         32,

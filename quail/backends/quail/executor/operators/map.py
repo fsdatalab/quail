@@ -15,6 +15,7 @@ import pyarrow as pa
 
 from quail.backends.quail.executor.extract import load_vocabulary
 from quail.backends.quail.executor.parts import (
+    ColumnPart,
     ExecutionPart,
     document_inputs,
     execute_parts,
@@ -79,7 +80,7 @@ def execute_maps(state, nodes, inputs) -> dict:
     return results
 
 
-class MapPart(ExecutionPart):
+class MapPart(ColumnPart, ExecutionPart):
     """One pipeline's consecutive maps, decoded as branches at one stage."""
 
     combine = True
@@ -208,19 +209,24 @@ class MapPart(ExecutionPart):
         self.fed = [int(n) for n in rows]
         return tails + sum(self.fed)
 
+    def column_values(self, index, positions) -> tuple:
+        tokens = self.decoder.answers(self.first + index, self._slots(index, positions))
+        tokenizer = load_vocabulary(self.state).tokenizer
+        return (pa.array(tokenizer.batch_decode(tokens, skip_special_tokens=True),
+                         pa.string()),)
+
     def complete(self, fresh, spans, stats, offset):
         """Build each map's answer table and attribute its GPU work."""
-        tokenizer = load_vocabulary(self.state).tokenizer
         own = [int(asked.sum()) * len(node.spec.prompt_token_parts[1]) + fed
                for asked, node, fed in zip(self.asked, self.nodes, self.fed)]
         for q, node in enumerate(self.nodes):
             spec = node.spec
             asked = np.flatnonzero(self.asked[q])
             tokens = self.decoder.answers(self.first + q, self._slots(q, asked))
-            answers = tokenizer.batch_decode(tokens, skip_special_tokens=True)
+            (values,) = self.column_values(q, asked)
             (alias,) = spec.aliases
             rows = Rows({alias: self.ids[asked].astype(np.int32)},
-                        pa.table({spec.name: pa.array(answers, pa.string())}))
+                        pa.table({spec.name: values}))
             rows = join_prior_rows(rows, alias, self.priors, self.prior_tables)
             selected = stage_spans(spans, offset, offset + 1)
             fresh_tokens = fresh - sum(own[1:]) if q == 0 else own[q]

@@ -123,7 +123,8 @@ def greedy(prompt, limit):
 def map_node(name, tail, limit, attention=""):
     return SimpleNamespace(attention=attention, spec=SimpleNamespace(
         name=name, prompt_token_parts=((), tuple(tail)), max_answer_tokens=limit,
-        expected_answer_tokens=min(64, limit)))
+        expected_answer_tokens=min(64, limit), aliases=("d",),
+        output_columns=("d", name)))
 
 
 def events_torch(lag):
@@ -153,7 +154,8 @@ def classification_and_condition(ids):
         return True
 
     classification = ClassifyPart(
-        SimpleNamespace(spec=SimpleNamespace(name="label")), ids,
+        SimpleNamespace(spec=SimpleNamespace(name="label", aliases=("d",),
+                                              output_columns=("d", "label"))), ids,
         SimpleNamespace(labels=labels, stages=[Stage(
             suffixes=[[702]], frame=[700, 701], single=True,
             readout=Bits(), decide=classify)]))

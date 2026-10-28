@@ -165,3 +165,22 @@ def test_count_star_returns_zero_when_no_features_pass_the_filter(session):
         f"SELECT COUNT(*) AS n FROM reviews r, {UNNEST} "
         f"WHERE f.strength > 3")
     assert finish(query, _unnest_oracle()).collect().to_pylist() == [{"n": 0}]
+
+
+@pytest.mark.parametrize("comparison, num_rows", [("IS NULL", 0), ("IS NOT NULL", 3)])
+def test_feature_list_null_tests_keep_empty_lists(session, comparison, num_rows):
+    query = session.sql(
+        "SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), "
+        "pooling => 'last') AS features FROM reviews r "
+        f"WHERE features {comparison}")
+    assert finish(query, Oracle(features=lambda spec, document: []))\
+        .collect().num_rows == num_rows
+
+
+@pytest.mark.parametrize("test", ["features = 'x'", "LENGTH(features) > 0"])
+def test_feature_lists_must_be_unnested_before_testing_their_fields(session, test):
+    with pytest.raises(CompileError, match="UNNEST"):
+        session.sql(
+            "SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), "
+            "pooling => 'last') AS features FROM reviews r "
+            f"WHERE {test}")

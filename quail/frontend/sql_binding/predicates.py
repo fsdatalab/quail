@@ -257,6 +257,11 @@ def column_test(b, test: PlainTest, selected: dict) -> tuple | None:
         column_expression(ColumnRef(alias, dict(b.tables)[alias], name),
                           (), test.function), test.comparison, test.value)
     if call.kind == "features":
+        if (test.function is not None
+                or test.comparison not in ("is null", "is not null")):
+            raise CompileError(
+                "AI.SAE_FEATURES returns a list; test IS NULL or IS NOT NULL, "
+                "or UNNEST it to test its fields")
         predicate.validate()
     else:
         predicate.validate_text_column()

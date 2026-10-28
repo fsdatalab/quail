@@ -6,6 +6,7 @@ import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail.executor.parts import (
+    ColumnPart,
     SingleResultPart,
     document_inputs,
     join_prior_rows,
@@ -42,7 +43,7 @@ def _feature_column(lengths, indices, strengths) -> pa.ListArray:
     return pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), values)
 
 
-class SaeFeaturesPart(SingleResultPart):
+class SaeFeaturesPart(ColumnPart, SingleResultPart):
     """One feature call's stage and result table within a pipeline."""
 
     model_inputs = staticmethod(document_inputs)
@@ -96,7 +97,7 @@ class SaeFeaturesPart(SingleResultPart):
         self.prior_tables = prior_tables
         self.values = [None] * len(self.ids)
         self.pending = {}        # anchor -> settled handle not yet read
-        self.harvested = []      # (anchors, lengths, indices, strengths)
+        self.harvested = []      # (anchors, feature-list array)
         self.reached = 0
         torch = state.torch
         encoder = sae_encoder(state)
@@ -140,9 +141,13 @@ class SaeFeaturesPart(SingleResultPart):
             decide=decide, single=True,
             label=f"sae features {spec.name}")]
 
-    @property
-    def tested_columns(self) -> tuple[str, ...]:
-        return ()
+    def column_values(self, index, positions) -> tuple:
+        if self.node.spec.pooling == "max":
+            self._harvest(completed_only=False, positions=positions)
+            return (pa.array([self.values[position] for position in positions],
+                             type=FEATURE_LIST),)
+        return (_feature_column(*feature_lists_of_rows(
+            [self.values[position] for position in positions], self.keep)),)
 
     def finish(self, every) -> int:
         """Read the settled maxima that have landed; return the suffix tokens."""
@@ -150,46 +155,45 @@ class SaeFeaturesPart(SingleResultPart):
         head, tail = self.node.spec.prompt_token_parts
         return self.reached * len(tail)
 
-    def _harvest(self, *, completed_only: bool) -> None:
-        """Unpack pending handles slab by slab, never waiting mid-run.
+    def _harvest(self, *, completed_only: bool, positions=None) -> None:
+        """Unpack settled handles, optionally waiting for their copies.
 
-        finish() runs between chunks, so it reads only slabs whose
-        copies have landed and the GPU keeps working underneath;
-        result() reads the rest once the pipeline is done.
+        finish() reads completed slabs only. A condition reads its
+        requested positions; result() reads everything left.
         """
         if self.accumulator is None or not self.pending:
             return
-        anchors = np.fromiter(self.pending, np.int64, len(self.pending))
+        anchors = np.asarray(list(self.pending) if positions is None else [
+            position for position in positions if position in self.pending], np.int64)
         taken, lengths, indices, strengths = self.accumulator.harvest(
             [self.pending[anchor] for anchor in anchors],
             completed_only=completed_only)
         if not taken.size:
             return
         read = anchors[taken]
-        self.harvested.append((read, lengths, indices, strengths))
-        for anchor in read.tolist():
+        values = _feature_column(lengths, indices, strengths)
+        self.harvested.append((read, values))
+        for anchor, value in zip(read.tolist(), values):
+            self.values[anchor] = value
             del self.pending[anchor]
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec
         if spec.pooling == "max":
             self._harvest(completed_only=False)
-            batches = self.harvested or [(np.empty(0, np.int64),) * 2 + (
-                np.empty(0, np.int32), np.empty(0, np.float32))]
-            answered, lengths, indices, strengths = (
-                np.concatenate(column) for column in zip(*batches))
-            answered = answered.tolist()
+            batches = self.harvested or [(np.empty(0, np.int64),
+                                         pa.array([], type=FEATURE_LIST))]
+            answered = np.concatenate([anchors for anchors, _ in batches]).tolist()
+            values = pa.concat_arrays([column for _, column in batches])
         else:
             answered = [index for index, value in enumerate(self.values)
                         if value is not None]
-            lengths, indices, strengths = feature_lists_of_rows(
-                [self.values[index] for index in answered],
-                self.keep)
+            (values,) = self.column_values(0, answered)
         rows = np.asarray([[self.ids[index]] for index in answered],
                           dtype=np.int32).reshape(-1, 1)
         (alias,) = spec.aliases
         listed = Rows({alias: rows[:, 0]}, pa.table({
-            spec.name: _feature_column(lengths, indices, strengths)}))
+            spec.name: values}))
         listed = join_prior_rows(listed, alias, self.priors, self.prior_tables)
         return NodeResult(classify_outputs(self.node, listed), NodeMetrics(
             input_rows=self.reached, output_rows=len(answered),

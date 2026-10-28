@@ -100,9 +100,8 @@ class FilterPart(SingleResultPart):
 class ConditionGate(SingleResultPart):
     """Pipeline condition that drops documents whose tested value fails.
 
-    The value is a label a ClassifyPart decoded or an answer or span
-    an ExtractPart copied, read as each document's settles; the
-    pipeline then skips the document's later stages and frees its KV.
+    The value is a settled column-operator result. The pipeline skips
+    a rejected document's later stages and frees its KV.
     """
 
     stages = ()
@@ -130,10 +129,8 @@ class ConditionGate(SingleResultPart):
     def answer_dependencies(self):
         if not self.producer.answer_limits:
             return ()
-        return tuple(self.producer.first + q
-                     for q, node in enumerate(self.producer.nodes)
-                     if self.node.column in (node.spec.name,
-                                              getattr(node.spec, "span_name", None)))
+        index, _ = self.producer.column_sources[self.node.column]
+        return (self.producer.first + index,)
 
     def gate(self, key):
         # values settle as chunks finish, so each is tested as its
@@ -141,8 +138,7 @@ class ConditionGate(SingleResultPart):
         # evaluated once
         values = self.producer.tested_values(self.node.column,
                                              [self.position[key[1]]])
-        value = values[0].as_py()
-        token = tuple(sorted(value.items())) if isinstance(value, dict) else value
+        token = values[0]
         if token not in self.accepted:
             self.accepted[token] = bool(self.node.predicate.accepts(
                 pa.table({self.node.column: values}))[0].as_py())

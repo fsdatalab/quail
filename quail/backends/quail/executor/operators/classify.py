@@ -10,6 +10,7 @@ from quail.backends.quail.executor.label_stages import (
 )
 from quail.backends.quail.executor.parts import (
     AnswerStream,
+    ColumnPart,
     SingleResultPart,
     execute_parts,
     join_prior_rows,
@@ -130,7 +131,7 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
     return ClassifyPart(node, ids, plan, kept=kept)
 
 
-class ClassifyPart(ClassifyBatch):
+class ClassifyPart(ColumnPart, ClassifyBatch):
     """Classification stages and result tables within a pipeline."""
 
     @staticmethod
@@ -168,15 +169,9 @@ class ClassifyPart(ClassifyBatch):
     def results(self) -> dict:
         return {self.node.node_id: self.result_value}
 
-    @property
-    def tested_columns(self) -> tuple[str, ...]:
-        """The columns a Filter in the pipeline may test."""
-        return (self.node.spec.name,)
-
-    def tested_values(self, column: str, positions) -> pa.Array:
-        """Return the labels decoded so far of the documents at the positions."""
-        return pa.array([self.plan.labels[position] for position in positions],
-                        pa.string())
+    def column_values(self, index, positions) -> tuple:
+        return (pa.array([self.plan.labels[position] for position in positions],
+                         pa.string()),)
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec

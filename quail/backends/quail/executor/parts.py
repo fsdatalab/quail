@@ -157,6 +157,31 @@ class ExecutionPart(ABC):
         """Return completed results keyed by node or output name."""
 
 
+class ColumnPart:
+    """Settled output columns available to conditions in a pipeline."""
+
+    @property
+    def column_sources(self) -> dict:
+        """Map each computed column to its node and value indices."""
+        return {column: (index, field)
+                for index, node in enumerate(self.nodes)
+                for field, column in enumerate(
+                    node.spec.output_columns[len(node.spec.aliases):])}
+
+    @property
+    def tested_columns(self) -> tuple[str, ...]:
+        return tuple(self.column_sources)
+
+    def tested_values(self, column, positions):
+        """Read one settled column at positions among the part's documents."""
+        index, field = self.column_sources[column]
+        return self.column_values(index, positions)[field]
+
+    @abstractmethod
+    def column_values(self, index, positions) -> tuple:
+        """Read a node's settled arrays in its output-column order."""
+
+
 class SingleResultPart(ExecutionPart):
     """Prepared work whose execution produces one result."""
 

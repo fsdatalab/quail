@@ -4,7 +4,6 @@ import time
 from dataclasses import replace
 
 import numpy as np
-import pyarrow as pa
 
 from quail.backends.quail.executor.extract import (
     ExtractionStages,
@@ -13,6 +12,7 @@ from quail.backends.quail.executor.extract import (
 from quail.backends.quail.executor.extract.stages import ExtractionInputs
 from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import (
+    ColumnPart,
     ExecutionPart,
     execute_parts,
     gpu_seconds,
@@ -108,7 +108,7 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
     return results
 
 
-class RecurrentExtractPart(ExecutionPart):
+class RecurrentExtractPart(ColumnPart, ExecutionPart):
     """Extraction stages and per-question results for the shared executor."""
 
     combine = True
@@ -170,32 +170,15 @@ class RecurrentExtractPart(ExecutionPart):
     def appended_tokens(self) -> int:
         return self.extraction.appended_tokens
 
-    @property
-    def tested_columns(self) -> tuple[str, ...]:
-        """The columns a Filter in the pipeline may test."""
-        return tuple(name for node in self.nodes
-                     for name in (node.spec.name, node.spec.span_name))
+    def answers(self, q, kept=None):
+        return self.extraction.answers(q, kept)
 
-    def tested_values(self, column: str, positions) -> pa.Array:
-        """Return the answers or spans settled so far at the positions.
-
-        Args:
-            column: An extraction's answer or span column.
-            positions: Positions among the part's documents.
-        """
-        q, span = next(
-            (q, column == node.spec.span_name) for q, node in enumerate(self.nodes)
-            if column in (node.spec.name, node.spec.span_name))
-        answers = [
-            self.extraction.documents[position].answers[q] for position in positions
-        ]
-        if not span:
-            return pa.array([answer.answer for answer in answers], pa.string())
-        return pa.array(
-            [None if answer.span is None
-             else {"start": answer.span[0], "end": answer.span[1]}
-             for answer in answers],
-            pa.struct([("start", pa.int32()), ("end", pa.int32())]))
+    def column_values(self, index, positions) -> tuple:
+        values, spans = self.answers(index, positions)
+        spec = self.nodes[index].spec
+        return tuple(extraction_rows(
+            spec.alias, spec.name, spec.span_name, self.ids[positions], values, spans
+        ).values.columns)
 
     def finish(self, every) -> int:
         """Settle every answer; return the tokens the questions fed."""
@@ -227,7 +210,7 @@ class ExtractPart(MapPart):
 
     execute_group = staticmethod(execute_extractions)
     model_inputs = staticmethod(RecurrentExtractPart.model_inputs)
-    tested_columns = RecurrentExtractPart.tested_columns
+    column_values = RecurrentExtractPart.column_values
 
     def __new__(cls, state, nodes, ids, inputs, first=0):
         if getattr(state.loaded_model.arena, "num_state_slots", 0):
@@ -270,17 +253,6 @@ class ExtractPart(MapPart):
     def answers(self, q, kept=None):
         slots = self.slots[q] if kept is None else self.slots[q, kept]
         return self.decoder.output_answers(self.first + q, slots)
-
-    def tested_values(self, column, positions):
-        q, span = next((q, column == node.spec.span_name)
-                       for q, node in enumerate(self.nodes)
-                       if column in (node.spec.name, node.spec.span_name))
-        values, spans = self.answers(q, positions)
-        if not span:
-            return pa.array(values, pa.string())
-        return pa.array([None if value is None else dict(start=value[0], end=value[1])
-                         for value in spans],
-                        pa.struct([("start", pa.int32()), ("end", pa.int32())]))
 
     def finish(self, every):
         fed = super().finish(every)
