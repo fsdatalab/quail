@@ -185,6 +185,15 @@ class MapDecoder:
             scores[mine] = curve[written[mine]]
         return running[np.lexsort((running, written[running], -scores[running]))]
 
+    def answer_reserve(self) -> np.ndarray:
+        """Per map, the tokens 90% of its answers stay within, as known now."""
+        from quail.backends.quail.executor.answer_survival import quantile_tokens
+
+        return np.array([
+            quantile_tokens(self.lengths[q], self.written[q],
+                            self.expected_tokens[q], int(self.limits[q]))
+            for q in range(len(self.limits))], dtype=np.int64)
+
     def running(self):
         """Slots whose next decode row can choose another token."""
         running = np.flatnonzero((self.map >= 0) & ~self.paused)

@@ -591,8 +591,11 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     prefixes, keys, tree, dependencies = maps.branch_inputs(
         documents, [("d", i) for i in ids], prefix_tree(documents, setup.page_tokens),
         setup.page_tokens, 1)
+    # a prior of one-token answers reserves almost nothing, so answers
+    # outgrow their reservations and the tight arena evicts some
     decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), limits,
-                         [STOP], setup.page_tokens)
+                         [STOP], setup.page_tokens,
+                         expected_tokens=[1] * len(limits))
     maps.decoder = decoder
     stats = {}
     run_stages(torch_, arena, pipeline, stages, prefixes, budget,
@@ -605,8 +608,11 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
         np.testing.assert_array_equal(maps.asked[q], maps.asked[0])
         got = [answer.tolist() for answer in decoder.answers(q, maps._slots(q, asked))]
         assert got == [greedy(documents[a] + tail, answer_limit) for a in asked]
-    assert stats["num_evictions"] > 0
-    assert stats["recomputed_tokens"] > 0
+    # one map in a roomy pass can finish within what the arena frees;
+    # several always outgrow it
+    if num_maps > 1:
+        assert stats["num_evictions"] > 0
+    assert (stats["recomputed_tokens"] > 0) == (stats["num_evictions"] > 0)
     assert not decoder.active
     assert not arena.accounting.owned
 

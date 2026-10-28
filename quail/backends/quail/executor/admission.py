@@ -863,7 +863,9 @@ class JoinAdmission:
 
     def done(self):
         if self.limit_reached():
-            return not self.in_flight and not self._settled
+            # a document in flight still finishes every branch it started
+            return (not self.in_flight and not self._settled
+                    and all(self._stage[a] == _DONE for a in self.waiting))
         return len(self.pending) == self._dead and not self.ready \
             and not self.in_flight and not self._settled \
             and all(self._stage[a] == _DONE for a in self.waiting)

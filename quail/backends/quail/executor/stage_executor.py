@@ -185,10 +185,20 @@ class StageExecutor:
             if appended_tokens is not None:
                 kept = min(kept, int(appended_tokens))
             self.capacity_extra = max(self.capacity_extra, len(frame) + kept)
+        # per anchor, the map whose answer it writes; per map, the tokens
+        # admission reserves for an answer, refreshed each pass
+        self.anchor_map = None
+        self.answer_reserve = None
         if self.answer_maps:
-            # One extra page lets a readmitted answer progress before growing again.
+            # every answer starts with a page, so a readmitted one can
+            # write before it grows again
             self.capacity_extra += min(self.arena.page_tokens,
                                        int(self.decoder.limits.max()) - 1)
+            self.anchor_map = np.full(len(self.prefixes), -1, dtype=np.int64)
+            for j, first in self.answer_maps.items():
+                slots = decoder.slot_maps.get(first, {})
+                self.anchor_map[list(slots)] = list(slots.values())
+            self.answer_reserve = decoder.answer_reserve()
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
 
@@ -394,11 +404,28 @@ class StageExecutor:
         parent, shared = (None, 0) if borrow is None else borrow
         points = tuple(t for t in self.share_points[anchor]
                        if shared < t < prefix)
+        capacity = prefix + self.capacity_extra
+        borrowed = (self.keys[parent], shared) if shared else None
+        if self.anchor_map is not None and self.anchor_map[anchor] >= 0:
+            # room for the answer 90% of its map's answers stay within; a
+            # longer one grows past it, and may be evicted for it
+            reserve = max(0, int(self.answer_reserve[self.anchor_map[anchor]])
+                          - self.arena.page_tokens)
+            if self.arena.reserve(
+                    key, prefix, capacity_tokens=capacity + reserve,
+                    borrow=borrowed, extension=self._extends, share_points=points):
+                return self._reserved(anchor, key, parent)
+            if len(self.decoder.running()):
+                return False    # running answers will free pages
+            # nothing running frees pages: start with the one page, and grow
         if not self.arena.reserve(
-                key, prefix, capacity_tokens=prefix + self.capacity_extra,
-                borrow=(self.keys[parent], shared) if shared else None,
+                key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
             return False
+        return self._reserved(anchor, key, parent)
+
+    def _reserved(self, anchor, key, parent):
+        """Hold what an admitted document reads and lends."""
         if parent is not None:
             self.arena.read_state((self.keys[parent],))
             self._reserved_parents[anchor] = self.keys[parent]
@@ -809,6 +836,7 @@ class StageExecutor:
                 self.arena.evict_retained(self.sched.blocked_pages)
             if self.decoder is not None:
                 self._grow_answers()
+                self.answer_reserve = self.decoder.answer_reserve()
             decode = None if self.decoder is None else self.decoder.rows()
             # Answers keep their rows; recomputations and new prompts fill the rest.
             room = self.sched.chunk_budget - (0 if decode is None else len(decode))
