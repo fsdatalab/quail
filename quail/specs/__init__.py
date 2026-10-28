@@ -21,6 +21,7 @@ from .diffusion_gemma_26b import DIFFUSION_GEMMA_26B_FP8
 from .h100_sxm import H100_PRICE_SOURCE, H100_SXM, H100_USD_PER_HOUR
 from .l40s import L40S
 from .lfm2_2_6b import LFM2_2_6B_BF16
+from .lfm3_1_7b import LFM3_1_7B_BF16
 from .qwen3 import qwen3_spec
 from .qwen3_4b import QWEN3_4B_FP8
 from .qwen3_5_2b_sae import QWEN3_5_2B_SAE_BF16
@@ -41,6 +42,7 @@ MODELS = {QWEN3_4B_FP8.name: QWEN3_4B_FP8,
          QWEN3_6_35B_A3B_FP8.name: QWEN3_6_35B_A3B_FP8,
          QWEN3_8_27B_FP8.name: QWEN3_8_27B_FP8,
          LFM2_2_6B_BF16.name: LFM2_2_6B_BF16,
+         LFM3_1_7B_BF16.name: LFM3_1_7B_BF16,
          QWEN3_32B_FP8.name: QWEN3_32B_FP8,
          QWEN3_RERANKER_0_6B_BF16.name: QWEN3_RERANKER_0_6B_BF16,
          QWEN3_RERANKER_4B_BF16.name: QWEN3_RERANKER_4B_BF16,
