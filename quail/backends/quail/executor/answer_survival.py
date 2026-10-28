@@ -21,5 +21,6 @@ def remaining_tokens(lengths, written, expected_tokens, limit, prior_weight=20.0
     events = events[1:] + prior_weight * (prior[:-1] - prior[1:])
     hazard = np.divide(events, risk, out=np.zeros(limit), where=risk > 0)
     survival = np.r_[1.0, np.cumprod(1.0 - hazard)]
+    survival[limit] = 0.0
     tail = np.r_[np.cumsum(survival[:0:-1])[::-1], 0.0]
     return np.divide(tail, survival, out=np.zeros(limit + 1), where=survival > 0)

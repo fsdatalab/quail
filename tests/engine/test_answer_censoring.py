@@ -16,7 +16,7 @@ def test_cold_start_uses_the_map_length_prior():
 
 
 def test_censored_answers_leave_the_risk_set_after_their_written_length():
-    # Risk at 2 is three; the censor at 3 leaves two at risk at 4.
+    # The censor at 3 leaves two answers at risk at 4.
     remaining = remaining_tokens([2, -1, 4, 6], [2, 3, 4, 6], 3, 6,
                                  prior_weight=0)
     survival = np.array([1, 1, .75, .75, .375, .375, 0])
@@ -24,3 +24,8 @@ def test_censored_answers_leave_the_risk_set_after_their_written_length():
     expected[:-1] /= survival[:-1]
     np.testing.assert_allclose(remaining, expected)
     assert remaining[2] > remaining[4] > remaining[5]
+
+
+def test_censored_answers_cannot_survive_beyond_the_answer_limit():
+    remaining = remaining_tokens([-1], [2], 1, 6)
+    np.testing.assert_allclose(remaining[2:], [3, 2, 1, 0, 0])
