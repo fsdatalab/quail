@@ -20,22 +20,3 @@ def prior_survival(expected_tokens: float, limit: int) -> np.ndarray:
     curve = keep ** np.arange(limit + 1, dtype=np.float64)
     curve[limit] = 0.0
     return curve
-
-
-def expected_branches(curves) -> float:
-    """The mean number of one document's answers written per pass.
-
-    A document's answers start together; the document stays in passes
-    while any is unfinished. Each pass t writes Σ S_m(t) answers in
-    expectation, and the document is in pass t with chance
-    1 - Π (1 - S_m(t)), taking answers as independent.
-
-    Args:
-        curves: One survival curve per answer of the document.
-    """
-    width = max(len(curve) for curve in curves)
-    stacked = np.zeros((len(curves), width))
-    for row, curve in zip(stacked, curves):
-        row[:len(curve)] = curve
-    passes = float((1.0 - np.prod(1.0 - stacked, axis=0)).sum())
-    return float(stacked.sum()) / passes if passes else 0.0

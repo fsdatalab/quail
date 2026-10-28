@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from quail.cost.answers import expected_branches, prior_survival
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
 from quail.physical import (
@@ -376,19 +375,20 @@ def _map_attention(graph: PhysicalGraph, context) -> dict:
     The maps over one table are one document's branches: each reads the
     document's pages and its own. A branch's pass has one row, and the
     readers of the document in a pass are the branches still writing,
-    on average expected_branches of their prior survival curves.
+    taking every answer to run to its limit: the limits' sum over the
+    longest limit.
     """
-    curves = {}
+    limits = {}
     for node in graph.nodes:
         if isinstance(node, AiMap) and node.spec is not None:
-            curves.setdefault(node.spec.aliases[0], []).append(prior_survival(
-                node.spec.expected_answer_tokens, node.spec.max_answer_tokens))
+            limits.setdefault(node.spec.aliases[0], []).append(
+                node.spec.max_answer_tokens)
     return {
         alias: choose_attention_path(
-            context.model, context.device, readers=expected_branches(group),
+            context.model, context.device, readers=sum(group) / max(group),
             reader_rows=1.0,
             node_tokens=_mean(context.document_tokens.get(alias, ())))
-        for alias, group in curves.items()}
+        for alias, group in limits.items()}
 
 
 def _mean(values) -> float:
