@@ -38,9 +38,23 @@ def summarize(record: dict, steps: list[dict]) -> dict:
 
     Recompute seconds are an estimate: each step's duration, the time to
     the next step, split by the share of its tokens that were recomputed.
+    A backend without vLLM's scheduler, such as Quail, has no steps and
+    reports the QUAIL-B metrics alone.
     """
     query = record["queries"][0]
     metrics = query.get("metrics", {})
+    measured = {
+        "query": query["id"], "status": query["status"],
+        "runtime_s": query.get("runtime_s"),
+        "input_tokens_per_second": metrics.get("input_tokens_per_second"),
+        "cost_usd": metrics.get("cost_usd"),
+        "input_tokens": metrics.get("input_tokens"),
+        "fresh_tokens": metrics.get("fresh_tokens"),
+        "minimum_tokens": metrics.get("minimum_tokens"),
+        "regret_approximate": metrics.get("regret_approximate"),
+    }
+    if not steps:
+        return measured
     scheduled = sum(step["scheduled"] for step in steps)
     recomputed = sum(step["recomputed"] for step in steps)
     recompute_s = sum(
@@ -48,13 +62,7 @@ def summarize(record: dict, steps: list[dict]) -> dict:
         for step, later in zip(steps, steps[1:]) if step["scheduled"])
     minimum = metrics.get("minimum_tokens")
     return {
-        "query": query["id"], "status": query["status"],
-        "runtime_s": query.get("runtime_s"),
-        "input_tokens_per_second": metrics.get("input_tokens_per_second"),
-        "cost_usd": metrics.get("cost_usd"),
-        "input_tokens": metrics.get("input_tokens"),
-        "minimum_tokens": minimum,
-        "regret_approximate": metrics.get("regret_approximate"),
+        **measured,
         "num_steps": len(steps),
         "scheduled_tokens": scheduled,
         "recomputed_tokens": recomputed,
@@ -74,7 +82,7 @@ def summarize(record: dict, steps: list[dict]) -> dict:
               volumes=VOLUMES)
 def trace_backend(backend: str, query_id: str, scale_factor: float, model: str,
                   collection_id: str, run_dir: str) -> str:
-    """Run one query on one vLLM backend and save its scheduler steps.
+    """Run one query on one backend and save vLLM's scheduler steps, if any.
 
     Returns:
         The summary as JSON.
@@ -94,8 +102,10 @@ def trace_backend(backend: str, query_id: str, scale_factor: float, model: str,
         data_dir=Path(DATA_DIR) / f"sf{scale_factor}",
         ground_truth_collection=collection_id or None,
         output_dir=str(directory))
-    steps = [json.loads(line) for line in trace.read_text().splitlines()]
-    shutil.copy(trace, directory / "steps.jsonl")
+    steps = []
+    if trace.exists():
+        steps = [json.loads(line) for line in trace.read_text().splitlines()]
+        shutil.copy(trace, directory / "steps.jsonl")
     summary = {"backend": backend, "model": model, "scale_factor": scale_factor,
                **summarize(record, steps)}
     (directory / "summary.json").write_text(json.dumps(summary, indent=1))
