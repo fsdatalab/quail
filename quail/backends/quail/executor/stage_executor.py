@@ -830,6 +830,7 @@ class StageExecutor:
         while self.outstanding:
             self._report_next()
         if self.decoder is not None:
+            self._answers_landed()
             self.decoder.prepare()
         handles = self.readouts.submit(
             normed, entries, chunk.rows_per_answer)
@@ -844,8 +845,6 @@ class StageExecutor:
             # documents with nothing to send at their first stage never run
             for settlement in self.sched.take_settled():
                 self._event(settlement)
-            if self.decoder is not None:
-                self._answers_landed()
             if self.sched.done():
                 break
             if len(self.outstanding) > 1:
@@ -869,6 +868,7 @@ class StageExecutor:
             if not groups:
                 if self.outstanding:
                     self._report_next(partial=True)
+                    self._answers_landed()
                     continue
                 if self.decoder is not None and self.decoder.copy_pending.any():
                     # No other prefill, decode or replay can hide this preparation.
@@ -877,6 +877,7 @@ class StageExecutor:
                 if self.decoder is not None and self.decoder.copies:
                     # Every answer waits on a token still on its way.
                     self.decoder.harvest(wait=True, prepare=False)
+                    self._answers_landed()
                     continue
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):

@@ -365,6 +365,8 @@ def test_prefill_launches_before_copy_setup_and_pending_first_tokens(
     decoder = None
     launched_pending = []
     prepared = []
+    submitted = {}
+    submit = MapDecoder.submit
     forward = TokenModel.forward_chunk
     initialize = CopyConstraint.__init__
     prepare = CopyConstraint.prepare
@@ -373,7 +375,8 @@ def test_prefill_launches_before_copy_setup_and_pending_first_tokens(
     def launched(model, chunk):
         nonlocal num_passes
         num_passes += 1
-        if decoder is not None and decoder.copy_pending.any():
+        if decoder is not None and (decoder.copy_pending.any()
+                                    or decoder.inflight.any()):
             launched_pending.append(num_passes)
             if chunk.decode_rows is not None:
                 assert not decoder.copy_pending[chunk.decode_rows.slots].any()
@@ -383,12 +386,19 @@ def test_prefill_launches_before_copy_setup_and_pending_first_tokens(
         assert num_passes > 0, "candidate setup must run under the first prefill"
         initialize(self, *args)
 
-    def landed(self, copy):
-        nonlocal decoder, first_pending
+    def queued(self, *args):
+        nonlocal decoder
         decoder = self
+        submit(self, *args)
+        for copy in self.copies:
+            submitted.setdefault(id(copy), (copy, num_passes))
+
+    def landed(self, copy):
+        nonlocal first_pending
         read(self, copy)
         if first_pending is None and self.copy_pending.any():
-            first_pending = num_passes
+            first_pending = submitted[id(copy)][1]
+            assert num_passes > first_pending, "ready prefill must precede harvest"
 
     def ready(self, *args):
         if not prepared:
@@ -401,6 +411,7 @@ def test_prefill_launches_before_copy_setup_and_pending_first_tokens(
     monkeypatch.setattr(CopyConstraint, "__init__", configured)
     monkeypatch.setattr(CopyConstraint, "prepare", ready)
     monkeypatch.setattr(MapDecoder, "_read", landed)
+    monkeypatch.setattr(MapDecoder, "submit", queued)
     _, answers, _ = run(vocabulary, list(TEXTS), False, "unified", 3, 512)
     assert answers == expected
     assert launched_pending and prepared
