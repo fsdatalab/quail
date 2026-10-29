@@ -355,3 +355,46 @@ def test_a_distinct_key_reads_only_its_shortest_survivor(tmp_path):
     # no two of the three documents read share a first token
     assert stopped.fresh_tokens == per_document.fresh_tokens
     assert stopped.seconds < every.seconds
+
+
+def test_map_answers_decode_one_pass_per_token_and_share_their_document(tmp_path):
+    # tokens each answer writes, by map and row
+    written = {"plot": {0: 5, 1: 2, 2: 1}, "names": {0: 3, 1: 4, 2: 1}}
+    with _session(tmp_path) as sess:
+        query = (sess.docs("reviews").alias("r")
+                 .ai_map("r.body", "Retell the plot.", name="plot")
+                 .ai_map("r.body", "List the names.", name="names")
+                 .select("r.id", "plot", "names"))
+        maps = {node.call.prompt: node.name
+                for node in query.logical.operators().maps}
+        lowered = {name: quail.lower_prompt(prompt, sess.tokenizer)
+                   for prompt, name in maps.items()}
+
+        def estimate(lengths, shared):
+            def answer(prompt, assignment):
+                return " ".join(["word"] * lengths[maps[prompt]][assignment["r"]])
+            return quail.speed_of_light_estimate(
+                query, answer, credit_shared_prefixes=shared)
+
+        one_token = {name: {row: 1 for row in range(3)} for name in written}
+        estimates = {shared: (estimate(written, shared), estimate(one_token, shared))
+                     for shared in (True, False)}
+    # the longest answer writes 5 tokens: its first from the prompt, then
+    # 4 fed back, one pass each
+    assert estimates[True][0].latency.passes == 4
+    assert sum(stage["answer_rows"]
+               for stage in estimates[True][0].filter_stages) == 16
+    # each fed token reads its document, its map's tail, and the answer
+    # before it; the maps of one review read the review once per pass
+    # with the shared prefix credit, once per answer without it
+    head = lowered["plot"].preamble_tokens
+    expected = {True: 0.0, False: 0.0}
+    for row in range(3):
+        document = head + 2
+        fed = {name: written[name][row] - 1 for name in written}
+        answer_reads = sum(count * lowered[name].tail_tokens + count * (count - 1) / 2
+                  for name, count in fed.items())
+        expected[True] += document * max(fed.values()) + answer_reads
+        expected[False] += document * sum(fed.values()) + answer_reads
+    for shared, (full, base) in estimates.items():
+        assert full.work.kv_read - base.work.kv_read == expected[shared]
