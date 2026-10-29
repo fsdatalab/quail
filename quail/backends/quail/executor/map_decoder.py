@@ -477,9 +477,8 @@ class MapDecoder:
             mine = np.flatnonzero(np.isin(self.map[documents], group.questions))
             if not len(mine):
                 continue
-            index = group.constraint.tensor(mine)
             self._constrain(
-                group, projections[group.key][index], documents[mine], indices[mine],
+                group, projections[group.key], documents[mine], indices[mine],
                 out=values, output_rows=mine)
         host = torch.empty(values.shape, dtype=torch.int64,
                            pin_memory=self.head.is_cuda)
@@ -549,10 +548,9 @@ class MapDecoder:
             offsets = np.repeat(np.cumsum(sizes) - sizes, sizes)
             selected = (np.repeat(first[block], sizes)
                         + np.arange(int(sizes.sum())) - offsets)
-            index = constraint.tensor(np.column_stack(
-                (selected, output_rows[selected])))
-            out[index[:, 1]] = self._constrain_block(
-                group, projected[index[:, 0]], documents[selected], indices[selected],
+            index = constraint.tensor(output_rows[selected])
+            out[index] = self._constrain_block(
+                group, projected[index], documents[selected], indices[selected],
                 int(widths[block].max()), int(num_streams[block].max()), num_steps)
         return out
 
