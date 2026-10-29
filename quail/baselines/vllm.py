@@ -280,8 +280,7 @@ class VLLMClient:
                            tail_texts=None):
         """Decode the answers of each document through the engine's step loop.
 
-        Args:
-            sampling_params: One setting for every field, or one per field.
+        sampling_params is one setting for every field, or one per field.
         """
         return run_extract_fields(
             self.llm.llm_engine,

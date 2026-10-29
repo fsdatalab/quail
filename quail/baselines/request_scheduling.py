@@ -250,12 +250,9 @@ def run_extract_fields(
     enter the queue once that request has written a token, so they read
     the body from the prefix cache instead of computing it again. The
     engine exposes add_request and step, as vLLM's LLMEngine does.
-
-    Args:
-        sampling_params: One sampling setting for every field, or a
-            list with one per field.
-        answer_tokens: The answer tokens each field counts toward the
-            document cap.
+    sampling_params is one setting for every field or a list with one
+    per field; answer_tokens is what each field counts toward the
+    document cap.
 
     Returns:
         A dict with the outputs of each field in document order, the

@@ -1,4 +1,4 @@
-"""Measure how much stock and pipelined vLLM preempt and recompute on a query.
+r"""Measure how much stock and pipelined vLLM preempt and recompute on a query.
 
 Each backend runs the query on its own H100 through the QUAIL-B runner,
 with the baseline's engine settings. A vLLM plugin
@@ -8,7 +8,7 @@ requests preempted, requests running and waiting, and KV in use. Each
 backend's run.json, steps.jsonl, and summary.json go to
 /results/ablations/vllm_preemption/<run id>/<backend>/.
 
-    uv run modal run --detach experiments/cells/vllm_preemption.py::trace \\
+    uv run modal run --detach experiments/cells/vllm_preemption.py::trace \
         --query IMDB-26 2>&1 | tee "$run_log"
 """
 
