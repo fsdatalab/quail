@@ -427,7 +427,8 @@ def child(arguments: str) -> None:
             timeline = window.get("timeline")
             sampler = window.get("sampler")
             probe.start(verify=window.get("verify", False),
-                        eager=window.get("eager", False))
+                        eager=window.get("eager", False),
+                        work=window.get("work", False))
             if sampler is not None:
                 sampler.start()
             import torch
@@ -491,6 +492,7 @@ def child(arguments: str) -> None:
                     torch.profiler.ProfilerActivity.CUDA])
             window["verify"] = mode == "verify"
             window["eager"] = mode == "eager"
+            window["work"] = mode == "work"
             output = run_query(session, spec, tables)
             piecewise = window["piecewise"]
             measures = output.measurements

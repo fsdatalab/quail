@@ -55,6 +55,35 @@ def test_kernel_trace_separates_idle_inside_forward_from_other_gpu_work():
     assert [kernel["name"] for kernel in window["kernels"]] == ["kernel"]
 
 
+def test_attention_work_counts_chunked_prefixes_and_shared_decode_reads():
+    from experiments.cells.piecewise_probe import attention_work
+    from quail.backends.quail.executor.chunk import DecodeRows
+
+    decode = DecodeRows(positions=[0, 1], write_rows=[], page_table=[], slots=[],
+                        shared_cu=[0, 2], shared_used=[100])
+    chunk = SimpleNamespace(
+        tokens=5, attention_mode="unified", row_spans=[("document", 0, 2, 3)],
+        decode_rows=decode, meta=dict(
+            unified=dict(cu_q_host=[0, 3, 5], used_host=[7, 6]), shared={}))
+    got = attention_work(chunk)
+    assert got["causal_pairs"] == 29
+    assert got["prefix_pairs"] == 11
+    assert got["suffix_pairs"] == 7
+    assert got["decode_pairs"] == 11
+    assert got["shared_pairs"] == 200
+
+    def prefill(num_tokens, num_keys):
+        chunk.tokens = num_tokens
+        chunk.row_spans = [("document", 0, num_tokens, num_tokens)]
+        chunk.decode_rows = None
+        chunk.meta = dict(
+            unified=dict(cu_q_host=[0, num_tokens], used_host=[num_keys]), shared=None)
+        return attention_work(chunk)["prefix_pairs"]
+
+    assert prefill(17, 17) + prefill(83, 100) == prefill(100, 100) == 5050
+    assert prefill(4, 2) == 3
+
+
 def test_timeline_clips_to_join_and_merges_concurrent_operations(tmp_path):
     pytest.importorskip("ijson")
     path = tmp_path / "trace.json.gz"
