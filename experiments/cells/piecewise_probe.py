@@ -1,5 +1,6 @@
 """Collect replay coverage and compare real chunk outputs with eager execution."""
 
+from collections import Counter
 from functools import partial
 from types import SimpleNamespace
 
@@ -38,7 +39,9 @@ class PiecewiseProbe:
             replay = not probe.eager and graphs.supports(chunk)
             result = (graphs.pipeline.forward_chunk(chunk) if probe.eager
                       else original(graphs, chunk))
-            record = {"tokens": chunk.tokens, "replay": replay}
+            path = ("shared" if chunk.meta.get("shared") is not None
+                    else chunk.attention_mode)
+            record = {"tokens": chunk.tokens, "replay": replay, "path": path}
             bucket = next((n for n in graphs.token_buckets if n >= chunk.tokens), None)
             signature = (chunk.attention_mode,
                          bool((chunk.meta.get("reads") or {}).get("nodes")),
@@ -60,10 +63,15 @@ class PiecewiseProbe:
                 torch.testing.assert_close(result, expected, rtol=0, atol=0)
                 probe.checked.add(signature)
             probe.records.append(record)
-            probe.capture = {"seconds": graphs.capture_s,
-                             "bytes": graphs.captured_bytes,
-                             "reserved_bytes": graphs.memory_bytes,
-                             "buckets": graphs.token_buckets}
+            if probe.capture is None:
+                probe.capture = {"seconds": graphs.capture_s,
+                                 "bytes": graphs.captured_bytes,
+                                 "reserved_bytes": graphs.memory_bytes,
+                                 "buckets": graphs.token_buckets,
+                                 "layers": len(graphs.pipeline.layers),
+                                 "projection_shapes": [list(linear.weight.shape)
+                                                       for linear in
+                                                       graphs.pipeline.linears()]}
             return result
 
         graph_class.forward = forward
@@ -81,6 +89,7 @@ class PiecewiseProbe:
         """Return capture memory, pass counts, and checked output equality."""
         self.active = False
         return {"passes": len(self.records),
+                "paths": dict(Counter(row["path"] for row in self.records)),
                 "replays": sum(row["replay"] for row in self.records),
                 "capture": self.capture,
                 "checks": [row for row in self.records if "equal" in row]}

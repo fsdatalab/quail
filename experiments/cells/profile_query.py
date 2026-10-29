@@ -99,8 +99,8 @@ def _gpu_gaps(prof, top: int) -> dict:
     gaps.sort(reverse=True)
     by_kernel = {}
     for k_start, k_end, name in kernels:
-        total, calls = by_kernel.get(name[:80], (0.0, 0))
-        by_kernel[name[:80]] = total + k_end - k_start, calls + 1
+        total, calls = by_kernel.get(name, (0.0, 0))
+        by_kernel[name] = total + k_end - k_start, calls + 1
     ranked = sorted(by_kernel.items(), key=lambda item: -item[1][0])
     return {
         "kernels": [{"name": name, "s": round(total / 1e6, 4), "calls": calls}
