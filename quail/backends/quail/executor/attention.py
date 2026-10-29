@@ -177,12 +177,19 @@ class Engine:
             f"activation scales {tuple(input_scale.shape)} do not match "
             f"tokens={tokens} groups={groups}")
 
-    def quant(self, x):
+    def quant(self, x, *, output=None):
         if not self.is_fp8:
             return x, None
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            get_fp8_min_max,
             per_token_group_quant_fp8,
         )
+        if output is not None:
+            assert x.is_contiguous()
+            self.torch.ops._C.per_token_group_fp8_quant(
+                x, *output, GROUP, 1e-10, *get_fp8_min_max(),
+                self.use_ue8m0, True, False)
+            return output
         return per_token_group_quant_fp8(
             x, group_size=GROUP, column_major_scales=True,
             use_ue8m0=self.use_ue8m0)
@@ -815,7 +822,26 @@ class Engine:
             k3, v3, k_pool, v_pool, src, dst,
             ROW=row, ROW_POW2=1 << (row - 1).bit_length())
 
-    def merge_attn_quant(self, out_a, lse_a, out_b, lse_b, source):
+    def write_kv(self, k3, v3, meta, *, tree=False):
+        """Write fresh rows and retained partial pages unless already captured."""
+        if meta.get("kv_written", False):
+            return
+        layer = meta["layer"]
+        if tree:
+            if meta["kv_src"] is not None:
+                self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"], layer)
+            return
+        pool = self._pool(layer, meta["unified"])
+        if pool is None:
+            return
+        if pool["src"].numel():
+            self.kv_row_scatter(k3, v3, pool["src"], pool["dst"], layer)
+        if pool["tail_src"] is not None:
+            k_pool, v_pool = self.arena.layer_kv(layer)
+            self.kv_row_scatter(k_pool, v_pool,
+                                pool["tail_src"], pool["tail_dst"], layer)
+
+    def merge_attn_quant(self, out_a, lse_a, out_b, lse_b, source, *, output=None):
         """Merge cached and fresh attention and write the o_proj input.
 
         The source vector maps each packed row to its row in out_b, or
@@ -828,17 +854,20 @@ class Engine:
         if heads % gpb:
             raise ValueError(
                 f"the merge kernel takes heads in groups of {gpb}, not {heads}")
-        if self.is_fp8:
-            assert dim == GROUP
+        if output is not None:
+            q, scales = output
+        elif self.is_fp8:
             q = self.torch.empty((n, heads * dim), dtype=self.fp8,
                                  device=out_a.device)
             scales = self._col_major_scales(n, heads * dim)
-            scale_strides = scales.stride(1), scales.stride(0)
         else:
             q = self.torch.empty((n, heads * dim), dtype=self.torch.bfloat16,
                                  device=out_a.device)
             scales = None
-            scale_strides = 0, 0
+        if self.is_fp8:
+            assert dim == GROUP
+        scale_strides = ((0, 0) if scales is None
+                         else (scales.stride(1), scales.stride(0)))
         self._triton_kernels()["merge_quant"][(n, heads // gpb)](
             out_a, out_b, lse_a, lse_b, source, q,
             q if scales is None else scales,
@@ -872,7 +901,7 @@ class Engine:
             return self.custom_qk_norm_rope(qkv, positions, attn)
         return self.vllm_qk_norm_rope(qkv, positions, attn)
 
-    def attention(self, q, k, v, chunk):
+    def attention(self, q, k, v, chunk, *, output=None):
         """Attention over the chunk and the arena; the quantized o_proj input.
 
         The chunk carries the path it was packed for. q, k, and v are
@@ -884,23 +913,28 @@ class Engine:
         k3 = k.view(n, KH, D)
         v3 = v.contiguous().view(n, KH, D)
         if chunk.attention_mode == "tree":
-            return self.attention_tree(q3, k3, v3, chunk.meta)
+            return self.attention_tree(q3, k3, v3, chunk.meta, output=output)
         if chunk.meta.get("shared") is not None:
-            return self.attention_shared(q3, k3, v3, chunk.meta)
-        return self.quant(self.attention_unified(q3, k3, v3, chunk.meta))
+            return self.attention_shared(q3, k3, v3, chunk.meta, output=output)
+        target = (output[0].view(n, H, D)
+                  if output is not None and not self.is_fp8 else None)
+        return self.quant(self.attention_unified(
+            q3, k3, v3, chunk.meta, output=target), output=output)
 
     # ---- attention: the two workload paths --------------------------
 
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None, softmax_scale=None,
-            window=None, version=None):
+            window=None, version=None, output=None):
         # LSE comes back as [heads, total_queries] for the merge kernel.
         # Blackwell's head-256 FA4 kernel rejects the SplitKV that
         # num_splits=0 can select.
         from vllm.vllm_flash_attn import flash_attn_varlen_func
         version = version or self.fa_version
         extra = {}
+        if output is not None:
+            extra["out"] = output
         if softmax_scale is not None:
             extra["softmax_scale"] = softmax_scale
         if window is not None:
@@ -919,7 +953,7 @@ class Engine:
             return_softmax_lse=True, **extra)
 
     def _flashinfer_paged(self, q3, kp, vp, metadata, *, causal,
-                          softmax_scale, window):
+                          softmax_scale, window, output=None):
         """Run paged attention with a FlashInfer plan shared across layers."""
         import numpy as np
         from flashinfer import BatchPrefillWithPagedKVCacheWrapper
@@ -958,10 +992,10 @@ class Engine:
                 q3.shape[1], kp.shape[2], q3.shape[2], page_tokens, **options)
             uploaded.record()
             self._flashinfer_plans[key] = metadata, wrapper, uploaded
-        return wrapper.run(q3, (kp, vp))
+        return wrapper.run(q3, (kp, vp), out=output)
 
     def _paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table, *,
-               causal, softmax_scale=None, window=None, metadata=None):
+               causal, softmax_scale=None, window=None, metadata=None, output=None):
         """One paged attention call.
 
         FlashAttention 3, or FlashAttention 4 when the head is wider
@@ -971,16 +1005,16 @@ class Engine:
         if self.fa_version == 4 and q3.shape[-1] == 512:
             return self._flashinfer_paged(
                 q3, kp, vp, metadata, causal=causal,
-                softmax_scale=softmax_scale, window=window)
+                softmax_scale=softmax_scale, window=window, output=output)
         wide = q3.shape[-1] > FA_MAX_HEAD_DIM
         out, _ = self._fa(
             q3, kp, vp, cu_q, None, max_q, max_seqused_k, causal=causal,
             block_table=block_table, seqused_k=seqused_k,
             softmax_scale=softmax_scale, window=window,
-            version=4 if wide else None)
+            version=4 if wide else None, output=output)
         return out
 
-    def attention_tree(self, q3, k3, v3, meta):
+    def attention_tree(self, q3, k3, v3, meta, *, output=None):
         """The tree attention path: two calls, then one fused merge.
 
         Takes (rows, heads, dim) tensors and returns the input pair
@@ -991,17 +1025,17 @@ class Engine:
         if meta.get("canvas") is not None:
             raise ValueError("canvas rows run the unified attention path")
 
-        if meta["kv_src"] is not None:
-            self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"],
-                                layer)
+        self.write_kv(k3, v3, meta, tree=True)
 
+        reads = meta["reads"]
+        target = (output[0].view(n, H, D) if reads is None
+                  and output is not None and not self.is_fp8 else None)
         out_a, lse_a = self._fa(
             q3, k3, v3, meta["cu_a"], meta["cu_a"],
-            meta["max_a"], meta["max_a"], causal=True)
-        reads = meta["reads"]
+            meta["max_a"], meta["max_a"], causal=True, output=target)
         if reads is None:
             meta["layer"] += 1
-            return self.quant(out_a.view(n, H * D))
+            return self.quant(out_a.view(n, H * D), output=output)
 
         rows = reads["rows"]
         q_readers = q3.index_select(0, rows)
@@ -1024,11 +1058,11 @@ class Engine:
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(
-            out_a, lse_a, out_b, lse_b, reads["source"])
+            out_a, lse_a, out_b, lse_b, reads["source"], output=output)
         meta["layer"] += 1
         return q_out, scales
 
-    def attention_shared(self, q3, k3, v3, meta):
+    def attention_shared(self, q3, k3, v3, meta, *, output=None):
         """The unified call, plus one stacked read of shared pages, merged.
 
         Every row reads its own pages in the causal paged call, after
@@ -1040,12 +1074,7 @@ class Engine:
         """
         layer = meta["layer"]
         unified, shared = meta["unified"], meta["shared"]
-        if unified["src"].numel():
-            self.kv_row_scatter(k3, v3, unified["src"], unified["dst"], layer)
-        if unified["tail_src"] is not None:
-            k_pool, v_pool = self.arena.layer_kv(layer)
-            self.kv_row_scatter(k_pool, v_pool,
-                                unified["tail_src"], unified["tail_dst"], layer)
+        self.write_kv(k3, v3, meta)
         kp, vp = self.arena.paged_kv(layer)
         out_a, lse_a = self._fa(
             q3, kp, vp, unified["cu_q"], None, unified["max_q"],
@@ -1057,7 +1086,7 @@ class Engine:
             block_table=shared["table"], seqused_k=shared["used"])
         q_out, scales = self.merge_attn_quant(
             out_a, lse_a.transpose(0, 1), out_b, lse_b.transpose(0, 1),
-            shared["source"])
+            shared["source"], output=output)
         meta["layer"] += 1
         return q_out, scales
 
@@ -1068,7 +1097,7 @@ class Engine:
         return tables.get("sliding") or tables
 
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
-                          window=None):
+                          window=None, output=None):
         """Write current KV to its cache slots, then one causal paged attention call.
 
         The call reads retained and current KV together. Takes
@@ -1093,6 +1122,7 @@ class Engine:
             window: Sliding window in tokens, or None for full
                 attention. Causal rows see `window` keys behind them;
                 canvas rows see `window` keys on either side.
+            output: Optional persistent BF16 attention output, (rows, heads, dim).
         """
         n = q3.shape[0]
         layer = meta["layer"]
@@ -1112,7 +1142,7 @@ class Engine:
             out, _ = self._fa(
                 q3, k3, v3, meta["cu_a"], meta["cu_a"],
                 meta["max_a"], meta["max_a"], causal=True,
-                softmax_scale=softmax_scale, window=behind)
+                softmax_scale=softmax_scale, window=behind, output=output)
             if canvas is not None:
                 q_c = q3.index_select(0, canvas["rows"])
                 out_c, _ = self._fa(
@@ -1122,17 +1152,12 @@ class Engine:
                 out.index_copy_(0, canvas["rows"], out_c)
             meta["layer"] += 1
             return out.view(n, -1)
-        if pool["src"].numel():
-            self.kv_row_scatter(k3, v3, pool["src"], pool["dst"], layer)
-        if pool["tail_src"] is not None:
-            k_pool, v_pool = self.arena.layer_kv(layer)
-            self.kv_row_scatter(k_pool, v_pool,
-                                pool["tail_src"], pool["tail_dst"], layer)
+        self.write_kv(k3, v3, meta)
         kp, vp = self.arena.paged_kv(layer)
         out = self._paged(
             q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
             pool["max_used"], pool["table"], causal=True,
-            softmax_scale=softmax_scale, window=behind, metadata=pool)
+            softmax_scale=softmax_scale, window=behind, metadata=pool, output=output)
         if canvas is not None:
             q_c = q3.index_select(0, canvas["rows"])
             out_c = self._paged(

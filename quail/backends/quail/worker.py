@@ -137,6 +137,11 @@ class LoadedGpu:
         if arena_pages is not None:
             slots = checkpoint_arena_args(
                 self.spec, self.device, chunk_tokens, arena_pages[0])
+            graphs = self.pipeline.piecewise_graphs
+            if (graphs is not None and tuple(arena_pages)
+                    != (self.arena.num_pages, self.arena.num_sliding_pages)):
+                self.torch.cuda.synchronize()
+                graphs.invalidate()
             self.arena.resize(*arena_pages, free_resident=True,
                               **{k: v for k, v in slots.items()
                                  if k == "num_state_slots"})

@@ -63,7 +63,7 @@ PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "gpus": 1,
            "documents": {}, **ENVELOPE["settings"]}
 
 
-def test_arena_resize_keeps_pieces_that_do_not_reference_kv(booted, monkeypatch):
+def test_arena_resize_releases_pieces_that_write_kv(booted, monkeypatch):
     calls = []
     gpu = LoadedGpu.__new__(LoadedGpu)
     gpu.torch = sys.modules["torch"]
@@ -84,7 +84,7 @@ def test_arena_resize_keeps_pieces_that_do_not_reference_kv(booted, monkeypatch)
     assert calls == ["resize"]
     calls.clear()
     gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
-    assert calls == ["resize"]
+    assert calls == ["synchronize", "invalidate", "resize"]
 
 
 def test_prepared_boot_is_handed_to_the_query_and_used_once(

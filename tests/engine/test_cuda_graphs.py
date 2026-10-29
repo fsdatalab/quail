@@ -7,6 +7,7 @@ import pytest
 
 from quail.backends.quail.executor.cuda_graphs import (
     CapturedPieces,
+    KVWriteBuffers,
     PiecewiseBuffers,
     PiecewiseGraphs,
 )
@@ -21,13 +22,15 @@ def chunk(num_tokens=5):
         input_ids=torch.arange(12, 12 + num_tokens),
         positions=torch.arange(num_tokens), tokens=num_tokens,
         final_indices=torch.tensor([num_tokens - 1]), attention_mode="tree",
-        meta={"layer": 0, "kv_dst": torch.arange(num_tokens)})
+        meta={"layer": 0, "kv_src": torch.arange(num_tokens),
+              "kv_dst": torch.arange(num_tokens), "unified": None})
 
 
 def pipeline():
     return SimpleNamespace(
         engine=SimpleNamespace(
             torch=torch, num_q_heads=2, num_kv_heads=1, head_dim=2,
+            arena=SimpleNamespace(k=[], page_tokens=16, has_sliding=False),
             quant=lambda q: (q.clone(), torch.ones(q.shape[0], 1))),
         final_norm=SimpleNamespace(weight=torch.zeros(4)), forward_hook=None,
         forward_chunk=lambda chunk: "eager")
@@ -58,19 +61,19 @@ def test_padding_never_reaches_attention_or_writes_kv(mode):
     source.attention_mode = mode
     buffers.copy(source)
     assert buffers.ids.tolist() == [12, 13, 14, 15, 16, 0, 0, 0]
-    kv = torch.zeros(8, 2, dtype=torch.bfloat16)
-
-    def attention(q, k, v, received):
+    def attention(q, k, v, received, *, output):
         assert received is source
         assert q.shape[0] == k.shape[0] == v.shape[0] == source.tokens
-        kv[received.meta["kv_dst"]] = v
-        return q, torch.ones(source.tokens, 1)
+        assert output[0].data_ptr() == buffers.o_in.data_ptr()
+        assert output[1].data_ptr() == buffers.o_scale.data_ptr()
+        output[0].fill_(7)
+        output[1].fill_(2)
 
     model.engine.attention = attention
-    buffers.v.fill_(7)
     buffers.attention(model, source)
-    assert (kv[:5] == 7).all()
-    assert (kv[5:] == 0).all()
+    assert (buffers.o_in[:5] == 7).all()
+    assert (buffers.o_in[5:] == 0).all()
+    assert buffers.q.data_ptr() != buffers.o_in.data_ptr()
     source = chunk(2)
     buffers.copy(source)
     assert buffers.ids.tolist() == [12, 13, 0, 0, 0, 0, 0, 0]
@@ -78,12 +81,52 @@ def test_padding_never_reaches_attention_or_writes_kv(mode):
     buffers.attention(model, source)
 
 
+def test_captured_kv_mappings_mask_padding_and_keep_partial_page_order():
+    from quail.backends.quail.executor.attention import Engine
+
+    engine = Engine.__new__(Engine)
+    keys = [torch.zeros(16, 1, 2), torch.zeros(16, 1, 2)]
+    values = [torch.zeros_like(k) for k in keys]
+    engine.arena = SimpleNamespace(
+        sliding_layers={1}, layer_kv=lambda layer: (keys[layer], values[layer]))
+
+    def scatter(k, v, src, dst, layer):
+        live = dst >= 0
+        keys[layer][dst[live]] = k[src[live]]
+        values[layer][dst[live]] = v[src[live]]
+
+    engine.kv_row_scatter = scatter
+    full = KVWriteBuffers(torch, 3, 16, device="cpu")
+    sliding = KVWriteBuffers(torch, 3, 16, device="cpu")
+    mapping = dict(src=torch.tensor([0]), dst=torch.tensor([2]),
+                   tail_src=torch.tensor([2]), tail_dst=torch.tensor([7]))
+    full.copy(mapping)
+    sliding.copy(dict(mapping, dst=torch.tensor([4]), tail_src=torch.tensor([4])))
+    meta = dict(layer=0, unified=dict(full.meta, sliding=sliding.meta))
+    k, v = torch.full((3, 1, 2), 5.0), torch.full((3, 1, 2), 9.0)
+    for layer, row in ((0, 2), (1, 4)):
+        meta["layer"] = layer
+        engine.write_kv(k, v, meta)
+        assert (keys[layer][[row, 7]] == 5).all()
+        assert (values[layer][[row, 7]] == 9).all()
+        assert keys[layer].count_nonzero() == 4
+    full.copy(None)
+    assert (full.meta["dst"] == -1).all()
+    assert (full.meta["tail_dst"] == -1).all()
+    assert not full.supports(dict(mapping, tail_dst=torch.arange(49)))
+    meta["kv_written"] = True
+    keys[1].zero_()
+    engine.write_kv(k, v, meta)
+    assert not keys[1].count_nonzero()
+
+
 @pytest.mark.parametrize("unsupported", ["large", "empty", "disabled", "hook",
-                                          "canvas", "uncaptured"])
+                                          "canvas", "uncaptured", "arena", "writes"])
 def test_unsupported_batches_fall_back(unsupported):
     model = pipeline()
     graphs = PiecewiseGraphs(model, token_buckets=(8,), memory_bytes=1024)
-    graphs.graphs = [object()]
+    graphs.storage = model.engine.arena.k
+    graphs.graphs = [CapturedPieces(PiecewiseBuffers(model, 8, device="cpu"), [])]
     source = chunk()
     assert graphs.supports(source)
     match unsupported:
@@ -99,6 +142,10 @@ def test_unsupported_batches_fall_back(unsupported):
             source.meta["canvas"] = object()
         case "uncaptured":
             graphs.graphs.clear()
+        case "arena":
+            model.engine.arena.k = []
+        case "writes":
+            source.meta["kv_dst"] = torch.arange(9)
     assert graphs.forward(source) == "eager"
     assert graphs.replays == 0
 
@@ -106,7 +153,8 @@ def test_unsupported_batches_fall_back(unsupported):
 def test_shared_reads_and_prefill_chunks_are_supported():
     model = pipeline()
     graphs = PiecewiseGraphs(model, token_buckets=(8,), memory_bytes=1024)
-    graphs.graphs = [object()]
+    graphs.storage = model.engine.arena.k
+    graphs.graphs = [CapturedPieces(PiecewiseBuffers(model, 8, device="cpu"), [])]
     source = chunk()
     source.meta.update(max_a=1000, reads={"nodes": object(), "max_used": 100000})
     assert graphs.supports(source)
@@ -118,8 +166,9 @@ def test_replay_returns_independent_output_storage():
     model = pipeline()
     buffers = PiecewiseBuffers(model, 8, device="cpu")
     buffers.output.copy_(torch.arange(32).reshape(8, 4))
-    model.engine.attention = lambda q, k, v, chunk: (q, torch.ones(len(q), 1))
+    model.engine.attention = lambda q, k, v, chunk, **kw: None
     graphs = PiecewiseGraphs(model, token_buckets=(8,), memory_bytes=1024)
+    graphs.storage = model.engine.arena.k
     graphs.graphs = [CapturedPieces(buffers, [
         SimpleNamespace(replay=lambda: None), SimpleNamespace(replay=lambda: None)])]
     actual = graphs.forward(chunk())
@@ -145,7 +194,7 @@ def test_capture_accounts_for_inactive_private_pool_storage(monkeypatch, memory_
             dict(segment_pool_id=pool, total_size=80, allocated_size=20),
             dict(segment_pool_id=(0, 0), total_size=1000, allocated_size=0)])
     model = SimpleNamespace(
-        engine=SimpleNamespace(torch=SimpleNamespace(
+        engine=SimpleNamespace(arena=SimpleNamespace(k=[]), torch=SimpleNamespace(
             cuda=cuda, inference_mode=nullcontext)), layers=[None])
     monkeypatch.setattr(cuda_graphs, "PiecewiseBuffers", lambda *a: SimpleNamespace(
         piece=lambda *a: None))
