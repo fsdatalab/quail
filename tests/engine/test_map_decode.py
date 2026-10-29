@@ -33,6 +33,7 @@ from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext
 from quail.physical import AiJoin, AiMap, MapSpec, PortRef
 from quail.physical.base import input_ports
+from quail.specs import QWEN3_4B_FP8
 
 VOCABULARY = 1024
 STOP = VOCABULARY - 1
@@ -419,6 +420,7 @@ def map_state(setup, arena, forward_chunk):
         torch=events_torch(3), chunk_tokens=setup.budget, async_answers=Bits(),
         loaded_model=SimpleNamespace(
             arena=arena, pipeline=pipeline, input_staging=None,
+            model_spec=QWEN3_4B_FP8,
             model=SimpleNamespace(quail_full_head=torch.eye(VOCABULARY)),
             vocabulary=SimpleNamespace(stop_ids=[STOP], tokenizer=SimpleNamespace(
                 batch_decode=batch_decode))))

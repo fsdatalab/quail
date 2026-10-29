@@ -146,7 +146,8 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
     monkeypatch.setenv("QUAIL_EXTRACT_TRACE", str(new_path))
     decoder = MapDecoder(
         events_torch(0), head, num_questions, [12] * num_questions,
-        vocabulary.stop_ids, 16
+        vocabulary.stop_ids, 16,
+        workspace_bytes=64 * 2**20,
     )
     slots = np.arange(num_questions)
     decoder.configure_copy(0, slots[:, None], documents, [spec] * num_questions)
@@ -198,7 +199,8 @@ def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
     documents = inputs(spec, vocabulary, [text])
     size = len(vocabulary.vocab)
     decoder = MapDecoder(
-        events_torch(3), torch.eye(size), 1, [8], vocabulary.stop_ids, 16
+        events_torch(3), torch.eye(size), 1, [8], vocabulary.stop_ids, 16,
+        workspace_bytes=64 * 2**20,
     )
     decoder.configure_copy(0, np.array([[0]]), documents, [spec])
 

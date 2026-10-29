@@ -88,6 +88,7 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
         [answer_limit] * num_questions,
         vocabulary.stop_ids,
         16,
+        workspace_bytes=64 * 2**20,
     )
     decoder.configure_copy(0, slots, documents, [spec] * num_questions)
     for q in range(num_questions):
@@ -210,6 +211,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         part.answer_limits,
         vocabulary.stop_ids,
         setup.page_tokens,
+        workspace_bytes=64 * 2**20,
     )
     part.decoder = decoder
     survivors = []
@@ -301,7 +303,8 @@ def test_map_and_copy_fields_can_reuse_a_slot_without_changing_saved_spans():
     documents = ExtractionInputs(state, [spec], vocabulary, [0], None, ["five years"])
     size = len(vocabulary.vocab)
     decoder = MapDecoder(
-        events_torch(0), torch.eye(size), 1, [2, 2, 2], vocabulary.stop_ids, 16
+        events_torch(0), torch.eye(size), 1, [2, 2, 2], vocabulary.stop_ids, 16,
+        workspace_bytes=64 * 2**20,
     )
     decoder.configure_copy(1, np.array([[0]]), documents, [spec])
     first = vocabulary.encode_ids("five")[0]
@@ -563,6 +566,7 @@ def test_later_questions_wait_only_for_the_answer_their_condition_reads(
         parts[0].answer_limits,
         vocabulary.stop_ids,
         setup.page_tokens,
+        workspace_bytes=64 * 2**20,
     )
     parts[0].decoder = decoder
     model = TokenModel(arena)

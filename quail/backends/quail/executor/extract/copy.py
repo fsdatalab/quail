@@ -10,6 +10,52 @@ from quail.backends.quail.executor.extract.trace import TRACE_WIDTH, trace_path
 from quail.cost.draft_policy import LIVE_BUCKETS, PRIOR_WEIGHT
 
 
+def verification_blocks(counts, stream_width, num_streams, num_options, num_keys,
+                        top_tokens, mask_words, workspace_bytes):
+    """Yield row indices, position block sizes, and workspace byte bounds.
+
+    The bound excludes resident inputs and the caller's final output. It includes
+    compaction, first-choice options, block outputs, and simultaneous token,
+    index, score and trace intermediates. Rows too wide for one position fail
+    before allocating device temporaries.
+    """
+    widths = np.broadcast_to(stream_width, counts.shape)
+    num_streams = np.maximum(1, np.broadcast_to(num_streams, counts.shape))
+    order = np.lexsort((counts, num_streams, widths))
+    # Lookup's live int64 gathers dominate; score/trace passes retain its results.
+    options = 64 * num_options + 32 * num_keys
+    per_position = 512 + 96 * top_tokens + 16 * mask_words
+    # CUDA rounds each allocation to 512 bytes; fewer than 128 are live here.
+    padding = 128 * 512
+    start = 0
+    while start < len(order):
+        row = order[start]
+        num_steps = int(counts[row])
+        width, num_columns = int(widths[row]), int(num_streams[row])
+        base = padding + 64 * width + options + num_steps * per_position
+        steps = min(num_steps, (workspace_bytes - base) // (192 * num_columns))
+        if steps < 1:
+            raise ValueError("one copy verification position exceeds its workspace")
+        end = start + 1
+        peak = base + steps * 192 * num_columns
+        if steps == num_steps:
+            while end < len(order):
+                row = order[end]
+                num_next_steps = max(num_steps, int(counts[row]))
+                next_width = max(width, int(widths[row]))
+                num_next_columns = max(num_columns, int(num_streams[row]))
+                per_row = (64 * next_width + options
+                           + num_next_steps * (per_position + 192 * num_next_columns))
+                if padding + (end + 1 - start) * per_row > workspace_bytes:
+                    break
+                end += 1
+                steps = num_steps = num_next_steps
+                width, num_columns = next_width, num_next_columns
+                peak = padding + (end - start) * per_row
+        yield order[start:end], steps, peak
+        start = end
+
+
 def _padded(values, dtype=np.int64):
     width = max(1, max(map(len, values), default=0))
     out = np.full((len(values), width), -1, dtype=dtype)
@@ -472,6 +518,8 @@ class CopyConstraint:
             .min(dim=1)
             .values
         )
+        # No finite candidate ends the answer; dead padding cannot choose its token.
+        following = torch.where(best.isfinite(), following, -1)
         chosen = torch.where(at == 0, first_token, following) if first else following
         allows = (allowed & (tokens == top[:, None])).any(dim=1)
         leaves = (
@@ -502,29 +550,42 @@ class CopyConstraint:
             )
         return chosen, ended, keep
 
+    def compact(self, streams, alive, num_streams):
+        """Keep live columns first, preserving their original order."""
+        torch = self.torch
+        columns = torch.arange(streams.shape[1], device=self.device)
+        ranks = alive.to(torch.int64).cumsum(dim=1)
+        ranks = torch.where(alive, ranks - 1, ranks[:, -1:] + columns - ranks)
+        order = torch.empty_like(ranks)
+        order.scatter_(1, ranks, columns.expand_as(ranks))
+        columns = order[:, :num_streams]
+        return streams.gather(1, columns), alive.gather(1, columns)
+
     def verify(self, projected, streams, alive, source, at, documents, limits,
-               valid, first):
+               valid, first, active):
         """Verify every draft position, retaining the first rejected choice."""
         torch = self.torch
         chosen, ended, keep = self.choose_readout(
             projected[:, 0], streams, alive, at[:, 0], documents, first=first)
-        alive = torch.where(ended[:, None], alive, keep)
+        use = active & valid[:, 0]
+        alive = torch.where((use & ~ended)[:, None], keep, alive)
         following = self.source(streams, alive)
         hit = chosen == self.tokens_at(source, at[:, 0])
         values = torch.stack((torch.where(ended, -1, chosen), following,
                               alive.sum(dim=1), hit.to(torch.int64)), dim=1)[:, None]
+        values = torch.where(use[:, None, None], values, -2)
         traces = (self.trace_values[:, None].view(torch.int32).to(torch.int64)
                   if self.trace is not None else None)
+        active = use & ~ended & hit & (at[:, 0] + 1 < limits)
         if at.shape[1] == 1:
-            return values, alive, following, traces
-        active = ~ended & hit & (at[:, 0] + 1 < limits)
+            return values, alive, following, traces, active
         # The first choice can change a tied source after stream compaction.
-        tail, alive, source, tail_traces = self._verify_tail(
+        tail, alive, source, tail_traces, active = self._verify_tail(
             projected[:, 1:], streams, alive, following, at[:, 1:], documents,
             limits, valid[:, 1:], active)
         if traces is not None:
             traces = torch.cat((traces, tail_traces), dim=1)
-        return torch.cat((values, tail), dim=1), alive, source, traces
+        return torch.cat((values, tail), dim=1), alive, source, traces, active
 
     def _verify_tail(self, projected, streams, alive, source, at, documents,
                      limits, valid, active):
@@ -568,7 +629,8 @@ class CopyConstraint:
                                 first=False)
             traces = self.trace_values.view(num_rows, num_steps, -1)
             traces = traces.view(torch.int32).to(torch.int64)
-        return values, final, self.source(streams, final), traces
+        active = use[:, -1] & continues[:, -1]
+        return values, final, self.source(streams, final), traces, active
 
     def _runner(self, tokens, values, allowed, chosen):
         torch = self.torch

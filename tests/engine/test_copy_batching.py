@@ -11,9 +11,12 @@ from helpers.extract_fakes import make_spec
 from test_map_decode import events_torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from quail.backends.quail.executor.extract.copy import verification_blocks
 from quail.backends.quail.executor.extract.stages import ExtractionInputs
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
+from quail.cost import budgets
+from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
 class Dispatches(TorchDispatchMode):
@@ -45,7 +48,8 @@ def copy_batch(num_fields, num_documents=4, document_tokens=24, draft_tokens=2,
     num_slots = slots.size + num_map_documents
     decoder = MapDecoder(events_torch(0), torch.eye(size), num_slots,
                          [answer_limit] * (num_fields + bool(num_map_documents)),
-                         vocabulary.stop_ids, 16)
+                         vocabulary.stop_ids, 16,
+                         workspace_bytes=64 * 2**20)
     decoder.configure_copy(0, slots, documents, [spec] * num_fields)
     for q, selected in enumerate(slots):
         for slot in selected:
@@ -167,9 +171,7 @@ def sequential_constrain(self, group, projected, documents, indices):
                               self.num_streams[slots]).max())
     num_streams = max(1, num_streams)
     if num_streams < stream_width:
-        columns = alive.to(torch.int8).topk(num_streams, dim=1).indices
-        streams = streams.gather(1, columns)
-        alive = alive.gather(1, columns)
+        streams, alive = constraint.compact(streams, alive, num_streams)
     source = group.source[index]
     active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
     width = 4 + self.copy_words + self.copy_trace_words
@@ -232,8 +234,9 @@ def verifier_inputs(decoder, vocabulary, mixed=False):
 
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize("num_fields", [1, 3, 41])
+@pytest.mark.parametrize("workspace_bytes", [64 * 2**20, 128000])
 def test_long_draft_choices_and_state_match_sequential_verification(
-    monkeypatch, tmp_path, trace, num_fields
+    monkeypatch, tmp_path, trace, num_fields, workspace_bytes
 ):
     if trace:
         monkeypatch.setenv("QUAIL_EXTRACT_TRACE", str(tmp_path / "trace.jsonl"))
@@ -245,23 +248,28 @@ def test_long_draft_choices_and_state_match_sequential_verification(
     inputs = verifier_inputs(decoder, vocabulary, mixed=True)
     group = inputs[0]
     decoder.limits[::3] = 30
+    ranks = group.alive.to(torch.int64).cumsum(dim=1)
+    group.alive &= ranks <= (1 + torch.arange(len(group.alive)) % 3)[:, None]
+    decoder.num_streams[:] = group.alive.sum(dim=1).numpy()[group.index]
     columns = torch.arange(group.alive.shape[1])
     last = torch.where(group.alive, columns, 0).max(dim=1).values
     group.source[1::2] = group.streams.gather(1, last[:, None]).squeeze(1)[1::2]
     saved = (group.alive.clone(), group.streams.clone(), group.source.clone(),
              group.widths.copy())
     expected = sequential_constrain(decoder, *inputs)
-    final = (group.alive.clone(), group.streams.clone(), group.source.clone(),
-             group.widths.copy())
+    final = (group.alive.clone(), group.streams.clone(), group.source.clone())
     group.alive.copy_(saved[0])
     group.streams.copy_(saved[1])
     group.source.copy_(saved[2])
     group.widths[:] = saved[3]
+    decoder.workspace_bytes = workspace_bytes
     actual = decoder._constrain(*inputs)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    for got, want in zip((group.alive, group.streams, group.source), final[:3]):
-        torch.testing.assert_close(got, want, rtol=0, atol=0)
-    np.testing.assert_array_equal(group.widths, final[3])
+    torch.testing.assert_close(group.alive, final[0], rtol=0, atol=0)
+    torch.testing.assert_close(group.streams[group.alive], final[1][final[0]],
+                               rtol=0, atol=0)
+    torch.testing.assert_close(group.source, final[2], rtol=0, atol=0)
+    assert (group.widths >= group.alive.sum(dim=1).numpy()).all()
     assert (actual[:, 0] == -2).any()
     assert (actual[:, 0] >= 0).any()
 
@@ -278,3 +286,56 @@ def test_verifier_dispatch_count_does_not_grow_with_draft_length(monkeypatch):
             decoder._constrain(*inputs)
         counts.append(sum(dispatches.counts.values()))
     assert counts[0] == counts[1], counts
+
+
+@pytest.mark.parametrize("num_streams", [256, 8192, 131072])
+def test_cuad_sized_verification_stays_inside_the_activation_workspace(num_streams):
+    chunk_tokens = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
+    workspace_bytes = budgets.copy_verification_workspace_bytes(
+        QWEN3_4B_FP8, chunk_tokens)
+    counts = np.full(41 * 45, 48)
+    stream_width = max(32768, num_streams)
+    blocks = list(verification_blocks(
+        counts, stream_width, num_streams, 4096, 2048, 4,
+        -(-stream_width // 64), workspace_bytes))
+    np.testing.assert_array_equal(np.sort(np.concatenate([b[0] for b in blocks])),
+                                  np.arange(len(counts)))
+    assert len(blocks) > 1
+    for rows, num_steps, peak in blocks:
+        assert 1 <= num_steps <= 48
+        assert len(rows) * num_steps * num_streams * 192 <= peak <= workspace_bytes
+    if num_streams == 131072:
+        assert any(num_steps < 48 for _, num_steps, _ in blocks)
+
+
+def test_verification_refuses_a_row_that_cannot_fit_one_position():
+    with pytest.raises(ValueError, match="exceeds its workspace"):
+        list(verification_blocks(np.array([48]), 32768, 8192, 4096, 2048, 4,
+                                 512, workspace_bytes=1))
+
+
+def test_compaction_keeps_column_order_independent_of_block_size():
+    decoder, _ = copy_batch(1)
+    constraint = decoder.copy_groups[0].constraint
+    streams = torch.arange(1000).expand(41 * 45, -1)
+    alive = (streams + torch.arange(len(streams))[:, None]) % 3 != 0
+    expected = np.argsort(~alive.numpy(), axis=1, kind="stable")[:, :700]
+    for num_rows in [17, len(streams)]:
+        blocks = [constraint.compact(streams[start:start + num_rows],
+                                     alive[start:start + num_rows], 700)
+                  for start in range(0, len(streams), num_rows)]
+        np.testing.assert_array_equal(torch.cat([b[0] for b in blocks]), expected)
+        np.testing.assert_array_equal(torch.cat([b[1] for b in blocks]),
+                                      alive.gather(1, torch.tensor(expected)))
+
+
+def test_wide_first_tokens_do_not_expand_every_continuing_draft():
+    workspace_bytes = budgets.copy_verification_workspace_bytes(QWEN3_4B_FP8, 8192)
+    counts = np.r_[np.ones(20, dtype=np.int64), np.full(41 * 45, 48)]
+    live = np.r_[np.full(20, 32768), np.ones(41 * 45, dtype=np.int64)]
+    blocks = list(verification_blocks(counts, 32768, live, 4096, 2048, 4, 512,
+                                      workspace_bytes))
+    cells = sum(len(rows) * num_steps * int(live[rows].max())
+                for rows, num_steps, _ in blocks)
+    assert cells < len(counts) * 48 * 32768 // 100
+    assert all(peak <= workspace_bytes for _, _, peak in blocks)

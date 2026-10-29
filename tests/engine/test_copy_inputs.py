@@ -163,7 +163,8 @@ def run(vocabulary, texts, old, mode, draft, budget, planned="unified"):
             extraction.prefixes, extraction.keys, None, 16, 0
         )
         decoder = MapDecoder(
-            torch_, marker, len(prefixes), part.answer_limits, vocabulary.stop_ids, 16
+            torch_, marker, len(prefixes), part.answer_limits, vocabulary.stop_ids, 16,
+            workspace_bytes=64 * 2**20,
         )
         part.decoder = decoder
         key_fields = {keys[a]: item for a, item in part.branch_of.items()}

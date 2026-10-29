@@ -44,10 +44,12 @@ class MapDecoder:
         stop_ids: Token ids that end an answer.
         page_tokens: Tokens per arena page.
         expected_tokens: Prior mean answer lengths, or min(64, limit) per map.
+        workspace_bytes: Shared activation workspace available for copy verification.
     """
 
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
-                 page_tokens: int, expected_tokens=None):
+                 page_tokens: int, expected_tokens=None, *, workspace_bytes=0):
+        self.workspace_bytes = workspace_bytes
         self.torch = torch
         self.head = head
         self.limits = np.asarray(limits, dtype=np.int64)
@@ -476,8 +478,9 @@ class MapDecoder:
             if not len(mine):
                 continue
             index = group.constraint.tensor(mine)
-            values[index] = self._constrain(
-                group, projections[group.key][index], documents[mine], indices[mine])
+            self._constrain(
+                group, projections[group.key][index], documents[mine], indices[mine],
+                out=values, output_rows=mine)
         host = torch.empty(values.shape, dtype=torch.int64,
                            pin_memory=self.head.is_cuda)
         host.copy_(values, non_blocking=True)
@@ -521,40 +524,74 @@ class MapDecoder:
                 projections[key][start + index] = readout.from_logits(logits[index])
         return chosen, projections
 
-    def _constrain(self, group, projected, documents, indices):
+    def _constrain(self, group, projected, documents, indices, *, out=None,
+                   output_rows=None):
+        from quail.backends.quail.executor.extract.copy import verification_blocks
+
+        torch, constraint = self.torch, group.constraint
+        slots, first, counts = np.unique(
+            documents, return_index=True, return_counts=True)
+        widths = group.widths[group.index[slots]]
+        num_streams = np.maximum(1, np.where(indices[first] == 0, widths,
+                                            self.num_streams[slots]))
+        blocks = list(verification_blocks(
+            counts, widths, num_streams, constraint.option_rows.shape[1],
+            constraint.num_keys, constraint.spec.top_tokens, self.copy_words,
+            self.workspace_bytes))
+        if out is None:
+            width = 4 + self.copy_words + self.copy_trace_words
+            out = torch.full((len(documents), width), -2,
+                             dtype=torch.int64, device=self.device)
+        if output_rows is None:
+            output_rows = np.arange(len(documents))
+        for block, num_steps, _ in blocks:
+            sizes = counts[block]
+            offsets = np.repeat(np.cumsum(sizes) - sizes, sizes)
+            selected = (np.repeat(first[block], sizes)
+                        + np.arange(int(sizes.sum())) - offsets)
+            index = constraint.tensor(np.column_stack(
+                (selected, output_rows[selected])))
+            out[index[:, 1]] = self._constrain_block(
+                group, projected[index[:, 0]], documents[selected], indices[selected],
+                int(widths[block].max()), int(num_streams[block].max()), num_steps)
+        return out
+
+    def _constrain_block(self, group, projected, documents, indices, stream_width,
+                         num_streams, num_steps):
         torch, constraint = self.torch, group.constraint
         slots, first, inverse, counts = np.unique(
             documents, return_index=True, return_inverse=True, return_counts=True)
         local = constraint.tensor(self.copy_document[slots])
         index = constraint.tensor(group.index[slots])
         limits = constraint.tensor(self.limits[self.map[slots]])
-        stream_width = int(group.widths[group.index[slots]].max())
         streams = group.streams[index, :stream_width]
         alive = group.alive[index, :stream_width]
-        num_streams = int(np.where(indices[first] == 0, stream_width,
-                                  self.num_streams[slots]).max())
-        num_streams = max(1, num_streams)
         if num_streams < stream_width:
-            columns = alive.to(torch.int8).topk(num_streams, dim=1).indices
-            streams = streams.gather(1, columns)
-            alive = alive.gather(1, columns)
+            streams, alive = constraint.compact(streams, alive, num_streams)
         source = group.source[index]
-        steps = np.arange(int(counts.max()))
-        valid = steps < counts[:, None]
-        row = np.minimum(first[:, None] + steps, len(documents) - 1)
-        at = constraint.tensor(np.where(valid, indices[row], 1))
-        values, alive, source, traces = constraint.verify(
-            projected[constraint.tensor(row)], streams, alive, source, at, local,
-            limits, constraint.tensor(valid), first=bool((indices[first] == 0).any()))
-        selected = constraint.tensor(np.column_stack((inverse,
-                                                      np.arange(len(documents))
-                                                      - first[inverse])))
+        active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
         width = 4 + self.copy_words + self.copy_trace_words
         out = torch.full((len(documents), width), -2,
                          dtype=torch.int64, device=self.device)
-        out[:, :4] = values[selected[:, 0], selected[:, 1]]
-        if self.copy_trace is not None:
-            out[:, 4 + self.copy_words:] = traces[selected[:, 0], selected[:, 1]]
+        offsets = np.arange(len(documents)) - first[inverse]
+        for start in range(0, int(counts.max()), num_steps):
+            end = min(start + num_steps, int(counts.max()))
+            steps = np.arange(start, end)
+            valid = steps < counts[:, None]
+            row = np.minimum(first[:, None] + steps, len(documents) - 1)
+            at = constraint.tensor(np.where(valid, indices[row], 1))
+            values, alive, source, traces, active = constraint.verify(
+                projected[constraint.tensor(row)], streams, alive, source, at, local,
+                limits, constraint.tensor(valid),
+                first=bool((valid[:, 0] & (indices[row[:, 0]] == 0)).any()),
+                active=active)
+            selected = np.flatnonzero((offsets >= start) & (offsets < end))
+            take = constraint.tensor(np.column_stack((selected, inverse[selected],
+                                                      offsets[selected] - start)))
+            out[take[:, 0], :4] = values[take[:, 1], take[:, 2]]
+            if self.copy_trace is not None:
+                out[take[:, 0], 4 + self.copy_words:] = traces[take[:, 1], take[:, 2]]
+            del values, traces
         group.alive[index, :stream_width] = False
         group.alive[index, :num_streams] = alive
         group.streams[index, :num_streams] = streams
@@ -669,8 +706,11 @@ def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapD
     """Return a decoder for a pipeline's maps on the loaded model."""
     from quail.backends.quail.executor.extract import load_vocabulary
     from quail.backends.quail.executor.model_loading import full_output_head
+    from quail.cost.budgets import copy_verification_workspace_bytes
 
     return MapDecoder(
         state.torch, full_output_head(state.loaded_model.model), num_documents,
         limits, load_vocabulary(state).stop_ids,
-        state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens)
+        state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens,
+        workspace_bytes=copy_verification_workspace_bytes(
+            state.loaded_model.model_spec, state.chunk_tokens))
