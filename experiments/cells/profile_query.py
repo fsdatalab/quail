@@ -47,6 +47,7 @@ BEFORE_REMOTE = "/root/before"
 BEFORE_LOCAL = os.environ.get("QUAIL_BEFORE_SOURCE", "")
 image = gpu_image(*([(BEFORE_LOCAL, BEFORE_REMOTE)]
                     if modal.is_local() and BEFORE_LOCAL else []))
+image = image.add_local_python_source("experiments.cells.piecewise_probe")
 
 
 def _digest(output) -> str:
@@ -332,6 +333,8 @@ def child(arguments: str) -> None:
     modes, top = args["modes"], args["top"]
     print(f"quail from {quail.__file__}", flush=True)
     window = {}
+    from experiments.cells.piecewise_probe import PiecewiseProbe
+    probe = PiecewiseProbe()
 
     class ProfiledRunner(graph_module.GenericRunner):
         def run(self, *args, **kwargs):
@@ -397,7 +400,9 @@ def child(arguments: str) -> None:
                 window["trace"] = torch.profiler.profile(activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA])
+            probe.start(verify=mode == "verify")
             output = run_query(session, spec, tables)
+            piecewise = probe.summary()
             measures = output.measurements
             nodes = {key: {name: value[name] for name in NODE_FIELDS
                            if name in value}
@@ -414,6 +419,7 @@ def child(arguments: str) -> None:
                     "kernel_cache_files")},
                 "nodes": nodes,
                 "allocator": window.get("allocator"),
+                "piecewise": piecewise,
             }
             if window["trace"] is not None:
                 record["gpu_window"] = _gpu_gaps(window["trace"], top)
