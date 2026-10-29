@@ -13,6 +13,8 @@ class PiecewiseBuffers:
 
     Only real rows reach attention. Padding therefore has no KV writes,
     sequence boundaries, or reads, regardless of the attention path.
+    GEMM tiling can change rounding with the padded row count; replay
+    parity is checked against eager pieces with the same bucket shape.
     """
 
     def __init__(self, pipeline, num_tokens, *, device="cuda"):
