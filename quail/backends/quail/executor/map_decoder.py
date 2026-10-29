@@ -296,8 +296,8 @@ class MapDecoder:
         self.paused[document] = False
         self.drafts[document] = 0
 
-    def eviction_order(self, curves=None):
-        """Running slots ordered by longest expected remaining answer first."""
+    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None):
+        """Order running slots by page-hold time saved per recomputation second."""
         from quail.backends.quail.executor.answer_survival import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
@@ -310,6 +310,17 @@ class MapDecoder:
             mine = running[self.map[running] == q]
             written[mine] = self.written[q][mine]
             scores[mine] = curve[written[mine]]
+        if recompute_cost is not None and len(running):
+            num_pages = self.num_pages[running]
+            if page_holds is not None:
+                width = int(num_pages.max())
+                table = self.pages[running, :width]
+                num_pages = ((np.arange(width) < num_pages[:, None])
+                             & (page_holds[table] == 1)).sum(axis=1)
+            seconds = recompute_cost.prefill_seconds(
+                self.origin[running] + written[running])
+            scores[running] *= np.divide(num_pages, seconds,
+                                         out=np.zeros(len(running)), where=seconds > 0)
         return running[np.lexsort((running, written[running], -scores[running]))]
 
     def running(self):

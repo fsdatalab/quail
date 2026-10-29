@@ -742,6 +742,31 @@ def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
                                   decoder.eviction_order())
 
 
+def test_eviction_prefers_cheaper_prompts_and_counts_only_reclaimable_pages():
+    arena = make_arena(Setup(path="unified", pages=300, page_tokens=4))
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
+                         [32], [STOP], 4, expected_tokens=[16])
+    decoder.answer_slots = {0: np.arange(2)}
+    decoder.start(0, 0, 1024, arena.alloc(("d", 0), 1028))
+    decoder.start(1, 0, 32, arena.alloc(("d", 1), 36))
+    decoder.written[0][:] = 2
+    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
+    admission = AnswerAdmission(decoder, [1022, 30], 6, {}, [0, 0], arena.page_cost,
+                                cost, arena.page_holds)
+    admission.refresh(np.array([0, 0]))
+    assert decoder.eviction_order()[0] == 0
+    assert admission.eviction_order()[0] == 1
+    assert admission.recompute == cost.recompute_cost.prefill_seconds(34)
+    arena.alloc(("borrower", 0), 32, borrow=(("d", 1), 32))
+    admission.refresh(np.array([0, 0]))
+    assert admission.eviction_order()[0] == 0
+    assert admission.recompute == cost.recompute_cost.prefill_seconds(1026)
+    assert arena.free_key(("d", 1)) == 1
+    assert arena.free_key(("d", 0)) == 257
+    arena.free_key(("borrower", 0))
+    assert arena.free_pages == 300
+
+
 def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
         monkeypatch):
     cpu_staging(monkeypatch)

@@ -249,7 +249,7 @@ class StageExecutor:
             self.answer_admission = AnswerAdmission(
                 decoder, self.prefix_lengths, self.capacity_extra,
                 self.sched.dependencies, self.borrowing.tree_shared,
-                self.arena.page_cost, decode_cost)
+                self.arena.page_cost, decode_cost, self.arena.page_holds)
         # a Gated DeltaNet layer starts a borrower from the parent's state
         # at the shared point, so a parent writes one slot per point
         self.share_points = [()] * len(self.keys)
@@ -462,7 +462,9 @@ class StageExecutor:
             if added is not None:
                 decoder.add_pages(growing, added)
                 continue
-            victim = int(decoder.eviction_order()[0])
+            order = (decoder.eviction_order() if self.answer_admission is None
+                     else self.answer_admission.eviction_order())
+            victim = int(order[0])
             for detached in decoder.pause(victim):
                 self.borrowing.chosen.pop(int(detached), None)
             key = self.keys[victim]

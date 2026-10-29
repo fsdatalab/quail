@@ -59,7 +59,7 @@ class AnswerAdmission:
     """Per-pass pooled page demand for admitted documents and their branches."""
 
     def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
-                 shared, page_cost, decode_cost=None):
+                 shared, page_cost, decode_cost=None, page_holds=None):
         self.decoder = decoder
         self.prefix = np.asarray(prefix_lengths, dtype=np.int64)
         self.parent = np.arange(len(self.prefix))
@@ -75,6 +75,7 @@ class AnswerAdmission:
         self.capacity = -(-(self.prefix + capacity_extra) // page_tokens) * page_tokens
         self.roots = self.parent == np.arange(len(self.prefix))
         self.decode_cost = decode_cost
+        self.page_holds = page_holds
         self.borrowed = np.where(self.roots, 0, shared)
         self.lead = np.zeros(len(self.prefix), dtype=np.int64)
         np.maximum.at(self.lead, self.parent, self.borrowed)
@@ -132,13 +133,19 @@ class AnswerAdmission:
         self.mean = float(self.added_mean[roots].sum())
         self.variance = float(self.added_variance[roots].sum())
         self.maximum = float(self.added_maximum[roots].sum())
-        order = decoder.eviction_order(curves)
+        order = self.eviction_order(curves)
         self.recompute = None
         if len(order):
             victim = order[0]
             tokens = (decoder.origin[victim]
                       + decoder.written[decoder.map[victim]][victim])
             self.recompute = self._recompute_seconds(tokens)
+
+    def eviction_order(self, curves=None):
+        """Rank the same victims for admission pricing and actual eviction."""
+        policy = None if self.decode_cost is None else self.decode_cost.recompute_cost
+        holds = None if self.page_holds is None else self.page_holds()
+        return self.decoder.eviction_order(curves, policy, holds)
 
     def _refresh_work(self, answer_slots, contexts, replays):
         cost = self.decode_cost
