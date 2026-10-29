@@ -6,13 +6,17 @@ Run from the repository root:
 
 The synthetic workload has 41 fields, 45 documents and 7,500 tokens per
 contract. Each answer has one matching start and accepts its drafts. It
-measures continuing passes after first-token preparation, not model time,
-attention, real CUAD answer lengths, or GPU performance. New-path timings
-include CPU tensor execution and the small identity output head. Old-path
-timings exclude head projection and use precomputed readouts.
+reports first-token setup and admission, continuing passes, and row packing
+with shared contract pages. It does not measure model time, attention, real
+CUAD answer lengths, or GPU performance. New-path timings include CPU tensor
+execution and the small identity output head. Old-path timings exclude head
+projection and use precomputed readouts. The named phases are cumulative
+cProfile times; nested phases must not be added together.
 """
 
 import argparse
+import cProfile
+import pstats
 import statistics
 import time
 
@@ -27,7 +31,14 @@ from quail.backends.quail.executor.readout import AsyncTopLogprobs
 def compare(num_fields, num_documents, document_tokens, num_passes):
     """Time continuing draft passes with the same accepted tokens."""
     torch.set_num_threads(1)
-    decoder, vocabulary = copy_batch(num_fields, num_documents, document_tokens)
+    with cProfile.Profile() as setup:
+        decoder, vocabulary = copy_batch(num_fields, num_documents, document_tokens)
+        decoder.rows()
+    stats = pstats.Stats(setup)
+    for name in ("configure_copy", "start", "submit", "harvest", "prepare",
+                 "prepare_documents", "rows"):
+        seconds = sum(value[3] for key, value in stats.stats.items() if key[2] == name)
+        print(f"first-token CPU milliseconds {name}={seconds * 1000:.2f}")
     group = decoder.copy_groups[0]
     spec = group.constraint.spec
     documents = group.constraint.documents.documents
@@ -75,6 +86,33 @@ def compare(num_fields, num_documents, document_tokens, num_passes):
           f"old={statistics.median(old)*1000:.2f}")
     print(f"tensor dispatches/pass={sum(dispatches.counts.values())}, "
           f"head GEMMs/pass={dispatches.counts['aten.mm.default']}")
+    with cProfile.Profile() as continuing:
+        continuation(decoder, vocabulary)
+    stats = pstats.Stats(continuing)
+    for name in ("rows", "prepare", "prepare_ahead", "_extend", "_constrain"):
+        seconds = sum(value[3] for key, value in stats.stats.items() if key[2] == name)
+        print(f"continuing CPU milliseconds {name}={seconds * 1000:.2f}")
+    shared_layout(decoder, num_documents, document_tokens)
+
+
+def shared_layout(decoder, num_documents, document_tokens):
+    """Time row packing with full contract pages shared across fields."""
+    decoder.share = True
+    width = -(-(document_tokens + 32) // decoder.page_tokens)
+    decoder.pages = np.tile(np.arange(width, dtype=np.int32), (len(decoder.map), 1))
+    decoder.num_pages[:] = width
+    decoder.origin[:] = document_tokens
+    decoder.parent[:] = np.arange(len(decoder.map)) % num_documents
+    shared = document_tokens // decoder.page_tokens * decoder.page_tokens
+    decoder.borrowed[num_documents:] = shared
+    decoder.lead[:num_documents] = shared
+    elapsed = []
+    for _ in range(20):
+        start = time.perf_counter()
+        decoder.rows()
+        elapsed.append(time.perf_counter() - start)
+    print("shared contract rows CPU milliseconds="
+          f"{statistics.median(elapsed)*1000:.2f}")
 
 
 if __name__ == "__main__":
