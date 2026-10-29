@@ -159,7 +159,7 @@ class Timeline:
                 rows = getattr(args[1], "shape", (None,))[0] if len(
                     args) > 1 and kind == "submit" else None
                 if kind == "forward":
-                    rows = args[1].tokens
+                    rows = args[2].tokens
                 timeline.entries.append((kind, started, ended, events, rows))
 
         if isinstance(owner, type) and isinstance(
