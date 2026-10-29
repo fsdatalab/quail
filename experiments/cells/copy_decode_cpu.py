@@ -32,13 +32,18 @@ def compare(num_fields, num_documents, document_tokens, num_passes):
     """Time continuing draft passes with the same accepted tokens."""
     torch.set_num_threads(1)
     with cProfile.Profile() as setup:
-        decoder, vocabulary = copy_batch(num_fields, num_documents, document_tokens)
+        decoder, vocabulary = copy_batch(
+            num_fields, num_documents, document_tokens, prepare=False)
+        assert decoder.rows() is None
+    phase_times(setup, "first-token", [
+        ("map_decoder.py", name) for name in
+        ("configure_copy", "_configure_copy", "start", "submit", "harvest", "rows")
+    ] + [("copy.py", "prepare_documents")])
+    with cProfile.Profile() as deferred:
+        decoder.prepare()
         decoder.rows()
-    stats = pstats.Stats(setup)
-    for name in ("configure_copy", "start", "submit", "harvest", "prepare",
-                 "prepare_documents", "rows"):
-        seconds = sum(value[3] for key, value in stats.stats.items() if key[2] == name)
-        print(f"first-token CPU milliseconds {name}={seconds * 1000:.2f}")
+    phase_times(deferred, "deferred", [("copy.py", "prepare"),
+                                       ("map_decoder.py", "rows")])
     group = decoder.copy_groups[0]
     spec = group.constraint.spec
     documents = group.constraint.documents.documents
@@ -88,11 +93,19 @@ def compare(num_fields, num_documents, document_tokens, num_passes):
           f"head GEMMs/pass={dispatches.counts['aten.mm.default']}")
     with cProfile.Profile() as continuing:
         continuation(decoder, vocabulary)
-    stats = pstats.Stats(continuing)
-    for name in ("rows", "prepare", "prepare_ahead", "_extend", "_constrain"):
-        seconds = sum(value[3] for key, value in stats.stats.items() if key[2] == name)
-        print(f"continuing CPU milliseconds {name}={seconds * 1000:.2f}")
+    phase_times(continuing, "continuing", [
+        ("map_decoder.py", name) for name in ("rows", "harvest", "_constrain")
+    ] + [("copy.py", name) for name in ("prepare", "prepare_ahead", "_extend")])
     shared_layout(decoder, num_documents, document_tokens)
+
+
+def phase_times(profile, label, names):
+    """Print cumulative phase times without merging same-named methods."""
+    stats = pstats.Stats(profile)
+    for filename, name in names:
+        seconds = sum(value[3] for key, value in stats.stats.items()
+                      if key[2] == name and key[0].endswith("/" + filename))
+        print(f"{label} CPU milliseconds {filename}:{name}={seconds * 1000:.2f}")
 
 
 def shared_layout(decoder, num_documents, document_tokens):
