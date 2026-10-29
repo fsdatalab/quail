@@ -212,11 +212,6 @@ class ExtractPart(MapPart):
     model_inputs = staticmethod(RecurrentExtractPart.model_inputs)
     column_values = RecurrentExtractPart.column_values
 
-    def __new__(cls, state, nodes, ids, inputs, first=0):
-        if getattr(state.loaded_model.arena, "num_state_slots", 0):
-            return RecurrentExtractPart(state, nodes, ids, inputs)
-        return super().__new__(cls)
-
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
         first_node = parts[0].node if parts else nodes[0]

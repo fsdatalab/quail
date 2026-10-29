@@ -1,8 +1,74 @@
 """Layer-group page layouts for answer decoding."""
 
+from dataclasses import replace
+
 import numpy as np
 
 from quail.backends.quail.executor.chunk import DecodeRows, decode_groups
+
+
+class SlidingAttentionGroup:
+    """Sliding-pool decode tables with each document's retained window origin."""
+
+    def __init__(self, arena, keys):
+        self.arena = arena
+        self.keys = keys
+
+    def decode(self, rows):
+        """Build sliding reads and writes without full-pool page identities."""
+        slots, inverse = np.unique(rows.slots, return_inverse=True)
+        pages = [self.arena.owned_sliding_pages(self.keys[slot]) for slot in slots]
+        starts = np.array([self.arena.sliding_start(self.keys[slot])
+                           for slot in slots], dtype=np.int64)
+        table = np.zeros((len(slots), max(map(len, pages))), dtype=np.int32)
+        for index, owned in enumerate(pages):
+            table[index, :len(owned)] = owned
+        table = table[inverse]
+        positions = rows.positions - starts[inverse]
+        page_tokens = self.arena.page_tokens
+        write_rows = (table[np.arange(len(rows)), positions // page_tokens]
+                      .astype(np.int64) * page_tokens + positions % page_tokens)
+        return replace(rows, write_rows=write_rows, own_table=table,
+                       own_lengths=positions + 1)
+
+
+class StateGroup:
+    """Checkpoint metadata for committed tokens and speculative suffixes."""
+
+    def __init__(self, arena, keys):
+        self.arena = arena
+        self.keys = keys
+
+    def replays(self, rows):
+        """Return accepted draft spans not yet present in the extension state."""
+        if rows is None:
+            return []
+        spans = []
+        for begin in rows.sequence_offsets[:-1]:
+            slot = rows.slots[begin]
+            key = self.keys[slot]
+            extension = self.arena.extension(key)
+            start = (extension[1] if extension is not None
+                     else self.arena.checkpoint_tokens(key))
+            end = int(rows.positions[begin])
+            if start < end:
+                spans.append((int(slot), start, end))
+            elif start != end:
+                raise ValueError("answer state is past its next token")
+        return spans
+
+    def decode(self, rows, row0):
+        """Describe state reads, committing the chosen input but not draft tokens."""
+        groups = []
+        offsets = rows.sequence_offsets
+        for begin, end in zip(offsets[:-1], offsets[1:]):
+            groups.append(dict(
+                key=self.keys[rows.slots[begin]], fresh=False, start=0,
+                f=int(rows.positions[begin]), row0=row0 + begin,
+                prefix_end=row0 + begin, row1=row0 + end,
+                suffix_spans=(np.array([row0 + begin]), np.array([row0 + end])),
+                kept=int(end - begin) if rows.advance[begin] else 1))
+        return groups
 
 
 class FullAttentionGroup:

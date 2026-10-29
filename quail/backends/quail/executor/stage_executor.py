@@ -613,13 +613,27 @@ class StageExecutor:
                                      self._suffixes_of(j, a).ids,
                                      self.decoder.tokens[q][a, :written]))
             ids = prompt[start:end]
-            specs.append(dict(key=self.keys[a], prefix=None, f=start,
-                              suffixes=Suffixes(ids, [len(ids)]),
-                              write_suffix_tokens=len(ids), single=True))
+            prefix = None
+            f = start
+            carry = {}
+            if self.arena.num_state_slots and start < self.prefix_lengths[a]:
+                f = min(end, self.prefix_lengths[a])
+                prefix, ids = prompt[start:f], prompt[f:end]
+                carry = dict(start=start, borrow_key=self.keys[a] if start else None)
+            specs.append(dict(key=self.keys[a], prefix=prefix, f=f,
+                              suffixes=Suffixes(ids, [len(ids)] if len(ids) else []),
+                              write_suffix_tokens=len(ids), single=True, **carry))
             if end == len(prompt):
                 resumed.append(a)
                 firsts.append((sum(n for _, n in entries), a, j))
-            entries.append((j, 1))
+            entries.append((j, int(bool(len(ids)))))
+        for a, start, end in self.arena.answer_replays(decode):
+            q = self.decoder.map[a]
+            origin = self.decoder.origin[a]
+            ids = self.decoder.tokens[q][a, start - origin:end - origin]
+            specs.append(dict(key=self.keys[a], prefix=None, f=start,
+                              suffixes=Suffixes(ids, [len(ids)]),
+                              write_suffix_tokens=len(ids), read_rows=[0], single=True))
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
             staging=self.staging, canvas=self.canvas, answer_row=self.answer_row,
@@ -861,6 +875,8 @@ class StageExecutor:
             decode = None if self.decoder is None else self.decoder.rows()
             # Answers keep their rows; recomputations and new prompts fill the rest.
             room = self.sched.chunk_budget - (0 if decode is None else len(decode))
+            room -= sum(end - start
+                        for _, start, end in self.arena.answer_replays(decode))
             replays, room = self._replays(max(0, room))
             if (self.answer_admission is not None
                     and (self.sched.pending or self.sched.waiting)):

@@ -318,7 +318,9 @@ class MapDecoder:
                    - np.repeat(np.cumsum(counts) - counts, counts))
         running = np.repeat(running, counts)
         positions = self.origin[running] + self.fed[running] + offsets
-        return self.kv.rows(running, positions, self.share)
+        rows = self.kv.rows(running, positions, self.share)
+        rows.advance = ~self.constrained[self.map[running]]
+        return rows
 
     def feed(self, chunk) -> None:
         """Copy each decode row's input token from the token buffer."""
