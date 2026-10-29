@@ -272,19 +272,22 @@ class AsyncTopLogprobs(_HostReadout):
         torch = self.torch
         out = torch.empty((normed.shape[0], self.width), dtype=torch.float32,
                           device=normed.device)
-        n = len(self.groups)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
-            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
-            logits -= torch.logsumexp(logits, dim=1, keepdim=True)
-            rows = slice(start, start + block.shape[0])
-            picked = logits.index_select(1, self.extras)
-            for column, group in enumerate(self.groups):
-                out[rows, column] = torch.logsumexp(picked[:, group], dim=1)
-            top, ids = torch.topk(logits, self.k, dim=1)
-            out[rows, n:n + self.k] = ids.float()
-            out[rows, n + self.k:] = top
+            logits = self.F.linear(block.to(self.head.dtype), self.head)
+            out[start:start + block.shape[0]] = self.from_logits(logits)
         return out
+
+    def from_logits(self, logits):
+        """Return compact top-token values from a full-vocabulary projection."""
+        torch = self.torch
+        logits = logits.float()
+        logits = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+        picked = logits.index_select(1, self.extras)
+        extras = [torch.logsumexp(picked[:, group], dim=1)[:, None]
+                  for group in self.groups]
+        top, ids = torch.topk(logits, self.k, dim=1)
+        return torch.cat([*extras, ids.float(), top], dim=1)
 
     def submit(self, normed, rows_per_answer=None):
         return (*self._copy(self.values(normed)), rows_per_answer)

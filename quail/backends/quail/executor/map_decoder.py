@@ -95,6 +95,7 @@ class MapDecoder:
         # whether a document's branches read its shared pages together
         self.share = False
         self.copy_constraints = {}
+        self.copy_readouts = {}
         self.copy_words = 0
         self.copy_trace_words = 0
         self.copy_trace = None
@@ -108,8 +109,15 @@ class MapDecoder:
     def configure_copy(self, first, slots, documents, specs):
         """Constrain extraction fields to their document's token streams."""
         from quail.backends.quail.executor.extract.copy import CopyConstraint
+        from quail.backends.quail.executor.readout import AsyncTopLogprobs
         from quail.cost.draft_policy import LIVE_BUCKETS
 
+        key = specs[0].top_tokens, tuple(documents.vocabulary.stop_ids)
+        if key not in self.copy_readouts:
+            self.copy_readouts[key] = (AsyncTopLogprobs(
+                self.torch, self.torch.nn.functional, self.head, key[0], [key[1]]), [])
+        _, questions = self.copy_readouts[key]
+        questions.extend(range(first, first + len(specs)))
         constraint = CopyConstraint(self.torch, self.device, documents, specs[0])
         self.copy_words = max(self.copy_words, constraint.mask_words)
         self.copy_trace_words = max(self.copy_trace_words, constraint.trace_width)
@@ -424,22 +432,29 @@ class MapDecoder:
         width = 4 + self.copy_words + self.copy_trace_words
         values = torch.full((len(documents), width), -1, dtype=torch.int64,
                             device=self.device)
+        chosen, projections = self._project(hidden, documents)
         plain = np.flatnonzero(~self.constrained[self.map[documents]])
         if len(plain):
             index = torch.from_numpy(plain).to(self.device, non_blocking=True)
-            logits = torch.nn.functional.linear(
-                hidden[index].to(self.head.dtype), self.head)
-            chosen = torch.argmax(logits, dim=1)
-            values[index, 0] = chosen
+            values[index, 0] = chosen[index]
             slots = torch.from_numpy(documents[plain]).to(self.device,
                                                          non_blocking=True)
-            self.next_token.index_copy_(0, slots, chosen)
-        for q, state in self.copy_constraints.items():
-            mine = np.flatnonzero(self.map[documents] == q)
-            if len(mine):
-                index = state.constraint.tensor(mine)
-                values[index] = self._constrain(
-                    state, hidden[index], documents[mine], indices[mine])
+            self.next_token.index_copy_(0, slots, chosen[index])
+        for key, (readout, questions) in self.copy_readouts.items():
+            mine = np.flatnonzero(np.isin(self.map[documents], questions))
+            if not len(mine):
+                continue
+            index = torch.from_numpy(mine).to(self.device, non_blocking=True)
+            projected = projections[key][index]
+            for q in questions:
+                selected = np.flatnonzero(self.map[documents[mine]] == q)
+                if not len(selected):
+                    continue
+                state = self.copy_constraints[q]
+                rows = mine[selected]
+                values[state.constraint.tensor(rows)] = self._constrain(
+                    state, projected[state.constraint.tensor(selected)],
+                    documents[rows], indices[rows])
         host = torch.empty(values.shape, dtype=torch.int64,
                            pin_memory=self.head.is_cuda)
         host.copy_(values, non_blocking=True)
@@ -451,7 +466,29 @@ class MapDecoder:
         while len(self.copies) > IN_FLIGHT:
             self._read(self.copies.popleft())
 
-    def _constrain(self, state, hidden, documents, indices):
+    def _project(self, hidden, documents):
+        from quail.backends.quail.executor.readout import AsyncTopLogprobs
+
+        torch = self.torch
+        chosen = torch.empty(len(hidden), dtype=torch.int64, device=self.device)
+        projections = {
+            key: torch.empty((len(hidden), readout.width), device=self.device)
+            for key, (readout, _) in self.copy_readouts.items()}
+        maps = self.map[documents]
+        for start in range(0, len(hidden), AsyncTopLogprobs.BLOCK_ROWS):
+            end = min(start + AsyncTopLogprobs.BLOCK_ROWS, len(hidden))
+            logits = torch.nn.functional.linear(
+                hidden[start:end].to(self.head.dtype), self.head)
+            chosen[start:end] = logits.argmax(dim=1)
+            for key, (readout, questions) in self.copy_readouts.items():
+                mine = np.flatnonzero(np.isin(maps[start:end], questions))
+                if not len(mine):
+                    continue
+                index = torch.from_numpy(mine).to(self.device, non_blocking=True)
+                projections[key][start + index] = readout.from_logits(logits[index])
+        return chosen, projections
+
+    def _constrain(self, state, projected, documents, indices):
         torch, constraint = self.torch, state.constraint
         slots, first, inverse, counts = np.unique(
             documents, return_index=True, return_inverse=True, return_counts=True)
@@ -471,10 +508,8 @@ class MapDecoder:
             row = np.minimum(first + step, len(documents) - 1)
             at = constraint.tensor(np.where(valid, indices[row], 1))
             selected = constraint.tensor(row)
-            logits = torch.nn.functional.linear(
-                hidden[selected].to(self.head.dtype), self.head)
-            chosen, ended, keep = constraint.choose(
-                logits, streams, alive, at, local,
+            chosen, ended, keep = constraint.choose_readout(
+                projected[selected], streams, alive, at, local,
                 first=bool((valid & (indices[row] == 0)).any()))
             use = active & constraint.tensor(valid)
             writes = use & ~ended

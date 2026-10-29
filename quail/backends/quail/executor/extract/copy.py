@@ -374,16 +374,34 @@ class CopyConstraint:
         logits = logits.float()
         logits = logits - torch.logsumexp(logits, dim=1, keepdim=True)
         top_values, top_ids = torch.topk(logits, self.spec.top_tokens, dim=1)
-        scores = torch.full_like(logits, -float("inf"))
-        scores.scatter_(1, top_ids, top_values)
         stop = torch.logsumexp(logits.index_select(1, self.stop_ids), dim=1)
+        return self._choose(
+            top_values, top_ids, stop, streams, alive, at, documents, first)
+
+    def choose_readout(self, values, streams, alive, at, documents, first=True):
+        """Apply the token rule to an already projected top-k readout."""
+        k = self.spec.top_tokens
+        return self._choose(values[:, 1 + k:], values[:, 1:1 + k].to(self.torch.int64),
+                            values[:, 0], streams, alive, at, documents, first)
+
+    def _choose(self, top_values, top_ids, stop, streams, alive, at, documents, first):
+        torch = self.torch
+        sorted_ids, order = top_ids.sort(dim=1)
+        sorted_values = top_values.gather(1, order)
+
+        def scores(tokens):
+            columns = torch.searchsorted(sorted_ids, tokens.contiguous())
+            columns = columns.clamp_max(sorted_ids.shape[1] - 1)
+            return torch.where(sorted_ids.gather(1, columns) == tokens,
+                               sorted_values.gather(1, columns), -float("inf"))
+
         top = top_ids[:, 0]
         possible = alive
         if first:
             options = self.option_rows_device[documents]
             option = options.clamp_min(0)
             key = self.option_key_ids[option]
-            values = scores.gather(1, self.first_tokens[option])
+            values = scores(self.first_tokens[option])
             values = torch.where(options >= 0, values, -float("inf"))
             if self.trace is not None:
                 first_choices = self.first_tokens[option], values, options >= 0
@@ -415,12 +433,12 @@ class CopyConstraint:
             streams.copy_(torch.where(at[:, None] == 0, initial, streams))
             possible = alive & ((at[:, None] > 0) | maxima.gather(1, keys).isfinite())
         tokens = self.tokens_at(streams, at[:, None])
-        values = scores.gather(1, tokens.clamp_min(0))
+        values = scores(tokens.clamp_min(0))
         allowed = possible & (tokens >= 0)
         values = torch.where(allowed, values, -float("inf"))
         best = values.max(dim=1).values
         following = (
-            torch.where(values == best[:, None], tokens, logits.shape[1])
+            torch.where(values == best[:, None], tokens, len(self.vocabulary.vocab))
             .min(dim=1)
             .values
         )
