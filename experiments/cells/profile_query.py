@@ -5,7 +5,8 @@ sample (Python stack sampling), trace (torch.profiler), timeline
 (executor-step and GPU event timing), verify (graph/eager output checks),
 and eager (graphs disabled, unchanged KV capacity). Each run prints timing,
 allocation, accuracy, and result-digest fields. The env option sets child-process
-variables.
+variables. A trace run also saves 5 seconds of its trace, from 40% into
+the run, as a Perfetto trace under /results/ablations/traces.
 
 Pass QUAIL_OVERRIDES=module:NAME=json-value;... in env to set module
 constants in the child, such as an executor constant under test, or
@@ -39,6 +40,11 @@ from bench.quailb_parallel import (
 from quail.deploy.images import gpu_image
 
 PROFILE_DIR = "/results/ablations/profiles"
+# Perfetto traces, served by experiments/cells/trace_server.py
+TRACE_DIR = "/results/ablations/traces"
+# seconds of a trace run kept for Perfetto, starting 40% into the GPU
+# activity; a whole run's trace is too large for the browser
+TRACE_WINDOW_S = 5.0
 # caching allocator counters: a retry flushes the cache after a failed
 # cudaMalloc, which waits for every stream
 ALLOCATOR_COUNTS = ("num_alloc_retries", "num_sync_all_streams",
@@ -122,6 +128,39 @@ def _forward_kernels(events):
                     "commands_per_layer": sum(launches[name].values()) / count,
                     "apis": dict(launches[name])}
                 for name, count in attention.items()}}
+
+
+def _save_trace(prof, path: Path) -> dict:
+    """Save a window of a torch.profiler run as a gzipped Perfetto trace.
+
+    Returns:
+        The trace's file name and the window's start and length in seconds
+        from the first GPU kernel.
+    """
+    import gzip
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        raw = Path(directory) / "trace.json"
+        prof.export_chrome_trace(str(raw))
+        trace = json.loads(raw.read_text())
+    events = trace["traceEvents"]
+    kernels = [event["ts"] for event in events if event.get("cat") == "kernel"]
+    if not kernels:
+        return {}
+    first, last = min(kernels), max(kernels)
+    start = first + 0.4 * (last - first)
+    end = start + TRACE_WINDOW_S * 1e6
+    trace["traceEvents"] = [
+        event for event in events
+        if event.get("ph") == "M"
+        or ("ts" in event and event["ts"] <= end
+            and event["ts"] + event.get("dur", 0) >= start)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt") as out:
+        json.dump(trace, out)
+    return {"file": path.name, "start_s": round((start - first) / 1e6, 3),
+            "window_s": TRACE_WINDOW_S}
 
 
 def _gpu_gaps(prof, top: int) -> dict:
@@ -518,6 +557,9 @@ def child(arguments: str) -> None:
             }
             if window["trace"] is not None:
                 record["gpu_window"] = _gpu_gaps(window["trace"], top)
+                prefix = Path(args["stats_prefix"]).name
+                record["perfetto"] = _save_trace(
+                    window["trace"], Path(TRACE_DIR) / f"{prefix}-run{run}.json.gz")
             if window["timeline"] is not None:
                 record["timeline"] = window["timeline"].summary(top)
             if window["sampler"] is not None:
