@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from quail.backends.quail.executor.model_loading import answer_weights
+from quail.cost.budgets import READOUT_BLOCK_ROWS
 from quail.planner.prompt_lowering import true_false_ids
 
 
@@ -160,7 +161,7 @@ class AsyncLabelLogprobs(_HostReadout):
 
     # rows per head block: every block reads the whole head, so few big
     # blocks; 512 x 151,936 logits in bf16 and float32 are 445 MiB
-    BLOCK_ROWS = 512
+    BLOCK_ROWS = READOUT_BLOCK_ROWS
 
     def __init__(self, torch, F, head, targets, rows=1, normalize=True):
         super().__init__(torch)

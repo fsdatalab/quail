@@ -13,6 +13,18 @@ INT32_MAX = 2**31 - 1
 ACT_BYTES = 2           # bf16 activations, bytes per element
 ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
 #                         the arena for overlapped chunk construction
+READOUT_BLOCK_ROWS = 512
+
+
+def copy_verification_workspace_bytes(model: ModelSpec, chunk_tokens: int) -> int:
+    """Return shared readout workspace capped by one activation chunk.
+
+    The head readout's two fp32 logits tables are released before copy
+    verification runs on the same CUDA stream. Reuse their bounded space,
+    leaving the other activation chunk for retained outputs and staging.
+    """
+    return int(min(chunk_tokens * model.act_per_token,
+                   2 * READOUT_BLOCK_ROWS * model.vocab * 4))
 
 
 def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
