@@ -100,9 +100,11 @@ def run(vocabulary, texts, old, mode, draft, budget):
     arena = make_arena(setup)
     model = TokenModel(arena)
     torch_ = events_torch(0)
+    columns = torch.arange(1024)
+    columns = columns[columns != 1022]
     marker = torch.sparse_coo_tensor(
-        torch.stack((torch.full((1024,), word), torch.arange(1024))),
-        torch.ones(1024),
+        torch.stack((torch.full((len(columns),), word), columns)),
+        torch.ones(len(columns)),
         (len(vocabulary.vocab), 1024),
         check_invariants=True,
     ).coalesce()
@@ -164,6 +166,7 @@ def run(vocabulary, texts, old, mode, draft, budget):
         part.decoder = decoder
         key_fields = {keys[a]: item for a, item in part.branch_of.items()}
     histories = Counter()
+    expected_rows = {}
     graph_eligible = 0
     scatter_rows = 0
     original = model.forward_chunk
@@ -191,7 +194,11 @@ def run(vocabulary, texts, old, mode, draft, budget):
                 )
                 scatter_rows += len(dest)
         result = original(chunk)
-        finals = set(chunk.final_indices.tolist())
+        # The unused head column identifies the selected normalized row.
+        result[:, 1022] = torch.arange(1, len(result) + 1)
+        final_rows = {row: i + 1 for i, row in enumerate(chunk.final_indices.tolist())}
+        expected_rows.clear()
+        finals = set(final_rows)
         work = []
         for key, start, _, end in chunk.row_spans:
             if old:
@@ -243,9 +250,31 @@ def run(vocabulary, texts, old, mode, draft, budget):
             )
             index = position + 1 - len(prompt)
             histories[(d, q, index, tokens, positions)] += 1
+            expected_rows[d, q, index] = final_rows[row]
         return result
 
     pipeline.forward_chunk = observe
+    if decoder is not None:
+        submit = decoder.submit
+
+        def checked(normed, first_rows, first_documents, rows):
+            for row, anchor in zip(first_rows, first_documents):
+                q, d = part.branch_of[anchor]
+                assert (
+                    int(normed[row, 1022])
+                    == expected_rows[d, q, int(decoder.fed[anchor])]
+                )
+            if rows is not None:
+                start = len(normed) - len(rows)
+                for offset, anchor in enumerate(rows.slots):
+                    q, d = part.branch_of[int(anchor)]
+                    index = int(rows.positions[offset] - decoder.origin[anchor] + 1)
+                    assert (
+                        int(normed[start + offset, 1022]) == expected_rows[d, q, index]
+                    )
+            return submit(normed, first_rows, first_documents, rows)
+
+        decoder.submit = checked
     stats = {}
     run_stages(
         torch_,
