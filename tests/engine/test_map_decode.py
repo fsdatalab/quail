@@ -65,6 +65,7 @@ class TokenModel(HashModel):
             self._unified(self._whole(chunk.meta), ids, positions, hashes)
         else:
             self._tree(chunk.meta, ids, positions, hashes)
+        self._check_state(chunk.meta, ids, positions, hashes)
         rows = chunk.final_indices.tolist()
         out = torch.zeros(len(rows), VOCABULARY)
         out[torch.arange(len(rows)),
@@ -234,11 +235,14 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("path", ["unified", "tree"])
+@pytest.mark.parametrize("path,state_slots,window", [
+    ("unified", 0, None), ("tree", 0, None), ("unified", 120, None),
+    ("unified", 0, 5), ("unified", 120, 5)])
 @pytest.mark.parametrize("lag", [0, 3])
 @pytest.mark.parametrize("planned", ["unified", "tree"])
 def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path,
-                                                              lag, planned):
+                                                              lag, planned,
+                                                              state_slots, window):
     cpu_staging(monkeypatch)
     rng = np.random.default_rng(1)
     # every document starts with the same preamble, longer than a page,
@@ -248,7 +252,8 @@ def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path
                  for n in rng.integers(3, 60, size=10)]
     tails = [[500, 501, 502], [600, 601], [650, 651, 652, 653]]
     limits = [6, 4, 5]
-    setup = Setup(path=path, pages=300, budget=200)
+    setup = Setup(path=path, pages=300, budget=200, state_slots=state_slots,
+                  window=window)
     arena = make_arena(setup)
     model = TokenModel(arena)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk,
@@ -572,7 +577,8 @@ def test_maps_feed_only_document_kv_to_every_join_partner(
 @pytest.mark.parametrize("stop_modulus", [0, 19])
 @pytest.mark.parametrize("path", ["unified", "tree"])
 def test_evicted_answers_recompute_exactly_with_gates_and_limits(
-        monkeypatch, num_maps, limit, lag, budget, stop_modulus, path):
+        monkeypatch, num_maps, limit, lag, budget, stop_modulus, path,
+        state_slots=0, window=None):
     cpu_staging(monkeypatch)
     monkeypatch.setattr(__name__ + ".next_token", lambda h: (
         STOP if stop_modulus and h % stop_modulus == 0 else 10 + h % 900))
@@ -582,7 +588,8 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     ids = list(range(len(documents)))
     tails = [[500, 501], [600, 601], [650, 651]][:num_maps]
     limits = [24, 20, 28][:num_maps]
-    setup = Setup(path=path, pages=16, page_tokens=4, budget=budget)
+    setup = Setup(path=path, pages=16, page_tokens=4, budget=budget,
+                  state_slots=state_slots, window=window, sliding_pages=16)
     arena = make_arena(setup)
     model = TokenModel(arena)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=(),
@@ -619,8 +626,21 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
         assert stats["num_evictions"] > 0
     # an evicted answer whose last token in flight ends it needs no recompute
     assert stats["recomputed_tokens"] == 0 or stats["num_evictions"] > 0
+    if state_slots:
+        assert stats["recomputed_tokens"] > 0
+        assert model.state_starts.max() > 1
+        assert len(arena.accounting.free_slots) == state_slots
     assert not decoder.active
     assert not arena.accounting.owned
+
+
+@pytest.mark.parametrize("budget,lag", [(20, 0), (200, 3)])
+@pytest.mark.parametrize("window", [None, 5])
+def test_hybrid_answers_recompute_exactly_and_reuse_checkpoint_slots(
+        monkeypatch, budget, lag, window):
+    test_evicted_answers_recompute_exactly_with_gates_and_limits(
+        monkeypatch, num_maps=3, limit=None, lag=lag, budget=budget,
+        stop_modulus=0, path="unified", state_slots=24, window=window)
 
 
 @pytest.mark.parametrize("priced,answer_limit,num_pages,num_admitted", [
