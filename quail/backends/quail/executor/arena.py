@@ -83,6 +83,11 @@ class KVArena:
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
         self.reset_stats()
 
+    def bind_answers(self, group, keys):
+        """Own the answer slots' full-attention layout for this execution."""
+        self.answer_group = group
+        self.answer_keys = keys
+
     def _build(self, num_pages, page_tokens, num_sliding_pages, num_state_slots=0):
         torch = self.torch
         self.accounting = PageArena(num_pages, page_tokens, num_state_slots)

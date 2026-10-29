@@ -139,6 +139,8 @@ class StageExecutor:
                      else anchor_keys)
         if len(self.keys) != len(self.prefixes):
             raise ValueError("anchor_keys must match anchor_prefixes")
+        if decoder is not None:
+            self.arena.bind_answers(decoder.kv, self.keys)
         self.frames = [list(stage.frame) for stage in self.stages]
         self.frame_ids = [np.asarray(frame, dtype=np.int64) for frame in self.frames]
         self.writes = frame_writes(self.stages)
@@ -453,14 +455,14 @@ class StageExecutor:
             running = decoder.running()
             positions = (decoder.origin[running] + decoder.fed[running]
                          + decoder.row_counts(running) - 1)
-            growing = running[positions >= decoder.num_pages[running]
+            growing = running[positions >= decoder.kv.num_pages[running]
                               * self.arena.page_tokens]
             if not len(growing):
                 return
             # Copy drafts can cross more than one page.
             added = self.arena.grow_pages([self.keys[a] for a in growing.tolist()])
             if added is not None:
-                decoder.add_pages(growing, added)
+                decoder.kv.add_pages(growing, added)
                 continue
             order = (decoder.eviction_order() if self.answer_admission is None
                      else self.answer_admission.eviction_order())
@@ -499,7 +501,7 @@ class StageExecutor:
                         key, self.prefix_lengths[a], capacity_tokens=capacity,
                         extension=self._extends):
                     break       # the pool is short; the rest wait in order
-                decoder.set_pages(a, self.arena.owned_pages(key))
+                decoder.kv.set_pages(a, self.arena.owned_pages(key))
             end = min(length, start + room)
             replays.append((a, start, end))
             room -= end - start

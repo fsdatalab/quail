@@ -108,7 +108,7 @@ class AnswerAdmission:
                 decoder.expected_tokens[q], int(decoder.limits[q]))
             current = decoder.map[slots] == q
             available = np.where(current,
-                                 decoder.num_pages[slots] * page_tokens
+                                 decoder.kv.num_pages[slots] * page_tokens
                                  - decoder.origin[slots],
                                  self.capacity[slots] - self.prompt[slots])
             mean, variance = page_moments(
@@ -173,8 +173,8 @@ class AnswerAdmission:
             replay = np.asarray(replays)
             slots = np.r_[slots, replay[:, 0]]
             contexts = np.r_[contexts, replay[:, 2] + 1]
-        groups, shared = (decode_groups(slots, decoder.parent, decoder.borrowed,
-                                        decoder.lead)
+        groups, shared = (decode_groups(slots, decoder.kv.parent, decoder.kv.borrowed,
+                                        decoder.kv.lead)
                           if decoder.share else (None, None))
         self.work = cost.row_work(contexts, groups, shared).total()
 
