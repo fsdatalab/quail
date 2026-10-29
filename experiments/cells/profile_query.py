@@ -388,7 +388,9 @@ def child(arguments: str) -> None:
                            data_dir=Path(DATA_DIR) / f"sf{scale_factor}",
                            collection_id=args["collection_id"] or None)
     spec = suite.queries[0]
-    tables = {relation.table: suite.tables[relation.table]
+    sample_rows = args.get("sample_rows", 0)
+    tables = {relation.table: (suite.tables[relation.table].slice(0, sample_rows)
+                              if sample_rows else suite.tables[relation.table])
               for relation in spec.info.relations}
     config = quail.EngineConfig(gpus=1, model=args["model"], backend="quail",
                                 device="h100-sxm", gpu_timing=True)
@@ -419,6 +421,8 @@ def child(arguments: str) -> None:
                      for key, value in measures["node_metrics"].items()}
             record = {
                 "query": query_id, "run": run, "mode": mode,
+                "sample_rows": sample_rows,
+                "input_rows": {name: len(table) for name, table in tables.items()},
                 "quail": quail.__file__,
                 "digest": _digest(output),
                 **{name: measures.get(name) for name in (
@@ -430,7 +434,7 @@ def child(arguments: str) -> None:
                 "nodes": nodes,
                 "allocator": window.get("allocator"),
                 "piecewise": piecewise,
-                "accuracy": evaluate(spec, output, suite.ground_truth, suite.tables),
+                "accuracy": evaluate(spec, output, suite.ground_truth, tables),
             }
             if window["trace"] is not None:
                 record["gpu_window"] = _gpu_gaps(window["trace"], top)
@@ -455,7 +459,7 @@ def child(arguments: str) -> None:
               volumes=VOLUMES)
 def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                   model: str, modes: list[str], top: int, repeats: int,
-                  tag: str, env: str = "") -> str:
+                  tag: str, env: str = "", sample_rows: int = 0) -> str:
     """Profile each query in fresh processes and return its RESULT lines.
 
     Args:
@@ -468,6 +472,7 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
         repeats: Number of repetitions per query and code version.
         tag: Prefix for saved profile filenames.
         env: Comma-separated KEY=VALUE variables for child processes.
+        sample_rows: Keep the first rows of each input table; zero keeps all rows.
 
     Returns:
         Collected RESULT lines from all query processes.
@@ -500,6 +505,7 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                         modes=modes,
                         top=top,
                         stats_prefix=prefix,
+                        sample_rows=sample_rows,
                     )
                 )
                 command = [sys.executable, "-c",
@@ -535,13 +541,15 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
 def profile(queries: str = "BIO-5,FEV-11", scale_factor: float = 0.1,
             model: str = "qwen3-4b-fp8", modes: str = "plain,cprofile",
             top: int = 30, repeats: int = 1, tag: str = "window",
-            env: str = ""):
+            env: str = "", sample_rows: int = 0):
+    if sample_rows < 0:
+        raise ValueError("sample_rows must be nonnegative")
     query_ids = [query.strip() for query in queries.split(",") if query.strip()]
     data = ensure_data.spawn(scale_factor, query_ids, "")
     print(f"function call id: {data.object_id} (data)", flush=True)
     collection = data.get()
     call = profile_query.spawn(query_ids, scale_factor, collection, model,
-                               modes.split(","), top, repeats, tag, env)
+                               modes.split(","), top, repeats, tag, env, sample_rows)
     print(f"function call id: {call.object_id} (profile {queries})", flush=True)
     for line in call.get().splitlines():
         print("SUMMARY " + line, flush=True)
