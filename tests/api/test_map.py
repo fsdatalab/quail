@@ -228,3 +228,17 @@ def test_map_answer_selectivity_prices_the_following_column(session):
     assert [test.position for test in tests] == [0, 1]
     assert finish(query, Oracle()).collect().to_pylist() == [
         {"r.id": 2, "topic": "topic 1", "summary": "summary 1"}]
+
+
+def test_a_documents_extract_fields_and_maps_share_one_attention_choice(session):
+    words = " ".join(f"w{i}" for i in range(2000))
+    session.register("deeds", DocumentProvider.from_table(
+        pa.table({"id": [1, 2], "body": [words, words + " end"]}), id_col="id"))
+    query = session.sql(
+        f"SELECT d.id, AI.MAP(d.body, '{SUMMARY}', 64) AS s, "
+        "AI.EXTRACT(d.body, {'signer': 'Who signed?'}) AS deed FROM deeds d")
+    nodes = [node for node in query.plan().graph.nodes
+             if type(node).__name__ in ("AiExtract", "AiMap")]
+    # an extraction field and a map are two branches reading each long
+    # document; the planner reads it once for both
+    assert len(nodes) == 2 and {node.attention for node in nodes} == {"tree"}
