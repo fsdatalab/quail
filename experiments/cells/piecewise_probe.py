@@ -23,9 +23,10 @@ class PiecewiseProbe:
             replay = graphs.supports(chunk)
             result = original(graphs, chunk)
             record = {"tokens": chunk.tokens, "replay": replay}
+            bucket = next((n for n in graphs.token_buckets if n >= chunk.tokens), None)
             signature = (chunk.attention_mode,
                          bool((chunk.meta.get("reads") or {}).get("nodes")),
-                         bool(chunk.meta.get("shared")), chunk.tokens)
+                         bool(chunk.meta.get("shared")), bucket)
             if probe.verify and replay and len(probe.checked) < 8 and (
                     signature not in probe.checked):
                 torch = graphs.pipeline.engine.torch

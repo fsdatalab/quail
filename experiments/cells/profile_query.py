@@ -1,9 +1,10 @@
 """Profile QUAIL-B query execution on Modal, excluding model startup.
 
 Queries run in fresh processes. Modes are plain (no profiler), cprofile,
-sample (Python stack sampling), trace (torch.profiler), and timeline
-(executor-step and GPU event timing). Each run prints timing, allocation,
-and result-digest fields. The env option sets child-process variables.
+sample (Python stack sampling), trace (torch.profiler), timeline
+(executor-step and GPU event timing), and verify (exact graph/eager output
+checks). Each run prints timing, allocation, and result-digest fields.
+The env option sets child-process variables.
 
 Pass QUAIL_OVERRIDES=module:NAME=json-value;... in env to set module
 constants in the child, such as an executor constant under test, or
@@ -157,6 +158,8 @@ class Timeline:
                     events[1].record()
                 rows = getattr(args[1], "shape", (None,))[0] if len(
                     args) > 1 and kind == "submit" else None
+                if kind == "forward":
+                    rows = args[1].tokens
                 timeline.entries.append((kind, started, ended, events, rows))
 
         if isinstance(owner, type) and isinstance(
@@ -342,6 +345,7 @@ def child(arguments: str) -> None:
             traced = window.get("trace")
             timeline = window.get("timeline")
             sampler = window.get("sampler")
+            probe.start(verify=window.get("verify", False))
             if sampler is not None:
                 sampler.start()
             import torch
@@ -356,6 +360,7 @@ def child(arguments: str) -> None:
             try:
                 return super().run(*args, **kwargs)
             finally:
+                window["piecewise"] = probe.summary()
                 if profiler is not None:
                     profiler.disable()
                 if traced is not None:
@@ -400,9 +405,9 @@ def child(arguments: str) -> None:
                 window["trace"] = torch.profiler.profile(activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA])
-            probe.start(verify=mode == "verify")
+            window["verify"] = mode == "verify"
             output = run_query(session, spec, tables)
-            piecewise = probe.summary()
+            piecewise = window["piecewise"]
             measures = output.measurements
             nodes = {key: {name: value[name] for name in NODE_FIELDS
                            if name in value}
