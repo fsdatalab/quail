@@ -263,7 +263,8 @@ class Prompt:
         descriptions: Their descriptions, in label order.
         task_description: A classification's extra instructions.
         turn: The model's chat text around the prompt.
-        source: The classification template as written.
+        source: The classification template, or the extraction
+            question, as written.
         letters: The letters naming the labels of a lettered prompt.
     """
 
