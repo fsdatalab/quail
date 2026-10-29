@@ -29,12 +29,13 @@ class Dispatches(TorchDispatchMode):
 
 
 def copy_batch(num_fields, num_documents=4, document_tokens=24, draft_tokens=2,
-               num_map_documents=0, prepare=True):
+               num_map_documents=0, prepare=True, answer_limit=32, text=None):
     """Build independent fields over repeated document spans with a small head."""
-    text = "five" + " years" * (document_tokens - 1)
+    text = text or "five" + " years" * (document_tokens - 1)
     spec, vocabulary = make_spec(text)
     spec = replace(spec, top_tokens=4, draft_tokens=draft_tokens,
-                   max_answer_tokens=32, first_window_chars=8, window_chars=16)
+                   max_answer_tokens=answer_limit, first_window_chars=8,
+                   window_chars=16)
     state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
     documents = ExtractionInputs(
         state, [spec] * num_fields, vocabulary, np.arange(num_documents), None,
@@ -43,7 +44,7 @@ def copy_batch(num_fields, num_documents=4, document_tokens=24, draft_tokens=2,
     size = len(vocabulary.vocab)
     num_slots = slots.size + num_map_documents
     decoder = MapDecoder(events_torch(0), torch.eye(size), num_slots,
-                         [32] * (num_fields + bool(num_map_documents)),
+                         [answer_limit] * (num_fields + bool(num_map_documents)),
                          vocabulary.stop_ids, 16)
     decoder.configure_copy(0, slots, documents, [spec] * num_fields)
     for q, selected in enumerate(slots):
@@ -149,3 +150,131 @@ def test_pending_first_tokens_do_not_hold_back_ready_map_rows(monkeypatch):
     assert not decoder.copy_pending.any()
     assert decoder.running().tolist() == list(range(14))
     assert decoder.written[3][12:].tolist() == [2, 2]
+
+
+def sequential_constrain(self, group, projected, documents, indices):
+    """Run the pre-batching verifier, including unused-row trace values."""
+    torch, constraint = self.torch, group.constraint
+    slots, first, inverse, counts = np.unique(
+        documents, return_index=True, return_inverse=True, return_counts=True)
+    local = constraint.tensor(self.copy_document[slots])
+    index = constraint.tensor(group.index[slots])
+    limits = constraint.tensor(self.limits[self.map[slots]])
+    stream_width = int(group.widths[group.index[slots]].max())
+    streams = group.streams[index, :stream_width]
+    alive = group.alive[index, :stream_width]
+    num_streams = int(np.where(indices[first] == 0, stream_width,
+                              self.num_streams[slots]).max())
+    num_streams = max(1, num_streams)
+    if num_streams < stream_width:
+        columns = alive.to(torch.int8).topk(num_streams, dim=1).indices
+        streams = streams.gather(1, columns)
+        alive = alive.gather(1, columns)
+    source = group.source[index]
+    active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
+    width = 4 + self.copy_words + self.copy_trace_words
+    out = torch.full((len(documents), width), -2,
+                     dtype=torch.int64, device=self.device)
+    for step in range(int(counts.max())):
+        valid = step < counts
+        row = np.minimum(first + step, len(documents) - 1)
+        at = constraint.tensor(np.where(valid, indices[row], 1))
+        selected = constraint.tensor(row)
+        chosen, ended, keep = constraint.choose_readout(
+            projected[selected], streams, alive, at, local,
+            first=bool((valid & (indices[row] == 0)).any()))
+        use = active & constraint.tensor(valid)
+        writes = use & ~ended
+        alive = torch.where(writes[:, None], keep, alive)
+        following = constraint.source(streams, alive)
+        hit = chosen == constraint.tokens_at(source, at)
+        values = torch.stack((torch.where(ended, -1, chosen), following,
+                              alive.sum(dim=1), hit.to(torch.int64)), dim=1)
+        # Only valid rows may scatter; padded rows can alias a real row.
+        valid_index = constraint.tensor(np.flatnonzero(valid))
+        out[selected[valid_index], :4] = torch.where(
+            use[valid_index, None], values[valid_index], -2)
+        if self.copy_trace is not None:
+            bits = constraint.trace_values.view(torch.int32).to(torch.int64)
+            out[selected[valid_index], 4 + self.copy_words:] = bits[valid_index]
+        active &= writes & hit & (at + 1 < limits)
+        source = following
+    group.alive[index, :stream_width] = False
+    group.alive[index, :num_streams] = alive
+    group.streams[index, :num_streams] = streams
+    group.widths[group.index[slots]] = num_streams
+    group.source[index] = source
+    packed = constraint.packed_positions(streams, alive, local)
+    out[:, 4:4 + constraint.mask_words] = packed[constraint.tensor(inverse)]
+    return out
+
+
+def verifier_inputs(decoder, vocabulary, mixed=False):
+    """Build projected choices over long, optionally ragged draft rows."""
+    rows = decoder.rows()
+    documents = rows.slots
+    indices = rows.positions - decoder.origin[documents] + 1
+    if mixed:
+        valid = indices <= 40 + documents % 9
+        documents, indices = documents[valid], indices[valid]
+    hidden = torch.full((len(documents), len(vocabulary.vocab)), -10.0)
+    hidden[:, vocabulary.encode_ids(" years")[0]] = 1
+    if mixed:
+        rejects = ((documents % 4 == 0) & (indices == 20)
+                   | (documents % 4 == 1) & (indices == 40))
+        hidden[rejects, vocabulary.encode_ids(" days")[0]] = 2
+        stops = (documents % 4 == 2) & (indices == 1 + documents % 43)
+        hidden[stops, vocabulary.stop_ids[0]] = 2
+    group = decoder.copy_groups[0]
+    _, projected = decoder._project(hidden, documents)
+    return group, projected[group.key], documents, indices
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("num_fields", [1, 3, 41])
+def test_long_draft_choices_and_state_match_sequential_verification(
+    monkeypatch, tmp_path, trace, num_fields
+):
+    if trace:
+        monkeypatch.setenv("QUAIL_EXTRACT_TRACE", str(tmp_path / "trace.jsonl"))
+    else:
+        monkeypatch.delenv("QUAIL_EXTRACT_TRACE", raising=False)
+    text = " ".join("five" + " years" * length + " days" for length in [64, 19, 39])
+    decoder, vocabulary = copy_batch(num_fields, draft_tokens=47, answer_limit=96,
+                                     text=text)
+    inputs = verifier_inputs(decoder, vocabulary, mixed=True)
+    group = inputs[0]
+    decoder.limits[::3] = 30
+    columns = torch.arange(group.alive.shape[1])
+    last = torch.where(group.alive, columns, 0).max(dim=1).values
+    group.source[1::2] = group.streams.gather(1, last[:, None]).squeeze(1)[1::2]
+    saved = (group.alive.clone(), group.streams.clone(), group.source.clone(),
+             group.widths.copy())
+    expected = sequential_constrain(decoder, *inputs)
+    final = (group.alive.clone(), group.streams.clone(), group.source.clone(),
+             group.widths.copy())
+    group.alive.copy_(saved[0])
+    group.streams.copy_(saved[1])
+    group.source.copy_(saved[2])
+    group.widths[:] = saved[3]
+    actual = decoder._constrain(*inputs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for got, want in zip((group.alive, group.streams, group.source), final[:3]):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    np.testing.assert_array_equal(group.widths, final[3])
+    assert (actual[:, 0] == -2).any()
+    assert (actual[:, 0] >= 0).any()
+
+
+def test_verifier_dispatch_count_does_not_grow_with_draft_length(monkeypatch):
+    monkeypatch.delenv("QUAIL_EXTRACT_TRACE", raising=False)
+    counts = []
+    for num_steps in [4, 48]:
+        decoder, vocabulary = copy_batch(41, document_tokens=128,
+                                         draft_tokens=num_steps - 1, answer_limit=96)
+        inputs = verifier_inputs(decoder, vocabulary)
+        assert len(inputs[2]) == 41 * 4 * num_steps
+        with Dispatches() as dispatches:
+            decoder._constrain(*inputs)
+        counts.append(sum(dispatches.counts.values()))
+    assert counts[0] == counts[1], counts

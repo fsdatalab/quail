@@ -502,6 +502,74 @@ class CopyConstraint:
             )
         return chosen, ended, keep
 
+    def verify(self, projected, streams, alive, source, at, documents, limits,
+               valid, first):
+        """Verify every draft position, retaining the first rejected choice."""
+        torch = self.torch
+        chosen, ended, keep = self.choose_readout(
+            projected[:, 0], streams, alive, at[:, 0], documents, first=first)
+        alive = torch.where(ended[:, None], alive, keep)
+        following = self.source(streams, alive)
+        hit = chosen == self.tokens_at(source, at[:, 0])
+        values = torch.stack((torch.where(ended, -1, chosen), following,
+                              alive.sum(dim=1), hit.to(torch.int64)), dim=1)[:, None]
+        traces = (self.trace_values[:, None].view(torch.int32).to(torch.int64)
+                  if self.trace is not None else None)
+        if at.shape[1] == 1:
+            return values, alive, following, traces
+        active = ~ended & hit & (at[:, 0] + 1 < limits)
+        # The first choice can change a tied source after stream compaction.
+        tail, alive, source, tail_traces = self._verify_tail(
+            projected[:, 1:], streams, alive, following, at[:, 1:], documents,
+            limits, valid[:, 1:], active)
+        if traces is not None:
+            traces = torch.cat((traces, tail_traces), dim=1)
+        return torch.cat((values, tail), dim=1), alive, source, traces
+
+    def _verify_tail(self, projected, streams, alive, source, at, documents,
+                     limits, valid, active):
+        torch = self.torch
+        num_rows, num_steps = at.shape
+        expanded = streams[:, None, :].expand(-1, num_steps, -1)
+        tokens = self.tokens_at(expanded, at[:, :, None])
+        drafted = self.tokens_at(source[:, None], at)
+        # A hit retains the earliest source, so it stays fixed until rejection.
+        matches = tokens == drafted[:, :, None]
+        prefixes = matches.to(torch.int32).cumprod(dim=1).bool()
+        before = torch.cat((alive[:, None], alive[:, None] & prefixes[:, :-1]), dim=1)
+        flat_streams = expanded.reshape(num_rows * num_steps, -1)
+        flat_at = at.flatten()
+        flat_documents = documents[:, None].expand(-1, num_steps).flatten()
+        chosen, ended, keep = self.choose_readout(
+            projected.flatten(0, 1), flat_streams, before.flatten(0, 1), flat_at,
+            flat_documents, first=False)
+        chosen, ended = chosen.view_as(at), ended.view_as(at)
+        keep = keep.view_as(before)
+        hit = chosen == drafted
+        continues = valid & ~ended & hit & (at + 1 < limits[:, None])
+        prefixes = continues[:, :-1].to(torch.int32).cumprod(dim=1).bool()
+        use = torch.cat((active[:, None], active[:, None] & prefixes), dim=1)
+        use &= valid
+        after = torch.where(ended[:, :, None], before, keep)
+        # Rejected and terminal choices update the state once; later rows do not.
+        last = (use.sum(dim=1) - 1).clamp_min(0)
+        rows = torch.arange(num_rows, device=self.device)
+        final = torch.where(use[:, :1], after[rows, last], alive)
+        following = self.source(flat_streams, after.flatten(0, 1)).view_as(at)
+        values = torch.stack((torch.where(ended, -1, chosen), following,
+                              after.sum(dim=2), hit.to(torch.int64)), dim=2)
+        values = torch.where(use[:, :, None], values, -2)
+        traces = None
+        if self.trace is not None:
+            # The sequential trace also records unused rows against frozen state.
+            traced = torch.where(use[:, :, None], before, final[:, None])
+            self.choose_readout(projected.flatten(0, 1), flat_streams,
+                                traced.flatten(0, 1), flat_at, flat_documents,
+                                first=False)
+            traces = self.trace_values.view(num_rows, num_steps, -1)
+            traces = traces.view(torch.int32).to(torch.int64)
+        return values, final, self.source(streams, final), traces
+
     def _runner(self, tokens, values, allowed, chosen):
         torch = self.torch
         others = allowed & (tokens != chosen[:, None])

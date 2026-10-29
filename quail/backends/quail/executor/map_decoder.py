@@ -539,34 +539,22 @@ class MapDecoder:
             streams = streams.gather(1, columns)
             alive = alive.gather(1, columns)
         source = group.source[index]
-        active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
+        steps = np.arange(int(counts.max()))
+        valid = steps < counts[:, None]
+        row = np.minimum(first[:, None] + steps, len(documents) - 1)
+        at = constraint.tensor(np.where(valid, indices[row], 1))
+        values, alive, source, traces = constraint.verify(
+            projected[constraint.tensor(row)], streams, alive, source, at, local,
+            limits, constraint.tensor(valid), first=bool((indices[first] == 0).any()))
+        selected = constraint.tensor(np.column_stack((inverse,
+                                                      np.arange(len(documents))
+                                                      - first[inverse])))
         width = 4 + self.copy_words + self.copy_trace_words
         out = torch.full((len(documents), width), -2,
                          dtype=torch.int64, device=self.device)
-        for step in range(int(counts.max())):
-            valid = step < counts
-            row = np.minimum(first + step, len(documents) - 1)
-            at = constraint.tensor(np.where(valid, indices[row], 1))
-            selected = constraint.tensor(row)
-            chosen, ended, keep = constraint.choose_readout(
-                projected[selected], streams, alive, at, local,
-                first=bool((valid & (indices[row] == 0)).any()))
-            use = active & constraint.tensor(valid)
-            writes = use & ~ended
-            alive = torch.where(writes[:, None], keep, alive)
-            following = constraint.source(streams, alive)
-            hit = chosen == constraint.tokens_at(source, at)
-            values = torch.stack((torch.where(ended, -1, chosen), following,
-                                  alive.sum(dim=1), hit.to(torch.int64)), dim=1)
-            # Only valid rows may scatter; padded rows can alias a real row.
-            valid_index = constraint.tensor(np.flatnonzero(valid))
-            out[selected[valid_index], :4] = torch.where(
-                use[valid_index, None], values[valid_index], -2)
-            if self.copy_trace is not None:
-                bits = constraint.trace_values.view(torch.int32).to(torch.int64)
-                out[selected[valid_index], 4 + self.copy_words:] = bits[valid_index]
-            active &= writes & hit & (at + 1 < limits)
-            source = following
+        out[:, :4] = values[selected[:, 0], selected[:, 1]]
+        if self.copy_trace is not None:
+            out[:, 4 + self.copy_words:] = traces[selected[:, 0], selected[:, 1]]
         group.alive[index, :stream_width] = False
         group.alive[index, :num_streams] = alive
         group.streams[index, :num_streams] = streams
