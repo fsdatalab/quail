@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from helpers.extract_fakes import make_spec
 from test_map_decode import events_torch
@@ -108,3 +109,21 @@ def test_maps_keep_argmax_tie_order_in_a_shared_projection():
     decoder.harvest(wait=True)
     assert dispatches.counts["aten.mm.default"] == 1
     assert decoder.tokens[3][-2:, 1].tolist() == [min(tokens)] * 2
+
+
+def test_copy_rows_and_selection_need_no_preparation_after_harvest(monkeypatch):
+    decoder, vocabulary = copy_batch(3, document_tokens=100)
+    constraint = decoder.copy_groups[0].constraint
+    prepare = constraint.prepare
+    monkeypatch.setattr(constraint, "prepare", lambda *args: pytest.fail(
+        "copy selection must already have its inputs"))
+    rows = decoder.rows()
+    decoder.feed(SimpleNamespace(
+        decode_rows=rows, tokens=len(rows), meta={},
+        input_ids=torch.empty(len(rows), dtype=torch.int64)))
+    hidden = torch.full((len(rows), len(vocabulary.vocab)), -10.0)
+    hidden[:, vocabulary.encode_ids(" years")[0]] = 1
+    decoder.submit(hidden, [], [], rows)
+    monkeypatch.setattr(constraint, "prepare", prepare)
+    decoder.harvest(wait=True)
+    assert all((written[written > 0] == 4).all() for written in decoder.written)

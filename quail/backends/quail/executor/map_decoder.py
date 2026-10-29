@@ -169,7 +169,11 @@ class MapDecoder:
             if not len(slots):
                 continue
             constraint = group.constraint
-            self._prepare_copy(group, slots, written[mine], sizes[mine])
+            local = group.index[slots]
+            if np.any((written[mine] > 0) & (
+                    (group.prepared_written[local] != written[mine])
+                    | (group.prepared_drafts[local] < sizes[mine]))):
+                raise AssertionError("copy inputs were not prepared at harvest")
             position, option = np.divmod(self.copy_sources[slots],
                                          constraint.num_options)
             remaining = (1 + constraint.filler_lengths[option]
@@ -363,7 +367,8 @@ class MapDecoder:
         if not together.any():
             return rows
         skip = np.where(together, shared // self.page_tokens, 0)
-        columns = skip[:, None] + np.arange(width)
+        own_width = int((self.num_pages[running] - skip).max())
+        columns = skip[:, None] + np.arange(own_width)
         rows.own_table = np.where(
             columns < self.num_pages[running][:, None],
             table[index[:, None], np.minimum(columns, width - 1)], 0
@@ -475,6 +480,16 @@ class MapDecoder:
         self.copies.append(_Copy(event, host, documents, indices,
                                  self.map[documents].copy()))
         np.add.at(self.inflight, documents, 1)
+        for group in self.copy_groups:
+            mine = np.isin(self.map[documents], group.questions)
+            if (mine & (indices == 0)).any():
+                group.constraint.prepare_documents()
+            mine &= indices > 0
+            slots, first = np.unique(documents[mine], return_index=True)
+            if len(slots):
+                group.constraint.prepare_ahead(
+                    self.copy_document[slots], group.masks[group.index[slots]],
+                    indices[mine][first])
         while len(self.copies) > IN_FLIGHT:
             self._read(self.copies.popleft())
 
@@ -504,9 +519,6 @@ class MapDecoder:
         torch, constraint = self.torch, group.constraint
         slots, first, inverse, counts = np.unique(
             documents, return_index=True, return_inverse=True, return_counts=True)
-        # A replay can choose a token before the slot packs another decode row.
-        self._prepare_copy(group, slots, indices[first],
-                           np.zeros(len(slots), dtype=np.int64))
         local = constraint.tensor(self.copy_document[slots])
         index = constraint.tensor(group.index[slots])
         limits = constraint.tensor(self.limits[self.map[slots]])
@@ -588,6 +600,15 @@ class MapDecoder:
         self.stopped[documents[stop]] = True
         self.map[documents[ended]] = -1
         self.finished.extend(zip(documents[ended].tolist(), maps[ended].tolist()))
+        for group in self.copy_groups:
+            slots = np.unique(documents[np.isin(maps, group.questions)])
+            slots = slots[(self.map[slots] >= 0) & (self.inflight[slots] == 0)]
+            written = np.empty(len(slots), dtype=np.int64)
+            for q in group.questions:
+                mine = self.map[slots] == q
+                written[mine] = self.written[q][slots[mine]]
+            drafts = np.full(len(slots), group.constraint.spec.draft_tokens)
+            self._prepare_copy(group, slots, written, drafts)
 
     def _read_copy(self, q, documents, indices, values):
         from quail.cost.draft_policy import LIVE_BUCKETS
