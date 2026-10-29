@@ -92,7 +92,7 @@ def specs_for(vocabulary, draft):
     return specs
 
 
-def run(vocabulary, texts, old, mode, draft, budget):
+def run(vocabulary, texts, old, mode, draft, budget, planned="unified"):
     specs = specs_for(vocabulary, draft)
     (word,) = vocabulary.encode_ids(" five")
     encoded = vocabulary.document_batch(texts, [None] * len(texts))
@@ -148,6 +148,7 @@ def run(vocabulary, texts, old, mode, draft, budget):
                     node_id=f"e{q}",
                     backend_name="quail",
                     model=QWEN3_4B_FP8.name,
+                    attention=planned,
                     spec=spec,
                 )
                 for q, spec in enumerate(specs)
@@ -303,6 +304,8 @@ def run(vocabulary, texts, old, mode, draft, budget):
             eligible=graph_eligible,
             reads=sum(histories.values()),
             scatter=scatter_rows,
+            shared_reads=model.shared_reads,
+            read_tokens=None if decoder is None else decoder.read_tokens,
             stats=stats,
         ),
     )
@@ -329,3 +332,23 @@ def test_branches_and_rewinds_read_identical_prompt_and_draft_histories(
         assert current == baseline
         if mode == "unified":
             assert other["eligible"] == 0
+
+
+@pytest.mark.parametrize("draft", [0, 3])
+def test_planned_tree_extractions_read_shared_pages_once_without_changing_answers(
+    monkeypatch, vocabulary, draft
+):
+    cpu_staging(monkeypatch)
+    baseline, answers, unshared = run(
+        vocabulary, list(TEXTS), False, "unified", draft, 512
+    )
+    current, got, shared = run(
+        vocabulary, list(TEXTS), False, "unified", draft, 512, planned="tree"
+    )
+    assert current == baseline
+    assert got == answers
+    assert unshared["shared_reads"] == 0
+    assert shared["shared_reads"] > 0
+    reads = shared["read_tokens"]
+    assert reads["shared"] > 0
+    assert reads["alone"] + reads["own"] + reads["shared"] < reads["all"]

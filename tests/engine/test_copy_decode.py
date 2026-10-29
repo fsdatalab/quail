@@ -334,8 +334,11 @@ def test_map_and_copy_fields_can_reuse_a_slot_without_changing_saved_spans():
 
 @pytest.mark.parametrize("map_first", [False, True])
 @pytest.mark.parametrize("tested", [None, "extract", "map"])
+@pytest.mark.parametrize("extract_attention", ["unified", "tree"])
+@pytest.mark.parametrize("map_attention", ["unified", "tree"])
+@pytest.mark.parametrize("pages", [24, 300])
 def test_maps_and_extracts_share_branches_without_changing_results(
-    monkeypatch, map_first, tested
+    monkeypatch, map_first, tested, extract_attention, map_attention, pages
 ):
     from helpers.fakes import cpu_staging
     from helpers.kv_checker import Setup, chain, make_arena
@@ -363,7 +366,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     spec, vocabulary = make_spec(*texts, "five days years lease", "or", "for")
     vocabulary.tokenizer.batch_decode = batch_decode
     spec = replace(spec, max_answer_tokens=6, draft_tokens=3, top_tokens=4)
-    setup = Setup(path="unified", pages=24, page_tokens=4, budget=128)
+    setup = Setup(path="unified", pages=pages, page_tokens=4, budget=128)
     arena = make_arena(setup)
     model = TokenModel(arena)
     state = map_state(setup, arena, model.forward_chunk)
@@ -382,6 +385,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
                 node_id=f"extract:{q}",
                 backend_name="quail",
                 model="qwen3-4b-fp8",
+                attention=extract_attention,
                 spec=replace(spec, name=f"answer{q}"),
             )
             for q in range(2)
@@ -392,7 +396,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     )
 
     def mapped(name, first):
-        node = map_node(name, [10, 11], 6, "tree")
+        node = map_node(name, [10, 11], 6, map_attention)
         node.node_id, node.rows_port, node.spec.aliases = name, "rows:c", ("c",)
         return MapPart(state, [node], ids, first)
 
@@ -466,6 +470,15 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         assert any(expected)
         assert after.asked[0].tolist() == expected
     assert len(set(maps.slots.flat) & set(extracts.slots.flat)) == 0
+    shared = "tree" in (extract_attention, map_attention)
+    assert extracts.decoder.share == shared
+    # Tight KV can serialize short answers before sibling branches decode.
+    if pages == 300 or not shared:
+        assert (model.shared_reads > 0) == shared
+    reads = extracts.decoder.read_tokens
+    assert (reads["alone"] + reads["own"] + reads["shared"] < reads["all"]) == (
+        model.shared_reads > 0
+    )
     assert not arena.accounting.owned
 
 
