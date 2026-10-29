@@ -73,52 +73,53 @@ def _digest(output) -> str:
 
 def _forward_kernels(events):
     """Measure kernel envelopes and eager launches attributed to forward scopes."""
+    from bisect import bisect_left
     from collections import Counter, defaultdict
 
     from torch.autograd import DeviceType
 
-    cpu = {event.id: event for event in events if event.device_type == DeviceType.CPU}
-
-    def owner(event, prefix):
-        parent = (event if event.device_type == DeviceType.CPU
-                  else cpu.get(event.linked_correlation_id))
-        while parent is not None:
-            if parent.name.startswith(prefix):
-                return parent
-            parent = parent.cpu_parent
-        return None
-
-    forwards, launches = defaultdict(list), defaultdict(Counter)
-    attention = Counter()
-    num_kernels = 0
+    # Kineto's CUDA annotations include custom and replayed kernels that
+    # do not link individually to a PyTorch CPU operator.
+    forwards, kernels = [], []
+    launches, attention = defaultdict(Counter), Counter()
     for event in events:
         if event.device_type == DeviceType.CUDA:
-            num_kernels += 1
-            forward = owner(event, "quail.forward")
-            if forward is not None:
-                forwards[forward.id].append(event.time_range)
+            if event.name == "quail.forward":
+                forwards.append(event.time_range)
+            elif not event.is_user_annotation:
+                kernels.append(event.time_range)
         elif event.name.startswith("quail.attention."):
             attention[event.name] += 1
-        elif "Launch" in event.name:
-            call = owner(event, "quail.attention.")
-            if call is not None:
-                launches[call.name][event.name] += 1
+        elif any(kind in event.name for kind in ("Launch", "Memcpy", "Memset")):
+            parent = event.cpu_parent
+            while parent is not None:
+                if parent.name.startswith("quail.attention."):
+                    launches[parent.name][event.name] += 1
+                    break
+                parent = parent.cpu_parent
+    merged = []
+    for value in sorted(kernels, key=lambda value: value.start):
+        if merged and value.start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], value.end)
+        else:
+            merged.append([value.start, value.end])
+    ends = [end for _, end in merged]
     span = busy = 0.0
-    for ranges in forwards.values():
-        ranges.sort(key=lambda value: value.start)
-        start, end = ranges[0].start, ranges[0].start
-        for value in ranges:
-            busy += max(0, value.end - max(end, value.start))
-            end = max(end, value.end)
-        span += end - start
+    for value in forwards:
+        span += value.end - value.start
+        index = bisect_left(ends, value.start)
+        while index < len(merged) and merged[index][0] < value.end:
+            start, end = merged[index]
+            busy += max(0, min(end, value.end) - max(start, value.start))
+            index += 1
     return {"passes": len(forwards), "span_s": span / 1e6,
             "busy_s": busy / 1e6, "idle_s": (span - busy) / 1e6,
-            "attributed_kernels": sum(len(rows) for rows in forwards.values()),
-            "total_kernels": num_kernels,
+            "total_kernels": len(kernels),
             "attention_dispatch": {
                 name.removeprefix("quail.attention."): {
-                    "layers": count, "launches": sum(launches[name].values()),
-                    "launches_per_layer": sum(launches[name].values()) / count,
+                    "layers": count, "launches": sum(
+                        n for api, n in launches[name].items() if "Launch" in api),
+                    "commands_per_layer": sum(launches[name].values()) / count,
                     "apis": dict(launches[name])}
                 for name, count in attention.items()}}
 
@@ -130,7 +131,8 @@ def _gpu_gaps(prof, top: int) -> dict:
     events = list(prof.events())
     kernels = sorted((event.time_range.start, event.time_range.end, event.name)
                      for event in events
-                     if event.device_type == DeviceType.CUDA)
+                     if event.device_type == DeviceType.CUDA
+                     and not event.is_user_annotation)
     cpu = [event.time_range.start for event in events
            if event.device_type == DeviceType.CPU]
     if not kernels:

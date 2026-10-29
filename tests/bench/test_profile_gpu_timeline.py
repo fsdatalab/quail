@@ -24,7 +24,7 @@ def test_query_timeline_records_forward_token_counts():
 
 def test_kernel_trace_separates_idle_inside_forward_from_other_gpu_work():
     torch = pytest.importorskip("torch")
-    from experiments.cells.profile_query import _forward_kernels
+    from experiments.cells.profile_query import _forward_kernels, _gpu_gaps
 
     cpu, cuda = torch.autograd.DeviceType.CPU, torch.autograd.DeviceType.CUDA
     forward = SimpleNamespace(
@@ -34,16 +34,25 @@ def test_kernel_trace_separates_idle_inside_forward_from_other_gpu_work():
     launch = SimpleNamespace(
         id=3, device_type=cpu, name="cuLaunchKernel", cpu_parent=attention)
     kernels = [SimpleNamespace(
-        device_type=cuda, linked_correlation_id=link,
+        device_type=cuda, name="kernel", is_user_annotation=False,
         time_range=SimpleNamespace(start=start, end=end))
-        for link, start, end in [(2, 1, 3), (2, 5, 8), (0, 9, 20)]]
-    got = _forward_kernels([forward, attention, launch, *kernels])
+        for start, end in [(1, 3), (5, 8), (9, 20)]]
+    annotation = SimpleNamespace(
+        device_type=cuda, name="quail.forward", is_user_annotation=True,
+        time_range=SimpleNamespace(start=1, end=8))
+    got = _forward_kernels([forward, attention, launch, annotation, *kernels])
     assert got["passes"] == 1
     assert got["busy_s"] == 5e-6
     assert got["idle_s"] == 2e-6
-    assert got["attributed_kernels"] == 2
     assert got["total_kernels"] == 3
-    assert got["attention_dispatch"]["shared"]["launches_per_layer"] == 1
+    assert got["attention_dispatch"]["shared"]["commands_per_layer"] == 1
+    for event in (forward, attention, launch):
+        event.time_range = SimpleNamespace(start=0, end=10)
+    prof = SimpleNamespace(events=lambda: [forward, attention, launch,
+                                         annotation, *kernels])
+    window = _gpu_gaps(prof, 10)
+    assert window["busy_s"] == 16e-6
+    assert [kernel["name"] for kernel in window["kernels"]] == ["kernel"]
 
 
 def test_timeline_clips_to_join_and_merges_concurrent_operations(tmp_path):
