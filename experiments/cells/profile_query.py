@@ -11,7 +11,9 @@ the run, as a Perfetto trace under /results/ablations/traces.
 Pass QUAIL_OVERRIDES=module:NAME=json-value;... in env to set module
 constants in the child, such as an executor constant under test, or
 QUAIL_SWEEP=overrides|overrides|... to run each set as its own version
-in one container, alternating order between repetitions.
+in one container, alternating order between repetitions. For example,
+QUAIL_SWEEP=|profile_query:GRAPH_SIZES="vllm" runs Quail's CUDA graph
+sizes, then the stock vLLM baseline's.
 
 Set QUAIL_BEFORE_SOURCE to a directory containing an earlier copy of
 quail to compare both versions on the same GPU. Run order alternates
@@ -41,6 +43,9 @@ from bench.quailb_parallel import (
 from quail.deploy.images import gpu_image
 
 PROFILE_DIR = "/results/ablations/profiles"
+# CUDA graph capture sizes: None keeps Quail's; "vllm" takes the stock
+# vLLM baseline's. Set it per run with QUAIL_OVERRIDES or QUAIL_SWEEP.
+GRAPH_SIZES = None
 # Perfetto traces, served by experiments/cells/trace_server.py
 TRACE_DIR = "/results/ablations/traces"
 # seconds of a trace run kept for Perfetto, starting 40% into the GPU
@@ -465,6 +470,23 @@ def _apply_overrides(text: str) -> None:
         print(f"override {module}.{name} = {value}", flush=True)
 
 
+def _apply_graph_sizes() -> None:
+    """Capture the stock vLLM baseline's graph sizes when GRAPH_SIZES asks."""
+    if GRAPH_SIZES is None:
+        return
+    if GRAPH_SIZES != "vllm":
+        raise ValueError(f"unknown GRAPH_SIZES {GRAPH_SIZES!r}")
+    from quail.backends.quail.executor import cuda_graphs
+    from quail.baselines.vllm import CUDA_GRAPH_CAPTURE_SIZES
+    from quail.cost import budgets
+
+    sizes = tuple(CUDA_GRAPH_CAPTURE_SIZES)
+    # the budgets size the graph reserve and KV from the same sizes
+    budgets.graph_token_buckets = lambda model, device: sizes
+    cuda_graphs.graph_token_buckets = budgets.graph_token_buckets
+    print(f"graph sizes: {len(sizes)} from the vLLM baseline", flush=True)
+
+
 def child(arguments: str) -> None:
     """Run one query several times in a fresh session; print a RESULT line per run.
 
@@ -485,6 +507,7 @@ def child(arguments: str) -> None:
 
     args = json.loads(arguments)
     _apply_overrides(os.environ.get("QUAIL_OVERRIDES", ""))
+    _apply_graph_sizes()
     query_id, scale_factor = args["query_id"], args["scale_factor"]
     modes, top = args["modes"], args["top"]
     print(f"quail from {quail.__file__}", flush=True)
