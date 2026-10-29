@@ -130,6 +130,7 @@ class MapDecoder:
             constraint=constraint, key=key,
             questions=np.arange(first, first + len(specs)), index=index,
             streams=streams, alive=streams >= 0,
+            widths=np.full(slots.size, streams.shape[1], dtype=np.int64),
             source=self.torch.zeros(slots.size, dtype=self.torch.int64,
                                     device=self.device),
             masks=np.zeros((slots.size, constraint.mask_words), dtype=np.int64),
@@ -509,8 +510,16 @@ class MapDecoder:
         local = constraint.tensor(self.copy_document[slots])
         index = constraint.tensor(group.index[slots])
         limits = constraint.tensor(self.limits[self.map[slots]])
-        streams = group.streams[index]
-        alive = group.alive[index]
+        stream_width = int(group.widths[group.index[slots]].max())
+        streams = group.streams[index, :stream_width]
+        alive = group.alive[index, :stream_width]
+        num_streams = int(np.where(indices[first] == 0, stream_width,
+                                  self.num_streams[slots]).max())
+        num_streams = max(1, num_streams)
+        if num_streams < stream_width:
+            columns = alive.to(torch.int8).topk(num_streams, dim=1).indices
+            streams = streams.gather(1, columns)
+            alive = alive.gather(1, columns)
         source = group.source[index]
         active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
         width = 4 + self.copy_words + self.copy_trace_words
@@ -540,8 +549,10 @@ class MapDecoder:
                 out[selected[valid_index], 4 + self.copy_words:] = bits[valid_index]
             active &= writes & hit & (at + 1 < limits)
             source = following
-        group.alive[index] = alive
-        group.streams[index] = streams
+        group.alive[index, :stream_width] = False
+        group.alive[index, :num_streams] = alive
+        group.streams[index, :num_streams] = streams
+        group.widths[group.index[slots]] = num_streams
         group.source[index] = source
         packed = constraint.packed_positions(streams, alive, local)
         out[:, 4:4 + constraint.mask_words] = packed[constraint.tensor(inverse)]

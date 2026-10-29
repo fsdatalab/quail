@@ -89,7 +89,6 @@ class CopyConstraint:
         self.max_positions = max(1, int(counts.max(initial=0)))
         self.mask_words = -(-self.max_positions // 64)
         self.position_offsets_device = self.tensor(self.position_offsets)
-        self.mask_bits = self.tensor(np.arange(64))
         self.positions = []
         self.exhausted = np.zeros(len(self.characters), dtype=bool)
         self.prepared = np.empty(0, dtype=np.int64)
@@ -188,12 +187,11 @@ class CopyConstraint:
             - self.position_offsets_device[documents, None]
         ).clamp_min(0)
         mask = torch.zeros(
-            (len(alive), self.mask_words * 64), dtype=torch.int64, device=self.device
+            (len(alive), self.mask_words), dtype=torch.int64, device=self.device
         )
-        mask.scatter_reduce_(1, positions, alive.to(torch.int64), reduce="amax")
-        return (mask.reshape(len(alive), self.mask_words, 64) << self.mask_bits).sum(
-            dim=2
-        )
+        # Each surviving stream has a distinct document position.
+        mask.scatter_add_(1, positions // 64, alive.to(torch.int64) << (positions % 64))
+        return mask
 
     def prepare(self, documents, tokens, masks, written, drafts, sources):
         """Prepare only continuations that can verify the next copy draft.
