@@ -20,12 +20,16 @@ class RetentionPolicy:
     checkpoint_pages: float = 0.0    # pages of the state a hybrid model's
     #                                  document keeps beside its KV
 
+    def prefill_seconds(self, tokens: int) -> float:
+        """Return ideal compute time to rebuild a prefix of this length."""
+        return (self.linear_seconds * tokens
+                + self.pair_seconds * triangle(tokens)
+                + self.sliding_pair_seconds * triangle(tokens, self.sliding_window))
+
     def priority(self, key, tokens: int, pages: int) -> tuple:
         alias, document = key
         probability, next_use = self.uses.get(alias, (0.0, 0))
-        seconds = (self.linear_seconds * tokens
-                   + self.pair_seconds * triangle(tokens)
-                   + self.sliding_pair_seconds * triangle(tokens, self.sliding_window))
+        seconds = self.prefill_seconds(tokens)
         held = pages + self.checkpoint_pages
         return (probability * seconds / held, -next_use, -document)
 
