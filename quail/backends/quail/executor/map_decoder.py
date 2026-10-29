@@ -533,11 +533,16 @@ class MapDecoder:
             streams = streams.gather(1, columns)
             alive = alive.gather(1, columns)
         source = group.source[index]
+        num_steps = int(counts.max())
+        # An accepted draft keeps its source; a rejection ends verification.
+        expected = constraint.tokens_at(
+            source[:, None],
+            constraint.tensor(indices[first, None] + np.arange(num_steps)))
         active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
         width = 4 + self.copy_words + self.copy_trace_words
         out = torch.full((len(documents), width), -2,
                          dtype=torch.int64, device=self.device)
-        for step in range(int(counts.max())):
+        for step in range(num_steps):
             valid = step < counts
             row = np.minimum(first + step, len(documents) - 1)
             at = constraint.tensor(np.where(valid, indices[row], 1))
@@ -549,7 +554,7 @@ class MapDecoder:
             writes = use & ~ended
             alive = torch.where(writes[:, None], keep, alive)
             following = constraint.source(streams, alive)
-            hit = chosen == constraint.tokens_at(source, at)
+            hit = chosen == expected[:, step]
             values = torch.stack((torch.where(ended, -1, chosen), following,
                                   alive.sum(dim=1), hit.to(torch.int64)), dim=1)
             # Only valid rows may scatter; padded rows can alias a real row.
