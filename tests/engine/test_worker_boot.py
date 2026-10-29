@@ -46,11 +46,12 @@ def booted(monkeypatch):
     for name in ("load_model", "AnswerRows", "KVArena", "AsyncAnswers"):
         monkeypatch.setattr(worker, name, lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "build_pipeline",
-                        lambda *a, **k: SimpleNamespace(decode_graphs=None))
+                        lambda *a, **k: SimpleNamespace(piecewise_graphs=None))
     monkeypatch.setattr(worker, "KVArena", lambda *a, **k: SimpleNamespace(
         k=[], v=[], gdn_state=None, conv_state=None, num_pages=0))
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})
+    monkeypatch.setattr(worker.PiecewiseGraphs, "for_specs", lambda *a: None)
 
 
 ENVELOPE = {
@@ -62,13 +63,13 @@ PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "gpus": 1,
            "documents": {}, **ENVELOPE["settings"]}
 
 
-def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
+def test_arena_resize_keeps_pieces_that_do_not_reference_kv(booted, monkeypatch):
     calls = []
     gpu = LoadedGpu.__new__(LoadedGpu)
     gpu.torch = sys.modules["torch"]
     monkeypatch.setattr(gpu.torch.cuda, "synchronize",
                         lambda: calls.append("synchronize"))
-    gpu.pipeline = SimpleNamespace(decode_graphs=SimpleNamespace(
+    gpu.pipeline = SimpleNamespace(piecewise_graphs=SimpleNamespace(
         invalidate=lambda: calls.append("invalidate")))
     gpu.arena = SimpleNamespace(
         num_pages=8, num_sliding_pages=0, k=[], v=[], gdn_state=None,
@@ -83,7 +84,7 @@ def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
     assert calls == ["resize"]
     calls.clear()
     gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
-    assert calls == ["synchronize", "invalidate", "resize"]
+    assert calls == ["resize"]
 
 
 def test_prepared_boot_is_handed_to_the_query_and_used_once(

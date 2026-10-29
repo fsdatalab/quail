@@ -12,7 +12,7 @@ from helpers.fakes import cpu_staging, fake_pipeline
 from helpers.kv_checker import Setup, make_arena
 from test_map_decode import TokenModel, events_torch
 
-from quail.backends.quail.executor.cuda_graphs import DecodeGraphs
+from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
 from quail.backends.quail.executor.extract.copy import CopyConstraint
 from quail.backends.quail.executor.extract.stages import ExtractionStages
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
@@ -24,7 +24,7 @@ from quail.catalog.tokens import GigatokenEncoder
 from quail.logical import ColumnRef
 from quail.logical.prompts import bind_extract_prompt
 from quail.physical import AiExtract, ExtractSpec
-from quail.specs import QWEN3_4B_FP8
+from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 QUESTIONS = (
     "What is the term?",
@@ -113,8 +113,9 @@ def run(vocabulary, texts, old, mode, draft, budget, planned="unified"):
         forward_chunk=model.forward_chunk, canvas_ids=(), tree_attention=True
     )
     pipeline.engine = SimpleNamespace(arena=arena)
-    graphs = DecodeGraphs(pipeline)
-    graphs.storage = arena.k
+    pipeline.forward_hook = None
+    graphs = PiecewiseGraphs.for_specs(pipeline, QWEN3_4B_FP8, H100_SXM)
+    graphs.graphs = [object()]
     state = SimpleNamespace(
         torch=torch_,
         loaded_model=SimpleNamespace(
@@ -332,8 +333,7 @@ def test_branches_and_rewinds_read_identical_prompt_and_draft_histories(
         current, got, other = run(vocabulary, texts, old, mode, draft, budget)
         assert got == answers
         assert current == baseline
-        if mode == "unified":
-            assert other["eligible"] == 0
+        assert other["eligible"] > 0
 
 
 @pytest.mark.parametrize("draft", [0, 3])

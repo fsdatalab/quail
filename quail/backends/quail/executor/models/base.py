@@ -35,7 +35,7 @@ class ModelPipeline:
     gemm_warmup = True
     warm_row_classes = True    # row-count classes keep one KV row per reader
     warm_joins = True          # join and classification chunks borrow prefixes
-    decode_graphs = None
+    piecewise_graphs = None
     # For a spec with an SAE, forward_chunk returns the residual stream
     # after the last loaded layer instead of the final-normed rows, and
     # forward_hook, when a query sets it, is called with (stream, chunk)

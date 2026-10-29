@@ -42,8 +42,8 @@ def forward_chunk(pipeline, arena, chunk):
     temporaries whether the pass returns or raises.
     """
     try:
-        if pipeline.decode_graphs is not None:
-            out = pipeline.decode_graphs.forward(chunk)
+        if pipeline.piecewise_graphs is not None:
+            out = pipeline.piecewise_graphs.forward(chunk)
         else:
             out = pipeline.forward_chunk(chunk)
         arena.sample_memory(chunk.tokens, len(chunk.layout))
