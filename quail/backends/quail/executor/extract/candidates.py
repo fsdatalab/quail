@@ -52,7 +52,11 @@ class SqueezedText:
     """A document with single spaces and a map to original character ends."""
 
     def __init__(self, text: str):
-        self.text = re.sub(r"\s+", " ", text)
+        self.text = " ".join(text.split())
+        if text and text[0].isspace():
+            self.text = " " + self.text
+        if text and text[-1].isspace() and self.text != " ":
+            self.text += " "
         self.ends = np.arange(1, len(self.text) + 1, dtype=np.int64)
         runs = list(re.finditer(r"\s{2,}", text))
         if runs:
