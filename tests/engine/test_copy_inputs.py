@@ -115,7 +115,9 @@ def run(vocabulary, texts, old, mode, draft, budget, planned="unified"):
     pipeline.engine = SimpleNamespace(arena=arena)
     pipeline.forward_hook = None
     graphs = PiecewiseGraphs.for_specs(pipeline, QWEN3_4B_FP8, H100_SXM)
-    graphs.graphs = [object()]
+    graphs.storage = arena.k
+    graphs.graphs = [SimpleNamespace(buffers=SimpleNamespace(
+        num_tokens=graphs.token_buckets[-1], supports=lambda chunk: True))]
     state = SimpleNamespace(
         torch=torch_,
         loaded_model=SimpleNamespace(
