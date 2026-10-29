@@ -706,6 +706,11 @@ def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
     assert order.index(2) < order.index(3)
     decoder.pause(0)
     assert 0 not in decoder.eviction_order()
+    curves = {q: answer_survival(decoder.lengths[q], decoder.written[q],
+                                 decoder.expected_tokens[q], int(decoder.limits[q]))
+              for q in range(len(decoder.limits))}
+    np.testing.assert_array_equal(decoder.eviction_order(curves),
+                                  decoder.eviction_order())
 
 
 def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(

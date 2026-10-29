@@ -294,7 +294,7 @@ class MapDecoder:
         self.paused[document] = False
         self.drafts[document] = 0
 
-    def eviction_order(self):
+    def eviction_order(self, curves=None):
         """Running slots ordered by longest expected remaining answer first."""
         from quail.backends.quail.executor.answer_survival import remaining_tokens
 
@@ -302,8 +302,9 @@ class MapDecoder:
         scores = np.zeros(len(self.map))
         written = np.zeros(len(self.map), dtype=np.int64)
         for q in np.unique(self.map[running]):
-            curve = remaining_tokens(self.lengths[q], self.written[q],
-                                     self.expected_tokens[q], int(self.limits[q]))
+            curve = remaining_tokens(
+                self.lengths[q], self.written[q], self.expected_tokens[q],
+                int(self.limits[q]), survival=None if curves is None else curves.get(q))
             mine = running[self.map[running] == q]
             written[mine] = self.written[q][mine]
             scores[mine] = curve[written[mine]]

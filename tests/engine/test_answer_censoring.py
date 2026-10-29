@@ -23,6 +23,8 @@ def test_cold_start_uses_the_map_length_prior():
         assert np.isclose(remaining[written], prior[written + 1:].sum()
                           / prior[written])
     assert remaining[8] == 0
+    np.testing.assert_allclose(remaining, remaining_tokens([], [], 3, 8,
+                                                          survival=prior))
 
 
 def test_censored_answers_leave_the_risk_set_after_their_written_length():
