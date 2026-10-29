@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from quail.backends.quail.executor.chunk import DecodeRows
+from quail.backends.quail.executor.chunk import DecodeRows, decode_groups
 
 # copies of chosen tokens kept in flight before the host waits on the
 # oldest; two lets the host read a pass's tokens while the next runs
@@ -362,15 +362,8 @@ class MapDecoder:
         # whose first pages are the same; its rows read those pages once
         # together when two or more of them run. A slot both borrowing
         # and lent from takes the group with the longer shared pages
-        parents = self.parent[running]
-        as_child = np.where(self.borrowed[running] == self.lead[parents],
-                            self.borrowed[running], 0)
-        as_parent = self.lead[running]
-        groups = np.where(as_parent >= as_child, running, parents)
-        shared = np.maximum(as_parent, as_child)
-        _, inverse, counts = np.unique(np.where(shared > 0, groups, -1 - index),
-                                       return_inverse=True, return_counts=True)
-        together = (shared > 0) & (counts[inverse] > 1)
+        groups, shared = decode_groups(running, self.parent, self.borrowed, self.lead)
+        together = shared > 0
         if not together.any():
             return rows
         skip = np.where(together, shared // self.page_tokens, 0)

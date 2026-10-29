@@ -89,7 +89,7 @@ class StageExecutor:
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
                  appended_tokens=None, gpu_timing=False, survival=None,
-                 decoder=None, dependencies=None, knee_rows=0, recompute_cost=None):
+                 decoder=None, dependencies=None, knee_rows=0, decode_cost=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -249,7 +249,7 @@ class StageExecutor:
             self.answer_admission = AnswerAdmission(
                 decoder, self.prefix_lengths, self.capacity_extra,
                 self.sched.dependencies, self.borrowing.tree_shared,
-                self.arena.page_cost, recompute_cost)
+                self.arena.page_cost, decode_cost)
         # a Gated DeltaNet layer starts a borrower from the parent's state
         # at the shared point, so a parent writes one slot per point
         self.share_points = [()] * len(self.keys)
@@ -412,7 +412,7 @@ class StageExecutor:
                             if self.arena.is_resident(key)
                             else self.arena.page_cost(capacity - shared))
             if not self.answer_admission.allows(
-                    anchor, self.arena.free_pages, prompt_pages, rows, self.knee_rows):
+                    anchor, self.arena.free_pages, prompt_pages):
                 if self.answer_admission.maximum or len(self.decoder.running()):
                     return False
                 # No answer can free pages: start with one page and grow.

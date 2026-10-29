@@ -29,11 +29,12 @@ from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
+from quail.cost.decode import DecodeCost
 from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext
 from quail.physical import AiJoin, AiMap, MapSpec, PortRef
 from quail.physical.base import input_ports
-from quail.specs import QWEN3_4B_FP8
+from quail.specs import DEVICES, QWEN3_4B_FP8
 
 VOCABULARY = 1024
 STOP = VOCABULARY - 1
@@ -622,11 +623,11 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("knee_rows,answer_limit,num_pages,num_admitted", [
-    (0, 80, 20, 1), (200, 80, 20, 4), (0, 8, 12, 2),
+@pytest.mark.parametrize("priced,answer_limit,num_pages,num_admitted", [
+    (False, 80, 20, 1), (True, 80, 20, 4), (False, 8, 12, 2),
 ])
-def test_answer_admission_uses_free_pass_work_below_the_knee(
-        monkeypatch, knee_rows, answer_limit, num_pages, num_admitted):
+def test_answer_admission_prices_overlap_only_with_hardware_specs(
+        monkeypatch, priced, answer_limit, num_pages, num_admitted):
     cpu_staging(monkeypatch)
     setup = Setup(path="unified", pages=num_pages, page_tokens=4, budget=200)
     arena = make_arena(setup)
@@ -646,9 +647,11 @@ def test_answer_admission_uses_free_pass_work_below_the_knee(
     decoder = MapDecoder(torch_, torch.eye(VOCABULARY), 4, [answer_limit], [STOP], 4)
     maps.decoder = decoder
     stats = {}
+    decode_cost = (DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
+                   if priced else None)
     run_stages(torch_, arena, pipeline, gated_stages([maps]), prefixes, 200,
                anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
-               decoder=decoder, stats=stats, knee_rows=knee_rows)
+               decoder=decoder, stats=stats, decode_cost=decode_cost)
     assert admitted[0] == num_admitted
     if answer_limit == 8:
         assert num_admitted == num_pages // -(-(10 + answer_limit - 1) // 4)
@@ -663,19 +666,21 @@ def test_admission_counts_dependent_answers_without_reserving_them_twice():
     decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 3,
                          [32, 16], [STOP], 4, expected_tokens=[12, 4])
     decoder.answer_slots = {0: np.array([0, 1]), 1: np.array([2])}
+    decoder.share = True
+    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
     admission = AnswerAdmission(decoder, [8, 8, 8], 6, {2: (0, 0)}, [0, 0, 4],
-                                lambda tokens: pages_for(tokens, 4))
+                                lambda tokens: pages_for(tokens, 4), cost)
     admission.refresh(np.array([-1, -1, -1]))
     assert admission.added_mean[0] > admission.added_mean[1]
-    assert admission.gain[0] > admission.gain[1]
-    assert admission.allows(0, 20, 4, 0, 100)
+    assert admission.expected_tokens[0] > admission.expected_tokens[1]
+    assert admission.allows(0, 20, 4)
     admission.admit(0)
     before = admission.mean
-    assert admission.allows(2, 3, 3, 100, 100)
+    assert admission.allows(2, 3, 3)
     admission.admit(2)
     assert admission.mean == pytest.approx(before - 3)
     decoder.start(0, 0, 10, [0, 1, 2, 3])
-    decoder.start(2, 1, 10, [0, 4, 5, 6])
+    decoder.start(2, 1, 10, [0, 4, 5, 6], parent=0, shared_tokens=4)
     decoder.written[0][0] = 2
     decoder.written[1][2] = 1
     admission.refresh(np.array([0, -1, 0]))
@@ -687,7 +692,13 @@ def test_admission_counts_dependent_answers_without_reserving_them_twice():
         expected += mean[0]
     assert admission.mean == pytest.approx(expected)
     victim = decoder.eviction_order()[0]
-    assert admission.recompute == 10 + decoder.written[decoder.map[victim]][victim]
+    assert admission.recompute == cost.recompute_cost.prefill_seconds(
+        10 + decoder.written[decoder.map[victim]][victim])
+    decoder._count_reads(decoder.rows(), shared=True)
+    reads = decoder.read_tokens
+    assert admission.work.pairs == reads["all"]
+    assert admission.work.kv_read == reads["alone"] + reads["own"] + reads["shared"]
+    assert admission.work.kv_read < admission.work.pairs
     decoder.lengths[1][2] = 4
     decoder.map[2] = -1
     admission.refresh(np.array([0, -1, -2]))
@@ -705,9 +716,9 @@ def test_reserved_replays_count_as_answer_demand_before_they_resume():
     admission = AnswerAdmission(decoder, [8, 8], 6, {}, [0, 0],
                                 lambda tokens: pages_for(tokens, 4))
     admission.refresh(np.array([0, -1]))
-    assert admission.allows(1, 12, 4, 100, 100)
+    assert admission.allows(1, 12, 4)
     admission.refresh(np.array([0, -1]), [(0, 0, 14)])
-    assert not admission.allows(1, 12, 4, 100, 100)
+    assert not admission.allows(1, 12, 4)
     assert decoder.paused[0]
 
 

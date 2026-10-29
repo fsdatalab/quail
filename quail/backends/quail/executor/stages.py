@@ -207,7 +207,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                label=None, default_attention="tree", on_chunk=None,
                on_answers=None, stop_groups=None, appended_tokens=None,
                gpu_timing=False, survival=None, decoder=None, dependencies=None,
-               knee_rows=0, recompute_cost=None):
+               knee_rows=0, decode_cost=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -260,10 +260,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         appended_tokens: The most tokens the append stages leave after
             a document's frame, when stages discard tokens earlier ones
             added; None sums every append stage's longest suffix.
-        knee_rows: Rows at which a pass becomes compute-bound. Below it,
-            answer work can pay for the added overflow risk of new documents.
-        recompute_cost: Hardware-derived prefix compute coefficients, or None
-            to price recomputation by tokens alone.
+        knee_rows: Rows below which the pass is logged as thin.
+        decode_cost: Spec-only decode and recomputation times, or None
+            to require full answer capacity before admitting a document.
         dependencies: Dependent anchor -> (document anchor, start stage).
             A dependent starts only after that document launches the stage,
             finishes there, and never counts toward a limit.
@@ -292,7 +291,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         on_answers=on_answers, stop_groups=stop_groups,
         appended_tokens=appended_tokens, gpu_timing=gpu_timing,
         decoder=decoder, dependencies=dependencies, knee_rows=knee_rows,
-        recompute_cost=recompute_cost,
+        decode_cost=decode_cost,
     ).run()
 
 

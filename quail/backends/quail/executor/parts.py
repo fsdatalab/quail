@@ -264,7 +264,7 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
             appended_tokens=max(part.appended_tokens for part in parts) or None,
             decoder=decoder, dependencies=dependencies,
             knee_rows=getattr(state, "knee_rows", 0),
-            recompute_cost=getattr(state, "recompute_cost", None))
+            decode_cost=getattr(state, "decode_cost", None))
     complete_parts(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
             for node_id, result in part.results().items()}

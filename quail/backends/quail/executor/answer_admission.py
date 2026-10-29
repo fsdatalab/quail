@@ -1,10 +1,12 @@
-"""Pool answer-page uncertainty and price admission in token-computations."""
+"""Pool answer-page uncertainty and price admission in seconds."""
 
 from math import erfc, sqrt
 
 import numpy as np
 
 from quail.backends.quail.executor.answer_survival import answer_survival
+from quail.backends.quail.executor.chunk import decode_groups
+from quail.cost.work import Work
 
 
 def page_moments(survival, written, available, page_tokens):
@@ -57,7 +59,7 @@ class AnswerAdmission:
     """Per-pass pooled page demand for admitted documents and their branches."""
 
     def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
-                 shared, page_cost, recompute_cost=None):
+                 shared, page_cost, decode_cost=None):
         self.decoder = decoder
         self.prefix = np.asarray(prefix_lengths, dtype=np.int64)
         self.parent = np.arange(len(self.prefix))
@@ -72,7 +74,10 @@ class AnswerAdmission:
         self.prompt = self.prefix + capacity_extra - start_tokens
         self.capacity = -(-(self.prefix + capacity_extra) // page_tokens) * page_tokens
         self.roots = self.parent == np.arange(len(self.prefix))
-        self.recompute_cost = recompute_cost
+        self.decode_cost = decode_cost
+        self.borrowed = np.where(self.roots, 0, shared)
+        self.lead = np.zeros(len(self.prefix), dtype=np.int64)
+        np.maximum.at(self.lead, self.parent, self.borrowed)
         self.mean = self.variance = self.maximum = 0.0
 
     def refresh(self, stages, replays=()):
@@ -87,7 +92,8 @@ class AnswerAdmission:
         self.added_mean = np.zeros(num_anchors)
         self.added_variance = np.zeros(num_anchors)
         self.added_maximum = np.zeros(num_anchors)
-        self.gain = np.zeros(num_anchors)
+        self.expected_tokens = np.zeros(num_anchors)
+        answer_slots, contexts = [], []
         self.committed = admitted.copy()
         self.pending_pages = np.where(stages == -1, self.prompt_pages, 0)
         curves = {}
@@ -112,7 +118,11 @@ class AnswerAdmission:
             self.added_mean[roots] += mean
             self.added_variance[roots] += variance
             self.added_maximum[roots] += maximum
-            self.gain[roots] += curve.sum()
+            expected_tokens = curve.sum()
+            self.expected_tokens[roots] += expected_tokens
+            answer_slots.append(slots)
+            contexts.append(self.prompt[slots] + expected_tokens / 2)
+        self._refresh_work(answer_slots, contexts, replays)
         # A pending branch also needs its deterministic prompt pages.
         pending = np.bincount(self.parent, weights=self.pending_pages,
                               minlength=num_anchors)
@@ -128,26 +138,61 @@ class AnswerAdmission:
             victim = order[0]
             tokens = (decoder.origin[victim]
                       + decoder.written[decoder.map[victim]][victim])
-            self.recompute = self._recompute_work(tokens)
+            self.recompute = self._recompute_seconds(tokens)
 
-    def _recompute_work(self, tokens):
-        policy = self.recompute_cost
-        if policy is None or not policy.linear_seconds:
-            return float(tokens)
-        return policy.prefill_seconds(tokens) / policy.linear_seconds
+    def _refresh_work(self, answer_slots, contexts, replays):
+        cost = self.decode_cost
+        self.work = Work()
+        self.added_work = {}
+        if cost is None:
+            return
+        decoder = self.decoder
+        slots = np.concatenate(answer_slots)
+        contexts = np.concatenate(contexts)
+        groups, shared = (decode_groups(slots, self.parent, self.borrowed, self.lead)
+                          if decoder.share else (None, None))
+        work = cost.row_work(contexts, groups, shared)
+        self.added_work = {
+            name: np.bincount(self.parent[slots], weights=values,
+                              minlength=len(self.prefix))
+            for name, values in vars(work).items() if np.ndim(values)}
+        running = decoder.running()
+        counts = decoder.row_counts(running)
+        offsets = (np.arange(int(counts.sum()))
+                   - np.repeat(np.cumsum(counts) - counts, counts))
+        slots = np.repeat(running, counts)
+        contexts = decoder.origin[slots] + decoder.fed[slots] + offsets + 1
+        if replays:
+            replay = np.asarray(replays)
+            slots = np.r_[slots, replay[:, 0]]
+            contexts = np.r_[contexts, replay[:, 2] + 1]
+        groups, shared = (decode_groups(slots, decoder.parent, decoder.borrowed,
+                                        decoder.lead)
+                          if decoder.share else (None, None))
+        self.work = cost.row_work(contexts, groups, shared).total()
 
-    def allows(self, anchor, free_pages, prompt_pages, rows, knee_rows):
+    def _recompute_seconds(self, tokens):
+        if self.decode_cost is None:
+            return float("inf")
+        return self.decode_cost.recompute_cost.prefill_seconds(tokens)
+
+    def _added_work(self, anchor):
+        return Work(**{name: values[anchor]
+                       for name, values in self.added_work.items()})
+
+    def allows(self, anchor, free_pages, prompt_pages):
         """Price a new document; its already-priced branches can start freely."""
         if self.committed[self.parent[anchor]]:
             return True
         recompute = self.recompute
         if recompute is None:
-            recompute = self._recompute_work(self.prompt[anchor])
+            recompute = self._recompute_seconds(self.prompt[anchor])
+        gain = (0.0 if self.decode_cost is None else self.decode_cost.gain(
+            self.work, self._added_work(anchor), self.expected_tokens[anchor]))
         return admission_worthwhile(
             free_pages, prompt_pages, self.mean, self.variance, self.maximum,
             self.added_mean[anchor], self.added_variance[anchor],
-            self.added_maximum[anchor],
-            self.gain[anchor] if rows < knee_rows else 0.0, recompute)
+            self.added_maximum[anchor], gain, recompute)
 
     def admit(self, anchor):
         """Commit a document's demand or remove a branch's allocated prompt pages."""
@@ -160,3 +205,4 @@ class AnswerAdmission:
             self.variance += self.added_variance[anchor]
             self.maximum += self.added_maximum[anchor]
             self.committed[anchor] = True
+            self.work = self.work + self._added_work(anchor)

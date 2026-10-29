@@ -15,6 +15,18 @@ from quail.backends.quail.executor.attention import ATTENTION_PATHS
 from quail.backends.quail.executor.gdn import plan_phases
 
 
+def decode_groups(slots, parent, borrowed, lead):
+    """Return each decode row's shared-read group and shared prefix length."""
+    parents = parent[slots]
+    as_child = np.where(borrowed[slots] == lead[parents], borrowed[slots], 0)
+    as_parent = lead[slots]
+    groups = np.where(as_parent >= as_child, slots, parents)
+    shared = np.maximum(as_parent, as_child)
+    groups = np.where(shared > 0, groups, -1 - np.arange(len(slots)))
+    _, inverse, counts = np.unique(groups, return_inverse=True, return_counts=True)
+    return groups, np.where(counts[inverse] > 1, shared, 0)
+
+
 @dataclass
 class Chunk:
     """Token tensors and attention metadata for one packed forward pass.
