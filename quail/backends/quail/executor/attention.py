@@ -822,7 +822,7 @@ class Engine:
             k3, v3, k_pool, v_pool, src, dst,
             ROW=row, ROW_POW2=1 << (row - 1).bit_length())
 
-    def write_kv(self, k3, v3, meta, *, tree=False):
+    def write_kv(self, k3, v3, meta, *, tree=False, copy_tail=True):
         """Write fresh rows and retained partial pages unless already captured."""
         if meta.get("kv_written", False):
             return
@@ -836,7 +836,7 @@ class Engine:
             return
         if pool["src"].numel():
             self.kv_row_scatter(k3, v3, pool["src"], pool["dst"], layer)
-        if pool["tail_src"] is not None:
+        if copy_tail and pool["tail_src"] is not None:
             k_pool, v_pool = self.arena.layer_kv(layer)
             self.kv_row_scatter(k_pool, v_pool,
                                 pool["tail_src"], pool["tail_dst"], layer)

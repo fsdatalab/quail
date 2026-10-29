@@ -21,6 +21,7 @@ class KVWriteBuffers:
 
     def __init__(self, torch, num_tokens, page_tokens, *, device):
         self.meta = {}
+        self.has_tails = False
         for name in ("src", "dst", "tail_src", "tail_dst"):
             count = num_tokens * (page_tokens if name.startswith("tail_") else 1)
             self.meta[name] = torch.full(
@@ -35,6 +36,8 @@ class KVWriteBuffers:
 
     def copy(self, writes):
         """Stage mappings and mask unused fresh and partial-page destinations."""
+        self.has_tails = (writes is not None and writes["tail_src"] is not None
+                          and writes["tail_src"].numel() > 0)
         for name, target in self.meta.items():
             target.fill_(-1 if name.endswith("dst") else 0)
             source = writes[name] if writes is not None else None
@@ -76,6 +79,12 @@ class PiecewiseBuffers:
         if self.sliding_writes is not None:
             self.kv_meta["unified"]["sliding"] = self.sliding_writes.meta
 
+    @property
+    def has_tails(self):
+        """Whether either KV pool has retained partial pages to copy."""
+        return (self.writes.has_tails
+                or (self.sliding_writes is not None and self.sliding_writes.has_tails))
+
     def supports(self, chunk):
         """Whether the full and sliding KV mappings fit this token bucket."""
         writes = chunk_writes(chunk)
@@ -102,7 +111,7 @@ class PiecewiseBuffers:
             self.q[:n], self.k[:n], self.v[:n], chunk,
             output=(self.o_in[:n], None if self.o_scale is None else self.o_scale[:n]))
 
-    def piece(self, pipeline, index):
+    def piece(self, pipeline, index, *, copy_tail=None):
         """Run embedding or the previous MLP, then the next QKV or final norm."""
         if index == 0:
             hidden = pipeline.embed(self.ids)
@@ -128,7 +137,8 @@ class PiecewiseBuffers:
             engine.write_kv(
                 self.k.view(self.num_tokens, engine.num_kv_heads, engine.head_dim),
                 self.v.view(self.num_tokens, engine.num_kv_heads, engine.head_dim),
-                self.kv_meta)
+                self.kv_meta,
+                copy_tail=self.has_tails if copy_tail is None else copy_tail)
 
 
 @dataclass
@@ -137,16 +147,19 @@ class CapturedPieces:
 
     buffers: PiecewiseBuffers
     graphs: list
+    tail_graphs: list | None = None
 
     def forward(self, pipeline, chunk):
         """Replay pieces separated by eager attention and copy selected outputs."""
         self.buffers.copy(chunk)
+        graphs = (self.tail_graphs if self.buffers.has_tails
+                  and self.tail_graphs is not None else self.graphs)
         chunk.meta["layer"] = 0
         previous = chunk.meta.get("kv_written")
         chunk.meta["kv_written"] = True
         try:
-            self.graphs[0].replay()
-            for graph in self.graphs[1:]:
+            graphs[0].replay()
+            for graph in graphs[1:]:
                 self.buffers.attention(pipeline, chunk)
                 graph.replay()
             return self.buffers.output.index_select(0, chunk.final_indices)
@@ -161,7 +174,8 @@ class PiecewiseGraphs:
     """Capture and replay Qwen3 dense work on the worker's current stream.
 
     Captured writes reference the arena, so resizing it invalidates the
-    graphs. All temporary tensors die inside their piece, allowing the
+    graphs. The two tail-copy variants share each bucket's boundary
+    buffers. All temporary tensors die inside their piece, allowing the
     shared pool to reuse their storage across layers and token buckets.
     """
 
@@ -213,16 +227,20 @@ class PiecewiseGraphs:
                 # Larger captures establish the shared pool's high watermark.
                 for num_tokens in reversed(self.token_buckets):
                     buffers = PiecewiseBuffers(self.pipeline, num_tokens)
-                    graphs = []
-                    for index in range(len(self.pipeline.layers) + 1):
-                        piece = partial(buffers.piece, self.pipeline, index)
-                        piece()
-                        stream.synchronize()
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph, pool=pool, stream=stream):
+                    variants = []
+                    for copy_tail in (False, True):
+                        graphs = []
+                        for index in range(len(self.pipeline.layers) + 1):
+                            piece = partial(buffers.piece, self.pipeline, index,
+                                            copy_tail=copy_tail)
                             piece()
-                        graphs.append(graph)
-                    self.graphs.append(CapturedPieces(buffers, graphs))
+                            stream.synchronize()
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                                piece()
+                            graphs.append(graph)
+                        variants.append(graphs)
+                    self.graphs.append(CapturedPieces(buffers, *variants))
             current.wait_stream(stream)
             stream.synchronize()
             self.graphs.reverse()

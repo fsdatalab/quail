@@ -110,11 +110,17 @@ def test_captured_kv_mappings_mask_padding_and_keep_partial_page_order():
         assert (keys[layer][[row, 7]] == 5).all()
         assert (values[layer][[row, 7]] == 9).all()
         assert keys[layer].count_nonzero() == 4
+    meta["layer"] = 0
+    keys[0].zero_()
+    engine.write_kv(k, v, meta, copy_tail=False)
+    assert (keys[0][2] == 5).all()
+    assert not keys[0][7].count_nonzero()
     full.copy(None)
+    assert not full.has_tails
     assert (full.meta["dst"] == -1).all()
     assert (full.meta["tail_dst"] == -1).all()
     assert not full.supports(dict(mapping, tail_dst=torch.arange(49)))
-    meta["kv_written"] = True
+    meta.update(layer=1, kv_written=True)
     keys[1].zero_()
     engine.write_kv(k, v, meta)
     assert not keys[1].count_nonzero()
@@ -178,6 +184,26 @@ def test_replay_returns_independent_output_storage():
     assert graphs.replays == graphs.passes == 1
 
 
+def test_passes_without_partial_pages_skip_the_tail_copy_graphs():
+    model = pipeline()
+    buffers = PiecewiseBuffers(model, 8, device="cpu")
+    buffers.output.zero_()
+    calls = []
+    captured = CapturedPieces(
+        buffers, [SimpleNamespace(replay=lambda: calls.append("no_tail"))],
+        [SimpleNamespace(replay=lambda: calls.append("tail"))])
+    source = chunk()
+    source.attention_mode = "unified"
+    captured.forward(model, source)
+    source.meta["unified"] = dict(
+        src=None, dst=None, tail_src=torch.tensor([0]), tail_dst=torch.tensor([3]))
+    captured.forward(model, source)
+    source.meta["unified"] = None
+    captured.forward(model, source)
+    assert calls == ["no_tail", "tail", "no_tail"]
+    assert "kv_written" not in source.meta
+
+
 @pytest.mark.parametrize("memory_bytes", [159, 160])
 def test_capture_accounts_for_inactive_private_pool_storage(monkeypatch, memory_bytes):
     from quail.backends.quail.executor import cuda_graphs
@@ -197,7 +223,7 @@ def test_capture_accounts_for_inactive_private_pool_storage(monkeypatch, memory_
         engine=SimpleNamespace(arena=SimpleNamespace(k=[]), torch=SimpleNamespace(
             cuda=cuda, inference_mode=nullcontext)), layers=[None])
     monkeypatch.setattr(cuda_graphs, "PiecewiseBuffers", lambda *a: SimpleNamespace(
-        piece=lambda *a: None))
+        piece=lambda *a, **kw: None))
     graphs = PiecewiseGraphs(model, token_buckets=(1, 2), memory_bytes=memory_bytes)
     if memory_bytes < 160:
         with pytest.raises(RuntimeError, match="exceeding"):
