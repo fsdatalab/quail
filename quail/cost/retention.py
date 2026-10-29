@@ -40,13 +40,13 @@ def retention_pages(arena_tokens: int, chunk_tokens: int, page_tokens: int) -> i
                - execution_pages(chunk_tokens, page_tokens))
 
 
-def coefficients(model, device) -> dict:
+def coefficients(model, device, *, peak=False) -> dict:
     """Return the model's ideal prefix computation coefficients."""
     full, sliding = attention_pair_flops(model)
     bandwidth = device.arithmetic_bandwidth(model.attention_precision)
     config = {
         "linear_seconds": compute_seconds(
-            Work(tokens=1, pairs=0, kv_written=0, kv_read=0), model, device),
+            Work(tokens=1, pairs=0, kv_written=0, kv_read=0), model, device, peak=peak),
         "pair_seconds": full / bandwidth,
         "sliding_pair_seconds": sliding / bandwidth,
         "sliding_window": model.sliding_window,
