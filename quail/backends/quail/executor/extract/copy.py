@@ -4,9 +4,7 @@ import numpy as np
 
 from quail.backends.quail.executor.extract.candidates import (
     CandidateIndex,
-    SqueezedText,
-    Stream,
-    ensure_tokens,
+    TextWindows,
 )
 from quail.backends.quail.executor.extract.trace import TRACE_WIDTH, trace_path
 from quail.cost.draft_policy import LIVE_BUCKETS, PRIOR_WEIGHT
@@ -28,7 +26,7 @@ class CopyConstraint:
     """
 
     def __init__(self, torch, device, documents, spec):
-        self.torch, self.device, self.spec = torch, device, spec
+        self.torch, self.device, self.spec = torch, torch.device(device), spec
         self.documents = documents
         self.trace = trace_path()
         self.trace_width = TRACE_WIDTH if self.trace is not None else 0
@@ -40,9 +38,11 @@ class CopyConstraint:
         characters, ends, position_tokens, position_documents = [], [], [], []
         streams, keys, option_rows = [], [], []
         option0 = position0 = 0
+        kids = [document.scan.kids for document in documents.documents]
+        option_table = vocabulary.option_table(np.concatenate(kids) if kids else [])
         for d, document in enumerate(documents.documents):
             scan = document.scan
-            index = scan.candidates = CandidateIndex.of(scan, vocabulary)
+            index = scan.candidates = CandidateIndex.of(scan, vocabulary, option_table)
             options.append(index.token)
             position_keys.append(index.inverse + key0)
             option_keys.append(index.segment + key0)
@@ -63,9 +63,6 @@ class CopyConstraint:
         self.num_keys = max(1, max(keys, default=0))
         self.characters = np.concatenate(characters) if position0 else np.array([0])
         self.position_ends = np.concatenate(ends) if position0 else np.array([0])
-        self.position_tokens = (
-            np.concatenate(position_tokens) if position0 else np.array([0])
-        )
         self.position_documents = (
             np.concatenate(position_documents) if position0 else np.array([0])
         )
@@ -89,7 +86,9 @@ class CopyConstraint:
         self.max_positions = max(1, int(counts.max(initial=0)))
         self.mask_words = -(-self.max_positions // 64)
         self.position_offsets_device = self.tensor(self.position_offsets)
-        self.positions = []
+        self.windows = None
+        self.window_ends = self.position_ends.copy()
+        self.window_started = np.zeros(len(self.characters), dtype=bool)
         self.exhausted = np.zeros(len(self.characters), dtype=bool)
         self.prepared = np.empty(0, dtype=np.int64)
         self.num_positions = 0
@@ -214,11 +213,7 @@ class CopyConstraint:
             - written
         )
         drafts = np.minimum(drafts, np.maximum(0, remaining))
-        mask = np.unpackbits(
-            np.ascontiguousarray(masks).view(np.uint8), axis=1, bitorder="little"
-        )[:, : self.max_positions]
-        answers, columns = np.nonzero(mask)
-        positions = self.position_offsets[documents[answers]] + columns
+        answers, positions = self.live_positions(documents, masks)
         lookup = (
             self.position_keys[positions] * len(self.vocabulary.vocab) + tokens[answers]
         )
@@ -241,6 +236,24 @@ class CopyConstraint:
             following = self._tokens(positions, options, at)
             keep = (following >= 0) & (following == expected)
             positions, options, answers = positions[keep], options[keep], answers[keep]
+        self._upload()
+
+    def live_positions(self, documents, masks):
+        """Expand only nonempty mask words into answer and document positions."""
+        answers, words = np.nonzero(masks)
+        bits = np.arange(64, dtype=np.uint64)
+        member, columns = np.nonzero(
+            (masks[answers, words].astype(np.uint64)[:, None] >> bits) & 1)
+        positions = words[member] * 64 + columns
+        answers = answers[member]
+        return answers, self.position_offsets[documents[answers]] + positions
+
+    def prepare_ahead(self, documents, masks, written):
+        """Extend live starts far enough for the next pass before its result lands."""
+        answers, positions = self.live_positions(documents, masks)
+        self._extend(positions, np.minimum(
+            written[answers] + 2 * self.spec.draft_tokens + 1,
+            self.spec.max_answer_tokens - 1))
         self._upload()
 
     def _tokens(self, positions, options, at):
@@ -270,31 +283,11 @@ class CopyConstraint:
         positions, needed = positions[pending], needed[pending]
         if not len(positions):
             return
-        streams = []
-        for position in positions:
-            row = self.position_rows[position]
-            if row < 0:
-                document = self.documents.documents[self.position_documents[position]]
-                scan = document.scan
-                if scan.normalized is None:
-                    scan.normalized = SqueezedText(document.text)
-                row = len(self.positions)
-                self.position_rows[position] = row
-                self.positions.append(
-                    Stream(
-                        int(self.characters[position]),
-                        [int(self.position_tokens[position])],
-                        [int(self.position_ends[position])],
-                        document.text,
-                        normalized=scan.normalized,
-                        first_window_chars=self.spec.first_window_chars,
-                        window_chars=self.spec.window_chars,
-                    )
-                )
-            streams.append(self.positions[row])
-        ensure_tokens(streams, needed, self.vocabulary)
+        missing = positions[self.position_rows[positions] < 0]
+        self.position_rows[missing] = np.arange(
+            self.num_positions, self.num_positions + len(missing))
+        self.num_positions += len(missing)
         rows = self.position_rows[positions]
-        self.num_positions = len(self.positions)
         num_tokens = self.spec.max_answer_tokens + self.spec.draft_tokens
         if self.num_positions > len(self.ends):
             capacity = max(self.num_positions, 2 * len(self.ends))
@@ -304,17 +297,51 @@ class CopyConstraint:
             wider = np.full((capacity, num_tokens), -1, dtype=np.int32)
             wider[: len(self.continuations_host)] = self.continuations_host
             self.continuations_host = wider
-        tokens = _padded([stream.stream[1:num_tokens] for stream in streams], np.int32)
-        ends = _padded(
-            [stream.ends[: self.spec.max_answer_tokens] for stream in streams]
-        )
-        self.position_lengths[positions] = np.array(
-            [min(num_tokens, len(s.stream)) - 1 for s in streams]
-        )
-        self.exhausted[positions] = [stream.exhausted for stream in streams]
-        self.ends[rows, : ends.shape[1]] = ends
-        self.continuations_host[rows, : tokens.shape[1]] = tokens
+        self.ends[rows, 0] = self.position_ends[positions]
         self.changed[positions] = True
+        while True:
+            pending = ((self.position_lengths[positions] < needed)
+                       & ~self.exhausted[positions])
+            positions, needed = positions[pending], needed[pending]
+            if not len(positions):
+                break
+            self._extend_windows(positions)
+
+    def prepare_documents(self):
+        """Index normalized text while the documents' prefill is in flight."""
+        if self.windows is None:
+            self.windows = TextWindows([
+                document.text for document in self.documents.documents])
+
+    def _extend_windows(self, positions):
+        self.prepare_documents()
+        documents = self.position_documents[positions]
+        sizes = np.where(self.window_started[positions], self.spec.window_chars,
+                         self.spec.first_window_chars)
+        text, left, cuts = self.windows.windows(
+            documents, self.window_ends[positions], sizes)
+        self.window_started[positions] = True
+        self.window_ends[positions] = cuts
+        tokens, offsets, boundaries = self.vocabulary.encode_packed(text)
+        counts = np.diff(boundaries)
+        owner = np.repeat(np.arange(len(positions)), counts)
+        columns = (np.arange(len(tokens)) - np.repeat(boundaries[:-1], counts)
+                   + self.position_lengths[positions[owner]])
+        rows = self.position_rows[positions[owner]]
+        valid = columns < self.continuations_host.shape[1] - 1
+        self.continuations_host[rows[valid], columns[valid]] = tokens[valid]
+        valid = columns + 1 < self.ends.shape[1]
+        end = np.minimum(self.windows.ends[left[owner] + offsets[:, 1] - 1]
+                         - self.windows.offsets[documents[owner]], cuts[owner])
+        self.ends[rows[valid], columns[valid] + 1] = end[valid]
+        self.position_lengths[positions] = np.minimum(
+            self.position_lengths[positions] + counts,
+            self.continuations_host.shape[1] - 1)
+        self.exhausted[positions] = (
+            (cuts + self.windows.offsets[documents] == self.windows.limits[documents])
+            | (counts == 0)
+            | (self.position_lengths[positions]
+               == self.continuations_host.shape[1] - 1))
 
     def _upload(self):
         positions = np.flatnonzero(self.changed)
@@ -337,7 +364,10 @@ class CopyConstraint:
         self.changed[positions] = False
 
     def tensor(self, value):
-        return self.torch.as_tensor(value).to(self.device, non_blocking=True)
+        host = self.torch.as_tensor(value)
+        if self.device.type == "cuda":
+            host = host.pin_memory()
+        return host.to(self.device, non_blocking=True)
 
     def tokens_at(self, streams, at):
         """Gather a stream's token at each answer index, or -1 past its end."""
