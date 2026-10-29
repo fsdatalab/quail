@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import modal
@@ -130,6 +131,40 @@ def _forward_kernels(events):
                 for name, count in attention.items()}}
 
 
+def _kernel_lanes(events: list) -> list:
+    """Move each GPU event that overlaps an earlier one on its stream to a lane.
+
+    Kernels on one stream can overlap, as under programmatic dependent
+    launch; Perfetto cannot nest a partly overlapping slice and reports
+    an import error for each.
+
+    Returns:
+        The events, with one thread name event per added lane.
+    """
+    by_stream = defaultdict(list)
+    for event in events:
+        if event.get("ph") == "X" and event.get("cat") in (
+                "kernel", "gpu_memcpy", "gpu_memset"):
+            by_stream[(event["pid"], event["tid"])].append(event)
+    names = []
+    for (pid, tid), items in by_stream.items():
+        ends = []
+        for event in sorted(items, key=lambda item: item["ts"]):
+            end = event["ts"] + event.get("dur", 0)
+            lane = next((index for index, last in enumerate(ends)
+                         if last <= event["ts"]), len(ends))
+            if lane == len(ends):
+                ends.append(end)
+            ends[lane] = end
+            if lane:
+                event["tid"] = f"{tid} overlap {lane}"
+        names.extend({"ph": "M", "name": "thread_name", "pid": pid,
+                      "tid": f"{tid} overlap {lane}",
+                      "args": {"name": f"stream {tid}, overlapping {lane}"}}
+                     for lane in range(1, len(ends)))
+    return events + names
+
+
 def _save_trace(prof, path: Path) -> dict:
     """Save a window of a torch.profiler run as a gzipped Perfetto trace.
 
@@ -151,11 +186,13 @@ def _save_trace(prof, path: Path) -> dict:
     first, last = min(kernels), max(kernels)
     start = first + 0.4 * (last - first)
     end = start + TRACE_WINDOW_S * 1e6
-    trace["traceEvents"] = [
+    # the profiler's own span covers the whole run and would set the view
+    trace["traceEvents"] = _kernel_lanes([
         event for event in events
         if event.get("ph") == "M"
-        or ("ts" in event and event["ts"] <= end
-            and event["ts"] + event.get("dur", 0) >= start)]
+        or ("ts" in event and event.get("cat") != "Trace"
+            and event["ts"] <= end
+            and event["ts"] + event.get("dur", 0) >= start)])
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wt") as out:
         json.dump(trace, out)
