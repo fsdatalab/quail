@@ -497,6 +497,7 @@ class StageExecutor:
                         key, self.prefix_lengths[a], capacity_tokens=capacity,
                         extension=self._extends):
                     break       # the pool is short; the rest wait in order
+                decoder.set_pages(a, self.arena.owned_pages(key))
             end = min(length, start + room)
             replays.append((a, start, end))
             room -= end - start
@@ -859,7 +860,7 @@ class StageExecutor:
             replays, room = self._replays(max(0, room))
             if (self.answer_admission is not None
                     and (self.sched.pending or self.sched.waiting)):
-                self.answer_admission.refresh(np.asarray(self.sched._stage))
+                self.answer_admission.refresh(np.asarray(self.sched._stage), replays)
             groups = self.sched.next_chunk(
                 self.arena.free_pages if self.paged else 1 << 62, room=room)
             if not groups and (decode is not None or replays):

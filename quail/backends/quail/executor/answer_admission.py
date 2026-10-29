@@ -60,7 +60,6 @@ class AnswerAdmission:
                  shared, page_cost, recompute_cost=None):
         self.decoder = decoder
         self.prefix = np.asarray(prefix_lengths, dtype=np.int64)
-        self.capacity_extra = capacity_extra
         self.parent = np.arange(len(self.prefix))
         for anchor, (parent, _) in dependencies.items():
             self.parent[anchor] = parent
@@ -76,10 +75,13 @@ class AnswerAdmission:
         self.recompute_cost = recompute_cost
         self.mean = self.variance = self.maximum = 0.0
 
-    def refresh(self, stages):
-        """Rebuild moments with NumPy arrays, once before an admission batch."""
+    def refresh(self, stages, replays=()):
+        """Rebuild moments for running answers and this pass's reserved replays."""
         admitted = stages >= 0
         decoder = self.decoder
+        ready = ~decoder.paused
+        if replays:
+            ready[np.asarray(replays)[:, 0]] = True
         page_tokens = decoder.page_tokens
         num_anchors = len(self.prefix)
         self.added_mean = np.zeros(num_anchors)
@@ -91,7 +93,7 @@ class AnswerAdmission:
         curves = {}
         for q, slots in decoder.answer_slots.items():
             slots = np.asarray(slots, dtype=np.int64)
-            slots = slots[(decoder.lengths[q][slots] < 0) & ~decoder.paused[slots]
+            slots = slots[(decoder.lengths[q][slots] < 0) & ready[slots]
                           & (stages[slots] != -2)]
             roots = self.parent[slots]
             curves[q] = curve = answer_survival(
@@ -140,7 +142,7 @@ class AnswerAdmission:
             return True
         recompute = self.recompute
         if recompute is None:
-            recompute = self._recompute_work(self.prefix[anchor] + self.capacity_extra)
+            recompute = self._recompute_work(self.prompt[anchor])
         return admission_worthwhile(
             free_pages, prompt_pages, self.mean, self.variance, self.maximum,
             self.added_mean[anchor], self.added_variance[anchor],

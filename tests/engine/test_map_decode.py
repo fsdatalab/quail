@@ -693,6 +693,22 @@ def test_admission_counts_dependent_answers_without_reserving_them_twice():
     assert admission.mean < expected
 
 
+def test_reserved_replays_count_as_answer_demand_before_they_resume():
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
+                         [32], [STOP], 4, expected_tokens=[16])
+    decoder.answer_slots = {0: np.arange(2)}
+    decoder.start(0, 0, 10, [0, 1, 2, 3])
+    decoder.written[0][0] = 4
+    decoder.pause(0)
+    admission = AnswerAdmission(decoder, [8, 8], 6, {}, [0, 0],
+                                lambda tokens: pages_for(tokens, 4))
+    admission.refresh(np.array([0, -1]))
+    assert admission.allows(1, 12, 4, 100, 100)
+    admission.refresh(np.array([0, -1]), [(0, 0, 14)])
+    assert not admission.allows(1, 12, 4, 100, 100)
+    assert decoder.paused[0]
+
+
 def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
     decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 4,
                          [24, 6], [STOP], 4, expected_tokens=[12, 3])
