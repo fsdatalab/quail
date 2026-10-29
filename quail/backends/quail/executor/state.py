@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         AsyncLabelLogprobs,
         AsyncScores,
     )
+    from quail.cost.retention import RetentionPolicy
     from quail.specs.base import ModelSpec
 
 
@@ -53,6 +54,7 @@ class QueryExecutionState:
     gpu_timing: bool = False
     # rows at which a pass's dense projections become compute-bound
     knee_rows: int = 0
+    recompute_cost: RetentionPolicy | None = None
 
 
 class GpuRuntime(Protocol):

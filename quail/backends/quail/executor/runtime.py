@@ -12,6 +12,7 @@ from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.reranker import RerankerModelExecution
 from quail.cost.budgets import compute_knee
+from quail.cost.retention import RetentionPolicy, coefficients
 from quail.physical import AiClassify, AiScore, PhysicalNode
 
 
@@ -67,6 +68,9 @@ class QuailModelExecution:
             # Retain allocated transfer buffers, not the previous query's tokens.
             loaded.input_staging.fixed_tokens.clear()
         self._reranker = None
+        device = getattr(self.context, "device", None)
+        recompute_cost = (None if device is None else RetentionPolicy(
+            **coefficients(self.context.model, device)))
         self._query = QueryExecutionState(
             loaded_model=loaded,
             torch=torch,
@@ -74,7 +78,7 @@ class QuailModelExecution:
             answer_rows=answer_rows,
             chunk_tokens=chunk_tokens,
             score_readout=async_scores,
-            knee_rows=self._knee_rows(),
+            knee_rows=self._knee_rows(), recompute_cost=recompute_cost,
         )
 
     def _knee_rows(self) -> int:

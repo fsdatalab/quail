@@ -17,6 +17,9 @@ import torch
 from helpers.fakes import cpu_staging, fake_pipeline
 from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 
+from quail.backends.quail.executor.admission import pages_for
+from quail.backends.quail.executor.answer_admission import AnswerAdmission, page_moments
+from quail.backends.quail.executor.answer_survival import answer_survival
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.operators.classify import ClassifyPart
 from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
@@ -590,8 +593,8 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     prefixes, keys, tree, dependencies = maps.branch_inputs(
         documents, [("d", i) for i in ids], prefix_tree(documents, setup.page_tokens),
         setup.page_tokens, 1)
-    # a prior of one-token answers reserves almost nothing, so answers
-    # outgrow their reservations and the tight arena evicts some
+    # A one-token prior predicts no growth, so answers outgrow their
+    # initial pages and the tight arena evicts some.
     decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), limits,
                          [STOP], setup.page_tokens,
                          expected_tokens=[1] * len(limits))
@@ -617,9 +620,13 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     assert not arena.accounting.owned
 
 
-def test_prompt_reservations_admit_more_than_full_answer_limits(monkeypatch):
+@pytest.mark.parametrize("knee_rows,answer_limit,num_pages,num_admitted", [
+    (0, 80, 20, 1), (200, 80, 20, 4), (0, 8, 12, 2),
+])
+def test_answer_admission_uses_free_pass_work_below_the_knee(
+        monkeypatch, knee_rows, answer_limit, num_pages, num_admitted):
     cpu_staging(monkeypatch)
-    setup = Setup(path="unified", pages=20, page_tokens=4, budget=200)
+    setup = Setup(path="unified", pages=num_pages, page_tokens=4, budget=200)
     arena = make_arena(setup)
     model = TokenModel(arena)
     admitted = []
@@ -631,21 +638,59 @@ def test_prompt_reservations_admit_more_than_full_answer_limits(monkeypatch):
     pipeline = fake_pipeline(forward_chunk=forward_chunk, canvas_ids=())
     torch_ = events_torch(3)
     documents = [list(range(20 + a, 28 + a)) for a in range(4)]
-    maps = MapPart(None, [map_node("answer", [500, 501], 80)], range(4), 0)
+    maps = MapPart(None, [map_node("answer", [500, 501], answer_limit)], range(4), 0)
     prefixes, keys, tree, dependencies = maps.branch_inputs(
         documents, [("d", a) for a in range(4)], None, setup.page_tokens, 0)
-    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), 4, [80], [STOP], 4)
+    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), 4, [answer_limit], [STOP], 4)
     maps.decoder = decoder
     stats = {}
     run_stages(torch_, arena, pipeline, gated_stages([maps]), prefixes, 200,
                anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
-               decoder=decoder, stats=stats)
-    # Reserving an 80-token answer would not admit even one prompt here.
-    assert admitted[0] == 4
+               decoder=decoder, stats=stats, knee_rows=knee_rows)
+    assert admitted[0] == num_admitted
+    if answer_limit == 8:
+        assert num_admitted == num_pages // -(-(10 + answer_limit - 1) // 4)
+    # Full 80-token answers cannot fit; the progress fallback still starts one.
     assert stats["skipped_documents"] == 0
     assert [answer.tolist() for answer in decoder.answers(0, range(4))] == [
-        greedy(document + [500, 501], 80) for document in documents]
+        greedy(document + [500, 501], answer_limit) for document in documents]
     assert not arena.accounting.owned
+
+
+def test_admission_counts_dependent_answers_without_reserving_them_twice():
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 3,
+                         [32, 16], [STOP], 4, expected_tokens=[12, 4])
+    decoder.answer_slots = {0: np.array([0, 1]), 1: np.array([2])}
+    admission = AnswerAdmission(decoder, [8, 8, 8], 6, {2: (0, 0)}, [0, 0, 4],
+                                lambda tokens: pages_for(tokens, 4))
+    admission.refresh(np.array([-1, -1, -1]))
+    assert admission.added_mean[0] > admission.added_mean[1]
+    assert admission.gain[0] > admission.gain[1]
+    assert admission.allows(0, 20, 4, 0, 100)
+    admission.admit(0)
+    before = admission.mean
+    assert admission.allows(2, 3, 3, 100, 100)
+    admission.admit(2)
+    assert admission.mean == pytest.approx(before - 3)
+    decoder.start(0, 0, 10, [0, 1, 2, 3])
+    decoder.start(2, 1, 10, [0, 4, 5, 6])
+    decoder.written[0][0] = 2
+    decoder.written[1][2] = 1
+    admission.refresh(np.array([0, -1, 0]))
+    expected = 0
+    for q, anchor in [(0, 0), (1, 2)]:
+        curve = answer_survival(decoder.lengths[q], decoder.written[q],
+                                decoder.expected_tokens[q], int(decoder.limits[q]))
+        mean, _ = page_moments(curve, decoder.written[q][[anchor]], np.array([6]), 4)
+        expected += mean[0]
+    assert admission.mean == pytest.approx(expected)
+    victim = decoder.eviction_order()[0]
+    assert admission.recompute == 10 + decoder.written[decoder.map[victim]][victim]
+    decoder.lengths[1][2] = 4
+    decoder.map[2] = -1
+    admission.refresh(np.array([0, -1, -2]))
+    assert admission.pending_pages[2] == 0
+    assert admission.mean < expected
 
 
 def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
