@@ -158,8 +158,7 @@ def inspect_cases(graph, context, arguments):
     }
     head = full_output_head(gpu.model)
     torch.cuda.synchronize()
-    if pipeline.decode_graphs is not None:
-        pipeline.decode_graphs.invalidate()
+    pipeline.piecewise_graphs = None
     arena.resize(1, free_resident=True)
     torch.cuda.empty_cache()
     records = []

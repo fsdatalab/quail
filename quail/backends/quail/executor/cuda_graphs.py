@@ -150,7 +150,14 @@ class PiecewiseGraphs:
             current.wait_stream(stream)
             stream.synchronize()
             self.graphs.reverse()
-            self.captured_bytes = torch.cuda.memory_allocated() - before
+            # Inactive blocks in a graph pool remain reserved until its
+            # graphs die; memory_allocated alone omits those blocks.
+            private_unused = sum(
+                segment["total_size"] - segment["allocated_size"]
+                for segment in torch.cuda.memory_snapshot()
+                if tuple(segment["segment_pool_id"]) == pool)
+            self.captured_bytes = (
+                torch.cuda.memory_allocated() - before + private_unused)
             if self.captured_bytes > self.memory_bytes:
                 raise RuntimeError(
                     f"graphs allocated {self.captured_bytes} bytes, "
@@ -160,7 +167,7 @@ class PiecewiseGraphs:
             raise
         self.capture_s = time.perf_counter() - started
         logger.info("captured %d piecewise buckets in %.2f s; %.1f MiB "
-                    "allocated / %.1f MiB reserved",
+                    "storage / %.1f MiB budget",
                     len(self.graphs), self.capture_s, self.captured_bytes / 2**20,
                     self.memory_bytes / 2**20)
         return True

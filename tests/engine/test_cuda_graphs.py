@@ -1,5 +1,6 @@
 """Piecewise padding never reaches attention or KV."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -126,6 +127,37 @@ def test_replay_returns_independent_output_storage():
     buffers.output.zero_()
     assert actual.equal(expected)
     assert graphs.replays == graphs.passes == 1
+
+
+@pytest.mark.parametrize("memory_bytes", [159, 160])
+def test_capture_accounts_for_inactive_private_pool_storage(monkeypatch, memory_bytes):
+    from quail.backends.quail.executor import cuda_graphs
+
+    pool = (0, 1)
+    allocations = iter([100, 200])
+    stream = SimpleNamespace(wait_stream=lambda _: None, synchronize=lambda: None)
+    cuda = SimpleNamespace(
+        memory_allocated=lambda: next(allocations), graph_pool_handle=lambda: pool,
+        Stream=lambda: stream, current_stream=lambda: stream,
+        stream=lambda _: nullcontext(), CUDAGraph=object,
+        graph=lambda *a, **kw: nullcontext(),
+        memory_snapshot=lambda: [
+            dict(segment_pool_id=pool, total_size=80, allocated_size=20),
+            dict(segment_pool_id=(0, 0), total_size=1000, allocated_size=0)])
+    model = SimpleNamespace(
+        engine=SimpleNamespace(torch=SimpleNamespace(
+            cuda=cuda, inference_mode=nullcontext)), layers=[None])
+    monkeypatch.setattr(cuda_graphs, "PiecewiseBuffers", lambda *a: SimpleNamespace(
+        piece=lambda *a: None))
+    graphs = PiecewiseGraphs(model, token_buckets=(1, 2), memory_bytes=memory_bytes)
+    if memory_bytes < 160:
+        with pytest.raises(RuntimeError, match="exceeding"):
+            graphs.prepare()
+        assert not graphs.graphs
+    else:
+        assert graphs.prepare()
+        assert not graphs.prepare()
+    assert graphs.captured_bytes == 160
 
 
 @pytest.mark.parametrize("buckets", [(), [1], (0,), (2, 1), (1, 1), (1.5,)])
