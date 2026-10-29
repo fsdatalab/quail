@@ -261,7 +261,9 @@ class AsyncTopLogprobs(_HostReadout):
             members = list(extra) if isinstance(extra, tuple) else [extra]
             self.groups.append(slice(len(ids), len(ids) + len(members)))
             ids.extend(members)
-        self.extras = torch.tensor(ids, device=head.device, dtype=torch.long)
+        self.extras = torch.tensor(
+            ids, dtype=torch.long, pin_memory=head.is_cuda
+        ).to(head.device, non_blocking=True)
         self.width = len(extras) + 2 * k
         self.ragged = ragged
         self.dtype = (np.dtype(object) if ragged

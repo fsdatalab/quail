@@ -1047,3 +1047,17 @@ def test_operators_after_grouped_extractions_read_the_last_member(monkeypatch):
     gate = ApplyGate.prepare(None, [apply], [0, 1, 2], [group], {"apply:keep": {}},
                              None)
     assert gate.call == {"c": [0, 1, 2]}
+
+
+@pytest.mark.parametrize("is_cuda", [False, True])
+def test_extra_readout_tokens_use_pinned_nonblocking_cuda_uploads(is_cuda):
+    from unittest.mock import Mock
+
+    from quail.backends.quail.executor.readout import AsyncTopLogprobs
+
+    torch = Mock()
+    head = SimpleNamespace(device="cuda" if is_cuda else "cpu", is_cuda=is_cuda)
+    readout = AsyncTopLogprobs(torch, None, head, 4, [(3, 7)])
+    torch.tensor.assert_called_once_with([3, 7], dtype=torch.long, pin_memory=is_cuda)
+    torch.tensor.return_value.to.assert_called_once_with(head.device, non_blocking=True)
+    assert readout.extras is torch.tensor.return_value.to.return_value
