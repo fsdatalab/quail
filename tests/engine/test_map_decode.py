@@ -17,6 +17,9 @@ import torch
 from helpers.fakes import cpu_staging, fake_pipeline
 from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 
+from quail.backends.quail.executor.admission import pages_for
+from quail.backends.quail.executor.answer_admission import AnswerAdmission, page_moments
+from quail.backends.quail.executor.answer_survival import answer_survival
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.operators.classify import ClassifyPart
 from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
@@ -26,10 +29,12 @@ from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
+from quail.cost.decode import DecodeCost
 from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext
 from quail.physical import AiJoin, AiMap, MapSpec, PortRef
 from quail.physical.base import input_ports
+from quail.specs import DEVICES, QWEN3_4B_FP8
 
 VOCABULARY = 1024
 STOP = VOCABULARY - 1
@@ -68,26 +73,23 @@ class TokenModel(HashModel):
 
 
     def _whole(self, meta):
-        """The unified call as one sequence per row, shared pages first.
-
-        A row that reads its group's shared pages in a second call
-        reads them, then its own pages, as one logical sequence.
-        """
+        """Reconstruct each sequence's full context with shared pages first."""
         unified, shared = meta["unified"], meta["shared"]
         if shared is None:
             return unified
         self.shared_reads += 1
         cu = unified["cu_q"].tolist()
-        sequence = {cu[i]: i for i in range(len(cu) - 1) if cu[i + 1] - cu[i] == 1}
+        sequence = {row: i for i, (start, end) in enumerate(zip(cu, cu[1:]))
+                    for row in range(start, end)}
         table = [list(row) for row in unified["table"].tolist()]
         used = unified["used"].tolist()
         rows, groups = shared["rows"].tolist(), shared["cu_q"].tolist()
         tokens = shared["used"].tolist()
         for g, pages in enumerate(shared["table"].tolist()):
             pages = pages[:-(-tokens[g] // self.page)]
-            for row in rows[groups[g]:groups[g + 1]]:
-                table[sequence[row]] = pages + table[sequence[row]]
-                used[sequence[row]] += tokens[g]
+            for i in {sequence[row] for row in rows[groups[g]:groups[g + 1]]}:
+                table[i] = pages + table[i]
+                used[i] += tokens[g]
         width = max(map(len, table))
         return dict(unified, used=torch.tensor(used), table=torch.tensor(
             [row + [0] * (width - len(row)) for row in table]))
@@ -419,6 +421,7 @@ def map_state(setup, arena, forward_chunk):
         torch=events_torch(3), chunk_tokens=setup.budget, async_answers=Bits(),
         loaded_model=SimpleNamespace(
             arena=arena, pipeline=pipeline, input_staging=None,
+            model_spec=QWEN3_4B_FP8,
             model=SimpleNamespace(quail_full_head=torch.eye(VOCABULARY)),
             vocabulary=SimpleNamespace(stop_ids=[STOP], tokenizer=SimpleNamespace(
                 batch_decode=batch_decode))))
@@ -593,8 +596,8 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     prefixes, keys, tree, dependencies = maps.branch_inputs(
         documents, [("d", i) for i in ids], prefix_tree(documents, setup.page_tokens),
         setup.page_tokens, 1)
-    # a prior of one-token answers reserves almost nothing, so answers
-    # outgrow their reservations and the tight arena evicts some
+    # A one-token prior predicts no growth, so answers outgrow their
+    # initial pages and the tight arena evicts some.
     decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), limits,
                          [STOP], setup.page_tokens,
                          expected_tokens=[1] * len(limits))
@@ -620,9 +623,13 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     assert not arena.accounting.owned
 
 
-def test_prompt_reservations_admit_more_than_full_answer_limits(monkeypatch):
+@pytest.mark.parametrize("priced,answer_limit,num_pages,num_admitted", [
+    (False, 80, 20, 1), (True, 80, 20, 4), (False, 8, 12, 2),
+])
+def test_answer_admission_prices_overlap_only_with_hardware_specs(
+        monkeypatch, priced, answer_limit, num_pages, num_admitted):
     cpu_staging(monkeypatch)
-    setup = Setup(path="unified", pages=20, page_tokens=4, budget=200)
+    setup = Setup(path="unified", pages=num_pages, page_tokens=4, budget=200)
     arena = make_arena(setup)
     model = TokenModel(arena)
     admitted = []
@@ -634,21 +641,85 @@ def test_prompt_reservations_admit_more_than_full_answer_limits(monkeypatch):
     pipeline = fake_pipeline(forward_chunk=forward_chunk, canvas_ids=())
     torch_ = events_torch(3)
     documents = [list(range(20 + a, 28 + a)) for a in range(4)]
-    maps = MapPart(None, [map_node("answer", [500, 501], 80)], range(4), 0)
+    maps = MapPart(None, [map_node("answer", [500, 501], answer_limit)], range(4), 0)
     prefixes, keys, tree, dependencies = maps.branch_inputs(
         documents, [("d", a) for a in range(4)], None, setup.page_tokens, 0)
-    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), 4, [80], [STOP], 4)
+    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), 4, [answer_limit], [STOP], 4)
     maps.decoder = decoder
     stats = {}
+    decode_cost = (DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
+                   if priced else None)
     run_stages(torch_, arena, pipeline, gated_stages([maps]), prefixes, 200,
                anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
-               decoder=decoder, stats=stats)
-    # Reserving an 80-token answer would not admit even one prompt here.
-    assert admitted[0] == 4
+               decoder=decoder, stats=stats, decode_cost=decode_cost)
+    assert admitted[0] == num_admitted
+    if answer_limit == 8:
+        assert num_admitted == num_pages // -(-(10 + answer_limit - 1) // 4)
+    # Full 80-token answers cannot fit; the progress fallback still starts one.
     assert stats["skipped_documents"] == 0
     assert [answer.tolist() for answer in decoder.answers(0, range(4))] == [
-        greedy(document + [500, 501], 80) for document in documents]
+        greedy(document + [500, 501], answer_limit) for document in documents]
     assert not arena.accounting.owned
+
+
+def test_admission_counts_dependent_answers_without_reserving_them_twice():
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 3,
+                         [32, 16], [STOP], 4, expected_tokens=[12, 4])
+    decoder.answer_slots = {0: np.array([0, 1]), 1: np.array([2])}
+    decoder.share = True
+    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
+    admission = AnswerAdmission(decoder, [8, 8, 8], 6, {2: (0, 0)}, [0, 0, 4],
+                                lambda tokens: pages_for(tokens, 4), cost)
+    admission.refresh(np.array([-1, -1, -1]))
+    assert admission.added_mean[0] > admission.added_mean[1]
+    assert admission.expected_tokens[0] > admission.expected_tokens[1]
+    assert admission.allows(0, 20, 4)
+    admission.admit(0)
+    before = admission.mean
+    assert admission.allows(2, 3, 3)
+    admission.admit(2)
+    assert admission.mean == pytest.approx(before - 3)
+    decoder.start(0, 0, 10, [0, 1, 2, 3])
+    decoder.start(2, 1, 10, [0, 4, 5, 6], parent=0, shared_tokens=4)
+    decoder.written[0][0] = 2
+    decoder.written[1][2] = 1
+    admission.refresh(np.array([0, -1, 0]))
+    expected = 0
+    for q, anchor in [(0, 0), (1, 2)]:
+        curve = answer_survival(decoder.lengths[q], decoder.written[q],
+                                decoder.expected_tokens[q], int(decoder.limits[q]))
+        mean, _ = page_moments(curve, decoder.written[q][[anchor]], np.array([6]), 4)
+        expected += mean[0]
+    assert admission.mean == pytest.approx(expected)
+    victim = decoder.eviction_order()[0]
+    assert admission.recompute == cost.recompute_cost.prefill_seconds(
+        10 + decoder.written[decoder.map[victim]][victim])
+    decoder._count_reads(decoder.rows(), shared=True)
+    reads = decoder.read_tokens
+    assert admission.work.pairs == reads["all"]
+    assert admission.work.kv_read == reads["alone"] + reads["own"] + reads["shared"]
+    assert admission.work.kv_read < admission.work.pairs
+    decoder.lengths[1][2] = 4
+    decoder.map[2] = -1
+    admission.refresh(np.array([0, -1, -2]))
+    assert admission.pending_pages[2] == 0
+    assert admission.mean < expected
+
+
+def test_reserved_replays_count_as_answer_demand_before_they_resume():
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
+                         [32], [STOP], 4, expected_tokens=[16])
+    decoder.answer_slots = {0: np.arange(2)}
+    decoder.start(0, 0, 10, [0, 1, 2, 3])
+    decoder.written[0][0] = 4
+    decoder.pause(0)
+    admission = AnswerAdmission(decoder, [8, 8], 6, {}, [0, 0],
+                                lambda tokens: pages_for(tokens, 4))
+    admission.refresh(np.array([0, -1]))
+    assert admission.allows(1, 12, 4)
+    admission.refresh(np.array([0, -1]), [(0, 0, 14)])
+    assert not admission.allows(1, 12, 4)
+    assert decoder.paused[0]
 
 
 def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
@@ -664,6 +735,36 @@ def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
     assert order.index(2) < order.index(3)
     decoder.pause(0)
     assert 0 not in decoder.eviction_order()
+    curves = {q: answer_survival(decoder.lengths[q], decoder.written[q],
+                                 decoder.expected_tokens[q], int(decoder.limits[q]))
+              for q in range(len(decoder.limits))}
+    np.testing.assert_array_equal(decoder.eviction_order(curves),
+                                  decoder.eviction_order())
+
+
+def test_eviction_prefers_cheaper_prompts_and_counts_only_reclaimable_pages():
+    arena = make_arena(Setup(path="unified", pages=300, page_tokens=4))
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
+                         [32], [STOP], 4, expected_tokens=[16])
+    decoder.answer_slots = {0: np.arange(2)}
+    decoder.start(0, 0, 1024, arena.alloc(("d", 0), 1028))
+    decoder.start(1, 0, 32, arena.alloc(("d", 1), 36))
+    decoder.written[0][:] = 2
+    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
+    admission = AnswerAdmission(decoder, [1022, 30], 6, {}, [0, 0], arena.page_cost,
+                                cost, arena.page_holds)
+    admission.refresh(np.array([0, 0]))
+    assert decoder.eviction_order()[0] == 0
+    assert admission.eviction_order()[0] == 1
+    assert admission.recompute == cost.recompute_cost.prefill_seconds(34)
+    arena.alloc(("borrower", 0), 32, borrow=(("d", 1), 32))
+    admission.refresh(np.array([0, 0]))
+    assert admission.eviction_order()[0] == 0
+    assert admission.recompute == cost.recompute_cost.prefill_seconds(1026)
+    assert arena.free_key(("d", 1)) == 1
+    assert arena.free_key(("d", 0)) == 257
+    arena.free_key(("borrower", 0))
+    assert arena.free_pages == 300
 
 
 def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(

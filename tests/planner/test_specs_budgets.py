@@ -104,7 +104,7 @@ def test_model_weights_and_kv_memory_budgets():
     head = QWEN3_32B_FP8.head_mem_bytes
     assert head == 151_936 * 5_120 * 2
     assert QWEN3_32B_FP8.W_resident == QWEN3_32B_FP8.W_mem
-    assert budgets.arena_tokens(QWEN3_32B_FP8, H100_SXM) == 112_304 - 5_936
+    assert budgets.arena_tokens(QWEN3_32B_FP8, H100_SXM) == 104_800
     # the chunk budget does not move: the 32B chunk is capped by the
     # int32 kernel index, not by memory
     kept = replace(QWEN3_32B_FP8, tied_head=True)
@@ -112,13 +112,61 @@ def test_model_weights_and_kv_memory_budgets():
         budgets.chunk_budget(kept, H100_SXM)
 
     tokens = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM)
-    assert tokens == 362_240     # 22,640 pages of 16 tokens
-    assert tokens // 400 == 905
+    assert tokens == 360_752
+    assert tokens // 400 == 901
     fp8 = budgets.arena_tokens(replace(QWEN3_4B_FP8, kv_bytes=1.0), H100_SXM)
     assert fp8 == pytest.approx(2 * tokens, rel=0.01)
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
         assert budgets.arena_tokens(model, RTX_PRO_6000_BLACKWELL_SERVER) \
             > budgets.arena_tokens(model, H100_SXM)
+
+
+@pytest.mark.parametrize("model", [
+    QWEN3_4B_FP8, QWEN3_32B_FP8, QWEN3_5_4B_BF16, DIFFUSION_GEMMA_26B_FP8,
+])
+@pytest.mark.parametrize("chunk", [1, 32, 1_024, 1_000_000])
+def test_copy_verification_shares_readout_workspace_without_reducing_kv(model, chunk):
+    workspace = budgets.copy_verification_workspace_bytes(model, chunk)
+    readout = 2 * budgets.READOUT_BLOCK_ROWS * model.vocab * 4
+    assert isinstance(workspace, int)
+    assert workspace == int(min(chunk * model.act_per_token, readout))
+    activations = budgets.ACT_RESERVE_CHUNKS * chunk * model.act_per_token
+    assert activations - workspace >= workspace
+    assert budgets.arena_bytes(model, H100_SXM, chunk) == (
+        H100_SXM.mem_bytes * budgets.POOL_FRACTION - model.W_resident - activations
+        - budgets.graph_memory_bytes(model, H100_SXM))
+    assert budgets.chunk_memory_bytes(model, chunk) == (
+        model.W_resident + activations
+        + budgets.checkpoint_memory_bytes(model, chunk))
+
+
+@pytest.mark.parametrize("model", [
+    QWEN3_4B_FP8, QWEN3_32B_FP8, QWEN3_5_4B_BF16, DIFFUSION_GEMMA_26B_FP8,
+])
+def test_copy_workspace_scales_with_activations_until_the_readout_cap(model):
+    workspace = budgets.copy_verification_workspace_bytes(model, 1)
+    assert workspace == model.act_per_token
+    assert budgets.copy_verification_workspace_bytes(model, 2) == 2 * workspace
+    wider = replace(model, hidden=2 * model.hidden)
+    assert budgets.copy_verification_workspace_bytes(wider, 1) == wider.act_per_token
+    assert wider.act_per_token > workspace
+    readout = 2 * budgets.READOUT_BLOCK_ROWS * model.vocab * 4
+    chunk = int(4 * readout // model.act_per_token) + 1
+    assert budgets.copy_verification_workspace_bytes(model, chunk) == readout
+    assert budgets.copy_verification_workspace_bytes(model, 2 * chunk) == readout
+    larger_vocab = replace(model, vocab=2 * model.vocab)
+    assert budgets.copy_verification_workspace_bytes(larger_vocab, chunk) == 2 * readout
+
+
+def test_readouts_use_the_workspace_budget_block_size():
+    from quail.backends.quail.executor.readout import (
+        AsyncLabelLogprobs,
+        AsyncTopLogprobs,
+    )
+
+    assert budgets.READOUT_BLOCK_ROWS == 512
+    assert AsyncLabelLogprobs.BLOCK_ROWS == budgets.READOUT_BLOCK_ROWS
+    assert AsyncTopLogprobs.BLOCK_ROWS == budgets.READOUT_BLOCK_ROWS
 
 
 def test_device_memory_budgets():

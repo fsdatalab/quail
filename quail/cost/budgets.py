@@ -13,6 +13,18 @@ INT32_MAX = 2**31 - 1
 ACT_BYTES = 2           # bf16 activations, bytes per element
 ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
 #                         the arena for overlapped chunk construction
+READOUT_BLOCK_ROWS = 512
+
+
+def copy_verification_workspace_bytes(model: ModelSpec, chunk_tokens: int) -> int:
+    """Return shared readout workspace capped by one activation chunk.
+
+    The head readout's two fp32 logits tables are released before copy
+    verification runs on the same CUDA stream. Reuse their bounded space,
+    leaving the other activation chunk for retained outputs and staging.
+    """
+    return int(min(chunk_tokens * model.act_per_token,
+                   2 * READOUT_BLOCK_ROWS * model.vocab * 4))
 
 
 def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
@@ -39,7 +51,7 @@ def kernel_index_cap(model: ModelSpec) -> int:
 
 def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
     """Return the largest chunk that fits its memory reservations, or zero."""
-    available = device.mem_bytes * POOL_FRACTION
+    available = device.mem_bytes * POOL_FRACTION - graph_memory_bytes(model, device)
     free = available - model.W_resident
     lower = 0
     upper = max(0, int(free // (ACT_RESERVE_CHUNKS * model.act_per_token)))
@@ -92,7 +104,8 @@ def _chunk_leaving_kv(model: ModelSpec, device: DeviceSpec, chunk: int) -> int:
     """
     if model.sliding_window or chunk < 1:
         return chunk
-    free = device.mem_bytes * POOL_FRACTION - model.W_resident
+    free = (device.mem_bytes * POOL_FRACTION - model.W_resident
+            - graph_memory_bytes(model, device))
     per = ACT_RESERVE_CHUNKS * model.act_per_token + model.kappa_full
     if per > 0:
         chunk = min(chunk, max(1, int(free // per)))
@@ -119,11 +132,41 @@ def sliding_kv_fits(model: ModelSpec, device: DeviceSpec,
     return True
 
 
+def graph_token_buckets(model: ModelSpec, device: DeviceSpec) -> tuple[int, ...]:
+    """Return dense Qwen3 capture sizes through twice the compute ridge.
+
+    Beyond twice the ridge, dense compute dominates weight reads by at
+    least two. Geometric steps bound padding to half the real rows,
+    rounded up, while keeping the number of captures logarithmic.
+    """
+    if model.arch != "qwen3" or model.state_layers or model.canvas_tokens:
+        return ()
+    maximum = min(ceil(2 * compute_knee(model, device)), kernel_index_cap(model))
+    buckets = [1]
+    while buckets[-1] < maximum:
+        buckets.append(min(maximum, ceil(3 * buckets[-1] / 2)))
+    return tuple(buckets)
+
+
+def graph_memory_bytes(model: ModelSpec, device: DeviceSpec) -> int:
+    """Reserve bucket boundary buffers and one shared capture workspace.
+
+    Each bucket's persistent state fits one activation footprint. All
+    captures share a pool, whose temporaries fit the largest footprint.
+    Attention and readout still use the ordinary activation reserve.
+    """
+    buckets = graph_token_buckets(model, device)
+    if not buckets:
+        return 0
+    return ceil((sum(buckets) + buckets[-1]) * model.act_per_token)
+
+
 def arena_bytes(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int) -> float:
-    """Bytes left for KV after resident weights and the activation reserve."""
+    """Bytes left for KV after weights, activations, and CUDA graph storage."""
     return (device.mem_bytes * POOL_FRACTION - model.W_resident
-            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
+            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token
+            - graph_memory_bytes(model, device))
 
 
 # Questions one pass may start from checkpoints at once; each needs a

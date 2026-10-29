@@ -1,103 +1,166 @@
-"""Graph padding preserves sequence boundaries and KV ownership."""
+"""Piecewise padding never reaches attention or KV."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 
-from quail.backends.quail.executor.cuda_graphs import DecodeBuffers, DecodeGraphs
+from quail.backends.quail.executor.cuda_graphs import (
+    CapturedPieces,
+    PiecewiseBuffers,
+    PiecewiseGraphs,
+)
+from quail.cost.budgets import compute_knee, graph_memory_bytes, graph_token_buckets
+from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_5_4B_BF16, QWEN3_32B_FP8
 
 torch = pytest.importorskip("torch")
 
 
-def chunk():
-    buffers = DecodeBuffers(torch, 5, 16, device="cpu")
-    out = buffers.chunk
-    out.input_ids[:] = torch.tensor([12, 13, 14, 15, 16])
-    out.positions[:] = torch.tensor([4, 5, 6, 9, 10])
-    out.final_indices = torch.tensor([2, 4])
-    out.meta["cu_a"] = torch.tensor([0, 3, 5], dtype=torch.int32)
-    out.meta["max_a"] = 3
-    out.meta["kv_src"] = torch.tensor([0, 1, 2, 3, 4])
-    out.meta["kv_dst"] = torch.tensor([20, 21, 22, 41, 42])
-    out.meta["reads"] = dict(
-        rows=torch.arange(5), cu_q=torch.tensor([0, 3, 5], dtype=torch.int32),
-        max_q=3, max_used=9, used=torch.tensor([4, 9], dtype=torch.int32),
-        table=torch.tensor([[1], [2]], dtype=torch.int32),
-        source=torch.arange(5, dtype=torch.int32))
-    return out
+def chunk(num_tokens=5):
+    return SimpleNamespace(
+        input_ids=torch.arange(12, 12 + num_tokens),
+        positions=torch.arange(num_tokens), tokens=num_tokens,
+        final_indices=torch.tensor([num_tokens - 1]), attention_mode="tree",
+        meta={"layer": 0, "kv_dst": torch.arange(num_tokens)})
 
 
-def test_padding_preserves_attention_and_only_real_rows_write_kv():
+def pipeline():
+    return SimpleNamespace(
+        engine=SimpleNamespace(
+            torch=torch, num_q_heads=2, num_kv_heads=1, head_dim=2,
+            quant=lambda q: (q.clone(), torch.ones(q.shape[0], 1))),
+        final_norm=SimpleNamespace(weight=torch.zeros(4)), forward_hook=None,
+        forward_chunk=lambda chunk: "eager")
+
+
+@pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_32B_FP8])
+def test_buckets_bound_padding_and_stop_at_twice_the_compute_ridge(model):
+    buckets = graph_token_buckets(model, H100_SXM)
+    assert buckets[0] == 1
+    assert buckets[-1] - 1 < 2 * compute_knee(model, H100_SXM) <= buckets[-1]
+    for n in range(1, buckets[-1] + 1):
+        bucket = next(b for b in buckets if b >= n)
+        assert bucket <= (3 * n + 1) // 2
+    assert graph_memory_bytes(model, H100_SXM) == (
+        sum(buckets) + buckets[-1]) * model.act_per_token
+
+
+def test_hybrid_models_keep_the_eager_path_and_no_graph_reservation():
+    assert PiecewiseGraphs.for_specs(None, QWEN3_5_4B_BF16, H100_SXM) is None
+    assert graph_memory_bytes(QWEN3_5_4B_BF16, H100_SXM) == 0
+
+
+@pytest.mark.parametrize("mode", ["tree", "unified"])
+def test_padding_never_reaches_attention_or_writes_kv(mode):
+    model = pipeline()
+    buffers = PiecewiseBuffers(model, 8, device="cpu")
     source = chunk()
-    buffers = DecodeBuffers(torch, 8, 16, device="cpu")
-    buffers.synthetic(7)
+    source.attention_mode = mode
     buffers.copy(source)
     assert buffers.ids.tolist() == [12, 13, 14, 15, 16, 0, 0, 0]
-    assert buffers.cu_a.tolist() == [0, 3, 5, 6, 7, 8, 8, 8, 8]
-    assert buffers.cu_q.tolist() == buffers.cu_a.tolist()
-    assert buffers.used.tolist() == [4, 9, 0, 0, 0, 0, 0, 0]
-    assert buffers.source.tolist() == [0, 1, 2, 3, 4, -1, -1, -1]
-    assert buffers.dst.tolist() == [20, 21, 22, 41, 42, -1, -1, -1]
-    assert buffers.table[:2, :1].equal(source.meta["reads"]["table"])
+    kv = torch.zeros(8, 2, dtype=torch.bfloat16)
 
-    # A shorter batch must not inherit any prior sequence or write mapping.
-    source.tokens = 2
-    source.input_ids = source.input_ids[:2]
-    source.positions = source.positions[:2]
-    source.meta["cu_a"] = torch.tensor([0, 2], dtype=torch.int32)
-    source.meta["kv_src"] = source.meta["kv_dst"] = None
-    reads = source.meta["reads"]
-    reads["rows"] = torch.tensor([1])
-    reads["cu_q"] = torch.tensor([0, 1], dtype=torch.int32)
-    reads["used"] = torch.tensor([4], dtype=torch.int32)
-    reads["table"] = reads["table"][:1]
-    reads["source"] = torch.tensor([-1, 0], dtype=torch.int32)
+    def attention(q, k, v, received):
+        assert received is source
+        assert q.shape[0] == k.shape[0] == v.shape[0] == source.tokens
+        kv[received.meta["kv_dst"]] = v
+        return q, torch.ones(source.tokens, 1)
+
+    model.engine.attention = attention
+    buffers.v.fill_(7)
+    buffers.attention(model, source)
+    assert (kv[:5] == 7).all()
+    assert (kv[5:] == 0).all()
+    source = chunk(2)
     buffers.copy(source)
-    assert buffers.cu_a.tolist() == [0, 2, 3, 4, 5, 6, 7, 8, 8]
-    assert buffers.cu_q.tolist() == list(range(9))
-    assert buffers.used.tolist() == [4, 0, 0, 0, 0, 0, 0, 0]
-    assert buffers.source.tolist() == [-1, 0, -1, -1, -1, -1, -1, -1]
-    assert (buffers.dst == -1).all()
+    assert buffers.ids.tolist() == [12, 13, 0, 0, 0, 0, 0, 0]
+    assert buffers.positions.tolist() == [0, 1, 0, 0, 0, 0, 0, 0]
+    buffers.attention(model, source)
 
 
-@pytest.mark.parametrize("unsupported", [
-    "unified", "many_tokens", "new_arena",
-])
+@pytest.mark.parametrize("unsupported", ["large", "empty", "disabled", "hook",
+                                          "canvas", "uncaptured"])
 def test_unsupported_batches_fall_back(unsupported):
+    model = pipeline()
+    graphs = PiecewiseGraphs(model, token_buckets=(8,), memory_bytes=1024)
+    graphs.graphs = [object()]
     source = chunk()
-    arena = SimpleNamespace(k=[], page_tokens=16)
-    calls = []
-    pipeline = SimpleNamespace(
-        engine=SimpleNamespace(arena=arena),
-        forward_chunk=lambda x: calls.append(x) or "eager")
-    graphs = DecodeGraphs(pipeline)
-    graphs.storage = arena.k
     assert graphs.supports(source)
     match unsupported:
-        case "unified":
-            source.attention_mode = "unified"
-        case "many_tokens":
-            source.tokens = 513
-        case "new_arena":
-            arena.k = []
+        case "large":
+            source.tokens = 9
+        case "empty":
+            source.tokens = 0
+        case "disabled":
+            graphs.enabled = False
+        case "hook":
+            model.forward_hook = lambda: None
+        case "canvas":
+            source.meta["canvas"] = object()
+        case "uncaptured":
+            graphs.graphs.clear()
     assert graphs.forward(source) == "eager"
-    assert calls == [source]
+    assert graphs.replays == 0
+
+
+def test_shared_reads_and_prefill_chunks_are_supported():
+    model = pipeline()
+    graphs = PiecewiseGraphs(model, token_buckets=(8,), memory_bytes=1024)
+    graphs.graphs = [object()]
+    source = chunk()
+    source.meta.update(max_a=1000, reads={"nodes": object(), "max_used": 100000})
+    assert graphs.supports(source)
+    source.attention_mode = "unified"
+    assert graphs.supports(source)
 
 
 def test_replay_returns_independent_output_storage():
-    source = chunk()
-    arena = SimpleNamespace(k=[], page_tokens=16)
-    graphs = DecodeGraphs(SimpleNamespace(engine=SimpleNamespace(arena=arena)))
-    graphs.storage = arena.k
-    output = torch.arange(8 * 3).reshape(8, 3)
-    graphs.graphs = [SimpleNamespace(
-        buffers=DecodeBuffers(torch, 8, 16, device="cpu"),
-        graph=SimpleNamespace(replay=lambda: None), output=output)]
-    actual = graphs.forward(source)
-    expected = output[[2, 4]].clone()
-    output.zero_()
+    model = pipeline()
+    buffers = PiecewiseBuffers(model, 8, device="cpu")
+    buffers.output.copy_(torch.arange(32).reshape(8, 4))
+    model.engine.attention = lambda q, k, v, chunk: (q, torch.ones(len(q), 1))
+    graphs = PiecewiseGraphs(model, token_buckets=(8,), memory_bytes=1024)
+    graphs.graphs = [CapturedPieces(buffers, [
+        SimpleNamespace(replay=lambda: None), SimpleNamespace(replay=lambda: None)])]
+    actual = graphs.forward(chunk())
+    expected = buffers.output[[4]].clone()
+    buffers.output.zero_()
     assert actual.equal(expected)
-    assert graphs.replays == 1
-    graphs.invalidate()
-    assert not graphs.graphs
-    assert graphs.storage is None
+    assert graphs.replays == graphs.passes == 1
+
+
+@pytest.mark.parametrize("memory_bytes", [159, 160])
+def test_capture_accounts_for_inactive_private_pool_storage(monkeypatch, memory_bytes):
+    from quail.backends.quail.executor import cuda_graphs
+
+    pool = (0, 1)
+    allocations = iter([100, 200])
+    stream = SimpleNamespace(wait_stream=lambda _: None, synchronize=lambda: None)
+    cuda = SimpleNamespace(
+        memory_allocated=lambda: next(allocations), graph_pool_handle=lambda: pool,
+        Stream=lambda: stream, current_stream=lambda: stream,
+        stream=lambda _: nullcontext(), CUDAGraph=object,
+        graph=lambda *a, **kw: nullcontext(),
+        memory_snapshot=lambda: [
+            dict(segment_pool_id=pool, total_size=80, allocated_size=20),
+            dict(segment_pool_id=(0, 0), total_size=1000, allocated_size=0)])
+    model = SimpleNamespace(
+        engine=SimpleNamespace(torch=SimpleNamespace(
+            cuda=cuda, inference_mode=nullcontext)), layers=[None])
+    monkeypatch.setattr(cuda_graphs, "PiecewiseBuffers", lambda *a: SimpleNamespace(
+        piece=lambda *a: None))
+    graphs = PiecewiseGraphs(model, token_buckets=(1, 2), memory_bytes=memory_bytes)
+    if memory_bytes < 160:
+        with pytest.raises(RuntimeError, match="exceeding"):
+            graphs.prepare()
+        assert not graphs.graphs
+    else:
+        assert graphs.prepare()
+        assert not graphs.prepare()
+    assert graphs.captured_bytes == 160
+
+
+@pytest.mark.parametrize("buckets", [(), [1], (0,), (2, 1), (1, 1), (1.5,)])
+def test_invalid_buckets_are_rejected(buckets):
+    with pytest.raises(ValueError, match="increasing positive integers"):
+        PiecewiseGraphs(None, token_buckets=buckets, memory_bytes=0)

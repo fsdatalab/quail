@@ -270,6 +270,10 @@ class GigatokenEncoder:
 
     def batch_numpy(self, texts):
         """Return flat token IDs and row boundaries for short continuation texts."""
+        if isinstance(texts, pa.Array):
+            import awkward as ak
+
+            texts = ak.from_arrow(texts)
         encoded = self.tokenizer.encode_batch(texts, parallel=False).layout
         return np.asarray(encoded.content.data), np.asarray(encoded.offsets.data)
 

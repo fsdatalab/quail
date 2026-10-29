@@ -213,9 +213,10 @@ class JoinAdmission:
             one suffix is written into the anchor's own pages.
         answer_dtype: The answer array type, one for every stage or a
             list per stage; None records 0/1 lists.
-        reserve: Optional callable(anchor, borrow) that reserves the anchor's
-            storage before admission. borrow is None or (parent, shared tokens).
-            False leaves the anchor queued; True commits the reservation.
+        reserve: Optional callable(anchor, borrow, rows) that reserves storage
+            before admission. borrow is None or (parent, shared tokens); rows
+            counts work already packed in this pass. False leaves the anchor
+            queued; True commits the reservation.
         dependencies: Dependent anchor -> (parent anchor, start stage). A
             dependent waits for its parent's launch at that stage, runs only
             that stage, and is excluded from limits and survival estimates.
@@ -330,10 +331,11 @@ class JoinAdmission:
         resident = dict(resident or {})
         anchor_partners = dict(anchor_partners or {})
         # A deferred parent cannot free its pages before a dependent runs.
-        self._dependent_reserve = max((
-            self.page_cost(prefix_tokens[a] - self.borrowing.tree_shared[a]
-                           + self._extra)
-            for a in self.dependencies), default=0)
+        self._dependent_pages = np.zeros(n, dtype=np.int64)
+        for a, (parent, _) in self.dependencies.items():
+            pages = self.page_cost(prefix_tokens[a] - self.borrowing.tree_shared[a]
+                                   + self._extra)
+            self._dependent_pages[parent] = max(self._dependent_pages[parent], pages)
         for a, prefix in enumerate(prefix_tokens):
             self._register(prefix, resident.get(a), anchor_partners.get(a))
         # resident anchors first: they cost no prefix tokens and few
@@ -461,7 +463,7 @@ class JoinAdmission:
         need = self.page_cost(prefix + self._extra)
         shared = self.borrowing.tree_shared[a] if a in self.dependencies else 0
         fresh = prefix - shared
-        reserve = 0 if a in self.dependencies else self._dependent_reserve
+        reserve = self._dependent_pages[a] if a < len(self._dependent_pages) else 0
         oversized = False
         if resident_pages is not None:
             need = max(0, need - resident_pages)
@@ -666,8 +668,8 @@ class JoinAdmission:
                     break
                 continue
             required = need + max(0, self._page_reserve - temporary_pages)
-            if dependency is None:
-                required += self._dependent_reserve
+            if a < len(self._dependent_pages):
+                required += self._dependent_pages[a]
             if required > free_pages:
                 blocked = True
                 self.blocked_pages = required - free_pages
@@ -687,7 +689,8 @@ class JoinAdmission:
                 self.blocked_pages = (
                     need + self._suffix_page_cost(a, j, 0) - free_pages)
                 break
-            if self.reserve is not None and not self.reserve(a, borrow):
+            if self.reserve is not None and not self.reserve(
+                    a, borrow, self.chunk_budget - room):
                 hold.append(a)
                 break
             temporary_pages += pages

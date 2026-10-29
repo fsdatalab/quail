@@ -1,9 +1,11 @@
 """Profile QUAIL-B query execution on Modal, excluding model startup.
 
 Queries run in fresh processes. Modes are plain (no profiler), cprofile,
-sample (Python stack sampling), trace (torch.profiler), and timeline
-(executor-step and GPU event timing). Each run prints timing, allocation,
-and result-digest fields. The env option sets child-process variables.
+sample (Python stack sampling), trace (torch.profiler), timeline
+(executor-step and GPU event timing), verify (graph/eager output checks),
+and eager (graphs disabled, unchanged KV capacity). Each run prints timing,
+allocation, accuracy, and result-digest fields. The env option sets child-process
+variables.
 
 Pass QUAIL_OVERRIDES=module:NAME=json-value;... in env to set module
 constants in the child, such as an executor constant under test, or
@@ -47,6 +49,7 @@ BEFORE_REMOTE = "/root/before"
 BEFORE_LOCAL = os.environ.get("QUAIL_BEFORE_SOURCE", "")
 image = gpu_image(*([(BEFORE_LOCAL, BEFORE_REMOTE)]
                     if modal.is_local() and BEFORE_LOCAL else []))
+image = image.add_local_python_source("experiments.cells.piecewise_probe")
 
 
 def _digest(output) -> str:
@@ -55,7 +58,8 @@ def _digest(output) -> str:
 
     digest = hashlib.sha256()
     tables = {**output.filter_answers, **output.join_answers,
-              **(output.classify_answers or {}), **(output.map_answers or {})}
+              **(output.classify_answers or {}), **(output.map_answers or {}),
+              **(output.extract_answers or {})}
     for name in sorted(tables):
         table = tables[name]
         rows = sorted(json.dumps(list(row.values()), default=str)
@@ -95,8 +99,8 @@ def _gpu_gaps(prof, top: int) -> dict:
     gaps.sort(reverse=True)
     by_kernel = {}
     for k_start, k_end, name in kernels:
-        total, calls = by_kernel.get(name[:80], (0.0, 0))
-        by_kernel[name[:80]] = total + k_end - k_start, calls + 1
+        total, calls = by_kernel.get(name, (0.0, 0))
+        by_kernel[name] = total + k_end - k_start, calls + 1
     ranked = sorted(by_kernel.items(), key=lambda item: -item[1][0])
     return {
         "kernels": [{"name": name, "s": round(total / 1e6, 4), "calls": calls}
@@ -156,6 +160,8 @@ class Timeline:
                     events[1].record()
                 rows = getattr(args[1], "shape", (None,))[0] if len(
                     args) > 1 and kind == "submit" else None
+                if kind == "forward":
+                    rows = args[2].tokens
                 timeline.entries.append((kind, started, ended, events, rows))
 
         if isinstance(owner, type) and isinstance(
@@ -325,6 +331,7 @@ def child(arguments: str) -> None:
     import quail.backends.quail.graph as graph_module
     from bench.quailb import run_query
     from quail_b.benchmark import load_benchmark
+    from quail_b.scoring import evaluate
 
     args = json.loads(arguments)
     _apply_overrides(os.environ.get("QUAIL_OVERRIDES", ""))
@@ -332,6 +339,8 @@ def child(arguments: str) -> None:
     modes, top = args["modes"], args["top"]
     print(f"quail from {quail.__file__}", flush=True)
     window = {}
+    from experiments.cells.piecewise_probe import PiecewiseProbe
+    probe = PiecewiseProbe()
 
     class ProfiledRunner(graph_module.GenericRunner):
         def run(self, *args, **kwargs):
@@ -339,6 +348,8 @@ def child(arguments: str) -> None:
             traced = window.get("trace")
             timeline = window.get("timeline")
             sampler = window.get("sampler")
+            probe.start(verify=window.get("verify", False),
+                        eager=window.get("eager", False))
             if sampler is not None:
                 sampler.start()
             import torch
@@ -353,6 +364,7 @@ def child(arguments: str) -> None:
             try:
                 return super().run(*args, **kwargs)
             finally:
+                window["piecewise"] = probe.summary()
                 if profiler is not None:
                     profiler.disable()
                 if traced is not None:
@@ -397,7 +409,10 @@ def child(arguments: str) -> None:
                 window["trace"] = torch.profiler.profile(activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA])
+            window["verify"] = mode == "verify"
+            window["eager"] = mode == "eager"
             output = run_query(session, spec, tables)
+            piecewise = window["piecewise"]
             measures = output.measurements
             nodes = {key: {name: value[name] for name in NODE_FIELDS
                            if name in value}
@@ -414,6 +429,8 @@ def child(arguments: str) -> None:
                     "kernel_cache_files")},
                 "nodes": nodes,
                 "allocator": window.get("allocator"),
+                "piecewise": piecewise,
+                "accuracy": evaluate(spec, output, suite.ground_truth, suite.tables),
             }
             if window["trace"] is not None:
                 record["gpu_window"] = _gpu_gaps(window["trace"], top)

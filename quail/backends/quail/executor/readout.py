@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from quail.backends.quail.executor.model_loading import answer_weights
+from quail.cost.budgets import READOUT_BLOCK_ROWS
 from quail.planner.prompt_lowering import true_false_ids
 
 
@@ -160,7 +161,7 @@ class AsyncLabelLogprobs(_HostReadout):
 
     # rows per head block: every block reads the whole head, so few big
     # blocks; 512 x 151,936 logits in bf16 and float32 are 445 MiB
-    BLOCK_ROWS = 512
+    BLOCK_ROWS = READOUT_BLOCK_ROWS
 
     def __init__(self, torch, F, head, targets, rows=1, normalize=True):
         super().__init__(torch)
@@ -261,7 +262,9 @@ class AsyncTopLogprobs(_HostReadout):
             members = list(extra) if isinstance(extra, tuple) else [extra]
             self.groups.append(slice(len(ids), len(ids) + len(members)))
             ids.extend(members)
-        self.extras = torch.tensor(ids, device=head.device, dtype=torch.long)
+        self.extras = torch.tensor(
+            ids, dtype=torch.long, pin_memory=head.is_cuda
+        ).to(head.device, non_blocking=True)
         self.width = len(extras) + 2 * k
         self.ragged = ragged
         self.dtype = (np.dtype(object) if ragged
@@ -272,19 +275,22 @@ class AsyncTopLogprobs(_HostReadout):
         torch = self.torch
         out = torch.empty((normed.shape[0], self.width), dtype=torch.float32,
                           device=normed.device)
-        n = len(self.groups)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
-            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
-            logits -= torch.logsumexp(logits, dim=1, keepdim=True)
-            rows = slice(start, start + block.shape[0])
-            picked = logits.index_select(1, self.extras)
-            for column, group in enumerate(self.groups):
-                out[rows, column] = torch.logsumexp(picked[:, group], dim=1)
-            top, ids = torch.topk(logits, self.k, dim=1)
-            out[rows, n:n + self.k] = ids.float()
-            out[rows, n + self.k:] = top
+            logits = self.F.linear(block.to(self.head.dtype), self.head)
+            out[start:start + block.shape[0]] = self.from_logits(logits)
         return out
+
+    def from_logits(self, logits):
+        """Return compact top-token values from a full-vocabulary projection."""
+        torch = self.torch
+        logits = logits.float()
+        logits = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+        picked = logits.index_select(1, self.extras)
+        extras = [torch.logsumexp(picked[:, group], dim=1)[:, None]
+                  for group in self.groups]
+        top, ids = torch.topk(logits, self.k, dim=1)
+        return torch.cat([*extras, ids.float(), top], dim=1)
 
     def submit(self, normed, rows_per_answer=None):
         return (*self._copy(self.values(normed)), rows_per_answer)

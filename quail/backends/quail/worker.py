@@ -13,6 +13,7 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
 from quail.backends.quail.executor.extract import load_vocabulary
 from quail.backends.quail.executor.model_loading import load_model
 from quail.backends.quail.executor.models import build_pipeline
@@ -115,6 +116,8 @@ class LoadedGpu:
             self.decision_head = DecisionHead.load(torch, F, path)
             self.decision_offsets = decision_offsets(spec, path)
         self.pipeline = build_pipeline(spec, self.model, self.arena)
+        self.pipeline.piecewise_graphs = PiecewiseGraphs.for_specs(
+            self.pipeline, spec, device)
         self.pipeline_s = time.perf_counter() - t0
 
         self.execution = backend.start(context)
@@ -134,11 +137,6 @@ class LoadedGpu:
         if arena_pages is not None:
             slots = checkpoint_arena_args(
                 self.spec, self.device, chunk_tokens, arena_pages[0])
-            graphs = self.pipeline.decode_graphs
-            if (graphs is not None and tuple(arena_pages)
-                    != (self.arena.num_pages, self.arena.num_sliding_pages)):
-                self.torch.cuda.synchronize()
-                graphs.invalidate()
             self.arena.resize(*arena_pages, free_resident=True,
                               **{k: v for k, v in slots.items()
                                  if k == "num_state_slots"})
@@ -181,7 +179,7 @@ class LoadedGpu:
                     # AI.EXTRACT and AI.MAP read the tokenizer's vocabulary;
                     # loading it is startup, not query time
                     load_vocabulary(self.execution)
-            graphs = self.pipeline.decode_graphs
+            graphs = self.pipeline.piecewise_graphs
             if graphs is not None and graphs.prepare():
                 tier = tier or "graphs"
         if tier is None:

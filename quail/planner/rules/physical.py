@@ -369,26 +369,27 @@ class ShouldSharePrefixes(PhysicalRule):
         return PhysicalGraph(tuple(nodes), graph.root)
 
 
-def _map_attention(graph: PhysicalGraph, context) -> dict:
-    """The attention path for the maps over each table, by alias.
+def _answer_attention(graph: PhysicalGraph, context) -> dict:
+    """The attention path for each table's answer branches, by alias.
 
-    The maps over one table are one document's branches: each reads the
-    document's pages and its own. A branch's pass has one row, and the
-    readers of the document in a pass are the branches still writing,
-    taking every answer to run to its limit: the limits' sum over the
-    longest limit.
+    A table's extraction fields and maps are one document's branches:
+    each reads the document's pages and its own. A branch's pass has
+    one row, more with a copy draft, and the readers of the document in
+    a pass are the branches still writing, taking every answer to run
+    to its limit: the limits' sum over the longest limit.
     """
-    limits = {}
+    branches = {}
     for node in graph.nodes:
-        if isinstance(node, AiMap) and node.spec is not None:
-            limits.setdefault(node.spec.aliases[0], []).append(
-                node.spec.max_answer_tokens)
+        if isinstance(node, (AiMap, AiExtract)) and node.spec is not None:
+            branches.setdefault(node.spec.aliases[0], []).append(node.spec)
     return {
         alias: choose_attention_path(
-            context.model, context.device, readers=sum(group) / max(group),
-            reader_rows=1.0,
+            context.model, context.device,
+            readers=(sum(spec.max_answer_tokens for spec in specs)
+                     / max(spec.max_answer_tokens for spec in specs)),
+            reader_rows=_mean(1 + getattr(spec, "draft_tokens", 0) for spec in specs),
             node_tokens=_mean(context.document_tokens.get(alias, ())))
-        for alias, group in limits.items()}
+        for alias, specs in branches.items()}
 
 
 def _mean(values) -> float:
@@ -426,13 +427,13 @@ class ChooseAttentionAlgorithm(PhysicalRule):
             raise ValueError(
                 f"attention must be 'tree' or 'unified', got {forced!r}")
         tree_available = tree_attention_allowed(model)
-        map_paths = _map_attention(graph, context) if tree_available else {}
+        answer_paths = _answer_attention(graph, context) if tree_available else {}
         nodes = []
         changed = False
         for node in graph.nodes:
             path = None
-            if isinstance(node, AiMap) and node.spec is not None:
-                path = map_paths.get(node.spec.aliases[0], "unified")
+            if isinstance(node, (AiMap, AiExtract)) and node.spec is not None:
+                path = answer_paths.get(node.spec.aliases[0], "unified")
             if isinstance(node, AiFilter):
                 lengths = context.document_tokens.get(node.alias)
                 store = None if lengths is None else lengths.store

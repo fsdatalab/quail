@@ -26,8 +26,11 @@ def _latencies(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
 
 
 def compute_seconds(work: _workload.Work, model: ModelSpec,
-                    device: DeviceSpec) -> float:
-    """Return ideal compute time without memory movement."""
+                    device: DeviceSpec, *, peak: bool = False) -> float:
+    """Return compute time without memory movement, optionally at spec peak."""
+    if peak:
+        return sum(component.flops / device.arithmetic_bandwidth(component.precision)
+                   for component in dense_decoder_components(work, model, passes=0.0))
     return sum(component.compute_seconds
                for component in _latencies(
                    work, model, device, passes=0.0))

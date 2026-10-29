@@ -26,10 +26,12 @@ def answer_survival(lengths, written, expected_tokens, limit, prior_weight=20.0)
     return survival
 
 
-def remaining_tokens(lengths, written, expected_tokens, limit, prior_weight=20.0):
-    """Return expected remaining lengths at each written length, 0 through limit."""
-    survival = answer_survival(lengths, written, expected_tokens, limit,
-                               prior_weight)
+def remaining_tokens(lengths, written, expected_tokens, limit, prior_weight=20.0,
+                     *, survival=None):
+    """Return expected remaining lengths, reusing a supplied survival curve."""
+    if survival is None:
+        survival = answer_survival(lengths, written, expected_tokens, limit,
+                                   prior_weight)
     tail = np.r_[np.cumsum(survival[:0:-1])[::-1], 0.0]
     return np.divide(tail, survival, out=np.zeros(limit + 1), where=survival > 0)
 

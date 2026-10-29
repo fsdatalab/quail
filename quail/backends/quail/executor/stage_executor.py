@@ -42,8 +42,8 @@ def forward_chunk(pipeline, arena, chunk):
     temporaries whether the pass returns or raises.
     """
     try:
-        if pipeline.decode_graphs is not None:
-            out = pipeline.decode_graphs.forward(chunk)
+        if pipeline.piecewise_graphs is not None:
+            out = pipeline.piecewise_graphs.forward(chunk)
         else:
             out = pipeline.forward_chunk(chunk)
         arena.sample_memory(chunk.tokens, len(chunk.layout))
@@ -89,7 +89,7 @@ class StageExecutor:
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
                  appended_tokens=None, gpu_timing=False, survival=None,
-                 decoder=None, dependencies=None, knee_rows=0):
+                 decoder=None, dependencies=None, knee_rows=0, decode_cost=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -187,20 +187,12 @@ class StageExecutor:
             if appended_tokens is not None:
                 kept = min(kept, int(appended_tokens))
             self.capacity_extra = max(self.capacity_extra, len(frame) + kept)
-        # per anchor, the map whose answer it writes; per map, the tokens
-        # admission reserves for an answer, refreshed each pass
-        self.anchor_map = None
-        self.answer_reserve = None
+        self.answer_admission = None
         if self.answer_maps:
             # every answer starts with a page, so a readmitted one can
             # write before it grows again
             self.capacity_extra += min(self.arena.page_tokens,
                                        int(self.decoder.limits.max()) - 1)
-            self.anchor_map = np.full(len(self.prefixes), -1, dtype=np.int64)
-            for j, first in self.answer_maps.items():
-                slots = decoder.slot_maps.get(first, {})
-                self.anchor_map[list(slots)] = list(slots.values())
-            self.answer_reserve = decoder.answer_reserve()
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
 
@@ -251,6 +243,13 @@ class StageExecutor:
         )
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
+        if self.answer_maps and self.paged:
+            from quail.backends.quail.executor.answer_admission import AnswerAdmission
+
+            self.answer_admission = AnswerAdmission(
+                decoder, self.prefix_lengths, self.capacity_extra,
+                self.sched.dependencies, self.borrowing.tree_shared,
+                self.arena.page_cost, decode_cost, self.arena.page_holds)
         # a Gated DeltaNet layer starts a borrower from the parent's state
         # at the shared point, so a parent writes one slot per point
         self.share_points = [()] * len(self.keys)
@@ -399,7 +398,7 @@ class StageExecutor:
             return can_borrow(doc, parent, same_chunk)
         return check
 
-    def _reserve(self, anchor, borrow):
+    def _reserve(self, anchor, borrow, rows):
         """Reserve a document's KV and checkpoints before admitting its work."""
         key = self.keys[anchor]
         prefix = self.prefix_lengths[anchor]
@@ -408,18 +407,15 @@ class StageExecutor:
                        if shared < t < prefix)
         capacity = prefix + self.capacity_extra
         borrowed = (self.keys[parent], shared) if shared else None
-        if self.anchor_map is not None and self.anchor_map[anchor] >= 0:
-            # room for the answer 90% of its map's answers stay within; a
-            # longer one grows past it, and may be evicted for it
-            reserve = max(0, int(self.answer_reserve[self.anchor_map[anchor]])
-                          - self.arena.page_tokens)
-            if self.arena.reserve(
-                    key, prefix, capacity_tokens=capacity + reserve,
-                    borrow=borrowed, extension=self._extends, share_points=points):
-                return self._reserved(anchor, key, parent)
-            if len(self.decoder.running()):
-                return False    # running answers will free pages
-            # nothing running frees pages: start with the one page, and grow
+        if self.answer_admission is not None:
+            prompt_pages = (self.arena.growth_cost(key, capacity)
+                            if self.arena.is_resident(key)
+                            else self.arena.page_cost(capacity - shared))
+            if not self.answer_admission.allows(
+                    anchor, self.arena.free_pages, prompt_pages):
+                if self.answer_admission.maximum or len(self.decoder.running()):
+                    return False
+                # No answer can free pages: start with one page and grow.
         if not self.arena.reserve(
                 key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
@@ -427,7 +423,9 @@ class StageExecutor:
         return self._reserved(anchor, key, parent)
 
     def _reserved(self, anchor, key, parent):
-        """Hold what an admitted document reads and lends."""
+        """Commit answer demand and hold the KV an admitted document reads and lends."""
+        if self.answer_admission is not None:
+            self.answer_admission.admit(anchor)
         if parent is not None:
             self.arena.read_state((self.keys[parent],))
             self._reserved_parents[anchor] = self.keys[parent]
@@ -464,7 +462,9 @@ class StageExecutor:
             if added is not None:
                 decoder.add_pages(growing, added)
                 continue
-            victim = int(decoder.eviction_order()[0])
+            order = (decoder.eviction_order() if self.answer_admission is None
+                     else self.answer_admission.eviction_order())
+            victim = int(order[0])
             for detached in decoder.pause(victim):
                 self.borrowing.chosen.pop(int(detached), None)
             key = self.keys[victim]
@@ -484,8 +484,8 @@ class StageExecutor:
                 # its answer ended in a token that landed after eviction
                 del self.recomputing[a]
                 continue
-            if decoder.inflight[a]:
-                continue    # its last tokens are still on their way
+            if decoder.inflight[a] or decoder.copy_pending[a]:
+                continue    # its next copy inputs are not ready
             q = self.decoder.map[a]
             written = int(self.decoder.written[q][a])
             length = int(self.decoder.origin[a]) + written
@@ -499,6 +499,7 @@ class StageExecutor:
                         key, self.prefix_lengths[a], capacity_tokens=capacity,
                         extension=self._extends):
                     break       # the pool is short; the rest wait in order
+                decoder.set_pages(a, self.arena.owned_pages(key))
             end = min(length, start + room)
             replays.append((a, start, end))
             room -= end - start
@@ -710,7 +711,7 @@ class StageExecutor:
         """Report the answer stage of each document whose answer ended."""
         if self.decoder is None:
             return []
-        self.decoder.harvest()
+        self.decoder.harvest(prepare=False)
         self.answered.update(a for a, _ in self.decoder.take_finished())
         transitions = []
         # each branch settles at its own answer's end and frees its pages;
@@ -829,6 +830,9 @@ class StageExecutor:
         # launch queue, and a host blocked there could not decide them
         while self.outstanding:
             self._report_next()
+        if self.decoder is not None:
+            self._answers_landed()
+            self.decoder.prepare()
         handles = self.readouts.submit(
             normed, entries, chunk.rows_per_answer)
         if self.decoder is not None:
@@ -842,8 +846,6 @@ class StageExecutor:
             # documents with nothing to send at their first stage never run
             for settlement in self.sched.take_settled():
                 self._event(settlement)
-            if self.decoder is not None:
-                self._answers_landed()
             if self.sched.done():
                 break
             if len(self.outstanding) > 1:
@@ -854,11 +856,13 @@ class StageExecutor:
                 self.arena.evict_retained(self.sched.blocked_pages)
             if self.decoder is not None:
                 self._grow_answers()
-                self.answer_reserve = self.decoder.answer_reserve()
             decode = None if self.decoder is None else self.decoder.rows()
             # Answers keep their rows; recomputations and new prompts fill the rest.
             room = self.sched.chunk_budget - (0 if decode is None else len(decode))
             replays, room = self._replays(max(0, room))
+            if (self.answer_admission is not None
+                    and (self.sched.pending or self.sched.waiting)):
+                self.answer_admission.refresh(np.asarray(self.sched._stage), replays)
             groups = self.sched.next_chunk(
                 self.arena.free_pages if self.paged else 1 << 62, room=room)
             if not groups and (decode is not None or replays):
@@ -867,10 +871,16 @@ class StageExecutor:
             if not groups:
                 if self.outstanding:
                     self._report_next(partial=True)
+                    self._answers_landed()
+                    continue
+                if self.decoder is not None and self.decoder.copy_pending.any():
+                    # No other prefill, decode or replay can hide this preparation.
+                    self.decoder.prepare()
                     continue
                 if self.decoder is not None and self.decoder.copies:
                     # Every answer waits on a token still on its way.
-                    self.decoder.harvest(wait=True)
+                    self.decoder.harvest(wait=True, prepare=False)
+                    self._answers_landed()
                     continue
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):

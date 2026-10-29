@@ -1,5 +1,6 @@
 """Test packed token rows, positions, and answer rows from flattened suffixes."""
 
+import numpy as np
 import pytest
 from helpers.fakes import cpu_staging, plain_arena
 
@@ -132,6 +133,56 @@ def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared, run):
             model=QWEN3_4B_FP8, device=H100_SXM)
         assert cost.work.tokens == fresh_tokens
         assert cost.work.kv_read == retained_reads
+
+
+@pytest.mark.parametrize("mode", ["tree", "unified"])
+@pytest.mark.parametrize("shared", [False, True])
+def test_copy_drafts_pack_as_causal_sequences_without_combining_slots(
+        monkeypatch, mode, shared):
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    keys = [("d", 0), ("d", 1)]
+    for key in keys:
+        arena.activate(key, 32, capacity_tokens=48, base_tokens=32,
+                       borrow=(keys[0], 16) if shared and key == keys[1] else None)
+    slots = np.array([0, 0, 0, 1, 1, 1])
+    positions = np.array([35, 36, 37, 33, 34, 37])
+    tables = np.array([arena.owned_pages(keys[slot]) for slot in slots])
+    decode = chunk_mod.DecodeRows(
+        slots=slots, positions=positions, page_table=tables,
+        write_rows=np.array([int(arena.capacity_rows(keys[slot])[position])
+                             for slot, position in zip(slots, positions)]))
+    if shared:
+        decode.own_table = tables[:, 1:]
+        decode.own_lengths = positions + 1 - 16
+        decode.shared_rows = np.arange(len(slots))
+        decode.shared_cu = np.array([0, len(slots)])
+        decode.shared_table = tables[:1, :1]
+        decode.shared_used = np.array([16])
+    chunk = chunk_mod.pack_chunk(
+        torch, arena, [], attention_mode=mode, decode=decode)
+    # A gap in a slot's positions starts another causal sequence.
+    assert chunk.meta["cu_a"].tolist() == [0, 3, 5, 6]
+    assert chunk.final_indices.tolist() == list(range(6))
+    assert chunk.rows_per_answer is None
+    if mode == "tree":
+        reads = chunk.meta["reads"]
+        assert reads["cu_q"].tolist() == [0, 3, 5, 6]
+        assert reads["used"].tolist() == [35, 33, 37]
+        assert reads["table"].tolist() == tables[[0, 3, 5]].tolist()
+        assert chunk.meta["kv_dst"].tolist() == decode.write_rows.tolist()
+    else:
+        reads = chunk.meta["unified"]
+        assert reads["cu_q"].tolist() == [0, 3, 5, 6]
+        assert reads["used"].tolist() == [n - (16 if shared else 0)
+                                          for n in [38, 35, 38]]
+        expected = tables[[0, 3, 5], 1:] if shared else tables[[0, 3, 5]]
+        assert reads["table"].tolist() == expected.tolist()
+        assert reads["dst"].tolist() == decode.write_rows.tolist()
+        assert (chunk.meta["shared"] is not None) == shared
+    for key in reversed(keys):
+        arena.free_key(key)
+    assert not arena.accounting.owned
 
 
 @pytest.mark.parametrize("mode", ["tree", "unified"])

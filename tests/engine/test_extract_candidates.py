@@ -8,6 +8,7 @@ from quail.backends.quail.executor.extract.candidates import (
     DocumentTokens,
     SqueezedText,
     Stream,
+    TextWindows,
     ensure_tokens,
     first_tokens,
     make_streams,
@@ -174,3 +175,19 @@ def test_candidate_ties_prefer_longer_spelling():
                           scan)
     assert higher.best_token == short
     assert list(higher.items(tables)) == [(0, (short, tables.encode_ids("ir")))]
+
+
+@pytest.mark.parametrize("size", [1, 2, 8, 16])
+def test_packed_windows_preserve_unicode_and_partial_whitespace_runs(size):
+    texts = ["", "  café\n\n\n東京 🙂 word\t end  ", "a b", "\n\t "]
+    packed = TextWindows(texts)
+    documents = np.repeat(np.arange(len(texts)), [len(text) + 1 for text in texts])
+    starts = np.concatenate([np.arange(len(text) + 1) for text in texts])
+    windows, left, cuts = packed.windows(documents, starts, np.full(len(starts), size))
+    for row, (document, start) in enumerate(zip(documents, starts)):
+        stream = Stream(0, [0], [int(start)], texts[document], first_window_chars=size)
+        text, ends = stream.window()
+        assert windows[row].as_py() == text
+        actual = np.minimum(packed.ends[left[row]:left[row] + len(text)]
+                            - packed.offsets[document], cuts[row])
+        np.testing.assert_array_equal(actual, ends)

@@ -20,12 +20,16 @@ class RetentionPolicy:
     checkpoint_pages: float = 0.0    # pages of the state a hybrid model's
     #                                  document keeps beside its KV
 
+    def prefill_seconds(self, tokens: int) -> float:
+        """Return ideal compute time to rebuild a prefix of this length."""
+        return (self.linear_seconds * tokens
+                + self.pair_seconds * triangle(tokens)
+                + self.sliding_pair_seconds * triangle(tokens, self.sliding_window))
+
     def priority(self, key, tokens: int, pages: int) -> tuple:
         alias, document = key
         probability, next_use = self.uses.get(alias, (0.0, 0))
-        seconds = (self.linear_seconds * tokens
-                   + self.pair_seconds * triangle(tokens)
-                   + self.sliding_pair_seconds * triangle(tokens, self.sliding_window))
+        seconds = self.prefill_seconds(tokens)
         held = pages + self.checkpoint_pages
         return (probability * seconds / held, -next_use, -document)
 
@@ -36,13 +40,13 @@ def retention_pages(arena_tokens: int, chunk_tokens: int, page_tokens: int) -> i
                - execution_pages(chunk_tokens, page_tokens))
 
 
-def coefficients(model, device) -> dict:
+def coefficients(model, device, *, peak=False) -> dict:
     """Return the model's ideal prefix computation coefficients."""
     full, sliding = attention_pair_flops(model)
     bandwidth = device.arithmetic_bandwidth(model.attention_precision)
     config = {
         "linear_seconds": compute_seconds(
-            Work(tokens=1, pairs=0, kv_written=0, kv_read=0), model, device),
+            Work(tokens=1, pairs=0, kv_written=0, kv_read=0), model, device, peak=peak),
         "pair_seconds": full / bandwidth,
         "sliding_pair_seconds": sliding / bandwidth,
         "sliding_window": model.sliding_window,

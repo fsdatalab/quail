@@ -3,10 +3,23 @@
 import gzip
 import json
 import struct
+from types import SimpleNamespace
 
 import pytest
 
 from experiments.profile_gpu_timeline import encode_intervals, read_gpu_intervals
+
+
+def test_query_timeline_records_forward_token_counts():
+    from experiments.cells.profile_query import Timeline
+
+    timeline = Timeline.__new__(Timeline)
+    timeline.active = True
+    timeline.entries = []
+    owner = SimpleNamespace(forward=lambda pipeline, arena, chunk: "output")
+    timeline._wrap(owner, "forward", "forward")
+    assert owner.forward(None, None, SimpleNamespace(tokens=37)) == "output"
+    assert timeline.entries[-1][-1] == 37
 
 
 def test_timeline_clips_to_join_and_merges_concurrent_operations(tmp_path):

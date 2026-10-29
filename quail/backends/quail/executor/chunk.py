@@ -15,6 +15,18 @@ from quail.backends.quail.executor.attention import ATTENTION_PATHS
 from quail.backends.quail.executor.gdn import plan_phases
 
 
+def decode_groups(slots, parent, borrowed, lead):
+    """Return each decode row's shared-read group and shared prefix length."""
+    parents = parent[slots]
+    as_child = np.where(borrowed[slots] == lead[parents], borrowed[slots], 0)
+    as_parent = lead[slots]
+    groups = np.where(as_parent >= as_child, slots, parents)
+    shared = np.maximum(as_parent, as_child)
+    groups = np.where(shared > 0, groups, -1 - np.arange(len(slots)))
+    _, inverse, counts = np.unique(groups, return_inverse=True, return_counts=True)
+    return groups, np.where(counts[inverse] > 1, shared, 0)
+
+
 @dataclass
 class Chunk:
     """Token tensors and attention metadata for one packed forward pass.
@@ -98,6 +110,17 @@ class DecodeRows:
 
     def __len__(self) -> int:
         return len(self.positions)
+
+    @property
+    def sequence_offsets(self) -> np.ndarray:
+        """Return bounds of consecutive positions belonging to the same slot."""
+        if not len(self):
+            return np.zeros(1, dtype=np.int64)
+        starts = np.flatnonzero(
+            (self.slots[1:] != self.slots[:-1])
+            | (self.positions[1:] != self.positions[:-1] + 1)
+        ) + 1
+        return np.r_[0, starts, len(self)]
 
 
 class ArenaFullError(RuntimeError):
@@ -329,7 +352,7 @@ class _PoolBuilder:
         self.dst = []
         self.tail_src = []
         self.tail_dst = []
-        # (page table, lengths) blocks of one-row sequences, after the rows
+        # (page table, lengths) blocks of decode sequences, after the rows
         self.blocks = []
 
     def add_sequence(self, pages, kv_tokens):
@@ -337,11 +360,13 @@ class _PoolBuilder:
         self.lengths.append(kv_tokens)
 
     def add_block(self, rows: DecodeRows, r0: int):
-        """Add one one-row sequence per decode row, starting at input row r0."""
+        """Add consecutive decode sequences, starting at input row r0."""
+        offsets = rows.sequence_offsets
+        first, last = offsets[:-1], offsets[1:] - 1
         if rows.own_table is None:
-            self.blocks.append((rows.page_table, rows.positions + 1))
+            self.blocks.append((rows.page_table[first], rows.positions[last] + 1))
         else:
-            self.blocks.append((rows.own_table, rows.own_lengths))
+            self.blocks.append((rows.own_table[first], rows.own_lengths[last]))
         self.src.append(np.arange(r0, r0 + len(rows), dtype=np.int64))
         self.dst.append(rows.write_rows)
 
@@ -698,20 +723,19 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             raise ValueError("decode rows read a model with every-token "
                              "attention only")
         count = len(decode)
+        decode_offsets = decode.sequence_offsets
         if tree_path:
-            # each row reads its resident rows in call B and itself in
-            # call A
+            # A draft reads its resident prefix in B and its causal rows in A.
             reader_rows.append(np.arange(num_tokens, num_tokens + count,
                                          dtype=np.int64))
-            cu_q.extend(range(cu_q[-1] + 1, cu_q[-1] + count + 1))
-            read_used.extend(np.asarray(decode.positions).tolist())
-            max_q = max(max_q, 1)
+            cu_q.extend((cu_q[-1] + decode_offsets[1:]).tolist())
+            read_used.extend(decode.positions[decode_offsets[:-1]].tolist())
+            max_q = max(max_q, int(np.diff(decode_offsets).max()))
         id_parts.append(np.zeros(count, dtype=np.int64))
         position.append(np.asarray(decode.positions, dtype=np.int64))
         finals.append(np.arange(num_tokens, num_tokens + count, dtype=np.int64))
         rows_per_answer.append(np.ones(count, dtype=np.int64))
-        cu_a.append(np.arange(num_tokens + 1, num_tokens + count + 1,
-                              dtype=np.int64))
+        cu_a.append(num_tokens + decode_offsets[1:])
         num_tokens += count
     cu_a = np.concatenate(cu_a)
 
@@ -724,10 +748,12 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         else:
             pages = [arena.owned_pages(key) for key in read_keys]
             width = max([len(row) for row in pages] + [decode.page_table.shape[1]])
-            flat = np.zeros((len(pages) + len(decode), width), dtype=np.int32)
+            flat = np.zeros(
+                (len(pages) + len(decode_offsets) - 1, width), dtype=np.int32)
             for row, own in enumerate(pages):
                 flat[row, :len(own)] = own
-            flat[len(pages):, :decode.page_table.shape[1]] = decode.page_table
+            flat[len(pages):, :decode.page_table.shape[1]] = (
+                decode.page_table[decode_offsets[:-1]])
             table = stage("read_table", flat, torch.int32).view(*flat.shape)
         t = _tick(timing, "pack_blocktable", t)
         rows = np.concatenate(reader_rows)
@@ -858,7 +884,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
             if decode is not None:
                 pools[0].add_block(decode, decode_row0)
-                cu_q.extend(range(cu_q[-1] + 1, cu_q[-1] + len(decode) + 1))
+                cu_q.extend((cu_q[-1] + decode_offsets[1:]).tolist())
             built = [pool.build(arena, stage, torch, staging, index)
                      for index, pool in enumerate(pools)]
             unified = dict(
