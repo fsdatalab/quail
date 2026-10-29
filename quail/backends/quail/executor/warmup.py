@@ -67,6 +67,11 @@ def _warm_convolutions(torch, pipeline, budget):
                                bias, activate)
 
 
+def _warm_run(*args, **kwargs):
+    """Run warm-up stages; their log lines say warm-up, not a query stage."""
+    return run_stages(*args, label="kernel warmup", **kwargs)
+
+
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                   join_chunk):
     """Run real forward passes over every attention path.
@@ -83,7 +88,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
-        run_stages(
+        _warm_run(
             torch, arena, pipeline,
             filter_stages([question], async_ans), warm_documents, budget,
             attention_mode=mode)
@@ -94,7 +99,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                 continue
             logger.debug("kernels: warming %s attention, %s tokens", mode, t)
             body = (document * (t // len(document) + 1))[:max(8, t - q_max)]
-            run_stages(
+            _warm_run(
                 torch, arena, pipeline,
                 filter_stages([question], async_ans), [body], budget,
                 attention_mode=mode)
@@ -105,7 +110,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     join_chunk = join_chunk and getattr(pipeline, "warm_joins", True)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
-        run_stages(
+        _warm_run(
             torch, arena, pipeline,
             [Stage(suffixes=[question] * 8, readout=async_ans)], warm_documents, budget)
     if join_chunk and trailing == 1:
@@ -114,12 +119,12 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         # decision model classifies with its own readout
         logger.debug("kernels: warming classification forward pass")
         labels = [question[:1 + i % 6] for i in range(26)]
-        run_stages(
+        _warm_run(
             torch, arena, pipeline,
             [Stage(suffixes=labels, readout=async_ans, frame=question)],
             warm_documents, budget)
     logger.debug("kernels: warming filter without KV writes")
-    run_stages(
+    _warm_run(
         torch, arena, pipeline,
         filter_stages([question], async_ans), warm_documents, budget,
         paged=False, default_attention="unified")
