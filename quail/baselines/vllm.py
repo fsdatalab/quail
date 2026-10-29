@@ -278,7 +278,11 @@ class VLLMClient:
     def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
                            answer_tokens, tag="x", body_texts=None,
                            tail_texts=None):
-        """Decode the fields of each document through the engine's step loop."""
+        """Decode the answers of each document through the engine's step loop.
+
+        Args:
+            sampling_params: One setting for every field, or one per field.
+        """
         return run_extract_fields(
             self.llm.llm_engine,
             sampling_params,
@@ -458,11 +462,12 @@ def stock_vllm_backend() -> RequestBackend:
 
 
 def pipelined_vllm_backend() -> RequestBackend:
-    """Return vLLM with per document filter pipelining."""
+    """Return vLLM with per document filter and map pipelining."""
     return RequestBackend(
         name="pipelined_vllm",
         engine=VLLMEngine(),
         filter_submission="pipelined",
+        map_submission="pipelined",
     )
 
 

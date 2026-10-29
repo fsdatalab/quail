@@ -1,5 +1,7 @@
-# Declares Quail's vLLM plugin, which registers the gigatoken tokenizer
-# in every vLLM process (quail.baselines.vllm.register_gigatoken). The
+# Declares Quail's vLLM plugins, which run in every vLLM process: one
+# registers the gigatoken tokenizer (quail.baselines.vllm.register_gigatoken),
+# one records scheduler steps when QUAIL_VLLM_STEP_TRACE names a file
+# (quail.baselines.vllm_trace.install_step_trace). The
 # GPU images install this package; they mount the quail source rather
 # than install the project, so the project's own metadata is absent.
 [project]
@@ -8,6 +10,7 @@ version = "0"
 
 [project.entry-points."vllm.general_plugins"]
 quail_gigatoken = "quail.baselines.vllm:register_gigatoken"
+quail_step_trace = "quail.baselines.vllm_trace:install_step_trace"
 
 [build-system]
 requires = ["setuptools>=68"]

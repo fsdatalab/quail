@@ -306,13 +306,19 @@ def extract_fields(client, specs, bodies, texts, body_texts=None) -> list[dict]:
             for outputs in run["outputs"]]
 
 
-def map_documents(client, specs, bodies, body_texts=None) -> list[dict]:
-    """Write every map's answer over the same prompt bodies in one engine call.
+def map_documents(client, specs, bodies, body_texts=None, *,
+                  submission="operator-at-a-time") -> list[dict]:
+    """Write every map's answer over the same prompt bodies.
 
-    The prompts go in document order, each document's maps together,
-    so the engine's prefix caching computes a document's KV once for
-    all of them. Each answer is greedy, up to the model's turn end or
-    its map's answer limit.
+    Operator-at-a-time submission sends every prompt in one engine
+    call, in document order with each document's maps together, so the
+    engine's prefix caching computes a document's KV once for all of
+    them. Pipelined submission runs the maps of each document through
+    the client's step loop, as extraction fields do: the first map
+    computes the body's KV before the others enter, and the document
+    cap counts each prompt and one answer token, as a filter's does.
+    Each answer is greedy, up to the model's turn end or its map's
+    answer limit.
 
     Args:
         client: The engine client.
@@ -320,27 +326,43 @@ def map_documents(client, specs, bodies, body_texts=None) -> list[dict]:
         bodies: Token ids for each prompt before the tail, preamble included.
         body_texts: The text of each prompt before the tail, for an
             engine that tokenizes the prompt itself; None sends token ids.
+        submission: "operator-at-a-time" or "pipelined".
 
     Returns:
         One dict per spec with its answers, in body order, and the
-        request and token counts; each reports the call's wall seconds.
+        request and token counts; each reports the run's wall seconds
+        and document cap (None for operator-at-a-time).
+
+    Raises:
+        ValueError: The submission is unknown, or pipelined on a client
+            without a step loop.
     """
-    prompts = [
-        body_texts[index] + spec.tail_text if body_texts is not None
-        else {"prompt_token_ids": body + token_list(spec.tail_token_ids)}
-        for index, body in enumerate(bodies) for spec in specs]
-    params = [client.decode_params(spec.max_answer_tokens)
-              for spec in specs] * len(bodies)
+    params = [client.decode_params(spec.max_answer_tokens) for spec in specs]
     started = time.perf_counter()
-    outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
+    if submission == "pipelined":
+        if not hasattr(client, "run_extract_fields"):
+            raise ValueError("pipelined maps need a client with a step loop")
+        run = client.run_extract_fields(
+            params, bodies, [token_list(spec.tail_token_ids) for spec in specs],
+            answer_tokens=1, body_texts=body_texts,
+            tail_texts=[spec.tail_text for spec in specs])
+        per_spec, document_cap = run["outputs"], run["doc_cap"]
+    elif submission == "operator-at-a-time":
+        prompts = [
+            body_texts[index] + spec.tail_text if body_texts is not None
+            else {"prompt_token_ids": body + token_list(spec.tail_token_ids)}
+            for index, body in enumerate(bodies) for spec in specs]
+        outputs = (client.generate(prompts, params * len(bodies), use_tqdm=False)
+                   if prompts else [])
+        per_spec = [outputs[q::len(specs)] for q in range(len(specs))]
+        document_cap = None
+    else:
+        raise ValueError(f"unknown map submission {submission!r}")
     wall_s = time.perf_counter() - started
-    results = []
-    for q in range(len(specs)):
-        own = outputs[q::len(specs)]
-        results.append({
-            "answers": [output.outputs[0].text for output in own],
-            "wall_s": wall_s, "requests": len(own), **_generation_counts(own)})
-    return results
+    return [{"answers": [output.outputs[0].text for output in own],
+             "wall_s": wall_s, "requests": len(own), "doc_cap": document_cap,
+             **_generation_counts(own)}
+            for own in per_spec]
 
 
 def read_extractions(outputs, texts, wall_s: float) -> dict:

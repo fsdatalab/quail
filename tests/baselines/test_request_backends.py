@@ -629,3 +629,62 @@ def test_an_experiment_can_turn_on_vllm_ngram_drafts(monkeypatch):
     for value in ("ngram", "ngram:0", "eagle:5"):
         with pytest.raises(ValueError):
             speculative_config(value)
+
+
+class _MapClient:
+    """Answers each prompt with its last token and limit, by call or step loop."""
+
+    def __init__(self):
+        self.pending = {}
+
+    def decode_params(self, max_tokens, stop=None):
+        return max_tokens
+
+    @staticmethod
+    def _output(ids, limit, request_id=None):
+        return SimpleNamespace(
+            request_id=request_id, finished=True, prompt_token_ids=ids,
+            num_cached_tokens=0,
+            outputs=[SimpleNamespace(token_ids=[1], text=f"{ids[-1]}/{limit}")])
+
+    def generate(self, prompts, params, use_tqdm=False):
+        return [self._output(prompt["prompt_token_ids"], limit)
+                for prompt, limit in zip(prompts, params)]
+
+    def add_request(self, request_id, prompt, limit):
+        self.pending[request_id] = (prompt["prompt_token_ids"], limit)
+
+    def step(self):
+        outputs = [self._output(ids, limit, request_id)
+                   for request_id, (ids, limit) in self.pending.items()]
+        self.pending.clear()
+        return outputs
+
+    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
+                           answer_tokens, body_texts=None, tail_texts=None):
+        from quail.baselines.request_scheduling import run_extract_fields
+
+        return run_extract_fields(self, sampling_params, body_ids, tail_ids,
+                                  CAPACITY["kv_cache_size_tokens"],
+                                  answer_tokens=answer_tokens)
+
+
+@pytest.mark.parametrize("submission", ["operator-at-a-time", "pipelined"])
+def test_maps_write_each_answer_under_its_own_limit(submission):
+    from quail.baselines.nodes import RequestMapSpec
+
+    specs = tuple(RequestMapSpec(alias="d", output=output, tail_token_ids=(tail,),
+                                 max_answer_tokens=limit)
+                  for output, tail, limit in (("plot", 90, 1024), ("topic", 91, 32)))
+    node = RequestExecution(node_id="request-model", backend_name="stock_vllm",
+                            aliases=("d",), maps=specs)
+    result = _execution(
+        {"d": [[10], [11], [12]]}, client=_MapClient(),
+        document_texts={"d": ["one", "two", "three"]},
+        map_submission=submission).execute(node, {"input:0": [0, 1, 2]})
+    assert result.outputs["map_answers:plot"].to_pydict()["plot"] == [
+        "90/1024"] * 3
+    assert result.outputs["map_answers:topic"].to_pydict()["topic"] == [
+        "91/32"] * 3
+    steps = result.metrics.extension["steps"]
+    assert {step["submission"] for step in steps} == {submission}

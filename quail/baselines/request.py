@@ -140,7 +140,7 @@ class RequestBackend:
 
     The engine adapter boots vLLM or SGLang and returns a client with
     generate, reset_prefix_cache, and run_filter_sequence. The submission
-    strategies decide how filter stages and join tuples become
+    strategies decide how filter stages, join tuples, and maps become
     requests.
     """
 
@@ -148,6 +148,7 @@ class RequestBackend:
     engine: Any
     filter_submission: str
     join_submission: str = "anchor-major"
+    map_submission: str = "operator-at-a-time"
     locates_answers_in_text = False
 
     @property
@@ -193,6 +194,7 @@ class RequestBackend:
             backend_name=self.name,
             filter_submission=self.filter_submission,
             join_submission=self.join_submission,
+            map_submission=self.map_submission,
             scores_labels=getattr(self.engine, "scores_labels", False),
         )
 

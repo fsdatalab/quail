@@ -67,6 +67,7 @@ class RequestModelExecution:
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
+        self.map_submission = settings["map_submission"]
         self.submit_text = bool(getattr(self.client, "accepts_text", False))
 
     def _classify(self, spec, bodies) -> dict:
@@ -495,15 +496,18 @@ class RequestModelExecution:
                 ))
 
     def _execute_maps(self, node, survivors, outputs, steps):
-        """Submit every map's prompts in one engine call and collect the answers."""
+        """Submit every map's prompts and collect the answers."""
         for alias, specs, ids, _, bodies, body_texts in self._answer_groups(
                 node, node.maps, survivors, "AI.MAP"):
-            results = map_documents(self.client, specs, bodies, body_texts)
+            results = map_documents(self.client, specs, bodies, body_texts,
+                                    submission=self.map_submission)
             for spec, result in zip(specs, results):
                 outputs[f"map_answers:{spec.output}"] = Rows(
                     {alias: document_ids(ids)},
                     pa.table({spec.output: pa.array(result["answers"],
                                                     pa.string())}))
                 steps.append(request_step(result, kind="map", alias=alias,
-                                          output=spec.output, num_in=len(ids),
-                                          num_out=len(ids)))
+                                          output=spec.output,
+                                          submission=self.map_submission,
+                                          num_in=len(ids), num_out=len(ids),
+                                          document_cap=result["doc_cap"]))

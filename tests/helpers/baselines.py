@@ -59,6 +59,7 @@ def _execution(documents, *, model=QWEN3_4B_FP8, **settings):
             "documents": documents, "true_ids": [1], "capacity": CAPACITY,
             "filter_submission": "operator-at-a-time",
             "join_submission": "anchor-major",
+            "map_submission": "operator-at-a-time",
             **settings,
         },
     ))
