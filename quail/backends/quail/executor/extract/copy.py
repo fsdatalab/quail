@@ -251,10 +251,12 @@ class CopyConstraint:
     def prepare_ahead(self, documents, masks, written):
         """Extend live starts far enough for the next pass before its result lands."""
         answers, positions = self.live_positions(documents, masks)
-        self._extend(positions, np.minimum(
-            written[answers] + 2 * self.spec.draft_tokens + 1,
-            self.spec.max_answer_tokens - 1))
+        limits = np.minimum(
+            written + 2 * self.spec.draft_tokens + 1,
+            self.spec.max_answer_tokens + self.spec.draft_tokens - 1)
+        self._extend(positions, limits[answers])
         self._upload()
+        return limits
 
     def _tokens(self, positions, options, at):
         sizes = self.filler_lengths[options]

@@ -79,7 +79,7 @@ class MapDecoder:
         self.borrowed = np.zeros(n, dtype=np.int64)
         self.lead = np.zeros(n, dtype=np.int64)
         self.device = head.device
-        self.next_token = torch.zeros(n, dtype=torch.int64, device=self.device)
+        self.next_token = None
         self.copies = deque()
         # per slot, the token copies on their way to the host that hold
         # one of its tokens; an evicted answer recomputes once it has none
@@ -97,6 +97,8 @@ class MapDecoder:
         self.copy_constraints = {}
         self.copy_readouts = {}
         self.copy_groups = []
+        self.copy_inputs = []
+        self.copy_pending = np.zeros(n, dtype=bool)
         self.copy_words = 0
         self.copy_trace_words = 0
         self.copy_trace = None
@@ -108,7 +110,19 @@ class MapDecoder:
         self.drafts = np.zeros(n, dtype=np.int64)
 
     def configure_copy(self, first, slots, documents, specs):
-        """Constrain extraction fields to their document's token streams."""
+        """Register extraction fields for setup after the first forward launch."""
+        self.constrained[first:first + len(specs)] = True
+        self.copy_inputs.append((first, slots, documents, specs))
+
+    def _initialize(self):
+        if self.next_token is None:
+            self.next_token = self.torch.zeros(
+                len(self.map), dtype=self.torch.int64, device=self.device)
+        pending, self.copy_inputs = self.copy_inputs, []
+        for first, slots, documents, specs in pending:
+            self._configure_copy(first, slots, documents, specs)
+
+    def _configure_copy(self, first, slots, documents, specs):
         from quail.backends.quail.executor.extract.copy import CopyConstraint
         from quail.backends.quail.executor.readout import AsyncTopLogprobs
         from quail.cost.draft_policy import LIVE_BUCKETS
@@ -135,10 +149,10 @@ class MapDecoder:
                                     device=self.device),
             masks=np.zeros((slots.size, constraint.mask_words), dtype=np.int64),
             prepared_written=np.full(slots.size, -1, dtype=np.int64),
-            prepared_drafts=np.zeros(slots.size, dtype=np.int64))
+            prepared_drafts=np.zeros(slots.size, dtype=np.int64),
+            lookahead=np.full(slots.size, -1, dtype=np.int64))
         self.copy_groups.append(group)
         for q, spec in enumerate(specs):
-            self.constrained[first + q] = True
             self.copy_document[slots[q]] = np.arange(len(documents.documents))
             self.copy_constraints[first + q] = SimpleNamespace(
                 constraint=constraint, spec=spec,
@@ -173,7 +187,7 @@ class MapDecoder:
             if np.any((written[mine] > 0) & (
                     (group.prepared_written[local] != written[mine])
                     | (group.prepared_drafts[local] < sizes[mine]))):
-                raise AssertionError("copy inputs were not prepared at harvest")
+                raise AssertionError("copy inputs were not prepared before packing")
             position, option = np.divmod(self.copy_sources[slots],
                                          constraint.num_options)
             remaining = (1 + constraint.filler_lengths[option]
@@ -201,6 +215,8 @@ class MapDecoder:
 
     def output_answers(self, map_index, slots):
         """Return extraction text and original character spans for a field."""
+        if map_index not in self.copy_constraints:
+            return [None] * len(slots), [None] * len(slots)
         state = self.copy_constraints[map_index]
         return state.constraint.output_answers(
             self.copy_document[slots], state.sources[slots],
@@ -231,6 +247,7 @@ class MapDecoder:
         self.fed[document] = 0
         self.stopped[document] = False
         self.copy_sources[document] = -1
+        self.copy_pending[document] = False
         self.num_streams[document] = 0
         self.drafts[document] = 0
         self.parent[document] = document
@@ -310,7 +327,7 @@ class MapDecoder:
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         ready = (~self.constrained[self.map[running]]
                  | (self.inflight[running] == 0))
-        return running[ready & ~self.stopped[running]
+        return running[ready & ~self.stopped[running] & ~self.copy_pending[running]
                        & (self.fed[running] + 1 < self.limits[self.map[running]])]
 
     @property
@@ -438,6 +455,7 @@ class MapDecoder:
         count = 0 if rows is None else len(rows)
         if not len(first_rows) and not count:
             return
+        self._initialize()
         documents = np.concatenate([
             np.asarray(first_documents, dtype=np.int64),
             np.empty(0, dtype=np.int64) if rows is None else rows.slots])
@@ -487,7 +505,7 @@ class MapDecoder:
             mine &= indices > 0
             slots, first = np.unique(documents[mine], return_index=True)
             if len(slots):
-                group.constraint.prepare_ahead(
+                group.lookahead[group.index[slots]] = group.constraint.prepare_ahead(
                     self.copy_document[slots], group.masks[group.index[slots]],
                     indices[mine][first])
         while len(self.copies) > IN_FLIGHT:
@@ -570,10 +588,28 @@ class MapDecoder:
         out[:, 4:4 + constraint.mask_words] = packed[constraint.tensor(inverse)]
         return out
 
-    def harvest(self, wait: bool = False) -> None:
-        """Read every copy that has landed, or every copy when wait is set."""
+    def harvest(self, wait: bool = False, prepare: bool = True) -> None:
+        """Read landed copies, optionally preparing their next decode rows."""
         while self.copies and (wait or self.copies[0].event.query()):
             self._read(self.copies.popleft())
+        if prepare:
+            self.prepare()
+
+    def prepare(self):
+        """Prepare pending copy rows while a forward pass runs, or when none fits."""
+        self._initialize()
+        for group in self.copy_groups:
+            slots = np.flatnonzero(self.copy_pending & (self.inflight == 0)
+                                   & np.isin(self.map, group.questions))
+            if not len(slots):
+                continue
+            written = np.empty(len(slots), dtype=np.int64)
+            for q in group.questions:
+                mine = self.map[slots] == q
+                written[mine] = self.written[q][slots[mine]]
+            drafts = np.full(len(slots), group.constraint.spec.draft_tokens)
+            self._prepare_copy(group, slots, written, drafts)
+            self.copy_pending[slots] = False
 
     def _read(self, copy: _Copy) -> None:
         copy.event.synchronize()
@@ -599,6 +635,7 @@ class MapDecoder:
                 self._read_copy(q, documents[mine], indices[mine], values[mine])
         self.stopped[documents[stop]] = True
         self.map[documents[ended]] = -1
+        self.copy_pending[documents[ended]] = False
         self.finished.extend(zip(documents[ended].tolist(), maps[ended].tolist()))
         for group in self.copy_groups:
             slots = np.unique(documents[np.isin(maps, group.questions)])
@@ -607,8 +644,15 @@ class MapDecoder:
             for q in group.questions:
                 mine = self.map[slots] == q
                 written[mine] = self.written[q][slots[mine]]
-            drafts = np.full(len(slots), group.constraint.spec.draft_tokens)
-            self._prepare_copy(group, slots, written, drafts)
+            local = group.index[slots]
+            spec = group.constraint.spec
+            needed = np.minimum(written + spec.draft_tokens,
+                                spec.max_answer_tokens + spec.draft_tokens - 1)
+            ready = ((group.prepared_written[local] > 0)
+                     & (group.lookahead[local] >= needed))
+            group.prepared_written[local[ready]] = written[ready]
+            group.prepared_drafts[local[ready]] = spec.draft_tokens
+            self.copy_pending[slots] = ~ready
 
     def _read_copy(self, q, documents, indices, values):
         from quail.cost.draft_policy import LIVE_BUCKETS

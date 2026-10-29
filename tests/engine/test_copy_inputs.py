@@ -13,6 +13,7 @@ from helpers.kv_checker import Setup, make_arena
 from test_map_decode import TokenModel, events_torch
 
 from quail.backends.quail.executor.cuda_graphs import DecodeGraphs
+from quail.backends.quail.executor.extract.copy import CopyConstraint
 from quail.backends.quail.executor.extract.stages import ExtractionStages
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.backends.quail.executor.map_decoder import MapDecoder
@@ -352,3 +353,54 @@ def test_planned_tree_extractions_read_shared_pages_once_without_changing_answer
     reads = shared["read_tokens"]
     assert reads["shared"] > 0
     assert reads["alone"] + reads["own"] + reads["shared"] < reads["all"]
+
+
+def test_prefill_launches_before_copy_setup_and_pending_first_tokens(
+    monkeypatch, vocabulary
+):
+    cpu_staging(monkeypatch)
+    _, expected, _ = run(vocabulary, list(TEXTS), True, "unified", 3, 512)
+    num_passes = 0
+    first_pending = None
+    decoder = None
+    launched_pending = []
+    prepared = []
+    forward = TokenModel.forward_chunk
+    initialize = CopyConstraint.__init__
+    prepare = CopyConstraint.prepare
+    read = MapDecoder._read
+
+    def launched(model, chunk):
+        nonlocal num_passes
+        num_passes += 1
+        if decoder is not None and decoder.copy_pending.any():
+            launched_pending.append(num_passes)
+            if chunk.decode_rows is not None:
+                assert not decoder.copy_pending[chunk.decode_rows.slots].any()
+        return forward(model, chunk)
+
+    def configured(self, *args):
+        assert num_passes > 0, "candidate setup must run under the first prefill"
+        initialize(self, *args)
+
+    def landed(self, copy):
+        nonlocal decoder, first_pending
+        decoder = self
+        read(self, copy)
+        if first_pending is None and self.copy_pending.any():
+            first_pending = num_passes
+
+    def ready(self, *args):
+        if not prepared:
+            assert first_pending is not None
+            assert num_passes > first_pending, "ready prefill must launch first"
+        prepared.append(num_passes)
+        prepare(self, *args)
+
+    monkeypatch.setattr(TokenModel, "forward_chunk", launched)
+    monkeypatch.setattr(CopyConstraint, "__init__", configured)
+    monkeypatch.setattr(CopyConstraint, "prepare", ready)
+    monkeypatch.setattr(MapDecoder, "_read", landed)
+    _, answers, _ = run(vocabulary, list(TEXTS), False, "unified", 3, 512)
+    assert answers == expected
+    assert launched_pending and prepared

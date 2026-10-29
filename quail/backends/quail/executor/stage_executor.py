@@ -484,8 +484,8 @@ class StageExecutor:
                 # its answer ended in a token that landed after eviction
                 del self.recomputing[a]
                 continue
-            if decoder.inflight[a]:
-                continue    # its last tokens are still on their way
+            if decoder.inflight[a] or decoder.copy_pending[a]:
+                continue    # its next copy inputs are not ready
             q = self.decoder.map[a]
             written = int(self.decoder.written[q][a])
             length = int(self.decoder.origin[a]) + written
@@ -710,7 +710,7 @@ class StageExecutor:
         """Report the answer stage of each document whose answer ended."""
         if self.decoder is None:
             return []
-        self.decoder.harvest()
+        self.decoder.harvest(prepare=False)
         self.answered.update(a for a, _ in self.decoder.take_finished())
         transitions = []
         # each branch settles at its own answer's end and frees its pages;
@@ -829,6 +829,8 @@ class StageExecutor:
         # launch queue, and a host blocked there could not decide them
         while self.outstanding:
             self._report_next()
+        if self.decoder is not None:
+            self.decoder.prepare()
         handles = self.readouts.submit(
             normed, entries, chunk.rows_per_answer)
         if self.decoder is not None:
@@ -868,9 +870,13 @@ class StageExecutor:
                 if self.outstanding:
                     self._report_next(partial=True)
                     continue
+                if self.decoder is not None and self.decoder.copy_pending.any():
+                    # No other prefill, decode or replay can hide this preparation.
+                    self.decoder.prepare()
+                    continue
                 if self.decoder is not None and self.decoder.copies:
                     # Every answer waits on a token still on its way.
-                    self.decoder.harvest(wait=True)
+                    self.decoder.harvest(wait=True, prepare=False)
                     continue
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):

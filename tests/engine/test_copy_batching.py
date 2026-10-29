@@ -29,7 +29,7 @@ class Dispatches(TorchDispatchMode):
 
 
 def copy_batch(num_fields, num_documents=4, document_tokens=24, draft_tokens=2,
-               num_map_documents=0):
+               num_map_documents=0, prepare=True):
     """Build independent fields over repeated document spans with a small head."""
     text = "five" + " years" * (document_tokens - 1)
     spec, vocabulary = make_spec(text)
@@ -54,7 +54,7 @@ def copy_batch(num_fields, num_documents=4, document_tokens=24, draft_tokens=2,
     hidden = torch.full((num_slots, size), -10.0)
     hidden[:, vocabulary.encode_ids("five")[0]] = 1
     decoder.submit(hidden, np.arange(num_slots), np.arange(num_slots), None)
-    decoder.harvest(wait=True)
+    decoder.harvest(wait=True, prepare=prepare)
     return decoder, vocabulary
 
 
@@ -124,6 +124,28 @@ def test_copy_rows_and_selection_need_no_preparation_after_harvest(monkeypatch):
     hidden = torch.full((len(rows), len(vocabulary.vocab)), -10.0)
     hidden[:, vocabulary.encode_ids(" years")[0]] = 1
     decoder.submit(hidden, [], [], rows)
-    monkeypatch.setattr(constraint, "prepare", prepare)
     decoder.harvest(wait=True)
+    monkeypatch.setattr(constraint, "prepare", prepare)
     assert all((written[written > 0] == 4).all() for written in decoder.written)
+
+
+def test_pending_first_tokens_do_not_hold_back_ready_map_rows(monkeypatch):
+    decoder, vocabulary = copy_batch(3, num_map_documents=2, prepare=False)
+    assert decoder.copy_pending[:12].all()
+    constraint = decoder.copy_groups[0].constraint
+    with monkeypatch.context() as context:
+        context.setattr(constraint, "prepare", lambda *args: pytest.fail(
+            "ready rows must launch before first-token preparation"))
+        rows = decoder.rows()
+        assert rows.slots.tolist() == [12, 13]
+        decoder.feed(SimpleNamespace(
+            decode_rows=rows, tokens=len(rows), meta={},
+            input_ids=torch.empty(len(rows), dtype=torch.int64)))
+        hidden = torch.full((len(rows), len(vocabulary.vocab)), -10.0)
+        hidden[:, vocabulary.encode_ids(" years")[0]] = 1
+        decoder.submit(hidden, [], [], rows)
+    decoder.prepare()
+    decoder.harvest(wait=True, prepare=False)
+    assert not decoder.copy_pending.any()
+    assert decoder.running().tolist() == list(range(14))
+    assert decoder.written[3][12:].tolist() == [2, 2]
