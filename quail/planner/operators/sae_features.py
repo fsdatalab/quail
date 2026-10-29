@@ -2,8 +2,13 @@
 
 from quail.cost import budgets
 from quail.cost.sae_features import SaeFeaturesCost
-from quail.physical import AiSaeFeatures, PortRef
-from quail.planner.operators.common import bind_inference, inference_node
+from quail.physical import AiSaeFeatures
+from quail.planner.operators.common import (
+    bind_inference,
+    emit_calls,
+    inference_node,
+    node_index,
+)
 from quail.planner.plan import Refusal
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import SaeFeaturesRefusedError
@@ -76,19 +81,16 @@ def emit_sae_features(builder, alias, expected_rows, names, port,
     feature_calls = {node.name: node
                      for node in builder.operators.sae_features
                      if node.alias == alias}
-    calls = [feature_calls[name] for name in names]
-    max_pooling = any(node.pooling == "max" for node in calls)
-    row_ports = []
-    for index, logical_node in enumerate(calls):
+    max_pooling = any(feature_calls[name].pooling == "max" for name in names)
+
+    def node_of(name, port, expected_rows, index):
+        logical_node = feature_calls[name]
         spec = sae_features_spec(
-            builder.context, logical_node.call, logical_node.name,
-            expected_rows, resident=resident or index > 0,
-            max_pooling=max_pooling)
-        node = inference_node(
+            builder.context, logical_node.call, name, expected_rows,
+            resident=resident or index > 0, max_pooling=max_pooling)
+        return inference_node(
             AiSaeFeatures, spec, (port,),
-            index=sum(isinstance(n, AiSaeFeatures) for n in builder.nodes),
+            index=node_index(builder, AiSaeFeatures),
             backend="quail", model=builder.model.name)
-        builder.nodes.append(node)
-        port = PortRef(node.node_id, node.rows_port)
-        row_ports.append(port)
-    return port, row_ports
+
+    return emit_calls(builder, alias, expected_rows, port, names, node_of)
