@@ -89,7 +89,7 @@ class AiExtract(AiInference):
     """
 
     spec: ExtractSpec | None = None
-    # "unified" or "tree": the attention path the choose_attention_algorithm
+    # "unified" or "tree": the attention path the choose_attention_path
     # rule chose for the document's answer branches (its fields and maps)
     attention: str = ""
 

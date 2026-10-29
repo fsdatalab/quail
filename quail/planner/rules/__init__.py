@@ -8,7 +8,7 @@ from quail.planner.rules.logical import (
     ShouldPushDownProjection,
 )
 from quail.planner.rules.physical import (
-    ChooseAttentionAlgorithm,
+    ChooseAttentionPath,
     ChooseClassifyImplementation,
     ShouldEliminateWindowSort,
     ShouldPushDownLimit,
@@ -30,5 +30,5 @@ def built_in_rules() -> tuple:
         ShouldPushDownFilters(), ShouldLiftMaps(), ShouldEliminateWindowSort(),
         ShouldPushDownLimitThroughWindow(), ShouldPushDownLimit(),
         ChooseClassifyImplementation(), ShouldRetainKv(), ShouldSharePrefixes(),
-        ChooseAttentionAlgorithm(),
+        ChooseAttentionPath(),
     )

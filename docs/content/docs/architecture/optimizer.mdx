@@ -121,7 +121,7 @@ built-in rules of the same kind, in registration order.
 | `choose_classify_implementation` | Physical | Choose a classification's label scoring method. | Yes |
 | `should_retain_kv` | Physical | Keep selected document KV for later operators. | No |
 | `should_share_prefixes` | Physical | Reuse KV between documents with a shared prefix. | Yes |
-| `choose_attention_algorithm` | Physical | Choose unified or tree attention for filters and joins. | Yes |
+| `choose_attention_path` | Physical | Choose unified or tree attention for filters and joins. | Yes |
 
 The implementations are in
 [`rules/logical.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/logical.py)
@@ -356,7 +356,7 @@ so the rule can make its final decision after tokenization finishes.
 
 ### Attention path
 
-The `choose_attention_algorithm` rule chooses between the unified and tree attention
+The `choose_attention_path` rule chooses between the unified and tree attention
 paths described in [Execution](/docs/architecture/execution#attention-paths).
 It compares their estimated time for requests that read the same prefix.
 For `r` requests, each with `q` new tokens and a shared prefix of `s` tokens,
@@ -387,4 +387,4 @@ time on an H100. It also excludes kernel launch time. These limits apply
 to the path comparison, rather than the main roofline attention estimate.
 
 The implementation is
-[`choose_attention_path`](https://github.com/fsdatalab/quail/blob/main/quail/cost/budgets.py).
+[`cheaper_attention_path`](https://github.com/fsdatalab/quail/blob/main/quail/cost/budgets.py).

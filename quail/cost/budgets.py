@@ -419,9 +419,9 @@ def tree_attention_allowed(model: ModelSpec) -> bool:
             and model.params >= TREE_ATTENTION_MIN_PARAMS)
 
 
-def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
-                          readers: float, reader_rows: float,
-                          node_tokens: float) -> str:
+def cheaper_attention_path(model: ModelSpec, device: DeviceSpec, *,
+                           readers: float, reader_rows: float,
+                           node_tokens: float) -> str:
     """Pick "unified" or "tree" attention for readers of one shared node.
 
     The node is a join's anchor or a filter's parent document; its

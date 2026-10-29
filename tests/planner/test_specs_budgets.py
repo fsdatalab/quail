@@ -259,7 +259,7 @@ def test_attention_time_covers_only_the_attention_layers():
 def test_the_tree_merge_is_charged_for_the_attention_layers_only():
     # tree takes 0.73 of the unified time with the merge over 8 layers,
     # and 1.24 of it if the merge were charged over all 32
-    assert budgets.choose_attention_path(
+    assert budgets.cheaper_attention_path(
         QWEN3_5_4B_BF16, H100_SXM, readers=2, reader_rows=16,
         node_tokens=500) == "tree"
 

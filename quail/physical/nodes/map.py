@@ -40,7 +40,7 @@ class AiMap(AiInference):
     """
 
     spec: MapSpec | None = None
-    # "unified" or "tree": the attention path the choose_attention_algorithm
+    # "unified" or "tree": the attention path the choose_attention_path
     # rule chose for the maps' branches; tree reads a document's shared
     # pages once for all its branches in a pass
     attention: str = ""

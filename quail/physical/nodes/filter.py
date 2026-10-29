@@ -107,7 +107,7 @@ class AiFilter(PhysicalNode):
     # documents borrow the KV pages of a document that shares their
     # token prefix (the should_share_prefixes rule)
     share_prefixes: bool = False
-    # "unified" or "tree": the attention path the choose_attention_algorithm rule
+    # "unified" or "tree": the attention path the choose_attention_path rule
     # chose; empty leaves the executor's default
     attention: str = ""
     # value columns of the alias; the executor reads one document of

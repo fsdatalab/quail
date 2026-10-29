@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from quail.cost.budgets import choose_attention_path, tree_attention_allowed
+from quail.cost.budgets import cheaper_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
 from quail.physical import (
     Aggregate as PhysicalAggregate,
@@ -271,7 +271,7 @@ def filter_attention(model, device, store, lengths, question_tokens: int) -> str
     tree = page_tree(store, device.page_tokens)
     votes = {"tree": 0, "unified": 0}
     for shared, readers, rows in zip(*tree.reader_groups(lengths)):
-        path = choose_attention_path(
+        path = cheaper_attention_path(
             model, device, readers=readers,
             reader_rows=rows / readers + question_tokens, node_tokens=shared)
         votes[path] += readers * shared
@@ -383,7 +383,7 @@ def _answer_attention(graph: PhysicalGraph, context) -> dict:
         if isinstance(node, (AiMap, AiExtract)) and node.spec is not None:
             branches.setdefault(node.spec.aliases[0], []).append(node.spec)
     return {
-        alias: choose_attention_path(
+        alias: cheaper_attention_path(
             context.model, context.device,
             readers=(sum(spec.max_answer_tokens for spec in specs)
                      / max(spec.max_answer_tokens for spec in specs)),
@@ -397,13 +397,13 @@ def _mean(values) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-class ChooseAttentionAlgorithm(PhysicalRule):
+class ChooseAttentionPath(PhysicalRule):
     """Annotate each join with the attention path the cost model prefers.
 
     A join stage has every partner of an anchor reading the anchor's
     KV: under tree attention those reads are stacked into one, under
     unified attention each partner reads the anchor itself. The choice
-    is by roofline (choose_attention_path). A diffusion model and a
+    is by roofline (cheaper_attention_path). A diffusion model and a
     model under 2B dense parameters stay unified
     (tree_attention_allowed).
 
@@ -416,7 +416,7 @@ class ChooseAttentionAlgorithm(PhysicalRule):
     estimated lengths gets the path its exact tokens call for.
     """
 
-    name = "choose_attention_algorithm"
+    name = "choose_attention_path"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -454,7 +454,7 @@ class ChooseAttentionAlgorithm(PhysicalRule):
                     rows = stage.pair_tail_tokens + sum(
                         _mean(context.document_tokens.get(partner, ()))
                         for partner in stage.partners)
-                    path = choose_attention_path(
+                    path = cheaper_attention_path(
                         model, device, readers=readers, reader_rows=rows,
                         node_tokens=_mean(lengths))
             if path is not None and forced is not None:
