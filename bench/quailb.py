@@ -93,17 +93,15 @@ def queries(session) -> dict:
 
 
 def _prompt_key(prompt) -> str:
-    """Return what tells a bound prompt apart: its template, or an extraction's tail."""
-    return prompt.tail if prompt.kind == "extract" else prompt.template
+    """Return what tells bound prompts apart: the template, or an extract's question."""
+    return prompt.source if prompt.kind == "extract" else prompt.template
 
 
-def canonical_templates(ground_truth, turn=("", "")) -> dict[str, str]:
+def canonical_templates(ground_truth) -> dict[str, str]:
     """Map each predicate's prompt as Quail binds it to the written template.
 
     Args:
         ground_truth: The saved predicates and their answers.
-        turn: The model's chat turn text, which an extraction's tail
-            carries.
     """
     canonical = {}
     for labels in ground_truth.predicates.values():
@@ -121,7 +119,7 @@ def canonical_templates(ground_truth, turn=("", "")) -> dict[str, str]:
                 (left,) if right is None else (left, right),
                 predicate["labels"])
         elif predicate["kind"] == "extract":
-            bound = bind_extract_prompt((left,), predicate["template"], turn)
+            bound = bind_extract_prompt((left,), predicate["template"])
         else:
             bound = quail.bind_join_prompt(
                 predicate["template"], (left, right))
@@ -133,7 +131,7 @@ def _ids(table: pa.Table) -> list[str]:
     return [str(row_id) for row_id in table.column("id").to_pylist()]
 
 
-def answer_oracle(ground_truth, tables, turn=("", "")):
+def answer_oracle(ground_truth, tables):
     """Return the oracle Quail's speed of light estimate takes.
 
     The callable maps (prompt, assignment) to the saved reference answer:
@@ -144,9 +142,8 @@ def answer_oracle(ground_truth, tables, turn=("", "")):
     Args:
         ground_truth: The saved predicates and their answers.
         tables: The corpus tables, by name.
-        turn: The chat turn text of the model the query is built for.
     """
-    templates = canonical_templates(ground_truth, turn)
+    templates = canonical_templates(ground_truth)
     ids_by_table = {name: _ids(table) for name, table in tables.items()}
 
     def answer(prompt, assignment):

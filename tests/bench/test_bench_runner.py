@@ -318,7 +318,7 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
         item.key: PredicateLabels(item.key, f"ls_{item.key}", predicate_payload(item),
                                   {("ct0", None): ["audit yearly"]}, {})})
     (node,) = query.logical.operators().extracts
-    answer = answer_oracle(truth, {"contracts": CONTRACTS}, turn)
+    answer = answer_oracle(truth, {"contracts": CONTRACTS})
     assert answer(node.call.prompt, {"c": 0}) == ["audit yearly"]
     pieces = output.prompt_pieces
     assert pieces is not None
@@ -336,6 +336,26 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
     assert [item["id"] for item in pieces["extracts"]] == ["extract-1"]
     assert pieces["extracts"][0]["tail"][:2] == ["Question:", "Which"]
     assert pieces["extracts"][0]["tail"][-1] == "Phrase:"
+
+
+def test_the_answer_oracle_prices_an_extract_query_for_a_chat_model(tmp_path):
+    spec = get_query("CUAD-1")
+    (operator,) = spec.info.extracts
+    (item,) = [item for item in PREDICATE_BY_KEY.values()
+               if item.template == operator.prompt]
+    spans = {(row_id, None): ["audit"] for row_id in CONTRACTS["id"].to_pylist()}
+    truth = GroundTruthCollection("gt_extract", "c_extract", 0.1, None, {
+        item.key: PredicateLabels(item.key, f"ls_{item.key}", predicate_payload(item),
+                                  spans, {})})
+    with _session(tmp_path) as sess:
+        sess.register("contracts", DocumentProvider.from_table(
+            CONTRACTS, id_col="id"))
+        # built as experiments/cells/hybrid_sweep_sol.py builds it, without
+        # the session model's chat turn
+        oracle = answer_oracle(truth, {"contracts": CONTRACTS})
+        estimate = quail.speed_of_light_estimate(
+            build_query(sess, spec), oracle, label=oracle)
+    assert estimate.documents_by_alias == {"c": 3}
 
 
 def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
