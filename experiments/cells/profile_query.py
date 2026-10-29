@@ -71,6 +71,58 @@ def _digest(output) -> str:
     return digest.hexdigest()[:16]
 
 
+def _forward_kernels(events):
+    """Measure kernel envelopes and eager launches attributed to forward scopes."""
+    from collections import Counter, defaultdict
+
+    from torch.autograd import DeviceType
+
+    cpu = {event.id: event for event in events if event.device_type == DeviceType.CPU}
+
+    def owner(event, prefix):
+        parent = (event if event.device_type == DeviceType.CPU
+                  else cpu.get(event.linked_correlation_id))
+        while parent is not None:
+            if parent.name.startswith(prefix):
+                return parent
+            parent = parent.cpu_parent
+        return None
+
+    forwards, launches = defaultdict(list), defaultdict(Counter)
+    attention = Counter()
+    num_kernels = 0
+    for event in events:
+        if event.device_type == DeviceType.CUDA:
+            num_kernels += 1
+            forward = owner(event, "quail.forward")
+            if forward is not None:
+                forwards[forward.id].append(event.time_range)
+        elif event.name.startswith("quail.attention."):
+            attention[event.name] += 1
+        elif "Launch" in event.name:
+            call = owner(event, "quail.attention.")
+            if call is not None:
+                launches[call.name][event.name] += 1
+    span = busy = 0.0
+    for ranges in forwards.values():
+        ranges.sort(key=lambda value: value.start)
+        start, end = ranges[0].start, ranges[0].start
+        for value in ranges:
+            busy += max(0, value.end - max(end, value.start))
+            end = max(end, value.end)
+        span += end - start
+    return {"passes": len(forwards), "span_s": span / 1e6,
+            "busy_s": busy / 1e6, "idle_s": (span - busy) / 1e6,
+            "attributed_kernels": sum(len(rows) for rows in forwards.values()),
+            "total_kernels": num_kernels,
+            "attention_dispatch": {
+                name.removeprefix("quail.attention."): {
+                    "layers": count, "launches": sum(launches[name].values()),
+                    "launches_per_layer": sum(launches[name].values()) / count,
+                    "apis": dict(launches[name])}
+                for name, count in attention.items()}}
+
+
 def _gpu_gaps(prof, top: int) -> dict:
     """Measure GPU busy and idle time, including the longest idle gaps."""
     from torch.autograd import DeviceType
@@ -107,6 +159,7 @@ def _gpu_gaps(prof, top: int) -> dict:
                     for name, (total, calls) in ranked[:top]],
         "span_s": (end - start) / 1e6, "busy_s": busy / 1e6,
         "idle_s": (end - start - busy) / 1e6,
+        "forward": _forward_kernels(events),
         "gaps": [{"ms": round(gap / 1e3, 2), "at_ms": round(at / 1e3, 1),
                   "after": before[:60], "before": after[:60]}
                  for gap, at, before, after in gaps[:top]],
@@ -304,6 +357,25 @@ class Sampler:
                 "quail_inclusive_ms": ranked(inclusive)}
 
 
+def _trace_calls(owner, name, window):
+    """Attribute kernels to forwards and eager attention boundaries in traces."""
+    original = getattr(owner, name)
+
+    def traced(*args, **kwargs):
+        if window.get("trace") is None:
+            return original(*args, **kwargs)
+        import torch
+        chunk = args[-1]
+        path = ("shared" if chunk.meta.get("shared") is not None
+                else chunk.attention_mode)
+        label = ("quail.forward" if name == "forward_chunk"
+                 else f"quail.attention.{path}")
+        with torch.profiler.record_function(label):
+            return original(*args, **kwargs)
+
+    setattr(owner, name, traced)
+
+
 def _apply_overrides(text: str) -> None:
     """Set module constants from "module:NAME=value;..." for one run."""
     import importlib
@@ -341,6 +413,10 @@ def child(arguments: str) -> None:
     window = {}
     from experiments.cells.piecewise_probe import PiecewiseProbe
     probe = PiecewiseProbe()
+    from quail.backends.quail.executor import cuda_graphs, stage_executor
+    _trace_calls(stage_executor, "forward_chunk", window)
+    if hasattr(cuda_graphs, "PiecewiseBuffers"):
+        _trace_calls(cuda_graphs.PiecewiseBuffers, "attention", window)
 
     class ProfiledRunner(graph_module.GenericRunner):
         def run(self, *args, **kwargs):

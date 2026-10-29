@@ -22,6 +22,30 @@ def test_query_timeline_records_forward_token_counts():
     assert timeline.entries[-1][-1] == 37
 
 
+def test_kernel_trace_separates_idle_inside_forward_from_other_gpu_work():
+    torch = pytest.importorskip("torch")
+    from experiments.cells.profile_query import _forward_kernels
+
+    cpu, cuda = torch.autograd.DeviceType.CPU, torch.autograd.DeviceType.CUDA
+    forward = SimpleNamespace(
+        id=1, device_type=cpu, name="quail.forward", cpu_parent=None)
+    attention = SimpleNamespace(
+        id=2, device_type=cpu, name="quail.attention.shared", cpu_parent=forward)
+    launch = SimpleNamespace(
+        id=3, device_type=cpu, name="cuLaunchKernel", cpu_parent=attention)
+    kernels = [SimpleNamespace(
+        device_type=cuda, linked_correlation_id=link,
+        time_range=SimpleNamespace(start=start, end=end))
+        for link, start, end in [(2, 1, 3), (2, 5, 8), (0, 9, 20)]]
+    got = _forward_kernels([forward, attention, launch, *kernels])
+    assert got["passes"] == 1
+    assert got["busy_s"] == 5e-6
+    assert got["idle_s"] == 2e-6
+    assert got["attributed_kernels"] == 2
+    assert got["total_kernels"] == 3
+    assert got["attention_dispatch"]["shared"]["launches_per_layer"] == 1
+
+
 def test_timeline_clips_to_join_and_merges_concurrent_operations(tmp_path):
     pytest.importorskip("ijson")
     path = tmp_path / "trace.json.gz"
