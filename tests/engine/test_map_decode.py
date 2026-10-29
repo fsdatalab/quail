@@ -68,26 +68,23 @@ class TokenModel(HashModel):
 
 
     def _whole(self, meta):
-        """The unified call as one sequence per row, shared pages first.
-
-        A row that reads its group's shared pages in a second call
-        reads them, then its own pages, as one logical sequence.
-        """
+        """Reconstruct each sequence's full context with shared pages first."""
         unified, shared = meta["unified"], meta["shared"]
         if shared is None:
             return unified
         self.shared_reads += 1
         cu = unified["cu_q"].tolist()
-        sequence = {cu[i]: i for i in range(len(cu) - 1) if cu[i + 1] - cu[i] == 1}
+        sequence = {row: i for i, (start, end) in enumerate(zip(cu, cu[1:]))
+                    for row in range(start, end)}
         table = [list(row) for row in unified["table"].tolist()]
         used = unified["used"].tolist()
         rows, groups = shared["rows"].tolist(), shared["cu_q"].tolist()
         tokens = shared["used"].tolist()
         for g, pages in enumerate(shared["table"].tolist()):
             pages = pages[:-(-tokens[g] // self.page)]
-            for row in rows[groups[g]:groups[g + 1]]:
-                table[sequence[row]] = pages + table[sequence[row]]
-                used[sequence[row]] += tokens[g]
+            for i in {sequence[row] for row in rows[groups[g]:groups[g + 1]]}:
+                table[i] = pages + table[i]
+                used[i] += tokens[g]
         width = max(map(len, table))
         return dict(unified, used=torch.tensor(used), table=torch.tensor(
             [row + [0] * (width - len(row)) for row in table]))
