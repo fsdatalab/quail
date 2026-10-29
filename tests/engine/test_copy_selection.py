@@ -96,8 +96,9 @@ def test_position_masks_preserve_the_high_bit_and_word_boundaries():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("draft_tokens", [0, 4])
+@pytest.mark.parametrize("num_questions", [1, 3, 41])
 def test_copy_traces_match_the_host_rule_on_the_same_logits(
-    monkeypatch, tmp_path, dtype, draft_tokens
+    monkeypatch, tmp_path, dtype, draft_tokens, num_questions
 ):
     text = "five days or five years. five years."
     spec, vocabulary = make_spec(text)
@@ -112,37 +113,46 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
     extra_stop = vocabulary.encode_ids("none")[0]
     vocabulary.stop_ids = (*vocabulary.stop_ids, extra_stop)
     vocabulary.is_stop[extra_stop] = True
-    documents = inputs(spec, vocabulary, [text])
+    state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
+    documents = ExtractionInputs(
+        state, [spec] * num_questions, vocabulary, [0], None, [text]
+    )
     size = len(vocabulary.vocab)
     head = torch.eye(size, dtype=dtype)
-    logits = torch.full((20, size), -10.0, dtype=dtype)
+    logits = torch.full((num_questions, 20, size), -10.0, dtype=dtype)
     first = vocabulary.encode_ids("five")[0]
     alternate = vocabulary.encode_ids(" five")[0]
-    years = vocabulary.encode_ids(" years")[0]
-    logits[0, [first, alternate]] = 2
-    logits[1, years] = 2
-    logits[2:, vocabulary.stop_ids[0]] = 1
-    logits[2:, extra_stop] = 0
+    continuations = [vocabulary.encode_ids(word)[0] for word in (" years", " days")]
+    logits[:, 0, [first, alternate]] = 2
+    for q in range(num_questions):
+        logits[q, 1, continuations[q % 2]] = 2 + q / 64
+    logits[:, 2:, vocabulary.stop_ids[0]] = 1
+    logits[:, 2:, extra_stop] = 0
     readout = AsyncTopLogprobs(
         torch, torch.nn.functional, head, 4, [vocabulary.stop_ids]
     )
     old_path, new_path = tmp_path / "old.jsonl", tmp_path / "new.jsonl"
     monkeypatch.setenv("QUAIL_EXTRACT_TRACE", str(old_path))
-    reference = Decoder(vocabulary, 4, 9, 1, spec)
+    reference = Decoder(vocabulary, 4, 9, num_questions, spec)
     document = documents.documents[0]
-    answer = document.answers[0]
-    fed = []
-    while not answer.done:
-        at = len(answer.written)
-        values = readout.values(logits[at : at + max(1, len(fed))]).numpy()
-        reference.verify(document, 0, values, fed)
-        if not answer.done:
-            fed = reference.draft(answer, document.rho)
+    for q, answer in enumerate(document.answers):
+        fed = []
+        while not answer.done:
+            at = len(answer.written)
+            values = readout.values(logits[q, at : at + max(1, len(fed))]).numpy()
+            reference.verify(document, q, values, fed)
+            if not answer.done:
+                fed = reference.draft(answer, document.rho, q)
     monkeypatch.setenv("QUAIL_EXTRACT_TRACE", str(new_path))
-    decoder = MapDecoder(events_torch(0), head, 1, [12], vocabulary.stop_ids, 16)
-    decoder.configure_copy(0, np.array([[0]]), documents, [spec])
-    decoder.start(0, 0, 0, [0, 1])
-    decoder.submit(logits[:1], [0], [0], None)
+    decoder = MapDecoder(
+        events_torch(0), head, num_questions, [12] * num_questions,
+        vocabulary.stop_ids, 16
+    )
+    slots = np.arange(num_questions)
+    decoder.configure_copy(0, slots[:, None], documents, [spec] * num_questions)
+    for q in slots:
+        decoder.start(int(q), int(q), 0, [0, 1])
+    decoder.submit(logits[:, 0], slots, slots, None)
     decoder.harvest(wait=True)
     while decoder.active:
         rows = decoder.rows()
@@ -154,17 +164,24 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
                 input_ids=torch.empty(len(rows), dtype=torch.int64),
             )
         )
-        decoder.submit(logits[rows.positions + 1], [], [], rows)
+        decoder.submit(logits[rows.slots, rows.positions + 1], [], [], rows)
         decoder.harvest(wait=True)
-    assert decoder.output_answers(0, [0]) == ([answer.answer], [answer.span])
-    assert decoder.answers(0, [0])[0].tolist() == answer.written
+    for q, answer in enumerate(document.answers):
+        assert decoder.output_answers(q, [q]) == ([answer.answer], [answer.span])
+        assert decoder.answers(q, [q])[0].tolist() == answer.written
     old = [json.loads(line) for line in old_path.read_text().splitlines()]
     new = [json.loads(line) for line in new_path.read_text().splitlines()]
     assert len(new) == len(old)
-    for actual, expected in zip(new, old):
-        assert actual == pytest.approx(expected, abs=1e-6)
-    assert old[0]["margin"] == 0
-    assert old[-1]["chosen"] == -1
+    assert {row["question"] for row in new} == set(range(num_questions))
+    for q in range(num_questions):
+        expected = [row for row in old if row["question"] == q]
+        actual = [row for row in new if row["question"] == q]
+        assert [row["index"] for row in actual] == list(range(len(expected)))
+        assert len(actual) == len(expected)
+        for got, want in zip(actual, expected):
+            assert got == pytest.approx(want, abs=1e-6)
+        assert expected[0]["margin"] == 0
+        assert expected[-1]["chosen"] == -1
 
 
 def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
