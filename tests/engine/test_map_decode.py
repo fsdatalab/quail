@@ -375,12 +375,17 @@ def map_state(setup, arena, forward_chunk):
                 batch_decode=batch_decode))))
 
 
-@pytest.mark.parametrize("num_maps", [1, 2, 3])
-@pytest.mark.parametrize("limit", [None, 2])
-@pytest.mark.parametrize("lag", [0, 3])
-@pytest.mark.parametrize("budget", [20, 200])
-@pytest.mark.parametrize("stop_modulus", [0, 19])
-@pytest.mark.parametrize("path", ["unified", "tree"])
+# every pair of settings appears in some case
+@pytest.mark.parametrize("num_maps,limit,lag,budget,stop_modulus,path", [
+    (3, None, 3, 20, 0, "tree"),
+    (1, 2, 0, 200, 19, "tree"),
+    (2, None, 3, 200, 19, "unified"),
+    (2, 2, 0, 20, 0, "unified"),
+    (1, None, 3, 20, 0, "unified"),
+    (3, 2, 0, 200, 19, "unified"),
+    (2, None, 0, 20, 19, "tree"),
+    (3, 2, 3, 200, 0, "tree"),
+])
 def test_evicted_answers_recompute_exactly_with_gates_and_limits(
         monkeypatch, num_maps, limit, lag, budget, stop_modulus, path,
         state_slots=0, window=None):

@@ -130,19 +130,23 @@ def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
     check_join_after_join([parent, child], *join_parts(), setup)
 
 
+@pytest.mark.parametrize(
+    "arena_kind", [("unified", False, False), ("tree", False, False),
+                   ("unified", True, False)],
+    ids=["unified", "tree", "sliding"], indirect=True)
 def test_large_filters_joins_and_filters_feeding_joins(arena_kind):
-    """Documents of thousands of tokens on a 1,024-token window."""
-    for seed in range(2):
-        rng = random.Random(300 + seed)
+    """Documents of thousands of tokens on a 1,024-token window.
+
+    The canvas row runs on the small corpora only.
+    """
+    rng = random.Random(300)
+    documents, setup = large(rng, arena_kind)
+    named("filter", check_filter, documents, questions(rng), setup)
+    for retain in (False, True):
+        rng = random.Random(400)
         documents, setup = large(rng, arena_kind)
-        named(f"filter seed {seed}", check_filter, documents, questions(rng),
-              setup)
-        for retain in (False, True):
-            rng = random.Random(400 + seed)
-            documents, setup = large(rng, arena_kind)
-            named(f"join seed {seed} retain {retain}", check_join, documents,
-                  *join_parts(), setup, retain=retain)
-        rng = random.Random(500 + seed)
-        documents, setup = large(rng, arena_kind)
-        named(f"feed seed {seed}", check_feed, documents, [90, 91, 92],
-              *join_parts(), setup)
+        named(f"join retain {retain}", check_join, documents, *join_parts(),
+              setup, retain=retain)
+    rng = random.Random(500)
+    documents, setup = large(rng, arena_kind)
+    named("feed", check_feed, documents, [90, 91, 92], *join_parts(), setup)

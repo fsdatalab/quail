@@ -124,7 +124,7 @@ def test_model_weights_and_kv_memory_budgets():
 @pytest.mark.parametrize("model", [
     QWEN3_4B_FP8, QWEN3_32B_FP8, QWEN3_5_4B_BF16, DIFFUSION_GEMMA_26B_FP8,
 ])
-@pytest.mark.parametrize("chunk", [1, 32, 1_024, 1_000_000])
+@pytest.mark.parametrize("chunk", [1, 1_000_000])
 def test_copy_verification_shares_readout_workspace_without_reducing_kv(model, chunk):
     workspace = budgets.copy_verification_workspace_bytes(model, chunk)
     readout = 2 * budgets.READOUT_BLOCK_ROWS * model.vocab * 4

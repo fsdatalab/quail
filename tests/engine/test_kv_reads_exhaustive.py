@@ -4,12 +4,12 @@ A document is one to three whole pages, each all A tokens or all B
 tokens, with or without a five-token tail. That covers the ways two
 documents can share pages: not at all, part of a page, whole pages, a
 whole document, and a duplicate whose length is a whole number of
-pages. Every multiset of up to two such documents runs through a
-filter, a two-stage filter, a join, and a filter feeding a join, on
-both attention paths, a sliding-window arena, and a canvas row, with
-the fewest arena pages and the smallest chunk budget it fits, where
-admission blocks and parents wait. test_kv_reads covers large sizes.
-See kv_checker for the check.
+pages. Every multiset of up to two such documents, up to swapping A
+and B, runs through a filter, a two-stage filter, a join, and a
+filter feeding a join, on both attention paths, a sliding-window
+arena, and a canvas row, with the fewest arena pages and the smallest
+chunk budget it fits, where admission blocks and parents wait.
+test_kv_reads covers large sizes. See kv_checker for the check.
 """
 
 import itertools
@@ -31,17 +31,26 @@ def arena_kind(request, monkeypatch):
 
 
 def corpora(page_tokens):
-    """Every multiset of one or two small documents."""
+    """Every multiset of one or two small documents, up to swapping A and B.
+
+    Swapping the A and B tokens keeps which pages documents share, so
+    of two corpora that differ only by the swap, one runs.
+    """
     pages = ([1] * page_tokens, [2] * page_tokens)
     shapes = []
     for count in range(1, 4):
         for contents in itertools.product(pages, repeat=count):
             body = [token for page in contents for token in page]
             shapes += [body, body + [3] * 5]
+    swap = {1: 2, 2: 1}
     for size in (1, 2):
         for picks in itertools.combinations_with_replacement(
                 range(len(shapes)), size):
-            yield [list(shapes[i]) for i in picks]
+            documents = [list(shapes[i]) for i in picks]
+            swapped = [[swap.get(token, token) for token in document]
+                       for document in documents]
+            if sorted(documents) <= sorted(swapped):
+                yield documents
 
 
 def tightest(documents, kind, extra, page_tokens=16):

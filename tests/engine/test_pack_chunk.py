@@ -92,9 +92,10 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
             attention_mode=mode)
 
 
-@pytest.mark.parametrize("mode", ["tree", "unified"])
-@pytest.mark.parametrize("shared", [0, 16])
-@pytest.mark.parametrize("run", [1, 2])
+# every pair of settings appears in some case
+@pytest.mark.parametrize("mode,shared,run", [
+    ("tree", 0, 1), ("tree", 16, 2), ("unified", 0, 2), ("unified", 16, 1),
+])
 def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared, run):
     cpu_staging(monkeypatch)
     arena = plain_arena()

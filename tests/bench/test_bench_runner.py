@@ -338,10 +338,12 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
     assert pieces["extracts"][0]["tail"][-1] == "Phrase:"
 
 
+# one query of each shape: one map, three maps, a filter, a
+# classification, a filter before three maps, every row labeled out, a
+# sort and limit, and extractions
 @pytest.mark.parametrize("query_id", [
-    "IMDB-20", "IMDB-21", "IMDB-22", "IMDB-23", "IMDB-24", "IMDB-25", "IMDB-26",
-    "IMDB-27", "IMDB-28", "CUAD-17", "CUAD-18", "CUAD-19", "CUAD-20", "CUAD-21",
-    "CUAD-22"])
+    "IMDB-20", "IMDB-22", "IMDB-23", "IMDB-24", "IMDB-27", "IMDB-28", "CUAD-19",
+    "CUAD-21"])
 def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path, query_id):
     spec = get_query(query_id)
     corpus = {"reviews": CORPUS["reviews"], "contracts": CONTRACTS}

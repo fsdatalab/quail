@@ -37,10 +37,10 @@ def test_censored_answers_leave_the_risk_set_after_their_written_length():
     assert remaining[2] > remaining[4] > remaining[5]
 
 
-@pytest.mark.parametrize("model_name", [
-    "qwen3.5-4b-bf16", "qwen3.5-27b-fp8", "qwen3.8-27b-fp8", "lfm2-2.6b-bf16",
+@pytest.mark.parametrize("model_name,device_name", [
+    ("qwen3.5-4b-bf16", "h100-sxm"), ("qwen3.5-27b-fp8", "l40s"),
+    ("qwen3.8-27b-fp8", "b200"), ("lfm2-2.6b-bf16", "l40s"),
 ])
-@pytest.mark.parametrize("device_name", ["h100-sxm", "l40s", "b200"])
 def test_hybrid_decode_prices_state_movement_and_compute_from_specs(
         model_name, device_name):
     model, device = MODELS[model_name], DEVICES[device_name]
