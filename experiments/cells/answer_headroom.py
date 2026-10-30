@@ -49,9 +49,12 @@ image = gpu_image()
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=4 * 3600,
               volumes=VOLUMES)
-def run_mode(mode: str, scale_factor: float, num_documents: int, repeats: int,
-             run_dir: str) -> str:
-    """Run every query under one admission mode and save its measurements.
+def run_mode(mode: str, query_ids: list[str], scale_factor: float,
+             num_documents: int, repeats: int, run_dir: str) -> str:
+    """Run the queries under one admission mode and save their measurements.
+
+    A query id names one of QUERIES, run on the first num_documents
+    reviews, or a QUAIL-B query, run on its whole tables.
 
     Returns:
         The measurements as JSON.
@@ -61,6 +64,8 @@ def run_mode(mode: str, scale_factor: float, num_documents: int, repeats: int,
     import pyarrow.parquet as pq
 
     import quail
+    import quail_b as benchmark
+    from bench.quailb import build_query
 
     table = pq.read_table(Path(DATA_DIR) / f"sf{scale_factor}" / "reviews.parquet")
     config = quail.EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="quail",
@@ -74,11 +79,20 @@ def run_mode(mode: str, scale_factor: float, num_documents: int, repeats: int,
         session.sql(warmup).run().collect()
         session.register("reviews", quail.DocumentProvider.from_table(
             table.slice(0, num_documents), id_col="id"))
+        tables = Path(DATA_DIR) / f"sf{scale_factor}"
+        # QUAIL-B queries read every other table whole; reviews stay sliced
+        if any(name not in QUERIES for name in query_ids):
+            for path in sorted(tables.glob("*.parquet")):
+                if path.stem == "reviews":
+                    continue
+                session.register(path.stem, quail.DocumentProvider.from_parquet(
+                    str(path), id_col="id"))
         tokenizer = session.tokenizer
-        for name, sql in QUERIES.items():
+        for name in query_ids:
             runs = []
             for _ in range(repeats):
-                result = session.sql(sql).run()
+                result = (session.sql(QUERIES[name]).run() if name in QUERIES
+                          else build_query(session, benchmark.get_query(name)).run())
                 rows = result.collect()
                 digest = hashlib.sha256()
                 lengths = []
@@ -99,8 +113,8 @@ def run_mode(mode: str, scale_factor: float, num_documents: int, repeats: int,
                     "decode_rows": sum(m.get("decode_rows", 0) for m in maps),
                     **{key: value for m in maps for key, value in m.items()
                        if key.startswith(("headroom_", "pass_")) and value},
-                    "answer_p50": int(np.percentile(lengths, 50)),
-                    "answer_p90": int(np.percentile(lengths, 90)),
+                    "answer_p50": int(np.percentile(lengths, 50)) if lengths else None,
+                    "answer_p90": int(np.percentile(lengths, 90)) if lengths else None,
                     "answers_sha256": digest.hexdigest(),
                 })
                 print(mode, name, runs[-1], flush=True)
@@ -113,14 +127,17 @@ def run_mode(mode: str, scale_factor: float, num_documents: int, repeats: int,
 
 
 @app.local_entrypoint()
-def compare(modes: str = "prompt,headroom", scale_factor: float = 0.1,
-            num_documents: int = 1000, repeats: int = 2):
-    ensure_data.remote(scale_factor, ["IMDB-20"], "")
+def compare(modes: str = "prompt,headroom", queries: str = ",".join(QUERIES),
+            scale_factor: float = 0.1, num_documents: int = 1000, repeats: int = 2):
+    query_ids = [name for name in queries.split(",") if name]
+    ensure_data.remote(scale_factor, ["IMDB-20"] + [
+        name for name in query_ids if name not in QUERIES], "")
     run_id = (f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
               f"{uuid.uuid4().hex[:8]}")
     run_dir = f"{OUTPUT_DIR}/{run_id}"
     print(f"run directory: {run_dir}", flush=True)
-    calls = [run_mode.spawn(mode, scale_factor, num_documents, repeats, run_dir)
+    calls = [run_mode.spawn(mode, query_ids, scale_factor, num_documents, repeats,
+                            run_dir)
              for mode in filter(None, modes.split(","))]
     for call in calls:
         print(call.get(), flush=True)
