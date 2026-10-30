@@ -546,8 +546,12 @@ def child(arguments: str) -> None:
     probe = PiecewiseProbe()
     from quail.backends.quail.executor import cuda_graphs, stage_executor
     _trace_calls(stage_executor, "forward_chunk", window)
-    if hasattr(cuda_graphs, "PiecewiseBuffers"):
-        _trace_calls(cuda_graphs.PiecewiseBuffers, "attention", window)
+    # the eager boundary between pieces; "attention" before token mixers
+    boundary = next((name for name in ("mixer", "attention")
+                     if hasattr(getattr(cuda_graphs, "PiecewiseBuffers", None), name)),
+                    None)
+    if boundary is not None:
+        _trace_calls(cuda_graphs.PiecewiseBuffers, boundary, window)
 
     class ProfiledRunner(graph_module.GenericRunner):
         def run(self, *args, **kwargs):

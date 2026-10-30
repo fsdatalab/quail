@@ -141,13 +141,20 @@ GRAPH_TOKEN_BUCKETS = (
     1, 2, 4, *range(8, 256, 8), *range(256, 513, 16), *range(768, 8_193, 256))
 
 
+# Families whose pipelines split their forward pass into captured
+# pieces (ModelPipeline.piece)
+GRAPH_ARCHS = ("qwen3", "qwen3_5")
+
+
 def graph_token_buckets(model: ModelSpec, device: DeviceSpec) -> tuple[int, ...]:
-    """Return the CUDA graph capture sizes of a dense Qwen3 model.
+    """Return the CUDA graph capture sizes of a dense Qwen3 or Qwen3.5 model.
 
     The sizes are GRAPH_TOKEN_BUCKETS, up to the model's kernel index
-    cap; other model families run without graphs.
+    cap. Other families, experts, SAE readouts, and diffusion canvases
+    run without graphs.
     """
-    if model.arch != "qwen3" or model.state_layers or model.canvas_tokens:
+    if (model.arch not in GRAPH_ARCHS or model.experts or model.sae is not None
+            or model.canvas_tokens):
         return ()
     cap = kernel_index_cap(model)
     return tuple(size for size in GRAPH_TOKEN_BUCKETS if size <= cap)

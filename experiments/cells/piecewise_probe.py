@@ -113,9 +113,10 @@ class PiecewiseProbe:
                                  "reserved_bytes": graphs.memory_bytes,
                                  "buckets": graphs.token_buckets,
                                  "layers": len(graphs.pipeline.layers),
-                                 "projection_shapes": [list(linear.weight.shape)
-                                                       for linear in
-                                                       graphs.pipeline.linears()]}
+                                 "projection_shapes": [
+                                     list(linear.weight.shape) for linear in
+                                     graphs.pipeline.linears()]
+                                 if graphs.pipeline.gemm_warmup else None}
             return result
 
         graph_class.forward = forward

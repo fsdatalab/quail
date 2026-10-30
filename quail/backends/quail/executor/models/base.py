@@ -7,6 +7,31 @@ kernels, quantization, attention paths, and arena access. The chunk
 loop sees only this class.
 """
 
+from contextlib import nullcontext
+
+
+def overlaid_rows(torch, num_tokens, device, *layouts):
+    """Row-major boundary tensors of mixer kinds that are never live at once.
+
+    Each layout is a list of widths, laid out back to back from the
+    start of one shared buffer as (num_tokens, width) tensors; the
+    buffer fits the largest layout.
+
+    Returns:
+        One list of tensors per layout.
+    """
+    flat = torch.zeros(num_tokens * max(sum(layout) for layout in layouts),
+                       dtype=torch.bfloat16, device=device)
+    views = []
+    for layout in layouts:
+        start, tensors = 0, []
+        for width in layout:
+            end = start + num_tokens * width
+            tensors.append(flat[start:end].view(num_tokens, width))
+            start = end
+        views.append(tensors)
+    return views
+
 
 class ModelPipeline:
     """The contract between the chunk loop and one model family.
@@ -58,3 +83,28 @@ class ModelPipeline:
     def convolutions(self):
         """Return (weight, bias, activate) per convolution shape for warmup."""
         return ()
+
+    def forward_context(self, num_tokens):
+        """Return the context a forward pass, or a captured piece, runs under."""
+        return nullcontext()
+
+    # A family whose specs get CUDA graph sizes (graph_token_buckets)
+    # splits its forward pass at its token mixers (executor/cuda_graphs.py):
+    # piece 0 runs up to layer 0's mixer, piece i from layer i - 1's mixer
+    # to layer i's, and the last piece writes the final-normed rows.
+
+    def boundary(self, num_tokens, device) -> dict:
+        """Row-major tensors the pieces and mixers pass to each other."""
+        raise NotImplementedError
+
+    def bucket_boundary(self, num_tokens, device) -> dict:
+        """Boundary tensors each graph size allocates, not sliced by row."""
+        return {}
+
+    def piece(self, index, buffers):
+        """Captured work before layer index's token mixer (see above)."""
+        raise NotImplementedError
+
+    def mixer(self, index, buffers, chunk):
+        """Run layer index's token mixer eagerly over the chunk's real rows."""
+        raise NotImplementedError

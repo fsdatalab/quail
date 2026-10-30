@@ -1,4 +1,4 @@
-"""Piecewise padding never reaches attention or KV."""
+"""Piecewise padding never reaches a token mixer or KV."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -11,8 +11,17 @@ from quail.backends.quail.executor.cuda_graphs import (
     PiecewiseBuffers,
     PiecewiseGraphs,
 )
+from quail.backends.quail.executor.models.qwen3 import Qwen3Pipeline
 from quail.cost.budgets import graph_memory_bytes, graph_token_buckets
-from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_5_4B_BF16, QWEN3_32B_FP8
+from quail.specs import (
+    H100_SXM,
+    LFM2_2_6B_BF16,
+    QWEN3_4B_FP8,
+    QWEN3_5_2B_SAE_BF16,
+    QWEN3_5_4B_BF16,
+    QWEN3_6_35B_A3B_FP8,
+    QWEN3_32B_FP8,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -27,17 +36,18 @@ def chunk(num_tokens=5):
 
 
 def pipeline():
-    return SimpleNamespace(
-        engine=SimpleNamespace(
-            torch=torch, num_q_heads=2, num_kv_heads=1, head_dim=2,
-            arena=SimpleNamespace(k=[], page_tokens=16, has_sliding=False),
-            quant=lambda q: (q.clone(), torch.ones(q.shape[0], 1))),
-        final_norm=SimpleNamespace(weight=torch.zeros(4)), forward_hook=None,
-        forward_chunk=lambda chunk: "eager")
+    model = Qwen3Pipeline.__new__(Qwen3Pipeline)
+    model.engine = SimpleNamespace(
+        torch=torch, num_q_heads=2, num_kv_heads=1, head_dim=2,
+        arena=SimpleNamespace(k=[], page_tokens=16, has_sliding=False),
+        quant=lambda q: (q.clone(), torch.ones(q.shape[0], 1)))
+    model.final_norm = SimpleNamespace(weight=torch.zeros(4))
+    model.forward_chunk = lambda chunk: "eager"
+    return model
 
 
-@pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_32B_FP8])
-def test_dense_qwen3_captures_the_stock_vllm_sizes_with_padding_under_256(model):
+@pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_32B_FP8, QWEN3_5_4B_BF16])
+def test_dense_models_capture_the_stock_vllm_sizes_with_padding_under_256(model):
     buckets = graph_token_buckets(model, H100_SXM)
     assert len(buckets) == 81
     assert buckets[0] == 1
@@ -48,13 +58,15 @@ def test_dense_qwen3_captures_the_stock_vllm_sizes_with_padding_under_256(model)
         2 * buckets[-1] * model.act_per_token)
 
 
-def test_hybrid_models_keep_the_eager_path_and_no_graph_reservation():
-    assert PiecewiseGraphs.for_specs(None, QWEN3_5_4B_BF16, H100_SXM) is None
-    assert graph_memory_bytes(QWEN3_5_4B_BF16, H100_SXM) == 0
+@pytest.mark.parametrize(
+    "model", [QWEN3_6_35B_A3B_FP8, QWEN3_5_2B_SAE_BF16, LFM2_2_6B_BF16])
+def test_experts_sae_readouts_and_lfm2_keep_the_eager_path(model):
+    assert PiecewiseGraphs.for_specs(None, model, H100_SXM) is None
+    assert graph_memory_bytes(model, H100_SXM) == 0
 
 
 @pytest.mark.parametrize("mode", ["tree", "unified"])
-def test_padding_never_reaches_attention_or_writes_kv(mode):
+def test_padding_never_reaches_attention(mode):
     model = pipeline()
     buffers = PiecewiseBuffers(model, 8, device="cpu")
     source = chunk()
@@ -70,7 +82,7 @@ def test_padding_never_reaches_attention_or_writes_kv(mode):
         output[1].fill_(2)
 
     model.engine.attention = attention
-    buffers.attention(model, source)
+    buffers.mixer(model, 0, source)
     assert (buffers.o_in[:5] == 7).all()
     assert (buffers.o_in[5:] == 0).all()
     assert buffers.q.data_ptr() != buffers.o_in.data_ptr()
@@ -78,7 +90,7 @@ def test_padding_never_reaches_attention_or_writes_kv(mode):
     buffers.copy(source)
     assert buffers.ids.tolist() == [12, 13, 0, 0, 0, 0, 0, 0]
     assert buffers.positions.tolist() == [0, 1, 0, 0, 0, 0, 0, 0]
-    buffers.attention(model, source)
+    buffers.mixer(model, 0, source)
 
 
 def test_smaller_buckets_share_the_largest_buckets_rows_but_not_its_scales():
@@ -237,7 +249,8 @@ def test_capture_accounts_for_inactive_private_pool_storage(monkeypatch, memory_
             dict(segment_pool_id=(0, 0), total_size=1000, allocated_size=0)])
     model = SimpleNamespace(
         engine=SimpleNamespace(arena=SimpleNamespace(k=[]), torch=SimpleNamespace(
-            cuda=cuda, inference_mode=nullcontext)), layers=[None])
+            cuda=cuda, inference_mode=nullcontext)), layers=[None],
+        forward_context=lambda num_tokens: nullcontext())
     monkeypatch.setattr(
         cuda_graphs, "PiecewiseBuffers",
         lambda *a, **kw: SimpleNamespace(piece=lambda *a, **kw: None))

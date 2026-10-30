@@ -1,4 +1,10 @@
-"""Capture dense layer work while leaving attention and its metadata eager."""
+"""Capture the work between token mixers, leaving the mixers and their metadata eager.
+
+A token mixer (attention, or a Gated DeltaNet layer's convolution and
+recurrence) reads per-chunk metadata of variable size, so it runs
+eagerly between captured pieces, as vLLM's piecewise graphs split at
+the same ops.
+"""
 
 import time
 from dataclasses import dataclass
@@ -55,48 +61,45 @@ class KVWriteBuffers:
 class PiecewiseBuffers:
     """Persistent boundary tensors for one padded token count.
 
-    Only real rows reach attention. Padding therefore has no KV writes,
-    sequence boundaries, or reads, regardless of the attention path.
-    GEMM tiling can change rounding with the padded row count; replay
-    parity is checked against eager pieces with the same bucket shape.
+    The model pipeline names the tensors its pieces and token mixers
+    pass between them (ModelPipeline.boundary); these are shared by
+    every model: input ids and positions, the running residual, the
+    final rows, and the fixed KV write mappings a piece writes through.
+
+    Only real rows reach a token mixer. Padding therefore has no KV
+    writes, sequence boundaries, state, or reads. GEMM tiling can change
+    rounding with the padded row count; replay parity is checked
+    against eager pieces with the same bucket shape.
 
     Given storage, a larger bucket's buffers, every row-major tensor is
     a prefix of that bucket's, so all buckets share one allocation; one
-    stream replays one bucket at a time. Column-major activation scales
-    cannot be sliced by row, so each bucket keeps its own.
+    stream replays one bucket at a time. Tensors that cannot be sliced
+    by row, such as column-major activation scales, are the pipeline's
+    bucket_boundary, which each bucket allocates for itself.
     """
 
     def __init__(self, pipeline, num_tokens, *, device="cuda", storage=None):
         engine = pipeline.engine
         torch = engine.torch
         self.num_tokens = num_tokens
+        self.copy_tail = False
         if storage is not None and storage.num_tokens < num_tokens:
             raise ValueError("storage must hold at least num_tokens rows")
-        self.ids = (storage.ids[:num_tokens] if storage is not None else
-                    torch.zeros(num_tokens, dtype=torch.int64, device=device))
-        self.positions = (storage.positions[:num_tokens] if storage is not None
-                          else torch.zeros_like(self.ids))
-        width = pipeline.final_norm.weight.numel()
-        q_width = engine.num_q_heads * engine.head_dim
-        kv_width = engine.num_kv_heads * engine.head_dim
-        if storage is not None:
-            self.residual = storage.residual[:num_tokens]
-            self.output = storage.output[:num_tokens]
-            self.q = storage.q[:num_tokens]
-            self.k = storage.k[:num_tokens]
-            self.v = storage.v[:num_tokens]
+        if storage is None:
+            width = pipeline.final_norm.weight.numel()
+            ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+            residual = torch.zeros((num_tokens, width), dtype=torch.bfloat16,
+                                   device=device)
+            rows = dict(ids=ids, positions=torch.zeros_like(ids),
+                        residual=residual, output=torch.empty_like(residual),
+                        **pipeline.boundary(num_tokens, device))
         else:
-            self.residual = torch.zeros((num_tokens, width), dtype=torch.bfloat16,
-                                        device=device)
-            self.output = torch.empty_like(self.residual)
-            self.q = torch.zeros((num_tokens, q_width), dtype=torch.bfloat16,
-                                 device=device)
-            self.k = torch.zeros((num_tokens, kv_width), dtype=torch.bfloat16,
-                                 device=device)
-            self.v = torch.zeros_like(self.k)
-        self.o_in, self.o_scale = engine.quant(torch.zeros_like(self.q))
-        if storage is not None:
-            self.o_in = storage.o_in[:num_tokens]
+            rows = {name: tensor[:num_tokens]
+                    for name, tensor in storage.rows.items()}
+        self.rows = rows
+        for name, tensor in (rows | pipeline.bucket_boundary(
+                num_tokens, device)).items():
+            setattr(self, name, tensor)
         page_tokens = engine.arena.page_tokens
         self.writes = KVWriteBuffers(
             torch, num_tokens, page_tokens, device=device,
@@ -134,53 +137,35 @@ class PiecewiseBuffers:
             self.sliding_writes.copy(
                 writes.get("sliding") or writes if writes is not None else None)
 
-    def attention(self, pipeline, chunk):
-        """Read real rows, writing attention directly to the dense graph's inputs."""
-        n = chunk.tokens
-        pipeline.engine.attention(
-            self.q[:n], self.k[:n], self.v[:n], chunk,
-            output=(self.o_in[:n], None if self.o_scale is None else self.o_scale[:n]))
+    def write_kv(self, engine, k, v, layer):
+        """Write a layer's fresh KV rows through the staged mappings."""
+        self.kv_meta["layer"] = layer
+        engine.write_kv(
+            k.view(self.num_tokens, engine.num_kv_heads, engine.head_dim),
+            v.view(self.num_tokens, engine.num_kv_heads, engine.head_dim),
+            self.kv_meta, copy_tail=self.copy_tail)
 
     def piece(self, pipeline, index, *, copy_tail=None):
-        """Run embedding or the previous MLP, then the next QKV or final norm."""
-        if index == 0:
-            hidden = pipeline.embed(self.ids)
-            residual = None
-        else:
-            residual = self.residual
-            hidden = pipeline.after_attention(
-                self.o_in, self.o_scale, residual, pipeline.layers[index - 1])
-        if index == len(pipeline.layers):
-            normed, _ = pipeline.engine.fused_add_rms_norm(
-                hidden, residual, pipeline.final_norm)
-            self.output.copy_(normed)
-        else:
-            q, k, v, residual = pipeline.before_attention(
-                hidden, residual, self.positions, pipeline.layers[index])
-            self.q.copy_(q)
-            self.k.copy_(k)
-            self.v.copy_(v)
-            if index == 0:
-                self.residual.copy_(residual)
-            engine = pipeline.engine
-            self.kv_meta["layer"] = index
-            engine.write_kv(
-                self.k.view(self.num_tokens, engine.num_kv_heads, engine.head_dim),
-                self.v.view(self.num_tokens, engine.num_kv_heads, engine.head_dim),
-                self.kv_meta,
-                copy_tail=self.has_tails if copy_tail is None else copy_tail)
+        """Run the pipeline's work from token mixer index - 1 up to mixer index."""
+        self.copy_tail = self.has_tails if copy_tail is None else copy_tail
+        pipeline.piece(index, self)
+
+    def mixer(self, pipeline, index, chunk):
+        """Run layer index's token mixer eagerly over the chunk's real rows."""
+        chunk.meta["layer"] = index
+        pipeline.mixer(index, self, chunk)
 
 
 @dataclass
 class CapturedPieces:
-    """A bucket's boundary buffers and ordered non-attention graphs."""
+    """A bucket's boundary buffers and ordered graphs between token mixers."""
 
     buffers: PiecewiseBuffers
     graphs: list
     tail_graphs: list | None = None
 
     def forward(self, pipeline, chunk):
-        """Replay pieces separated by eager attention and copy selected outputs."""
+        """Replay pieces separated by eager token mixers; copy selected outputs."""
         self.buffers.copy(chunk)
         graphs = (self.tail_graphs if self.buffers.has_tails
                   and self.tail_graphs is not None else self.graphs)
@@ -188,10 +173,11 @@ class CapturedPieces:
         previous = chunk.meta.get("kv_written")
         chunk.meta["kv_written"] = True
         try:
-            graphs[0].replay()
-            for graph in graphs[1:]:
-                self.buffers.attention(pipeline, chunk)
-                graph.replay()
+            with pipeline.forward_context(self.buffers.num_tokens):
+                graphs[0].replay()
+                for index, graph in enumerate(graphs[1:]):
+                    self.buffers.mixer(pipeline, index, chunk)
+                    graph.replay()
             return self.buffers.output.index_select(0, chunk.final_indices)
         finally:
             if previous is None:
@@ -201,7 +187,7 @@ class CapturedPieces:
 
 
 class PiecewiseGraphs:
-    """Capture and replay Qwen3 dense work on the worker's current stream.
+    """Capture and replay the pieces of a model pipeline on the current stream.
 
     Captured writes reference the arena, so resizing it invalidates the
     graphs. The two tail-copy variants share each bucket's boundary
@@ -266,11 +252,13 @@ class PiecewiseGraphs:
                         for index in range(len(self.pipeline.layers) + 1):
                             piece = partial(buffers.piece, self.pipeline, index,
                                             copy_tail=copy_tail)
-                            piece()
-                            stream.synchronize()
-                            graph = torch.cuda.CUDAGraph()
-                            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                            with self.pipeline.forward_context(num_tokens):
                                 piece()
+                                stream.synchronize()
+                                graph = torch.cuda.CUDAGraph()
+                                with torch.cuda.graph(graph, pool=pool,
+                                                      stream=stream):
+                                    piece()
                             graphs.append(graph)
                         variants.append(graphs)
                     self.graphs.append(CapturedPieces(buffers, *variants))

@@ -511,7 +511,7 @@ def short_conv_core(inputs, weight, phases, arena, layer_slot):
     return out
 
 
-def gdn_core(geometry, tensors, phases, arena, layer_slot):
+def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
     """Run one Gated DeltaNet layer's convolution and recurrence.
 
     Args:
@@ -521,6 +521,7 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot):
         phases: The chunk's phases from plan_phases.
         arena: KVArena holding the checkpoint pools.
         layer_slot: Index of this layer among the Gated DeltaNet layers.
+        output: Optional (rows, value heads, value dim) tensor to write.
 
     Returns:
         (rows, value heads, value dim) recurrence outputs.
@@ -531,8 +532,9 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot):
     spec = geometry
     qkv = tensors["qkv"]
     rows = qkv.shape[0]
-    out = torch.zeros((rows, spec.gdn_value_heads, spec.gdn_value_dim),
-                      dtype=qkv.dtype, device=qkv.device)
+    out = (output.zero_() if output is not None else
+           torch.zeros((rows, spec.gdn_value_heads, spec.gdn_value_dim),
+                       dtype=qkv.dtype, device=qkv.device))
     scale = spec.gdn_key_dim ** -0.5
     for phase in phases:
         if phase is None:

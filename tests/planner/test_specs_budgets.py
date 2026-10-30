@@ -264,7 +264,7 @@ def test_the_tree_merge_is_charged_for_the_attention_layers_only():
         node_tokens=500) == "tree"
 
 
-@pytest.mark.parametrize("tokens,expected_slots", [(200, 611), (16_000, 61)])
+@pytest.mark.parametrize("tokens,expected_slots", [(200, 588), (16_000, 59)])
 def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
         tokens, expected_slots):
     from quail.backends.quail.worker import checkpoint_arena_args
@@ -276,7 +276,9 @@ def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
     assert model.checkpoint_bytes == 51_511_296
     assert budgets.checkpoint_pass_bytes(model, 1_024, chunk) == 4_941 * 2**20
     pool = budgets.hybrid_pool_pages(model, H100_SXM, chunk)
-    assert pool == 68_060
+    # the 1.34 GB CUDA graph reserve takes 2,560 of 68,060 pages
+    assert budgets.graph_memory_bytes(model, H100_SXM) == 2_560 * 16 * model.kappa
+    assert pool == 65_500
     kv_pages, sliding = budgets.arena_pages(model, H100_SXM, chunk, tokens)
     assert sliding == 0
     slots = budgets.checkpoint_slots(model, H100_SXM, chunk, kv_pages)

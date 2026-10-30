@@ -67,6 +67,56 @@ class Qwen3Pipeline(ModelPipeline):
         d_in, d_scale = engine.activation_quant(gate_up)
         return engine.gemm(d_in, d_scale, layer.mlp.down_proj)
 
+    def boundary(self, num_tokens, device):
+        """Q, K, and V into attention, and its quantized o_proj input out."""
+        torch = self.engine.torch
+        q_width = self.engine.num_q_heads * self.engine.head_dim
+        kv_width = self.engine.num_kv_heads * self.engine.head_dim
+        q = torch.zeros((num_tokens, q_width), dtype=torch.bfloat16, device=device)
+        k = torch.zeros((num_tokens, kv_width), dtype=torch.bfloat16,
+                        device=device)
+        o_in, _ = self.engine.quant(torch.zeros_like(q))
+        return dict(q=q, k=k, v=torch.zeros_like(k), o_in=o_in)
+
+    def bucket_boundary(self, num_tokens, device):
+        """The o_proj input's column-major FP8 scales, or None for bf16."""
+        torch = self.engine.torch
+        q_width = self.engine.num_q_heads * self.engine.head_dim
+        _, o_scale = self.engine.quant(torch.zeros(
+            (num_tokens, q_width), dtype=torch.bfloat16, device=device))
+        return dict(o_scale=o_scale)
+
+    def piece(self, index, buffers):
+        """Embedding or the previous MLP, then the next QKV and KV write."""
+        if index == 0:
+            hidden = self.embed(buffers.ids)
+            residual = None
+        else:
+            residual = buffers.residual
+            hidden = self.after_attention(
+                buffers.o_in, buffers.o_scale, residual, self.layers[index - 1])
+        if index == len(self.layers):
+            normed, _ = self.engine.fused_add_rms_norm(
+                hidden, residual, self.final_norm)
+            buffers.output.copy_(normed)
+            return
+        q, k, v, residual = self.before_attention(
+            hidden, residual, buffers.positions, self.layers[index])
+        buffers.q.copy_(q)
+        buffers.k.copy_(k)
+        buffers.v.copy_(v)
+        if index == 0:
+            buffers.residual.copy_(residual)
+        buffers.write_kv(self.engine, buffers.k, buffers.v, index)
+
+    def mixer(self, index, buffers, chunk):
+        """Attention over real rows, written into the next piece's input."""
+        n = chunk.tokens
+        self.engine.attention(
+            buffers.q[:n], buffers.k[:n], buffers.v[:n], chunk,
+            output=(buffers.o_in[:n],
+                    None if buffers.o_scale is None else buffers.o_scale[:n]))
+
     def forward_chunk(self, chunk):
         engine = self.engine
         chunk.meta["layer"] = 0
