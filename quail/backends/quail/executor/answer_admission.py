@@ -213,3 +213,219 @@ class AnswerAdmission:
             self.maximum += self.added_maximum[anchor]
             self.committed[anchor] = True
             self.work = self.work + self._added_work(anchor)
+
+    def waits(self):
+        """Return whether a refused document can wait for pages to free."""
+        return bool(self.maximum or len(self.decoder.running()))
+
+
+def input_bucket(tokens):
+    """Return the input-length bucket: one per doubling of the prefix length."""
+    return np.floor(np.log2(np.maximum(np.asarray(tokens, dtype=float), 1.0))
+                    ).astype(np.int64)
+
+
+class HeadroomAdmission(AnswerAdmission):
+    """Admit a document when its prompt and its answers' headroom fit.
+
+    Each answer has its own headroom: pages its answer may grow into
+    beyond the pages it holds. Free pages minus the headroom of running
+    answers, minus the pages evicted answers need to come back, must
+    cover a new document's prompt and its answers' headroom. The pages
+    are counted, not allocated: answers still grow one page at a time.
+
+    With choose_headroom False every headroom is zero, so a document is
+    admitted when its prompt fits. Otherwise each answer's headroom is
+    the page count j minimizing D(j) + P(Y > j) * R(j):
+
+    - P(Y > j): the chance the answer needs more than j more pages,
+      from the Kaplan-Meier curve of its map and input-length bucket,
+      conditional on the tokens it has written.
+    - D(j): j times the value of one page to waiting documents, the
+      SoL seconds one waiting document saves by joining passes that
+      run anyway, divided by the pages its prompt takes.
+    - R(j): the SoL seconds rebuilding the answer's prefix adds when
+      it outgrows j pages and is evicted.
+
+    Headrooms are chosen again each time the curves are rebuilt.
+    """
+
+    def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
+                 shared, page_cost, decode_cost=None, page_holds=None, *,
+                 choose_headroom=True, chunk_tokens=0, curve_refresh=32):
+        super().__init__(decoder, prefix_lengths, capacity_extra, dependencies,
+                         shared, page_cost, decode_cost, page_holds)
+        self.page_cost = page_cost
+        self.capacity_extra = capacity_extra
+        self.choose_headroom = choose_headroom and decode_cost is not None
+        self.chunk_tokens = chunk_tokens
+        self.curve_refresh = curve_refresh
+        self.bucket = input_bucket(self.prefix)
+        self.slot_map = np.full(len(self.prefix), -1, dtype=np.int64)
+        # per slot, the KV position its pages and headroom reach
+        self.reach = np.zeros(len(self.prefix), dtype=np.int64)
+        self.headroom_pages = 0
+        self.replay_pages = 0
+        self.page_value = 0.0
+        self.bucket_curves = {}
+        self._ended = -1
+        self._rebuilt = 0
+        self._refreshes = 0
+        # (refresh, map, bucket, answers, mean headroom pages) per rebuild
+        self.trace = []
+
+    def refresh(self, stages, replays=(), replay_pages=0):
+        """Rebuild the work, the curves when answers ended, and each headroom."""
+        super().refresh(stages, replays)
+        decoder = self.decoder
+        for q, slots in decoder.answer_slots.items():
+            self.slot_map[np.asarray(slots, dtype=np.int64)] = q
+        self.replay_pages = int(replay_pages)
+        self._refreshes += 1
+        ended = sum(int((lengths >= 0).sum()) for lengths in decoder.lengths)
+        # rebuild after a tenth more answers ended, or every curve_refresh
+        if self.choose_headroom and (
+                self._ended < 0 or ended > 1.1 * self._ended + 1
+                or self._refreshes - self._rebuilt >= self.curve_refresh):
+            self._ended, self._rebuilt = ended, self._refreshes
+            self._rebuild_curves()
+            self.page_value = self._page_value(stages)
+            running = self._running()
+            self.reach[running] = (decoder.kv.num_pages[running] * decoder.page_tokens
+                                   + self._choose(running) * decoder.page_tokens)
+            self._record(running)
+        running = self._running()
+        self.headroom_pages = int(self._remaining(running).sum())
+        # pending branches of admitted documents need their prompt pages
+        roots = self.committed[self.parent]
+        self.headroom_pages += int(self.pending_pages[roots].sum())
+
+    def _remaining(self, slots):
+        """Headroom pages the slots' answers have not grown into yet."""
+        page_tokens = self.decoder.page_tokens
+        held = self.decoder.kv.num_pages[slots] * page_tokens
+        return np.maximum(0, -(-(self.reach[slots] - held) // page_tokens))
+
+    def _running(self):
+        decoder = self.decoder
+        return np.flatnonzero((decoder.map >= 0) & ~decoder.paused)
+
+    def _available(self, slots):
+        """Answer tokens the slots' allocated pages cover."""
+        decoder = self.decoder
+        return (decoder.kv.num_pages[slots] * decoder.page_tokens
+                - decoder.origin[slots])
+
+    def _rebuild_curves(self):
+        decoder = self.decoder
+        self.bucket_curves = {}
+        for q, slots in decoder.answer_slots.items():
+            slots = np.asarray(slots, dtype=np.int64)
+            limit = int(decoder.limits[q])
+            lengths, written = decoder.lengths[q][slots], decoder.written[q][slots]
+            whole = answer_survival(lengths, written, decoder.expected_tokens[q],
+                                    limit)
+            buckets = self.bucket[slots]
+            for b in np.unique(buckets):
+                mine = buckets == b
+                self.bucket_curves[(q, int(b))] = answer_survival(
+                    lengths[mine], written[mine], decoder.expected_tokens[q],
+                    limit, prior=whole)
+
+    def _page_value(self, stages):
+        """SoL seconds one page saves a waiting document, 0 when none waits."""
+        waiting = np.flatnonzero((stages == -1) & self.roots & ~self.committed)
+        if not len(waiting):
+            return 0.0
+        anchor = int(waiting[0])
+        gain = self.decode_cost.gain(self.work, self._added_work(anchor),
+                                     self.expected_tokens[anchor])
+        pages = self.page_cost(int(self.prefix[anchor]) + self.capacity_extra)
+        return gain / max(1, pages)
+
+    def _choose(self, slots, written=None, available=None, origin=None):
+        """Return each slot's headroom pages, minimizing D(j) + P(Y > j) R(j)."""
+        decoder = self.decoder
+        page_tokens = decoder.page_tokens
+        chosen = np.zeros(len(slots), dtype=np.int64)
+        if not len(slots):
+            return chosen
+        current = decoder.map[slots]
+        maps = np.where(current >= 0, current, self.slot_map[slots])
+        if written is None:
+            written = np.zeros(len(slots), dtype=np.int64)
+            for q in np.unique(maps):
+                mine = maps == q
+                written[mine] = decoder.written[q][slots[mine]]
+            available = self._available(slots)
+            origin = decoder.origin[slots]
+        keys = maps * (1 << 32) + self.bucket[slots]
+        for key in np.unique(keys):
+            mine = np.flatnonzero(keys == key)
+            curve = self.bucket_curves.get((int(key >> 32), int(key & 0xFFFFFFFF)))
+            if curve is None:
+                continue
+            limit = len(curve) - 1
+            pages = np.arange(-(-limit // page_tokens) + 1)
+            held = np.minimum(limit, available[mine])[:, None]
+            reach = np.minimum(limit, held + 1 + pages * page_tokens)
+            survived = curve[np.minimum(limit, written[mine])][:, None]
+            overrun = np.divide(curve[reach], survived, out=np.zeros(reach.shape),
+                                where=survived > 0)
+            # an overrun is evicted with the tokens its pages held
+            tokens = origin[mine][:, None] + np.minimum(
+                limit, held + pages * page_tokens)
+            recover = self.decode_cost.replay_seconds(self.work, tokens,
+                                                      self.chunk_tokens)
+            chosen[mine] = np.argmin(pages * self.page_value + overrun * recover,
+                                     axis=1)
+        return chosen
+
+    def _record(self, running):
+        for (q, b) in self.bucket_curves:
+            mine = running[(self.slot_map[running] == q)
+                           & (self.bucket[running] == b)]
+            if len(mine):
+                self.trace.append((self._refreshes, q, b, len(mine),
+                                   float(self._remaining(mine).mean())))
+
+    def _candidate_headroom(self, anchor):
+        """Headroom pages a document's answers would hold, chosen now."""
+        if not self.choose_headroom:
+            return 0
+        slots = np.flatnonzero((self.parent == anchor) & (self.slot_map >= 0))
+        if not len(slots):
+            return 0
+        zeros = np.zeros(len(slots), dtype=np.int64)
+        chosen = self._choose(slots, zeros, self.capacity[slots] - self.prompt[slots],
+                              self.prompt[slots])
+        self.reach[slots] = self.capacity[slots] + chosen * self.decoder.page_tokens
+        return int(chosen.sum())
+
+    def allows(self, anchor, free_pages, prompt_pages):
+        """Admit when the prompt and its answers' headroom fit beside what is held."""
+        if self.committed[self.parent[anchor]]:
+            return True
+        need = prompt_pages + self._candidate_headroom(anchor)
+        return free_pages - self.headroom_pages - self.replay_pages >= need
+
+    def admit(self, anchor):
+        """Count an admitted document's headroom, or a branch's allocated prompt."""
+        if self.committed[self.parent[anchor]]:
+            self.headroom_pages -= int(self.pending_pages[anchor])
+            self.pending_pages[anchor] = 0
+            return
+        self.committed[anchor] = True
+        self.work = self.work + self._added_work(anchor)
+        slots = np.flatnonzero((self.parent == anchor) & (self.slot_map >= 0))
+        self.headroom_pages += int(((self.reach[slots] - self.capacity[slots])
+                                    // self.decoder.page_tokens).clip(0).sum())
+        branches = np.flatnonzero((self.parent == anchor)
+                                  & (np.arange(len(self.prefix)) != anchor))
+        self.headroom_pages += int(self.pending_pages[branches].sum())
+
+    def waits(self):
+        """Return whether a refused document can wait for pages to free."""
+        decoder = self.decoder
+        evicted = decoder.paused & (decoder.map >= 0)
+        return bool(len(decoder.running()) or evicted.any())

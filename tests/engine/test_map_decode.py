@@ -16,6 +16,8 @@ import torch
 from helpers.fakes import cpu_staging, fake_pipeline
 from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 
+from quail.backends.quail.executor.admission import pages_for
+from quail.backends.quail.executor.answer_admission import HeadroomAdmission
 from quail.backends.quail.executor.answer_survival import answer_survival
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.operators.classify import ClassifyPart
@@ -24,7 +26,9 @@ from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
-from quail.specs import QWEN3_4B_FP8
+from quail.cost.decode import DecodeCost
+from quail.cost.work import Work
+from quail.specs import DEVICES, QWEN3_4B_FP8
 
 VOCABULARY = 1024
 STOP = VOCABULARY - 1
@@ -508,3 +512,136 @@ def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
         assert got == [greedy(documents[a] + tail, answer_limit) for a in asked]
     assert stats["num_evictions"] > 0
     assert not arena.accounting.owned
+
+
+@pytest.mark.parametrize("mode", ["prompt", "headroom"])
+@pytest.mark.parametrize("num_maps", [1, 3])
+@pytest.mark.parametrize("budget,lag", [(20, 0), (200, 3)])
+@pytest.mark.parametrize("path", ["unified", "tree"])
+def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
+        monkeypatch, mode, num_maps, budget, lag, path):
+    cpu_staging(monkeypatch)
+    monkeypatch.setenv("QUAIL_ANSWER_ADMISSION", mode)
+    monkeypatch.setattr(__name__ + ".next_token", lambda h: (
+        STOP if h % 7 == 0 else 10 + h % 900))
+    rng = np.random.default_rng(23)
+    documents = [[20, 21, 22, 23] + rng.integers(20, 400, size=4 + 4 * (i % 3)).tolist()
+                 for i in range(12)]
+    ids = list(range(len(documents)))
+    tails = [[500, 501], [600, 601], [650, 651]][:num_maps]
+    limits = [24, 20, 28][:num_maps]
+    setup = Setup(path=path, pages=20, page_tokens=4, budget=budget)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=(),
+                             tree_attention=True)
+    maps = MapPart(None, [map_node(f"m{q}", tail, answer_limit, "tree")
+                          for q, (tail, answer_limit) in enumerate(zip(tails, limits))],
+                   ids, 0)
+    prefixes, keys, tree, dependencies = maps.branch_inputs(
+        documents, [("d", i) for i in ids], prefix_tree(documents, setup.page_tokens),
+        setup.page_tokens, 0)
+    decoder = MapDecoder(events_torch(lag), torch.eye(VOCABULARY), len(prefixes),
+                         limits, [STOP], setup.page_tokens,
+                         expected_tokens=[1] * len(limits))
+    maps.decoder = decoder
+    stats = {}
+    run_stages(events_torch(lag), arena, pipeline, gated_stages([maps]), prefixes,
+               budget, anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
+               decoder=decoder, stats=stats, attention_mode=path,
+               decode_cost=DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"]))
+    for q, (tail, answer_limit) in enumerate(zip(tails, limits)):
+        got = [answer.tolist() for answer in decoder.answers(q, maps._slots(q, ids))]
+        assert got == [greedy(documents[a] + tail, answer_limit) for a in ids]
+    assert stats["answer_admission"] == mode
+    assert not decoder.active
+    assert not arena.accounting.owned
+
+
+def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
+                       num_documents=3, prefix_tokens=8):
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), num_documents,
+                         [limit], [STOP], 4, expected_tokens=[expected_tokens])
+    decoder.answer_slots = {0: np.arange(num_documents)}
+    for a, length in ended:
+        decoder.lengths[0][a] = length
+        decoder.written[0][a] = length
+    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
+    admission = HeadroomAdmission(decoder, [prefix_tokens] * num_documents, 6, {},
+                                  [0] * num_documents,
+                                  lambda tokens: pages_for(tokens, 4), cost)
+    return decoder, admission
+
+
+def test_prompt_admission_admits_when_the_prompt_fits_but_waits_for_evicted_answers():
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
+                         [32], [STOP], 4, expected_tokens=[16])
+    decoder.answer_slots = {0: np.arange(2)}
+    decoder.start(0, 0, 10, [0, 1, 2, 3])
+    admission = HeadroomAdmission(decoder, [8, 8], 6, {}, [0, 0],
+                                  lambda tokens: pages_for(tokens, 4),
+                                  choose_headroom=False)
+    admission.refresh(np.array([0, -1]))
+    assert admission.allows(1, 4, 4)
+    assert not admission.allows(1, 3, 4)
+    decoder.pause(0)
+    admission.refresh(np.array([0, -1]), replay_pages=4)
+    assert not admission.allows(1, 4, 4)
+    assert admission.allows(1, 8, 4)
+    assert admission.waits()
+
+
+def test_headroom_grows_with_long_answers_and_shrinks_when_pages_are_valuable():
+    long_ended = [(0, 30), (1, 31)]
+    _, admission = headroom_admission(ended=long_ended, num_documents=4)
+    admission.refresh(np.array([-2, -2, -1, -1]))
+    roomy = admission._candidate_headroom(2)
+    assert roomy > 0
+    admission.page_value = 1.0
+    assert admission._candidate_headroom(2) == 0
+    _, short = headroom_admission(ended=[(0, 1), (1, 1)], expected_tokens=1,
+                                  num_documents=4)
+    short.refresh(np.array([-2, -2, -1, -1]))
+    assert short._candidate_headroom(2) < roomy
+
+
+def test_headroom_of_running_answers_is_counted_against_new_documents():
+    # rebuilding a long prompt costs more than a page saves the next document
+    decoder, admission = headroom_admission(ended=[(2, 30)], prefix_tokens=8000)
+    decoder.start(0, 0, 8006, list(range(2003)))
+    admission.refresh(np.array([0, -1, -2]))
+    held = admission.headroom_pages
+    assert held > 0
+    need = 4 + admission._candidate_headroom(1)
+    assert admission.allows(1, held + need, 4)
+    assert not admission.allows(1, held + need - 1, 4)
+
+
+def test_bucket_curves_follow_their_own_answers_and_fall_back_to_the_map():
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 40,
+                         [64], [STOP], 4, expected_tokens=[8])
+    decoder.answer_slots = {0: np.arange(40)}
+    prefix_lengths = [8] * 20 + [256] * 19 + [1024]
+    for a in range(39):
+        decoder.lengths[0][a] = decoder.written[0][a] = 4 if a < 20 else 60
+    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
+    admission = HeadroomAdmission(decoder, prefix_lengths, 6, {}, [0] * 40,
+                                  lambda tokens: pages_for(tokens, 4), cost)
+    admission.refresh(np.array([-2] * 39 + [-1]))
+    short = admission.bucket_curves[(0, 3)]
+    long = admission.bucket_curves[(0, 8)]
+    alone = admission.bucket_curves[(0, 10)]
+    whole = answer_survival(decoder.lengths[0], decoder.written[0], 8, 64)
+    assert short[10] < 0.3 < whole[10] < 0.6 < long[10]
+    np.testing.assert_allclose(alone, whole)
+
+
+def test_replay_seconds_charge_extra_passes_and_spare_compute():
+    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
+    decode = cost.row_work(np.full(8, 512.0)).total()
+    small, large = cost.replay_seconds(decode, np.array([16, 8192]))
+    assert 0 <= small < large
+    split = cost.replay_seconds(decode, np.array([8192]), chunk_tokens=2048)[0]
+    assert split == pytest.approx(large + 3 * cost.weight_seconds)
+    alone = cost.replay_seconds(Work(), np.array([16]))[0]
+    assert alone >= cost.weight_seconds > small

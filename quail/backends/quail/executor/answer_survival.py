@@ -5,19 +5,23 @@ import numpy as np
 from quail.cost.answers import prior_survival
 
 
-def answer_survival(lengths, written, expected_tokens, limit, prior_weight=20.0):
+def answer_survival(lengths, written, expected_tokens, limit, prior_weight=20.0,
+                    *, prior=None):
     """Return S(t), the chance an answer runs past t tokens, t = 0..limit.
 
     A Kaplan-Meier curve: finished answers are events, including answers
     cut off at the limit; unfinished answers are censored at their last
-    token read by the host. The geometric prior contributes fractional
-    events and risk counts, so the curve starts from the planner's guess.
+    token read by the host. The prior contributes fractional events and
+    risk counts, so the curve starts from it: the planner's geometric
+    guess by default, or a given curve such as the curve of all of a
+    map's answers when this curve covers one input-length bucket.
     """
     lengths = np.asarray(lengths, dtype=np.int64)
     observed = np.where(lengths >= 0, lengths, np.asarray(written, dtype=np.int64))
     counts = np.bincount(observed, minlength=limit + 1)
     events = np.bincount(lengths[lengths >= 0], minlength=limit + 1)
-    prior = prior_survival(expected_tokens, limit)
+    if prior is None:
+        prior = prior_survival(expected_tokens, limit)
     risk = np.cumsum(counts[::-1])[::-1][1:] + prior_weight * prior[:-1]
     events = events[1:] + prior_weight * (prior[:-1] - prior[1:])
     hazard = np.divide(events, risk, out=np.zeros(limit), where=risk > 0)

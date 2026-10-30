@@ -248,7 +248,12 @@ class MapPart(ColumnPart, ExecutionPart):
                         "borrowed_prefix_tokens": (
                             stats.get("borrowed_tokens", 0) if q == 0 else 0),
                         "pack_s": (round(stats.get("pack_s", 0.0), 3)
-                                   if q == 0 else 0.0)}))
+                                   if q == 0 else 0.0),
+                        "answer_admission": stats.get("answer_admission"),
+                        "answer_evictions": (stats.get("num_evictions", 0)
+                                             if q == 0 else 0),
+                        "recomputed_tokens": (stats.get("recomputed_tokens", 0)
+                                              if q == 0 else 0)}))
         self.result_value = self._results[self.nodes[0].node_id]
 
     def results(self) -> dict:

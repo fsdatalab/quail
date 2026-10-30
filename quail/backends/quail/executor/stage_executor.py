@@ -1,5 +1,6 @@
 """Run one stage list: admission, packed forward chunks, and answer readout."""
 
+import os
 import time
 from functools import partial
 from itertools import groupby
@@ -20,6 +21,26 @@ from quail.backends.quail.executor.stages import (
     state_share_points,
 )
 from quail.progress import Progress, logger
+
+ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
+ANSWER_ADMISSION_MODES = ("pooled", "prompt", "headroom")
+
+
+def answer_admission_mode() -> str:
+    """Return the answer admission QUAIL_ANSWER_ADMISSION names, pooled by default.
+
+    - pooled: admit when the batching gain beats the pooled overflow risk.
+    - prompt: admit when the prompt fits, with no answer headroom.
+    - headroom: admit when the prompt and each answer's chosen headroom fit.
+
+    Raises:
+        ValueError: The variable names no mode.
+    """
+    mode = os.environ.get(ANSWER_ADMISSION_ENV, "pooled")
+    if mode not in ANSWER_ADMISSION_MODES:
+        raise ValueError(f"{ANSWER_ADMISSION_ENV}={mode!r}; expected one of "
+                         f"{', '.join(ANSWER_ADMISSION_MODES)}")
+    return mode
 
 
 def attention_path(pipeline, requested, default_attention="unified") -> str:
@@ -245,13 +266,22 @@ class StageExecutor:
         )
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
+        self.admission_mode = answer_admission_mode()
         if self.answer_maps and self.paged:
-            from quail.backends.quail.executor.answer_admission import AnswerAdmission
+            from quail.backends.quail.executor.answer_admission import (
+                AnswerAdmission,
+                HeadroomAdmission,
+            )
 
-            self.answer_admission = AnswerAdmission(
-                decoder, self.prefix_lengths, self.capacity_extra,
-                self.sched.dependencies, self.borrowing.tree_shared,
-                self.arena.page_cost, decode_cost, self.arena.page_holds)
+            arguments = (decoder, self.prefix_lengths, self.capacity_extra,
+                         self.sched.dependencies, self.borrowing.tree_shared,
+                         self.arena.page_cost, decode_cost, self.arena.page_holds)
+            if self.admission_mode == "pooled":
+                self.answer_admission = AnswerAdmission(*arguments)
+            else:
+                self.answer_admission = HeadroomAdmission(
+                    *arguments, choose_headroom=self.admission_mode == "headroom",
+                    chunk_tokens=self.sched.chunk_budget)
         # a Gated DeltaNet layer starts a borrower from the parent's state
         # at the shared point, so a parent writes one slot per point
         self.share_points = [()] * len(self.keys)
@@ -415,7 +445,7 @@ class StageExecutor:
                             else self.arena.page_cost(capacity - shared))
             if not self.answer_admission.allows(
                     anchor, self.arena.free_pages, prompt_pages):
-                if self.answer_admission.maximum or len(self.decoder.running()):
+                if self.answer_admission.waits():
                     return False
                 # No answer can free pages: start with one page and grow.
         if not self.arena.reserve(
@@ -506,6 +536,20 @@ class StageExecutor:
             replays.append((a, start, end))
             room -= end - start
         return replays, room
+
+    def _replay_pages(self, replays):
+        """Pages evicted answers not yet reserved need to come back."""
+        reserved = {a for a, _, _ in replays}
+        pages = 0
+        for a in self.recomputing:
+            q = int(self.decoder.map[a])
+            if a in reserved or q < 0 or self.arena.is_resident(self.keys[a]):
+                continue
+            length = (int(self.decoder.origin[a])
+                      + int(self.decoder.written[q][a]) + self.arena.page_tokens)
+            pages += self.arena.page_cost(
+                max(self.prefix_lengths[a] + self.capacity_extra, length))
+        return pages
 
     def _build(self, chunk_groups, decode=None, replays=()):
         """Pack a chunk and identify each entry's stage and answer row count.
@@ -880,7 +924,12 @@ class StageExecutor:
             replays, room = self._replays(max(0, room))
             if (self.answer_admission is not None
                     and (self.sched.pending or self.sched.waiting)):
-                self.answer_admission.refresh(np.asarray(self.sched._stage), replays)
+                stage = np.asarray(self.sched._stage)
+                if self.admission_mode == "pooled":
+                    self.answer_admission.refresh(stage, replays)
+                else:
+                    self.answer_admission.refresh(stage, replays,
+                                                  self._replay_pages(replays))
             groups = self.sched.next_chunk(
                 self.arena.free_pages if self.paged else 1 << 62, room=room)
             if not groups and (decode is not None or replays):
@@ -936,6 +985,9 @@ class StageExecutor:
             self.stats["skipped_documents"] = len(self.sched.oversized)
             self.stats["num_evictions"] = self.num_evictions
             self.stats["recomputed_tokens"] = self.recomputed_tokens
+            self.stats["answer_admission"] = self.admission_mode
+            self.stats["headroom_trace"] = getattr(
+                self.answer_admission, "trace", [])
         if self.spans:
             self.torch.cuda.synchronize()
             # between forward passes the GPU runs readouts and uploads,
