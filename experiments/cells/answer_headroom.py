@@ -247,7 +247,9 @@ def estimate_sol(query: str, run_dir: str, mode: str, scale_factor: float,
         written = {}
         for prompt, node in maps.items():
             ids = ids_by_table[node.call.prompt.args[0].provider]
-            by_id = dict(zip(map(str, saved["id"]), saved[node.name]))
+            # the result names the id column after its alias, such as c.id
+            id_column = next(name for name in saved if name.endswith("id"))
+            by_id = dict(zip(map(str, saved[id_column]), saved[node.name]))
             written[prompt] = [by_id[str(row_id)] or "" for row_id in ids]
 
         def answer(prompt, assignment):
