@@ -149,6 +149,8 @@ class StageExecutor:
         self.knee_rows = knee_rows
         self.recomputed_tokens = 0
         self.decode_cost = decode_cost
+        # host seconds spent refreshing answer admission and admitting
+        self.admission_s = 0.0
         # rounds and the work in them: tokens by kind, attention pairs,
         # KV tokens read, and their SoL seconds when specs are known
         self.pass_work = dict(passes=0, decode_rows=0, replay_tokens=0,
@@ -972,13 +974,18 @@ class StageExecutor:
             if (self.answer_admission is not None
                     and (self.sched.pending or self.sched.waiting)):
                 stage = np.asarray(self.sched._stage)
+                started = time.perf_counter()
                 if self.admission_mode == "pooled":
                     self.answer_admission.refresh(stage, replays)
                 else:
                     self.answer_admission.refresh(stage, replays,
                                                   self._replay_pages(replays))
+                self.admission_s += time.perf_counter() - started
+            started = time.perf_counter()
             groups = self.sched.next_chunk(
                 self.arena.free_pages if self.paged else 1 << 62, room=room)
+            if self.answer_admission is not None:
+                self.admission_s += time.perf_counter() - started
             if not groups and (decode is not None or replays):
                 self._run_part([], decode, replays)
                 continue
@@ -1038,6 +1045,7 @@ class StageExecutor:
             self.stats["headroom_granted"] = getattr(
                 self.answer_admission, "granted", [])
             self.stats["pass_work"] = dict(self.pass_work)
+            self.stats["admission_s"] = self.admission_s
         if self.spans:
             self.torch.cuda.synchronize()
             # between forward passes the GPU runs readouts and uploads,

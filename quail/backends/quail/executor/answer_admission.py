@@ -248,20 +248,19 @@ class HeadroomAdmission(AnswerAdmission):
     - R(j): the SoL seconds rebuilding the answer's prefix adds when
       it outgrows j pages and is evicted.
 
-    Headrooms are chosen again each time the curves are rebuilt.
+    Every refresh rebuilds the curves and the value of a page, and
+    chooses the headroom of running answers again.
     """
 
     def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
                  shared, page_cost, decode_cost=None, page_holds=None, *,
-                 choose_headroom=True, chunk_tokens=0, curve_refresh=32,
-                 bucket_answers=30):
+                 choose_headroom=True, chunk_tokens=0, bucket_answers=30):
         super().__init__(decoder, prefix_lengths, capacity_extra, dependencies,
                          shared, page_cost, decode_cost, page_holds)
         self.page_cost = page_cost
         self.capacity_extra = capacity_extra
         self.choose_headroom = choose_headroom and decode_cost is not None
         self.chunk_tokens = chunk_tokens
-        self.curve_refresh = curve_refresh
         self.bucket_answers = bucket_answers
         self.bucket = input_bucket(self.prefix)
         self.slot_map = np.full(len(self.prefix), -1, dtype=np.int64)
@@ -271,8 +270,6 @@ class HeadroomAdmission(AnswerAdmission):
         self.replay_pages = 0
         self.page_value = 0.0
         self.bucket_curves = {}
-        self._ended = -1
-        self._rebuilt = 0
         self._refreshes = 0
         # (refresh, map, bucket, answers, mean headroom pages) per rebuild
         self.trace = []
@@ -282,19 +279,14 @@ class HeadroomAdmission(AnswerAdmission):
         self.granted_at = []
 
     def refresh(self, stages, replays=(), replay_pages=0):
-        """Rebuild the work, the curves when answers ended, and each headroom."""
+        """Rebuild the work, the curves, and each running answer's headroom."""
         super().refresh(stages, replays)
         decoder = self.decoder
         for q, slots in decoder.answer_slots.items():
             self.slot_map[np.asarray(slots, dtype=np.int64)] = q
         self.replay_pages = int(replay_pages)
         self._refreshes += 1
-        ended = sum(int((lengths >= 0).sum()) for lengths in decoder.lengths)
-        # rebuild after a tenth more answers ended, or every curve_refresh
-        if self.choose_headroom and (
-                self._ended < 0 or ended > 1.1 * self._ended + 1
-                or self._refreshes - self._rebuilt >= self.curve_refresh):
-            self._ended, self._rebuilt = ended, self._refreshes
+        if self.choose_headroom:
             self._rebuild_curves()
             self.page_value = self._page_value(stages)
             running = self._running()

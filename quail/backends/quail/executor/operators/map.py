@@ -283,6 +283,7 @@ def admission_metrics(stats) -> dict:
             sum(entry[3] * entry[4] for entry in trace) / answers, 3)
         if answers else 0.0,
     }
+    metrics["admission_s"] = round(stats.get("admission_s", 0.0), 3)
     for name, value in stats.get("pass_work", {}).items():
         metrics[f"pass_{name}"] = round(value, 3) if isinstance(value, float) else value
     return metrics

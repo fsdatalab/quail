@@ -117,7 +117,8 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
                     "answer_tokens": sum(m.get("answer_tokens", 0) for m in maps),
                     "decode_rows": sum(m.get("decode_rows", 0) for m in maps),
                     **{key: value for m in maps for key, value in m.items()
-                       if key.startswith(("headroom_", "pass_")) and value},
+                       if key.startswith(("headroom_", "pass_", "admission_s"))
+                       and value},
                     "answer_p50": int(np.percentile(lengths, 50)) if lengths else None,
                     "answer_p90": int(np.percentile(lengths, 90)) if lengths else None,
                     "answers_sha256": digest.hexdigest(),
