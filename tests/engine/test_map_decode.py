@@ -610,6 +610,21 @@ def test_headroom_grows_with_long_answers_and_shrinks_when_pages_are_valuable():
     assert short._candidate_headroom(2) < roomy
 
 
+def test_a_page_is_priced_over_the_prompt_and_headroom_a_document_takes():
+    _, admission = headroom_admission(ended=[(0, 30), (1, 31)], num_documents=4,
+                                      prefix_tokens=8000)
+    admission.refresh(np.array([-2, -2, -1, -1]))
+    value = admission.page_value
+    added = admission._added_work(2)
+    base = admission.work if admission.work.tokens else added
+    gain = admission.decode_cost.gain(base, added, admission.expected_tokens[2])
+    prompt_pages = admission.page_cost(8000 + 6)
+    headroom = int(admission._admission_headroom(2, value)[1].sum())
+    assert headroom > 0
+    assert value == gain / (prompt_pages + headroom)
+    assert value < gain / prompt_pages
+
+
 def test_headroom_of_running_answers_is_counted_against_new_documents():
     # rebuilding a long prompt costs more than a page saves the next document
     decoder, admission = headroom_admission(ended=[(2, 30)], prefix_tokens=8000)

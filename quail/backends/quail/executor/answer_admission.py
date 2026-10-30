@@ -32,7 +32,8 @@ class HeadroomAdmission:
       of all its map's answers until bucket_answers of its own ended.
     - D(j): j times the value of one page to waiting documents, the
       SoL seconds one waiting document saves by joining passes that
-      run anyway, divided by the pages its prompt takes.
+      run anyway, divided by the pages it takes: its prompt and the
+      headroom its answers get at that value.
     - R(j): the SoL seconds rebuilding the answer's prefix adds when
       it outgrows j pages and is evicted.
 
@@ -206,7 +207,15 @@ class HeadroomAdmission:
                     limit, prior=whole)
 
     def _page_value(self, stages):
-        """SoL seconds one page saves a waiting document, 0 when none waits."""
+        """SoL seconds one page saves a waiting document, 0 when none waits.
+
+        The document takes its prompt's pages and its answers' headroom,
+        and that headroom depends on the value of a page. The value is
+        the fixed point v = gain / (prompt pages + headroom at v), found
+        from the prompt-only value: each step lowers v and raises the
+        headroom, a whole number of pages, so it ends where the headroom
+        repeats.
+        """
         waiting = np.flatnonzero((stages == -1) & self.roots & ~self.committed)
         if not len(waiting):
             return 0.0
@@ -215,11 +224,24 @@ class HeadroomAdmission:
         # with nothing running, price joining a pass that holds one such answer
         base = self.work if self.work.tokens else added
         gain = self.decode_cost.gain(base, added, self.expected_tokens[anchor])
-        pages = self.page_cost(int(self.prefix[anchor]) + self.capacity_extra)
-        return gain / max(1, pages)
+        prompt_pages = self.page_cost(int(self.prefix[anchor]) + self.capacity_extra)
+        value, headroom = gain / max(1, prompt_pages), None
+        while True:
+            pages = int(self._admission_headroom(anchor, value)[1].sum())
+            if pages == headroom:
+                return value
+            headroom = pages
+            value = gain / max(1, prompt_pages + headroom)
 
-    def _choose(self, slots, written=None, available=None, origin=None):
-        """Return each slot's headroom pages, minimizing D(j) + P(Y > j) R(j)."""
+    def _choose(self, slots, written=None, available=None, origin=None,
+                page_value=None):
+        """Return each slot's headroom pages, minimizing D(j) + P(Y > j) R(j).
+
+        D(j) prices a page at page_value, the current value of a page
+        when None.
+        """
+        if page_value is None:
+            page_value = self.page_value
         decoder = self.decoder
         page_tokens = decoder.page_tokens
         chosen = np.zeros(len(slots), dtype=np.int64)
@@ -252,7 +274,7 @@ class HeadroomAdmission:
                 limit, held + pages * page_tokens)
             recover = self.decode_cost.replay_seconds(self.work, tokens,
                                                       self.chunk_tokens)
-            chosen[mine] = np.argmin(pages * self.page_value + overrun * recover,
+            chosen[mine] = np.argmin(pages * page_value + overrun * recover,
                                      axis=1)
         return chosen
 
@@ -264,16 +286,24 @@ class HeadroomAdmission:
                 self.trace.append((self._refreshes, q, b, len(mine),
                                    float(self._remaining(mine).mean())))
 
+    def _admission_headroom(self, anchor, page_value=None):
+        """Headroom pages each of a document's answers would get if admitted.
+
+        Returns:
+            The answer slots and their headroom pages, before any answer
+            token is written.
+        """
+        slots = np.flatnonzero((self.parent == anchor) & (self.slot_map >= 0))
+        zeros = np.zeros(len(slots), dtype=np.int64)
+        return slots, self._choose(
+            slots, zeros, self.capacity[slots] - self.prompt[slots],
+            self.prompt[slots], page_value)
+
     def _candidate_headroom(self, anchor):
         """Headroom pages a document's answers would hold, chosen now."""
         if not self.choose_headroom:
             return 0
-        slots = np.flatnonzero((self.parent == anchor) & (self.slot_map >= 0))
-        if not len(slots):
-            return 0
-        zeros = np.zeros(len(slots), dtype=np.int64)
-        chosen = self._choose(slots, zeros, self.capacity[slots] - self.prompt[slots],
-                              self.prompt[slots])
+        slots, chosen = self._admission_headroom(anchor)
         self.reach[slots] = self.capacity[slots] + chosen * self.decoder.page_tokens
         return int(chosen.sum())
 
