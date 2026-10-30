@@ -516,6 +516,55 @@ def _apply_overrides(text: str) -> None:
         print(f"override {module}.{name} = {value}", flush=True)
 
 
+def _watch_compiles(window):
+    """Log each Triton and FlashInfer CuTe DSL compile that runs during a run.
+
+    Each entry gives the seconds from the run's start, the kernel, and
+    the seconds the compile took.
+    """
+    import triton
+    from triton import knobs
+
+    started = {}
+
+    def before(*, key, repr, fn, **_):
+        started[str(key)] = time.perf_counter()
+
+    def after(*, key, repr, fn, **_):
+        if "start" not in window:
+            return
+        now = time.perf_counter()
+        window["compiles"].append({
+            "at_s": round(now - window["start"], 3),
+            "kernel": f"{fn.module}.{fn.name}",
+            "seconds": round(now - started.pop(str(key), now), 3),
+            "signature": repr[:300]})
+
+    knobs.runtime.jit_cache_hook = before
+    knobs.runtime.jit_post_compile_hook = after
+    del triton
+    try:
+        from flashinfer.gdn_kernels.delta_rule_dsl import delta_rule_sm90
+    except ImportError:
+        return
+    original = delta_rule_sm90.cached_compile
+
+    def cached_compile(func, *args, **kwargs):
+        begun = time.perf_counter()
+        compiled = original(func, *args, **kwargs)
+        seconds = time.perf_counter() - begun
+        # a cache hit returns in microseconds
+        if seconds > 0.005 and "start" in window:
+            window["compiles"].append({
+                "at_s": round(begun - window["start"], 3),
+                "kernel": f"cute:{type(func).__name__}",
+                "seconds": round(seconds, 3),
+                "signature": str(func._get_compile_key())[:300]})
+        return compiled
+
+    delta_rule_sm90.cached_compile = cached_compile
+
+
 def child(arguments: str) -> None:
     """Run one query several times in a fresh session; print a RESULT line per run.
 
@@ -542,6 +591,7 @@ def child(arguments: str) -> None:
     modes, top = args["modes"], args["top"]
     print(f"quail from {quail.__file__}", flush=True)
     window = {}
+    _watch_compiles(window)
     from experiments.cells.piecewise_probe import PiecewiseProbe
     probe = PiecewiseProbe()
     from quail.backends.quail.executor import cuda_graphs, stage_executor
@@ -627,7 +677,10 @@ def child(arguments: str) -> None:
             window["verify"] = mode == "verify"
             window["eager"] = mode == "eager"
             window["work"] = mode == "work"
+            window["compiles"] = []
+            window["start"] = time.perf_counter()
             output = run_query(session, spec, tables)
+            del window["start"]
             answer_rows = _answer_rows(output)
             answers_path = f"{args['stats_prefix']}-run{run}-answers.json"
             Path(answers_path).write_text(json.dumps(answer_rows))
@@ -662,6 +715,7 @@ def child(arguments: str) -> None:
                 "nodes": nodes,
                 "allocator": window.get("allocator"),
                 "piecewise": piecewise,
+                "compiles": window["compiles"],
                 "accuracy": evaluate(spec, output, suite.ground_truth, tables),
             }
             if window["trace"] is not None:
