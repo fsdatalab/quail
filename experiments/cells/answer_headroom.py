@@ -37,13 +37,37 @@ REWRITE = ("Rewrite the review as a balanced one that gives both the strengths "
 PARTIES = "List every party to the agreement with its role."
 LIABILITY = "Quote every clause that limits liability or caps damages."
 SECTIONS = "Summarize each section of the agreement in one sentence."
-OBLIGATIONS = "List every obligation of each party, clause by clause."
-DEFINITIONS = "List every defined term with its definition."
-DATES = ("List every date, deadline, and notice period the agreement sets, "
-         "with what each applies to.")
-PAYMENTS = "List every payment, fee, and price term, with amounts and conditions."
-TERMINATION = ("Quote every clause that lets a party terminate the agreement, "
-               "with its conditions.")
+# long lists and summaries of one aspect of a contract each
+CONTRACT_MAPS = (
+    ("obligations", "List every obligation of each party, clause by clause."),
+    ("definitions", "List every defined term with its definition."),
+    ("sections", SECTIONS),
+    ("dates", "List every date, deadline, and notice period the agreement "
+              "sets, with what each applies to."),
+    ("payments", "List every payment, fee, and price term, with amounts and "
+                 "conditions."),
+    ("termination", "Quote every clause that lets a party terminate the "
+                    "agreement, with its conditions."),
+    ("parties", PARTIES),
+    ("licensing", "Describe every intellectual property, license, and "
+                  "ownership term, clause by clause."),
+    ("confidentiality", "Describe every confidentiality and non-disclosure "
+                        "obligation, with its scope and duration."),
+    ("warranties", "List every warranty, representation, and disclaimer each "
+                   "party makes."),
+    ("indemnification", "Describe every liability limit and indemnification "
+                        "duty, with what it covers."),
+    ("disputes", "Describe the governing law, venue, and every dispute "
+                 "resolution step."),
+    ("assignment", "Describe every assignment, transfer, and change of "
+                   "control term."),
+    ("insurance", "List every insurance, audit, and record-keeping "
+                  "requirement."),
+    ("renewal", "Describe the term of the agreement and every renewal and "
+                "extension term."),
+    ("notices", "List every notice requirement, with who must be notified, "
+                "how, and when."),
+)
 LIMIT = 1024
 QUERIES = {
     "one long map": (f"SELECT r.id, AI.MAP(r.body, '{PLOT}', {LIMIT}) "
@@ -58,16 +82,14 @@ QUERIES = {
         f"AI.MAP(c.text, '{LIABILITY}', {LIMIT}) AS liability, "
         f"AI.MAP(c.text, '{SECTIONS}', {LIMIT}) AS sections "
         "FROM contracts c"),
-    # six long answers per long contract: a contract read once per pass
-    # serves six answers, and an eviction recomputes the whole contract
-    "six contract maps": (
+    # long answers per long contract: a contract read once per pass serves
+    # all of them, and an eviction recomputes the whole contract
+    **{f"{count} contract maps": (
         "SELECT c.id, " + ", ".join(
             f"AI.MAP(c.text, '{prompt}', {LIMIT}) AS {name}"
-            for name, prompt in (
-                ("obligations", OBLIGATIONS), ("definitions", DEFINITIONS),
-                ("sections", SECTIONS), ("dates", DATES),
-                ("payments", PAYMENTS), ("termination", TERMINATION)))
-        + " FROM contracts c"),
+            for name, prompt in CONTRACT_MAPS[:size])
+        + " FROM contracts c")
+       for count, size in (("six", 6), ("sixteen", 16))},
 }
 # modes that run a vLLM baseline backend instead of a Quail admission mode
 VLLM_MODES = ("stock_vllm", "pipelined_vllm")
@@ -77,9 +99,11 @@ WARMUP_DOCUMENTS = 64
 image = gpu_image()
 
 
-def register_tables(session, reviews, scale_factor: float,
-                    num_documents: int) -> dict:
+def register_tables(session, reviews, scale_factor: float, num_documents: int,
+                    num_contracts: int = 0) -> dict:
     """Register the first num_documents reviews and every other table whole.
+
+    num_contracts above zero keeps only the first contracts.
 
     Returns:
         Each registered table's row ids, in row order.
@@ -92,6 +116,8 @@ def register_tables(session, reviews, scale_factor: float,
     for path in sorted((Path(DATA_DIR) / f"sf{scale_factor}").glob("*.parquet")):
         if path.stem != "reviews":
             tables[path.stem] = pq.read_table(path)
+    if num_contracts and "contracts" in tables:
+        tables["contracts"] = tables["contracts"].slice(0, num_contracts)
     for name, table in tables.items():
         session.register(name, quail.DocumentProvider.from_table(table, id_col="id"))
     return {name: table.column("id").to_pylist() for name, table in tables.items()}
@@ -117,7 +143,8 @@ def step_totals(steps: Path, first: int) -> tuple[int, int, int]:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=4 * 3600,
               volumes=VOLUMES)
 def run_mode(mode: str, query_ids: list[str], scale_factor: float,
-             num_documents: int, repeats: int, run_dir: str) -> str:
+             num_documents: int, repeats: int, run_dir: str,
+             num_contracts: int = 0) -> str:
     """Run the queries under one admission mode and save their measurements.
 
     A query id names one of QUERIES, run on the first num_documents
@@ -149,14 +176,16 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
     config = quail.EngineConfig(
         gpus=1, model="qwen3-4b-fp8",
         backend=mode if mode in VLLM_MODES else "quail", device="h100-sxm")
-    report = {"mode": mode, "num_documents": num_documents, "queries": {}}
+    report = {"mode": mode, "num_documents": num_documents,
+              "num_contracts": num_contracts, "queries": {}}
     with quail.Session(config) as session:
         # warm up on reviews the timed queries do not read, so no KV is reused
         session.register("warmup", quail.DocumentProvider.from_table(
             table.slice(len(table) - WARMUP_DOCUMENTS), id_col="id"))
         warmup = next(iter(QUERIES.values())).replace("FROM reviews", "FROM warmup")
         session.sql(warmup).run().collect()
-        register_tables(session, table, scale_factor, num_documents)
+        register_tables(session, table, scale_factor, num_documents,
+                        num_contracts)
         tokenizer = session.tokenizer
         for name in query_ids:
             runs = []
@@ -205,7 +234,8 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
 
 @app.local_entrypoint()
 def compare(modes: str = "prompt,headroom", queries: str = ",".join(QUERIES),
-            scale_factor: float = 0.1, num_documents: int = 1000, repeats: int = 2):
+            scale_factor: float = 0.1, num_documents: int = 1000, repeats: int = 2,
+            num_contracts: int = 0):
     query_ids = [name for name in queries.split(",") if name]
     # IMDB-20 brings the reviews and CUAD-22 the contracts
     ensure_data.remote(scale_factor, ["IMDB-20", "CUAD-22"] + [
@@ -215,7 +245,7 @@ def compare(modes: str = "prompt,headroom", queries: str = ",".join(QUERIES),
     run_dir = f"{OUTPUT_DIR}/{run_id}"
     print(f"run directory: {run_dir}", flush=True)
     calls = [run_mode.spawn(mode, query_ids, scale_factor, num_documents, repeats,
-                            run_dir)
+                            run_dir, num_contracts)
              for mode in filter(None, modes.split(","))]
     for call in calls:
         print(call.get(), flush=True)
@@ -223,7 +253,7 @@ def compare(modes: str = "prompt,headroom", queries: str = ",".join(QUERIES),
 
 @app.function(image=image, cpu=8, memory=65536, timeout=3600, volumes=VOLUMES)
 def estimate_sol(query: str, run_dir: str, mode: str, scale_factor: float,
-                 num_documents: int) -> str:
+                 num_documents: int, num_contracts: int = 0) -> str:
     """Price one query's SoL with the answers a saved run wrote.
 
     quail.speed_of_light_estimate: unlimited KV, ideal packing, each
@@ -241,7 +271,8 @@ def estimate_sol(query: str, run_dir: str, mode: str, scale_factor: float,
     table = pq.read_table(Path(DATA_DIR) / f"sf{scale_factor}" / "reviews.parquet")
     config = quail.EngineConfig(gpus=1, model="qwen3-4b-fp8", device="h100-sxm")
     with quail.Session(config) as session:
-        ids_by_table = register_tables(session, table, scale_factor, num_documents)
+        ids_by_table = register_tables(session, table, scale_factor, num_documents,
+                                       num_contracts)
         built = session.sql(QUERIES[query])
         maps = {node.call.prompt: node for node in built.logical.operators().maps}
         written = {}
@@ -271,9 +302,10 @@ def estimate_sol(query: str, run_dir: str, mode: str, scale_factor: float,
 
 @app.local_entrypoint()
 def sol(run_dir: str, queries: str = "six contract maps", mode: str = "headroom",
-        scale_factor: float = 1.0, num_documents: int = 1000):
+        scale_factor: float = 1.0, num_documents: int = 1000, num_contracts: int = 0):
     for query in filter(None, queries.split(",")):
-        call = estimate_sol.spawn(query, run_dir, mode, scale_factor, num_documents)
+        call = estimate_sol.spawn(query, run_dir, mode, scale_factor, num_documents,
+                                  num_contracts)
         print(f"function call id: {call.object_id} ({query})", flush=True)
         print(call.get(), flush=True)
 
