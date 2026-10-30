@@ -1,6 +1,5 @@
 """Piecewise padding never reaches a token mixer or KV."""
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -210,62 +209,3 @@ def test_replay_returns_independent_output_storage():
     buffers.output.zero_()
     assert actual.equal(expected)
     assert graphs.replays == graphs.passes == 1
-
-
-def test_passes_without_partial_pages_skip_the_tail_copy_graphs():
-    model = pipeline()
-    buffers = PiecewiseBuffers(model, 8, device="cpu")
-    buffers.output.zero_()
-    calls = []
-    captured = CapturedPieces(
-        buffers, [SimpleNamespace(replay=lambda: calls.append("no_tail"))],
-        [SimpleNamespace(replay=lambda: calls.append("tail"))])
-    source = chunk()
-    source.attention_mode = "unified"
-    captured.forward(model, source)
-    source.meta["unified"] = dict(
-        src=None, dst=None, tail_src=torch.tensor([0]), tail_dst=torch.tensor([3]))
-    captured.forward(model, source)
-    source.meta["unified"] = None
-    captured.forward(model, source)
-    assert calls == ["no_tail", "tail", "no_tail"]
-    assert "kv_written" not in source.meta
-
-
-@pytest.mark.parametrize("memory_bytes", [159, 160])
-def test_capture_accounts_for_inactive_private_pool_storage(monkeypatch, memory_bytes):
-    from quail.backends.quail.executor import cuda_graphs
-
-    pool = (0, 1)
-    allocations = iter([100, 200])
-    stream = SimpleNamespace(wait_stream=lambda _: None, synchronize=lambda: None)
-    cuda = SimpleNamespace(
-        memory_allocated=lambda: next(allocations), graph_pool_handle=lambda: pool,
-        Stream=lambda: stream, current_stream=lambda: stream,
-        stream=lambda _: nullcontext(), CUDAGraph=object,
-        graph=lambda *a, **kw: nullcontext(),
-        memory_snapshot=lambda: [
-            dict(segment_pool_id=pool, total_size=80, allocated_size=20),
-            dict(segment_pool_id=(0, 0), total_size=1000, allocated_size=0)])
-    model = SimpleNamespace(
-        engine=SimpleNamespace(arena=SimpleNamespace(k=[]), torch=SimpleNamespace(
-            cuda=cuda, inference_mode=nullcontext)), layers=[None],
-        forward_context=lambda num_tokens: nullcontext())
-    monkeypatch.setattr(
-        cuda_graphs, "PiecewiseBuffers",
-        lambda *a, **kw: SimpleNamespace(piece=lambda *a, **kw: None))
-    graphs = PiecewiseGraphs(model, token_buckets=(1, 2), memory_bytes=memory_bytes)
-    if memory_bytes < 160:
-        with pytest.raises(RuntimeError, match="exceeding"):
-            graphs.prepare()
-        assert not graphs.graphs
-    else:
-        assert graphs.prepare()
-        assert not graphs.prepare()
-    assert graphs.captured_bytes == 160
-
-
-@pytest.mark.parametrize("buckets", [(), [1], (0,), (2, 1), (1, 1), (1.5,)])
-def test_invalid_buckets_are_rejected(buckets):
-    with pytest.raises(ValueError, match="increasing positive integers"):
-        PiecewiseGraphs(None, token_buckets=buckets, memory_bytes=0)

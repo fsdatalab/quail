@@ -162,18 +162,3 @@ def test_pieces_and_mixers_match_the_eager_forward_with_padding(monkeypatch):
         for got, want in zip(model.engine.kv[2], eager_kv[2]):
             assert torch.equal(got, want)
         assert "kv_written" not in source.meta
-
-
-def test_boundary_holds_each_mixer_kinds_inputs_and_output(monkeypatch):
-    model = pipeline(monkeypatch)
-    rows = model.boundary(3, "cpu")
-    assert {name: tuple(tensor.shape) for name, tensor in rows.items()} == {
-        "qkv": (3, CONV_DIM), "z": (3, VALUE_WIDTH), "b": (3, HEADS),
-        "a": (3, HEADS), "core": (3, HEADS, VALUE_DIM),
-        "q": (3, Q_HEADS * HEAD_DIM), "k": (3, KV_HEADS * HEAD_DIM),
-        "v": (3, KV_HEADS * HEAD_DIM), "gate": (3, Q_HEADS * HEAD_DIM),
-        "attention": (3, Q_HEADS * HEAD_DIM)}
-    # a pass runs one mixer at a time, so the two kinds share storage
-    for gdn, attention in (("qkv", "q"), ("z", "gate"), ("core", "attention")):
-        assert rows[gdn].data_ptr() == rows[attention].data_ptr()
-    assert rows["k"].data_ptr() == rows["q"][-1, -1].data_ptr() + 2

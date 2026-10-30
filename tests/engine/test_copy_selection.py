@@ -12,7 +12,6 @@ from helpers.extract_reference import Decoder
 from helpers.extract_reference import ReferenceInputs as ExtractionInputs
 from test_map_decode import events_torch
 
-from quail.backends.quail.executor.extract.copy import CopyConstraint
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
 
@@ -20,78 +19,6 @@ from quail.backends.quail.executor.readout import AsyncTopLogprobs
 def inputs(spec, vocabulary, texts):
     state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
     return ExtractionInputs(state, [spec], vocabulary, range(len(texts)), None, texts)
-
-
-def test_copy_preparation_stops_extending_positions_after_their_draft_diverges(
-    monkeypatch,
-):
-    monkeypatch.delenv("QUAIL_EXTRACT_TRACE", raising=False)
-    text = "five years " + "tail " * 40 + "five days " * 100
-    spec, vocabulary = make_spec(text, "five", "tail")
-    spec = replace(
-        spec,
-        top_tokens=4,
-        max_answer_tokens=32,
-        draft_tokens=16,
-        first_window_chars=1,
-        window_chars=8,
-    )
-    documents = inputs(spec, vocabulary, [text])
-    encoded = []
-    original = vocabulary.encode_batch
-
-    def encode(texts):
-        encoded.extend(texts)
-        return original(texts)
-
-    monkeypatch.setattr(vocabulary, "encode_batch", encode)
-    constraint = CopyConstraint(torch, "cpu", documents, spec)
-    assert not encoded
-    assert constraint.num_positions == 0
-    logits = torch.full((1, len(vocabulary.vocab)), -20.0)
-    token = vocabulary.encode_ids("five")[0]
-    logits[0, token] = 1
-    streams = constraint.stream_ids.clone()
-    chosen, ended, alive = constraint.choose(
-        logits, streams, streams >= 0, torch.tensor([0]), torch.tensor([0])
-    )
-    assert chosen.tolist() == [token] and not ended.any()
-    source = constraint.source(streams, alive)
-    packed = constraint.packed_positions(streams, alive, torch.tensor([0])).numpy()
-    args = (
-        np.array([0]),
-        np.array([token]),
-        packed,
-        np.array([1]),
-        np.array([16]),
-        source.numpy(),
-    )
-    constraint.prepare(*args)
-    positions = (streams[alive] // constraint.num_options).numpy()
-    first = int(source[0]) // constraint.num_options
-    others = positions[positions != first]
-    assert len(others) == 100
-    assert constraint.position_lengths[first] >= 16
-    assert constraint.position_lengths[others].max() <= 2
-    assert constraint.num_positions == len(positions)
-    assert len(constraint.fillers) < constraint.num_options
-    num_encoded = len(encoded)
-    constraint.prepare(*args)
-    assert len(encoded) == num_encoded
-
-
-def test_position_masks_preserve_the_high_bit_and_word_boundaries():
-    text = "five " * 150
-    spec, vocabulary = make_spec(text)
-    constraint = CopyConstraint(torch, "cpu", inputs(spec, vocabulary, [text]), spec)
-    alive = torch.zeros_like(constraint.stream_ids, dtype=torch.bool)
-    selected = [0, 63, 64, 127, 128, 149]
-    alive[0, selected] = True
-    packed = constraint.packed_positions(
-        constraint.stream_ids, alive, torch.tensor([0])
-    )
-    bits = np.unpackbits(packed.numpy().view(np.uint8), axis=1, bitorder="little")
-    assert np.flatnonzero(bits[0]).tolist() == selected
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

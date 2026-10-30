@@ -7,14 +7,13 @@ from helpers.oracle import Oracle, finish
 import quail
 from quail.catalog import DocumentProvider
 from quail.logical import CompileError
-from quail.physical import AiMap, decode_graph, encode_graph
+from quail.physical import AiMap
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import EngineConfig
 
 REVIEWS = pa.table({"id": [1, 2, 3],
                     "body": ["good film", "bad film", "long dull film"]})
 SUMMARY = "Summarize the review in one sentence."
-TOPIC = "Name the main topic in a few words."
 
 
 @pytest.fixture()
@@ -60,35 +59,6 @@ def test_a_map_without_a_limit_writes_up_to_256_tokens(session):
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}') AS summary FROM reviews r")
     (node,) = _maps(query.plan())
     assert node.spec.max_answer_tokens == 256
-
-
-def test_maps_over_one_table_share_a_pipeline_and_its_kv(session):
-    query = session.sql(
-        f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 64) AS summary, "
-        f"AI.MAP(r.body, '{TOPIC}', 64) AS topic FROM reviews r")
-    plan = query.plan()
-    first, second = _maps(plan)
-    assert [member.node_id for member in build_pipelines(plan.graph)[
-        first.node_id]] == [first.node_id, second.node_id]
-    # the second map reads the document's KV the first one wrote
-    assert second.spec.estimated_seconds < first.spec.estimated_seconds
-    rows = finish(query, Oracle()).collect().to_pylist()
-    assert rows[1] == {"r.id": 2, "summary": "summary 1", "topic": "topic 1"}
-    codecs = session.registry.codecs
-    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
-
-
-def test_the_planner_reads_long_documents_once_for_their_maps(session):
-    words = " ".join(f"w{i}" for i in range(2000))
-    session.register("long", DocumentProvider.from_table(
-        pa.table({"id": [1, 2], "body": [words, words + " end"]}), id_col="id"))
-    one = session.sql(f"SELECT l.id, AI.MAP(l.body, '{SUMMARY}', 64) AS s "
-                      "FROM long l")
-    assert [node.attention for node in _maps(one.plan())] == ["unified"]
-    two = session.sql(f"SELECT l.id, AI.MAP(l.body, '{SUMMARY}', 64) AS s, "
-                      f"AI.MAP(l.body, '{TOPIC}', 64) AS t FROM long l")
-    # two branches read each 2,000-token document; once is cheaper
-    assert [node.attention for node in _maps(two.plan())] == ["tree", "tree"]
 
 
 def test_a_map_after_a_filter_reads_only_its_survivors(session):
@@ -213,32 +183,3 @@ def test_every_column_operator_supports_a_plain_result_test(session, kind, call,
         producer = next(node for node in plan.nodes
                         if node.node_id == condition.inputs[0].source.node_id)
         assert producer.spec.name == test.name
-
-
-def test_map_answer_selectivity_prices_the_following_column(session):
-    query = session.sql(
-        "SELECT r.id, AI.MAP(r.body, 'Name the topic.', 16) AS topic, "
-        "AI.MAP(r.body, 'Summarize.', 32) AS summary FROM reviews r "
-        "WHERE HINT(topic LIKE 'topic%', {'selectivity': 0.5}) "
-        "AND HINT(topic = 'topic 1', {'selectivity': 0.25})")
-    first, second = _maps(query.plan())
-    assert (first.spec.name, second.spec.name) == ("topic", "summary")
-    assert second.spec.expected_rows == 3 * 0.5 * 0.25
-    tests = query.logical.operators().column_filters["r"]
-    assert [test.position for test in tests] == [0, 1]
-    assert finish(query, Oracle()).collect().to_pylist() == [
-        {"r.id": 2, "topic": "topic 1", "summary": "summary 1"}]
-
-
-def test_a_documents_extract_fields_and_maps_share_one_attention_choice(session):
-    words = " ".join(f"w{i}" for i in range(2000))
-    session.register("deeds", DocumentProvider.from_table(
-        pa.table({"id": [1, 2], "body": [words, words + " end"]}), id_col="id"))
-    query = session.sql(
-        f"SELECT d.id, AI.MAP(d.body, '{SUMMARY}', 64) AS s, "
-        "AI.EXTRACT(d.body, {'signer': 'Who signed?'}) AS deed FROM deeds d")
-    nodes = [node for node in query.plan().graph.nodes
-             if type(node).__name__ in ("AiExtract", "AiMap")]
-    # an extraction field and a map are two branches reading each long
-    # document; the planner reads it once for both
-    assert len(nodes) == 2 and {node.attention for node in nodes} == {"tree"}

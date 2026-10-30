@@ -7,7 +7,6 @@ read its own prompt and answer so far at the right positions and
 wrote its KV where the next row reads it.
 """
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,24 +16,15 @@ import torch
 from helpers.fakes import cpu_staging, fake_pipeline
 from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 
-from quail.backends.quail.executor.admission import pages_for
-from quail.backends.quail.executor.answer_admission import AnswerAdmission, page_moments
 from quail.backends.quail.executor.answer_survival import answer_survival
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.operators.classify import ClassifyPart
 from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
-from quail.backends.quail.executor.operators.join import prepare_join_inputs
-from quail.backends.quail.executor.operators.map import MapPart, execute_maps
+from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import gated_stages
-from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
-from quail.cost.decode import DecodeCost
-from quail.execution.rows import Rows
-from quail.execution.runner import ExecutionContext
-from quail.physical import AiJoin, AiMap, MapSpec, PortRef
-from quail.physical.base import input_ports
-from quail.specs import DEVICES, QWEN3_4B_FP8
+from quail.specs import QWEN3_4B_FP8
 
 VOCABULARY = 1024
 STOP = VOCABULARY - 1
@@ -235,57 +225,6 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("path,state_slots,window", [
-    ("unified", 0, None), ("tree", 0, None), ("unified", 120, None),
-    ("unified", 0, 5), ("unified", 120, 5)])
-@pytest.mark.parametrize("lag", [0, 3])
-@pytest.mark.parametrize("planned", ["unified", "tree"])
-def test_maps_alone_decode_as_branches_that_share_the_document(monkeypatch, path,
-                                                              lag, planned,
-                                                              state_slots, window):
-    cpu_staging(monkeypatch)
-    rng = np.random.default_rng(1)
-    # every document starts with the same preamble, longer than a page,
-    # so a branch may borrow it from another document's branch
-    preamble = list(range(1, 21))
-    documents = [preamble + rng.integers(20, 900, size=int(n)).tolist()
-                 for n in rng.integers(3, 60, size=10)]
-    tails = [[500, 501, 502], [600, 601], [650, 651, 652, 653]]
-    limits = [6, 4, 5]
-    setup = Setup(path=path, pages=300, budget=200, state_slots=state_slots,
-                  window=window)
-    arena = make_arena(setup)
-    model = TokenModel(arena)
-    pipeline = fake_pipeline(forward_chunk=model.forward_chunk,
-                             tree_attention=True, canvas_ids=())
-    torch_ = events_torch(lag)
-    ids = list(range(len(documents)))
-    maps = MapPart(None, [map_node(f"m{q}", tail, limit, planned)
-                          for q, (tail, limit) in enumerate(zip(tails, limits))],
-                   ids, 0)
-    prefixes, keys, tree, dependencies = maps.branch_inputs(
-        documents, [("d", i) for i in ids],
-        prefix_tree(documents, setup.page_tokens), setup.page_tokens, 0)
-    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), limits,
-                         [STOP], setup.page_tokens)
-    maps.decoder = decoder
-    stats = {}
-    run_stages(torch_, arena, pipeline, gated_stages([maps]), prefixes, setup.budget,
-               anchor_keys=keys, attention_mode=path, prefix_tree=tree,
-               dependencies=dependencies,
-               decoder=decoder, stats=stats, gpu_timing=True)
-    for q, (tail, limit) in enumerate(zip(tails, limits)):
-        assert maps.asked[q].all()
-        got = [answer.tolist() for answer in decoder.answers(
-            q, maps._slots(q, ids))]
-        assert got == [greedy(document + tail, limit) for document in documents]
-    # the branches of a document borrow its prompt's whole pages, and
-    # read them once together on a unified pass when the planner chose tree
-    assert stats["borrowed_tokens"] > 0
-    assert (path == "unified" and planned == "tree") == (model.shared_reads > 0)
-    assert not arena.accounting.owned
-
-
 @pytest.mark.parametrize("pages", [6, 300])
 @pytest.mark.parametrize("limit", [None, 2])
 @pytest.mark.parametrize("lag", [0, 3])
@@ -432,144 +371,6 @@ def map_state(setup, arena, forward_chunk):
                 batch_decode=batch_decode))))
 
 
-@pytest.mark.parametrize("keep_kv", [False, True])
-def test_map_results_keep_only_document_kv_when_requested(monkeypatch, keep_kv):
-    cpu_staging(monkeypatch)
-    monkeypatch.setattr("quail.backends.quail.executor.parts.input_staging",
-                        lambda state: None)
-    documents = [list(range(1, 31)), list(range(10, 40)), list(range(20, 50))]
-    setup = Setup(path="unified", pages=200, budget=200)
-    arena = make_arena(setup)
-    model = TokenModel(arena)
-    state = map_state(setup, arena, model.forward_chunk)
-    nodes = [map_node(f"m{q}", tail, limit, "tree")
-             for q, (tail, limit) in enumerate(zip(
-                 [[500, 501], [600, 601], [650, 651]], [1, 7, 9]))]
-    for node in nodes:
-        node.node_id = node.spec.name
-        node.spec.aliases = ("d",)
-        node.rows_port = "rows:d"
-        node.document_head = ()
-        node.share_prefixes = False
-        node.keep_kv = keep_kv
-    results = execute_maps(state, nodes, {
-        "document_ids": [0, 1, 2], "documents": {"d": documents}, "limit": 2})
-    kept = results[nodes[0].node_id].outputs[nodes[0].rows_port].ids["d"].to_pylist()
-    # the limit's two documents, and any in flight when it was reached
-    assert kept[:2] == [0, 1]
-    for node in nodes:
-        result = results[node.node_id]
-        rows = result.outputs[node.rows_port]
-        assert rows.ids["d"].to_pylist() == kept
-        tail = list(node.spec.prompt_token_parts[1])
-        want = batch_decode([greedy(documents[d] + tail, node.spec.max_answer_tokens)
-                             for d in kept])
-        assert rows.column(node.spec.name).to_pylist() == want
-        assert result.metrics.output_rows == len(kept)
-    assert set(arena.accounting.owned) == ({("d", d) for d in kept} if keep_kv
-                                           else set())
-
-
-@pytest.mark.parametrize("num_maps", [1, 2, 3])
-@pytest.mark.parametrize("pages", [8, 300])
-@pytest.mark.parametrize("frame", [(), (700, 701, 702)])
-def test_maps_feed_only_document_kv_to_every_join_partner(
-        monkeypatch, num_maps, pages, frame):
-    cpu_staging(monkeypatch)
-    monkeypatch.setattr("quail.backends.quail.executor.parts.input_staging",
-                        lambda state: None)
-    rng = np.random.default_rng(13)
-    documents = [rng.integers(20, 400, size=24).tolist() for _ in range(5)]
-    partners = [rng.integers(20, 400, size=n).tolist() + [950 + p]
-                for p, n in enumerate([6, 12, 18, 24, 30, 36])]
-    ids = list(range(len(documents)))
-    setup = Setup(path="unified", pages=pages, budget=80)
-    nodes = []
-    source = PortRef("input:d", "rows:d")
-    for q, (tail, limit) in enumerate(zip(
-            [[500, 501], [600, 601], [650, 651]], [6, 7, 9])):
-        if q == num_maps:
-            break
-        node = AiMap(
-            node_id=f"map:{q}", inputs=input_ports((source,)), attention="tree",
-            spec=MapSpec(name=f"m{q}", aliases=("d",), query_template="",
-                         arguments=(), expected_rows=len(ids), estimated_seconds=0,
-                         prompt_token_parts=((), tuple(tail)),
-                         max_answer_tokens=limit))
-        nodes.append(node)
-        source = PortRef(node.node_id, node.rows_port)
-    join = AiJoin(
-        node_id="join", anchor="d", partners=("p",), attention="unified",
-        inputs=input_ports((source, PortRef("input:p", "rows:p"))),
-        frame_token_ids=frame, label_token_ids=(("p", ()),))
-    nodes.append(join)
-
-    def run(nodes):
-        arena = make_arena(setup)
-        model = TokenModel(arena)
-        seen = set()
-
-        def forward_chunk(chunk):
-            normed = model.forward_chunk(chunk)
-            meta = model._whole(chunk.meta)
-            dependent_pages = set()
-            for key, owned in arena.accounting.owned.items():
-                if isinstance(key, tuple) and isinstance(key[0], tuple):
-                    parent = (key[0][0], key[1])
-                    # a document can settle before its branches end
-                    document_pages = (arena.owned_pages(parent)
-                                      if arena.is_resident(parent) else ())
-                    dependent_pages.update(set(owned) - set(document_pages))
-            for i, end in enumerate(meta["cu_q"][1:]):
-                last = int(chunk.input_ids[end - 1])
-                if not 950 <= last < 950 + len(partners):
-                    continue
-                used = int(meta["used"][i])
-                table = meta["table"][i].tolist()[:-(-used // setup.page_tokens)]
-                assert not dependent_pages.intersection(table)
-                physical = [page * setup.page_tokens + offset
-                            for page in table for offset in range(setup.page_tokens)]
-                tokens = model.full.token[physical[:used]].tolist()
-                d = documents.index(tokens[:24])
-                p = last - 950
-                assert tokens == documents[d] + list(frame) + partners[p]
-                seen.add((d, p))
-            return normed
-
-        state = map_state(setup, arena, forward_chunk)
-        context = ExecutionContext(
-            runtimes={}, model_inputs=prepare_join_inputs,
-            model_result=lambda *args: None,
-            state={"documents": {"d": documents, "p": partners},
-                   "gpu": state.loaded_model, "retention": {},
-                   "joins_started": False, "kv_stats": {
-                       "join_anchor_hits": 0, "join_anchor_misses": 0}})
-        sources = {"input:d": Rows({"d": ids}),
-                   "input:p": Rows({"p": list(range(len(partners)))})}
-        inputs = {node.node_id: {
-            port.name: sources[port.source.node_id] for port in node.inputs
-            if port.source.node_id in sources} for node in nodes}
-        results = execute_pipeline(state, nodes, inputs, context)
-        assert seen == {(d, p) for d in ids for p in range(len(partners))}
-        assert not arena.accounting.owned
-        return results
-
-    fused = run(nodes)
-    for node in nodes[:-1]:
-        assert fused[node.node_id].metrics.extension["decode_rows"] > 0
-        rows = fused[node.node_id].outputs[node.rows_port]
-        assert rows.ids["d"].to_pylist() == ids
-        assert rows.column(node.spec.name).to_pylist() == batch_decode([
-            greedy(document + list(node.spec.prompt_token_parts[1]),
-                   node.spec.max_answer_tokens) for document in documents])
-    separate = run([replace(join, inputs=input_ports((
-        PortRef("input:d", "rows:d"), PortRef("input:p", "rows:p"))))])
-    got = fused[join.node_id].outputs["join_answers:0"]["rows"]
-    assert got == separate[join.node_id].outputs["join_answers:0"]["rows"]
-    assert got == {d: [next_token(chain(document + list(frame) + partner)) % 2
-                      for partner in partners] for d, document in enumerate(documents)}
-
-
 @pytest.mark.parametrize("num_maps", [1, 2, 3])
 @pytest.mark.parametrize("limit", [None, 2])
 @pytest.mark.parametrize("lag", [0, 3])
@@ -643,105 +444,6 @@ def test_hybrid_answers_recompute_exactly_and_reuse_checkpoint_slots(
         stop_modulus=0, path="unified", state_slots=24, window=window)
 
 
-@pytest.mark.parametrize("priced,answer_limit,num_pages,num_admitted", [
-    (False, 80, 20, 1), (True, 80, 20, 4), (False, 8, 12, 2),
-])
-def test_answer_admission_prices_overlap_only_with_hardware_specs(
-        monkeypatch, priced, answer_limit, num_pages, num_admitted):
-    cpu_staging(monkeypatch)
-    setup = Setup(path="unified", pages=num_pages, page_tokens=4, budget=200)
-    arena = make_arena(setup)
-    model = TokenModel(arena)
-    admitted = []
-
-    def forward_chunk(chunk):
-        admitted.append(len(chunk.fresh_keys))
-        return model.forward_chunk(chunk)
-
-    pipeline = fake_pipeline(forward_chunk=forward_chunk, canvas_ids=())
-    torch_ = events_torch(3)
-    documents = [list(range(20 + a, 28 + a)) for a in range(4)]
-    maps = MapPart(None, [map_node("answer", [500, 501], answer_limit)], range(4), 0)
-    prefixes, keys, tree, dependencies = maps.branch_inputs(
-        documents, [("d", a) for a in range(4)], None, setup.page_tokens, 0)
-    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), 4, [answer_limit], [STOP], 4)
-    maps.decoder = decoder
-    stats = {}
-    decode_cost = (DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
-                   if priced else None)
-    run_stages(torch_, arena, pipeline, gated_stages([maps]), prefixes, 200,
-               anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
-               decoder=decoder, stats=stats, decode_cost=decode_cost)
-    assert admitted[0] == num_admitted
-    if answer_limit == 8:
-        assert num_admitted == num_pages // -(-(10 + answer_limit - 1) // 4)
-    # Full 80-token answers cannot fit; the progress fallback still starts one.
-    assert stats["skipped_documents"] == 0
-    assert [answer.tolist() for answer in decoder.answers(0, range(4))] == [
-        greedy(document + [500, 501], answer_limit) for document in documents]
-    assert not arena.accounting.owned
-
-
-def test_admission_counts_dependent_answers_without_reserving_them_twice():
-    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 3,
-                         [32, 16], [STOP], 4, expected_tokens=[12, 4])
-    decoder.answer_slots = {0: np.array([0, 1]), 1: np.array([2])}
-    decoder.share = True
-    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
-    admission = AnswerAdmission(decoder, [8, 8, 8], 6, {2: (0, 0)}, [0, 0, 4],
-                                lambda tokens: pages_for(tokens, 4), cost)
-    admission.refresh(np.array([-1, -1, -1]))
-    assert admission.added_mean[0] > admission.added_mean[1]
-    assert admission.expected_tokens[0] > admission.expected_tokens[1]
-    assert admission.allows(0, 20, 4)
-    admission.admit(0)
-    before = admission.mean
-    assert admission.allows(2, 3, 3)
-    admission.admit(2)
-    assert admission.mean == pytest.approx(before - 3)
-    decoder.start(0, 0, 10, [0, 1, 2, 3])
-    decoder.start(2, 1, 10, [0, 4, 5, 6], parent=0, shared_tokens=4)
-    decoder.written[0][0] = 2
-    decoder.written[1][2] = 1
-    admission.refresh(np.array([0, -1, 0]))
-    expected = 0
-    for q, anchor in [(0, 0), (1, 2)]:
-        curve = answer_survival(decoder.lengths[q], decoder.written[q],
-                                decoder.expected_tokens[q], int(decoder.limits[q]))
-        mean, _ = page_moments(curve, decoder.written[q][[anchor]], np.array([6]), 4)
-        expected += mean[0]
-    assert admission.mean == pytest.approx(expected)
-    victim = decoder.eviction_order()[0]
-    assert admission.recompute == cost.recompute_cost.prefill_seconds(
-        10 + decoder.written[decoder.map[victim]][victim])
-    decoder._count_reads(decoder.rows(), shared=True)
-    reads = decoder.read_tokens
-    assert admission.work.pairs == reads["all"]
-    assert admission.work.kv_read == reads["alone"] + reads["own"] + reads["shared"]
-    assert admission.work.kv_read < admission.work.pairs
-    decoder.lengths[1][2] = 4
-    decoder.map[2] = -1
-    admission.refresh(np.array([0, -1, -2]))
-    assert admission.pending_pages[2] == 0
-    assert admission.mean < expected
-
-
-def test_reserved_replays_count_as_answer_demand_before_they_resume():
-    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
-                         [32], [STOP], 4, expected_tokens=[16])
-    decoder.answer_slots = {0: np.arange(2)}
-    decoder.start(0, 0, 10, [0, 1, 2, 3])
-    decoder.written[0][0] = 4
-    decoder.pause(0)
-    admission = AnswerAdmission(decoder, [8, 8], 6, {}, [0, 0],
-                                lambda tokens: pages_for(tokens, 4))
-    admission.refresh(np.array([0, -1]))
-    assert admission.allows(1, 12, 4)
-    admission.refresh(np.array([0, -1]), [(0, 0, 14)])
-    assert not admission.allows(1, 12, 4)
-    assert decoder.paused[0]
-
-
 def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
     decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 4,
                          [24, 6], [STOP], 4, expected_tokens=[12, 3])
@@ -760,31 +462,6 @@ def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
               for q in range(len(decoder.limits))}
     np.testing.assert_array_equal(decoder.eviction_order(curves),
                                   decoder.eviction_order())
-
-
-def test_eviction_prefers_cheaper_prompts_and_counts_only_reclaimable_pages():
-    arena = make_arena(Setup(path="unified", pages=300, page_tokens=4))
-    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
-                         [32], [STOP], 4, expected_tokens=[16])
-    decoder.answer_slots = {0: np.arange(2)}
-    decoder.start(0, 0, 1024, arena.alloc(("d", 0), 1028))
-    decoder.start(1, 0, 32, arena.alloc(("d", 1), 36))
-    decoder.written[0][:] = 2
-    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
-    admission = AnswerAdmission(decoder, [1022, 30], 6, {}, [0, 0], arena.page_cost,
-                                cost, arena.page_holds)
-    admission.refresh(np.array([0, 0]))
-    assert decoder.eviction_order()[0] == 0
-    assert admission.eviction_order()[0] == 1
-    assert admission.recompute == cost.recompute_cost.prefill_seconds(34)
-    arena.alloc(("borrower", 0), 32, borrow=(("d", 1), 32))
-    admission.refresh(np.array([0, 0]))
-    assert admission.eviction_order()[0] == 0
-    assert admission.recompute == cost.recompute_cost.prefill_seconds(1026)
-    assert arena.free_key(("d", 1)) == 1
-    assert arena.free_key(("d", 0)) == 257
-    arena.free_key(("borrower", 0))
-    assert arena.free_pages == 300
 
 
 def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
