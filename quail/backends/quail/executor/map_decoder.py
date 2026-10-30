@@ -15,7 +15,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from quail.backends.quail.executor.chunk import DecodeRows, decode_groups
+from quail.backends.quail.executor.chunk import DecodeRows
+from quail.backends.quail.executor.groups import FullAttentionGroup
 
 # copies of chosen tokens kept in flight before the host waits on the
 # oldest; two lets the host read a pass's tokens while the next runs
@@ -70,13 +71,7 @@ class MapDecoder:
         self.origin = np.zeros(n, dtype=np.int64)      # its first decode position
         self.fed = np.zeros(n, dtype=np.int64)         # decode rows packed
         self.stopped = np.zeros(n, dtype=bool)         # read a stop token
-        self.pages = np.zeros((n, 1), dtype=np.int32)  # its pages, padded
-        self.num_pages = np.zeros(n, dtype=np.int64)
-        # a slot borrows its first borrowed[slot] tokens' pages from
-        # parent[slot]; lead[slot] is the most any slot borrows from it
-        self.parent = np.arange(n, dtype=np.int64)
-        self.borrowed = np.zeros(n, dtype=np.int64)
-        self.lead = np.zeros(n, dtype=np.int64)
+        self.kv = FullAttentionGroup(n, page_tokens)
         self.device = head.device
         self.next_token = None
         self.copies = deque()
@@ -240,7 +235,6 @@ class MapDecoder:
             raise ValueError(f"document {document} is already writing an answer")
         if map_index in self.slot_maps:
             map_index = self.slot_maps[map_index][document]
-        self.set_pages(document, pages)
         self.map[document] = map_index
         self.origin[document] = position
         self.fed[document] = 0
@@ -249,49 +243,16 @@ class MapDecoder:
         self.copy_pending[document] = False
         self.num_streams[document] = 0
         self.drafts[document] = 0
-        self.parent[document] = document
-        self.borrowed[document] = 0
-        self.lead[document] = 0
-        if parent is not None and shared_tokens:
-            self.parent[document] = parent
-            self.borrowed[document] = shared_tokens
-            self.lead[parent] = max(self.lead[parent], shared_tokens)
-
-    def set_pages(self, document, pages):
-        """Update one slot's table after allocation or growth."""
-        pages = np.asarray(pages, dtype=np.int32)
-        if len(pages) > self.pages.shape[1]:
-            wider = np.zeros((len(self.map), len(pages)), dtype=np.int32)
-            wider[:, :self.pages.shape[1]] = self.pages
-            self.pages = wider
-        self.pages[document, :len(pages)] = pages
-        self.num_pages[document] = len(pages)
-
-    def add_pages(self, documents, pages) -> None:
-        """Append one page to each listed slot's table."""
-        width = int(self.num_pages[documents].max()) + 1
-        if width > self.pages.shape[1]:
-            wider = np.zeros((len(self.map), width), dtype=np.int32)
-            wider[:, :self.pages.shape[1]] = self.pages
-            self.pages = wider
-        self.pages[documents, self.num_pages[documents]] = pages
-        self.num_pages[documents] += 1
+        self.kv.start(document, pages, parent, shared_tokens)
 
     def pause(self, document):
         """Pause an answer and return slots whose shared-page identity changed."""
         self.paused[document] = True
-        children = np.flatnonzero(self.parent == document)
-        self.parent[children] = children
-        self.borrowed[children] = 0
-        self.parent[document] = document
-        self.borrowed[document] = 0
-        self.lead.fill(0)
-        np.maximum.at(self.lead, self.parent, self.borrowed)
-        return np.union1d(children, [document])
+        return self.kv.detach(document)
 
     def resume(self, document, pages):
         """Continue after prefilling the prompt and every saved answer token."""
-        self.set_pages(document, pages)
+        self.kv.set_pages(document, pages)
         self.fed[document] = self.written[self.map[document]][document]
         self.paused[document] = False
         self.drafts[document] = 0
@@ -311,10 +272,10 @@ class MapDecoder:
             written[mine] = self.written[q][mine]
             scores[mine] = curve[written[mine]]
         if recompute_cost is not None and len(running):
-            num_pages = self.num_pages[running]
+            num_pages = self.kv.num_pages[running]
             if page_holds is not None:
                 width = int(num_pages.max())
-                table = self.pages[running, :width]
+                table = self.kv.pages[running, :width]
                 num_pages = ((np.arange(width) < num_pages[:, None])
                              & (page_holds[table] == 1)).sum(axis=1)
             seconds = recompute_cost.prefill_seconds(
@@ -357,43 +318,8 @@ class MapDecoder:
                    - np.repeat(np.cumsum(counts) - counts, counts))
         running = np.repeat(running, counts)
         positions = self.origin[running] + self.fed[running] + offsets
-        page = positions // self.page_tokens
-        if (page >= self.num_pages[running]).any():
-            raise AssertionError("an answer's row is past its pages")
-        width = int(self.num_pages[running].max())
-        table = self.pages[running, :width]
-        index = np.arange(len(running))
-        write_rows = (table[index, page].astype(np.int64)
-                      * self.page_tokens + positions % self.page_tokens)
-        rows = DecodeRows(positions=positions, write_rows=write_rows,
-                          page_table=table, slots=running)
-        if not self.share:
-            return rows
-        # a group is a slot and the slots that borrow the most from it,
-        # whose first pages are the same; its rows read those pages once
-        # together when two or more of them run. A slot both borrowing
-        # and lent from takes the group with the longer shared pages
-        groups, shared = decode_groups(running, self.parent, self.borrowed, self.lead)
-        together = shared > 0
-        if not together.any():
-            return rows
-        skip = np.where(together, shared // self.page_tokens, 0)
-        own_width = int((self.num_pages[running] - skip).max())
-        columns = skip[:, None] + np.arange(own_width)
-        rows.own_table = np.where(
-            columns < self.num_pages[running][:, None],
-            table[index[:, None], np.minimum(columns, width - 1)], 0
-        ).astype(np.int32)
-        rows.own_lengths = positions + 1 - np.where(together, shared, 0)
-        member = np.flatnonzero(together)
-        order = member[np.argsort(groups[member], kind="stable")]
-        starts = np.flatnonzero(np.r_[True, np.diff(groups[order]) != 0])
-        rows.shared_rows = order
-        rows.shared_cu = np.r_[starts, len(order)].astype(np.int32)
-        firsts = order[starts]
-        most = int((shared[firsts] // self.page_tokens).max())
-        rows.shared_table = table[firsts, :most].astype(np.int32)
-        rows.shared_used = shared[firsts].astype(np.int32)
+        rows = self.kv.rows(running, positions, self.share)
+        rows.advance = ~self.constrained[self.map[running]]
         return rows
 
     def feed(self, chunk) -> None:

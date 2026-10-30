@@ -17,6 +17,7 @@ class DecodeCost:
     weight_seconds: float
     kv_seconds: float
     sliding_kv_seconds: float
+    state_seconds: float = 0.0
 
     @classmethod
     def from_specs(cls, model, device):
@@ -26,7 +27,8 @@ class DecodeCost:
         return cls(RetentionPolicy(**coefficients(model, device, peak=True)),
                    weight_bytes / device.hbm_bw,
                    model.kappa_full / device.hbm_bw,
-                   model.kappa_sliding / device.hbm_bw)
+                   model.kappa_sliding / device.hbm_bw,
+                   model.checkpoint_bytes / device.hbm_bw)
 
     def row_work(self, contexts, groups=None, shared=None):
         """Count per-row work, assigning each shared read to one group member."""
@@ -47,15 +49,19 @@ class DecodeCost:
             np.maximum.at(capped, inverse, shared_sliding)
             reads[firsts] += full
             sliding_reads[firsts] += capped
+        # Each answer advances its own state, even when its KV reads are shared.
+        state = np.ones(len(contexts)) if self.state_seconds else 0.0
         return Work(tokens=np.ones(len(contexts)), pairs=contexts,
                     kv_read=reads, sliding_pairs=sliding,
-                    sliding_kv_read=sliding_reads)
+                    sliding_kv_read=sliding_reads,
+                    state_read=state, state_written=state)
 
     def seconds(self, work):
         """Return the larger of pass memory time and pass compute time."""
         policy = self.recompute_cost
         memory = (self.weight_seconds + self.kv_seconds * work.kv_read
-                  + self.sliding_kv_seconds * work.sliding_kv_read)
+                  + self.sliding_kv_seconds * work.sliding_kv_read
+                  + self.state_seconds * (work.state_read + work.state_written))
         compute = (policy.linear_seconds * work.tokens
                    + policy.pair_seconds * work.pairs
                    + policy.sliding_pair_seconds * work.sliding_pairs)

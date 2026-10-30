@@ -1,4 +1,4 @@
-"""Copy decoding agrees with the recurrent extraction token rule on CPU."""
+"""Copy decoding agrees with the host reference token rule on CPU."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 import torch
 from helpers.extract_fakes import make_spec
+from helpers.extract_reference import Decoder, add_answers
+from helpers.extract_reference import ReferenceInputs as ExtractionInputs
 from test_map_decode import events_torch
 
-from quail.backends.quail.executor.extract.decode import Decoder
-from quail.backends.quail.executor.extract.stages import ExtractionInputs
 from quail.backends.quail.executor.map_decoder import MapDecoder
 
 
@@ -129,7 +129,7 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
 @pytest.mark.parametrize("lag", [0, 3])
 @pytest.mark.parametrize("pages", [24, 300])
 def test_copy_branches_match_reference_after_filters_and_limits(
-    monkeypatch, draft_tokens, limit, filtered, lag, pages
+    monkeypatch, draft_tokens, limit, filtered, lag, pages, state_slots=0
 ):
     from helpers.fakes import cpu_staging, fake_pipeline
     from helpers.kv_checker import Setup, chain, make_arena
@@ -170,7 +170,8 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         )
         for q in range(3)
     ]
-    setup = Setup(path="unified", pages=pages, page_tokens=4, budget=128)
+    setup = Setup(path="unified", pages=pages, page_tokens=4, budget=128,
+                  state_slots=state_slots)
     arena = make_arena(setup)
     torch_ = events_torch(lag)
     model = TokenModel(arena)
@@ -215,6 +216,17 @@ def test_copy_branches_match_reference_after_filters_and_limits(
     )
     part.decoder = decoder
     survivors = []
+    fed = []
+
+    def forward_chunk(chunk):
+        if state_slots and chunk.decode_rows is not None:
+            rows = chunk.decode_rows
+            tokens = chunk.input_ids[-len(rows):].tolist()
+            fed.extend((int(decoder.map[slot]), int(slot),
+                        int(position - decoder.origin[slot]), token)
+                       for slot, position, token in zip(
+                           rows.slots, rows.positions, tokens))
+        return model.forward_chunk(chunk)
 
     def settled(anchor, survived, row):
         if anchor < len(texts) and survived:
@@ -224,7 +236,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
     every, timed_spans, fresh = run_stages(
         torch_,
         arena,
-        fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=()),
+        fake_pipeline(forward_chunk=forward_chunk, canvas_ids=()),
         stages,
         prefixes,
         setup.budget,
@@ -235,6 +247,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         on_settled=settled,
         limit=limit,
         survival=1.0,
+        attention_mode=setup.path if state_slots else None,
     )
     expected_survivors = [
         d
@@ -247,6 +260,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         assert set(survivors) == set(expected_survivors)
     else:
         assert len(survivors) >= min(limit, len(expected_survivors))
+    add_answers(part.extraction)
     reference = Decoder(vocabulary, 4, 9, len(nodes), spec)
     for q, node in enumerate(nodes):
         assert set(np.flatnonzero(part.asked[q])) == set(survivors)
@@ -294,6 +308,22 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         )
         assert extension["steps"] >= len(asked)
     assert not arena.accounting.owned
+    if state_slots:
+        assert len(arena.accounting.free_slots) == state_slots
+        if draft_tokens:
+            assert any(position < decoder.lengths[q][slot] - 1
+                       and token != decoder.tokens[q][slot, position]
+                       for q, slot, position, token in fed), (
+                           "the workload must continue after rejecting a draft")
+
+
+@pytest.mark.parametrize("draft_tokens", [0, 3])
+@pytest.mark.parametrize("pages,lag,filtered", [(24, 0, False), (300, 3, True)])
+def test_hybrid_copy_answers_match_reference_after_rejected_drafts(
+        monkeypatch, draft_tokens, pages, lag, filtered):
+    test_copy_branches_match_reference_after_filters_and_limits(
+        monkeypatch, draft_tokens=draft_tokens, limit=None, filtered=filtered,
+        lag=lag, pages=pages, state_slots=120)
 
 
 def test_map_and_copy_fields_can_reuse_a_slot_without_changing_saved_spans():
@@ -428,6 +458,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         extracts.extraction.keys,
         keep_kv=False,
     )
+    add_answers(extracts.extraction)
     reference = Decoder(vocabulary, 4, 9, 2, spec)
     for d, document in enumerate(extracts.extraction.documents):
         prefix = list(map(int, document.prefix))

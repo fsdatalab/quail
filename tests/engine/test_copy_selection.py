@@ -8,11 +8,11 @@ import numpy as np
 import pytest
 import torch
 from helpers.extract_fakes import make_spec
+from helpers.extract_reference import Decoder
+from helpers.extract_reference import ReferenceInputs as ExtractionInputs
 from test_map_decode import events_torch
 
 from quail.backends.quail.executor.extract.copy import CopyConstraint
-from quail.backends.quail.executor.extract.decode import Decoder
-from quail.backends.quail.executor.extract.stages import ExtractionInputs
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
 

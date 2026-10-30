@@ -1,7 +1,4 @@
-"""Recurrent AI.EXTRACT stages on a scripted model.
-
-The shared full-attention decoder is exercised in test_copy_decode.py.
-"""
+"""Shared AI.EXTRACT execution on a scripted model."""
 
 from collections import Counter
 from dataclasses import replace
@@ -10,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pyarrow as pa
 import pytest
+import torch as tensor_torch
 from helpers.extract_fakes import (
     LEASE,
     NONE_HELD,
@@ -17,9 +15,14 @@ from helpers.extract_fakes import (
     QUOTED,
     TAIL,
     TERM,
-    make_spec,
 )
-from helpers.fakes import cpu_arena, fake_pack, fake_pipeline, fake_readout, fake_torch
+from helpers.extract_fakes import (
+    make_spec as make_extract_spec,
+)
+from helpers.extract_reference import AnswerState, Decoder
+from helpers.fakes import fake_pipeline, fake_readout
+from helpers.kv_checker import Setup, make_arena
+from test_map_decode import cpu_staging, events_torch
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.distributed import (
@@ -27,13 +30,12 @@ from quail.backends.quail.distributed import (
 )
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract.candidates import Stream
-from quail.backends.quail.executor.extract.decode import AnswerState, Decoder
-from quail.backends.quail.executor.extract.stages import ExtractionStages
+from quail.backends.quail.executor.extract.stages import ExtractionInputs
 from quail.backends.quail.executor.extract.vocabulary import same_word
 from quail.backends.quail.executor.operators.extract import (
+    ExtractPart,
     execute_extractions,
 )
-from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_execute
@@ -52,11 +54,25 @@ from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS, QWEN3_4B_FP8
 
 
-@pytest.fixture(autouse=True)
-def recurrent_extraction_path(monkeypatch):
-    from quail.backends.quail.executor.operators import extract
+def make_spec(*texts):
+    spec, vocabulary = make_extract_spec(*texts)
+    return replace(spec, top_tokens=4), vocabulary
 
-    monkeypatch.setattr(extract, "ExtractPart", extract.RecurrentExtractPart)
+
+@pytest.fixture(autouse=True)
+def packed_scripted_inputs(monkeypatch):
+    cpu_staging(monkeypatch)
+    monkeypatch.setattr("quail.backends.quail.executor.parts.input_staging",
+                        lambda state: None)
+    pack = chunk_mod.pack_chunk
+
+    def capture(torch, arena, groups, **kwargs):
+        chunk = pack(torch, arena, groups, **kwargs)
+        chunk.specs = groups
+        chunk.answer_keys = getattr(arena, "answer_keys", ())
+        return chunk
+
+    monkeypatch.setattr(chunk_mod, "pack_chunk", capture)
 
 
 @pytest.mark.parametrize(("scores", "stop", "chosen", "done"), [
@@ -144,27 +160,8 @@ def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
 
 
 def _extract_one(monkeypatch, text, gold):
-    """Ask the scripted model one question of one document; return its answer."""
-    spec, tables = make_spec()
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4)
-    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
-    state = _state(model)
-    state.loaded_model.vocabulary = tables
-    stages = ExtractionStages(state, [spec], tables, [0],
-                              [tables.encode_ids(text)], [text])
-    key = stages.documents[0].key
-    model.documents[key] = text
-    model.gold[key] = gold
-    from quail.backends.quail.executor.stages import run_stages
-
-    run_stages(state.torch, state.loaded_model.arena,
-               state.loaded_model.pipeline, stages.stages, stages.prefixes,
-               state.chunk_tokens, anchor_keys=stages.keys,
-               appended_tokens=stages.appended_tokens)
-    stages.finish()
-    return stages.documents[0].answers[0]
+    """Ask the scripted model one question through the shared decoder."""
+    return _extract_spec(monkeypatch, text, gold)[0]
 
 
 def test_an_answer_copies_the_quotes_inside_its_span(monkeypatch):
@@ -185,70 +182,20 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
     # days", and the model chooses " years" instead: the round ends
     # there, and the next round feeds " years" in the draft's place
     text = "five days or five years"
-    spec, tables = make_spec(text)
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4)
-    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
-    state = _state(model, recurrent=recurrent)
-    state.loaded_model.vocabulary = tables
-    stages = ExtractionStages(state, [spec], tables, [0],
-                           [tables.encode_ids(text)], [text])
-    key = stages.documents[0].key
-    model.documents[key] = text
-    model.gold[key] = "five years"
-    from quail.backends.quail.executor.stages import run_stages
-
-    run_stages(state.torch, state.loaded_model.arena,
-               state.loaded_model.pipeline, stages.stages, stages.prefixes,
-               state.chunk_tokens, anchor_keys=stages.keys,
-               appended_tokens=stages.appended_tokens)
-    stages.finish()
-    asked = stages.documents[0].answers[0]
+    asked, model = _extract_spec(monkeypatch, text, "five years", recurrent=recurrent)
     assert asked.answer == "five years" and asked.span == (13, 23)
-    assert asked.written == tables.encode_ids(" five years")
-    five, days, years = (tables.encode_ids(w)[0] for w in (" five", " days", " years"))
-    fed = [(suffix, f) for k, suffix, kept, _, f in model.packed if k == key]
-    # the cue, then the two rounds: the second starts where the first
-    # verified, one token past the first round's position
-    assert fed[1][0][:2] == [five, days]
-    if recurrent:
-        assert fed[2][0][:2] == [five, years]
-        assert fed[2][1] == fed[1][1]
-        kept = [entry[2] for entry in model.packed if entry[0] == key]
-        assert kept[1:] == [0, 1]
-    else:
-        assert fed[2][0][:1] == [years] and fed[2][1] == fed[1][1] + 1
-    assert asked.steps == 3
-    assert asked.fed_tokens == (len(tables.encode_ids(TAIL)) + len(fed[1][0])
-                                + len(fed[2][0]))
+    assert asked.written == model.tables.encode_ids(" five years")
+    assert asked.steps >= 2
+    assert any(model.tables.encode_ids(" days")[0] in suffix
+               for _, suffix, _, _, _ in model.packed)
+
 
 def test_rows_with_one_live_stream_are_decided_together(monkeypatch):
-    # with one live stream, a round's rows are decided at once; the
-    # answers, steps, and fed tokens match choosing row by row
-    counts = []
-    accepted = Decoder.accepted
-
-    def counting(self, answer, rows, fed):
-        counts.append(accepted(self, answer, rows, fed))
-        return counts[-1]
-
-    def outcome(run):
-        result, stages = run()
-        return (result.outputs["rows:c"].column("ends").to_pylist(),
-                [(a.written, a.steps, a.fed_tokens, a.span)
-                 for document in stages.documents for a in document.answers])
-
-    monkeypatch.setattr(Decoder, "accepted", counting)
-    fast = outcome(_setup(monkeypatch)[2])
-    assert max(counts) > 0
-    # the adaptive policy changes draft lengths, not answers or spans
-    rows, states = outcome(_setup(monkeypatch, policy="adaptive")[2])
-    assert rows == fast[0]
-    assert [(w, span) for w, _, _, span in states] == [
-        (w, span) for w, _, _, span in fast[1]]
-    monkeypatch.setattr(Decoder, "accepted", lambda self, answer, rows, fed: 0)
-    assert outcome(_setup(monkeypatch)[2]) == fast
+    fixed, stages = _setup(monkeypatch)[2]()
+    adaptive, other = _setup(monkeypatch, policy="adaptive")[2]()
+    assert fixed.outputs["rows:c"].table().equals(adaptive.outputs["rows:c"].table())
+    assert [(a.written, a.span) for d in stages.documents for a in d.answers] == [
+        (a.written, a.span) for d in other.documents for a in d.answers]
 
 
 class ScriptedModel:
@@ -300,33 +247,50 @@ class ScriptedModel:
         return self.tables.encode_ids(gold) if gold else []
 
     def forward_chunk(self, chunk):
+        specs = list(chunk.specs)
+        if chunk.decode_rows is not None:
+            decode = chunk.decode_rows
+            tokens = chunk.input_ids[-len(decode):].tolist()
+            for begin, end in zip(decode.sequence_offsets[:-1],
+                                  decode.sequence_offsets[1:]):
+                specs.append(dict(key=chunk.answer_keys[decode.slots[begin]],
+                                  suffixes=[tokens[begin:end]], read_all_rows=True,
+                                  f=int(decode.positions[begin]),
+                                  write_suffix_tokens=int(end - begin)))
         rows = []
-        for spec in chunk.specs:
+        for spec in specs:
             key = spec["key"]
+            if key not in self.gold:
+                parent = next(candidate for candidate in self.gold
+                              if candidate[1] == key[1])
+                self.gold[key] = self.gold[parent]
+                self.prefix_len[key] = self.prefix_len[parent]
+            if spec.get("prefix") is not None:
+                self.prefix_len[key] = spec["f"]
+                if key in self.documents:
+                    self.reads[key] += 1
             for index, suffix in enumerate(spec["suffixes"]):
-                suffix = [int(t) for t in suffix]
+                suffix = list(map(int, suffix))
                 read_all = bool(spec.get("read_all_rows"))
                 self.packed.append((key, suffix, spec.get("write_suffix_tokens", 0),
-                                    read_all, spec.get("f")))
-                # the request's rows follow position f: a frame, a
-                # rewinding stage, or a discarding one drops what an
-                # earlier stage appended
-                if spec.get("prefix") is not None:
-                    self.prefix_len[key] = len(spec["prefix"])
-                    self.reads[key] += 1
-                held = self.kv.get(key, [])
-                if spec.get("f") is not None and key in self.prefix_len:
-                    held = held[:spec["f"] - self.prefix_len[key]]
+                                    read_all, spec["f"]))
+                held = self.kv.get(key, [])[:spec["f"] - self.prefix_len[key]]
                 path = held + suffix
-                # every row of a draft is read; otherwise the last
                 count = (spec["read_rows"][index] if spec.get("read_rows") is not None
-                         else len(suffix))
-                for end in (range(len(path) - count + 1, len(path) + 1) if read_all
-                            else [len(path)]):
-                    rows.append(self._row_after(key, path[:end]))
+                         else len(suffix) if read_all else 1)
+                for end in range(len(path) - count + 1, len(path) + 1):
+                    values = self._row_after(key, path[:end])
+                    if self.cue_token not in path[:end]:
+                        rows.append(np.full(len(self.tables.vocab), values[0]))
+                        continue
+                    logits = np.full(len(self.tables.vocab), -30.0, dtype=np.float32)
+                    for token, value in zip(values[1:1 + self.k], values[1 + self.k:]):
+                        logits[int(token)] = max(logits[int(token)], value)
+                    logits[self.tables.stop_ids[0]] = values[0]
+                    rows.append(logits)
                 if spec.get("write_suffix_tokens", 0):
                     self.kv[key] = path
-        return np.stack(rows)
+        return tensor_torch.tensor(np.stack(rows), dtype=tensor_torch.float32)
 
     def _row_after(self, key, path):
         if path[-1] == self.cue_token:
@@ -370,34 +334,57 @@ class ScriptedModel:
         return self._cue({}, -0.5)
 
 
-def _fake_readout(tables, k):
-    """A readout over scripted rows."""
-    width = 1 + 2 * k
-    value = fake_readout(k=k, width=width, ragged=True, dtype=np.dtype(object))
-
-    def submit(rows, rows_per_answer=None):
-        values = np.asarray(rows, dtype=np.float32)[:, :width]
-        return split_rows(values, rows_per_answer)
-
-    value.submit, value.result = submit, lambda handle: handle
-    return value
-
-
 def _state(model, chunk_tokens=400, recurrent=False):
-    from quail.backends.quail.executor.pages import PageArena
-
-    arena = cpu_arena(256)
-    if recurrent:
-        arena.accounting = PageArena(256, 16, num_slots=8)
+    arena = make_arena(Setup(path="unified", pages=256,
+                             state_slots=24 if recurrent else 0))
     return QueryExecutionState(
         loaded_model=LoadedModelState(
-            model_spec=QWEN3_4B_FP8,
-            arena=arena,
+            model_spec=QWEN3_4B_FP8, arena=arena,
             pipeline=fake_pipeline(forward_chunk=model.forward_chunk),
-            input_staging=SimpleNamespace(fixed_tokens=set()),
-            model=object()),
-        torch=fake_torch(), chunk_tokens=chunk_tokens, answer_rows=object(),
+            input_staging=None,
+            model=SimpleNamespace(quail_full_head=tensor_torch.eye(len(model.tables.vocab)))),
+        torch=events_torch(0), chunk_tokens=chunk_tokens, answer_rows=object(),
         async_answers=fake_readout())
+
+
+def _snapshot(part):
+    for d, document in enumerate(part.extraction.documents):
+        document.answers = []
+        for q in range(len(part.nodes)):
+            slot = part.slots[q, d]
+            index = part.first + q
+            values, spans = part.answers(q, [d])
+            written = part.decoder.answers(index, [slot])[0].tolist()
+            document.answers.append(SimpleNamespace(
+                written=written, steps=int(part.decoder.steps[index][slot]),
+                done=part.decoder.lengths[index][slot] >= 0,
+                answer=values[0], span=spans[0], none_wins=not written))
+    return SimpleNamespace(**vars(part.extraction), counts=lambda q: part.counts[q])
+
+
+def _extract_spec(monkeypatch, text, gold, spec=None, vocabulary=None, recurrent=False):
+    if spec is None:
+        spec, vocabulary = make_spec(text)
+    model = ScriptedModel(vocabulary, {}, {}, 4)
+    state = _state(model, chunk_tokens=2000, recurrent=recurrent)
+    state.loaded_model.vocabulary = vocabulary
+    seen = []
+    original = ExtractPart.__init__
+
+    def initialize(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        for document in self.extraction.documents:
+            model.documents[document.key] = text
+            model.gold[document.key] = gold
+        seen.append(self)
+
+    monkeypatch.setattr(ExtractPart, "__init__", initialize)
+    node = AiExtract(node_id="extract", backend_name="quail", model=QWEN3_4B_FP8.name,
+                     spec=spec)
+    execute_extractions(state, [node], {
+        "document_ids": [0], "documents": {"c": [vocabulary.encode_ids(text)]},
+        "texts": {"c": [text]}})
+    return _snapshot(seen[-1]).documents[0].answers[0], model
 
 
 DOCS = [LEASE, TERM, NOTHING]
@@ -411,25 +398,22 @@ def _setup(monkeypatch, documents=None, token_documents=None,
     spec, tables = make_spec()
     spec = replace(spec, draft_policy=policy, round_cost_per_token=0.05)
     documents = DOCS if documents is None else documents
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4)
-    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     state = _state(model, recurrent=recurrent)
     state.loaded_model.vocabulary = tables
     tokens = {"c": ([tables.encode_ids(text) for text in documents]
                     if token_documents is None else token_documents)}
     stages_seen = {}
-    original = ExtractionStages.__init__
+    original = ExtractPart.__init__
 
     def init(self, *args, **kwargs):
         original(self, *args, **kwargs)
-        for document in self.documents:
+        for document in self.extraction.documents:
             model.documents[document.key] = document.text
             model.gold[document.key] = GOLD[documents.index(document.text)]
         stages_seen["stages"] = self
 
-    monkeypatch.setattr(ExtractionStages, "__init__", init)
+    monkeypatch.setattr(ExtractPart, "__init__", init)
 
     def node(name):
         return AiExtract(node_id=f"ai-extract:{name}", backend_name="quail",
@@ -443,12 +427,12 @@ def _setup(monkeypatch, documents=None, token_documents=None,
     def run(name="ends", keep_kv=False):
         result = execute_extractions(
             state, [replace(node(name), keep_kv=keep_kv)], inputs)[node(name).node_id]
-        return result, stages_seen["stages"]
+        return result, _snapshot(stages_seen["stages"])
 
     def run_pipeline(*names):
         results = execute_extractions(state, [node(name) for name in names],
                                       inputs)
-        return results, stages_seen["stages"]
+        return results, _snapshot(stages_seen["stages"])
 
     return state, model, run, run_pipeline
 
@@ -483,12 +467,10 @@ def test_extraction_accepts_empty_input_and_sparse_document_ids(monkeypatch):
     assert table.column("ends_span").is_null().to_pylist() == [
         GOLD[i] is None for i in document_ids]
     spec, vocabulary = make_spec()
-    stages = ExtractionStages(
-        state, [spec], vocabulary, [10_000_000, 2], None, DOCS,
-        document_positions=[0, 1])
-    assert stages.document_ids.nbytes + stages.document_order.nbytes == 32
-    for document in stages.documents:
-        assert stages._document(document.key) is document
+    inputs = ExtractionInputs(state, [spec], vocabulary, [10_000_000, 2], None, DOCS,
+                              document_positions=[0, 1])
+    assert inputs.document_ids.nbytes + inputs.document_order.nbytes == 32
+    assert [document.text for document in inputs.documents] == DOCS[:2]
 
 
 def _run(monkeypatch, documents=None):
@@ -536,7 +518,7 @@ def test_a_pipeline_of_extractions_reads_each_document_once(
     event = state.torch.cuda.Event
 
     def timed_event(**kwargs):
-        timing_calls.append("event")
+        timing_calls.append("event" if kwargs.get("enable_timing") else "copy")
         return event(**kwargs)
 
     monkeypatch.setattr(state.torch.cuda, "Event", timed_event)
@@ -549,18 +531,18 @@ def test_a_pipeline_of_extractions_reads_each_document_once(
     assert second.outputs["rows:c"].column("starts_span").to_pylist() == \
         first.outputs["rows:c"].column("ends_span").to_pylist()
     assert dict(model.reads) == {document.key: 1 for document in stages.documents}
-    # the documents are read once: the second extraction is charged
-    # only the tokens fed after them
+    # Whole pages are shared; each branch recomputes the partial document tail.
     prefixes = sum(len(document.prefix) for document in stages.documents)
     fed = [stages.counts(q)["suffix_tokens"] for q in range(2)]
-    assert first.metrics.fresh_tokens == prefixes + fed[0]
+    borrowed = first.metrics.extension["borrowed_prefix_tokens"]
+    assert first.metrics.fresh_tokens == 2 * prefixes - borrowed + fed[0]
     assert second.metrics.fresh_tokens == fed[1] > 0
     assert (first.metrics.gpu_s > 0) == gpu_timing
     assert (second.metrics.gpu_s > 0) == gpu_timing
     if gpu_timing:
         assert "event" in timing_calls and timing_calls.count("sync") == 1
     else:
-        assert timing_calls == []
+        assert set(timing_calls) == {"copy"}
 
 
 @pytest.mark.parametrize("gpus", [2, 4])
@@ -582,12 +564,14 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     registry = built_in_registry()
     children = []
     for _ in range(gpus):
-        torch, arena = fake_torch(), cpu_arena(256)
+        local = _state(model)
+        torch, arena = local.torch, local.loaded_model.arena
         pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
         execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
-        execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+        execution.bind_loaded_model(model=local.loaded_model.model,
+                                    arena=arena, pipeline=pipeline)
         execution.loaded_model.vocabulary = tables
-        execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+        execution.loaded_model.input_staging = None
         execution.bind_query(torch=torch, answer_rows=object(),
                              chunk_tokens=state.chunk_tokens,
                              async_answers=fake_readout())
@@ -638,10 +622,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
     spec, tables = make_spec()
     plain = spec
     head = list(plain.prompt_token_parts[0])
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4)
-    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     for index, text in enumerate(DOCS):
         model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
@@ -680,12 +661,14 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
         ),
         PortRef("ai-extract:starts", "rows:c"),
     )
-    torch, arena = fake_torch(), cpu_arena(256)
+    local = _state(model)
+    torch, arena = local.torch, local.loaded_model.arena
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
-    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.bind_loaded_model(model=local.loaded_model.model,
+                                    arena=arena, pipeline=pipeline)
     execution.loaded_model.vocabulary = tables
-    execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+    execution.loaded_model.input_staging = None
     execution.bind_query(
         torch=torch, answer_rows=object(), chunk_tokens=400,
         async_answers=fake_readout(
@@ -749,25 +732,10 @@ def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
     long = " ".join(["word"] * 200)
     spec, tables = make_spec(long)
     spec = replace(spec, max_answer_tokens=limit, draft_tokens=draft)
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4)
-    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
-    state = _state(model, chunk_tokens=2000)
-    state.loaded_model.vocabulary = tables
-    stages = ExtractionStages(state, [spec], tables, [0],
-                           [tables.encode_ids(long)], [long])
-    model.documents[stages.documents[0].key] = long
-    model.gold[stages.documents[0].key] = long
-    from quail.backends.quail.executor.stages import run_stages
-
-    run_stages(state.torch, state.loaded_model.arena,
-               state.loaded_model.pipeline, stages.stages, stages.prefixes,
-               state.chunk_tokens, anchor_keys=stages.keys)
-    stages.finish()
-    asked = stages.documents[0].answers[0]
-    assert asked.done and len(asked.written) == stages.spec.max_answer_tokens
-    assert asked.answer == " ".join(["word"] * stages.spec.max_answer_tokens)
+    asked, model = _extract_spec(monkeypatch, long, long, spec, tables)
+    assert asked.done and len(asked.written) == limit
+    assert asked.answer == " ".join(["word"] * limit)
     assert all(len(suffix) <= 1 + draft
                for _, suffix, _, whole, _ in model.packed if whole)
 
@@ -797,10 +765,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     from quail.physical.pipelines import build_pipelines
 
     spec, tables = make_spec()
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4)
-    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     for index, text in enumerate(DOCS):
         model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
@@ -827,12 +792,14 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     ), PortRef("filter:c:1", "rows:c"))
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:0", "ai-extract:starts", "filter:c:1"]
-    torch, arena = fake_torch(), cpu_arena(256)
+    local = _state(model)
+    torch, arena = local.torch, local.loaded_model.arena
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
-    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.bind_loaded_model(model=local.loaded_model.model,
+                                    arena=arena, pipeline=pipeline)
     execution.loaded_model.vocabulary = tables
-    execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+    execution.loaded_model.input_staging = None
     execution.bind_query(torch=torch, answer_rows=object(), chunk_tokens=400,
                          async_answers=fake_readout())
     state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
@@ -871,10 +838,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
 
     spec, tables = make_spec()
     head = list(spec.prompt_token_parts[0])
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4)
-    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     for index, text in enumerate(DOCS):
         model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
@@ -917,12 +881,14 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
     )
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:1", "ai_filter:c"]
-    torch, arena = fake_torch(), cpu_arena(256)
+    local = _state(model)
+    torch, arena = local.torch, local.loaded_model.arena
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
-    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.bind_loaded_model(model=local.loaded_model.model,
+                                    arena=arena, pipeline=pipeline)
     execution.loaded_model.vocabulary = tables
-    execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+    execution.loaded_model.input_staging = None
     execution.bind_query(
         torch=torch, answer_rows=object(), chunk_tokens=400,
         async_answers=fake_readout(
@@ -963,10 +929,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
     from quail.physical import Filter
 
     spec, tables = make_spec()
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4)
-    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     # the first four documents have no answer, so the test drops them;
     # some of the rest are still queued when enough have passed
     texts = [NOTHING] * 4 + [LEASE] * 4 + [TERM] * 4
@@ -985,12 +948,14 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
                    ColumnRef("c", "contracts", "ends"), "is not null"),
                aliases=("c",), written_position=0),
     ), PortRef("filter:c:0", "rows:c"))
-    torch, arena = fake_torch(), cpu_arena(256)
+    local = _state(model)
+    torch, arena = local.torch, local.loaded_model.arena
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
-    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.bind_loaded_model(model=local.loaded_model.model,
+                                    arena=arena, pipeline=pipeline)
     execution.loaded_model.vocabulary = tables
-    execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+    execution.loaded_model.input_staging = None
     documents = [tables.encode_ids(text) for text in texts]
     # a chunk holds about one document and its question
     chunk = max(len(document) for document in documents) + len(

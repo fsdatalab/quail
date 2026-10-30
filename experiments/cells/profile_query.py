@@ -4,9 +4,11 @@ Queries run in fresh processes. Modes are plain (no profiler), cprofile,
 sample (Python stack sampling), trace (torch.profiler), timeline
 (executor-step and GPU event timing), verify (graph/eager output checks),
 and eager (graphs disabled, unchanged KV capacity). Each run prints timing,
-allocation, accuracy, and result-digest fields. The env option sets child-process
-variables. A trace run also saves 5 seconds of its trace, from 40% into
-the run, as a Perfetto trace under /results/ablations/traces.
+allocation, accuracy, and result-digest fields, and saves the answer rows
+beside the profiles. The env option sets child-process variables;
+QUAIL_VLLM_EAGER=1 boots the vLLM baselines without CUDA graphs. A trace
+run also saves 5 seconds of its trace, from 40% into the run, as a
+Perfetto trace under /results/ablations/traces.
 
 Pass QUAIL_OVERRIDES=module:NAME=json-value;... in env to set module
 constants in the child, such as an executor constant under test, or
@@ -59,23 +61,44 @@ image = gpu_image(*([(BEFORE_LOCAL, BEFORE_REMOTE)]
 image = image.add_local_python_source("experiments.cells.piecewise_probe")
 
 
-def _digest(output) -> str:
+def _answer_rows(output) -> dict:
+    """Return each answer table's rows and the result rows, sorted."""
+    tables = {**output.filter_answers, **output.join_answers,
+              **(output.classify_answers or {}), **(output.map_answers or {}),
+              **(output.extract_answers or {})}
+    rows = {name: sorted(json.dumps(list(row.values()), default=str)
+                         for row in tables[name].to_pylist())
+            for name in sorted(tables)}
+    rows[""] = sorted(json.dumps(list(row.values()), default=str)
+                      for row in output.rows.to_pylist())
+    return rows
+
+
+def _digest(rows: dict) -> str:
     """Hash answer tables and result rows in document ID order."""
     import hashlib
 
     digest = hashlib.sha256()
-    tables = {**output.filter_answers, **output.join_answers,
-              **(output.classify_answers or {}), **(output.map_answers or {}),
-              **(output.extract_answers or {})}
-    for name in sorted(tables):
-        table = tables[name]
-        rows = sorted(json.dumps(list(row.values()), default=str)
-                      for row in table.to_pylist())
-        digest.update(json.dumps([name, rows]).encode())
-    rows = sorted(json.dumps(list(row.values()), default=str)
-                  for row in output.rows.to_pylist())
-    digest.update(json.dumps(rows).encode())
+    for name, table in rows.items():
+        if name:
+            digest.update(json.dumps([name, table]).encode())
+    digest.update(json.dumps(rows[""]).encode())
     return digest.hexdigest()[:16]
+
+
+def _eager_vllm() -> None:
+    """Boot the vLLM baselines without torch.compile or CUDA graphs."""
+    from quail.baselines import vllm as vllm_baseline
+
+    llm_kwargs = vllm_baseline.VLLMEngine.llm_kwargs
+
+    def eager_kwargs(self, spec, device=None):
+        kwargs = llm_kwargs(self, spec, device)
+        kwargs.pop("compilation_config", None)
+        return {**kwargs, "enforce_eager": True}
+
+    vllm_baseline.VLLMEngine.llm_kwargs = eager_kwargs
+    print("vLLM baselines boot eager", flush=True)
 
 
 def _forward_kernels(events):
@@ -513,6 +536,8 @@ def child(arguments: str) -> None:
 
     args = json.loads(arguments)
     _apply_overrides(os.environ.get("QUAIL_OVERRIDES", ""))
+    if os.environ.get("QUAIL_VLLM_EAGER"):
+        _eager_vllm()
     query_id, scale_factor = args["query_id"], args["scale_factor"]
     modes, top = args["modes"], args["top"]
     print(f"quail from {quail.__file__}", flush=True)
@@ -575,7 +600,8 @@ def child(arguments: str) -> None:
     tables = {relation.table: (suite.tables[relation.table].slice(0, sample_rows)
                               if sample_rows else suite.tables[relation.table])
               for relation in spec.info.relations}
-    config = quail.EngineConfig(gpus=1, model=args["model"], backend="quail",
+    config = quail.EngineConfig(gpus=1, model=args["model"],
+                                backend=args.get("backend", "quail"),
                                 device="h100-sxm", gpu_timing=True)
     with quail.Session(config) as session:
         for run, mode in enumerate(modes):
@@ -598,17 +624,31 @@ def child(arguments: str) -> None:
             window["eager"] = mode == "eager"
             window["work"] = mode == "work"
             output = run_query(session, spec, tables)
-            piecewise = window["piecewise"]
+            answer_rows = _answer_rows(output)
+            answers_path = f"{args['stats_prefix']}-run{run}-answers.json"
+            Path(answers_path).write_text(json.dumps(answer_rows))
+            piecewise = window.get("piecewise")
             measures = output.measurements
+            input_tokens = measures.get("input_tokens")
+            wall_s = measures.get("wall_s")
             nodes = {key: {name: value[name] for name in NODE_FIELDS
                            if name in value}
                      for key, value in measures["node_metrics"].items()}
             record = {
                 "query": query_id, "run": run, "mode": mode,
+                "backend": config.backend,
+                "input_tokens": input_tokens,
+                "input_tokens_per_second": (
+                    input_tokens / wall_s
+                    if input_tokens is not None and wall_s else None),
+                "cost_usd": (wall_s / 3600 * config.gpus
+                             * session.device.usd_per_hour
+                             if wall_s is not None else None),
                 "sample_rows": sample_rows,
                 "input_rows": {name: len(table) for name, table in tables.items()},
                 "quail": quail.__file__,
-                "digest": _digest(output),
+                "digest": _digest(answer_rows),
+                "answers_path": answers_path,
                 **{name: measures.get(name) for name in (
                     "wall_s", "model_wall_s", "gpu_s", "chunks", "frontend_s",
                     "planning_s", "input_ready_s", "physical_prepare_s",
@@ -646,7 +686,8 @@ def child(arguments: str) -> None:
               volumes=VOLUMES)
 def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                   model: str, modes: list[str], top: int, repeats: int,
-                  tag: str, env: str = "", sample_rows: int = 0) -> str:
+                  tag: str, env: str = "", sample_rows: int = 0,
+                  backend: str = "quail") -> str:
     """Profile each query in fresh processes and return its RESULT lines.
 
     Args:
@@ -660,6 +701,7 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
         tag: Prefix for saved profile filenames.
         env: Comma-separated KEY=VALUE variables for child processes.
         sample_rows: Keep the first rows of each input table; zero keeps all rows.
+        backend: Engine backend, such as quail or stock_vllm.
 
     Returns:
         Collected RESULT lines from all query processes.
@@ -689,6 +731,7 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                         scale_factor=scale_factor,
                         collection_id=collection_id,
                         model=model,
+                        backend=backend,
                         modes=modes,
                         top=top,
                         stats_prefix=prefix,
@@ -728,7 +771,7 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
 def profile(queries: str = "BIO-5,FEV-11", scale_factor: float = 0.1,
             model: str = "qwen3-4b-fp8", modes: str = "plain,cprofile",
             top: int = 30, repeats: int = 1, tag: str = "window",
-            env: str = "", sample_rows: int = 0):
+            env: str = "", sample_rows: int = 0, backend: str = "quail"):
     if sample_rows < 0:
         raise ValueError("sample_rows must be nonnegative")
     query_ids = [query.strip() for query in queries.split(",") if query.strip()]
@@ -736,7 +779,8 @@ def profile(queries: str = "BIO-5,FEV-11", scale_factor: float = 0.1,
     print(f"function call id: {data.object_id} (data)", flush=True)
     collection = data.get()
     call = profile_query.spawn(query_ids, scale_factor, collection, model,
-                               modes.split(","), top, repeats, tag, env, sample_rows)
+                               modes.split(","), top, repeats, tag, env, sample_rows,
+                               backend)
     print(f"function call id: {call.object_id} (profile {queries})", flush=True)
     for line in call.get().splitlines():
         print("SUMMARY " + line, flush=True)

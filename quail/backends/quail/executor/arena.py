@@ -83,6 +83,24 @@ class KVArena:
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
         self.reset_stats()
 
+    def bind_answers(self, group, keys):
+        """Own the answer slots' full-attention layout for this execution."""
+        from quail.backends.quail.executor.groups import (
+            SlidingAttentionGroup,
+            StateGroup,
+        )
+
+        self.answer_group = group
+        self.answer_keys = keys
+        self.sliding_group = (SlidingAttentionGroup(self, keys)
+                              if self.has_sliding else None)
+        self.state_group = StateGroup(self, keys) if self.num_state_slots else None
+
+    def answer_replays(self, rows):
+        """Return token spans needed to restore accepted answer state."""
+        return (self.state_group.replays(rows)
+                if rows is not None and self.num_state_slots else [])
+
     def _build(self, num_pages, page_tokens, num_sliding_pages, num_state_slots=0):
         torch = self.torch
         self.accounting = PageArena(num_pages, page_tokens, num_state_slots)
@@ -545,12 +563,16 @@ class KVArena:
         a pass's in one call; a key's row index is rebuilt only when
         something reads it.
         """
-        if self.sliding is not None:
-            raise ValueError("answers grow pages on full-attention models only")
-        self._evict_for_pages(len(keys), 0)
+        need_sliding = len(keys) if self.sliding is not None else 0
+        self._evict_for_pages(len(keys), need_sliding)
+        if (len(keys) > self.accounting.free_pages
+                or (self.sliding is not None
+                    and need_sliding > self.sliding.free_pages)):
+            return None
         added = self.accounting.grow_pages(keys)
-        if added is not None:
-            self._stale_rows.update(keys)
+        if self.sliding is not None:
+            self.sliding.grow_pages(keys)
+        self._stale_rows.update(keys)
         return added
 
     def reserve(self, key, tokens, *, capacity_tokens, borrow=None,

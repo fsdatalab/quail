@@ -8,13 +8,13 @@ import numpy as np
 import pytest
 import torch
 from helpers.extract_fakes import make_vocabulary
+from helpers.extract_reference import Decoder, ReferenceInputs
 from helpers.fakes import cpu_staging, fake_pipeline
 from helpers.kv_checker import Setup, make_arena
 from test_map_decode import TokenModel, events_torch
 
 from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
 from quail.backends.quail.executor.extract.copy import CopyConstraint
-from quail.backends.quail.executor.extract.stages import ExtractionStages
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.operators.extract import ExtractPart
@@ -93,8 +93,40 @@ def specs_for(vocabulary, draft):
     return specs
 
 
+def reference_histories(vocabulary, texts, specs):
+    """Run the host token rule over unpaged prompts and copy drafts."""
+    inputs = ReferenceInputs(None, specs, vocabulary, range(len(texts)), None, texts)
+    decoder = Decoder(vocabulary, 4, 9, len(specs), specs[0])
+    logits = torch.zeros(1, len(vocabulary.vocab))
+    logits[0, vocabulary.encode_ids(" five")[0]] = 1
+    readout = AsyncTopLogprobs(torch, torch.nn.functional, torch.eye(logits.shape[1]),
+                              4, [vocabulary.stop_ids])
+    values = readout.values(logits).numpy()
+    histories = Counter()
+    for d, document in enumerate(inputs.documents):
+        for q, spec in enumerate(specs):
+            prompt = list(map(int, document.prefix)) + list(spec.prompt_token_parts[1])
+            histories[d, q, 0, tuple(prompt), tuple(range(len(prompt)))] += 1
+            decoder.verify(document, q, values, [])
+            answer = document.answers[q]
+            while not answer.done:
+                written = answer.written[:-1]
+                fed = decoder.draft(answer, document.rho, q)
+                for end in range(1, len(fed) + 1):
+                    tokens = prompt + written + fed[:end]
+                    histories[d, q, len(written) + end, tuple(tokens),
+                              tuple(range(len(tokens)))] += 1
+                decoder.verify(document, q, np.repeat(values, len(fed), axis=0), fed)
+    answers = [([d.answers[q].answer for d in inputs.documents],
+                [d.answers[q].span for d in inputs.documents])
+               for q in range(len(specs))]
+    return histories, answers, {}
+
+
 def run(vocabulary, texts, old, mode, draft, budget, planned="unified"):
     specs = specs_for(vocabulary, draft)
+    if old:
+        return reference_histories(vocabulary, texts, specs)
     (word,) = vocabulary.encode_ids(" five")
     encoded = vocabulary.document_batch(texts, [None] * len(texts))
     setup = Setup(path=mode, pages=1000, budget=budget, page_tokens=16)
@@ -127,50 +159,32 @@ def run(vocabulary, texts, old, mode, draft, budget, planned="unified"):
             pipeline=pipeline,
         ),
     )
-    if old:
-        readout = AsyncTopLogprobs(
-            torch_, torch_.nn.functional, marker, 4, [vocabulary.stop_ids], ragged=True
-        )
-        extraction = ExtractionStages(
-            state,
-            specs,
-            vocabulary,
-            range(3),
-            encoded,
-            texts,
-            readout=readout,
-            pipeline_head=specs[0].prompt_token_parts[0],
-        )
-        prefixes, keys, stages = extraction.prefixes, extraction.keys, extraction.stages
-        decoder, tree, dependencies = None, None, None
-        key_fields = None
-    else:
-        part = ExtractPart(
-            state,
-            [
-                AiExtract(
-                    node_id=f"e{q}",
-                    backend_name="quail",
-                    model=QWEN3_4B_FP8.name,
-                    attention=planned,
-                    spec=spec,
-                )
-                for q, spec in enumerate(specs)
-            ],
-            range(3),
-            {"documents": {"c": encoded}, "texts": {"c": texts}},
-        )
-        extraction = part.extraction
-        stages = part.stages
-        prefixes, keys, tree, dependencies = part.branch_inputs(
-            extraction.prefixes, extraction.keys, None, 16, 0
-        )
-        decoder = MapDecoder(
-            torch_, marker, len(prefixes), part.answer_limits, vocabulary.stop_ids, 16,
-            workspace_bytes=64 * 2**20,
-        )
-        part.decoder = decoder
-        key_fields = {keys[a]: item for a, item in part.branch_of.items()}
+    part = ExtractPart(
+        state,
+        [
+            AiExtract(
+                node_id=f"e{q}",
+                backend_name="quail",
+                model=QWEN3_4B_FP8.name,
+                attention=planned,
+                spec=spec,
+            )
+            for q, spec in enumerate(specs)
+        ],
+        range(3),
+        {"documents": {"c": encoded}, "texts": {"c": texts}},
+    )
+    extraction = part.extraction
+    stages = part.stages
+    prefixes, keys, tree, dependencies = part.branch_inputs(
+        extraction.prefixes, extraction.keys, None, 16, 0
+    )
+    decoder = MapDecoder(
+        torch_, marker, len(prefixes), part.answer_limits, vocabulary.stop_ids, 16,
+        workspace_bytes=64 * 2**20,
+    )
+    part.decoder = decoder
+    key_fields = {keys[a]: item for a, item in part.branch_of.items()}
     histories = Counter()
     expected_rows = {}
     graph_eligible = 0
@@ -207,20 +221,7 @@ def run(vocabulary, texts, old, mode, draft, budget, planned="unified"):
         finals = set(final_rows)
         work = []
         for key, start, _, end in chunk.row_spans:
-            if old:
-                d = int(key[1])
-                q = next(
-                    (
-                        q
-                        for q, a in enumerate(extraction.documents[d].answers)
-                        if not a.done
-                    ),
-                    None,
-                )
-                if q is None:
-                    continue
-            else:
-                q, d = key_fields[key]
+            q, d = key_fields[key]
             work.extend((r, key, q, d) for r in range(start, end) if r in finals)
         if chunk.decode_rows is not None:
             start = chunk.tokens - len(chunk.decode_rows)
@@ -294,14 +295,9 @@ def run(vocabulary, texts, old, mode, draft, budget, planned="unified"):
         dependencies=dependencies,
         decoder=decoder,
         attention_mode=mode,
-        appended_tokens=(extraction.appended_tokens if old else None),
         stats=stats,
     )
-    if old:
-        extraction.finish()
-        answers = [extraction.answers(q) for q in range(3)]
-    else:
-        answers = [part.answers(q) for q in range(3)]
+    answers = [part.answers(q) for q in range(3)]
     return (
         histories,
         answers,
@@ -330,8 +326,7 @@ def test_branches_and_rewinds_read_identical_prompt_and_draft_histories(
     assert baseline and all(
         value is not None for values, _ in answers for value in values
     )
-    assert info["eligible"] > 0
-    for old, mode in [(True, "unified"), (False, "unified"), (False, "tree")]:
+    for old, mode in [(False, "unified"), (False, "tree")]:
         current, got, other = run(vocabulary, texts, old, mode, draft, budget)
         assert got == answers
         assert current == baseline

@@ -107,6 +107,7 @@ class DecodeRows:
     shared_cu: np.ndarray | None = None
     shared_table: np.ndarray | None = None
     shared_used: np.ndarray | None = None
+    advance: np.ndarray | None = None
 
     def __len__(self) -> int:
         return len(self.positions)
@@ -719,9 +720,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     if decode is not None and not len(decode):
         decode = None
     if decode is not None:
-        if arena.has_sliding or getattr(arena, "num_state_slots", 0):
-            raise ValueError("decode rows read a model with every-token "
-                             "attention only")
         count = len(decode)
         decode_offsets = decode.sequence_offsets
         if tree_path:
@@ -884,6 +882,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
             if decode is not None:
                 pools[0].add_block(decode, decode_row0)
+                if sliding:
+                    pools[1].add_block(arena.sliding_group.decode(decode), decode_row0)
                 cu_q.extend((cu_q[-1] + decode_offsets[1:]).tolist())
             built = [pool.build(arena, stage, torch, staging, index)
                      for index, pool in enumerate(pools)]
@@ -957,7 +957,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             raise ValueError("a model with Gated DeltaNet layers runs "
                              "the unified attention path")
         try:
-            gdn = plan_phases(arena, unified_groups, stage)
+            state_groups = (arena.state_group.decode(decode, decode_row0)
+                            if decode is not None else [])
+            gdn = plan_phases(arena, unified_groups + state_groups, stage)
         except Exception:
             for key in temporary_keys:
                 arena.free_key(key)
