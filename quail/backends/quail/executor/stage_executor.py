@@ -25,6 +25,9 @@ from quail.progress import Progress, logger
 
 ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
 ANSWER_ADMISSION_MODES = ("pooled", "prompt", "headroom")
+# a directory each headroom run writes a file of its headroom over time
+# and its curves to
+HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
 
 
 def answer_admission_mode() -> str:
@@ -1058,13 +1061,20 @@ class StageExecutor:
             logger.info("%s: %d answer evictions, %d recomputed tokens", self.label,
                         self.num_evictions, self.recomputed_tokens)
             curves = getattr(self.answer_admission, "bucket_curves", None)
-            if curves:
-                logger.info("%s: headroom %s", self.label, json.dumps({
-                    "page_tokens": self.arena.page_tokens,
-                    "rebuilds": self.answer_admission.trace,
-                    "granted": self.answer_admission.granted_at,
-                    "curves": {f"{q}:{b}": [round(float(v), 4) for v in curve[::8]]
-                               for (q, b), curve in curves.items()}}))
+            directory = os.environ.get(HEADROOM_TRACE_ENV)
+            if curves and directory:
+                name = "".join(c if c.isalnum() else "_" for c in self.label)[:60]
+                path = os.path.join(directory, f"{time.time_ns()}-{name}.json")
+                with open(path, "w") as file:
+                    json.dump({
+                        "label": self.label,
+                        "page_tokens": self.arena.page_tokens,
+                        "rebuilds": self.answer_admission.trace,
+                        "granted": self.answer_admission.granted_at,
+                        "curves": {f"{q}:{b}": [round(float(v), 4)
+                                                for v in curve[::8]]
+                                   for (q, b), curve in curves.items()}}, file)
+                logger.info("%s: headroom trace saved to %s", self.label, path)
             logger.info("%s: decode rows read KV tokens %s", self.label,
                         self.decoder.read_tokens)
         return self.sched.answers, self.spans, self.tokens

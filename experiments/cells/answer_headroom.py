@@ -60,6 +60,11 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
         The measurements as JSON.
     """
     os.environ["QUAIL_ANSWER_ADMISSION"] = mode
+    # the engine's workers start with the Session and read both variables
+    directory = Path(run_dir)
+    traces = directory / f"{mode}-traces"
+    traces.mkdir(parents=True, exist_ok=True)
+    os.environ["QUAIL_HEADROOM_TRACE"] = str(traces)
     import numpy as np
     import pyarrow.parquet as pq
 
@@ -119,8 +124,6 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
                 })
                 print(mode, name, runs[-1], flush=True)
             report["queries"][name] = runs
-    directory = Path(run_dir)
-    directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{mode}.json").write_text(json.dumps(report, indent=1))
     results_vol.commit()
     return json.dumps(report, indent=1)
