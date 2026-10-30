@@ -45,7 +45,7 @@ def test_buckets_bound_padding_and_stop_at_twice_the_compute_ridge(model):
         bucket = next(b for b in buckets if b >= n)
         assert bucket <= (3 * n + 1) // 2
     assert graph_memory_bytes(model, H100_SXM) == (
-        sum(buckets) + buckets[-1]) * model.act_per_token
+        2 * buckets[-1] * model.act_per_token)
 
 
 def test_hybrid_models_keep_the_eager_path_and_no_graph_reservation():
@@ -79,6 +79,22 @@ def test_padding_never_reaches_attention_or_writes_kv(mode):
     assert buffers.ids.tolist() == [12, 13, 0, 0, 0, 0, 0, 0]
     assert buffers.positions.tolist() == [0, 1, 0, 0, 0, 0, 0, 0]
     buffers.attention(model, source)
+
+
+def test_smaller_buckets_share_the_largest_buckets_rows_but_not_its_scales():
+    model = pipeline()
+    largest = PiecewiseBuffers(model, 8, device="cpu")
+    small = PiecewiseBuffers(model, 3, device="cpu", storage=largest)
+    for name in ("ids", "positions", "residual", "output", "q", "k", "v", "o_in"):
+        assert getattr(small, name).data_ptr() == getattr(largest, name).data_ptr()
+        assert getattr(small, name).shape[0] == 3
+    for name, mapping in small.writes.meta.items():
+        assert mapping.data_ptr() == largest.writes.meta[name].data_ptr()
+    assert small.o_scale.data_ptr() != largest.o_scale.data_ptr()
+    small.copy(chunk(2))
+    assert largest.ids[:3].tolist() == [12, 13, 0]
+    with pytest.raises(ValueError, match="at least num_tokens"):
+        PiecewiseBuffers(model, 9, device="cpu", storage=largest)
 
 
 def test_captured_kv_mappings_mask_padding_and_keep_partial_page_order():
@@ -222,8 +238,9 @@ def test_capture_accounts_for_inactive_private_pool_storage(monkeypatch, memory_
     model = SimpleNamespace(
         engine=SimpleNamespace(arena=SimpleNamespace(k=[]), torch=SimpleNamespace(
             cuda=cuda, inference_mode=nullcontext)), layers=[None])
-    monkeypatch.setattr(cuda_graphs, "PiecewiseBuffers", lambda *a: SimpleNamespace(
-        piece=lambda *a, **kw: None))
+    monkeypatch.setattr(
+        cuda_graphs, "PiecewiseBuffers",
+        lambda *a, **kw: SimpleNamespace(piece=lambda *a, **kw: None))
     graphs = PiecewiseGraphs(model, token_buckets=(1, 2), memory_bytes=memory_bytes)
     if memory_bytes < 160:
         with pytest.raises(RuntimeError, match="exceeding"):

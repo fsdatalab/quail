@@ -17,13 +17,20 @@ def chunk_writes(chunk):
 
 
 class KVWriteBuffers:
-    """Fixed scatter mappings with masked destinations for unused entries."""
+    """Fixed scatter mappings with masked destinations for unused entries.
 
-    def __init__(self, torch, num_tokens, page_tokens, *, device):
+    Given storage, a larger bucket's buffers, the mappings are prefixes
+    of that bucket's tensors.
+    """
+
+    def __init__(self, torch, num_tokens, page_tokens, *, device, storage=None):
         self.meta = {}
         self.has_tails = False
         for name in ("src", "dst", "tail_src", "tail_dst"):
             count = num_tokens * (page_tokens if name.startswith("tail_") else 1)
+            if storage is not None:
+                self.meta[name] = storage.meta[name][:count]
+                continue
             self.meta[name] = torch.full(
                 (count,), -1 if name.endswith("dst") else 0,
                 dtype=torch.int64, device=device)
@@ -52,28 +59,51 @@ class PiecewiseBuffers:
     sequence boundaries, or reads, regardless of the attention path.
     GEMM tiling can change rounding with the padded row count; replay
     parity is checked against eager pieces with the same bucket shape.
+
+    Given storage, a larger bucket's buffers, every row-major tensor is
+    a prefix of that bucket's, so all buckets share one allocation; one
+    stream replays one bucket at a time. Column-major activation scales
+    cannot be sliced by row, so each bucket keeps its own.
     """
 
-    def __init__(self, pipeline, num_tokens, *, device="cuda"):
+    def __init__(self, pipeline, num_tokens, *, device="cuda", storage=None):
         engine = pipeline.engine
         torch = engine.torch
         self.num_tokens = num_tokens
-        self.ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
-        self.positions = torch.zeros_like(self.ids)
-        self.residual = torch.zeros(
-            (num_tokens, pipeline.final_norm.weight.numel()),
-            dtype=torch.bfloat16, device=device)
-        self.output = torch.empty_like(self.residual)
-        self.q = torch.zeros((num_tokens, engine.num_q_heads * engine.head_dim),
-                             dtype=torch.bfloat16, device=device)
-        self.k = torch.zeros((num_tokens, engine.num_kv_heads * engine.head_dim),
-                             dtype=torch.bfloat16, device=device)
-        self.v = torch.zeros_like(self.k)
+        if storage is not None and storage.num_tokens < num_tokens:
+            raise ValueError("storage must hold at least num_tokens rows")
+        self.ids = (storage.ids[:num_tokens] if storage is not None else
+                    torch.zeros(num_tokens, dtype=torch.int64, device=device))
+        self.positions = (storage.positions[:num_tokens] if storage is not None
+                          else torch.zeros_like(self.ids))
+        width = pipeline.final_norm.weight.numel()
+        q_width = engine.num_q_heads * engine.head_dim
+        kv_width = engine.num_kv_heads * engine.head_dim
+        if storage is not None:
+            self.residual = storage.residual[:num_tokens]
+            self.output = storage.output[:num_tokens]
+            self.q = storage.q[:num_tokens]
+            self.k = storage.k[:num_tokens]
+            self.v = storage.v[:num_tokens]
+        else:
+            self.residual = torch.zeros((num_tokens, width), dtype=torch.bfloat16,
+                                        device=device)
+            self.output = torch.empty_like(self.residual)
+            self.q = torch.zeros((num_tokens, q_width), dtype=torch.bfloat16,
+                                 device=device)
+            self.k = torch.zeros((num_tokens, kv_width), dtype=torch.bfloat16,
+                                 device=device)
+            self.v = torch.zeros_like(self.k)
         self.o_in, self.o_scale = engine.quant(torch.zeros_like(self.q))
-        self.writes = KVWriteBuffers(torch, num_tokens, engine.arena.page_tokens,
-                                    device=device)
+        if storage is not None:
+            self.o_in = storage.o_in[:num_tokens]
+        page_tokens = engine.arena.page_tokens
+        self.writes = KVWriteBuffers(
+            torch, num_tokens, page_tokens, device=device,
+            storage=None if storage is None else storage.writes)
         self.sliding_writes = (KVWriteBuffers(
-            torch, num_tokens, engine.arena.page_tokens, device=device)
+            torch, num_tokens, page_tokens, device=device,
+            storage=None if storage is None else storage.sliding_writes)
             if engine.arena.has_sliding else None)
         self.kv_meta = dict(layer=0, unified=dict(self.writes.meta))
         if self.sliding_writes is not None:
@@ -225,8 +255,11 @@ class PiecewiseGraphs:
         try:
             with torch.cuda.stream(stream), torch.inference_mode():
                 # Larger captures establish the shared pool's high watermark.
+                storage = None
                 for num_tokens in reversed(self.token_buckets):
-                    buffers = PiecewiseBuffers(self.pipeline, num_tokens)
+                    buffers = PiecewiseBuffers(self.pipeline, num_tokens,
+                                               storage=storage)
+                    storage = storage or buffers
                     variants = []
                     for copy_tail in (False, True):
                         graphs = []

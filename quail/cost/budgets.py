@@ -149,16 +149,17 @@ def graph_token_buckets(model: ModelSpec, device: DeviceSpec) -> tuple[int, ...]
 
 
 def graph_memory_bytes(model: ModelSpec, device: DeviceSpec) -> int:
-    """Reserve bucket boundary buffers and one shared capture workspace.
+    """Reserve shared boundary buffers and one shared capture workspace.
 
-    Each bucket's persistent state fits one activation footprint. All
-    captures share a pool, whose temporaries fit the largest footprint.
-    Attention and readout still use the ordinary activation reserve.
+    The buckets' persistent state shares one allocation that fits the
+    largest bucket's activation footprint. All captures share a pool,
+    whose temporaries fit the same footprint. Attention and readout
+    still use the ordinary activation reserve.
     """
     buckets = graph_token_buckets(model, device)
     if not buckets:
         return 0
-    return ceil((sum(buckets) + buckets[-1]) * model.act_per_token)
+    return ceil(2 * buckets[-1] * model.act_per_token)
 
 
 def arena_bytes(model: ModelSpec, device: DeviceSpec,
