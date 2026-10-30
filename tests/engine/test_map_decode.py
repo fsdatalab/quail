@@ -554,6 +554,10 @@ def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
         got = [answer.tolist() for answer in decoder.answers(q, maps._slots(q, ids))]
         assert got == [greedy(documents[a] + tail, answer_limit) for a in ids]
     assert stats["answer_admission"] == mode
+    work = stats["pass_work"]
+    assert work["replay_tokens"] == stats["recomputed_tokens"]
+    assert work["decode_rows"] == sum(len(slots) for slots in model.decode_slots)
+    assert work["sol_s"] > 0
     assert not decoder.active
     assert not arena.accounting.owned
 

@@ -144,6 +144,11 @@ class StageExecutor:
         self.pass_queued = []
         self.knee_rows = knee_rows
         self.recomputed_tokens = 0
+        self.decode_cost = decode_cost
+        # rounds and the work in them: tokens by kind, attention pairs,
+        # KV tokens read, and their SoL seconds when specs are known
+        self.pass_work = dict(passes=0, decode_rows=0, replay_tokens=0,
+                              prefill_tokens=0, pairs=0, kv_read=0, sol_s=0.0)
 
         k = len(self.stages)
         if not self.paged and (
@@ -854,10 +859,48 @@ class StageExecutor:
             self._run_part(part[:half], decode, replays)
             self._run_part(part[half:])
 
+    def _count_pass(self, part, tokens, decode, replays):
+        """Add one pass's tokens, attention pairs, KV reads, and SoL seconds.
+
+        A decode row reads its whole context. A replay or prefill span
+        of tokens start..end attends to every earlier token and reads the
+        KV before start. Prefill spans start after a borrowed prefix or a
+        document already resident.
+        """
+        from quail.cost.work import Work, triangle
+
+        decode_rows = replay_tokens = pairs = kv_read = 0.0
+        if decode is not None:
+            contexts = np.asarray(decode.positions, dtype=float) + 1
+            decode_rows = float(len(contexts))
+            pairs += float(contexts.sum())
+            kv_read += float(contexts.sum())
+        for _, start, end in replays:
+            replay_tokens += end - start
+            pairs += float(triangle(end) - triangle(start))
+            kv_read += start
+        prefill = max(0.0, tokens - decode_rows - replay_tokens)
+        for a, j, start, end, carried in part:
+            rows = self._entry_rows(a, j, start, end, carried)
+            first = self.borrowing.shared(a) if carried else self.prefix_lengths[a]
+            pairs += float(triangle(first + rows) - triangle(first))
+            kv_read += first
+        work = self.pass_work
+        work["passes"] += 1
+        work["decode_rows"] += int(decode_rows)
+        work["replay_tokens"] += int(replay_tokens)
+        work["prefill_tokens"] += int(prefill)
+        work["pairs"] += int(pairs)
+        work["kv_read"] += int(kv_read)
+        if self.decode_cost is not None:
+            work["sol_s"] += self.decode_cost.seconds(
+                Work(tokens=float(tokens), pairs=pairs, kv_read=kv_read))
+
     def _run_one(self, part, decode=None, replays=()):
         started = time.perf_counter()
         chunk, entries, firsts = self._build(part, decode, replays)
         self.pack_s += time.perf_counter() - started
+        self._count_pass(part, chunk.tokens, decode, replays)
         self.tokens += chunk.tokens
         self.pass_rows.append(chunk.tokens)
         self.pass_queued.append(bool(self.sched.pending or self.sched.waiting))
@@ -988,6 +1031,9 @@ class StageExecutor:
             self.stats["answer_admission"] = self.admission_mode
             self.stats["headroom_trace"] = getattr(
                 self.answer_admission, "trace", [])
+            self.stats["headroom_granted"] = getattr(
+                self.answer_admission, "granted", [])
+            self.stats["pass_work"] = dict(self.pass_work)
         if self.spans:
             self.torch.cuda.synchronize()
             # between forward passes the GPU runs readouts and uploads,

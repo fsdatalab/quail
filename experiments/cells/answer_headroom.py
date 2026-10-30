@@ -4,8 +4,10 @@ Each mode runs on its own H100: QUAIL_ANSWER_ADMISSION picks it before
 the Session starts. A warm-up query on the last 64 reviews loads the
 model and captures CUDA graphs; then each query runs `repeats` times on
 the first `num_documents` reviews. Per run the cell records wall
-seconds, answer evictions, recomputed tokens, answer-length
-percentiles, and a hash of every answer, so modes can be checked for
+seconds, answer evictions, recomputed tokens, the headroom answers were
+given, the passes and the tokens, attention pairs, and KV tokens read
+in them with their SoL seconds, answer-length percentiles, and a hash
+of every answer, so modes can be checked for
 the same output. Results go to
 /results/ablations/answer_headroom/<run id>/<mode>.json.
 
@@ -95,7 +97,8 @@ def run_mode(mode: str, scale_factor: float, num_documents: int, repeats: int,
                     "recomputed_tokens": sum(m["recomputed_tokens"] for m in maps),
                     "answer_tokens": sum(m.get("answer_tokens", 0) for m in maps),
                     "decode_rows": sum(m.get("decode_rows", 0) for m in maps),
-                    "headroom_pages": max(m.get("headroom_pages", 0.0) for m in maps),
+                    **{key: value for m in maps for key, value in m.items()
+                       if key.startswith(("headroom_", "pass_")) and value},
                     "answer_p50": int(np.percentile(lengths, 50)),
                     "answer_p90": int(np.percentile(lengths, 90)),
                     "answers_sha256": digest.hexdigest(),

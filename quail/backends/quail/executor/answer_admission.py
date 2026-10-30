@@ -273,6 +273,8 @@ class HeadroomAdmission(AnswerAdmission):
         self._refreshes = 0
         # (refresh, map, bucket, answers, mean headroom pages) per rebuild
         self.trace = []
+        # headroom pages each admitted answer was given
+        self.granted = []
 
     def refresh(self, stages, replays=(), replay_pages=0):
         """Rebuild the work, the curves when answers ended, and each headroom."""
@@ -418,8 +420,10 @@ class HeadroomAdmission(AnswerAdmission):
         self.committed[anchor] = True
         self.work = self.work + self._added_work(anchor)
         slots = np.flatnonzero((self.parent == anchor) & (self.slot_map >= 0))
-        self.headroom_pages += int(((self.reach[slots] - self.capacity[slots])
-                                    // self.decoder.page_tokens).clip(0).sum())
+        granted = ((self.reach[slots] - self.capacity[slots])
+                   // self.decoder.page_tokens).clip(0)
+        self.granted.extend(granted.tolist())
+        self.headroom_pages += int(granted.sum())
         branches = np.flatnonzero((self.parent == anchor)
                                   & (np.arange(len(self.prefix)) != anchor))
         self.headroom_pages += int(self.pending_pages[branches].sum())

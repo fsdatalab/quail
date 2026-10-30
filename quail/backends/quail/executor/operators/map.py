@@ -254,21 +254,38 @@ class MapPart(ColumnPart, ExecutionPart):
                                              if q == 0 else 0),
                         "recomputed_tokens": (stats.get("recomputed_tokens", 0)
                                               if q == 0 else 0),
-                        "headroom_pages": (headroom_pages(stats)
-                                           if q == 0 else 0.0)}))
+                        **(admission_metrics(stats) if q == 0 else {})}))
         self.result_value = self._results[self.nodes[0].node_id]
 
     def results(self) -> dict:
         return self._results
 
 
-def headroom_pages(stats) -> float:
-    """Mean headroom pages of running answers over curve rebuilds, 0 for none."""
+def admission_metrics(stats) -> dict:
+    """Headroom and per-pass work metrics of the map's run, for its first map.
+
+    headroom_granted_pages is the mean headroom an admitted answer was
+    given; headroom_granted_share the share given any; and
+    headroom_running_pages the mean headroom running answers held when
+    the curves were rebuilt. The pass_ metrics count rounds and the
+    tokens, attention pairs, and KV tokens read in them, with their SoL
+    seconds.
+    """
+    granted = np.asarray(stats.get("headroom_granted", []), dtype=float)
     trace = stats.get("headroom_trace", [])
     answers = sum(entry[3] for entry in trace)
-    if not answers:
-        return 0.0
-    return round(sum(entry[3] * entry[4] for entry in trace) / answers, 2)
+    metrics = {
+        "headroom_granted_pages": round(float(granted.mean()), 3) if len(granted)
+        else 0.0,
+        "headroom_granted_share": round(float((granted > 0).mean()), 3)
+        if len(granted) else 0.0,
+        "headroom_running_pages": round(
+            sum(entry[3] * entry[4] for entry in trace) / answers, 3)
+        if answers else 0.0,
+    }
+    for name, value in stats.get("pass_work", {}).items():
+        metrics[f"pass_{name}"] = round(value, 3) if isinstance(value, float) else value
+    return metrics
 
 
 class AnswerBranches(MapPart):
