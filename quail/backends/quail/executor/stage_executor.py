@@ -891,8 +891,11 @@ class StageExecutor:
         prefill = max(0.0, tokens - decode_rows - replay_tokens)
         for a, j, start, end, carried in part:
             rows = self._entry_rows(a, j, start, end, carried)
-            first = self.borrowing.shared(a) if carried else self.prefix_lengths[a]
-            pairs += float(triangle(first + rows) - triangle(first))
+            # a carried entry's rows count its whole prompt from token 0,
+            # borrowed prefix included; a later entry's follow its prompt
+            begin = 0 if carried else self.prefix_lengths[a]
+            first = self.borrowing.shared(a) if carried else begin
+            pairs += float(triangle(begin + rows) - triangle(first))
             kv_read += first
         work = self.pass_work
         work["passes"] += 1

@@ -663,3 +663,21 @@ def test_replay_seconds_charge_extra_passes_and_spare_compute():
     assert split == pytest.approx(large + 3 * cost.weight_seconds)
     alone = cost.replay_seconds(Work(), np.array([16]))[0]
     assert alone >= cost.weight_seconds > small
+
+
+def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+
+    keys = ("passes", "decode_rows", "replay_tokens", "prefill_tokens", "pairs",
+            "kv_read", "sol_s")
+    executor = SimpleNamespace(
+        prefix_lengths=[10, 10], decode_cost=None, pass_work=dict.fromkeys(keys, 0),
+        borrowing=SimpleNamespace(shared=lambda a: 4 if a == 0 else 0),
+        _entry_rows=lambda a, j, start, end, carried: (10 if carried else 0) + 2)
+    # document 0 computes tokens 4..11 over 4 borrowed ones: keys 5..12
+    StageExecutor._count_pass(executor, [(0, 0, 0, 1, True)], 8, None, ())
+    assert executor.pass_work["pairs"] == sum(range(5, 13))
+    assert executor.pass_work["kv_read"] == 4
+    # a later suffix of document 1 follows its 10 prompt tokens: keys 11 and 12
+    StageExecutor._count_pass(executor, [(1, 1, 0, 1, False)], 2, None, ())
+    assert executor.pass_work["pairs"] == sum(range(5, 13)) + 11 + 12
