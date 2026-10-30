@@ -77,6 +77,32 @@ WARMUP_DOCUMENTS = 64
 image = gpu_image()
 
 
+def register_tables(session, reviews, scale_factor: float,
+                    num_documents: int) -> dict:
+    """Register the first num_documents reviews and every other table whole.
+
+    Returns:
+        Each registered table's row ids, in row order.
+    """
+    import pyarrow.parquet as pq
+
+    import quail
+
+    tables = {"reviews": reviews.slice(0, num_documents)}
+    for path in sorted((Path(DATA_DIR) / f"sf{scale_factor}").glob("*.parquet")):
+        if path.stem != "reviews":
+            tables[path.stem] = pq.read_table(path)
+    for name, table in tables.items():
+        session.register(name, quail.DocumentProvider.from_table(table, id_col="id"))
+    return {name: table.column("id").to_pylist() for name, table in tables.items()}
+
+
+def answers_path(run_dir: str, mode: str, query: str) -> Path:
+    """Return where a mode's last run of a query keeps its answers."""
+    slug = "".join(c if c.isalnum() else "_" for c in query)
+    return Path(run_dir) / f"{mode}-answers" / f"{slug}.json"
+
+
 def step_totals(steps: Path, first: int) -> tuple[int, int, int]:
     """Return the step trace's lines, and its evictions and recomputed tokens.
 
@@ -130,15 +156,7 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
             table.slice(len(table) - WARMUP_DOCUMENTS), id_col="id"))
         warmup = next(iter(QUERIES.values())).replace("FROM reviews", "FROM warmup")
         session.sql(warmup).run().collect()
-        session.register("reviews", quail.DocumentProvider.from_table(
-            table.slice(0, num_documents), id_col="id"))
-        tables = Path(DATA_DIR) / f"sf{scale_factor}"
-        # every other table is read whole; reviews stay sliced
-        for path in sorted(tables.glob("*.parquet")):
-            if path.stem == "reviews":
-                continue
-            session.register(path.stem, quail.DocumentProvider.from_parquet(
-                str(path), id_col="id"))
+        register_tables(session, table, scale_factor, num_documents)
         tokenizer = session.tokenizer
         for name in query_ids:
             runs = []
@@ -176,6 +194,9 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
                     runs[-1].update(answer_evictions=evictions,
                                     recomputed_tokens=recomputed)
                 print(mode, name, runs[-1], flush=True)
+            path = answers_path(run_dir, mode, name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(rows.to_pydict()))
             report["queries"][name] = runs
     (directory / f"{mode}.json").write_text(json.dumps(report, indent=1))
     results_vol.commit()
@@ -198,3 +219,59 @@ def compare(modes: str = "prompt,headroom", queries: str = ",".join(QUERIES),
              for mode in filter(None, modes.split(","))]
     for call in calls:
         print(call.get(), flush=True)
+
+
+@app.function(image=image, cpu=8, memory=65536, timeout=3600, volumes=VOLUMES)
+def estimate_sol(query: str, run_dir: str, mode: str, scale_factor: float,
+                 num_documents: int) -> str:
+    """Price one query's SoL with the answers a saved run wrote.
+
+    quail.speed_of_light_estimate: unlimited KV, ideal packing, each
+    distinct prefix computed once, one decode pass per fed answer
+    token, and the maps of one document reading it once per pass.
+
+    Returns:
+        The SoL record as JSON.
+    """
+    import pyarrow.parquet as pq
+
+    import quail
+
+    saved = json.loads(answers_path(run_dir, mode, query).read_text())
+    table = pq.read_table(Path(DATA_DIR) / f"sf{scale_factor}" / "reviews.parquet")
+    config = quail.EngineConfig(gpus=1, model="qwen3-4b-fp8", device="h100-sxm")
+    with quail.Session(config) as session:
+        ids_by_table = register_tables(session, table, scale_factor, num_documents)
+        built = session.sql(QUERIES[query])
+        maps = {node.call.prompt: node for node in built.logical.operators().maps}
+        written = {}
+        for prompt, node in maps.items():
+            ids = ids_by_table[node.call.prompt.args[0].provider]
+            by_id = dict(zip(map(str, saved["id"]), saved[node.name]))
+            written[prompt] = [by_id[str(row_id)] or "" for row_id in ids]
+
+        def answer(prompt, assignment):
+            (row,) = assignment.values()
+            return written[prompt][row]
+
+        sol = quail.speed_of_light_estimate(built, answer)
+    record = {"query": query, "answers_from": f"{run_dir} ({mode})",
+              "seconds": sol.seconds, "passes": sol.latency.passes,
+              "components": {component.name: component.seconds
+                             for component in sol.latency.components},
+              "fresh_tokens": sol.work.tokens, "kv_read_tokens": sol.work.kv_read,
+              "pairs": sol.work.pairs}
+    path = answers_path(run_dir, mode, query).with_suffix(".sol.json")
+    path.write_text(json.dumps(record, indent=1))
+    results_vol.commit()
+    return json.dumps(record, indent=1)
+
+
+@app.local_entrypoint()
+def sol(run_dir: str, queries: str = "six contract maps", mode: str = "headroom",
+        scale_factor: float = 1.0, num_documents: int = 1000):
+    for query in filter(None, queries.split(",")):
+        call = estimate_sol.spawn(query, run_dir, mode, scale_factor, num_documents)
+        print(f"function call id: {call.object_id} ({query})", flush=True)
+        print(call.get(), flush=True)
+
