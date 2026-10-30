@@ -6,14 +6,11 @@ from dataclasses import replace
 import numpy as np
 
 from quail.backends.quail.executor.extract import (
-    ExtractionStages,
     load_vocabulary,
 )
 from quail.backends.quail.executor.extract.stages import ExtractionInputs
 from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import (
-    ColumnPart,
-    ExecutionPart,
     execute_parts,
     gpu_seconds,
     shared_prefix_tree,
@@ -70,7 +67,7 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
 
     Args:
         nodes: The AiExtract nodes, in question order.
-        stages: The finished ExtractionStages.
+        stages: The extraction part with finished answers.
         document_ids: The documents' ids.
         fresh: The run's fresh tokens; the first node is charged them
             less the later questions' suffix tokens.
@@ -108,10 +105,9 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
     return results
 
 
-class RecurrentExtractPart(ColumnPart, ExecutionPart):
-    """Extraction stages and per-question results for the shared executor."""
+class ExtractPart(MapPart):
+    """Extraction fields decoded as document branches by MapDecoder."""
 
-    combine = True
     execute_group = staticmethod(execute_extractions)
 
     @staticmethod
@@ -128,51 +124,6 @@ class RecurrentExtractPart(ColumnPart, ExecutionPart):
                 "texts": context.state.get("texts", {}),
                 "limit": context.state.get("filter_limit")}
 
-    @classmethod
-    def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Prepare consecutive questions over the preceding operator's documents.
-
-        Raises:
-            ValueError: A document uses a different prompt or token sequence.
-        """
-        first = parts[0].node if parts else nodes[0]
-        part = cls(state, nodes, ids, {
-            "documents": context.state["documents"],
-            "texts": context.state.get("texts", {}),
-            "pipeline_head": first.document_head})
-        alias = part.node.spec.alias
-        for document, document_id in zip(part.extraction.documents, part.ids):
-            if document.key != (alias, document_id):
-                raise ValueError(
-                    f"AI.EXTRACT {part.node.spec.name!r} shows document "
-                    f"{document_id} of {alias!r} unlike the pipeline before it")
-        return part
-
-    def __init__(self, state, nodes, ids, inputs):
-        self.nodes = list(nodes)
-        self.node = self.nodes[0]
-        self.ids = np.asarray(ids, dtype=np.int64)
-        if any(not isinstance(node, AiExtract) for node in nodes):
-            raise TypeError("an extraction pipeline holds AiExtract nodes only")
-        alias = self.node.spec.alias
-        texts = inputs.get("texts", {}).get(alias)
-        if texts is None:
-            raise ValueError(f"AI.EXTRACT needs the text of {alias!r}")
-        self.extraction = ExtractionStages(
-            state, [node.spec for node in nodes], load_vocabulary(state), self.ids,
-            inputs["documents"][alias], texts,
-            pipeline_head=inputs.get("pipeline_head", self.node.document_head),
-            document_positions=inputs.get("document_positions"))
-        self.stages = self.extraction.stages
-        self._results = {}
-
-    @property
-    def appended_tokens(self) -> int:
-        return self.extraction.appended_tokens
-
-    def answers(self, q, kept=None):
-        return self.extraction.answers(q, kept)
-
     def column_values(self, index, positions) -> tuple:
         values, spans = self.answers(index, positions)
         spec = self.nodes[index].spec
@@ -180,37 +131,6 @@ class RecurrentExtractPart(ColumnPart, ExecutionPart):
             spec.alias, spec.name, spec.span_name, self.ids[positions], values, spans
         ).values.columns)
 
-    def finish(self, every) -> int:
-        """Settle every answer; return the tokens the questions fed."""
-        self.extraction.finish()
-        self.counts = [self.extraction.counts(q) for q in range(len(self.nodes))]
-        return sum(count["suffix_tokens"] for count in self.counts)
-
-    def complete(self, fresh, spans, stats, offset):
-        """Build each question's answer table and attribute its GPU work."""
-        per_question = len(self.stages) // len(self.nodes)
-
-        def own(q):
-            start = offset + q * per_question
-            selected = stage_spans(spans, start, start + per_question)
-            return gpu_seconds(selected), len(selected)
-
-        self._results = extraction_results(
-            self.nodes, self.extraction, self.ids, fresh=fresh, counts=self.counts,
-            own=own, stats=stats, kept=self.extraction.asked())
-        self.result_value = self._results[self.node.node_id]
-
-    def results(self) -> dict:
-        """Return the answer table and metrics for each extraction."""
-        return self._results
-
-
-class ExtractPart(MapPart):
-    """Extraction fields decoded as document branches by MapDecoder."""
-
-    execute_group = staticmethod(execute_extractions)
-    model_inputs = staticmethod(RecurrentExtractPart.model_inputs)
-    column_values = RecurrentExtractPart.column_values
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):

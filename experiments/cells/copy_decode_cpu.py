@@ -22,9 +22,9 @@ import time
 
 import numpy as np
 import torch
+from helpers.extract_reference import Decoder, add_answers
 from test_copy_batching import Dispatches, continuation, copy_batch
 
-from quail.backends.quail.executor.extract.decode import Decoder
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
 
 
@@ -46,7 +46,7 @@ def compare(num_fields, num_documents, document_tokens, num_passes):
                                        ("map_decoder.py", "rows")])
     group = decoder.copy_groups[0]
     spec = group.constraint.spec
-    documents = group.constraint.documents.documents
+    documents = add_answers(group.constraint.documents).documents
     reference = Decoder(vocabulary, spec.top_tokens, 1 + 2 * spec.top_tokens,
                         num_fields, spec)
     hidden = torch.full((4, len(vocabulary.vocab)), -10.0)

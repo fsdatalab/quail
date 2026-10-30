@@ -1,4 +1,4 @@
-"""Copy decoding agrees with the recurrent extraction token rule on CPU."""
+"""Copy decoding agrees with the host reference token rule on CPU."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 import torch
 from helpers.extract_fakes import make_spec
+from helpers.extract_reference import Decoder, add_answers
+from helpers.extract_reference import ReferenceInputs as ExtractionInputs
 from test_map_decode import events_torch
 
-from quail.backends.quail.executor.extract.decode import Decoder
-from quail.backends.quail.executor.extract.stages import ExtractionInputs
 from quail.backends.quail.executor.map_decoder import MapDecoder
 
 
@@ -260,6 +260,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         assert set(survivors) == set(expected_survivors)
     else:
         assert len(survivors) >= min(limit, len(expected_survivors))
+    add_answers(part.extraction)
     reference = Decoder(vocabulary, 4, 9, len(nodes), spec)
     for q, node in enumerate(nodes):
         assert set(np.flatnonzero(part.asked[q])) == set(survivors)
@@ -457,6 +458,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         extracts.extraction.keys,
         keep_kv=False,
     )
+    add_answers(extracts.extraction)
     reference = Decoder(vocabulary, 4, 9, 2, spec)
     for d, document in enumerate(extracts.extraction.documents):
         prefix = list(map(int, document.prefix))

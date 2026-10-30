@@ -9,18 +9,17 @@ The answer ends where the model would end its turn, or where its
 writing would leave the document.
 """
 
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from quail.backends.quail.executor.extract.candidates import (
     NEG,
-    DocumentTokens,
     ensure_tokens,
     first_tokens,
     make_streams,
 )
+from quail.backends.quail.executor.extract.stages import Document, ExtractionInputs
 from quail.backends.quail.executor.extract.trace import (
     choice_values,
     trace_path,
@@ -47,19 +46,6 @@ class AnswerState:
     answer: str | None = None
     span: tuple | None = None
     none_wins: bool = False
-
-
-@dataclass
-class Document:
-    """One document's prompt and its answer to each question."""
-
-    index: int
-    text: str
-    prefix: Sequence
-    scan: DocumentTokens
-    key: tuple
-    answers: list       # one AnswerState per question
-    rho: float = 0.0    # the document's KV read per round, in fed tokens
 
 
 class Decoder:
@@ -335,3 +321,20 @@ class Decoder:
         while end > start and text[end - 1].isspace():
             end -= 1
         answer.answer, answer.span = text[start:end], (start, end)
+
+
+def add_answers(inputs):
+    """Attach independent host-reference answers to prepared documents."""
+    for document in inputs.documents:
+        document.answers = [AnswerState() for _ in inputs.specs]
+    return inputs
+
+
+
+
+class ReferenceInputs(ExtractionInputs):
+    """Prepared documents with independent answers for the host reference."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        add_answers(self)
