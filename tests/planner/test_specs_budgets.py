@@ -264,7 +264,7 @@ def test_the_tree_merge_is_charged_for_the_attention_layers_only():
         node_tokens=500) == "tree"
 
 
-@pytest.mark.parametrize("tokens,expected_slots", [(200, 588), (16_000, 59)])
+@pytest.mark.parametrize("tokens,expected_slots", [(200, 587), (16_000, 58)])
 def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
         tokens, expected_slots):
     from quail.backends.quail.worker import checkpoint_arena_args
@@ -284,7 +284,8 @@ def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
     slots = budgets.checkpoint_slots(model, H100_SXM, chunk, kv_pages)
     assert slots == expected_slots
     cost = -(-tokens // 16) + budgets.checkpoint_pages(model)
-    assert slots * cost <= pool < (slots + 1) * cost
+    # the recurrent state's unused row 0 takes one slot's room
+    assert (slots + 1) * cost <= pool < (slots + 2) * cost
     retained = retention_pages(kv_pages * 16, chunk, 16)
     assert retained == kv_pages - budgets.execution_pages(chunk)
     assert retained + slots * budgets.checkpoint_pages(model) <= pool

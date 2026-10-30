@@ -248,9 +248,12 @@ def pool_bytes(arena) -> dict:
         return 0 if tensor is None else int(
             tensor.numel() * tensor.element_size())
 
+    # a KVArena's recurrent state has one more row than its slots
+    rows = getattr(arena, "gdn_state_rows", None)
     return {
         "kv": sum(size(t) for t in list(arena.k) + list(arena.v)),
-        "state": size(arena.gdn_state) + size(arena.conv_state),
+        "state": (size(arena.gdn_state if rows is None else rows)
+                  + size(arena.conv_state)),
     }
 
 

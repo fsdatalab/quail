@@ -119,11 +119,14 @@ class KVArena:
         self.v = [part.view(shape) for part, shape in zip(parts[1::2], shapes)]
         # one checkpoint per slot: the recurrent state in fp32 and the
         # convolution columns in bf16, each across every GDN layer
-        self.gdn_state = self.conv_state = None
+        self.gdn_state = self.gdn_state_rows = self.conv_state = None
         if num_state_slots:
-            self.gdn_state = torch.zeros(
-                (num_state_slots, *self.gdn_state_shape),
+            # vLLM's recurrent decode kernel reads state index 0 as no
+            # state, so slot s is row s + 1 and row 0 stays unused
+            self.gdn_state_rows = torch.zeros(
+                (num_state_slots + 1, *self.gdn_state_shape),
                 dtype=torch.float32, device=self.device)
+            self.gdn_state = self.gdn_state_rows[1:]
             self.conv_state = torch.zeros(
                 (num_state_slots, *self.conv_state_shape),
                 dtype=self.dtype, device=self.device)
@@ -159,7 +162,7 @@ class KVArena:
             return
         page_tokens = self.page_tokens
         self.k = self.v = None
-        self.gdn_state = self.conv_state = None
+        self.gdn_state = self.gdn_state_rows = self.conv_state = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
 
     # ---- checkpoints ---------------------------------------------------

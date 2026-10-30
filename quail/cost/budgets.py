@@ -265,13 +265,17 @@ def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec,
 
 def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
                      kv_pages: int) -> int:
-    """Checkpoints the pool holds beside an arena of `kv_pages`; 0 without them."""
+    """Checkpoints the pool holds beside an arena of `kv_pages`; 0 without them.
+
+    One slot's room goes to the recurrent state's unused row 0, which
+    vLLM's decode kernel reads as no state.
+    """
     pages = checkpoint_pages(model, device.page_tokens)
     if not pages:
         return 0
     retained = kv_pages - execution_pages(chunk_tokens, device.page_tokens)
     return max(0, int((hybrid_pool_pages(model, device, chunk_tokens)
-                       - retained) // pages))
+                       - retained) // pages) - 1)
 
 
 def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,

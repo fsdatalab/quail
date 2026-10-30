@@ -12,7 +12,10 @@ Prediction: the batched convolution matches the reference within 0.05
 absolute and its tails exactly; the chunked recurrence matches the
 reference within 0.05 absolute on outputs and 0.02 on states, for
 contiguous and strided inputs alike; the long convolution matches the
-reference on its last rows within 0.05; none produces NaN.
+reference on its last rows within 0.05; none produces NaN. One-token
+decode steps that update arena rows in place match the chunked kernel
+on gathered state within 0.05 on outputs and 0.02 on states, and leave
+row 0 and the other layer untouched.
 
     uv run modal run experiments/cells/hybrid_gdn_unit.py \
         --backend flashinfer 2>&1 | tee /tmp/hybrid_gdn_unit.log
@@ -124,6 +127,45 @@ def check(backend: str = "triton") -> dict:
                     (ref.float() - ker.float()).abs().max()),
                 "state_max_abs_diff": float((s_ref - final).abs().max()),
             }
+
+    # one-token decode steps updating arena rows in place, against the
+    # chunked kernel on gathered state: slot 0, a second layer, and a
+    # step that moves its state to another slot first (slot 1 to 3, while
+    # another step advances slot 1 itself)
+    from types import SimpleNamespace
+
+    reads, writes = [0, 2, 1, 1], [0, 2, 3, 1]
+    layer = 1
+    steps = len(reads)
+    state_rows = torch.zeros(5, 2, hv, dv, dk, device=device)
+    state_rows[1:] = torch.randn(4, 2, hv, dv, dk, device=device) * 0.1
+    arena = SimpleNamespace(gdn_state_rows=state_rows,
+                            gdn_state=state_rows[1:])
+    gathered = arena.gdn_state[torch.tensor(reads, device=device), layer].clone()
+    step_cu = torch.arange(steps + 1, dtype=torch.int32, device=device)
+    pq, pk, pv, pg, pb = fused_post_conv_prep(
+        conv_output=joined[:steps], a=a[:steps], b=b[:steps], A_log=a_log,
+        dt_bias=dt_bias, num_k_heads=hk, head_k_dim=dk, head_v_dim=dv,
+        apply_l2norm=True, output_g_exp=False)
+    expected, final = gdn.gated_delta_kernel(
+        pq, pk, pv, pg, pb, gathered, step_cu, scale, output_final_state=True)
+    moved = [i for i in range(steps) if reads[i] != writes[i]]
+    step = gdn.GdnPhase(
+        rows=None, cu_seqlens=step_cu, lengths=(1,) * steps,
+        state_rows=torch.tensor(writes, device=device) + 1,
+        copy_reads=torch.tensor([reads[i] for i in moved], device=device),
+        copy_writes=torch.tensor([writes[i] for i in moved], device=device))
+    other_layer = state_rows[:, 0].clone()
+    got = gdn._recurrent_decode(arena, step, layer, pq, pk, pv, pg, pb, scale)
+    written = arena.gdn_state[torch.tensor(writes, device=device), layer]
+    out["recurrent_decode"] = {
+        "nan_kernel": int(torch.isnan(got).sum()),
+        "max_abs_diff": float((expected.float() - got.float()).abs().max()),
+        "state_max_abs_diff": float((final - written).abs().max()),
+        "row_0_untouched": bool(not state_rows[0].any()),
+        "other_layer_untouched": bool(torch.equal(other_layer,
+                                                  state_rows[:, 0])),
+    }
 
     # one sequence past the row offset where rows * channels overflows int32
     long_rows = 2 ** 31 // channels + 2048

@@ -67,6 +67,33 @@ def _warm_convolutions(torch, pipeline, budget):
                                bias, activate)
 
 
+def _warm_recurrent(torch, arena, pipeline):
+    """Compile the recurrent decode kernel on the arena's state rows.
+
+    The one sequence names row 0, which the kernel reads as no state,
+    so the launch leaves every checkpoint as it was.
+    """
+    from quail.backends.quail.executor.gdn import GdnPhase, _recurrent_decode
+
+    spec = getattr(pipeline, "spec", None)
+    if (getattr(arena, "gdn_state_rows", None) is None
+            or not getattr(spec, "gdn_value_heads", 0)):
+        return
+    device = arena.gdn_state_rows.device
+    q = torch.zeros((1, spec.gdn_key_heads, spec.gdn_key_dim),
+                    dtype=torch.bfloat16, device=device)
+    v = torch.zeros((1, spec.gdn_value_heads, spec.gdn_value_dim),
+                    dtype=torch.bfloat16, device=device)
+    gate = torch.zeros((1, spec.gdn_value_heads), dtype=torch.float32,
+                       device=device)
+    phase = GdnPhase(
+        rows=None, lengths=(1,),
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        state_rows=torch.zeros(1, dtype=torch.int64, device=device))
+    _recurrent_decode(arena, phase, 0, q, q, v, gate, gate,
+                      spec.gdn_key_dim ** -0.5)
+
+
 def _warm_run(*args, **kwargs):
     """Run warm-up stages; their log lines say warm-up, not a query stage."""
     return run_stages(*args, label="kernel warmup", **kwargs)
@@ -81,6 +108,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     classification chunk.
     """
     _warm_convolutions(torch, pipeline, budget)
+    _warm_recurrent(torch, arena, pipeline)
     # a readout of several trailing rows needs a question that long
     trailing = 1 if async_ans is None else async_ans.trailing_rows
     warm_documents, question, document = _warm_inputs(budget, max(16, trailing))

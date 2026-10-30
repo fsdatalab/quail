@@ -39,6 +39,13 @@ class GdnPhase:
             False for rows another phase already produced.
         conv_metadata: vLLM convolution metadata shared by all layers.
             A phase consistently starts from zero or from saved state.
+        state_rows: For a phase of one-token sequences, the arena's
+            state row of each write slot (the slot plus one); the
+            recurrent kernel updates those rows in place. None runs the
+            chunked kernel on gathered state.
+        copy_reads: Read slots whose state first moves to a different
+            write slot, or None.
+        copy_writes: The write slots those states move to, or None.
     """
 
     rows: object
@@ -48,6 +55,9 @@ class GdnPhase:
     write_slots: object = None
     output: bool = True
     conv_metadata: object = None
+    state_rows: object = None
+    copy_reads: object = None
+    copy_writes: object = None
 
 
 def plan_phases(arena, groups, stage):
@@ -300,12 +310,39 @@ def _plan_phases(arena, groups, stage, undo):
                          stage(f"gdn_{name}_write", writes, torch.int64)),
             output=output)
 
+    def build_decode(name, rows, slots):
+        reads = np.array([pair[0] for pair in slots], dtype=np.int64)
+        writes = np.array([pair[1] for pair in slots], dtype=np.int64)
+        phase = build(name, rows, [1] * len(rows), reads, writes)
+        moved = reads != writes
+        phase.state_rows = stage(f"gdn_{name}_state_rows", writes + 1,
+                                 torch.int64)
+        if moved.any():
+            phase.copy_reads = stage(f"gdn_{name}_copy_read", reads[moved],
+                                     torch.int64)
+            phase.copy_writes = stage(f"gdn_{name}_copy_write", writes[moved],
+                                      torch.int64)
+        return phase
+
     phases = []
     for level in sorted(levels):
         rows, lengths, slots = levels[level]
-        reads = None if level == 0 else [pair[0] for pair in slots]
-        phases.append(build(f"level{level}", rows, lengths, reads,
-                            [pair[1] for pair in slots]))
+        if level == 0:
+            phases.append(build("level0", rows, lengths, None,
+                                [pair[1] for pair in slots]))
+            continue
+        # a one-token sequence is an answer's decode step
+        single = [index for index, length in enumerate(lengths) if length == 1]
+        rest = [index for index, length in enumerate(lengths) if length != 1]
+        if rest:
+            phases.append(build(
+                f"level{level}", [rows[i] for i in rest],
+                [lengths[i] for i in rest], [slots[i][0] for i in rest],
+                [slots[i][1] for i in rest]))
+        if single:
+            phases.append(build_decode(
+                f"level{level}_decode", [rows[i] for i in single],
+                [slots[i] for i in single]))
     rows, lengths, slots = lists["suffix"]
     if lengths:
         phases.append(build("suffix", rows, lengths, slots, None))
@@ -479,6 +516,28 @@ def _kernel_in_batches(spec, q, k, v, g, beta, load, store, phase, scale):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
 
+def _recurrent_decode(arena, phase, layer_slot, q, k, v, g, beta, scale):
+    """Advance each one-token sequence's state in its arena row, in place.
+
+    A sequence that reads another slot than it writes first copies that
+    state into its write slot. Returns (sequences, value heads, value
+    dim) outputs.
+    """
+    from vllm.third_party.flash_linear_attention.ops.fused_recurrent import (
+        fused_recurrent_gated_delta_rule,
+    )
+
+    if phase.copy_reads is not None:
+        arena.gdn_state[phase.copy_writes, layer_slot] = (
+            arena.gdn_state[phase.copy_reads, layer_slot])
+    out, _ = fused_recurrent_gated_delta_rule(
+        q[None], k[None], v[None], g[None], beta[None], scale=scale,
+        initial_state=arena.gdn_state_rows[:, layer_slot],
+        inplace_final_state=True, cu_seqlens=phase.cu_seqlens,
+        ssm_state_indices=phase.state_rows)
+    return out[0]
+
+
 # ---- the layer --------------------------------------------------------
 
 def short_conv_core(inputs, weight, phases, arena, layer_slot):
@@ -554,6 +613,13 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
             num_k_heads=spec.gdn_key_heads, head_k_dim=spec.gdn_key_dim,
             head_v_dim=spec.gdn_value_dim, apply_l2norm=True,
             output_g_exp=False)
+        if phase.state_rows is not None:
+            core = _recurrent_decode(arena, phase, layer_slot, q, k, v, g, b,
+                                     scale)
+            if phase.output:
+                out.index_copy_(0, phase.rows, core)
+            continue
+
         def load(first, last, phase=phase):
             if phase.read_slots is None:
                 return torch.zeros(
