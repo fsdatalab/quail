@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pyarrow as pa
 
 from quail.catalog.pairs import (
@@ -19,6 +20,9 @@ from quail.execution.result import (
 )
 from quail.execution.rows import Rows
 from quail.execution.spans import locate_span, read_phrase
+
+# the order shuffled map submission sends prompts in
+SHUFFLE_SEED = 0
 
 
 def token_list(values) -> list[int]:
@@ -313,7 +317,8 @@ def map_documents(client, specs, bodies, body_texts=None, *,
     Operator-at-a-time submission sends every prompt in one engine
     call, in document order with each document's maps together, so the
     engine's prefix caching computes a document's KV once for all of
-    them. Pipelined submission runs the maps of each document through
+    them. Shuffled submission sends the same call with the prompts in a
+    random order, seeded. Pipelined submission runs the maps of each document through
     the client's step loop, as extraction fields do: the first map
     computes the body's KV before the others enter, and the document
     cap counts each prompt and one answer token, as a filter's does.
@@ -326,7 +331,7 @@ def map_documents(client, specs, bodies, body_texts=None, *,
         bodies: Token ids for each prompt before the tail, preamble included.
         body_texts: The text of each prompt before the tail, for an
             engine that tokenizes the prompt itself; None sends token ids.
-        submission: "operator-at-a-time" or "pipelined".
+        submission: "operator-at-a-time", "shuffled", or "pipelined".
 
     Returns:
         One dict per spec with its answers, in body order, and the
@@ -347,13 +352,19 @@ def map_documents(client, specs, bodies, body_texts=None, *,
             answer_tokens=1, body_texts=body_texts,
             tail_texts=[spec.tail_text for spec in specs])
         per_spec, document_cap = run["outputs"], run["doc_cap"]
-    elif submission == "operator-at-a-time":
+    elif submission in ("operator-at-a-time", "shuffled"):
         prompts = [
             body_texts[index] + spec.tail_text if body_texts is not None
             else {"prompt_token_ids": body + token_list(spec.tail_token_ids)}
             for index, body in enumerate(bodies) for spec in specs]
-        outputs = (client.generate(prompts, params * len(bodies), use_tqdm=False)
-                   if prompts else [])
+        order = np.arange(len(prompts))
+        if submission == "shuffled":
+            order = np.random.default_rng(SHUFFLE_SEED).permutation(len(prompts))
+        sent = (client.generate([prompts[i] for i in order],
+                                [params[i % len(specs)] for i in order],
+                                use_tqdm=False)
+                if prompts else [])
+        outputs = [sent[k] for k in np.argsort(order)]
         per_spec = [outputs[q::len(specs)] for q in range(len(specs))]
         document_cap = None
     else:

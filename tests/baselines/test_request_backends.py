@@ -55,7 +55,8 @@ def _filter_query(session):
 def test_request_backends_plan_validate_and_execute(monkeypatch):
     registry = built_in_registry()
     assert set(registry.backends) == {
-        "quail", "stock_vllm", "pipelined_vllm", "dumb_vllm", "pipelined_sglang",
+        "quail", "stock_vllm", "pipelined_vllm", "shuffled_vllm", "dumb_vllm",
+        "pipelined_sglang",
     }
 
     for backend_name in ("stock_vllm", "pipelined_vllm", "pipelined_sglang"):
@@ -632,7 +633,7 @@ def test_an_experiment_can_turn_on_vllm_ngram_drafts(monkeypatch):
 
 
 class _MapClient:
-    """Answers each prompt with its last token and limit, by call or step loop."""
+    """Answers each prompt with its last two tokens and limit, by call or step loop."""
 
     def __init__(self):
         self.pending = {}
@@ -645,7 +646,8 @@ class _MapClient:
         return SimpleNamespace(
             request_id=request_id, finished=True, prompt_token_ids=ids,
             num_cached_tokens=0,
-            outputs=[SimpleNamespace(token_ids=[1], text=f"{ids[-1]}/{limit}")])
+            outputs=[SimpleNamespace(token_ids=[1],
+                                     text=f"{ids[-2]}:{ids[-1]}/{limit}")])
 
     def generate(self, prompts, params, use_tqdm=False):
         return [self._output(prompt["prompt_token_ids"], limit)
@@ -669,7 +671,7 @@ class _MapClient:
                                   answer_tokens=answer_tokens)
 
 
-@pytest.mark.parametrize("submission", ["operator-at-a-time", "pipelined"])
+@pytest.mark.parametrize("submission", ["operator-at-a-time", "shuffled", "pipelined"])
 def test_maps_write_each_answer_under_its_own_limit(submission):
     from quail.baselines.nodes import RequestMapSpec
 
@@ -683,8 +685,8 @@ def test_maps_write_each_answer_under_its_own_limit(submission):
         document_texts={"d": ["one", "two", "three"]},
         map_submission=submission).execute(node, {"input:0": [0, 1, 2]})
     assert result.outputs["map_answers:plot"].to_pydict()["plot"] == [
-        "90/1024"] * 3
+        "10:90/1024", "11:90/1024", "12:90/1024"]
     assert result.outputs["map_answers:topic"].to_pydict()["topic"] == [
-        "91/32"] * 3
+        "10:91/32", "11:91/32", "12:91/32"]
     steps = result.metrics.extension["steps"]
     assert {step["submission"] for step in steps} == {submission}

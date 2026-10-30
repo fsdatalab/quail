@@ -1,16 +1,16 @@
 r"""Compare answer admission modes on AI.MAP queries over reviews and contracts.
 
 Each mode runs on its own H100: QUAIL_ANSWER_ADMISSION picks it before
-the Session starts, and the modes stock_vllm and pipelined_vllm run the
-vLLM baseline backend instead, counting its evictions and recomputed
-tokens from its scheduler step trace. A warm-up query on the last 64
-reviews loads the model and captures CUDA graphs; then each query runs
-`repeats` times on the first `num_documents` reviews. Per run the cell records wall
-seconds, answer evictions, recomputed tokens, the headroom answers were
-given, the passes and the tokens, attention pairs, and KV tokens read
-in them with their SoL seconds, answer-length percentiles, and a hash
-of every answer, so modes can be checked for
-the same output. Results go to
+the Session starts, and the modes stock_vllm, shuffled_vllm, and
+pipelined_vllm run that vLLM baseline backend instead, counting its
+evictions and recomputed tokens from its scheduler step trace. A warm-up
+query on the last 64 reviews loads the model and captures CUDA graphs;
+then each query runs `repeats` times on the first `num_documents`
+reviews. Per run the cell records wall seconds, answer evictions,
+recomputed tokens, the headroom answers were given, the passes and the
+tokens, attention pairs, and KV tokens read in them with their SoL
+seconds, answer-length percentiles, and a hash of every answer, so
+modes can be checked for the same output. Results go to
 /results/ablations/answer_headroom/<run id>/<mode>.json.
 
     uv run modal run --detach experiments/cells/answer_headroom.py::compare \
@@ -91,7 +91,7 @@ QUERIES = {
         + " FROM contracts c"),
 }
 # modes that run a vLLM baseline backend instead of a Quail admission mode
-VLLM_MODES = ("stock_vllm", "pipelined_vllm")
+VLLM_MODES = ("stock_vllm", "shuffled_vllm", "pipelined_vllm")
 
 OUTPUT_DIR = "/results/ablations/answer_headroom"
 WARMUP_DOCUMENTS = 64

@@ -463,6 +463,16 @@ def pipelined_vllm_backend() -> RequestBackend:
     )
 
 
+def shuffled_vllm_backend() -> RequestBackend:
+    """Return stock vLLM sending every map prompt in one call, in random order."""
+    return RequestBackend(
+        name="shuffled_vllm",
+        engine=VLLMEngine(),
+        filter_submission="operator-at-a-time",
+        map_submission="shuffled",
+    )
+
+
 def dumb_vllm_backend() -> RequestBackend:
     """Return vLLM at its default settings, operator-at-a-time filters."""
     return RequestBackend(
