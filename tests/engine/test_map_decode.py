@@ -597,14 +597,15 @@ def test_prompt_admission_admits_when_the_prompt_fits_but_waits_for_evicted_answ
 
 def test_headroom_grows_with_long_answers_and_shrinks_when_pages_are_valuable():
     long_ended = [(0, 30), (1, 31)]
-    _, admission = headroom_admission(ended=long_ended, num_documents=4)
+    _, admission = headroom_admission(ended=long_ended, num_documents=4,
+                                      prefix_tokens=8000)
     admission.refresh(np.array([-2, -2, -1, -1]))
     roomy = admission._candidate_headroom(2)
     assert roomy > 0
     admission.page_value = 1.0
     assert admission._candidate_headroom(2) == 0
     _, short = headroom_admission(ended=[(0, 1), (1, 1)], expected_tokens=1,
-                                  num_documents=4)
+                                  num_documents=4, prefix_tokens=8000)
     short.refresh(np.array([-2, -2, -1, -1]))
     assert short._candidate_headroom(2) < roomy
 
@@ -630,7 +631,8 @@ def test_bucket_curves_follow_their_own_answers_and_fall_back_to_the_map():
         decoder.lengths[0][a] = decoder.written[0][a] = 4 if a < 20 else 60
     cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
     admission = HeadroomAdmission(decoder, prefix_lengths, 6, {}, [0] * 40,
-                                  lambda tokens: pages_for(tokens, 4), cost)
+                                  lambda tokens: pages_for(tokens, 4), cost,
+                                  bucket_answers=10)
     admission.refresh(np.array([-2] * 39 + [-1]))
     short = admission.bucket_curves[(0, 3)]
     long = admission.bucket_curves[(0, 8)]
@@ -638,6 +640,18 @@ def test_bucket_curves_follow_their_own_answers_and_fall_back_to_the_map():
     whole = answer_survival(decoder.lengths[0], decoder.written[0], 8, 64)
     assert short[10] < 0.3 < whole[10] < 0.6 < long[10]
     np.testing.assert_allclose(alone, whole)
+    sparse = HeadroomAdmission(decoder, prefix_lengths, 6, {}, [0] * 40,
+                               lambda tokens: pages_for(tokens, 4), cost,
+                               bucket_answers=25)
+    sparse.refresh(np.array([-2] * 39 + [-1]))
+    np.testing.assert_allclose(sparse.bucket_curves[(0, 3)], whole)
+
+
+def test_pages_have_value_to_waiting_documents_before_any_answer_runs():
+    _, admission = headroom_admission(num_documents=4)
+    admission.refresh(np.array([-1, -1, -1, -1]))
+    assert admission.work.tokens == 0
+    assert admission.page_value > 0
 
 
 def test_replay_seconds_charge_extra_passes_and_spare_compute():

@@ -240,7 +240,8 @@ class HeadroomAdmission(AnswerAdmission):
 
     - P(Y > j): the chance the answer needs more than j more pages,
       from the Kaplan-Meier curve of its map and input-length bucket,
-      conditional on the tokens it has written.
+      conditional on the tokens it has written. A bucket uses the curve
+      of all its map's answers until bucket_answers of its own ended.
     - D(j): j times the value of one page to waiting documents, the
       SoL seconds one waiting document saves by joining passes that
       run anyway, divided by the pages its prompt takes.
@@ -252,7 +253,8 @@ class HeadroomAdmission(AnswerAdmission):
 
     def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
                  shared, page_cost, decode_cost=None, page_holds=None, *,
-                 choose_headroom=True, chunk_tokens=0, curve_refresh=32):
+                 choose_headroom=True, chunk_tokens=0, curve_refresh=32,
+                 bucket_answers=30):
         super().__init__(decoder, prefix_lengths, capacity_extra, dependencies,
                          shared, page_cost, decode_cost, page_holds)
         self.page_cost = page_cost
@@ -260,6 +262,7 @@ class HeadroomAdmission(AnswerAdmission):
         self.choose_headroom = choose_headroom and decode_cost is not None
         self.chunk_tokens = chunk_tokens
         self.curve_refresh = curve_refresh
+        self.bucket_answers = bucket_answers
         self.bucket = input_bucket(self.prefix)
         self.slot_map = np.full(len(self.prefix), -1, dtype=np.int64)
         # per slot, the KV position its pages and headroom reach
@@ -332,6 +335,10 @@ class HeadroomAdmission(AnswerAdmission):
             buckets = self.bucket[slots]
             for b in np.unique(buckets):
                 mine = buckets == b
+                # a bucket with few ended answers keeps the map's curve
+                if int((lengths[mine] >= 0).sum()) < self.bucket_answers:
+                    self.bucket_curves[(q, int(b))] = whole
+                    continue
                 self.bucket_curves[(q, int(b))] = answer_survival(
                     lengths[mine], written[mine], decoder.expected_tokens[q],
                     limit, prior=whole)
@@ -342,8 +349,10 @@ class HeadroomAdmission(AnswerAdmission):
         if not len(waiting):
             return 0.0
         anchor = int(waiting[0])
-        gain = self.decode_cost.gain(self.work, self._added_work(anchor),
-                                     self.expected_tokens[anchor])
+        added = self._added_work(anchor)
+        # with nothing running, price joining a pass that holds one such answer
+        base = self.work if self.work.tokens else added
+        gain = self.decode_cost.gain(base, added, self.expected_tokens[anchor])
         pages = self.page_cost(int(self.prefix[anchor]) + self.capacity_extra)
         return gain / max(1, pages)
 
