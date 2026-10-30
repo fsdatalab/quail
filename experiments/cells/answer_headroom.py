@@ -84,12 +84,11 @@ QUERIES = {
         "FROM contracts c"),
     # long answers per long contract: a contract read once per pass serves
     # all of them, and an eviction recomputes the whole contract
-    **{f"{count} contract maps": (
+    "sixteen contract maps": (
         "SELECT c.id, " + ", ".join(
             f"AI.MAP(c.text, '{prompt}', {LIMIT}) AS {name}"
-            for name, prompt in CONTRACT_MAPS[:size])
-        + " FROM contracts c")
-       for count, size in (("six", 6), ("sixteen", 16))},
+            for name, prompt in CONTRACT_MAPS)
+        + " FROM contracts c"),
 }
 # modes that run a vLLM baseline backend instead of a Quail admission mode
 VLLM_MODES = ("stock_vllm", "pipelined_vllm")
@@ -301,7 +300,7 @@ def estimate_sol(query: str, run_dir: str, mode: str, scale_factor: float,
 
 
 @app.local_entrypoint()
-def sol(run_dir: str, queries: str = "six contract maps", mode: str = "headroom",
+def sol(run_dir: str, queries: str = "sixteen contract maps", mode: str = "headroom",
         scale_factor: float = 1.0, num_documents: int = 1000, num_contracts: int = 0):
     for query in filter(None, queries.split(",")):
         call = estimate_sol.spawn(query, run_dir, mode, scale_factor, num_documents,
