@@ -1,9 +1,11 @@
 r"""Compare answer admission modes on AI.MAP queries over reviews and contracts.
 
 Each mode runs on its own H100: QUAIL_ANSWER_ADMISSION picks it before
-the Session starts. A warm-up query on the last 64 reviews loads the
-model and captures CUDA graphs; then each query runs `repeats` times on
-the first `num_documents` reviews. Per run the cell records wall
+the Session starts, and the modes stock_vllm and pipelined_vllm run the
+vLLM baseline backend instead, counting its evictions and recomputed
+tokens from its scheduler step trace. A warm-up query on the last 64
+reviews loads the model and captures CUDA graphs; then each query runs
+`repeats` times on the first `num_documents` reviews. Per run the cell records wall
 seconds, answer evictions, recomputed tokens, the headroom answers were
 given, the passes and the tokens, attention pairs, and KV tokens read
 in them with their SoL seconds, answer-length percentiles, and a hash
@@ -35,6 +37,13 @@ REWRITE = ("Rewrite the review as a balanced one that gives both the strengths "
 PARTIES = "List every party to the agreement with its role."
 LIABILITY = "Quote every clause that limits liability or caps damages."
 SECTIONS = "Summarize each section of the agreement in one sentence."
+OBLIGATIONS = "List every obligation of each party, clause by clause."
+DEFINITIONS = "List every defined term with its definition."
+DATES = ("List every date, deadline, and notice period the agreement sets, "
+         "with what each applies to.")
+PAYMENTS = "List every payment, fee, and price term, with amounts and conditions."
+TERMINATION = ("Quote every clause that lets a party terminate the agreement, "
+               "with its conditions.")
 LIMIT = 1024
 QUERIES = {
     "one long map": (f"SELECT r.id, AI.MAP(r.body, '{PLOT}', {LIMIT}) "
@@ -49,11 +58,34 @@ QUERIES = {
         f"AI.MAP(c.text, '{LIABILITY}', {LIMIT}) AS liability, "
         f"AI.MAP(c.text, '{SECTIONS}', {LIMIT}) AS sections "
         "FROM contracts c"),
+    # six long answers per long contract: a contract read once per pass
+    # serves six answers, and an eviction recomputes the whole contract
+    "six contract maps": (
+        "SELECT c.id, " + ", ".join(
+            f"AI.MAP(c.text, '{prompt}', {LIMIT}) AS {name}"
+            for name, prompt in (
+                ("obligations", OBLIGATIONS), ("definitions", DEFINITIONS),
+                ("sections", SECTIONS), ("dates", DATES),
+                ("payments", PAYMENTS), ("termination", TERMINATION)))
+        + " FROM contracts c"),
 }
+# modes that run a vLLM baseline backend instead of a Quail admission mode
+VLLM_MODES = ("stock_vllm", "pipelined_vllm")
 
 OUTPUT_DIR = "/results/ablations/answer_headroom"
 WARMUP_DOCUMENTS = 64
 image = gpu_image()
+
+
+def step_totals(steps: Path, first: int) -> tuple[int, int, int]:
+    """Return the step trace's lines, and its evictions and recomputed tokens.
+
+    The evictions and recomputed tokens count from line `first` on.
+    """
+    lines = steps.read_text().splitlines() if steps.exists() else []
+    records = [json.loads(line) for line in lines[first:]]
+    return (len(lines), sum(r["preempted"] for r in records),
+            sum(r["recomputed"] for r in records))
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=4 * 3600,
@@ -68,12 +100,18 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
     Returns:
         The measurements as JSON.
     """
-    os.environ["QUAIL_ANSWER_ADMISSION"] = mode
-    # the engine's workers start with the Session and read both variables
+    from quail.baselines.vllm_trace import STEP_TRACE_ENV
+
+    # the engine's workers start with the Session and read these variables
     directory = Path(run_dir)
     traces = directory / f"{mode}-traces"
     traces.mkdir(parents=True, exist_ok=True)
-    os.environ["QUAIL_HEADROOM_TRACE"] = str(traces)
+    steps = traces / "steps.jsonl"
+    if mode in VLLM_MODES:
+        os.environ[STEP_TRACE_ENV] = str(steps)
+    else:
+        os.environ["QUAIL_ANSWER_ADMISSION"] = mode
+        os.environ["QUAIL_HEADROOM_TRACE"] = str(traces)
     import numpy as np
     import pyarrow.parquet as pq
 
@@ -82,8 +120,9 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
     from bench.quailb import build_query
 
     table = pq.read_table(Path(DATA_DIR) / f"sf{scale_factor}" / "reviews.parquet")
-    config = quail.EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="quail",
-                                device="h100-sxm")
+    config = quail.EngineConfig(
+        gpus=1, model="qwen3-4b-fp8",
+        backend=mode if mode in VLLM_MODES else "quail", device="h100-sxm")
     report = {"mode": mode, "num_documents": num_documents, "queries": {}}
     with quail.Session(config) as session:
         # warm up on reviews the timed queries do not read, so no KV is reused
@@ -104,6 +143,7 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
         for name in query_ids:
             runs = []
             for _ in range(repeats):
+                first, _, _ = step_totals(steps, 0)
                 result = (session.sql(QUERIES[name]).run() if name in QUERIES
                           else build_query(session, benchmark.get_query(name)).run())
                 rows = result.collect()
@@ -131,6 +171,10 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
                     "answer_p90": int(np.percentile(lengths, 90)) if lengths else None,
                     "answers_sha256": digest.hexdigest(),
                 })
+                if mode in VLLM_MODES:
+                    _, evictions, recomputed = step_totals(steps, first)
+                    runs[-1].update(answer_evictions=evictions,
+                                    recomputed_tokens=recomputed)
                 print(mode, name, runs[-1], flush=True)
             report["queries"][name] = runs
     (directory / f"{mode}.json").write_text(json.dumps(report, indent=1))
