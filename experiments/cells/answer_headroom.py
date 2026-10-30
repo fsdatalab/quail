@@ -21,8 +21,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bench.quailb_parallel import DATA_DIR, VOLUMES, app, ensure_data, results_vol
-from experiments.cells.map_length_probe import QUERIES
 from quail.deploy.images import gpu_image
+
+# the long-answer map drafts of experiments/cells/map_length_probe.py
+NAMES = ("List every film, actor, director, and character the review names, "
+         "with what the writer says about each.")
+PLOT = ("Retell the plot of the film as the review describes it, in order, "
+        "with every character and event the review mentions.")
+REWRITE = ("Rewrite the review as a balanced one that gives both the strengths "
+           "and the weaknesses of the film, keeping every point the writer makes.")
+LIMIT = 1024
+QUERIES = {
+    "one long map": (f"SELECT r.id, AI.MAP(r.body, '{PLOT}', {LIMIT}) "
+                     "AS plot FROM reviews r"),
+    "three long maps": (f"SELECT r.id, AI.MAP(r.body, '{PLOT}', {LIMIT}) AS plot, "
+                        f"AI.MAP(r.body, '{REWRITE}', {LIMIT}) AS balanced, "
+                        f"AI.MAP(r.body, '{NAMES}', {LIMIT}) AS names "
+                        "FROM reviews r"),
+}
 
 OUTPUT_DIR = "/results/ablations/answer_headroom"
 WARMUP_DOCUMENTS = 64
