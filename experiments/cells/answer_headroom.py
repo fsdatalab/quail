@@ -1,4 +1,4 @@
-r"""Compare answer admission modes on AI.MAP queries over IMDB reviews.
+r"""Compare answer admission modes on AI.MAP queries over reviews and contracts.
 
 Each mode runs on its own H100: QUAIL_ANSWER_ADMISSION picks it before
 the Session starts. A warm-up query on the last 64 reviews loads the
@@ -32,6 +32,9 @@ PLOT = ("Retell the plot of the film as the review describes it, in order, "
         "with every character and event the review mentions.")
 REWRITE = ("Rewrite the review as a balanced one that gives both the strengths "
            "and the weaknesses of the film, keeping every point the writer makes.")
+PARTIES = "List every party to the agreement with its role."
+LIABILITY = "Quote every clause that limits liability or caps damages."
+SECTIONS = "Summarize each section of the agreement in one sentence."
 LIMIT = 1024
 QUERIES = {
     "one long map": (f"SELECT r.id, AI.MAP(r.body, '{PLOT}', {LIMIT}) "
@@ -40,6 +43,12 @@ QUERIES = {
                         f"AI.MAP(r.body, '{REWRITE}', {LIMIT}) AS balanced, "
                         f"AI.MAP(r.body, '{NAMES}', {LIMIT}) AS names "
                         "FROM reviews r"),
+    # contract maps whose lengths differ by map and grow with the contract
+    "three contract maps": (
+        f"SELECT c.id, AI.MAP(c.text, '{PARTIES}', {LIMIT}) AS parties, "
+        f"AI.MAP(c.text, '{LIABILITY}', {LIMIT}) AS liability, "
+        f"AI.MAP(c.text, '{SECTIONS}', {LIMIT}) AS sections "
+        "FROM contracts c"),
 }
 
 OUTPUT_DIR = "/results/ablations/answer_headroom"
@@ -85,13 +94,12 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
         session.register("reviews", quail.DocumentProvider.from_table(
             table.slice(0, num_documents), id_col="id"))
         tables = Path(DATA_DIR) / f"sf{scale_factor}"
-        # QUAIL-B queries read every other table whole; reviews stay sliced
-        if any(name not in QUERIES for name in query_ids):
-            for path in sorted(tables.glob("*.parquet")):
-                if path.stem == "reviews":
-                    continue
-                session.register(path.stem, quail.DocumentProvider.from_parquet(
-                    str(path), id_col="id"))
+        # every other table is read whole; reviews stay sliced
+        for path in sorted(tables.glob("*.parquet")):
+            if path.stem == "reviews":
+                continue
+            session.register(path.stem, quail.DocumentProvider.from_parquet(
+                str(path), id_col="id"))
         tokenizer = session.tokenizer
         for name in query_ids:
             runs = []
@@ -134,7 +142,8 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
 def compare(modes: str = "prompt,headroom", queries: str = ",".join(QUERIES),
             scale_factor: float = 0.1, num_documents: int = 1000, repeats: int = 2):
     query_ids = [name for name in queries.split(",") if name]
-    ensure_data.remote(scale_factor, ["IMDB-20"] + [
+    # IMDB-20 brings the reviews and CUAD-22 the contracts
+    ensure_data.remote(scale_factor, ["IMDB-20", "CUAD-22"] + [
         name for name in query_ids if name not in QUERIES], "")
     run_id = (f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
               f"{uuid.uuid4().hex[:8]}")
