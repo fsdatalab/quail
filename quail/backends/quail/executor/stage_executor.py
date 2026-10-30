@@ -1,5 +1,6 @@
 """Run one stage list: admission, packed forward chunks, and answer readout."""
 
+import json
 import os
 import time
 from functools import partial
@@ -1056,6 +1057,14 @@ class StageExecutor:
         if self.decoder is not None:
             logger.info("%s: %d answer evictions, %d recomputed tokens", self.label,
                         self.num_evictions, self.recomputed_tokens)
+            curves = getattr(self.answer_admission, "bucket_curves", None)
+            if curves:
+                logger.info("%s: headroom %s", self.label, json.dumps({
+                    "page_tokens": self.arena.page_tokens,
+                    "rebuilds": self.answer_admission.trace,
+                    "granted": self.answer_admission.granted_at,
+                    "curves": {f"{q}:{b}": [round(float(v), 4) for v in curve[::8]]
+                               for (q, b), curve in curves.items()}}))
             logger.info("%s: decode rows read KV tokens %s", self.label,
                         self.decoder.read_tokens)
         return self.sched.answers, self.spans, self.tokens

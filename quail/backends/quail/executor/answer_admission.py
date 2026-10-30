@@ -273,8 +273,10 @@ class HeadroomAdmission(AnswerAdmission):
         self._refreshes = 0
         # (refresh, map, bucket, answers, mean headroom pages) per rebuild
         self.trace = []
-        # headroom pages each admitted answer was given
+        # headroom pages each admitted answer was given, and
+        # (refresh, bucket, pages) for each
         self.granted = []
+        self.granted_at = []
 
     def refresh(self, stages, replays=(), replay_pages=0):
         """Rebuild the work, the curves when answers ended, and each headroom."""
@@ -423,6 +425,8 @@ class HeadroomAdmission(AnswerAdmission):
         granted = ((self.reach[slots] - self.capacity[slots])
                    // self.decoder.page_tokens).clip(0)
         self.granted.extend(granted.tolist())
+        self.granted_at.extend((self._refreshes, int(self.bucket[slot]), int(pages))
+                               for slot, pages in zip(slots, granted))
         self.headroom_pages += int(granted.sum())
         branches = np.flatnonzero((self.parent == anchor)
                                   & (np.arange(len(self.prefix)) != anchor))
