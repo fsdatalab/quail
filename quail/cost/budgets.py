@@ -132,20 +132,25 @@ def sliding_kv_fits(model: ModelSpec, device: DeviceSpec,
     return True
 
 
-def graph_token_buckets(model: ModelSpec, device: DeviceSpec) -> tuple[int, ...]:
-    """Return dense Qwen3 capture sizes through twice the compute ridge.
+# CUDA graph capture sizes, in tokens per pass, for Quail and the vLLM
+# baselines alike. A pass pads to the next size and runs eagerly past
+# the largest. vLLM's defaults (1, 2, 4, then every 8 to 256 and every
+# 16 to 512), then every 256 to 8,192, so a decode pass of hundreds of
+# rows or a full prefill pass pads by fewer than 256 rows
+GRAPH_TOKEN_BUCKETS = (
+    1, 2, 4, *range(8, 256, 8), *range(256, 513, 16), *range(768, 8_193, 256))
 
-    Beyond twice the ridge, dense compute dominates weight reads by at
-    least two. Geometric steps bound padding to half the real rows,
-    rounded up, while keeping the number of captures logarithmic.
+
+def graph_token_buckets(model: ModelSpec, device: DeviceSpec) -> tuple[int, ...]:
+    """Return the CUDA graph capture sizes of a dense Qwen3 model.
+
+    The sizes are GRAPH_TOKEN_BUCKETS, up to the model's kernel index
+    cap; other model families run without graphs.
     """
     if model.arch != "qwen3" or model.state_layers or model.canvas_tokens:
         return ()
-    maximum = min(ceil(2 * compute_knee(model, device)), kernel_index_cap(model))
-    buckets = [1]
-    while buckets[-1] < maximum:
-        buckets.append(min(maximum, ceil(3 * buckets[-1] / 2)))
-    return tuple(buckets)
+    cap = kernel_index_cap(model)
+    return tuple(size for size in GRAPH_TOKEN_BUCKETS if size <= cap)
 
 
 def graph_memory_bytes(model: ModelSpec, device: DeviceSpec) -> int:

@@ -104,7 +104,7 @@ def test_model_weights_and_kv_memory_budgets():
     head = QWEN3_32B_FP8.head_mem_bytes
     assert head == 151_936 * 5_120 * 2
     assert QWEN3_32B_FP8.W_resident == QWEN3_32B_FP8.W_mem
-    assert budgets.arena_tokens(QWEN3_32B_FP8, H100_SXM) == 105_680
+    assert budgets.arena_tokens(QWEN3_32B_FP8, H100_SXM) == 96_128
     # the chunk budget does not move: the 32B chunk is capped by the
     # int32 kernel index, not by memory
     kept = replace(QWEN3_32B_FP8, tied_head=True)
@@ -112,8 +112,8 @@ def test_model_weights_and_kv_memory_budgets():
         budgets.chunk_budget(kept, H100_SXM)
 
     tokens = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM)
-    assert tokens == 361_536
-    assert tokens // 400 == 903
+    assert tokens == 353_136
+    assert tokens // 400 == 882
     fp8 = budgets.arena_tokens(replace(QWEN3_4B_FP8, kv_bytes=1.0), H100_SXM)
     assert fp8 == pytest.approx(2 * tokens, rel=0.01)
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):

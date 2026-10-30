@@ -13,6 +13,7 @@ from quail.baselines.request_scheduling import (
     run_extract_fields,
     run_filter_sequence,
 )
+from quail.cost.budgets import GRAPH_TOKEN_BUCKETS
 from quail.specs.base import DeviceSpec, ModelSpec
 from quail.specs.files import resolve_model_path
 
@@ -49,14 +50,6 @@ def gpu_memory_utilization(device: DeviceSpec | None,
     return min(GPU_MEMORY_UTILIZATION, reserved)
 
 
-# vLLM pads a step to the next captured size and runs a step past the
-# largest one eagerly. The sizes are vLLM's defaults (1, 2, 4, then
-# every 8 to 256 and every 16 to 512), then every 256 to 8,192, so a
-# decode step of hundreds of sequences or a full prefill step replays a
-# graph padded by fewer than 256 rows
-CUDA_GRAPH_CAPTURE_SIZES = (
-    [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16))
-    + list(range(768, 8_193, 256)))
 # vLLM caps a diffusion model at 8 sequences per step whenever the
 # setting is 128 or more, sized for its 256-row canvas; one row needs
 # no cap, so stay just under the trigger.
@@ -338,7 +331,7 @@ class VLLMEngine:
             "disable_log_stats": True,
             "tokenizer_mode": "gigatoken",
             "compilation_config": {
-                "cudagraph_capture_sizes": CUDA_GRAPH_CAPTURE_SIZES
+                "cudagraph_capture_sizes": list(GRAPH_TOKEN_BUCKETS)
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
                              else min(MAX_SEQUENCES,

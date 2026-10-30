@@ -11,7 +11,7 @@ from quail.backends.quail.executor.cuda_graphs import (
     PiecewiseBuffers,
     PiecewiseGraphs,
 )
-from quail.cost.budgets import compute_knee, graph_memory_bytes, graph_token_buckets
+from quail.cost.budgets import graph_memory_bytes, graph_token_buckets
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_5_4B_BF16, QWEN3_32B_FP8
 
 torch = pytest.importorskip("torch")
@@ -37,13 +37,13 @@ def pipeline():
 
 
 @pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_32B_FP8])
-def test_buckets_bound_padding_and_stop_at_twice_the_compute_ridge(model):
+def test_dense_qwen3_captures_the_stock_vllm_sizes_with_padding_under_256(model):
     buckets = graph_token_buckets(model, H100_SXM)
+    assert len(buckets) == 81
     assert buckets[0] == 1
-    assert buckets[-1] - 1 < 2 * compute_knee(model, H100_SXM) <= buckets[-1]
+    assert buckets[-1] == 8_192
     for n in range(1, buckets[-1] + 1):
-        bucket = next(b for b in buckets if b >= n)
-        assert bucket <= (3 * n + 1) // 2
+        assert next(b for b in buckets if b >= n) - n < 256
     assert graph_memory_bytes(model, H100_SXM) == (
         2 * buckets[-1] * model.act_per_token)
 
