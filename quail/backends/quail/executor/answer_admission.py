@@ -48,9 +48,11 @@ class HeadroomAdmission:
     cover a new document's prompt and its answers' headroom. The pages
     are counted, not allocated: answers still grow one page at a time.
 
-    With choose_headroom False every headroom is zero, so a document is
-    admitted when its prompt fits. Otherwise each answer's headroom is
-    the page count j minimizing D(j) + P(Y > j) * R(j):
+    With choose_headroom False, admission and eviction follow vLLM: no
+    answer has headroom, so a document is admitted when its prompt fits,
+    and eviction takes the answer started or resumed last. Otherwise
+    each answer's headroom is the page count j minimizing
+    D(j) + P(Y > j) * R(j):
 
     - P(Y > j): the chance the answer needs more than j more pages,
       from the Kaplan-Meier curve of its map and input-length bucket,
@@ -95,6 +97,7 @@ class HeadroomAdmission:
         np.maximum.at(self.lead, self.parent, self.borrowed)
         self.page_cost = page_cost
         self.capacity_extra = capacity_extra
+        self.vllm_like = not choose_headroom
         self.choose_headroom = choose_headroom and decode_cost is not None
         self.chunk_tokens = chunk_tokens
         self.bucket_answers = bucket_answers
@@ -120,6 +123,8 @@ class HeadroomAdmission:
         self.headroom_pages = 0
         self.replay_pages = 0
         self.page_value = 0.0
+        self.work = Work()
+        self.added_work = {}
         # (anchor, its answer slots, their R(j) grid) for the first
         # waiting document, valid until the work changes
         self._candidate = None
@@ -156,7 +161,24 @@ class HeadroomAdmission:
                 self.curves[row, :self.row_limit[row] + 1] for row in self.rows}
 
     def refresh(self, stages, replays=(), replay_pages=0):
-        """Rebuild the work, the curves, and each running answer's headroom."""
+        """Count held pages; with headroom, rebuild the curves and choose it."""
+        self.committed = stages >= 0
+        self.pending_pages = np.where(stages == -1, self.prompt_pages, 0)
+        self.replay_pages = int(replay_pages)
+        self._refreshes += 1
+        running = self._running()
+        if self.choose_headroom:
+            self._refresh_curves(stages, replays)
+            self._choose_running(stages, running)
+            if self.traced:
+                self._record(running)
+        self.headroom_pages = int(self._remaining(running).sum())
+        # pending branches of admitted documents need their prompt pages
+        roots = self.committed[self.parent]
+        self.headroom_pages += int(self.pending_pages[roots].sum())
+
+    def _refresh_curves(self, stages, replays):
+        """Rebuild the curves of maps whose answers moved, and the work."""
         if self.slots is None:
             self._bind()
         decoder = self.decoder
@@ -178,21 +200,8 @@ class HeadroomAdmission:
         slots, expected = slots[unfinished], expected[maps[unfinished]]
         self.expected_tokens = np.bincount(self.parent[slots], weights=expected,
                                            minlength=len(self.prefix))
-        self.committed = stages >= 0
-        self.pending_pages = np.where(stages == -1, self.prompt_pages, 0)
         self._refresh_work(slots, self.prompt[slots] + expected / 2, replays)
         self._candidate = None
-        self.replay_pages = int(replay_pages)
-        self._refreshes += 1
-        running = self._running()
-        if self.choose_headroom:
-            self._choose_running(stages, running)
-            if self.traced:
-                self._record(running)
-        self.headroom_pages = int(self._remaining(running).sum())
-        # pending branches of admitted documents need their prompt pages
-        roots = self.committed[self.parent]
-        self.headroom_pages += int(self.pending_pages[roots].sum())
 
     def _rebuild_curves(self, maps, lengths, observed, changed):
         """Rebuild the whole-map and bucket curves of the changed maps."""
@@ -208,8 +217,6 @@ class HeadroomAdmission:
                                          self.decoder.limits[mine])
         rows = self.rows[changed[self.rows // self.num_buckets]]
         self.curves[rows] = self.whole[rows // self.num_buckets]
-        if not self.choose_headroom:
-            return
         # a bucket with few ended answers keeps its map's curve
         row_of = self.slot_row[self.slots]
         num_ended = np.bincount(row_of[ended], minlength=len(self.curves))
@@ -231,6 +238,8 @@ class HeadroomAdmission:
 
     def eviction_order(self, curves=None):
         """Rank running answers for eviction, the first evicted first."""
+        if self.vllm_like:
+            return self.decoder.newest_first()
         policy = None if self.decode_cost is None else self.decode_cost.recompute_cost
         holds = None if self.page_holds is None else self.page_holds()
         kept = None

@@ -614,6 +614,21 @@ def test_vllm_like_admission_admits_when_the_prompt_fits_but_waits_for_replays()
     assert admission.waits()
 
 
+def test_vllm_like_admission_evicts_the_answer_started_or_resumed_last():
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 3,
+                         [32], [STOP], 4, expected_tokens=[16])
+    decoder.answer_slots = {0: np.arange(3)}
+    admission = HeadroomAdmission(decoder, [8, 8, 8], 6, {}, [0, 0, 0],
+                                  lambda tokens: pages_for(tokens, 4),
+                                  choose_headroom=False)
+    for a in (1, 0, 2):
+        decoder.start(a, 0, 10, [3 * a, 3 * a + 1, 3 * a + 2])
+    assert admission.eviction_order().tolist() == [2, 0, 1]
+    decoder.pause(1)
+    decoder.resume(1, [3, 4, 5])
+    assert admission.eviction_order().tolist() == [1, 2, 0]
+
+
 def test_headroom_grows_with_long_answers_and_shrinks_when_pages_are_valuable():
     long_ended = [(0, 30), (1, 31)]
     _, admission = headroom_admission(ended=long_ended, num_documents=4,
