@@ -253,11 +253,22 @@ class MapPart(ColumnPart, ExecutionPart):
                         "answer_evictions": (stats.get("num_evictions", 0)
                                              if q == 0 else 0),
                         "recomputed_tokens": (stats.get("recomputed_tokens", 0)
-                                              if q == 0 else 0)}))
+                                              if q == 0 else 0),
+                        "headroom_pages": (headroom_pages(stats)
+                                           if q == 0 else 0.0)}))
         self.result_value = self._results[self.nodes[0].node_id]
 
     def results(self) -> dict:
         return self._results
+
+
+def headroom_pages(stats) -> float:
+    """Mean headroom pages of running answers over curve rebuilds, 0 for none."""
+    trace = stats.get("headroom_trace", [])
+    answers = sum(entry[3] for entry in trace)
+    if not answers:
+        return 0.0
+    return round(sum(entry[3] * entry[4] for entry in trace) / answers, 2)
 
 
 class AnswerBranches(MapPart):
