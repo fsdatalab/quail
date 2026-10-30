@@ -38,9 +38,3 @@ def remaining_tokens(lengths, written, expected_tokens, limit, prior_weight=20.0
                                    prior_weight)
     tail = np.r_[np.cumsum(survival[:0:-1])[::-1], 0.0]
     return np.divide(tail, survival, out=np.zeros(limit + 1), where=survival > 0)
-
-
-def quantile_tokens(lengths, written, expected_tokens, limit, quantile=0.9) -> int:
-    """Return the answer length that this share of answers stay within."""
-    survival = answer_survival(lengths, written, expected_tokens, limit)
-    return int(np.argmax(survival <= 1.0 - quantile))

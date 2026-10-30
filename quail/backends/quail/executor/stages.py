@@ -97,7 +97,7 @@ class Stage:
             the pipeline's default canvas.
         canvas_rows: Number of rows in each canvas returned by canvas.
         answer_tokens: Limit on tokens a decoder writes after the stage's
-            request, as AI.MAP's answer. Admission prices their pooled page demand.
+            request, as AI.MAP's answer. Admission reserves headroom for each answer.
         answer_index: Index of this stage's first map in the decoder.
         answer_dependencies: Decoder fields this stage's requests read.
     """

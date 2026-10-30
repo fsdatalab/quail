@@ -24,23 +24,22 @@ from quail.backends.quail.executor.stages import (
 from quail.progress import Progress, logger
 
 ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
-ANSWER_ADMISSION_MODES = ("pooled", "prompt", "headroom")
+ANSWER_ADMISSION_MODES = ("prompt", "headroom")
 # a directory each headroom run writes a file of its headroom over time
 # and its curves to
 HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
 
 
 def answer_admission_mode() -> str:
-    """Return the answer admission QUAIL_ANSWER_ADMISSION names, pooled by default.
+    """Return the answer admission QUAIL_ANSWER_ADMISSION names, headroom by default.
 
-    - pooled: admit when the batching gain beats the pooled overflow risk.
     - prompt: admit when the prompt fits, with no answer headroom.
     - headroom: admit when the prompt and each answer's chosen headroom fit.
 
     Raises:
         ValueError: The variable names no mode.
     """
-    mode = os.environ.get(ANSWER_ADMISSION_ENV, "pooled")
+    mode = os.environ.get(ANSWER_ADMISSION_ENV, "headroom")
     if mode not in ANSWER_ADMISSION_MODES:
         raise ValueError(f"{ANSWER_ADMISSION_ENV}={mode!r}; expected one of "
                          f"{', '.join(ANSWER_ADMISSION_MODES)}")
@@ -280,19 +279,16 @@ class StageExecutor:
         self.admission_mode = answer_admission_mode()
         if self.answer_maps and self.paged:
             from quail.backends.quail.executor.answer_admission import (
-                AnswerAdmission,
                 HeadroomAdmission,
             )
 
-            arguments = (decoder, self.prefix_lengths, self.capacity_extra,
-                         self.sched.dependencies, self.borrowing.tree_shared,
-                         self.arena.page_cost, decode_cost, self.arena.page_holds)
-            if self.admission_mode == "pooled":
-                self.answer_admission = AnswerAdmission(*arguments)
-            else:
-                self.answer_admission = HeadroomAdmission(
-                    *arguments, choose_headroom=self.admission_mode == "headroom",
-                    chunk_tokens=self.sched.chunk_budget)
+            self.answer_admission = HeadroomAdmission(
+                decoder, self.prefix_lengths, self.capacity_extra,
+                self.sched.dependencies, self.borrowing.tree_shared,
+                self.arena.page_cost, decode_cost, self.arena.page_holds,
+                choose_headroom=self.admission_mode == "headroom",
+                chunk_tokens=self.sched.chunk_budget,
+                trace=bool(os.environ.get(HEADROOM_TRACE_ENV)))
         # a Gated DeltaNet layer starts a borrower from the parent's state
         # at the shared point, so a parent writes one slot per point
         self.share_points = [()] * len(self.keys)
@@ -986,11 +982,8 @@ class StageExecutor:
                     and (self.sched.pending or self.sched.waiting)):
                 stage = np.asarray(self.sched._stage)
                 started = time.perf_counter()
-                if self.admission_mode == "pooled":
-                    self.answer_admission.refresh(stage, replays)
-                else:
-                    self.answer_admission.refresh(stage, replays,
-                                                  self._replay_pages(replays))
+                self.answer_admission.refresh(stage, replays,
+                                              self._replay_pages(replays))
                 self.admission_s += time.perf_counter() - started
             started = time.perf_counter()
             groups = self.sched.next_chunk(
