@@ -63,8 +63,8 @@ class MapDecoder:
         # while the answer has not ended
         self.tokens = [np.zeros((n, int(limit)), dtype=np.int32)
                        for limit in self.limits]
-        self.lengths = [np.full(n, -1, dtype=np.int64) for _ in self.limits]
-        self.written = [np.zeros(n, dtype=np.int64) for _ in self.limits]
+        self.lengths = np.full((len(self.limits), n), -1, dtype=np.int64)
+        self.written = np.zeros((len(self.limits), n), dtype=np.int64)
         self.paused = np.zeros(n, dtype=bool)
         # the answer each document is writing now
         self.map = np.full(n, -1, dtype=np.int64)      # its map, -1 for none
@@ -250,15 +250,33 @@ class MapDecoder:
         self.paused[document] = True
         return self.kv.detach(document)
 
-    def resume(self, document, pages):
-        """Continue after prefilling the prompt and every saved answer token."""
-        self.kv.set_pages(document, pages)
+    def resume(self, document, pages, parent=None, shared_tokens=0):
+        """Continue after prefilling the prompt and every saved answer token.
+
+        Args:
+            document: The paused slot.
+            pages: Its page ids in logical order.
+            parent: The slot whose whole pages it borrows again, or None.
+            shared_tokens: The tokens it borrows from the parent.
+        """
+        self.kv.start(document, pages, parent, shared_tokens)
         self.fed[document] = self.written[self.map[document]][document]
         self.paused[document] = False
         self.drafts[document] = 0
 
-    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None):
-        """Order running slots by page-hold time saved per recomputation second."""
+    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None,
+                       kept=None):
+        """Order running slots by page-hold time saved per recomputation second.
+
+        Args:
+            curves: Survival curve per map; None builds them from the answers.
+            recompute_cost: Prices recomputing a prefix; None ranks by
+                expected remaining tokens alone.
+            page_holds: Holders of each page; only pages a slot holds
+                alone count as freed. None counts every page.
+            kept: Per slot, leading tokens a replay reads from pages
+                another holder keeps instead of recomputing them.
+        """
         from quail.backends.quail.executor.answer_survival import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
@@ -280,6 +298,8 @@ class MapDecoder:
                              & (page_holds[table] == 1)).sum(axis=1)
             seconds = recompute_cost.prefill_seconds(
                 self.origin[running] + written[running])
+            if kept is not None:
+                seconds = seconds - recompute_cost.prefill_seconds(kept[running])
             scores[running] *= np.divide(num_pages, seconds,
                                          out=np.zeros(len(running)), where=seconds > 0)
         return running[np.lexsort((running, written[running], -scores[running]))]

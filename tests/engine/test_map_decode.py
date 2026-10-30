@@ -514,12 +514,8 @@ def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("mode", ["prompt", "headroom"])
-@pytest.mark.parametrize("num_maps", [1, 3])
-@pytest.mark.parametrize("budget,lag", [(20, 0), (200, 3)])
-@pytest.mark.parametrize("path", ["unified", "tree"])
-def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
-        monkeypatch, mode, num_maps, budget, lag, path):
+def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
+    """Run maps over twelve documents in a 20-page pool; return the answers."""
     cpu_staging(monkeypatch)
     monkeypatch.setenv("QUAIL_ANSWER_ADMISSION", mode)
     monkeypatch.setattr(__name__ + ".next_token", lambda h: (
@@ -553,13 +549,36 @@ def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
     for q, (tail, answer_limit) in enumerate(zip(tails, limits)):
         got = [answer.tolist() for answer in decoder.answers(q, maps._slots(q, ids))]
         assert got == [greedy(documents[a] + tail, answer_limit) for a in ids]
+    assert not decoder.active
+    assert not arena.accounting.owned
+    return stats, model
+
+
+@pytest.mark.parametrize("mode", ["vllm-like", "headroom"])
+@pytest.mark.parametrize("num_maps", [1, 3])
+@pytest.mark.parametrize("budget,lag", [(20, 0), (200, 3)])
+@pytest.mark.parametrize("path", ["unified", "tree"])
+def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
+        monkeypatch, mode, num_maps, budget, lag, path):
+    stats, model = run_maps_under_eviction(monkeypatch, mode, num_maps, budget,
+                                           lag, path)
     assert stats["answer_admission"] == mode
     work = stats["pass_work"]
     assert work["replay_tokens"] == stats["recomputed_tokens"]
     assert work["decode_rows"] == sum(len(slots) for slots in model.decode_slots)
     assert work["sol_s"] > 0
-    assert not decoder.active
-    assert not arena.accounting.owned
+
+
+@pytest.mark.parametrize("path", ["unified", "tree"])
+def test_a_replay_reads_the_prefix_its_siblings_still_hold(monkeypatch, path):
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+
+    kept, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 20, 0, path)
+    monkeypatch.setattr(StageExecutor, "_lender", lambda self, a: (None, 0))
+    whole, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 20, 0, path)
+    assert kept["num_evictions"] and whole["num_evictions"]
+    assert (kept["recomputed_tokens"] / kept["num_evictions"]
+            < whole["recomputed_tokens"] / whole["num_evictions"])
 
 
 def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
@@ -577,7 +596,7 @@ def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
     return decoder, admission
 
 
-def test_prompt_admission_admits_when_the_prompt_fits_but_waits_for_evicted_answers():
+def test_vllm_like_admission_admits_when_the_prompt_fits_but_waits_for_replays():
     decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
                          [32], [STOP], 4, expected_tokens=[16])
     decoder.answer_slots = {0: np.arange(2)}

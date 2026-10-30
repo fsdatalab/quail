@@ -2,6 +2,8 @@
 
 import heapq
 
+import numpy as np
+
 
 class PageArena:
     """Page accounting: a free list and per-document page lists.
@@ -24,7 +26,7 @@ class PageArena:
         self.free = list(range(num_pages - 1, -1, -1))    # stack
         self.owned = {}       # key -> list of page ids it alone writes
         self.borrowed = {}    # key -> leading page ids read from a parent
-        self.holds = [0] * num_pages    # page id -> keys holding it
+        self.holds = np.zeros(num_pages, dtype=np.int32)    # page id -> its holders
         self.tokens = {}      # key -> resident token count, borrowed included
         self.pinned = set()    # current operators depend on these keys
         self._retained_sizes = {}
@@ -63,8 +65,7 @@ class PageArena:
         self.owned[key] = pages
         self.borrowed[key] = borrowed
         self.tokens[key] = tokens
-        for page in borrowed + pages:
-            self.holds[page] += 1
+        self.holds[borrowed + pages] += 1
         return pages
 
     def shared_pages(self, parent, shared: int, start: int = 0) -> list:
@@ -100,13 +101,11 @@ class PageArena:
 
     def release_pages(self, pages) -> int:
         """Drop one hold on each page; returns how many went free."""
-        freed = 0
-        for page in pages:
-            self.holds[page] -= 1
-            if not self.holds[page]:
-                self.free.append(page)
-                freed += 1
-        return freed
+        pages = np.asarray(pages, dtype=np.int64)
+        self.holds[pages] -= 1
+        freed = pages[self.holds[pages] == 0]
+        self.free.extend(freed.tolist())
+        return len(freed)
 
     def alloc_slot(self, key):
         """A checkpoint slot for a resident key, or None when none is free.
@@ -199,7 +198,7 @@ class PageArena:
         # the pages evicting the key would free: those it alone holds
         # now; a child freed later leaves more, so the count is a
         # lower bound, and admission short of pages evicts anyway
-        pages = sum(1 for page in self.table_pages(key) if self.holds[page] == 1)
+        pages = int((self.holds[self.table_pages(key)] == 1).sum())
         self.retained[key] = prefix_tokens
         self._retained_sizes[key] = pages
         self._retained_pages += pages
@@ -279,8 +278,7 @@ class PageArena:
             return None
         added = [self.free.pop() for _ in range(need)]
         self.owned[key].extend(added)
-        for page in added:
-            self.holds[page] += 1
+        self.holds[added] += 1
         return need
 
     def grow_pages(self, keys) -> list | None:
@@ -291,7 +289,7 @@ class PageArena:
         del self.free[len(self.free) - len(keys):]
         for key, page in zip(keys, added):
             self.owned[key].append(page)
-            self.holds[page] += 1
+        self.holds[added] += 1
         return added
 
     def row_indices(self, key, tokens=None):

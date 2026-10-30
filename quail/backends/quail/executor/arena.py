@@ -825,7 +825,7 @@ class KVArena:
 
     def page_holds(self):
         """Return the number of live references to each full-pool page."""
-        return np.asarray(self.accounting.holds)
+        return self.accounting.holds
 
     def owned_pages(self, key) -> list:
         """The page ids a resident key's block table reads, in logical order.

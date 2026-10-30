@@ -24,7 +24,7 @@ from quail.backends.quail.executor.stages import (
 from quail.progress import Progress, logger
 
 ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
-ANSWER_ADMISSION_MODES = ("prompt", "headroom")
+ANSWER_ADMISSION_MODES = ("vllm-like", "headroom")
 # a directory each headroom run writes a file of its headroom over time
 # and its curves to
 HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
@@ -33,7 +33,8 @@ HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
 def answer_admission_mode() -> str:
     """Return the answer admission QUAIL_ANSWER_ADMISSION names, headroom by default.
 
-    - prompt: admit when the prompt fits, with no answer headroom.
+    - vllm-like: admit when the prompt fits, with no answer headroom, as
+      vLLM admits a request.
     - headroom: admit when the prompt and each answer's chosen headroom fit.
 
     Raises:
@@ -141,6 +142,8 @@ class StageExecutor:
         self.waiting_reports = []
         self.answered = set()   # documents whose answers ended first
         self.recomputing = {}   # evicted slot -> tokens prefilled since readmission
+        # evicted slot -> (its parent, the page ids of its borrowed prefix)
+        self.replay_borrow = {}
         self.num_evictions = 0
         # per pass: its rows, and whether documents were still queued
         self.pass_rows = []
@@ -277,6 +280,13 @@ class StageExecutor:
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         self.admission_mode = answer_admission_mode()
+        # a replay reads a borrowed prefix another key still holds; a
+        # checkpointed or sliding layer would need state at the borrow point
+        self.kept_prefix = bool(self.paged and not self.arena.num_state_slots
+                                and not self.arena.sliding_layers)
+        self.anchor_parent = np.arange(len(self.keys))
+        for anchor, (parent, _) in self.sched.dependencies.items():
+            self.anchor_parent[anchor] = parent
         if self.answer_maps and self.paged:
             from quail.backends.quail.executor.answer_admission import (
                 HeadroomAdmission,
@@ -287,7 +297,7 @@ class StageExecutor:
                 self.sched.dependencies, self.borrowing.tree_shared,
                 self.arena.page_cost, decode_cost, self.arena.page_holds,
                 choose_headroom=self.admission_mode == "headroom",
-                chunk_tokens=self.sched.chunk_budget,
+                chunk_tokens=self.sched.chunk_budget, kept_prefix=self.kept_prefix,
                 trace=bool(os.environ.get(HEADROOM_TRACE_ENV)))
         # a Gated DeltaNet layer starts a borrower from the parent's state
         # at the shared point, so a parent writes one slot per point
@@ -504,6 +514,11 @@ class StageExecutor:
             order = (decoder.eviction_order() if self.answer_admission is None
                      else self.answer_admission.eviction_order())
             victim = int(order[0])
+            num_shared = int(decoder.kv.borrowed[victim]) // self.arena.page_tokens
+            self.replay_borrow[victim] = (
+                (int(decoder.kv.parent[victim]),
+                 decoder.kv.pages[victim, :num_shared].tolist())
+                if self.kept_prefix and num_shared else None)
             for detached in decoder.pause(victim):
                 self.borrowing.chosen.pop(int(detached), None)
             key = self.keys[victim]
@@ -522,6 +537,7 @@ class StageExecutor:
             if decoder.map[a] < 0:
                 # its answer ended in a token that landed after eviction
                 del self.recomputing[a]
+                self.replay_borrow.pop(a, None)
                 continue
             if decoder.inflight[a] or decoder.copy_pending[a]:
                 continue    # its next copy inputs are not ready
@@ -534,11 +550,14 @@ class StageExecutor:
                               int(self.decoder.limits[q]) - written - 1)
                 capacity = max(self.prefix_lengths[a] + self.capacity_extra,
                                length + reserve)
+                lender, kept = self._lender(a)
                 if not self.arena.reserve(
                         key, self.prefix_lengths[a], capacity_tokens=capacity,
+                        borrow=None if lender is None else (lender, kept),
                         extension=self._extends):
                     break       # the pool is short; the rest wait in order
                 decoder.kv.set_pages(a, self.arena.owned_pages(key))
+                start = self.recomputing[a] = kept
             end = min(length, start + room)
             replays.append((a, start, end))
             room -= end - start
@@ -555,8 +574,45 @@ class StageExecutor:
             length = (int(self.decoder.origin[a])
                       + int(self.decoder.written[q][a]) + self.arena.page_tokens)
             pages += self.arena.page_cost(
-                max(self.prefix_lengths[a] + self.capacity_extra, length))
+                max(self.prefix_lengths[a] + self.capacity_extra, length)
+                - self._lender(a)[1])
         return pages
+
+    def _lender(self, a):
+        """Return a resident key holding an evicted answer's borrowed prefix.
+
+        The key is its parent or a sibling whose table starts with the
+        same pages, so their KV is the answer's prefix.
+
+        Returns:
+            The key and the tokens its pages hold, or (None, 0).
+        """
+        saved = self.replay_borrow.get(a)
+        if saved is None:
+            return None, 0
+        parent, pages = saved
+        for lender in np.r_[parent, np.flatnonzero(self.anchor_parent == parent)]:
+            key = self.keys[lender]
+            if (lender != a and self.arena.is_resident(key)
+                    and self.arena.owned_pages(key)[:len(pages)] == pages):
+                return key, len(pages) * self.arena.page_tokens
+        return None, 0
+
+    def _resume(self, a):
+        """Resume a replayed answer, reading its prefix with its parent's group.
+
+        It rejoins the group only while the parent holds no other pages
+        for that prefix: grouped rows read the first member's table.
+        """
+        pages = self.arena.owned_pages(self.keys[a])
+        saved = self.replay_borrow.pop(a, None)
+        parent, shared = None, 0
+        if saved is not None and pages[:len(saved[1])] == saved[1]:
+            key = self.keys[saved[0]]
+            if (not self.arena.is_resident(key)
+                    or self.arena.owned_pages(key)[:len(saved[1])] == saved[1]):
+                parent, shared = saved[0], len(saved[1]) * self.arena.page_tokens
+        self.decoder.resume(a, pages, parent, shared)
 
     def _build(self, chunk_groups, decode=None, replays=()):
         """Pack a chunk and identify each entry's stage and answer row count.
@@ -698,7 +754,7 @@ class StageExecutor:
             self.decoder.feed(chunk)
             for _, a, j in firsts:
                 if a in resumed:
-                    self.decoder.resume(a, self.arena.owned_pages(self.keys[a]))
+                    self._resume(a)
                     del self.recomputing[a]
                     continue
                 self.answer_stage[a] = j
