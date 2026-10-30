@@ -25,7 +25,7 @@ from pathlib import Path
 from bench.quailb_parallel import DATA_DIR, VOLUMES, app, ensure_data, results_vol
 from quail.deploy.images import gpu_image
 
-# the long-answer map drafts of experiments/cells/map_length_probe.py
+# long-answer map drafts over IMDB reviews
 NAMES = ("List every film, actor, director, and character the review names, "
          "with what the writer says about each.")
 PLOT = ("Retell the plot of the film as the review describes it, in order, "

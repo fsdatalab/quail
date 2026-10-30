@@ -865,13 +865,19 @@ class StageExecutor:
             self._run_part(part[:half], decode, replays)
             self._run_part(part[half:])
 
-    def _count_pass(self, part, tokens, decode, replays):
+    @staticmethod
+    def _decode_reads(read_tokens):
+        """KV tokens decode rows read: alone, beside a shared read, and shared."""
+        return read_tokens["alone"], read_tokens["own"], read_tokens["shared"]
+
+    def _count_pass(self, part, tokens, decode, replays, decode_reads=None):
         """Add one pass's tokens, attention pairs, KV reads, and SoL seconds.
 
-        A decode row reads its whole context. A replay or prefill span
-        of tokens start..end attends to every earlier token and reads the
-        KV before start. Prefill spans start after a borrowed prefix or a
-        document already resident.
+        A decode row attends to its whole context. Its KV reads are the
+        decoder's: branches of one document read their shared pages once.
+        A replay or prefill span of tokens start..end attends to every
+        earlier token and reads the KV before start. Prefill spans start
+        after a borrowed prefix or a document already resident.
         """
         from quail.cost.work import Work, triangle
 
@@ -880,7 +886,8 @@ class StageExecutor:
             contexts = np.asarray(decode.positions, dtype=float) + 1
             decode_rows = float(len(contexts))
             pairs += float(contexts.sum())
-            kv_read += float(contexts.sum())
+            kv_read += (float(contexts.sum()) if decode_reads is None
+                        else float(decode_reads))
         for _, start, end in replays:
             replay_tokens += end - start
             pairs += float(triangle(end) - triangle(start))
@@ -904,9 +911,13 @@ class StageExecutor:
 
     def _run_one(self, part, decode=None, replays=()):
         started = time.perf_counter()
+        reads = (None if self.decoder is None
+                 else sum(self._decode_reads(self.decoder.read_tokens)))
         chunk, entries, firsts = self._build(part, decode, replays)
         self.pack_s += time.perf_counter() - started
-        self._count_pass(part, chunk.tokens, decode, replays)
+        if reads is not None:
+            reads = sum(self._decode_reads(self.decoder.read_tokens)) - reads
+        self._count_pass(part, chunk.tokens, decode, replays, reads)
         self.tokens += chunk.tokens
         self.pass_rows.append(chunk.tokens)
         self.pass_queued.append(bool(self.sched.pending or self.sched.waiting))
