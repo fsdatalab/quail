@@ -4,8 +4,9 @@ Queries run in fresh processes. Modes are plain (no profiler), cprofile,
 sample (Python stack sampling), trace (torch.profiler), timeline
 (executor-step and GPU event timing), verify (graph/eager output checks),
 and eager (graphs disabled, unchanged KV capacity). Each run prints timing,
-allocation, accuracy, and result-digest fields. The env option sets child-process
-variables.
+allocation, accuracy, and result-digest fields, and saves the answer rows
+beside the profiles. The env option sets child-process variables;
+QUAIL_VLLM_EAGER=1 boots the vLLM baselines without CUDA graphs.
 
 Pass QUAIL_OVERRIDES=module:NAME=json-value;... in env to set module
 constants in the child, such as an executor constant under test, or
@@ -52,23 +53,44 @@ image = gpu_image(*([(BEFORE_LOCAL, BEFORE_REMOTE)]
 image = image.add_local_python_source("experiments.cells.piecewise_probe")
 
 
-def _digest(output) -> str:
+def _answer_rows(output) -> dict:
+    """Return each answer table's rows and the result rows, sorted."""
+    tables = {**output.filter_answers, **output.join_answers,
+              **(output.classify_answers or {}), **(output.map_answers or {}),
+              **(output.extract_answers or {})}
+    rows = {name: sorted(json.dumps(list(row.values()), default=str)
+                         for row in tables[name].to_pylist())
+            for name in sorted(tables)}
+    rows[""] = sorted(json.dumps(list(row.values()), default=str)
+                      for row in output.rows.to_pylist())
+    return rows
+
+
+def _digest(rows: dict) -> str:
     """Hash answer tables and result rows in document ID order."""
     import hashlib
 
     digest = hashlib.sha256()
-    tables = {**output.filter_answers, **output.join_answers,
-              **(output.classify_answers or {}), **(output.map_answers or {}),
-              **(output.extract_answers or {})}
-    for name in sorted(tables):
-        table = tables[name]
-        rows = sorted(json.dumps(list(row.values()), default=str)
-                      for row in table.to_pylist())
-        digest.update(json.dumps([name, rows]).encode())
-    rows = sorted(json.dumps(list(row.values()), default=str)
-                  for row in output.rows.to_pylist())
-    digest.update(json.dumps(rows).encode())
+    for name, table in rows.items():
+        if name:
+            digest.update(json.dumps([name, table]).encode())
+    digest.update(json.dumps(rows[""]).encode())
     return digest.hexdigest()[:16]
+
+
+def _eager_vllm() -> None:
+    """Boot the vLLM baselines without torch.compile or CUDA graphs."""
+    from quail.baselines import vllm as vllm_baseline
+
+    llm_kwargs = vllm_baseline.VLLMEngine.llm_kwargs
+
+    def eager_kwargs(self, spec, device=None):
+        kwargs = llm_kwargs(self, spec, device)
+        kwargs.pop("compilation_config", None)
+        return {**kwargs, "enforce_eager": True}
+
+    vllm_baseline.VLLMEngine.llm_kwargs = eager_kwargs
+    print("vLLM baselines boot eager", flush=True)
 
 
 def _forward_kernels(events):
@@ -409,6 +431,8 @@ def child(arguments: str) -> None:
 
     args = json.loads(arguments)
     _apply_overrides(os.environ.get("QUAIL_OVERRIDES", ""))
+    if os.environ.get("QUAIL_VLLM_EAGER"):
+        _eager_vllm()
     query_id, scale_factor = args["query_id"], args["scale_factor"]
     modes, top = args["modes"], args["top"]
     print(f"quail from {quail.__file__}", flush=True)
@@ -495,6 +519,9 @@ def child(arguments: str) -> None:
             window["eager"] = mode == "eager"
             window["work"] = mode == "work"
             output = run_query(session, spec, tables)
+            answer_rows = _answer_rows(output)
+            answers_path = f"{args['stats_prefix']}-run{run}-answers.json"
+            Path(answers_path).write_text(json.dumps(answer_rows))
             piecewise = window.get("piecewise")
             measures = output.measurements
             input_tokens = measures.get("input_tokens")
@@ -515,7 +542,8 @@ def child(arguments: str) -> None:
                 "sample_rows": sample_rows,
                 "input_rows": {name: len(table) for name, table in tables.items()},
                 "quail": quail.__file__,
-                "digest": _digest(output),
+                "digest": _digest(answer_rows),
+                "answers_path": answers_path,
                 **{name: measures.get(name) for name in (
                     "wall_s", "model_wall_s", "gpu_s", "chunks", "frontend_s",
                     "planning_s", "input_ready_s", "physical_prepare_s",
