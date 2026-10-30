@@ -170,6 +170,34 @@ def _kernel_lanes(events: list) -> list:
     return events + names
 
 
+def _graph_replays(events: list) -> list:
+    """Add one slice per CUDA graph replay, on its own GPU row.
+
+    The profiler records each kernel of a replay as its own slice; a
+    replay's kernels share the correlation id of its cudaGraphLaunch.
+
+    Returns:
+        The events, with the replay slices and their row's name.
+    """
+    replays = defaultdict(list)
+    for event in events:
+        args = event.get("args", {})
+        if event.get("cat") == "kernel" and args.get("graph id"):
+            replays[(event["pid"], args["correlation"])].append(event)
+    added = []
+    for (pid, _), kernels in replays.items():
+        start = min(kernel["ts"] for kernel in kernels)
+        end = max(kernel["ts"] + kernel.get("dur", 0) for kernel in kernels)
+        added.append({"ph": "X", "cat": "graph_replay", "pid": pid,
+                      "tid": "graph replays", "ts": start, "dur": end - start,
+                      "name": f"graph {kernels[0]['args']['graph id']}",
+                      "args": {"kernels": len(kernels)}})
+    added.extend({"ph": "M", "name": "thread_name", "pid": pid,
+                  "tid": "graph replays", "args": {"name": "graph replays"}}
+                 for pid in {pid for pid, _ in replays})
+    return events + added
+
+
 def _save_trace(prof, path: Path) -> dict:
     """Save a window of a torch.profiler run as a gzipped Perfetto trace.
 
@@ -192,12 +220,12 @@ def _save_trace(prof, path: Path) -> dict:
     start = first + 0.4 * (last - first)
     end = start + TRACE_WINDOW_S * 1e6
     # the profiler's own span covers the whole run and would set the view
-    trace["traceEvents"] = _kernel_lanes([
+    trace["traceEvents"] = _graph_replays(_kernel_lanes([
         event for event in events
         if event.get("ph") == "M"
         or ("ts" in event and event.get("cat") != "Trace"
             and event["ts"] <= end
-            and event["ts"] + event.get("dur", 0) >= start)])
+            and event["ts"] + event.get("dur", 0) >= start)]))
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wt") as out:
         json.dump(trace, out)
