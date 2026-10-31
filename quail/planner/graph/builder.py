@@ -9,6 +9,7 @@ from quail.logical import (
     LogicalPlan,
     classified_above_joins,
     column_name,
+    condition_columns,
     effective_selectivity,
     extracted_above_joins,
     has_score,
@@ -210,6 +211,11 @@ class GraphBuilder:
             self.sequence_groups, set(self.ask_filters), self.gpus)
 
         self.nodes = []
+        # (alias, label or answer column) -> the last port that carries
+        # it, for the Filters that read it beside another operator's
+        self.computed_ports = {}
+        # the extraction tests emitted so far
+        self.emitted_tests = ()
         self.scoring = (ScoreLowering(self.context, self.nodes,
                                      self.projected_scores, statistics.chunk)
                         if has_score(self.plan) else None)
@@ -509,6 +515,20 @@ class GraphBuilder:
             estimator=pricer)
         seconds, estimates = pricer(plan.graph)
         return replace(plan, estimated_seconds=seconds, estimates=estimates)
+
+    def filter_inputs(self, alias, condition, port) -> tuple:
+        """Return a document Filter's input ports: its rows, then each other column's.
+
+        A condition may read the labels or answers of operators before
+        the one it follows; each comes from the last port that carries
+        it, so the Filter stays in the pipeline.
+        """
+        others = []
+        for name in condition_columns(condition):
+            found = self.computed_ports.get((alias, name))
+            if found is not None and found != port and found not in others:
+                others.append(found)
+        return input_ports((port, *others))
 
     def unique_id(self, prefix, name):
         key = f"{prefix}:{name}"

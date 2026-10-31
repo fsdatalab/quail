@@ -21,6 +21,7 @@ from quail.logical.expressions import (
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import classifications
 from quail.logical.nodes.extract import extractions
+from quail.logical.nodes.scan import Scan
 from quail.logical.nodes.unnest import Unnest
 
 
@@ -81,9 +82,10 @@ class SemanticFilter:
 class Filter:
     """Rows whose condition holds, decided without the model.
 
-    Below the Project, the condition tests columns a one-table
-    SemanticClassify or a SemanticExtract below adds: a label, or one
-    extraction's answer and span. Above the Project or an Unnest, it
+    Below the Project, the condition tests columns the one-table
+    SemanticClassify or SemanticExtract nodes below add: labels, or
+    answers and spans; it may test the table's source columns too, read
+    by document ID. Above the Project or an Unnest, it
     tests the columns the result rows below return, by name, such as
     ``r.stars``, ``lease.ends``, or a field column of an unnested list.
     """
@@ -120,7 +122,9 @@ class Filter:
             return
         computed = computed_columns(self.input)
         for reference in references:
-            if (reference.alias, reference.column) not in computed:
+            if ((reference.alias, reference.column) not in computed
+                    and reference.column not in scan_columns(self.input,
+                                                             reference.alias)):
                 raise CompileError(
                     f"a Filter tests a column a one-table classification or "
                     f"an extraction below it computes; nothing below "
@@ -169,6 +173,19 @@ def computed_columns(node) -> frozenset:
     for found in extractions(node):
         columns.update({(found.alias, found.name), (found.alias, found.span_name)})
     return frozenset(columns)
+
+
+def scan_columns(node, alias: str) -> frozenset:
+    """Return the source columns of the table an alias names, below a node."""
+    while not isinstance(node, Scan):
+        node = next((child for child in node.children()
+                     if alias in {field.alias for field in child.output_schema()}),
+                    None)
+        if node is None:
+            return frozenset()
+    if node.alias != alias or node.schema is None:
+        return frozenset()
+    return frozenset(node.schema.names)
 
 
 def above_projection(node) -> bool:

@@ -15,7 +15,6 @@ from quail.logical.expressions import (
     ColumnRef,
     CompileError,
     ModelCall,
-    RegularPredicate,
     aliased_call,
     column_name,
     column_references,
@@ -48,10 +47,10 @@ class ColumnTest:
     """A Filter on a column a classification or an extraction computes.
 
     Attributes:
-        name: The label column, or the extraction whose answer or
-            span the Filter tests, as the SemanticClassify or
+        name: The classification or extraction the Filter follows,
+            the last one it reads, as the SemanticClassify or
             SemanticExtract names it.
-        call: The model call that computes the column.
+        call: That operator's model call.
         condition: The condition the Filter applies.
         selectivity: The Filter's selectivity hint, or None.
         position: Its written position among the table's filters,
@@ -217,21 +216,15 @@ class LogicalPlan:
                 extracts.append(node)
             elif isinstance(node, SemanticSaeFeatures):
                 feature_calls.append(node)
-        calls = {
-            (node.alias, node.name): node.call
-            for node in classifies
-            if len(node.call.aliases()) == 1
-        }
         label_filters, extract_filters = {}, {}
         for alias in aliases:
             labels = [node for node in tested.get(alias, ())
-                      if isinstance(node.condition, RegularPredicate)
-                      and (alias, node.condition.column.column) in calls]
+                      if isinstance(_producer(node), SemanticClassify)]
             if labels:
                 label_filters[alias] = tuple(
                     ColumnTest(
-                        name=node.condition.column.column,
-                        call=calls[(alias, node.condition.column.column)],
+                        name=_producer(node).name,
+                        call=_producer(node).call,
                         condition=node.condition,
                         selectivity=node.selectivity,
                         position=len(filters.get(alias, ())) + index,
@@ -241,8 +234,8 @@ class LogicalPlan:
             if answers:
                 extract_filters[alias] = tuple(
                     ColumnTest(
-                        name=_extraction(node, extracts).name,
-                        call=_extraction(node, extracts).call,
+                        name=_producer(node).name,
+                        call=_producer(node).call,
                         condition=node.condition,
                         selectivity=node.selectivity,
                         position=len(filters.get(alias, ())) + len(labels) + index,
@@ -328,10 +321,18 @@ class Operators:
         )
 
 
-def _extraction(test: "Filter", extracts):
-    """Return the SemanticExtract computing the answer or span a Filter tests."""
-    (column, *_) = condition_columns(test.condition)
-    return next(node for node in extracts if column in (node.name, node.span_name))
+def _producer(test: "Filter"):
+    """Return the last classification or extraction below a Filter that it reads.
+
+    The Filter runs after that operator and reads the other columns by
+    document ID.
+    """
+    read = set(condition_columns(test.condition))
+    node = test.input
+    while not (isinstance(node, (SemanticClassify, SemanticExtract))
+               and read & {node.name, getattr(node, "span_name", node.name)}):
+        node = node.input
+    return node
 
 
 def join_outer_input(join: "SemanticJoin") -> "LogicalNode":

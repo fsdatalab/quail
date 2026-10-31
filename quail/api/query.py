@@ -490,6 +490,16 @@ class Query:
             for predicate in scan.predicates:
                 for test in predicate.tests():
                     needed.setdefault(scan.alias, {})[test.column.column] = None
+        # a Filter on labels or answers reads the source columns it tests
+        # by document ID
+        providers = {scan.alias: scan.provider for scan in operators.scans}
+        for tests in (operators.label_filters, operators.extract_filters):
+            for alias, filters in tests.items():
+                columns = self.catalog.get(providers[alias]).columns
+                for test in (found for each in filters
+                             for found in each.condition.tests()):
+                    if test.column.column in columns:
+                        needed.setdefault(alias, {})[test.column.column] = None
         for alias, key in filter_stop_keys(self.logical).items():
             for column in key:
                 needed.setdefault(alias, {})[column] = None

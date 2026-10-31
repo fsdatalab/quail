@@ -9,6 +9,7 @@ from helpers.oracle import Oracle, finish, oracle_executor
 
 import quail
 from quail.catalog import DocumentProvider
+from quail.logical import CompileError
 from quail.physical import (
     AiExtract,
     Filter,
@@ -190,11 +191,22 @@ def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(sessio
     assert placed(one) == [
         ("SemanticExtract", "c.lease.ends IS NULL OR c.lease.ends_span.start >= 0")]
     assert kept(one) == [1, 2]
-    # an answer and a source column, or two extractions: the result rows
+    # an answer and a source column, or two extractions: after the last
+    # extraction read, each other column read by document ID
     mixed = session.sql(head + "NOT (lease.ends IS NULL AND c.id = 2)")
     assert placed(mixed) == [
-        ("Project", "lease.ends IS NOT NULL OR NOT (c.id = 2)")]
+        ("SemanticExtract", "c.lease.ends IS NOT NULL OR NOT (c.id = 2)")]
     assert kept(mixed) == [1]
     fields = session.sql(head + "lease.ends = 'x' OR lease.rent IS NOT NULL")
-    assert placed(fields) == [("Project", "lease.ends = 'x' OR lease.rent IS NOT NULL")]
+    assert placed(fields) == [
+        ("SemanticExtract", "c.lease.ends = 'x' OR c.lease.rent IS NOT NULL")]
+    (test,) = [node for node in fields.plan().nodes if isinstance(node, Filter)]
+    assert [port.source.node_id for port in test.inputs] == [
+        "ai-extract:1", "ai-extract:0"]
     assert kept(fields) == [1]
+    # a label in WHERE is still an AI call, which OR does not combine
+    with pytest.raises(CompileError, match="OR combines tests of source columns"):
+        session.sql(
+            "SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind, "
+            f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+            "FROM contracts c WHERE kind = 'lease' OR lease.ends IS NULL")

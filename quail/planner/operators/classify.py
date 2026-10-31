@@ -21,7 +21,6 @@ from quail.physical import (
     Filter,
     PortRef,
 )
-from quail.physical.base import input_ports
 from quail.planner.operators.common import bind_inference, inference_node
 from quail.planner.prompt_lowering import (
     choice_token_parts,
@@ -493,14 +492,17 @@ def emit_classify(builder, alias, expected_rows, calls, port) -> tuple:
             if call in builder.operators.labels.projected:
                 row_ports.append(port)
             classified_calls.add(call)
+            latest = builder.operators.labels.names[call]
         if test is not None:
             filter_id = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
-                node_id=filter_id, inputs=input_ports((port,)),
+                node_id=filter_id,
+                inputs=builder.filter_inputs(alias, test.condition, port),
                 predicate=test.condition, aliases=(alias,),
                 selectivity=test.selectivity, written_position=test.position))
             port = PortRef(filter_id, f"rows:{alias}")
             expected_rows *= effective_selectivity(test.selectivity)
+        builder.computed_ports[(alias, latest)] = port
     return port, row_ports
 
 

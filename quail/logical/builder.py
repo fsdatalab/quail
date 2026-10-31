@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from quail.logical.expressions import (
+    SPAN_SUFFIX,
     Aggregation,
     CompileError,
     FilterPredicate,
@@ -119,13 +120,15 @@ class LogicalPlanBuilder:
         if predicates:
             node = SemanticFilter(node, tuple(predicates))
         calls = {name: call for call, name in labels}
+        answers = {column for _, name in extracts
+                   for column in (name, name + SPAN_SUFFIX)}
         label_filters = [(condition, selectivity)
                          for condition, selectivity in computed_filters
-                         if set(condition_columns(condition)) <= set(calls)]
+                         if set(condition_columns(condition)) & set(calls)]
         classified = []
         for condition, selectivity in label_filters:
             for name in condition_columns(condition):
-                if calls[name] not in classified:
+                if name in calls and calls[name] not in classified:
                     node = SemanticClassify(node, calls[name], name)
                     classified.append(calls[name])
             _check_labels(condition, calls)
@@ -135,11 +138,14 @@ class LogicalPlanBuilder:
                 node = SemanticClassify(node, call, name)
                 classified.append(call)
         tests = [test for test in computed_filters if test not in label_filters]
+        done = set()
         for call, name in extracts:
             extraction = SemanticExtract(node, call, name)
             node = extraction
+            done.update((name, extraction.span_name))
+            # a test runs after the last extraction it reads
             for predicate, selectivity in list(tests):
-                if set(condition_columns(predicate)) <= {name, extraction.span_name}:
+                if set(condition_columns(predicate)) & answers <= done:
                     node = Filter(node, predicate, selectivity)
                     tests.remove((predicate, selectivity))
         if tests:
@@ -321,9 +327,9 @@ def _check_labels(condition, calls) -> None:
             not among the labels.
     """
     for test in condition.tests():
-        if test.comparison not in ("=", "in"):
-            continue
         name = test.column.column
+        if test.comparison not in ("=", "in") or name not in calls:
+            continue
         values = test.value if isinstance(test.value, tuple) else (test.value,)
         unknown = sorted(set(values) - set(calls[name].labels))
         if unknown:

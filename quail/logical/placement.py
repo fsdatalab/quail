@@ -7,12 +7,13 @@ has all of its columns, as Spark's predicate pushdown does:
 
 - A part over one table's source columns runs at that table's Scan,
   before any model call.
-- A part over the columns of one operator, such as a classification's
-  label or an extraction's answer and span, runs right after that
-  operator, so the next operator skips the documents it rejects.
-- Any other part, such as one over two tables, over two extractions,
-  or over an unnested field, runs on the result rows, after the model
-  calls; the Project returns the columns it reads.
+- A part over one table's computed columns, its labels or its answers
+  and spans, and maybe its source columns, runs right after the last
+  operator it reads, so the next operator skips the documents it
+  rejects. The filter reads each column by document ID.
+- Any other part, such as one over two tables, over a label and an
+  answer, or over an unnested field, runs on the result rows, after the
+  model calls; the Project returns the columns it reads.
 
 For example, ``WHERE NOT (r.stars > 3 OR p.price < 10) AND r.lang =
 'en'`` becomes three parts: ``NOT r.stars > 3`` and ``r.lang = 'en'``
@@ -46,8 +47,8 @@ class PlacedConditions:
     Attributes:
         scans: alias -> the conditions on the table's source columns.
         computed: alias -> (condition, selectivity) per condition on
-            the columns of one operator: a label, or an extraction's
-            answer and span.
+            the table's labels, or on its answers and spans, and maybe
+            its source columns.
         rows: The conditions on result rows.
     """
 
@@ -64,9 +65,10 @@ def place_conditions(conditions, computed: Mapping[tuple[str, str], str],
         conditions: (condition, selectivity) pairs, in written order.
             A selectivity is a HINT on the whole condition, which then
             stays one part.
-        computed: (alias, column) -> the operator computing it, for
-            every classification's label column and every extraction's
-            answer and span column.
+        computed: (alias, column) -> (kind, name) of the operator
+            computing it, for every classification's label column
+            ("label") and every extraction's answer and span column
+            ("extract").
         unnested: The aliases of UNNEST relations.
 
     Raises:
@@ -90,7 +92,8 @@ def place_conditions(conditions, computed: Mapping[tuple[str, str], str],
                         f"HINT estimates a test of a label or an answer; "
                         f"{part} tests a source column, applied at the scan")
                 scans.setdefault(aliases.pop(), []).append(part)
-            elif len(aliases) == 1 and len(owners) == 1 and None not in owners:
+            elif (len(aliases) == 1 and not aliases & set(unnested)
+                  and len({kind for kind, _ in owners - {None}}) == 1):
                 tested.setdefault(aliases.pop(), []).append((part, selectivity))
             else:
                 if selectivity is not None:

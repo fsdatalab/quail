@@ -184,9 +184,11 @@ def place_relation(relation, columns, catalog, unnested=(), *,
                           "in", tuple(accepted)), selectivity)
         for alias, tests in label_tests.items()
         for call, accepted, selectivity in tests)
-    computed = {(alias, column): name for alias, calls in extracts.items()
+    computed = {(alias, column): ("extract", name)
+                for alias, calls in extracts.items()
                 for _, name in calls for column in (name, name + SPAN_SUFFIX)}
-    computed.update({(alias, name): name for alias, named_calls in labels.items()
+    computed.update({(alias, name): ("label", name)
+                     for alias, named_calls in labels.items()
                      for name in named_calls.values()})
     placed = place_conditions(conditions, computed, unnested)
     builder = LogicalPlanBuilder()

@@ -6,6 +6,7 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail.catalog.pairs import columns_key
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult, answer_table, filter_answer_table
 from quail.execution.rows import Rows
@@ -23,12 +24,17 @@ class FilterRuntime:
     def execute(self, node, inputs, context) -> NodeResult:
         if not isinstance(node, Filter):
             raise TypeError(type(node).__name__)
-        if len(inputs) != 1:
-            raise ValueError("Filter needs one input")
-        value = next(iter(inputs.values()))
+        values = [inputs[port.name] for port in node.inputs]
         if not node.aliases:
-            return filter_result_rows(node, value)
-        return filter_scores(node, value)
+            if len(values) != 1:
+                raise ValueError("a Filter on result rows needs one input")
+            return filter_result_rows(node, values[0])
+        rows, others = values[0], values[1:]
+        if all(name in rows.column_names for name in node.tested_columns):
+            return filter_scores(node, rows)
+        sources = context.sources.get(columns_key(node.aliases[0]))
+        return filter_scores(node, rows, tested_table(
+            node, rows, lambda name, ids: _read(name, ids, node, others, sources)))
 
 
 class ResultColumns:
@@ -71,9 +77,45 @@ def _filter_answer_table(node: Filter, rows: Rows, answers) -> pa.Table:
         np.full(rows.num_rows, node.written_position, dtype=np.int32), answers)
 
 
-def filter_scores(node, rows: Rows) -> NodeResult:
-    """Apply a filter to rows of scores, labels, or answers."""
-    answers = node.predicate.accepts(rows)
+def tested_table(node, rows: Rows, read) -> pa.Table:
+    """Return every column a document Filter tests, one row per row of rows.
+
+    Args:
+        node: The Filter.
+        rows: The rows it filters; their columns are read as they are.
+        read: (column, document ids) -> the column's values for those
+            documents, for a column the rows lack: another operator's
+            label or answer, or a source column.
+    """
+    ids = rows.ids[node.aliases[0]]
+    return pa.table({
+        name: (rows.column(name) if name in rows.column_names
+               else read(name, ids))
+        for name in node.tested_columns})
+
+
+def _read(name: str, ids, node, others, sources):
+    """Read a column for documents from other operators' rows or the source table."""
+    alias = node.aliases[0]
+    for other in others:
+        if name in other.column_names:
+            positions = pc.index_in(ids, value_set=other.ids[alias])
+            return pc.take(other.column(name), positions)
+    if sources is not None and name in sources.column_names:
+        return pc.take(sources.column(name), ids)
+    raise KeyError(f"{node.node_id!r} reads {name!r}, which no input holds")
+
+
+def filter_scores(node, rows: Rows, tested: pa.Table | None = None) -> NodeResult:
+    """Apply a filter to rows of scores, labels, or answers.
+
+    Args:
+        node: The Filter.
+        rows: The rows it filters.
+        tested: The columns the predicate reads, one row per row of
+            rows, when the rows lack some of them.
+    """
+    answers = node.predicate.accepts(rows if tested is None else tested)
     filtered = rows.filter(answers)
     if len(node.aliases) == 1:
         answer_name = f"filter_answers:{node.aliases[0]}"
