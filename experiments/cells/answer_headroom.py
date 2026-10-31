@@ -13,7 +13,7 @@ four map queries of the comparison:
 
     uv run modal run --detach experiments/cells/answer_headroom.py::compare \
         --modes stock_vllm,shuffled_vllm,headroom=0,headroom \
-        --queries CUAD-23,CUAD-22,IMDB-26,IMDB-25 --scale-factor 0.2 \
+        --queries CUAD-23,CUAD-22,IMDB-26,IMDB-25 --scale-factor 0.1 \
         --num-documents 0 --repeats 1 2>&1 | tee "$run_log"
 
 Per run the cell records wall seconds, answer evictions,
@@ -234,8 +234,8 @@ def compare(modes: str = "headroom=0,headroom", queries: str = ",".join(QUERIES)
             num_contracts: int = 0):
     query_ids = [name for name in queries.split(",") if name]
     # IMDB-20 brings the reviews and CUAD-22 the contracts
-    ensure_data.remote(scale_factor, ["IMDB-20", "CUAD-22"] + [
-        name for name in query_ids if name not in QUERIES], "")
+    ensure_data.remote(scale_factor, list(dict.fromkeys(["IMDB-20", "CUAD-22"] + [
+        name for name in query_ids if name not in QUERIES])), "")
     run_id = (f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
               f"{uuid.uuid4().hex[:8]}")
     run_dir = f"{OUTPUT_DIR}/{run_id}"
@@ -299,7 +299,7 @@ def estimate_sol(query: str, run_dir: str, mode: str, scale_factor: float,
 
 @app.local_entrypoint()
 def sol(run_dir: str, queries: str = "CUAD-23", mode: str = "headroom",
-        scale_factor: float = 0.2, num_documents: int = 0, num_contracts: int = 0):
+        scale_factor: float = 0.1, num_documents: int = 0, num_contracts: int = 0):
     for query in filter(None, queries.split(",")):
         call = estimate_sol.spawn(query, run_dir, mode, scale_factor, num_documents,
                                   num_contracts)
