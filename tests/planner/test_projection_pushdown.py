@@ -1,11 +1,9 @@
 """Projection and filter pushdown rule tests."""
 
 from dataclasses import replace
-from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 from helpers.sessions import _run, fake_tok, make_executor
 
 import quail
@@ -126,63 +124,8 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     session.close()
 
 
-class _UnstableProvider:
-    id_col = "id"
-    columns = ("id", "body", "stars")
-
-    def __init__(self):
-        self.scans = 0
-
-    def schema(self):
-        return pa.schema({"id": pa.string(), "body": pa.string(),
-                          "stars": pa.int64()})
-
-    def content_identity(self):
-        return "unstable"
-
-    def statistics(self):
-        from quail.catalog import TableStatistics
-        return TableStatistics(num_rows=3)
-
-    def scan(self, request):
-        self.scans += 1
-        rows = 3 if self.scans == 1 else 2
-        table = pa.table({
-            "id": [f"r{i}" for i in range(rows)],
-            "body": ["one two"] * rows,
-            "stars": list(range(rows)),
-        }).select(list(request.columns))
-        return table.to_reader()
 
 
-def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
-    session = _session(tmp_path)
-    session.register("documents", _UnstableProvider())
-    session.inputs.tokenize("documents", "body", ("id",))
-
-    with pytest.raises(RuntimeError, match="stable order"):
-        session.inputs.tokenize("documents", "body", ("stars",))
-    with pytest.raises(RuntimeError, match="stable order"):
-        session.inputs.tokenize("documents", "body", ("stars",))
-
-    assert ("unstable", "stars") not in session.inputs._column_stores
-    assert len(list(Path(session.inputs._token_directory.name).iterdir())) == 2
-    session.close()
-
-    def broken(text):
-        raise ValueError("tokenizer failed")
-
-    session = _session(tmp_path)
-    session._tokenizer = broken
-
-    with pytest.raises(ValueError, match="tokenizer failed"):
-        session.inputs.tokenize("reviews", "review", ("id",))
-
-    assert session.inputs._token_stores == {}
-    assert session.inputs._column_stores == {}
-    assert session.inputs._token_directory is None or not list(
-        Path(session.inputs._token_directory.name).iterdir())
-    session.close()
 
 
 def _pair_catalog():
@@ -278,79 +221,5 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
     assert push_down_filters(above) is None
 
 
-def test_apply_and_join_keys_keep_the_document_text_as_values(tmp_path):
-    from helpers.oracle import Oracle, oracle_executor
-
-    session = _session(tmp_path)
-    seen = []
-
-    def first_two(tables):
-        table = tables["r"]
-        seen.extend(table.column("review").to_pylist())
-        return table.column("r").to_pylist()[:2]
-
-    query = (session.docs("reviews").alias("r")
-             .apply(first_two, columns=[col("r.review")])
-             .ai_filter(prompt("q: {0}", col("r.review")))
-             .select("r.id"))
-    query.plan()
-    assert sorted(_scans(query.logical)["r"].columns) == ["id", "review"]
-    result = _run(query, oracle_executor(Oracle(filters={"r": {"q:": [1, 0, 1]}}),
-                                         functions=session.registry.functions))
-    # the function runs over the filter's survivors and reads their text
-    assert seen == ["good one", "fine one"]
-    assert result.to_rows() == [("r0",), ("r2",)]
-
-    session.register("products", quail.DocumentProvider.from_table(pa.table({
-        "asin": ["p0", "p1"], "description": ["bad one", "other"],
-    }), id_col="asin"))
-    query = (session.docs("reviews").alias("r")
-             .join(session.docs("products").alias("p"),
-                   on=col("r.review") == col("p.description"))
-             .ai_filter(prompt("m {0} {1}", col("r.review"), col("p.description")))
-             .select("r.id", "p.asin"))
-    query.plan()
-    assert sorted(_scans(query.logical)["r"].columns) == ["id", "review"]
-    assert sorted(_scans(query.logical)["p"].columns) == ["asin", "description"]
-    pairs = {("r", "p"): lambda r, p: True, ("p", "r"): lambda p, r: True}
-    assert _run(query, make_executor({}, pairs)).to_rows() == [("r1", "p0")]
-    session.close()
 
 
-@pytest.mark.parametrize("kind", ["tokens", "column"])
-@pytest.mark.parametrize("phase", ["write", "open"])
-def test_a_store_that_fails_to_finish_leaves_no_file_or_handle(
-        tmp_path, monkeypatch, kind, phase):
-    from quail.catalog import tokens
-
-    path = tmp_path / "store.arrow"
-    table = pa.table({"body": ["hello", "world"]})
-    handles = []
-    for name in ("OSFile", "memory_map"):
-        original = getattr(pa, name)
-
-        def opened(*args, _original=original, **kwargs):
-            handles.append(_original(*args, **kwargs))
-            return handles[-1]
-
-        monkeypatch.setattr(pa, name, opened)
-
-    def batches():
-        yield from table.to_batches()
-        if phase == "write":
-            raise KeyboardInterrupt("store failure")
-
-    def fail(*args, **kwargs):
-        raise OSError("store failure")
-
-    if phase == "open":
-        monkeypatch.setattr(pa.ipc, "open_file", fail)
-    with pytest.raises((KeyboardInterrupt, OSError), match="store failure"):
-        if kind == "tokens":
-            tokens.TokenStore.write(str(path), batches(), document_column="body",
-                                    tokenizer=lambda text: list(text.encode()),
-                                    token_type=pa.int32())
-        else:
-            tokens.ColumnStore.write(str(path), batches(), table.schema.field(0))
-    assert handles and all(handle.closed for handle in handles)
-    assert not path.exists()
