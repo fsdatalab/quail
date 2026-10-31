@@ -7,12 +7,10 @@ from typing import Any, Optional
 
 from quail.logical.expressions import (
     Aggregation,
-    ColumnRef,
     CompileError,
     FilterPredicate,
     ModelCall,
     Prompt,
-    RegularPredicate,
     aliased_call,
     column_name,
     column_references,
@@ -73,10 +71,9 @@ class LogicalPlanBuilder:
         column: str,
         predicates: tuple[FilterPredicate, ...] = (),
         labels: tuple = (),
-        label_filters: tuple = (),
         regular_predicates: tuple = (),
         extracts: tuple = (),
-        extract_filters: tuple = (),
+        computed_filters: tuple = (),
         sae_features: tuple = (),
         schema=None,
     ) -> None:
@@ -94,20 +91,21 @@ class LogicalPlanBuilder:
                 that a label filter tests sits below the first Filter
                 testing it; the others sit above the last Filter, in the
                 order given.
-            label_filters: (name, values, selectivity) per Filter on a
-                classification's label column, in written order.
             extracts: (call, name) per extraction, in order. They sit
                 above the classifications and label filters.
-            extract_filters: (condition, selectivity) per Filter on one
-                extraction's answer and span columns, in written order.
-                Each sits right above the extraction it tests.
+            computed_filters: (condition, selectivity) per Filter on the
+                columns of one operator, in written order: a
+                classification's label, or an extraction's answer and
+                span. A label filter sits above its classification, in
+                written order; an answer filter sits right above the
+                extraction it tests.
             sae_features: (call, name) per AI.SAE_FEATURES call, in
                 order. They sit above the extractions.
 
         Raises:
-            CompileError: The alias is taken, a label filter names a
-                column no classification in labels computes, or an
-                extraction filter names a column no extraction computes.
+            CompileError: The alias is taken, a label filter lists a
+                value that is not a label, or a filter names a column no
+                classification or extraction computes.
         """
         if alias in self._nodes:
             raise CompileError(f"duplicate table alias {alias!r}")
@@ -121,42 +119,33 @@ class LogicalPlanBuilder:
         if predicates:
             node = SemanticFilter(node, tuple(predicates))
         calls = {name: call for call, name in labels}
+        label_filters = [(condition, selectivity)
+                         for condition, selectivity in computed_filters
+                         if set(condition_columns(condition)) <= set(calls)]
         classified = []
-        for name, values, selectivity in label_filters:
-            if name not in calls:
-                raise CompileError(
-                    f"a filter on a label of {alias!r} tests a "
-                    f"classification the query does not name"
-                )
-            unknown = sorted(set(values) - set(calls[name].labels))
-            if unknown:
-                raise CompileError(
-                    f"the filter on {name!r} lists {unknown}, which are not "
-                    f"among its labels {list(calls[name].labels)}")
-            if calls[name] not in classified:
-                node = SemanticClassify(node, calls[name], name)
-                classified.append(calls[name])
-            node = Filter(
-                node,
-                RegularPredicate(ColumnRef(alias, provider, name), "in", tuple(values)),
-                selectivity,
-            )
+        for condition, selectivity in label_filters:
+            for name in condition_columns(condition):
+                if calls[name] not in classified:
+                    node = SemanticClassify(node, calls[name], name)
+                    classified.append(calls[name])
+            _check_labels(condition, calls)
+            node = Filter(node, condition, selectivity)
         for call, name in labels:
             if call not in classified:
                 node = SemanticClassify(node, call, name)
                 classified.append(call)
-        tests = list(extract_filters)
+        tests = [test for test in computed_filters if test not in label_filters]
         for call, name in extracts:
             extraction = SemanticExtract(node, call, name)
             node = extraction
-            for predicate, selectivity in extract_filters:
+            for predicate, selectivity in list(tests):
                 if set(condition_columns(predicate)) <= {name, extraction.span_name}:
                     node = Filter(node, predicate, selectivity)
                     tests.remove((predicate, selectivity))
         if tests:
             raise CompileError(
-                f"the filter {tests[0][0]} tests an extraction the query "
-                f"does not return")
+                f"the filter {tests[0][0]} tests a classification or an "
+                f"extraction the query does not return")
         for call, name in sae_features:
             node = SemanticSaeFeatures(node, call, name)
         self._tables.append(alias)
@@ -322,6 +311,25 @@ class LogicalPlanBuilder:
         plan = LogicalPlan(node)
         plan.validate()
         return plan
+
+
+def _check_labels(condition, calls) -> None:
+    """Refuse a label filter that lists a value its classification cannot return.
+
+    Raises:
+        CompileError: An = or IN test of a label lists a value that is
+            not among the labels.
+    """
+    for test in condition.tests():
+        if test.comparison not in ("=", "in"):
+            continue
+        name = test.column.column
+        values = test.value if isinstance(test.value, tuple) else (test.value,)
+        unknown = sorted(set(values) - set(calls[name].labels))
+        if unknown:
+            raise CompileError(
+                f"the filter on {name!r} lists {unknown}, which are not "
+                f"among its labels {list(calls[name].labels)}")
 
 
 def _row_test_columns(tests, unnested, source, returned) -> tuple:

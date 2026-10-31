@@ -7,8 +7,9 @@ has all of its columns, as Spark's predicate pushdown does:
 
 - A part over one table's source columns runs at that table's Scan,
   before any model call.
-- A part over one extraction's answer and span runs right after that
-  extraction, so the next operator skips the documents it rejects.
+- A part over the columns of one operator, such as a classification's
+  label or an extraction's answer and span, runs right after that
+  operator, so the next operator skips the documents it rejects.
 - Any other part, such as one over two tables, over two extractions,
   or over an unnested field, runs on the result rows, after the model
   calls; the Project returns the columns it reads.
@@ -44,17 +45,18 @@ class PlacedConditions:
 
     Attributes:
         scans: alias -> the conditions on the table's source columns.
-        extracts: alias -> (condition, selectivity) per condition on
-            one extraction's answer and span.
+        computed: alias -> (condition, selectivity) per condition on
+            the columns of one operator: a label, or an extraction's
+            answer and span.
         rows: The conditions on result rows.
     """
 
     scans: dict = field(default_factory=dict)
-    extracts: dict = field(default_factory=dict)
+    computed: dict = field(default_factory=dict)
     rows: tuple = ()
 
 
-def place_conditions(conditions, extracted: Mapping[tuple[str, str], str],
+def place_conditions(conditions, computed: Mapping[tuple[str, str], str],
                      unnested=()) -> PlacedConditions:
     """Split conditions at AND and place each part where its columns exist.
 
@@ -62,15 +64,16 @@ def place_conditions(conditions, extracted: Mapping[tuple[str, str], str],
         conditions: (condition, selectivity) pairs, in written order.
             A selectivity is a HINT on the whole condition, which then
             stays one part.
-        extracted: (alias, column) -> the extraction computing it, for
-            every extraction's answer and span column.
+        computed: (alias, column) -> the operator computing it, for
+            every classification's label column and every extraction's
+            answer and span column.
         unnested: The aliases of UNNEST relations.
 
     Raises:
         CompileError: A HINT is on a part decided without the model's
             answers, at the scan or on the result rows.
     """
-    scans, extracts, rows = {}, {}, []
+    scans, tested, rows = {}, {}, []
     for condition, selectivity in conditions:
         condition = normalize(condition)
         parts = conjuncts(condition) if selectivity is None else (condition,)
@@ -79,7 +82,7 @@ def place_conditions(conditions, extracted: Mapping[tuple[str, str], str],
             references = [reference for test in part.tests()
                           for reference in column_references(test.expression)]
             aliases = {reference.alias for reference in references}
-            owners = {extracted.get((reference.alias, reference.column))
+            owners = {computed.get((reference.alias, reference.column))
                       for reference in references}
             if len(aliases) == 1 and owners == {None} and not aliases & set(unnested):
                 if selectivity is not None:
@@ -88,7 +91,7 @@ def place_conditions(conditions, extracted: Mapping[tuple[str, str], str],
                         f"{part} tests a source column, applied at the scan")
                 scans.setdefault(aliases.pop(), []).append(part)
             elif len(aliases) == 1 and len(owners) == 1 and None not in owners:
-                extracts.setdefault(aliases.pop(), []).append((part, selectivity))
+                tested.setdefault(aliases.pop(), []).append((part, selectivity))
             else:
                 if selectivity is not None:
                     raise CompileError(
@@ -98,7 +101,7 @@ def place_conditions(conditions, extracted: Mapping[tuple[str, str], str],
                 rows.append(part)
     return PlacedConditions(
         {alias: tuple(found) for alias, found in scans.items()},
-        {alias: tuple(found) for alias, found in extracts.items()},
+        {alias: tuple(found) for alias, found in tested.items()},
         tuple(rows))
 
 

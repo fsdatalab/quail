@@ -42,6 +42,7 @@ from quail.logical import (
     CompileError,
     LogicalPlan,
     LogicalPlanBuilder,
+    RegularPredicate,
     WithCTE,
     column_name,
     cte_schema,
@@ -539,11 +540,19 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
                 (column.expression, column.name)
             )
 
+    # a test of a label is a condition on the column its classification adds
+    label_conditions = [
+        (RegularPredicate(ColumnRef(alias, dict(b.tables)[alias],
+                                    labels[alias][call]), "in", tuple(accepted)),
+         selectivity)
+        for alias, tests in b.label_tests.items()
+        for call, accepted, selectivity in tests]
+    computed = {(alias, column): name for alias, calls in extracts.items()
+                for _, name in calls for column in (name, name + SPAN_SUFFIX)}
+    computed.update({(alias, name): name for alias, named_calls in labels.items()
+                     for name in named_calls.values()})
     placed = place_conditions(
-        b.conditions,
-        {(alias, column): name for alias, calls in extracts.items()
-         for _, name in calls for column in (name, name + SPAN_SUFFIX)},
-        b.scope.relations)
+        [*b.conditions, *label_conditions], computed, b.scope.relations)
     logical = LogicalPlanBuilder()
     for alias, provider in b.tables:
         logical.add_scan(
@@ -553,12 +562,8 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
             tuple(b.filters.get(alias, ())),
             regular_predicates=placed.scans.get(alias, ()),
             labels=tuple(labels.get(alias, {}).items()),
-            label_filters=tuple(
-                (labels[alias][call], accepted, selectivity)
-                for call, accepted, selectivity in b.label_tests.get(alias, ())
-            ),
             extracts=tuple(extracts.get(alias, ())),
-            extract_filters=placed.extracts.get(alias, ()),
+            computed_filters=placed.computed.get(alias, ()),
             sae_features=tuple(feature_columns.get(alias, ())),
             schema=catalog.get(provider).schema(),
         )
