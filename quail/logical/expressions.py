@@ -946,7 +946,7 @@ def _explain(expression) -> str:
             # the column
             return expression.name
         return f"{_explain(call)} AS {expression.name}"
-    if isinstance(expression, (ColumnRef, GetField, ScalarFunction)):
+    if isinstance(expression, (str, ColumnRef, GetField, ScalarFunction)):
         return column_name(expression)
     if expression.kind == "label":
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"

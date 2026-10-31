@@ -82,3 +82,8 @@ def test_not_and_or_of_unnested_fields_and_source_columns_filter_rows(session):
         f"WHERE f.strength > 2 OR r.id = 7 ORDER BY f.feature")
     assert finish(mixed, _unnest_oracle()).collect().to_pylist() == [
         {"f.feature": 0}, {"f.feature": 2}, {"f.feature": 100}]
+
+
+def test_explain_shows_the_columns_an_unnest_returns(session):
+    query = session.sql(f"SELECT r.id, f.feature FROM reviews r, {UNNEST}")
+    assert "Project: r.id, f.feature" in query.explain()
