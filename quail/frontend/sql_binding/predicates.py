@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from sqlglot import exp
 
-from quail.logical import ColumnRef, CompileError, RegularPredicate
+from quail.logical import BooleanPredicate, ColumnRef, CompileError, RegularPredicate
 from quail.logical.expressions import SPAN_SUFFIX, column_expression
 
 _PLAIN_COMPARISONS = {
@@ -185,6 +185,61 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
             return None
     raise CompileError(
         f"{term.sql()} is not supported; a regular predicate is {_SUPPORTED}")
+
+
+def is_boolean_test(term) -> bool:
+    """Return whether a term is a NOT, AND, or OR of plain tests.
+
+    ``NOT a IS NULL`` and ``NOT`` directly before a text test stay
+    plain tests; parse_plain_test reads them.
+    """
+    node = term.unnest()
+    if isinstance(node, exp.Not):
+        inner = node.this
+        plain = ((isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null))
+                 or isinstance(inner, (exp.Contains, *_TEXT_TESTS)))
+        return not plain
+    return isinstance(node, (exp.And, exp.Or))
+
+
+def bind_boolean_test(b, term, selected: dict, tables=None) -> BooleanPredicate:
+    """Bind a NOT, AND, or OR of plain tests of one table's source columns.
+
+    Args:
+        b: The expression binder, which resolves the columns.
+        term: The term; is_boolean_test(term) holds.
+        selected: The AI calls in SELECT, by AS name.
+        tables: (alias, provider) pairs to resolve against instead of
+            the tables in scope.
+
+    Raises:
+        CompileError: A test compares two columns, reads an AI.EXTRACT
+            field, or the tests read more than one table.
+    """
+    node = term.unnest()
+    if isinstance(node, exp.Not):
+        operator, parts = "not", (node.this.unnest(),)
+    else:
+        operator = "and" if isinstance(node, exp.And) else "or"
+        parts = tuple(part.unnest() for part in node.flatten())
+    operands = []
+    for part in parts:
+        if is_boolean_test(part):
+            operands.append(bind_boolean_test(b, part, selected, tables))
+            continue
+        test = parse_plain_test(part, b.dialect)
+        if test is None:
+            raise CompileError(
+                f"{part.sql()} compares two columns; NOT and OR combine "
+                f"tests of a column against literals")
+        if extract_test(b, test, selected) is not None:
+            raise CompileError(
+                f"{part.sql()} tests an AI.EXTRACT field; NOT and OR combine "
+                f"tests of source columns, so test the field with AND")
+        operands.append(bind_plain_test(b, test, tables))
+    predicate = BooleanPredicate(operator, tuple(operands))
+    predicate.validate()
+    return predicate
 
 
 def _text_comparison(node, dialect: str) -> str | None:

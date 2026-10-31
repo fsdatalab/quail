@@ -539,6 +539,10 @@ class RegularPredicate:
             return self.expression.aliases()
         return (self.column.alias,)
 
+    def tests(self) -> tuple[RegularPredicate, ...]:
+        """Return this test alone, as BooleanPredicate.tests() returns its tests."""
+        return (self,)
+
     @property
     def text(self) -> bool:
         """Whether the comparison tests text against a pattern."""
@@ -645,6 +649,83 @@ class RegularPredicate:
         if self.comparison.startswith("is"):
             return f"{self.name} {self.comparison.upper()}"
         return f"{self.name} {self.comparison} {self.value!r}"
+
+
+BOOLEAN_OPERATORS = ("and", "or", "not")
+
+
+@dataclass(frozen=True)
+class BooleanPredicate:
+    """A NOT, AND, or OR of column tests on one table.
+
+    The scan evaluates it with Arrow's Kleene kernels, so a null
+    follows SQL's three-valued logic: ``NOT NULL`` is null, and a null
+    row is rejected at the end.
+
+    For example, ``NOT (LOWER(u.text) LIKE '%sorry%' AND u.turn > 3)``
+    is ``BooleanPredicate("not", (BooleanPredicate("and", (like,
+    greater)),))``.
+    """
+
+    operator: str  # one of BOOLEAN_OPERATORS
+    operands: tuple[RegularPredicate | BooleanPredicate, ...]
+
+    type_name: ClassVar[str] = "quail.boolean_predicate"
+
+    def tests(self) -> tuple[RegularPredicate, ...]:
+        """Return the column tests under the operators, in written order."""
+        return tuple(test for operand in self.operands for test in operand.tests())
+
+    def aliases(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(test.column.alias for test in self.tests()))
+
+    def validate(self) -> None:
+        if self.operator not in BOOLEAN_OPERATORS:
+            raise CompileError(f"unsupported boolean operator {self.operator!r}")
+        if self.operator == "not" and len(self.operands) != 1:
+            raise CompileError("NOT takes one test")
+        if self.operator != "not" and len(self.operands) < 2:
+            raise CompileError(f"{self.operator.upper()} takes at least two tests")
+        for operand in self.operands:
+            if not isinstance(operand, (RegularPredicate, BooleanPredicate)):
+                raise CompileError(
+                    f"a boolean predicate combines column tests, got "
+                    f"{type(operand).__name__}")
+            if (isinstance(operand, RegularPredicate)
+                    and isinstance(operand.expression, ModelCall)):
+                raise CompileError(
+                    "a boolean predicate combines column tests, not AI calls")
+            operand.validate()
+        if len(self.aliases()) != 1:
+            raise CompileError(
+                f"{self} reads tables {list(self.aliases())}; NOT and OR "
+                f"combine tests of one table")
+
+    def evaluate(self, columns) -> pa.Array | pa.ChunkedArray:
+        """Return a boolean array of the rows the predicate accepts.
+
+        Args:
+            columns: The table, record batch, or rows holding the
+                tested columns, read with ``column(name)``.
+        """
+        masks = [operand.evaluate(columns) for operand in self.operands]
+        if self.operator == "not":
+            return pc.invert(masks[0])
+        kernel = pc.and_kleene if self.operator == "and" else pc.or_kleene
+        mask = masks[0]
+        for other in masks[1:]:
+            mask = kernel(mask, other)
+        return mask
+
+    def accepts(self, columns) -> pa.Array:
+        """Return the rows the predicate accepts, with every null rejected."""
+        return accepted_rows(self.evaluate(columns))
+
+    def __str__(self) -> str:
+        if self.operator == "not":
+            return f"NOT ({self.operands[0]})"
+        return f" {self.operator.upper()} ".join(
+            f"({operand})" for operand in self.operands)
 
 
 @dataclass(frozen=True)

@@ -16,8 +16,10 @@ from quail.frontend.sql_binding.expressions import (
 from quail.frontend.sql_binding.predicates import (
     COLUMN_NODES,
     ai_aliases,
+    bind_boolean_test,
     bind_plain_test,
     extract_test,
+    is_boolean_test,
     parse_plain_test,
     unwrap_hint,
 )
@@ -99,6 +101,11 @@ class JoinBinder:
                         raise CompileError(
                             "AI.SCORE must be compared with <, <=, >, or >="
                         )
+                    if not _has_ai_call(term) and is_boolean_test(term):
+                        predicate = bind_boolean_test(b, term, {})
+                        b.regular_predicates.setdefault(
+                            predicate.aliases()[0], []).append(predicate)
+                        continue
                     test = None if _has_ai_call(term) else parse_plain_test(
                         term, b.dialect)
                     if test is not None:
@@ -218,6 +225,19 @@ def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
     """
     if _has_ai_call(term):
         return False
+    if is_boolean_test(term):
+        if selectivity is not None:
+            raise CompileError(
+                f"HINT estimates a test of a label or an answer; "
+                f"{term.sql()} tests source columns, applied at the scan")
+        predicate = bind_boolean_test(b, term, selected)
+        (alias,) = predicate.aliases()
+        if alias in b.scope.relations:
+            raise CompileError(
+                f"{term.sql()} tests an UNNEST column; NOT and OR combine "
+                f"tests of a table's own columns")
+        b.regular_predicates.setdefault(alias, []).append(predicate)
+        return True
     test = parse_plain_test(term, b.dialect)
     if test is None:
         return False
@@ -247,6 +267,10 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
         term = _name_select_labels(b, term, selected)
         if _bind_plain_term(b, term, selected, hint):
             continue
+        if isinstance(term.unnest(), exp.Or):
+            raise CompileError(
+                f"OR combines tests of source columns; {term.sql()} asks "
+                f"the model, so put the disjunction inside one prompt's text")
         anti = False
         node = term
         if isinstance(node, exp.Not):

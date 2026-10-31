@@ -818,7 +818,7 @@ def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
              "must be a number"),
             (head + "WHERE HINT(lease.ends IS NULL, {'anchor': 'c'})",
              "unknown option"),
-            (head + "WHERE NOT c.text = 'a'", "NOT is supported as")):
+            (head + "WHERE NOT lease.ends = 'a'", "tests an AI.EXTRACT field")):
         with pytest.raises(CompileError, match=message):
             sql(bad)
     builder = (session.docs("contracts").alias("c")

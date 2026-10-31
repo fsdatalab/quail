@@ -112,6 +112,24 @@ def test_regular_predicates_select_documents_before_the_model(session):
 
 
 
+def test_not_and_or_of_column_tests_run_at_the_scan(session):
+    # the AI predicates keep r0 (en, 5 stars) and r3 (en, no stars)
+    query = session.sql(
+        FILTER_SQL + " AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)")
+    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    assert [str(predicate) for predicate in scan.predicates] == [
+        "NOT ((lower(r.lang) like '%e%') AND (r.stars < 3))"]
+    # r3's NULL < 3 makes the AND and its NOT null, so the scan rejects r3
+    assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",)]
+    query = session.sql(FILTER_SQL + " AND (r.stars IS NULL OR r.lang = 'de')")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
+    with pytest.raises(CompileError, match="combine tests of one table"):
+        session.sql("""
+            SELECT r.id, p.asin FROM reviews r JOIN reviews p
+              ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.review))
+            WHERE r.stars > 3 OR p.stars > 3""").logical
+
+
 def test_a_document_too_long_for_a_pass_does_not_refuse_the_query():
     with quail.Session(CONFIG, tokenizer=fake_tok) as session:
         session.register("reviews", quail.DocumentProvider.from_table(pa.table({
@@ -151,7 +169,7 @@ def test_sql_and_builder_bind_regular_predicates(session):
     assert built == plan
     for sql, fragment in (
         ("r.stars BETWEEN 1 AND 3", "not supported"),
-        ("NOT r.stars = 3", "NOT is supported"),
+        ("NOT r.stars = r.lang", "compares two columns"),
         ("r.stars = r.stars", "only AI_FILTER"),
         ("r.stars > CURRENT_DATE", "literal"),
         ("r.nope = 1", "not in provider"),

@@ -294,7 +294,9 @@ class Query:
                 continue
             columns = pa.table(self.inputs.sample_columns(
                 scan.provider,
-                [predicate.column.column for predicate in scan.predicates]))
+                list(dict.fromkeys(test.column.column
+                                   for predicate in scan.predicates
+                                   for test in predicate.tests()))))
             sampled = columns.num_rows
             kept = len(selected_rows(columns, scan.predicates))
             # a sample that keeps nothing, or everything, says little
@@ -400,7 +402,8 @@ class Query:
         provider = self.catalog.get(scan.provider)
         expressions = (*self.logical.projection.columns,
                        *(key.expression for key in self.logical.result.order),
-                       *(predicate.column for predicate in scan.predicates))
+                       *(test.column for predicate in scan.predicates
+                         for test in predicate.tests()))
         columns = tuple(dict.fromkeys(
             column for expression in expressions
             for column in source_columns(expression)))
@@ -489,7 +492,8 @@ class Query:
                     needed.setdefault(ref.alias, {})[ref.column] = None
         for scan in operators.scans:
             for predicate in scan.predicates:
-                needed.setdefault(scan.alias, {})[predicate.column.column] = None
+                for test in predicate.tests():
+                    needed.setdefault(scan.alias, {})[test.column.column] = None
         for alias, key in filter_stop_keys(self.logical).items():
             for column in key:
                 needed.setdefault(alias, {})[column] = None

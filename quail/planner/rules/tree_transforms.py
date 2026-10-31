@@ -8,6 +8,7 @@ from quail.logical import (
     Aggregate,
     Alias,
     Apply,
+    BooleanPredicate,
     ColumnRef,
     Equality,
     Filter,
@@ -52,6 +53,8 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return _refs_of(model_call(expression).prompt.args)
     if isinstance(expression, RegularPredicate):
         return _column_refs(expression.expression)
+    if isinstance(expression, BooleanPredicate):
+        return _refs_of(expression.tests())
     if isinstance(expression, Equality):
         return _refs_of((expression.left, expression.right))
     if isinstance(expression, SortKey):

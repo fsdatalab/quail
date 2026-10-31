@@ -102,6 +102,15 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
     return sql
 
 
+def _asks_model(node) -> bool:
+    """Return whether an expression holds an AI call or an EXISTS subquery."""
+    return any(
+        isinstance(inner, (exp.AIClassify, exp.Exists))
+        or (isinstance(inner, exp.Anonymous)
+            and str(inner.this).upper().startswith("AI_"))
+        for inner in node.walk())
+
+
 def _reject_forbidden(tree) -> None:
     for cls, name in FORBIDDEN:
         if list(tree.find_all(cls)):
@@ -110,7 +119,9 @@ def _reject_forbidden(tree) -> None:
                 f"semantic part; do the relational part in the "
                 f"database the ids came from"
             )
-    if list(tree.find_all(exp.Or)):
+    if any(node.find_ancestor(exp.Having) for node in tree.find_all(exp.Or)):
+        raise CompileError("OR in HAVING is not supported; combine tests with AND")
+    if any(_asks_model(node) for node in tree.find_all(exp.Or)):
         raise CompileError(
             "OR between AI predicates is not supported: a disjunction "
             "belongs inside one prompt's text, where the model "
