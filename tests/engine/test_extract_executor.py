@@ -36,7 +36,7 @@ from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_execute
 from quail.builtins import built_in_registry
 from quail.catalog.tokens import TokenOffsets, TokenStore
-from quail.logical import ColumnRef, GetField, RegularPredicate
+from quail.logical import ColumnRef, GetField, Not, Or, RegularPredicate
 from quail.physical import (
     AiExtract,
     AiFilter,
@@ -801,8 +801,8 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                   backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(node_id="filter:c:0",
                inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
-               predicate=RegularPredicate(
-                   ColumnRef("c", "contracts", "ends"), "not like", "five%"),
+               predicate=Not(RegularPredicate(
+                   ColumnRef("c", "contracts", "ends"), "like", "five%")),
                aliases=("c",), written_position=0),
         AiExtract(node_id="ai-extract:starts",
                   inputs=input_ports((PortRef("filter:c:0", "rows:c"),)),
@@ -810,9 +810,13 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                   spec=replace(spec, name="starts")),
         Filter(node_id="filter:c:1",
                inputs=input_ports((PortRef("ai-extract:starts", "rows:c"),)),
-               predicate=RegularPredicate(
-                   GetField(ColumnRef("c", "contracts", "starts_span"), "start"),
-                   "<", 40),
+               # a condition on an answer and its span reads both as
+               # the document settles
+               predicate=Or((
+                   RegularPredicate(ColumnRef("c", "contracts", "starts"), "is null"),
+                   RegularPredicate(
+                       GetField(ColumnRef("c", "contracts", "starts_span"), "start"),
+                       "<", 40))),
                aliases=("c",), written_position=1),
     ), PortRef("filter:c:1", "rows:c"))
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]

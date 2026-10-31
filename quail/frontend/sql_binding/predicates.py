@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from sqlglot import exp
 
-from quail.logical import BooleanPredicate, ColumnRef, CompileError, RegularPredicate
+from quail.logical import And, ColumnRef, CompileError, Not, Or, RegularPredicate
 from quail.logical.expressions import SPAN_SUFFIX, column_expression
 
 _PLAIN_COMPARISONS = {
@@ -71,12 +71,14 @@ class PlainTest:
         comparison: One of quail.logical.COLUMN_COMPARISONS.
         value: The literal or tuple of literals compared with.
         function: The function applied to the column, or None.
+        negated: Whether the test is written negated, as ``NOT LIKE``.
     """
 
     operand: exp.Expression
     comparison: str
     value: object = None
     function: str | None = None
+    negated: bool = False
 
 
 # the SQL functions of one column, by the name the expression tree uses
@@ -137,14 +139,11 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
         CompileError: The term is not a supported plain test.
     """
     node, negated = term, False
-    if isinstance(node, exp.Not):
-        node, negated = node.this, True
     if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
         found = _operand(node.this)
         if found is not None:
-            return PlainTest(found[0], "is not null" if negated else "is null",
-                             function=found[1])
-    if isinstance(node, exp.In) and node.expressions and not negated:
+            return PlainTest(found[0], "is null", function=found[1])
+    if isinstance(node, exp.In) and node.expressions:
         found = _operand(node.this)
         if found is not None:
             return PlainTest(found[0], "in",
@@ -167,12 +166,7 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
         if comparison == "regex" and dialect == "snowflake":
             # Snowflake's REGEXP_LIKE and RLIKE match the whole value
             pattern = f"^(?:{pattern})$"
-        return PlainTest(found[0], f"not {comparison}" if negated else comparison,
-                         pattern, found[1])
-    if negated:
-        raise CompileError(
-            f"NOT is supported as NOT EXISTS, IS NOT NULL, and NOT before "
-            f"a text test, got NOT {node.sql()}")
+        return PlainTest(found[0], comparison, pattern, found[1], negated)
     comparison = _PLAIN_COMPARISONS.get(type(node))
     if comparison is not None:
         left, right = _operand(node.this), _operand(node.expression)
@@ -187,59 +181,47 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
         f"{term.sql()} is not supported; a regular predicate is {_SUPPORTED}")
 
 
-def is_boolean_test(term) -> bool:
-    """Return whether a term is a NOT, AND, or OR of plain tests.
+def bind_condition(b, term, selected: dict):
+    """Bind a WHERE or ON term that asks no model as a condition tree.
 
-    ``NOT a IS NULL`` and ``NOT`` directly before a text test stay
-    plain tests; parse_plain_test reads them.
-    """
-    node = term.unnest()
-    if isinstance(node, exp.Not):
-        inner = node.this
-        plain = ((isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null))
-                 or isinstance(inner, (exp.Contains, *_TEXT_TESTS)))
-        return not plain
-    return isinstance(node, (exp.And, exp.Or))
-
-
-def bind_boolean_test(b, term, selected: dict, tables=None) -> BooleanPredicate:
-    """Bind a NOT, AND, or OR of plain tests of one table's source columns.
+    NOT, AND, and OR become Not, And, and Or; every other term is one
+    plain test, of a source column or of an AI.EXTRACT field.
 
     Args:
         b: The expression binder, which resolves the columns.
-        term: The term; is_boolean_test(term) holds.
+        term: The term.
         selected: The AI calls in SELECT, by AS name.
-        tables: (alias, provider) pairs to resolve against instead of
-            the tables in scope.
+
+    Returns:
+        The condition, or None for a comparison of two columns, which
+        the caller reads as a join condition.
 
     Raises:
-        CompileError: A test compares two columns, reads an AI.EXTRACT
-            field, or the tests read more than one table.
+        CompileError: A term under NOT, AND, or OR compares two
+            columns, or a term is not a supported test.
     """
     node = term.unnest()
     if isinstance(node, exp.Not):
-        operator, parts = "not", (node.this.unnest(),)
-    else:
-        operator = "and" if isinstance(node, exp.And) else "or"
-        parts = tuple(part.unnest() for part in node.flatten())
-    operands = []
-    for part in parts:
-        if is_boolean_test(part):
-            operands.append(bind_boolean_test(b, part, selected, tables))
-            continue
-        test = parse_plain_test(part, b.dialect)
-        if test is None:
-            raise CompileError(
-                f"{part.sql()} compares two columns; NOT and OR combine "
-                f"tests of a column against literals")
-        if extract_test(b, test, selected) is not None:
-            raise CompileError(
-                f"{part.sql()} tests an AI.EXTRACT field; NOT and OR combine "
-                f"tests of source columns, so test the field with AND")
-        operands.append(bind_plain_test(b, test, tables))
-    predicate = BooleanPredicate(operator, tuple(operands))
-    predicate.validate()
-    return predicate
+        return Not(_bind_operand(b, node.this, selected))
+    if isinstance(node, (exp.And, exp.Or)):
+        kind = And if isinstance(node, exp.And) else Or
+        return kind(tuple(_bind_operand(b, part, selected) for part in node.flatten()))
+    test = parse_plain_test(node, b.dialect)
+    if test is None:
+        return None
+    found = extract_test(b, test, selected)
+    predicate = found[1] if found is not None else bind_plain_test(b, test)
+    return Not(predicate) if test.negated else predicate
+
+
+def _bind_operand(b, term, selected: dict):
+    """Bind a term under NOT, AND, or OR, which must test a column."""
+    condition = bind_condition(b, term, selected)
+    if condition is None:
+        raise CompileError(
+            f"{term.sql()} compares two columns; NOT, AND, and OR combine "
+            f"tests of a column against literals")
+    return condition
 
 
 def _text_comparison(node, dialect: str) -> str | None:

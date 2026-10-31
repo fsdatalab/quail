@@ -6,11 +6,15 @@ from dataclasses import dataclass, replace
 from typing import ClassVar, Optional
 
 from quail.logical.expressions import (
+    And,
     ColumnRef,
     CompileError,
+    Not,
+    Or,
     RegularPredicate,
     _explain,
     column_name,
+    column_references,
     model_call,
     validate_predicate,
 )
@@ -77,14 +81,15 @@ class SemanticFilter:
 class Filter:
     """Rows whose condition holds, decided without the model.
 
-    The condition tests a column a one-table SemanticClassify or a
-    SemanticExtract below adds: a label, an answer, or an answer's span.
-    Above an Unnest, it tests a column the rows below return, such as a
-    field column of an unnested list.
+    Below the Project, the condition tests columns a one-table
+    SemanticClassify or a SemanticExtract below adds: a label, or one
+    extraction's answer and span. Above the Project or an Unnest, it
+    tests the columns the result rows below return, by name, such as
+    ``r.stars``, ``lease.ends``, or a field column of an unnested list.
     """
 
     input: LogicalNode
-    condition: RegularPredicate
+    condition: RegularPredicate | Not | And | Or
     selectivity: Optional[float] = None  # fraction of rows that pass;
     #                                       None means not given
 
@@ -101,26 +106,39 @@ class Filter:
 
     def validate(self) -> None:
         self.condition.validate()
-        column = self.condition.column
-        if above_unnest(self.input):
-            if column_name(column) not in self.input.result_columns():
-                raise CompileError(
-                    f"a Filter above an Unnest tests a column the rows below "
-                    f"return, got {column_name(column)}")
+        references = [reference for test in self.condition.tests()
+                      for reference in column_references(test.expression)]
+        from quail.logical.nodes.relational import readable_columns, reads_projection
+
+        if reads_projection(self.input):
+            returned = readable_columns(self.input)
+            for reference in references:
+                if column_name(reference) not in returned:
+                    raise CompileError(
+                        f"a Filter on result rows tests a column the rows "
+                        f"below return, got {column_name(reference)}")
             return
-        if (column.alias, column.column) not in computed_columns(self.input):
-            raise CompileError(
-                f"a Filter tests a column a one-table classification or "
-                f"an extraction below it computes; nothing below computes "
-                f"{column.alias}.{column.column}"
-            )
+        computed = computed_columns(self.input)
+        for reference in references:
+            if (reference.alias, reference.column) not in computed:
+                raise CompileError(
+                    f"a Filter tests a column a one-table classification or "
+                    f"an extraction below it computes; nothing below "
+                    f"computes {reference.alias}.{reference.column}"
+                )
+
+    @property
+    def alias(self) -> str:
+        """Return the one table a Filter below the Project tests."""
+        (alias,) = self.condition.aliases()
+        return alias
 
     def result_columns(self) -> tuple[str, ...]:
-        """Return the columns of the rows below, above an Unnest."""
+        """Return the columns of the result rows below."""
         return self.input.result_columns()
 
     def list_types(self) -> dict:
-        """Return the list columns of the rows below, above an Unnest."""
+        """Return the list columns of the result rows below."""
         return self.input.list_types()
 
     def with_children(self, children: tuple[LogicalNode, ...]):
@@ -153,8 +171,16 @@ def computed_columns(node) -> frozenset:
     return frozenset(columns)
 
 
-def above_unnest(node) -> bool:
-    """Return whether the node is an Unnest or a Filter above one."""
+def above_projection(node) -> bool:
+    """Return whether the node reads result rows.
+
+    That is an Unnest, or a Filter above an Unnest or the Project; the
+    Project itself reads documents.
+    """
+    from quail.logical.nodes.relational import Project
+
     while isinstance(node, Filter):
         node = node.input
+        if isinstance(node, Project):
+            return True
     return isinstance(node, Unnest)

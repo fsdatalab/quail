@@ -179,8 +179,27 @@ class EqualsSpec(ExpressionSpec):
     right: ColSpec
 
 
+class ConditionSpec(ExpressionSpec):
+    """A where() condition: combine with ``&``, ``|``, and ``~``."""
+
+    def __and__(self, other) -> "AndSpec":
+        return AndSpec((self, _condition_spec(other, "&")))
+
+    def __or__(self, other) -> "OrSpec":
+        return OrSpec((self, _condition_spec(other, "|")))
+
+    def __invert__(self) -> "NotSpec":
+        return NotSpec(self)
+
+
+def _condition_spec(other, operator: str) -> ConditionSpec:
+    if not isinstance(other, ConditionSpec):
+        raise TypeError(f"{operator} combines tests of columns, got {other!r}")
+    return other
+
+
 @dataclass(frozen=True)
-class PredicateSpec(ExpressionSpec):
+class PredicateSpec(ConditionSpec):
     """An unresolved regular predicate for ``where()``.
 
     Attributes:
@@ -195,41 +214,27 @@ class PredicateSpec(ExpressionSpec):
     value: object = None
     selectivity: Optional[float] = None
 
-    def __invert__(self) -> "PredicateSpec":
-        """``~col(...).like(...)``: the negated text test."""
-        if self.comparison.startswith("not "):
-            comparison = self.comparison[4:]
-        elif self.comparison in ("is null", "is not null"):
-            comparison = "is not null" if self.comparison == "is null" else "is null"
-        else:
-            comparison = f"not {self.comparison}"
-        return PredicateSpec(self.col, comparison, self.value, self.selectivity)
-
     def hint(self, *, selectivity: float) -> "PredicateSpec":
         """``col(...).like(...).hint(selectivity=0.4)``: the fraction kept."""
         return PredicateSpec(self.col, self.comparison, self.value, selectivity)
 
-    def __and__(self, other) -> "AndSpec":
-        return AndSpec((self,)) & other
 
-    def tests(self) -> tuple:
-        """The tests combined with AND: this one."""
-        return (self,)
+@dataclass(frozen=True)
+class NotSpec(ConditionSpec):
+    """The rows a condition rejects: ``~col("r.text").like("%sorry%")``."""
+    operand: ConditionSpec
 
 
 @dataclass(frozen=True)
-class AndSpec(ExpressionSpec):
-    """Tests combined with AND: ``(col("a") > 1) & col("b").is_null()``."""
+class AndSpec(ConditionSpec):
+    """Conditions combined with AND: ``(col("a") > 1) & col("b").is_null()``."""
     parts: tuple
 
-    def __and__(self, other) -> "AndSpec":
-        if not isinstance(other, (PredicateSpec, AndSpec)):
-            raise TypeError(f"& combines tests of columns, got {other!r}")
-        return AndSpec((*self.parts, *other.tests()))
 
-    def tests(self) -> tuple:
-        """The tests combined with AND, in written order."""
-        return self.parts
+@dataclass(frozen=True)
+class OrSpec(ConditionSpec):
+    """Conditions combined with OR: ``(col("a") > 1) | col("b").is_null()``."""
+    parts: tuple
 
 
 @dataclass(frozen=True)

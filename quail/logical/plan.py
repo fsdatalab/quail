@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import pyarrow as pa
 from pyarrow import compute as pc
@@ -19,6 +19,7 @@ from quail.logical.expressions import (
     aliased_call,
     column_name,
     column_references,
+    condition_columns,
     evaluate_expression,
     model_call,
 )
@@ -52,7 +53,7 @@ class ColumnTest:
             span the Filter tests, as the SemanticClassify or
             SemanticExtract names it.
         call: The model call that computes the column.
-        condition: The RegularPredicate the Filter applies.
+        condition: The condition the Filter applies.
         selectivity: The Filter's selectivity hint, or None.
         position: Its written position among the table's filters,
             counted after the table's AI.IF predicates, with the label
@@ -61,7 +62,7 @@ class ColumnTest:
 
     name: str
     call: "ModelCall"
-    condition: RegularPredicate
+    condition: Any  # RegularPredicate | Not | And | Or
     selectivity: Optional[float]
     position: int
 
@@ -205,7 +206,7 @@ class LogicalPlan:
                     if alias not in aliases:
                         aliases.append(alias)
             elif isinstance(node, Filter):
-                alias = node.condition.column.alias
+                alias = node.alias
                 tested.setdefault(alias, []).append(node)
                 if alias not in aliases:
                     aliases.append(alias)
@@ -227,7 +228,8 @@ class LogicalPlan:
         label_filters, extract_filters = {}, {}
         for alias in aliases:
             labels = [node for node in tested.get(alias, ())
-                      if (alias, node.condition.column.column) in calls]
+                      if isinstance(node.condition, RegularPredicate)
+                      and (alias, node.condition.column.column) in calls]
             if labels:
                 label_filters[alias] = tuple(
                     ColumnTest(
@@ -242,8 +244,8 @@ class LogicalPlan:
             if answers:
                 extract_filters[alias] = tuple(
                     ColumnTest(
-                        name=_extraction(node.condition.column.column, extracts).name,
-                        call=_extraction(node.condition.column.column, extracts).call,
+                        name=_extraction(node, extracts).name,
+                        call=_extraction(node, extracts).call,
                         condition=node.condition,
                         selectivity=node.selectivity,
                         position=len(filters.get(alias, ())) + len(labels) + index,
@@ -331,8 +333,9 @@ class Operators:
         )
 
 
-def _extraction(column: str, extracts):
-    """Return the SemanticExtract computing an answer or span column."""
+def _extraction(test: "Filter", extracts):
+    """Return the SemanticExtract computing the answer or span a Filter tests."""
+    (column, *_) = condition_columns(test.condition)
     return next(node for node in extracts if column in (node.name, node.span_name))
 
 

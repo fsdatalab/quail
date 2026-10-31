@@ -17,7 +17,7 @@ from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sae_features import sae_encoded_tokens
 from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan
-from quail.logical import oriented_join_conditions
+from quail.logical import condition_columns, oriented_join_conditions
 from quail.logical.expressions import column_name, evaluate_expression
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
@@ -502,7 +502,8 @@ class Search:
 
     def answer_survivors(self, condition, rows, answers) -> list:
         """Return the live rows whose reference answer passes the condition."""
-        kept = condition.accepts(pa.table({condition.column.column: pa.array(
+        (column,) = condition_columns(condition)
+        kept = condition.accepts(pa.table({column: pa.array(
             [answers[row] for row in rows], pa.string())}))
         return [row for row, keep in zip(rows, kept.to_pylist()) if keep]
 

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 import pyarrow as pa
+from pyarrow import compute as pc
 
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult, answer_table, filter_answer_table
 from quail.execution.rows import Rows
 from quail.execution.runtimes.relational import row_batches
-from quail.logical import column_name
 from quail.physical import Filter
 
 
@@ -31,17 +31,33 @@ class FilterRuntime:
         return filter_scores(node, value)
 
 
+class ResultColumns:
+    """Read result row columns by name, including fields of struct columns.
+
+    The Project packs each extraction's answers into a struct column,
+    so ``lease.ends`` is the field ``ends`` of the column ``lease`` when
+    no column has that name.
+    """
+
+    def __init__(self, batch: pa.RecordBatch):
+        self.batch = batch
+
+    def column(self, name: str):
+        if name in self.batch.schema.names:
+            return self.batch.column(name)
+        struct, _, field = name.rpartition(".")
+        if struct in self.batch.schema.names:
+            return pc.struct_field(self.batch.column(struct), field)
+        raise KeyError(f"the result rows have no column {name!r}")
+
+
 def filter_result_rows(node, value) -> NodeResult:
     """Keep the result rows whose predicate holds, one batch at a time."""
-    name = column_name(node.predicate.column)
     num_rows, batches = 0, []
     for batch in row_batches(value):
         num_rows += batch.num_rows
-        # the predicate reads its column by the bare column name
-        tested = pa.RecordBatch.from_arrays(
-            [batch.column(name)], names=[node.predicate.column.column])
-        batches.append(batch.filter(node.predicate.accepts(tested))
-                       .select(list(node.columns)))
+        kept = node.predicate.accepts(ResultColumns(batch), qualified=True)
+        batches.append(batch.filter(kept).select(list(node.columns)))
     table = pa.Table.from_batches(batches)
     return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
         input_rows=num_rows, output_rows=table.num_rows))

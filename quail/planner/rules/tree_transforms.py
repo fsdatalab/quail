@@ -7,8 +7,8 @@ from dataclasses import replace
 from quail.logical import (
     Aggregate,
     Alias,
+    And,
     Apply,
-    BooleanPredicate,
     ColumnRef,
     Equality,
     Filter,
@@ -17,7 +17,9 @@ from quail.logical import (
     LogicalNode,
     LogicalPlan,
     ModelCall,
+    Not,
     Operators,
+    Or,
     Project,
     RegularPredicate,
     Result,
@@ -28,9 +30,10 @@ from quail.logical import (
     SemanticJoin,
     SortKey,
     Window,
-    above_unnest,
+    above_projection,
     is_score,
     model_call,
+    reads_projection,
 )
 from quail.logical.expressions import (
     GetField,
@@ -53,7 +56,7 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return _refs_of(model_call(expression).prompt.args)
     if isinstance(expression, RegularPredicate):
         return _column_refs(expression.expression)
-    if isinstance(expression, BooleanPredicate):
+    if isinstance(expression, (Not, And, Or)):
         return _refs_of(expression.tests())
     if isinstance(expression, Equality):
         return _refs_of((expression.left, expression.right))
@@ -159,7 +162,7 @@ def _lets_through(node, alias: str) -> bool:
     if isinstance(node, Apply):
         return node.ids != "pairs" and node.aliases[0] != alias
     if isinstance(node, Filter):
-        return node.condition.column.alias != alias
+        return node.alias != alias
     if isinstance(node, SemanticFilter):
         return all(model_call(p.expression).aliases()[0] != alias
                    for p in node.predicates)
@@ -211,9 +214,9 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
         children = tuple(visit(child) for child in node.children())
         if children != node.children():
             node = node.with_children(children)
-        if not isinstance(node, Filter):
+        if not isinstance(node, Filter) or reads_projection(node.input):
             return node
-        alias = node.condition.column.alias
+        alias = node.alias
         placed = _place_filter(node, node.input, alias)
         if placed is None:
             return node
@@ -243,7 +246,7 @@ def _sequence_alias(node) -> str:
     """Return the table alias a classification, extraction, or label filter reads."""
     if isinstance(node, (SemanticClassify, SemanticExtract)):
         return node.alias
-    return node.condition.column.alias
+    return node.alias
 
 
 def lift_maps(root: LogicalNode) -> LogicalNode | None:
@@ -265,8 +268,8 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     """
     # the result rows above the Project, an Unnest chain among them, hold
     # no document operators
-    if (isinstance(root, (Result, Aggregate, Window)) or above_unnest(root)
-            or isinstance(root, Project) and above_unnest(root.input)):
+    if (isinstance(root, (Result, Aggregate, Window)) or above_projection(root)
+            or isinstance(root, Project) and above_projection(root.input)):
         rewritten = lift_maps(root.input)
         return None if rewritten is None else root.with_children((rewritten,))
     nodes = LogicalPlan(root).walk()

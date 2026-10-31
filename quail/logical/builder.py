@@ -16,6 +16,7 @@ from quail.logical.expressions import (
     aliased_call,
     column_name,
     column_references,
+    condition_columns,
     model_call,
 )
 from quail.logical.nodes import (
@@ -34,6 +35,8 @@ from quail.logical.nodes import (
     Unnest,
     Window,
 )
+from quail.logical.nodes.relational import readable_columns
+from quail.logical.placement import result_columns_read, result_row_condition
 from quail.logical.plan import (
     LogicalPlan,
 )
@@ -89,8 +92,8 @@ class LogicalPlanBuilder:
             column: The document column.
             schema: The provider's Arrow schema, for typing the result.
             predicates: The table's AI.IF predicates in written order.
-            regular_predicates: RegularPredicate tests the scan applies
-                before any operator reads a document.
+            regular_predicates: The conditions the scan applies before
+                any operator reads a document.
             applies: (function, kind, ids, columns) per apply, in order.
             labels: (call, name) per one-table classification. A call
                 that a label filter tests sits below the first Filter
@@ -100,9 +103,9 @@ class LogicalPlanBuilder:
                 classification's label column, in written order.
             extracts: (call, name) per extraction, in order. They sit
                 above the classifications and label filters.
-            extract_filters: (RegularPredicate, selectivity) per Filter
-                on an extraction's answer or span column, in written
-                order. Each sits right above the extraction it tests.
+            extract_filters: (condition, selectivity) per Filter on one
+                extraction's answer and span columns, in written order.
+                Each sits right above the extraction it tests.
             sae_features: (call, name) per AI.SAE_FEATURES call, in
                 order. They sit above the extractions.
 
@@ -161,7 +164,7 @@ class LogicalPlanBuilder:
             extraction = SemanticExtract(node, call, name)
             node = extraction
             for predicate, selectivity in extract_filters:
-                if predicate.column.column in (name, extraction.span_name):
+                if set(condition_columns(predicate)) <= {name, extraction.span_name}:
                     node = Filter(node, predicate, selectivity)
                     tests.remove((predicate, selectivity))
         if tests:
@@ -265,7 +268,7 @@ class LogicalPlanBuilder:
         windows: tuple = (),
         output: tuple = (),
         unnests: tuple = (),
-        unnest_tests: tuple = (),
+        row_tests: tuple = (),
         unnest_outer: tuple = (),
     ) -> LogicalPlan:
         """Build the plan's result nodes over the projected columns.
@@ -283,9 +286,11 @@ class LogicalPlanBuilder:
                 or unnested lists are present.
             unnests: The list columns of each Unnest, lowest first; the
                 lists of one Unnest are zipped.
-            unnest_tests: RegularPredicates on unnested field columns.
-                Each becomes a Filter above the Unnest that adds its
-                column.
+            row_tests: The conditions on result rows, such as one over
+                two tables or over an unnested field. Each becomes a
+                Filter above the Project, or above the Unnest that adds
+                the last field it reads; the Project also returns the
+                source columns they read, and a later Project drops them.
             unnest_outer: For each Unnest, whether a row with no
                 elements returns one row of nulls; empty means none do.
         """
@@ -308,19 +313,26 @@ class LogicalPlanBuilder:
                            for ref in column_references(column))}
         source = tuple(column for column in columns
                        if column_name(column) not in expanded)
-        if unnests and aggregation is None:
+        written = Project(self._root, source, tuple(structs))
+        returned = written.result_columns()
+        row_tests = tuple(result_row_condition(test, written.packing())
+                          for test in row_tests)
+        if (unnests or row_tests) and aggregation is None:
             source += tuple(key.expression for key in order
                             if column_references(key.expression)
                             and not any(ref.alias in unnested for ref in
                                         column_references(key.expression))
                             and key.expression not in source)
+        source += _row_test_columns(row_tests, unnested, source, returned)
         node = _unnested(Project(self._root, source, tuple(structs)),
-                         unnests, unnest_tests,
+                         unnests, row_tests,
                          unnest_outer or (False,) * len(unnests))
-        if unnests:
-            selected = (tuple(column_name(column) for column in columns
-                              if column_name(column) not in unnested)
-                        if aggregation is not None or windows else tuple(output))
+        if unnests or row_tests:
+            if aggregation is not None or windows:
+                selected = tuple(column_name(column) for column in columns
+                                 if column_name(column) not in unnested)
+            else:
+                selected = tuple(output) if unnests else returned
             node = Project(node, tuple(expanded.get(name, name) for name in selected))
         if aggregation is not None:
             node = Aggregate(
@@ -339,24 +351,50 @@ class LogicalPlanBuilder:
         return plan
 
 
+def _row_test_columns(tests, unnested, source, returned) -> tuple:
+    """Return the source columns result row tests read that the Project lacks."""
+    present = set(returned) | {column_name(column) for column in source}
+    extra = []
+    for test in tests:
+        for reference in (reference for found in test.tests()
+                          for reference in column_references(found.expression)):
+            if (reference.provider and reference.alias not in unnested
+                    and column_name(reference) not in present):
+                extra.append(reference)
+                present.add(column_name(reference))
+    return tuple(extra)
+
+
 def _unnested(node, unnests, tests, outer):
-    """Return the node under its Unnests, each test above its field's Unnest.
+    """Return the node under its Unnests and result row Filters.
+
+    Each test sits above the Project, or above the Unnest that adds the
+    last column it reads.
 
     Raises:
         CompileError: An Unnest names no list column below it, or a test
-            reads no unnested field.
+            reads a column no result row holds.
     """
     tests = list(tests)
+
+    def place(node):
+        available = readable_columns(node)
+        for test in [test for test in tests
+                     if set(result_columns_read(test)) <= available]:
+            node = Filter(node, test)
+            tests.remove(test)
+        return node
+
+    node = place(node)
     for lists, keep_empty in zip(unnests, outer, strict=True):
         node = Unnest(node, tuple(lists), outer=keep_empty)
         node.validate()
-        fields = {name for names in node.fields().values() for name in names}
-        for test in [test for test in tests if column_name(test.column) in fields]:
-            node = Filter(node, test)
-            tests.remove(test)
+        node = place(node)
     if tests:
+        missing = sorted(set(result_columns_read(tests[0]))
+                         - readable_columns(node))
         raise CompileError(
-            f"{tests[0]} tests no field of an unnested list")
+            f"{tests[0]} reads {missing}, which no result row holds")
     return node
 
 

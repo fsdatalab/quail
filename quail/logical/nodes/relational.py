@@ -23,7 +23,7 @@ from quail.logical.expressions import (
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import classifications
 from quail.logical.nodes.extract import extractions
-from quail.logical.nodes.filter import above_unnest
+from quail.logical.nodes.filter import above_projection
 from quail.logical.nodes.sae_features import FEATURE_LIST
 
 
@@ -337,4 +337,24 @@ class Result:
 
 def reads_projection(node) -> bool:
     """Return whether the node is the Project or an Unnest chain above it."""
-    return isinstance(node, Project) or above_unnest(node)
+    return isinstance(node, Project) or above_projection(node)
+
+
+def readable_columns(node) -> frozenset:
+    """Return the names a condition on the node's result rows may read.
+
+    These are the result columns and, for each extraction's struct
+    column, its fields by ``struct.field``, such as ``lease.ends``.
+
+    Args:
+        node: The Project, or an Unnest or Filter above it.
+    """
+    names = set(node.result_columns())
+    below = node
+    while not isinstance(below, Project):
+        below = below.input
+    for struct, fields in below.packing():
+        if struct in names:
+            names.update(f"{struct}.{field}" for field, _ in fields)
+    return frozenset(names)
+

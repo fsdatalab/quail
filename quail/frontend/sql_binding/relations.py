@@ -16,11 +16,7 @@ from quail.frontend.sql_binding.expressions import (
 from quail.frontend.sql_binding.predicates import (
     COLUMN_NODES,
     ai_aliases,
-    bind_boolean_test,
-    bind_plain_test,
-    extract_test,
-    is_boolean_test,
-    parse_plain_test,
+    bind_condition,
     unwrap_hint,
 )
 from quail.logical import (
@@ -101,18 +97,10 @@ class JoinBinder:
                         raise CompileError(
                             "AI.SCORE must be compared with <, <=, >, or >="
                         )
-                    if not _has_ai_call(term) and is_boolean_test(term):
-                        predicate = bind_boolean_test(b, term, {})
-                        b.regular_predicates.setdefault(
-                            predicate.aliases()[0], []).append(predicate)
-                        continue
-                    test = None if _has_ai_call(term) else parse_plain_test(
-                        term, b.dialect)
-                    if test is not None:
-                        plain = bind_plain_test(b, test)
-                        b.regular_predicates.setdefault(plain.column.alias, []).append(
-                            plain
-                        )
+                    condition = (None if _has_ai_call(term)
+                                 else bind_condition(b, term, {}))
+                    if condition is not None:
+                        b.conditions.append((condition, None))
                         continue
                     equalities.append(_parse_equality(b, term, alias))
             if len(predicates) > 1:
@@ -207,7 +195,7 @@ def _name_select_labels(b: ExpressionBinder, term, selected: dict):
 
 def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
                      selectivity: float | None) -> bool:
-    """Bind a test of a source column or of an AI.EXTRACT field.
+    """Bind a term that asks no model as a condition, placed later.
 
     Args:
         b: The binder.
@@ -216,45 +204,15 @@ def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
         selectivity: The term's SELECTIVITY hint, or None.
 
     Returns:
-        Whether the term was a plain test; False leaves an AI term to
-        its binder.
-
-    Raises:
-        CompileError: A test of a source column carries a hint; the
-            scan applies it before any model call, so it has no cost.
+        Whether the term was a condition; False leaves an AI term, or a
+        comparison of two columns, to the AI binders.
     """
     if _has_ai_call(term):
         return False
-    if is_boolean_test(term):
-        if selectivity is not None:
-            raise CompileError(
-                f"HINT estimates a test of a label or an answer; "
-                f"{term.sql()} tests source columns, applied at the scan")
-        predicate = bind_boolean_test(b, term, selected)
-        (alias,) = predicate.aliases()
-        if alias in b.scope.relations:
-            raise CompileError(
-                f"{term.sql()} tests an UNNEST column; NOT and OR combine "
-                f"tests of a table's own columns")
-        b.regular_predicates.setdefault(alias, []).append(predicate)
-        return True
-    test = parse_plain_test(term, b.dialect)
-    if test is None:
+    condition = bind_condition(b, term, selected)
+    if condition is None:
         return False
-    found = extract_test(b, test, selected)
-    if found is not None:
-        alias, predicate = found
-        b.extract_tests.setdefault(alias, []).append((predicate, selectivity))
-    else:
-        if selectivity is not None:
-            raise CompileError(
-                f"HINT estimates a test of a label or an answer; "
-                f"{term.sql()} tests a source column, applied at the scan")
-        plain = bind_plain_test(b, test)
-        if plain.column.alias in b.scope.relations:
-            b.unnest_tests.append(plain)
-        else:
-            b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
+    b.conditions.append((condition, selectivity))
     return True
 
 

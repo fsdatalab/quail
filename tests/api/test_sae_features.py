@@ -160,6 +160,22 @@ def test_unnested_fields_resolve_without_qualifiers_when_unambiguous(session):
                     f"UNNEST({TWO_CALLS}) AS u(f, g)")
 
 
+def test_not_and_or_of_unnested_fields_and_source_columns_filter_rows(session):
+    # feature 100 has strength 0.5 in every document; document d has
+    # feature d at strength d + 1
+    fields = session.sql(
+        f"SELECT r.id, f.feature FROM reviews r, {UNNEST} "
+        f"WHERE NOT (f.strength < 1 OR f.feature = 100) ORDER BY r.id")
+    assert finish(fields, _unnest_oracle()).collect().to_pylist() == [
+        {"r.id": 7, "f.feature": 0}, {"r.id": 9, "f.feature": 1},
+        {"r.id": 11, "f.feature": 2}]
+    mixed = session.sql(
+        f"SELECT f.feature FROM reviews r, {UNNEST} "
+        f"WHERE f.strength > 2 OR r.id = 7 ORDER BY f.feature")
+    assert finish(mixed, _unnest_oracle()).collect().to_pylist() == [
+        {"f.feature": 0}, {"f.feature": 2}, {"f.feature": 100}]
+
+
 def test_count_star_returns_zero_when_no_features_pass_the_filter(session):
     query = session.sql(
         f"SELECT COUNT(*) AS n FROM reviews r, {UNNEST} "

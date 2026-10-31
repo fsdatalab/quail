@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
@@ -540,13 +541,13 @@ class RegularPredicate:
         return (self.column.alias,)
 
     def tests(self) -> tuple[RegularPredicate, ...]:
-        """Return this test alone, as BooleanPredicate.tests() returns its tests."""
+        """Return this test alone, as And.tests() returns its tests."""
         return (self,)
 
     @property
     def text(self) -> bool:
         """Whether the comparison tests text against a pattern."""
-        return self.comparison.removeprefix("not ") in TEXT_COMPARISONS
+        return self.comparison in TEXT_COMPARISONS
 
     def validate(self) -> None:
         if isinstance(self.expression, ModelCall):
@@ -599,7 +600,7 @@ class RegularPredicate:
                 isinstance(v, (str, bool)) for v in values):
             raise CompileError(f"{self.name} compares with a number")
 
-    def evaluate(self, columns) -> pa.ChunkedArray:
+    def evaluate(self, columns, *, qualified: bool = False) -> pa.ChunkedArray:
         """Return a boolean array of the rows the predicate accepts.
 
         A null compared with a literal is neither accepted nor rejected
@@ -608,35 +609,35 @@ class RegularPredicate:
         Args:
             columns: The table, record batch, or rows holding the
                 tested column, read with ``column(name)``.
+            qualified: Whether the columns are named with their table
+                alias, as result rows name them.
 
         Raises:
             CompileError: The literal cannot be compared with the
                 column's values, such as a string against a number
                 column.
         """
-        values = evaluate_expression(self.expression, columns)
+        values = evaluate_expression(self.expression, columns, qualified=qualified)
+        comparison = self.comparison
         try:
-            comparison = self.comparison.removeprefix("not ")
             if comparison == "is null":
-                mask = pc.is_null(values)
-            elif comparison == "is not null":
-                mask = pc.is_valid(values)
-            elif comparison == "in":
-                mask = membership(values, self.value)
-            elif isinstance(self.value, str):
-                mask = COMPARISON_KERNELS[comparison](values, self.value)
-            else:
-                mask = compare_literal(values, comparison, self.value)
-            return pc.invert(mask) if comparison != self.comparison else mask
+                return pc.is_null(values)
+            if comparison == "is not null":
+                return pc.is_valid(values)
+            if comparison == "in":
+                return membership(values, self.value)
+            if isinstance(self.value, str):
+                return COMPARISON_KERNELS[comparison](values, self.value)
+            return compare_literal(values, comparison, self.value)
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
                 pa.ArrowTypeError, TypeError, ValueError, OverflowError) as error:
             raise CompileError(
                 f"{self} cannot be evaluated on a column of type "
                 f"{values.type}: {error}") from error
 
-    def accepts(self, columns) -> pa.Array:
+    def accepts(self, columns, *, qualified: bool = False) -> pa.Array:
         """Return the rows the predicate accepts, with every null rejected."""
-        return accepted_rows(self.evaluate(columns))
+        return accepted_rows(self.evaluate(columns, qualified=qualified))
 
     @property
     def name(self) -> str:
@@ -651,81 +652,168 @@ class RegularPredicate:
         return f"{self.name} {self.comparison} {self.value!r}"
 
 
-BOOLEAN_OPERATORS = ("and", "or", "not")
+class _Connective:
+    """The methods Not, And, and Or share: a node over other conditions.
 
-
-@dataclass(frozen=True)
-class BooleanPredicate:
-    """A NOT, AND, or OR of column tests on one table.
-
-    The scan evaluates it with Arrow's Kleene kernels, so a null
-    follows SQL's three-valued logic: ``NOT NULL`` is null, and a null
-    row is rejected at the end.
-
-    For example, ``NOT (LOWER(u.text) LIKE '%sorry%' AND u.turn > 3)``
-    is ``BooleanPredicate("not", (BooleanPredicate("and", (like,
-    greater)),))``.
+    A condition is a RegularPredicate, or a Not, And, or Or over
+    conditions. Arrow's Kleene kernels evaluate it, so a null follows
+    SQL's three-valued logic: ``NOT NULL`` is null, ``NULL OR TRUE`` is
+    true, and a row whose condition is null is rejected at the end.
     """
 
-    operator: str  # one of BOOLEAN_OPERATORS
-    operands: tuple[RegularPredicate | BooleanPredicate, ...]
-
-    type_name: ClassVar[str] = "quail.boolean_predicate"
+    operands: tuple
+    minimum_operands: ClassVar[int] = 2
 
     def tests(self) -> tuple[RegularPredicate, ...]:
-        """Return the column tests under the operators, in written order."""
+        """Return the column tests under the node, in written order."""
         return tuple(test for operand in self.operands for test in operand.tests())
 
     def aliases(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(test.column.alias for test in self.tests()))
+        return tuple(dict.fromkeys(
+            alias for test in self.tests() for alias in test.aliases()))
 
     def validate(self) -> None:
-        if self.operator not in BOOLEAN_OPERATORS:
-            raise CompileError(f"unsupported boolean operator {self.operator!r}")
-        if self.operator == "not" and len(self.operands) != 1:
-            raise CompileError("NOT takes one test")
-        if self.operator != "not" and len(self.operands) < 2:
-            raise CompileError(f"{self.operator.upper()} takes at least two tests")
+        name = type(self).__name__.upper()
+        if len(self.operands) < self.minimum_operands:
+            raise CompileError(
+                f"{name} takes at least {self.minimum_operands} conditions")
         for operand in self.operands:
-            if not isinstance(operand, (RegularPredicate, BooleanPredicate)):
+            if not isinstance(operand, CONDITION_TYPES):
                 raise CompileError(
-                    f"a boolean predicate combines column tests, got "
-                    f"{type(operand).__name__}")
+                    f"{name} combines conditions, got {type(operand).__name__}")
             if (isinstance(operand, RegularPredicate)
                     and isinstance(operand.expression, ModelCall)):
                 raise CompileError(
-                    "a boolean predicate combines column tests, not AI calls")
+                    f"{name} combines column tests, not AI calls; put the "
+                    f"logic inside one prompt's text")
             operand.validate()
-        if len(self.aliases()) != 1:
-            raise CompileError(
-                f"{self} reads tables {list(self.aliases())}; NOT and OR "
-                f"combine tests of one table")
 
-    def evaluate(self, columns) -> pa.Array | pa.ChunkedArray:
-        """Return a boolean array of the rows the predicate accepts.
+    def evaluate(self, columns, *, qualified: bool = False):
+        """Return a boolean array of the rows the condition accepts.
 
         Args:
             columns: The table, record batch, or rows holding the
                 tested columns, read with ``column(name)``.
+            qualified: Whether the columns are named with their table
+                alias, as result rows name them.
         """
-        masks = [operand.evaluate(columns) for operand in self.operands]
-        if self.operator == "not":
-            return pc.invert(masks[0])
-        kernel = pc.and_kleene if self.operator == "and" else pc.or_kleene
-        mask = masks[0]
-        for other in masks[1:]:
-            mask = kernel(mask, other)
-        return mask
+        return self.combine([operand.evaluate(columns, qualified=qualified)
+                             for operand in self.operands])
 
-    def accepts(self, columns) -> pa.Array:
-        """Return the rows the predicate accepts, with every null rejected."""
-        return accepted_rows(self.evaluate(columns))
+    def accepts(self, columns, *, qualified: bool = False) -> pa.Array:
+        """Return the rows the condition accepts, with every null rejected."""
+        return accepted_rows(self.evaluate(columns, qualified=qualified))
 
     def __str__(self) -> str:
-        if self.operator == "not":
-            return f"NOT ({self.operands[0]})"
-        return f" {self.operator.upper()} ".join(
-            f"({operand})" for operand in self.operands)
+        return f" {type(self).__name__.upper()} ".join(
+            _operand_text(operand) for operand in self.operands)
+
+
+@dataclass(frozen=True)
+class Not(_Connective):
+    """The rows a condition rejects; a null stays null."""
+
+    operand: RegularPredicate | Not | And | Or
+
+    type_name: ClassVar[str] = "quail.not"
+    minimum_operands: ClassVar[int] = 1
+
+    @property
+    def operands(self) -> tuple:
+        return (self.operand,)
+
+    def combine(self, masks):
+        (mask,) = masks
+        return pc.invert(mask)
+
+    def __str__(self) -> str:
+        return f"NOT {_operand_text(self.operand, always=True)}"
+
+
+@dataclass(frozen=True)
+class And(_Connective):
+    """The rows every condition accepts."""
+
+    operands: tuple[RegularPredicate | Not | And | Or, ...]
+
+    type_name: ClassVar[str] = "quail.and"
+
+    def combine(self, masks):
+        return functools.reduce(pc.and_kleene, masks)
+
+
+@dataclass(frozen=True)
+class Or(_Connective):
+    """The rows at least one condition accepts."""
+
+    operands: tuple[RegularPredicate | Not | And | Or, ...]
+
+    type_name: ClassVar[str] = "quail.or"
+
+    def combine(self, masks):
+        return functools.reduce(pc.or_kleene, masks)
+
+
+CONDITION_TYPES = (RegularPredicate, Not, And, Or)
+# the opposite of each comparison whose negation is another comparison
+_NEGATED_COMPARISONS = {"is null": "is not null", "is not null": "is null"}
+
+
+def _operand_text(operand, *, always: bool = False) -> str:
+    """Return a condition as text, in parentheses when it combines others."""
+    text = str(operand)
+    return f"({text})" if always or isinstance(operand, (And, Or)) else text
+
+
+def negate(condition):
+    """Return the condition that accepts the rows the condition rejects.
+
+    NOT moves down to the column tests by De Morgan's laws, two NOTs
+    cancel, and ``NOT x IS NULL`` becomes ``x IS NOT NULL``, as
+    Spark's BooleanSimplification rule does. Every rewrite keeps SQL's
+    three-valued logic.
+    """
+    if isinstance(condition, Not):
+        return condition.operand
+    if isinstance(condition, And):
+        return Or(tuple(negate(operand) for operand in condition.operands))
+    if isinstance(condition, Or):
+        return And(tuple(negate(operand) for operand in condition.operands))
+    if condition.comparison in _NEGATED_COMPARISONS:
+        return RegularPredicate(condition.expression,
+                                _NEGATED_COMPARISONS[condition.comparison])
+    return Not(condition)
+
+
+def normalize(condition):
+    """Return the condition with NOT on column tests only and AND and OR flat.
+
+    For example, ``NOT (a AND (b AND c))`` becomes
+    ``NOT a OR NOT b OR NOT c``.
+    """
+    if isinstance(condition, Not):
+        negated = negate(normalize(condition.operand))
+        return negated if isinstance(negated, Not) else normalize(negated)
+    if isinstance(condition, (And, Or)):
+        kind = type(condition)
+        operands = []
+        for operand in map(normalize, condition.operands):
+            operands.extend(operand.operands if isinstance(operand, kind)
+                            else (operand,))
+        return kind(tuple(operands))
+    return condition
+
+
+def condition_columns(condition) -> tuple[str, ...]:
+    """Return the names of the columns a condition's tests read, unqualified."""
+    return tuple(dict.fromkeys(
+        reference.column for test in condition.tests()
+        for reference in column_references(test.expression)))
+
+
+def conjuncts(condition) -> tuple:
+    """Return the conditions an AND combines, or the condition alone."""
+    return condition.operands if isinstance(condition, And) else (condition,)
 
 
 @dataclass(frozen=True)

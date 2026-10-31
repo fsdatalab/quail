@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
-from quail.logical import BooleanPredicate, RegularPredicate
+from quail.logical import And, Not, Or, RegularPredicate
 
 from ..base import (
     ExecutionLocation,
@@ -31,7 +31,7 @@ class Scan(PhysicalNode):
     total_tokens: int = 0
     shard_ranges: tuple[tuple[int, int], ...] = ()
     shard_token_loads: tuple[int, ...] = ()
-    predicates: tuple[RegularPredicate | BooleanPredicate, ...] = ()
+    predicates: tuple[RegularPredicate | Not | And | Or, ...] = ()
     expected_rows: float | None = None
 
     type_name: ClassVar[str] = "quail.scan"

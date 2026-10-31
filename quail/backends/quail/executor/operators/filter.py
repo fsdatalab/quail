@@ -114,7 +114,7 @@ class ConditionGate(SingleResultPart):
         node = nodes[0]
         source_id = node.inputs[0].source.node_id
         producer = next(part for part in reversed(parts)
-                        if node.column in part.tested_columns)
+                        if set(node.tested_columns) <= set(part.tested_columns))
         source = next(part for part in reversed(parts)
                       if any(member.node_id == source_id for member in part.nodes))
         return cls(node, producer, source)
@@ -131,13 +131,12 @@ class ConditionGate(SingleResultPart):
         # values settle as chunks finish, so each is tested as its
         # document arrives; a repeated value, such as a label, is
         # evaluated once
-        values = self.producer.tested_values(self.node.column,
-                                             [self.position[key[1]]])
-        value = values[0].as_py()
-        token = tuple(sorted(value.items())) if isinstance(value, dict) else value
+        values = {column: self.producer.tested_values(column, [self.position[key[1]]])
+                  for column in self.node.tested_columns}
+        token = tuple(_hashable(found[0].as_py()) for found in values.values())
         if token not in self.accepted:
-            self.accepted[token] = bool(self.node.predicate.accepts(
-                pa.table({self.node.column: values}))[0].as_py())
+            self.accepted[token] = bool(
+                self.node.predicate.accepts(pa.table(values))[0].as_py())
         return None if self.accepted[token] else Stage.DROP
 
     def finish(self, every):
@@ -147,6 +146,11 @@ class ConditionGate(SingleResultPart):
         source = self.node.inputs[0].source
         return filter_scores(self.node,
                              self.source.results()[source.node_id].outputs[source.port])
+
+
+def _hashable(value):
+    """Return a span struct as sorted pairs, so a gate can cache its answer."""
+    return tuple(sorted(value.items())) if isinstance(value, dict) else value
 
 
 def filter_result(node, answers, tokens, document_ids,

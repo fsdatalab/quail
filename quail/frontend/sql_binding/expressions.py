@@ -77,16 +77,15 @@ class ExpressionBinder:
         self.dialect = dialect
         self.scope = Scope(catalog)
         self.tables = self.scope.tables
-        self.regular_predicates: dict[str, list[RegularPredicate]] = {}
         self.document_columns = self.scope.document_columns
         self.filters: dict[str, list[FilterPredicate]] = {}
         self.label_tests: dict[
             str, list[tuple[ModelCall, tuple[str, ...], float | None]]
         ] = {}
-        # alias -> (RegularPredicate on an answer or span, selectivity)
-        self.extract_tests: dict[str, list[tuple[RegularPredicate, float | None]]] = {}
+        # (condition, selectivity) per WHERE or ON term that asks no
+        # model; place_conditions decides where each runs
+        self.conditions: list[tuple] = []
         self.joins: list[JoinSpec] = []
-        self.unnest_tests: list[RegularPredicate] = []
 
     # ---- scope ------------------------------------------------------
 

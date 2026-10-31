@@ -114,7 +114,7 @@ def logical_tree(logical):
                 title += " stop_key=" + ",".join(node.stop_key)
         elif isinstance(node, logical_nodes.Filter):
             title = f"Filter: {node.explain_fields()['condition']}"
-            if not logical_nodes.above_unnest(node.input):
+            if not logical_nodes.reads_projection(node.input):
                 title += f" (selectivity={_selectivity(node.selectivity)})"
         elif isinstance(node, logical_nodes.SemanticJoin):
             title = f"SemanticJoin ({node.semantics})"

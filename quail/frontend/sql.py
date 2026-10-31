@@ -47,7 +47,8 @@ from quail.logical import (
     cte_schema,
     is_score,
 )
-from quail.logical.expressions import aliased_call
+from quail.logical.expressions import SPAN_SUFFIX, aliased_call
+from quail.logical.placement import place_conditions
 
 FORBIDDEN = (
     (exp.Qualify, "QUALIFY"),
@@ -538,6 +539,11 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
                 (column.expression, column.name)
             )
 
+    placed = place_conditions(
+        b.conditions,
+        {(alias, column): name for alias, calls in extracts.items()
+         for _, name in calls for column in (name, name + SPAN_SUFFIX)},
+        b.scope.relations)
     logical = LogicalPlanBuilder()
     for alias, provider in b.tables:
         logical.add_scan(
@@ -545,14 +551,14 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
             provider,
             b.document_columns.get(alias, ""),
             tuple(b.filters.get(alias, ())),
-            regular_predicates=tuple(b.regular_predicates.get(alias, ())),
+            regular_predicates=placed.scans.get(alias, ()),
             labels=tuple(labels.get(alias, {}).items()),
             label_filters=tuple(
                 (labels[alias][call], accepted, selectivity)
                 for call, accepted, selectivity in b.label_tests.get(alias, ())
             ),
             extracts=tuple(extracts.get(alias, ())),
-            extract_filters=tuple(b.extract_tests.get(alias, ())),
+            extract_filters=placed.extracts.get(alias, ()),
             sae_features=tuple(feature_columns.get(alias, ())),
             schema=catalog.get(provider).schema(),
         )
@@ -576,5 +582,5 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
         output=selection.output,
         unnests=tuple(names for names, _, _ in unnests),
         unnest_outer=tuple(outer for _, _, outer in unnests),
-        unnest_tests=tuple(b.unnest_tests),
+        row_tests=placed.rows,
     )

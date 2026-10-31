@@ -750,10 +750,53 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
                .where(~quail.col("lease.ends").like("March%"))
                .select("c.id", "lease"))
     assert str(negated.logical.root.input.condition) == (
-        "c.lease.ends not like 'March%'")
+        "NOT (c.lease.ends like 'March%')")
     result = execute_query(negated, physical_executor=_answers_executor(
         {0: "March 3, 2027", 1: None}))
     assert result.collect().num_rows == 0
+
+
+def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(session):
+    from quail.api.execute import execute_query
+    from quail.logical import Filter as LogicalFilter
+
+    head = (f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
+            f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE ")
+
+    def placed(query):
+        return [(type(node.input).__name__, str(node.condition))
+                for node in query.logical.walk() if isinstance(node, LogicalFilter)]
+
+    def kept(query):
+        result = execute_query(query, physical_executor=_answers_executor(
+            {0: "March 3, 2027", 1: None}))
+        return result.collect().column("c.id").to_pylist()
+
+    built = (session.docs("contracts").alias("c")
+             .ai_extract("c.text", {"ends": QUESTION, "rent": "How much?"},
+                         name="lease")
+             .where((quail.col("lease.ends") == "x")
+                    | quail.col("lease.rent").is_not_null())
+             .select("c.id", "lease"))
+    written = session.sql(head + "lease.ends = 'x' OR lease.rent IS NOT NULL")
+    assert built.logical == written.logical
+    # one extraction's answer and span: the Filter follows the extraction
+    one = session.sql(head + "NOT (lease.ends IS NULL OR lease_span.ends.start < 0)")
+    assert placed(one) == [
+        ("SemanticExtract", "c.lease.ends IS NOT NULL"),
+        ("Filter", "NOT (c.lease.ends_span.start < 0)")]
+    one = session.sql(head + "lease.ends IS NULL OR lease_span.ends.start >= 0")
+    assert placed(one) == [
+        ("SemanticExtract", "c.lease.ends IS NULL OR c.lease.ends_span.start >= 0")]
+    assert kept(one) == [1, 2]
+    # an answer and a source column, or two extractions: the result rows
+    mixed = session.sql(head + "NOT (lease.ends IS NULL AND c.id = 2)")
+    assert placed(mixed) == [
+        ("Project", "lease.ends IS NOT NULL OR NOT (c.id = 2)")]
+    assert kept(mixed) == [1]
+    fields = session.sql(head + "lease.ends = 'x' OR lease.rent IS NOT NULL")
+    assert placed(fields) == [("Project", "lease.ends = 'x' OR lease.rent IS NOT NULL")]
+    assert kept(fields) == [1]
 
 
 def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
@@ -765,7 +808,7 @@ def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
     repeated = sql(head + f"WHERE AI.EXTRACT(c.text, {fields}).ends "
                    f"NOT LIKE 'x%'")
     assert str(repeated.logical.root.input.condition) == (
-        "c.lease.ends not like 'x%'")
+        "NOT (c.lease.ends like 'x%')")
     bq = sql(head + "WHERE REGEXP_CONTAINS(lease.ends, '20..') AND "
              "CONTAINS_SUBSTR(lease.ends, 'MARCH') AND STARTS_WITH(lease.ends, 'M') "
              "AND NOT ENDS_WITH(lease.ends, '.') AND lease.ends NOT LIKE 'x%'",
@@ -777,13 +820,13 @@ def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
                   for test in bq.logical.operators().extract_filters["c"]]
     assert conditions == [
         "c.lease.ends regex '20..'", "c.lease.ends icontains 'MARCH'",
-        "c.lease.ends starts with 'M'", "c.lease.ends not ends with '.'",
-        "c.lease.ends not like 'x%'"]
+        "c.lease.ends starts with 'M'", "NOT (c.lease.ends ends with '.')",
+        "NOT (c.lease.ends like 'x%')"]
     conditions = [str(test.condition)
                   for test in snowflake.logical.operators().extract_filters["c"]]
     assert conditions == [
         "c.lease.ends regex '^(?:20..)$'", "c.lease.ends contains 'MARCH'",
-        "c.lease.ends starts with 'M'", "c.lease.ends not ends with '.'",
+        "c.lease.ends starts with 'M'", "NOT (c.lease.ends ends with '.')",
         "c.lease.ends regex '^(?:M.*)$'"]
     # the answer tests of a joined table ride with its extraction when
     # the planner lifts it above the joins
@@ -817,10 +860,12 @@ def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
             (head + "WHERE HINT(lease.ends IS NULL, {'selectivity': 'x'})",
              "must be a number"),
             (head + "WHERE HINT(lease.ends IS NULL, {'anchor': 'c'})",
-             "unknown option"),
-            (head + "WHERE NOT lease.ends = 'a'", "tests an AI.EXTRACT field")):
+             "unknown option")):
         with pytest.raises(CompileError, match=message):
             sql(bad)
+    with pytest.raises(CompileError, match="runs on the result rows"):
+        sql(head + "WHERE HINT(lease.ends IS NULL OR c.id = 1, "
+            "{'selectivity': 0.5})").logical
     builder = (session.docs("contracts").alias("c")
                .ai_extract("c.text", {"ends": QUESTION}, name="lease"))
     with pytest.raises(CompileError, match="no field 'signer'"):

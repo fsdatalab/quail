@@ -7,7 +7,7 @@ from quail.logical import Result as LogicalResult
 from quail.logical import Unnest as LogicalUnnest
 from quail.logical import Window as LogicalWindow
 from quail.logical import column_name, packed_columns
-from quail.logical.nodes.filter import above_unnest
+from quail.logical.nodes.filter import above_projection
 from quail.physical import (
     Aggregate,
     Filter,
@@ -47,7 +47,7 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
     chain = []
     node = below.input if isinstance(below, LogicalAggregate) else below
     while isinstance(node, (LogicalUnnest, LogicalFilter, LogicalProject)):
-        if isinstance(node, LogicalProject) and not above_unnest(node.input):
+        if isinstance(node, LogicalProject) and not above_projection(node.input):
             break
         chain.insert(0, node)
         node = node.input

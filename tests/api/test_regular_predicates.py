@@ -2,20 +2,25 @@
 
 import pyarrow as pa
 import pytest
+from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
 from quail.catalog.selection import selected_rows
 from quail.frontend.expressions import col, prompt
 from quail.logical import (
+    And,
     ColumnRef,
     CompileError,
     GetField,
+    Not,
+    Or,
     RegularPredicate,
     ScalarFunction,
     Scan,
 )
-from quail.logical.expressions import column_expression
+from quail.logical import Filter as LogicalFilter
+from quail.logical.expressions import column_expression, normalize
 from quail.planner.plan import Refusal
 
 REF = ColumnRef("r", "reviews", "stars")
@@ -112,22 +117,70 @@ def test_regular_predicates_select_documents_before_the_model(session):
 
 
 
-def test_not_and_or_of_column_tests_run_at_the_scan(session):
+def test_not_moves_down_to_the_column_tests_and_keeps_sqls_nulls():
+    stars = pa.table({"stars": [5, None, 2]})
+    high, low = _predicate(">", 4), _predicate("<", 3)
+    written = Not(And((high, Or((low, Not(_predicate("is null")))))))
+    # De Morgan's laws, two NOTs cancel, and NOT IS NULL is IS NOT NULL
+    assert normalize(written) == Or((Not(high), And((Not(low),
+                                                     _predicate("is null")))))
+    assert str(normalize(written)) == (
+        "NOT (r.stars > 4) OR (NOT (r.stars < 3) AND r.stars IS NULL)")
+    # the null row stays null through NOT, AND, and OR, so it is rejected
+    assert written.evaluate(stars).to_pylist() == [False, None, True]
+    assert normalize(written).evaluate(stars).to_pylist() == [False, None, True]
+    assert selected_rows(stars, (written,)).to_pylist() == [2]
+
+
+def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
     # the AI predicates keep r0 (en, 5 stars) and r3 (en, no stars)
     query = session.sql(
         FILTER_SQL + " AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)")
     scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
     assert [str(predicate) for predicate in scan.predicates] == [
-        "NOT ((lower(r.lang) like '%e%') AND (r.stars < 3))"]
-    # r3's NULL < 3 makes the AND and its NOT null, so the scan rejects r3
+        "NOT (lower(r.lang) like '%e%') OR NOT (r.stars < 3)"]
+    # r3's NULL < 3 makes the OR null, so the scan rejects r3
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",)]
     query = session.sql(FILTER_SQL + " AND (r.stars IS NULL OR r.lang = 'de')")
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
-    with pytest.raises(CompileError, match="combine tests of one table"):
-        session.sql("""
-            SELECT r.id, p.asin FROM reviews r JOIN reviews p
-              ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.review))
-            WHERE r.stars > 3 OR p.stars > 3""").logical
+    # NOT (a OR b) is two tests at the scan, as NOT a AND NOT b
+    query = session.sql(
+        "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) "
+        "AND NOT (r.lang = 'fr' OR r.stars IS NULL)")
+    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    assert [str(predicate) for predicate in scan.predicates] == [
+        "NOT (r.lang = 'fr')", "r.stars IS NOT NULL"]
+    built = (session.docs("reviews").alias("r")
+             .ai_filter(prompt("q1: {0}", col("r.review")))
+             .where(~((col("r.lang") == "fr") | col("r.stars").is_null()))
+             .select("r.id"))
+    assert built.logical == query.logical
+    assert _run(built, make_executor(TRUTH)).to_rows() == [
+        ("r0",), ("r1",), ("r4",)]
+
+
+def test_an_or_over_two_tables_runs_on_the_result_rows(session):
+    session.register("products", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["d0", "d1"],
+        "price": [10, 20]}), id_col="asin"))
+    query = session.sql("""
+        SELECT r.id, p.asin FROM reviews r
+        JOIN products p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
+        WHERE r.stars > 4 OR p.price > 15
+        ORDER BY r.id, p.asin
+    """)
+    filters = [node for node in query.logical.walk()
+               if isinstance(node, LogicalFilter)]
+    assert [str(node.condition) for node in filters] == [
+        "r.stars > 4 OR p.price > 15"]
+    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
+    # every pair with p1, and r0 and r5 (5 stars) with p0; r3's null
+    # stars with p1 is NULL OR TRUE, which is true
+    assert result.to_rows() == [
+        ("r0", "p0"), ("r0", "p1"), ("r1", "p1"), ("r2", "p1"), ("r3", "p1"),
+        ("r4", "p1"), ("r5", "p0"), ("r5", "p1")]
+    # the Project read the tested columns; the result does not return them
+    assert result.collect().column_names == ["r.id", "p.asin"]
 
 
 def test_a_document_too_long_for_a_pass_does_not_refuse_the_query():
@@ -291,7 +344,8 @@ def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
 
     assert passes("like", "Acme%") == [True, None, False, False]
     assert passes("ilike", "%ACME%") == [True, None, True, False]
-    assert passes("not ilike", "%ACME%") == [False, None, False, True]
+    assert Not(RegularPredicate(name, "ilike", "%ACME%")).evaluate(
+        names).to_pylist() == [False, None, False, True]
     assert passes("contains", "inc") == [False, None, True, False]
     assert passes("icontains", "CORP") == [True, None, False, False]
     assert passes("starts with", "B") == [False, None, False, True]

@@ -52,6 +52,7 @@ from quail.logical import (
     SemanticSaeFeatures,
     Unnest,
     Window,
+    condition_columns,
 )
 from quail.planner.sol.search import (
     ANSWER_TEST,
@@ -246,7 +247,8 @@ def _refuse_unpriced(logical) -> None:
                     f"filters")
     for tests in operators.extract_filters.values():
         for test in tests:
-            if test.condition.column.column.endswith(SPAN_SUFFIX):
+            if any(column.endswith(SPAN_SUFFIX)
+                   for column in condition_columns(test.condition)):
                 raise NotImplementedError(
                     f"the speed of light estimate does not price the test "
                     f"{test.condition} of an answer's span; the answer "

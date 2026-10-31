@@ -10,8 +10,11 @@ from quail.frontend.expressions import (
     AggSpec,
     AndSpec,
     ColSpec,
+    ConditionSpec,
     EqualsSpec,
     HavingSpec,
+    NotSpec,
+    OrSpec,
     PredicateSpec,
     PromptSpec,
     SortSpec,
@@ -26,6 +29,7 @@ from quail.logical import (
     AggregateCall,
     Aggregation,
     Alias,
+    And,
     ColumnRef,
     CompileError,
     Equality,
@@ -36,6 +40,8 @@ from quail.logical import (
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
+    Not,
+    Or,
     RegularPredicate,
     SortKey,
     WindowCall,
@@ -47,6 +53,7 @@ from quail.logical.expressions import (
     column_name,
     validate_task_description,
 )
+from quail.logical.placement import place_conditions
 
 
 class Query:
@@ -74,10 +81,9 @@ class Query:
         self._features = {}          # name -> Alias of an AI.SAE_FEATURES call
         self._unnests = []           # the list names of each unnest()
         self._unnest_outer = []      # whether each unnest() keeps empty rows
-        self._unnest_tests = []      # RegularPredicate on their fields
-        self._regular_predicates = {}  # alias -> [RegularPredicate]
-        # alias -> [(RegularPredicate on an answer or span, selectivity)]
-        self._extract_filters = {}
+        # (condition, selectivity) per where() test that asks no model;
+        # place_conditions decides where each runs
+        self._conditions = []
         self._limit = None
         self._order = []             # (column or name, descending, nulls_first)
         self._offset = 0
@@ -91,7 +97,7 @@ class Query:
 
     def alias(self, a: str) -> "Query":
         if (self._joins or self._filters or self._label_filters
-                or self._regular_predicates or self._scores or self._extracts
+                or self._conditions or self._scores or self._extracts
                 or self._applies or self._document_columns or self._labels
                 or len(self._tables) != 1):
             raise CompileError("alias() must come right after docs()")
@@ -558,10 +564,7 @@ class Query:
                 self._filters.setdefault(a, []).extend(preds)
             for a, tests in other._label_filters.items():
                 self._label_filters.setdefault(a, []).extend(tests)
-            for a, preds in other._regular_predicates.items():
-                self._regular_predicates.setdefault(a, []).extend(preds)
-            for a, tests in other._extract_filters.items():
-                self._extract_filters.setdefault(a, []).extend(tests)
+            self._conditions.extend(other._conditions)
             for a, applies in other._applies.items():
                 self._applies.setdefault(a, []).extend(applies)
             for name, fn in other._functions.items():
@@ -670,51 +673,62 @@ class Query:
                 characters.
         """
         for group in tests:
-            if not isinstance(group, (PredicateSpec, AndSpec)):
+            if not isinstance(group, ConditionSpec):
                 raise CompileError(
                     f"where() takes tests such as col('r.year') > 2020, "
-                    f"combined with &, got {group!r}")
-            for test in group.tests():
-                self._where_test(test)
+                    f"combined with &, |, and ~, got {group!r}")
+            for part in _and_parts(group):
+                self._where_condition(part)
         return self
 
     filter = where
 
-    def _where_test(self, test: PredicateSpec) -> None:
-        """Route one test to the scan, a label, an answer, or an unnest filter."""
-        spec = test.col
-        if spec.alias is None and spec.column in self._labels:
-            if test.comparison not in ("=", "in"):
-                raise CompileError(
-                    f"a label is tested with == or isin(), got {test.comparison}")
-            values = test.value if test.comparison == "in" else (test.value,)
-            self.label_in(spec.column, values, test.selectivity)
-            return
-        extracted = self._extract_column(spec)
+    def _where_condition(self, spec) -> None:
+        """Bind one where() condition; a test of a label alone filters labels."""
+        if isinstance(spec, PredicateSpec):
+            column = spec.col
+            if column.alias is None and column.column in self._labels:
+                if spec.comparison not in ("=", "in"):
+                    raise CompileError(
+                        f"a label is tested with == or isin(), got "
+                        f"{spec.comparison}")
+                values = spec.value if spec.comparison == "in" else (spec.value,)
+                self.label_in(column.column, values, spec.selectivity)
+                return
+        condition = self._condition(spec)
+        selectivity = spec.selectivity if isinstance(spec, PredicateSpec) else None
+        if selectivity is not None and self._extract_column(spec.col) is None:
+            raise CompileError(
+                f"a hint estimates a test of a label or an answer; "
+                f"{condition} tests a source column, tested at the scan")
+        self._conditions.append((condition, selectivity))
+
+    def _condition(self, spec):
+        """Resolve a condition spec into Not, And, Or, and RegularPredicate."""
+        if isinstance(spec, NotSpec):
+            return Not(self._condition(spec.operand))
+        if isinstance(spec, (AndSpec, OrSpec)):
+            kind = And if isinstance(spec, AndSpec) else Or
+            return kind(tuple(self._condition(part) for part in spec.parts))
+        column = spec.col
+        if column.alias is None and column.column in self._labels:
+            raise CompileError(
+                f"a label is tested alone with == or isin(); &, |, and ~ "
+                f"combine tests of columns, got a test of {column.column!r}")
+        extracted = self._extract_column(column)
         if extracted is not None:
             predicate = RegularPredicate(
-                column_expression(extracted, spec.path, spec.function),
-                test.comparison, test.value)
-            if spec.path:
+                column_expression(extracted, column.path, column.function),
+                spec.comparison, spec.value)
+            if column.path:
                 predicate.validate()
             else:
                 predicate.validate_text_column()
-            self._extract_filters.setdefault(extracted.alias, []).append(
-                (predicate, test.selectivity))
-            return
-        if test.selectivity is not None:
-            raise CompileError(
-                f"a hint estimates a test of a label or an answer; "
-                f"{spec.alias}.{spec.column} is a source column, tested at "
-                f"the scan")
-        predicate = RegularPredicate(self._resolve_value(spec), test.comparison,
-                                     test.value)
+            return predicate
+        predicate = RegularPredicate(self._resolve_value(column), spec.comparison,
+                                     spec.value)
         predicate.validate()
-        if predicate.column.alias in self._scope_.relations:
-            self._unnest_tests.append(predicate)
-        else:
-            self._regular_predicates.setdefault(predicate.column.alias, []).append(
-                predicate)
+        return predicate
 
     def _extract_column(self, spec: ColSpec) -> Optional[ColumnRef]:
         """Resolve a col() naming an extraction's answer or span, or None.
@@ -886,6 +900,12 @@ class Query:
         # a feature call is planned when the query returns its list
         featured = [column for column in columns
                     if aliased_call(column, "features") is not None]
+        placed = place_conditions(
+            self._conditions,
+            {(member.expression.aliases()[0], name): member.name
+             for _, members in self._extracts.values() for member in members
+             for name in (member.name, member.name + SPAN_SUFFIX)},
+            self._scope_.relations)
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(
@@ -897,12 +917,11 @@ class Query:
                 tuple((column.expression, column.name) for column in wanted
                       if column.expression.aliases() == (alias,)),
                 tuple(self._label_filters.get(alias, ())),
-                regular_predicates=tuple(
-                    self._regular_predicates.get(alias, ())),
+                regular_predicates=placed.scans.get(alias, ()),
                 extracts=tuple((column.expression, column.name)
                                for column in extracted
                                if column.expression.aliases() == (alias,)),
-                extract_filters=tuple(self._extract_filters.get(alias, ())),
+                extract_filters=placed.extracts.get(alias, ()),
                 sae_features=tuple((column.expression, column.name)
                                    for column in featured
                                    if column.expression.aliases() == (alias,)),
@@ -934,7 +953,7 @@ class Query:
                                windows=windows, output=output,
                                unnests=tuple(self._unnests),
                                unnest_outer=tuple(self._unnest_outer),
-                               unnest_tests=tuple(self._unnest_tests))
+                               row_tests=placed.rows)
 
     def _project(self, columns: list, c) -> str:
         """Add the column or named output ``c`` to ``columns``; return its name."""
@@ -1037,3 +1056,10 @@ def _sort_keys(keys) -> list:
 def docs(catalog: Catalog, provider: str,
          turn: tuple[str, str] = ("", ""), layout: str = "ai-if") -> Query:
     return Query(catalog, provider, turn, layout)
+
+
+def _and_parts(spec) -> tuple:
+    """Return the conditions a top-level & combines, so each is routed alone."""
+    if isinstance(spec, AndSpec):
+        return tuple(part for found in spec.parts for part in _and_parts(found))
+    return (spec,)
