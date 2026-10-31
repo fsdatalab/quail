@@ -21,8 +21,8 @@ The monitor here is an open-weight model with our own prompt, not the
 Claude monitor of the post, whose prompt is not published. Check its
 flags against labeled examples before relying on its rates.
 
-The flagged rows are saved as flagged.parquet and the report as
-report.json under the output directory.
+Every row's label, label probabilities, and flag score are saved as
+scores.parquet and the report as report.json under the output directory.
 """
 
 from __future__ import annotations
@@ -197,14 +197,12 @@ def verdicts(concerns: pa.Table, threshold: float,
 def run(paths: list[Path], output_dir: Path, *, threshold: float = 0.5,
         penalty_weight: float = 1.0, max_rows: int = MAX_ROWS,
         gpus: int = 1) -> dict:
-    """Screen the datasets, save the flagged rows, and save report.json."""
+    """Screen the datasets, save every row's scores, and save report.json."""
     candidates = load_candidates(paths, max_rows)
     concerns, run_report = screen(candidates, gpus)
-    scores = flag_scores(concerns)
     output_dir.mkdir(parents=True, exist_ok=True)
-    flagged_table = (concerns.append_column("flag_score", scores)
-               .filter(pc.greater(scores, threshold)))
-    pq.write_table(flagged_table, output_dir / "flagged.parquet")
+    pq.write_table(concerns.append_column("flag_score", flag_scores(concerns)),
+                   output_dir / "scores.parquet")
     report = {
         "model": MODEL, "threshold": threshold,
         "datasets": verdicts(concerns, threshold, penalty_weight),
