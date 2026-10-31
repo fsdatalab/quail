@@ -80,7 +80,6 @@ exclude = [
 [tool.uv]
 # uv's Python builds include the C headers Triton needs at startup
 python-preference = "only-managed"
-required-version = "==0.12.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
