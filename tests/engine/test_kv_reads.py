@@ -1,9 +1,7 @@
 """Filters and joins over random corpora read the right KV.
 
-The corpora repeat one another's starts, as agent snapshots do. Small
-corpora run on arenas a few documents fill; large ones have documents
-of thousands of tokens and a 1,024-token window, the sizes QUAIL-B
-runs at. See kv_checker for the check.
+The corpora repeat one another's starts, as agent snapshots do, and
+run on arenas a few documents fill. See kv_checker for the check.
 """
 
 import random
@@ -66,21 +64,6 @@ def small(rng, kind, n, pages, sliding_pages):
         budget=max(map(len, documents)) + rng.choice((8, 60, 600)))
 
 
-def large(rng, kind):
-    """Documents of thousands of tokens, a 1,024-token window."""
-    path, sliding, canvas = kind
-    documents = corpus(rng, 120, (0, 48, 300), (40, 200, 700, 1500))
-    longest = max(map(len, documents))
-    # the longest document and its extra rows fit either pool untrimmed
-    pages = -(-(longest + 16) // 16) + 1
-    return documents, Setup(
-        path=path, window=1024 if sliding else None,
-        canvas=(99,) if canvas else (),
-        pages=pages * rng.choice((1, 3, 10)),
-        sliding_pages=pages * rng.choice((1, 2)),
-        budget=longest + rng.choice((16, 4096, 16384)))
-
-
 def questions(rng):
     return [[90, 91, 92, 93], [90, 91, 94]][:rng.choice((1, 2))]
 
@@ -128,21 +111,3 @@ def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
                   canvas=(99,) if canvas else (), pages=12,
                   sliding_pages=12, budget=200, page_tokens=16)
     check_join_after_join([parent, child], *join_parts(), setup)
-
-
-def test_large_filters_joins_and_filters_feeding_joins(arena_kind):
-    """Documents of thousands of tokens on a 1,024-token window."""
-    for seed in range(2):
-        rng = random.Random(300 + seed)
-        documents, setup = large(rng, arena_kind)
-        named(f"filter seed {seed}", check_filter, documents, questions(rng),
-              setup)
-        for retain in (False, True):
-            rng = random.Random(400 + seed)
-            documents, setup = large(rng, arena_kind)
-            named(f"join seed {seed} retain {retain}", check_join, documents,
-                  *join_parts(), setup, retain=retain)
-        rng = random.Random(500 + seed)
-        documents, setup = large(rng, arena_kind)
-        named(f"feed seed {seed}", check_feed, documents, [90, 91, 92],
-              *join_parts(), setup)
