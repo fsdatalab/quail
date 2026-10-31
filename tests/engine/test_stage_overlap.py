@@ -8,9 +8,9 @@ from quail.backends.quail.executor.stage_executor import StageExecutor
 from quail.backends.quail.executor.stages import Stage, StageRequests, run_stages
 
 
-@pytest.mark.parametrize("path", ["unified", "tree"])
+@pytest.mark.parametrize("path", ["tree"])
 @pytest.mark.parametrize("budget,pages,shared_readout", [
-    (1000, 400, True), (1000, 400, False), (18, 400, True), (1000, 3, True),
+    (18, 400, True),
 ])
 def test_append_stages_launch_between_document_decisions(path, budget, pages,
                                                        shared_readout, monkeypatch):

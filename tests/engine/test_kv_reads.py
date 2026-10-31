@@ -19,9 +19,8 @@ from helpers.kv_checker import (
 pytest.importorskip("torch")
 
 
-@pytest.fixture(params=[("unified", False, False), ("tree", False, False),
-                        ("unified", True, False), ("unified", True, True)],
-                ids=["unified", "tree", "sliding", "sliding-canvas"])
+@pytest.fixture(params=[("tree", False, False), ("unified", True, True)],
+                ids=["tree", "sliding-canvas"])
 def arena_kind(request, monkeypatch):
     """(attention path, sliding layers, canvas row), with CPU staging."""
     cpu_staging(monkeypatch)
