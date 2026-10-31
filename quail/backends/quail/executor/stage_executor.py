@@ -145,9 +145,6 @@ class StageExecutor:
         self.recomputing = {}   # evicted slot -> tokens prefilled since readmission
         # evicted slot -> (its document, the page ids of its shared prefix)
         self.replay_borrow = {}
-        # document -> the retained key keeping its shared prefix for replays
-        self.cached = {}
-        self.num_cached = 0
         # how evicted answers came back: what they were, and what their
         # first replayed chunk read
         self.replay_outcomes = collections.Counter()
@@ -293,6 +290,8 @@ class StageExecutor:
         self.kept_prefix = bool(self.paged and self.admission_mode == "vllm-like"
                                 and not self.arena.num_state_slots
                                 and not self.arena.sliding_layers)
+        if self.kept_prefix:
+            self.arena.accounting.keep_freed_contents()
         self.anchor_parent = np.arange(len(self.keys))
         for anchor, (parent, _) in self.sched.dependencies.items():
             self.anchor_parent[anchor] = parent
@@ -470,7 +469,7 @@ class StageExecutor:
                             if self.arena.is_resident(key)
                             else self.arena.page_cost(capacity - shared))
             if not self.answer_admission.allows(
-                    anchor, self._available_pages(), prompt_pages):
+                    anchor, self.arena.free_pages, prompt_pages):
                 if self.answer_admission.waits():
                     return False
                 # No answer can free pages: start with one page and grow.
@@ -531,7 +530,7 @@ class StageExecutor:
                  else "other answer")
                 + (" with" if pages else " without") + " a shared prefix"] += 1
             self.recomputing[victim] = 0
-            self._cache_prefix(victim)
+            self._label_prefix(victim)
             for detached in decoder.pause(victim, detach=not self.kept_prefix):
                 self.borrowing.chosen.pop(int(detached), None)
             key = self.keys[victim]
@@ -562,17 +561,25 @@ class StageExecutor:
                               int(self.decoder.limits[q]) - written - 1)
                 capacity = max(self.prefix_lengths[a] + self.capacity_extra,
                                length + reserve)
-                lender, kept = self._lender(a)
-                if not self.arena.reserve(
-                        key, self.prefix_lengths[a], capacity_tokens=capacity,
-                        borrow=None if lender is None else (lender, kept),
-                        extension=self._extends):
+                lender, kept, *revived = self._lender(a)
+                if revived:
+                    lender = (("revived prefix", self.keys[a]), 0)
+                    self.arena.revive(lender, revived[0])
+                reserved = self.arena.reserve(
+                    key, self.prefix_lengths[a], capacity_tokens=capacity,
+                    borrow=None if lender is None else (lender, kept),
+                    extension=self._extends)
+                if revived:
+                    # the replay holds the pages now, or they are free again
+                    self.arena.free_key(lender)
+                if not reserved:
                     break       # the pool is short; the rest wait in order
                 decoder.kv.set_pages(a, self.arena.owned_pages(key))
                 start = self.recomputing[a] = kept
                 self.replay_outcomes[
-                    "replay borrowed the prefix" if kept
-                    else "replay found no lender" if self.replay_borrow.get(a)
+                    "replay revived free prefix pages" if revived
+                    else "replay borrowed the prefix" if kept
+                    else "replay found no prefix pages" if self.replay_borrow.get(a)
                     else "replay had no prefix to borrow"] += 1
             end = min(length, start + room)
             replays.append((a, start, end))
@@ -589,9 +596,11 @@ class StageExecutor:
                 continue
             length = (int(self.decoder.origin[a])
                       + int(self.decoder.written[q][a]) + self.arena.page_tokens)
+            # revived pages leave the free list too; borrowed ones were not on it
+            lender, kept, *_ = self._lender(a)
             pages += self.arena.page_cost(
                 max(self.prefix_lengths[a] + self.capacity_extra, length)
-                - self._lender(a)[1])
+                - (kept if lender is not None else 0))
         return pages
 
     def _family(self, a):
@@ -610,69 +619,35 @@ class StageExecutor:
         num_pages = int(max(kv.borrowed[a], kv.lead[a])) // self.arena.page_tokens
         return self.arena.owned_pages(key)[:num_pages]
 
-    def _cache_prefix(self, a):
-        """Keep a's shared prefix for its document's replays when a holds it last.
-
-        A retained key borrows the pages, so they stay valid until the
-        arena needs pages: retained keys are evicted then, and these
-        first, the least recently cached first.
-        """
+    def _label_prefix(self, a):
+        """Label a's shared prefix pages, so a replay can revive them once free."""
         pages = self._shared_pages(a)
-        if not pages or self.arena.page_holds()[pages[-1]] > 1:
-            return
-        family = self._family(a)
-        if not any(int(m) in self.recomputing for m in family):
-            return
-        document = int(family[0])
-        key = (("cached prefix", self.keys[document]), 0)
-        if self.arena.is_resident(key):
-            self.arena.free_key(key)
-        tokens = len(pages) * self.arena.page_tokens
-        self.arena.reserve(key, tokens, capacity_tokens=tokens,
-                           borrow=(self.keys[a], tokens))
-        self.num_cached += 1
-        self.arena.retain(key, tokens, priority=(-1.0, self.num_cached))
-        self.cached[document] = key
-
-    def _drop_cached(self):
-        for key in self.cached.values():
-            if self.arena.is_resident(key):
-                self.arena.free_key(key)
-        self.cached.clear()
-
-    def _available_pages(self):
-        """Free pages, and the pages cached prefixes free when evicted."""
-        if not self.paged:
-            return 1 << 62
-        free = self.arena.free_pages
-        if self.cached:
-            holds = self.arena.page_holds()
-            for key in self.cached.values():
-                if self.arena.is_resident(key):
-                    free += int((holds[self.arena.owned_pages(key)] == 1).sum())
-        return free
+        if pages:
+            self.arena.accounting.label(pages, int(self.anchor_parent[a]))
 
     def _lender(self, a):
-        """Return a resident key holding an evicted answer's shared prefix.
+        """Return where an evicted answer's replay reads its shared prefix.
 
-        The key is another answer of its document, or its cached
-        prefix, whose table starts with the same pages, so their KV is
-        the answer's prefix.
+        Either another answer of its document whose table starts with
+        the same pages, or the free pages that still hold the prefix's
+        first pages, as vLLM's prefix cache finds freed blocks.
 
         Returns:
-            The key and the tokens its pages hold, or (None, 0).
+            A resident key and the tokens its pages hold, (None, tokens,
+            free pages) for pages to revive, or (None, 0).
         """
         saved = self.replay_borrow.get(a)
         if saved is None:
             return None, 0
         document, pages = saved
-        keys = [self.keys[m] for m in self._family(a) if m != a]
-        if document in self.cached:
-            keys.append(self.cached[document])
-        for key in keys:
-            if (self.arena.is_resident(key)
+        for m in self._family(a):
+            key = self.keys[m]
+            if (m != a and self.arena.is_resident(key)
                     and self.arena.owned_pages(key)[:len(pages)] == pages):
                 return key, len(pages) * self.arena.page_tokens
+        run = self.arena.accounting.free_run(document, len(pages))
+        if run:
+            return None, len(run) * self.arena.page_tokens, run
         return None, 0
 
     def _resume(self, a):
@@ -846,7 +821,7 @@ class StageExecutor:
         anchor = settlement.anchor
         if self.on_settled is None or anchor in self.sched.dependencies:
             if self.arena.is_resident(self.keys[anchor]):
-                self._cache_prefix(anchor)
+                self._label_prefix(anchor)
                 self.arena.free_key(self.keys[anchor])
         else:
             self.on_settled(
@@ -1122,7 +1097,8 @@ class StageExecutor:
                                               self._replay_pages(replays))
                 self.admission_s += time.perf_counter() - started
             started = time.perf_counter()
-            groups = self.sched.next_chunk(self._available_pages(), room=room)
+            groups = self.sched.next_chunk(
+                self.arena.free_pages if self.paged else 1 << 62, room=room)
             if self.answer_admission is not None:
                 self.admission_s += time.perf_counter() - started
             if not groups and (decode is not None or replays):
@@ -1168,7 +1144,8 @@ class StageExecutor:
                 self.arena.free_key(self.keys[anchor])
         self.progress.finish(f"{self.label} done", f"{self.tokens:,} fresh tokens")
         self.arena.drop_holds(self.held)
-        self._drop_cached()
+        if self.kept_prefix:
+            self.arena.accounting.forget_freed_contents()
         if self.sched.oversized:
             logger.warning(
                 "%s: skipped %d documents too long for one forward pass; "

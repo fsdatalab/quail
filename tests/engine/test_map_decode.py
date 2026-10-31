@@ -596,14 +596,14 @@ def test_a_replay_reads_the_prefix_its_siblings_still_hold(monkeypatch, path):
 
 def test_a_replay_reads_its_document_prefix_after_its_last_reader_leaves(
         monkeypatch):
-    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.pages import PageArena
 
     rng = np.random.default_rng(5)
     documents = [rng.integers(20, 400, size=32).tolist() for _ in range(4)]
     run = dict(documents=documents, pages=20, stop_every=97)
     cached, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 200, 0,
                                         "tree", **run)
-    monkeypatch.setattr(StageExecutor, "_cache_prefix", lambda self, a: None)
+    monkeypatch.setattr(PageArena, "free_run", lambda self, tag, count: [])
     dropped, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 200, 0,
                                          "tree", **run)
     assert cached["num_evictions"] == dropped["num_evictions"] > 0

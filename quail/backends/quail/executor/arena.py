@@ -267,7 +267,7 @@ class KVArena:
         accounting = self.accounting
         self.memory_trace.append((
             round(time.perf_counter(), 4),
-            accounting.num_pages - len(accounting.free),
+            accounting.num_pages - accounting.free_pages,
             accounting.retained_pages,
             len(accounting.owned),
             accounting.num_slots - len(accounting.free_slots),
@@ -637,6 +637,19 @@ class KVArena:
             return True
         finally:
             self.done_reading(protected)
+
+    def revive(self, key, pages) -> None:
+        """Make free full-pool pages a key again, reading the KV they kept.
+
+        Only an arena without sliding layers revives: a sliding page's
+        window would need its own record.
+        """
+        if self.sliding is not None:
+            raise ValueError("an arena with sliding layers does not revive pages")
+        self.accounting.revive(key, pages)
+        self._base[key] = self.accounting.tokens[key]
+        self._sliding_start[key] = 0
+        self._refresh_rows(key)
 
     def alloc_temporary(self, tokens: int, sliding_tokens: int | None = None):
         key = object()
