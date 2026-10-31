@@ -7,13 +7,10 @@ length, and the join frame is [FRAME] * length.
 
 import random
 from contextlib import nullcontext
-from itertools import takewhile
 from types import SimpleNamespace
 
 import numpy as np
-import pyarrow as pa
 
-import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena
@@ -213,15 +210,6 @@ def fake_pack(torch, arena, specs, **kw):
                            meta=meta)
 
 
-def expected_filter_rows(filter_truth):
-    """Each document's answers up to and including its first FALSE."""
-    rows = {}
-    for d, truth in enumerate(filter_truth):
-        passed = list(takewhile(bool, truth))
-        rows[d] = passed + truth[len(passed):len(passed) + 1]
-    return rows
-
-
 def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
                     filtered=True, semantics="full", keep_kv=False):
     """R's filter sequence into a join with p.
@@ -342,20 +330,6 @@ def run_graph_on_arena(monkeypatch, graph, *, num_documents=14, num_partners=4,
     result = execute_single_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
     return result, model, filter_truth, join_truth
-
-
-def register_claims_evidence(session, claim_words=20, text_words=100):
-    """Four claims and three evidence rows sharing a url column."""
-    session.register("claims", quail.DocumentProvider.from_table(pa.table({
-        "id": [f"c{i}" for i in range(4)],
-        "claim": [f"{i} " + "word " * claim_words for i in range(4)],
-        "url": ["u0", "u1", "u1", "u9"],
-    }), id_col="id"))
-    session.register("evidence", quail.DocumentProvider.from_table(pa.table({
-        "id": [f"e{i}" for i in range(3)],
-        "text": [f"{i} " + "word " * text_words for i in range(3)],
-        "url": ["u1", "u0", "u1"],
-    }), id_col="id"))
 
 
 def keep_even(tables):

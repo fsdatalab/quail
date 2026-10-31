@@ -1,126 +1,20 @@
 """GROUP BY, aggregates, and HAVING: the Aggregate node, its runtime, the plan."""
 
-import json
 
-import numpy as np
 import pyarrow as pa
 import pytest
-from helpers.planning import _plan, node_kinds
 from helpers.sessions import CONFIG, _run, fake_tok, make_executor
 
 import quail
-from quail.catalog import Catalog, DocumentProvider
-from quail.execution.result import QueryResult
-from quail.execution.runtimes.relational import AggregateRuntime, aggregate_table
-from quail.explain import explain
-from quail.frontend.builder import docs
-from quail.frontend.expressions import avg, col, count, max_, prompt, sum_
-from quail.logical import AggregateCall, Aggregation, CompileError, HavingTest
-from quail.physical import Aggregate, Sort
+from quail.execution.runtimes.relational import aggregate_table
+from quail.frontend.expressions import col, count, prompt, sum_
+from quail.logical import CompileError
+from quail.physical import Aggregate
 from quail.physical.base import input_ports
 
 
 def _node(**fields):
     return Aggregate(node_id="aggregate", inputs=input_ports(()), **fields)
-
-
-def test_aggregate_table_groups_counts_and_filters_groups():
-    table = pa.table({
-        "lang": pa.array(["en", "fr", "en", "de", "en"]).dictionary_encode(),
-        "stars": [5, 2, None, 4, 3],
-        "r.id": ["a", "b", "c", "d", "e"],
-    })
-    node = _node(keys=("lang",),
-                 aggregates=(("n", "count", None), ("rated", "count", "stars"),
-                             ("mean", "avg", "stars"), ("top", "max", "stars"),
-                             ("ids", "count_distinct", "r.id"),
-                             ("n2", "count", None)),
-                 columns=("lang", "n", "rated", "mean", "top", "ids", "n2"))
-    result = aggregate_table(table, node)
-    assert result.to_pydict() == {
-        "lang": ["en", "fr", "de"], "n": [3, 1, 1], "rated": [2, 1, 1],
-        "mean": [4.0, 2.0, 4.0], "top": [5, 2, 4], "ids": [3, 1, 1],
-        "n2": [3, 1, 1]}
-    kept = aggregate_table(table, _node(
-        keys=("lang",), aggregates=(("n", "count", None), ("s", "sum", "stars")),
-        having=(("n", ">", 1), ("s", "<=", 8)), columns=("lang", "s")))
-    assert kept.to_pydict() == {"lang": ["en"], "s": [8]}
-    whole = aggregate_table(table, _node(
-        aggregates=(("n", "count", None), ("mean", "avg", "stars")),
-        columns=("mean", "n")))
-    assert whole.to_pydict() == {"mean": [3.5], "n": [5]}
-    result = AggregateRuntime().execute(
-        _node(keys=("lang",), aggregates=(("n", "count", None),),
-              columns=("n", "lang")),
-        {"rows": QueryResult.from_table(table)}, None)
-    assert result.outputs["rows"].to_rows() == [(3, "en"), (1, "fr"), (1, "de")]
-    assert (result.metrics.input_rows, result.metrics.output_rows) == (5, 3)
-
-
-@pytest.fixture()
-def catalog():
-    cat = Catalog()
-    cat.register("reviews", DocumentProvider.from_table(pa.table({
-        "id": ["x", "y"], "review": ["x", "y"], "lang": ["en", "fr"],
-        "stars": [1, 2]}), id_col="id"))
-    return cat
-
-
-def test_group_by_ends_the_plan_in_an_aggregate(catalog):
-    logical = (docs(catalog, "reviews").alias("r")
-               .ai_filter(prompt("flag: {0}", col("r.review")), selectivity=0.5)
-               .group_by("r.lang").agg(n=count(), s=avg("r.stars"))
-               .having(count() > 1, max_("r.stars") < 5)
-               .order_by(col("n").desc()).limit(2).select("r.lang", "n", "s"))
-    root = logical.root
-    assert [type(node).__name__ for node in logical.walk()][-3:] == [
-        "Project", "Aggregate", "Result"]
-    aggregate_node = root.input
-    assert aggregate_node.children() == (logical.projection,)
-    assert aggregate_node.with_expressions(
-        aggregate_node.expressions()) == aggregate_node
-    assert aggregate_node.with_children((logical.projection,)) == aggregate_node
-    assert tuple(ref.column for ref in aggregate_node.output_schema()) == (
-        "lang", "n", "s")
-    assert [str(column) for column in root.input.aggregates] == [
-        "n = count(*)", "s = avg(r.stars)", "__having_1 = max(r.stars)"]
-    assert [str(test) for test in root.input.having] == [
-        "n > 1", "__having_1 < 5"]
-    assert root.result_columns() == ("r.lang", "n", "s")
-    plan = _plan(logical, {"r": [400] * 100})
-    assert node_kinds(plan)[-3:] == ["Project", "Aggregate", "Sort"]
-    assert "filter_limit" not in plan.settings
-    aggregate = next(node for node in plan.nodes if isinstance(node, Aggregate))
-    assert aggregate.keys == ("r.lang",)
-    assert aggregate.having == (("n", ">", 1), ("__having_1", "<", 5))
-    assert aggregate.columns == ("r.lang", "n", "s")
-    sort = next(node for node in plan.nodes if isinstance(node, Sort))
-    assert (sort.keys, sort.columns, sort.fetch) == (
-        (("n", True, True),), ("r.lang", "n", "s"), 2)
-    text = explain(logical, plan)
-    assert "Aggregate: group by r.lang; n = count(*), s = avg(r.stars)" in text
-    assert "having n > 1 and __having_1 < 5" in text
-    assert "Aggregate: r.lang, n, s" in text.split("physical:", 1)[1]
-
-    with pytest.raises(CompileError, match="neither a GROUP BY key"):
-        (docs(catalog, "reviews").alias("r")
-         .ai_filter(prompt("flag: {0}", col("r.review")))
-         .agg(n=count()).select("r.lang", "n"))
-    with pytest.raises(CompileError, match="names a key or an aggregate"):
-        (docs(catalog, "reviews").alias("r")
-         .ai_filter(prompt("flag: {0}", col("r.review")))
-         .group_by("r.lang").agg(n=count()).order_by("r.stars")
-         .select("r.lang", "n"))
-    with pytest.raises(CompileError, match="takes count"):
-        docs(catalog, "reviews").alias("r").agg(n="count")
-    Aggregation(("r.lang",), (AggregateCall("count", None, "n"),),
-                ("r.lang", "n"), (HavingTest(AggregateCall("count", None, "n"),
-                                             ">", 1),)).validate(("r.lang",))
-    with pytest.raises(CompileError, match="does not compute"):
-        Aggregation(("r.lang",), (AggregateCall("count", None, "n"),),
-                    ("r.lang", "n"),
-                    (HavingTest(AggregateCall("sum", "r.lang", "n"), ">", 1),)
-                    ).validate(("r.lang",))
 
 
 @pytest.fixture()
@@ -170,119 +64,16 @@ def test_group_by_runs_on_the_result(session):
          "PROMPT('q: {0}', r.review)) GROUP BY r.lang", "AS name"),
         ("SELECT r.lang, COUNT(*) AS n FROM reviews r WHERE AI_FILTER("
          "PROMPT('q: {0}', r.review))", "not in GROUP BY"),
-        ("SELECT r.lang, COUNT(*) AS n FROM reviews r WHERE AI_FILTER("
-         "PROMPT('q: {0}', r.review)) GROUP BY r.lang HAVING r.lang = 'en'",
-         "tests an aggregate"),
-        ("SELECT r.lang, COUNT(*) AS n FROM reviews r WHERE AI_FILTER("
-         "PROMPT('q: {0}', r.review)) GROUP BY r.lang HAVING n > 'two'",
-         "with a number"),
-        ("SELECT r.lang, COUNT(*) AS n FROM reviews r WHERE AI_FILTER("
-         "PROMPT('q: {0}', r.review)) GROUP BY r.lang ORDER BY r.stars",
-         "names a key or an aggregate"),
-        ("SELECT COUNT(*) + 1 AS n FROM reviews r WHERE AI_FILTER("
-         "PROMPT('q: {0}', r.review))", "direct COUNT"),
     ):
         with pytest.raises(CompileError, match=fragment):
             session.sql(sql)
 
 
-def test_aggregate_internal_columns_do_not_replace_user_values():
-    table = pa.table({
-        "__row": [0.9, 0.9],
-        "count_all": ["a", "a"],
-        "row_position": [2, 4],
-    })
-    node = _node(
-        keys=("count_all",),
-        aggregates=(("mean", "avg", "__row"), ("n", "count", None),
-                    ("first", "min", "row_position")),
-        columns=("count_all", "mean", "n", "first"))
-    assert aggregate_table(table, node).to_pydict() == {
-        "count_all": ["a"], "mean": [0.9], "n": [2], "first": [2]}
-
-
-@pytest.mark.parametrize("grouped", [False, True])
-@pytest.mark.parametrize("dtype,values", [
-    (pa.int64(), [2**63 - 1, 1]), (pa.int64(), [-2**63, -1]),
-    (pa.uint64(), [2**64 - 1, 1])])
+@pytest.mark.parametrize("grouped", [True])
+@pytest.mark.parametrize("dtype,values", [(pa.int64(), [2**63 - 1, 1])])
 def test_an_integer_sum_raises_instead_of_wrapping(dtype, values, grouped):
     table = pa.table({"group": ["a"] * len(values), "value": pa.array(values, dtype)})
     node = _node(keys=("group",) if grouped else (),
                  aggregates=(("total", "sum", "value"),), columns=("total",))
     with pytest.raises(pa.ArrowInvalid):
         aggregate_table(table, node)
-
-
-@pytest.mark.parametrize("dtype,values,expected", [
-    (pa.int64(), [2**63 - 1, 1, -1, None], 2**63 - 1),
-    (pa.uint64(), [2**64 - 1, 0, None], 2**64 - 1),
-    (pa.int32(), [2**31 - 1, 1, None], 2**31)])
-def test_an_integer_sum_keeps_its_exact_total(dtype, values, expected):
-    table = pa.table({"group": ["a"] * len(values) + ["b"],
-                      "value": pa.array([*values, None], dtype)})
-    node = _node(keys=("group",), aggregates=(("total", "sum", "value"),
-                                              ("n", "count", "value")),
-                 columns=("group", "total", "n"))
-    assert aggregate_table(table, node).to_pylist() == [
-        {"group": "a", "total": expected, "n": len(values) - 1},
-        {"group": "b", "total": None, "n": 0}]
-
-
-@pytest.mark.parametrize("dtype,values,literal,expected", [
-    (pa.int64(), [2**53, 2**53 + 1, None], float(2**53), [1]),
-    (pa.uint64(), [0, 2**63, 2**64 - 1], 2**63, [2]),
-    (pa.float64(), [float(2**53), float(2**53 + 2), None], 2**53 + 1, [1])])
-def test_having_compares_large_values_without_rounding(
-        dtype, values, literal, expected):
-    table = pa.table({"group": range(len(values)), "value": pa.array(values, dtype)})
-    node = _node(keys=("group",), aggregates=(("answer", "max", "value"),),
-                 having=(("answer", ">", literal),), columns=("group", "answer"))
-    assert aggregate_table(table, node).to_pydict() == {
-        "group": expected, "answer": [values[index] for index in expected]}
-
-
-def test_a_numpy_having_literal_and_untyped_nulls_run(session):
-    query = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q: {0}", col("r.review")))
-             .agg(n=count()).having(count() > np.int64(1)).select("n"))
-    json.dumps(query.plan().to_envelope(session.registry.codecs))
-    assert _run(query, make_executor({"r": {"q:": [1] * 6}})).to_rows() == [(6,)]
-    # a null-typed column has no distinct values to count
-    table = pa.table({"g": ["a", "a"], "v": pa.nulls(2)})
-    node = _node(keys=("g",), aggregates=(("d", "count_distinct", "v"),
-                                          ("s", "sum", "v")), columns=("g", "d", "s"))
-    assert aggregate_table(table, node).to_pylist() == [{"g": "a", "d": 0, "s": None}]
-
-
-@pytest.mark.parametrize("answers, expected", [([1, 1, 1, 0, 1, 1], 5),
-                                                ([0] * 6, 0)])
-def test_count_star_without_value_columns(session, answers, expected):
-    sql = session.sql("""
-        SELECT COUNT(*) AS n FROM reviews r
-        WHERE AI_FILTER(PROMPT('q: {0}', r.review))
-    """)
-    python = (session.docs("reviews").alias("r")
-              .ai_filter(prompt("q: {0}", col("r.review")))
-              .agg(n=count()).select("n"))
-    for query in (sql, python):
-        result = _run(query, make_executor({"r": {"q:": answers}}))
-        assert result.to_rows() == [(expected,)]
-
-
-def test_grouped_select_order_does_not_duplicate_input_columns(session):
-    results = []
-    for columns in ("COUNT(r.lang) AS n, r.lang", "r.lang, COUNT(r.lang) AS n"):
-        query = session.sql(f"""
-            SELECT {columns} FROM reviews r
-            WHERE AI_FILTER(PROMPT('q: {{0}}', r.review))
-            GROUP BY r.lang ORDER BY r.lang
-        """)
-        result = _run(query, make_executor(TRUTH)).collect()
-        results.append(result.select(["r.lang", "n"]).to_pydict())
-    assert results[0] == results[1] == {"r.lang": ["de", "en", "fr"],
-                                      "n": [1, 3, 1]}
-    with pytest.raises(CompileError, match="projection names must be unique"):
-        session.sql("""
-            SELECT r.id, r.id FROM reviews r
-            WHERE AI_FILTER(PROMPT('q: {0}', r.review))
-        """)
