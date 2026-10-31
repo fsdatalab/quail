@@ -22,13 +22,12 @@ from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
-    AiInference,
     AiJoin,
     AiSaeFeatures,
     AiScore,
     PhysicalGraph,
 )
-from quail.physical.pipelines import build_pipelines
+from quail.physical.pipelines import build_pipelines, resident_inputs
 from quail.planner.operators.classify import classify_scoring
 from quail.planner.statistics.prefixes import key_documents, page_tree
 from quail.planner.statistics.tables import summarize_alias
@@ -79,22 +78,11 @@ class PlanPricer:
         anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
         last_filters = {node.alias: node.node_id for node in graph.nodes
                         if isinstance(node, AiFilter)}
-        # alias -> the document head of the KV a finished pipeline kept
-        retained = {}
+        residents = resident_inputs(graph, pipelines)
         out = {}
         for node in graph.topological_nodes():
             entry = {}
-            resident = (node.node_id in pipelines
-                        and pipelines[node.node_id][0] is not node)
-            if node.node_id in pipelines and not resident:
-                (alias,) = node.document_aliases
-                resident = retained.get(alias) == node.document_head
-                members = pipelines[node.node_id]
-                if any(isinstance(member, (AiFilter, AiJoin, AiInference))
-                       and member.keep_kv for member in members):
-                    retained[alias] = node.document_head
-                else:
-                    retained.pop(alias, None)
+            resident = node.node_id in residents
             if isinstance(node, AiFilter):
                 price = NodePrice(work=self._filter_work(node, resident) * (
                     1 / budgets.parallel_copies(self.context.gpus,

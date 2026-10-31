@@ -16,7 +16,7 @@ from quail.physical import (
     decode_graph,
     encode_graph,
 )
-from quail.physical.pipelines import build_pipelines
+from quail.physical.pipelines import build_pipelines, resident_inputs
 from quail.planner.plan import EngineConfig, Refusal
 
 QUESTION = "When does the lease end?"
@@ -137,6 +137,9 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     assert [member.node_id for member in pipelines[extracts[0].node_id]] == [
         extracts[0].node_id, filters[0].node_id, filters[1].node_id,
         filters[2].node_id, extracts[1].node_id, filters[3].node_id]
+    # the second extraction reads the KV the first left resident
+    residents = resident_inputs(plan.graph, pipelines)
+    assert extracts[1].node_id in residents and extracts[0].node_id not in residents
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
     assert "Filter: c.lease.ends ilike '%march%'" in query.explain()
