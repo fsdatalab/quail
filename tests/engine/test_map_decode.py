@@ -519,9 +519,8 @@ def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
     assert not arena.accounting.owned
 
 
-def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path,
-                            documents=None, pages=20, stop_every=7):
-    """Run maps over twelve documents, by default, in a small pool.
+def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
+    """Run maps over twelve documents in a 20-page pool.
 
     Returns:
         The run's stats and the token model, after checking every answer
@@ -530,16 +529,14 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path,
     cpu_staging(monkeypatch)
     monkeypatch.setenv("QUAIL_ANSWER_ADMISSION", mode)
     monkeypatch.setattr(__name__ + ".next_token", lambda h: (
-        STOP if h % stop_every == 0 else 10 + h % 900))
+        STOP if h % 7 == 0 else 10 + h % 900))
     rng = np.random.default_rng(23)
-    if documents is None:
-        documents = [[20, 21, 22, 23]
-                     + rng.integers(20, 400, size=4 + 4 * (i % 3)).tolist()
-                     for i in range(12)]
+    documents = [[20, 21, 22, 23] + rng.integers(20, 400, size=4 + 4 * (i % 3)).tolist()
+                 for i in range(12)]
     ids = list(range(len(documents)))
     tails = [[500, 501], [600, 601], [650, 651]][:num_maps]
     limits = [24, 20, 28][:num_maps]
-    setup = Setup(path=path, pages=pages, page_tokens=4, budget=budget)
+    setup = Setup(path=path, pages=20, page_tokens=4, budget=budget)
     arena = make_arena(setup)
     model = TokenModel(arena)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=(),
@@ -567,7 +564,7 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path,
     return stats, model
 
 
-@pytest.mark.parametrize("mode", ["vllm-like", "headroom"])
+@pytest.mark.parametrize("mode", ["headroom=0", "headroom"])
 @pytest.mark.parametrize("num_maps", [1, 3])
 @pytest.mark.parametrize("budget,lag", [(20, 0), (200, 3)])
 @pytest.mark.parametrize("path", ["unified", "tree"])
@@ -580,34 +577,6 @@ def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
     assert work["replay_tokens"] == stats["recomputed_tokens"]
     assert work["decode_rows"] == sum(len(slots) for slots in model.decode_slots)
     assert work["sol_s"] > 0
-
-
-@pytest.mark.parametrize("path", ["unified", "tree"])
-def test_a_replay_reads_the_prefix_its_siblings_still_hold(monkeypatch, path):
-    from quail.backends.quail.executor.stage_executor import StageExecutor
-
-    kept, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 20, 0, path)
-    monkeypatch.setattr(StageExecutor, "_lender", lambda self, a: (None, 0))
-    whole, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 20, 0, path)
-    assert kept["num_evictions"] and whole["num_evictions"]
-    assert (kept["recomputed_tokens"] / kept["num_evictions"]
-            < whole["recomputed_tokens"] / whole["num_evictions"])
-
-
-def test_a_replay_reads_its_document_prefix_after_its_last_reader_leaves(
-        monkeypatch):
-    from quail.backends.quail.executor.pages import PageArena
-
-    rng = np.random.default_rng(5)
-    documents = [rng.integers(20, 400, size=32).tolist() for _ in range(4)]
-    run = dict(documents=documents, pages=20, stop_every=97)
-    cached, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 200, 0,
-                                        "tree", **run)
-    monkeypatch.setattr(PageArena, "free_run", lambda self, tag, count: [])
-    dropped, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 200, 0,
-                                         "tree", **run)
-    assert cached["num_evictions"] == dropped["num_evictions"] > 0
-    assert cached["recomputed_tokens"] < dropped["recomputed_tokens"]
 
 
 def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
@@ -625,7 +594,7 @@ def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
     return decoder, admission
 
 
-def test_vllm_like_admission_admits_when_the_prompt_fits_but_waits_for_replays():
+def test_zero_headroom_admits_when_the_prompt_fits_but_waits_for_replays():
     decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
                          [32], [STOP], 4, expected_tokens=[16])
     decoder.answer_slots = {0: np.arange(2)}
@@ -641,21 +610,6 @@ def test_vllm_like_admission_admits_when_the_prompt_fits_but_waits_for_replays()
     assert not admission.allows(1, 4, 4)
     assert admission.allows(1, 8, 4)
     assert admission.waits()
-
-
-def test_vllm_like_admission_evicts_the_answer_started_or_resumed_last():
-    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 3,
-                         [32], [STOP], 4, expected_tokens=[16])
-    decoder.answer_slots = {0: np.arange(3)}
-    admission = HeadroomAdmission(decoder, [8, 8, 8], 6, {}, [0, 0, 0],
-                                  lambda tokens: pages_for(tokens, 4),
-                                  choose_headroom=False)
-    for a in (1, 0, 2):
-        decoder.start(a, 0, 10, [3 * a, 3 * a + 1, 3 * a + 2])
-    assert admission.eviction_order().tolist() == [2, 0, 1]
-    decoder.pause(1)
-    decoder.resume(1, [3, 4, 5])
-    assert admission.eviction_order().tolist() == [1, 2, 0]
 
 
 def test_headroom_grows_with_long_answers_and_shrinks_when_pages_are_valuable():

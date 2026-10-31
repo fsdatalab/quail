@@ -1,7 +1,6 @@
 """Page accounting for the KV arena: a free list, page lists per key, retention."""
 
 import heapq
-from collections import deque
 
 import numpy as np
 
@@ -12,12 +11,6 @@ class PageArena:
     A key may borrow the leading pages of another resident key's
     prefix: it reads them and never writes them. A page returns to
     the free list when its last holder frees it.
-
-    By default the free list is a stack, and a free page's KV is
-    forgotten. keep_freed_contents makes it vLLM's free block queue: a
-    key's pages return last page first, the page freed longest ago is
-    taken first, and a free page keeps a label for the KV it holds
-    until it is taken, so revive can make it a key again.
     """
 
     def __init__(self, num_pages: int, page_tokens: int, num_slots: int = 0):
@@ -31,10 +24,6 @@ class PageArena:
         self.ext_tokens = {}    # key -> tokens that second checkpoint covers
         self.share_slots = {}    # (key, tokens) -> slot of the state there
         self.free = list(range(num_pages - 1, -1, -1))    # stack
-        self.queue = None     # (page, its free count) once freed contents stay
-        self.frees = None    # page id -> times it went free
-        self.labels = {}      # label -> the free page holding that KV
-        self.label_of = {}    # page id -> its labels
         self.owned = {}       # key -> list of page ids it alone writes
         self.borrowed = {}    # key -> leading page ids read from a parent
         self.holds = np.zeros(num_pages, dtype=np.int32)    # page id -> its holders
@@ -70,9 +59,9 @@ class PageArena:
         if len(borrowed) * self.page_tokens > tokens:
             raise ValueError("a key cannot borrow past its own tokens")
         need = self.pages_needed(capacity_tokens) - len(borrowed)
-        if need > self.free_pages:
+        if need > len(self.free):
             return None
-        pages = self._take(need)
+        pages = [self.free.pop() for _ in range(need)]
         self.owned[key] = pages
         self.borrowed[key] = borrowed
         self.tokens[key] = tokens
@@ -115,85 +104,8 @@ class PageArena:
         pages = np.asarray(pages, dtype=np.int64)
         self.holds[pages] -= 1
         freed = pages[self.holds[pages] == 0]
-        if self.queue is None:
-            self.free.extend(freed.tolist())
-            return len(freed)
-        # the last page first, so a prefix's first pages are taken last
-        freed = freed[::-1]
-        self.frees[freed] += 1
-        self.queue.extend(zip(freed.tolist(), self.frees[freed].tolist()))
-        self.num_free += len(freed)
+        self.free.extend(freed.tolist())
         return len(freed)
-
-    def keep_freed_contents(self) -> None:
-        """Take the page freed longest ago first, and keep free pages' labels."""
-        self.frees = np.zeros(self.num_pages, dtype=np.int64)
-        # the stack's next page first
-        self.queue = deque((page, 0) for page in reversed(self.free))
-        self.num_free = len(self.free)
-        self.free = []
-
-    def forget_freed_contents(self) -> None:
-        """Return to a stack of free pages that keeps no labels."""
-        if self.queue is None:
-            return
-        free = list(dict.fromkeys(
-            page for page, freed in self.queue
-            if not self.holds[page] and freed == self.frees[page]))
-        self.free = free[::-1]
-        self.queue = self.frees = None
-        self.labels.clear()
-        self.label_of.clear()
-
-    def _take(self, count: int) -> list:
-        """Remove count free pages; a taken page's KV is overwritten."""
-        if self.queue is None:
-            taken = self.free[len(self.free) - count:][::-1]
-            del self.free[len(self.free) - count:]
-            return taken
-        taken = []
-        while len(taken) < count:
-            page, freed = self.queue.popleft()
-            # an entry is stale once its page was revived or freed again
-            if self.holds[page] or freed != self.frees[page]:
-                continue
-            taken.append(page)
-            for label in self.label_of.pop(page, ()):
-                if self.labels.get(label) == page:
-                    del self.labels[label]
-        self.num_free -= count
-        return taken
-
-    def label(self, pages, tag) -> None:
-        """Name the KV of pages a later key may revive: (tag, page index)."""
-        if self.queue is None:
-            return
-        for index, page in enumerate(pages):
-            self.labels[(tag, index)] = page
-            self.label_of.setdefault(page, set()).add((tag, index))
-
-    def free_run(self, tag, count: int) -> list:
-        """The free pages holding (tag, 0), (tag, 1), ... up to the first gap."""
-        run = []
-        for index in range(count):
-            page = self.labels.get((tag, index))
-            if page is None or self.holds[page]:
-                break
-            run.append(page)
-        return run
-
-    def revive(self, key, pages) -> None:
-        """Make free pages a resident key that holds the KV they kept."""
-        if key in self.owned:
-            raise KeyError(f"{key!r} already resident")
-        pages = list(pages)
-        if self.holds[pages].any():
-            raise ValueError("revived pages must be free")
-        self.owned[key] = pages
-        self.borrowed[key] = []
-        self.tokens[key] = len(pages) * self.page_tokens
-        self.holds[pages] += 1
-        self.num_free -= len(pages)
 
     def alloc_slot(self, key):
         """A checkpoint slot for a resident key, or None when none is free.
@@ -362,18 +274,19 @@ class PageArena:
                 - len(self.owned[key]))
         if need <= 0:
             return 0
-        if need > self.free_pages:
+        if need > len(self.free):
             return None
-        added = self._take(need)
+        added = [self.free.pop() for _ in range(need)]
         self.owned[key].extend(added)
         self.holds[added] += 1
         return need
 
     def grow_pages(self, keys) -> list | None:
         """Give each key one more page; None when the free list is short."""
-        if len(keys) > self.free_pages:
+        if len(keys) > len(self.free):
             return None
-        added = self._take(len(keys))
+        added = self.free[len(self.free) - len(keys):][::-1]
+        del self.free[len(self.free) - len(keys):]
         for key, page in zip(keys, added):
             self.owned[key].append(page)
         self.holds[added] += 1
@@ -396,7 +309,7 @@ class PageArena:
 
     @property
     def free_pages(self) -> int:
-        return len(self.free) if self.queue is None else self.num_free
+        return len(self.free)
 
     @property
     def resident_tokens(self) -> int:

@@ -71,9 +71,6 @@ class MapDecoder:
         self.origin = np.zeros(n, dtype=np.int64)      # its first decode position
         self.fed = np.zeros(n, dtype=np.int64)         # decode rows packed
         self.stopped = np.zeros(n, dtype=bool)         # read a stop token
-        # when each answer last started or resumed, counting from 1
-        self.scheduled = np.zeros(n, dtype=np.int64)
-        self.num_schedules = 0
         self.kv = FullAttentionGroup(n, page_tokens)
         self.device = head.device
         self.next_token = None
@@ -247,49 +244,21 @@ class MapDecoder:
         self.num_streams[document] = 0
         self.drafts[document] = 0
         self.kv.start(document, pages, parent, shared_tokens)
-        self._schedule(document)
 
-    def pause(self, document, detach=True):
-        """Pause an answer and return slots whose shared-page identity changed.
-
-        Args:
-            document: The slot to pause.
-            detach: Whether it and the slots sharing its pages stop
-                reading them as a group. Without it they keep reading
-                together, and the paused slot rejoins on resume.
-        """
+    def pause(self, document):
+        """Pause an answer and return slots whose shared-page identity changed."""
         self.paused[document] = True
-        if not detach:
-            return np.zeros(0, dtype=np.int64)
         return self.kv.detach(document)
 
     def resume(self, document, pages):
         """Continue after prefilling the prompt and every saved answer token."""
         self.kv.set_pages(document, pages)
-        self._schedule(document)
         self.fed[document] = self.written[self.map[document]][document]
         self.paused[document] = False
         self.drafts[document] = 0
 
-    def _schedule(self, document):
-        self.num_schedules += 1
-        self.scheduled[document] = self.num_schedules
-
-    def newest_first(self):
-        """Running slots, the one started or resumed last first, as vLLM preempts."""
-        running = np.flatnonzero((self.map >= 0) & ~self.paused)
-        return running[np.argsort(-self.scheduled[running], kind="stable")]
-
     def eviction_order(self, curves=None, recompute_cost=None, page_holds=None):
-        """Order running slots by page-hold time saved per recomputation second.
-
-        Args:
-            curves: Survival curve per map; None builds them from the answers.
-            recompute_cost: Prices recomputing a prefix; None ranks by
-                expected remaining tokens alone.
-            page_holds: Holders of each page; only pages a slot holds
-                alone count as freed. None counts every page.
-        """
+        """Order running slots by page-hold time saved per recomputation second."""
         from quail.backends.quail.executor.answer_survival import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)

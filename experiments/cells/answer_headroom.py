@@ -14,7 +14,7 @@ modes can be checked for the same output. Results go to
 /results/ablations/answer_headroom/<run id>/<mode>.json.
 
     uv run modal run --detach experiments/cells/answer_headroom.py::compare \
-        --modes vllm-like,headroom 2>&1 | tee "$run_log"
+        --modes headroom=0,headroom 2>&1 | tee "$run_log"
 """
 
 import hashlib
@@ -232,7 +232,7 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
 
 
 @app.local_entrypoint()
-def compare(modes: str = "vllm-like,headroom", queries: str = ",".join(QUERIES),
+def compare(modes: str = "headroom=0,headroom", queries: str = ",".join(QUERIES),
             scale_factor: float = 0.1, num_documents: int = 1000, repeats: int = 2,
             num_contracts: int = 0):
     query_ids = [name for name in queries.split(",") if name]

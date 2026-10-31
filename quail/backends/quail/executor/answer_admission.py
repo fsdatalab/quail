@@ -48,11 +48,9 @@ class HeadroomAdmission:
     cover a new document's prompt and its answers' headroom. The pages
     are counted, not allocated: answers still grow one page at a time.
 
-    With choose_headroom False, admission and eviction follow vLLM: no
-    answer has headroom, so a document is admitted when its prompt fits,
-    and eviction takes the answer started or resumed last. Otherwise
-    each answer's headroom is the page count j minimizing
-    D(j) + P(Y > j) * R(j):
+    With choose_headroom False every headroom is zero, so a document is
+    admitted when its prompt fits. Otherwise each answer's headroom is
+    the page count j minimizing D(j) + P(Y > j) * R(j):
 
     - P(Y > j): the chance the answer needs more than j more pages,
       from the Kaplan-Meier curve of its map and input-length bucket,
@@ -96,7 +94,6 @@ class HeadroomAdmission:
         np.maximum.at(self.lead, self.parent, self.borrowed)
         self.page_cost = page_cost
         self.capacity_extra = capacity_extra
-        self.vllm_like = not choose_headroom
         self.choose_headroom = choose_headroom and decode_cost is not None
         self.chunk_tokens = chunk_tokens
         self.bucket_answers = bucket_answers
@@ -236,8 +233,6 @@ class HeadroomAdmission:
 
     def eviction_order(self, curves=None):
         """Rank running answers for eviction, the first evicted first."""
-        if self.vllm_like:
-            return self.decoder.newest_first()
         policy = None if self.decode_cost is None else self.decode_cost.recompute_cost
         holds = None if self.page_holds is None else self.page_holds()
         return self.decoder.eviction_order(curves, policy, holds)

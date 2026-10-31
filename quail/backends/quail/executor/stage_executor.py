@@ -1,6 +1,5 @@
 """Run one stage list: admission, packed forward chunks, and answer readout."""
 
-import collections
 import json
 import os
 import time
@@ -25,7 +24,7 @@ from quail.backends.quail.executor.stages import (
 from quail.progress import Progress, logger
 
 ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
-ANSWER_ADMISSION_MODES = ("vllm-like", "headroom")
+ANSWER_ADMISSION_MODES = ("headroom=0", "headroom")
 # a directory each headroom run writes a file of its headroom over time
 # and its curves to
 HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
@@ -34,8 +33,7 @@ HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
 def answer_admission_mode() -> str:
     """Return the answer admission QUAIL_ANSWER_ADMISSION names, headroom by default.
 
-    - vllm-like: admit when the prompt fits, with no answer headroom, as
-      vLLM admits a request.
+    - headroom=0: admit when the prompt fits; every answer's headroom is 0.
     - headroom: admit when the prompt and each answer's chosen headroom fit.
 
     Raises:
@@ -143,11 +141,6 @@ class StageExecutor:
         self.waiting_reports = []
         self.answered = set()   # documents whose answers ended first
         self.recomputing = {}   # evicted slot -> tokens prefilled since readmission
-        # evicted slot -> (its document, the page ids of its shared prefix)
-        self.replay_borrow = {}
-        # how evicted answers came back: what they were, and what their
-        # first replayed chunk read
-        self.replay_outcomes = collections.Counter()
         self.num_evictions = 0
         # per pass: its rows, and whether documents were still queued
         self.pass_rows = []
@@ -284,17 +277,6 @@ class StageExecutor:
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         self.admission_mode = answer_admission_mode()
-        # under vllm-like admission a replay reads the prefix its document's
-        # answers share, as vLLM's prefix cache does; a checkpointed or
-        # sliding layer would need state at the borrow point
-        self.kept_prefix = bool(self.paged and self.admission_mode == "vllm-like"
-                                and not self.arena.num_state_slots
-                                and not self.arena.sliding_layers)
-        if self.kept_prefix:
-            self.arena.accounting.keep_freed_contents()
-        self.anchor_parent = np.arange(len(self.keys))
-        for anchor, (parent, _) in self.sched.dependencies.items():
-            self.anchor_parent[anchor] = parent
         if self.answer_maps and self.paged:
             from quail.backends.quail.executor.answer_admission import (
                 HeadroomAdmission,
@@ -522,20 +504,12 @@ class StageExecutor:
             order = (decoder.eviction_order() if self.answer_admission is None
                      else self.answer_admission.eviction_order())
             victim = int(order[0])
-            pages = self._shared_pages(victim)
-            self.replay_borrow[victim] = (
-                (int(self.anchor_parent[victim]), pages) if pages else None)
-            self.replay_outcomes[
-                ("first answer" if self.anchor_parent[victim] == victim
-                 else "other answer")
-                + (" with" if pages else " without") + " a shared prefix"] += 1
-            self.recomputing[victim] = 0
-            self._label_prefix(victim)
-            for detached in decoder.pause(victim, detach=not self.kept_prefix):
+            for detached in decoder.pause(victim):
                 self.borrowing.chosen.pop(int(detached), None)
             key = self.keys[victim]
             self.arena.drop_holds((key,))
             self.arena.free_key(key)
+            self.recomputing[victim] = 0
             self.num_evictions += 1
 
     def _replays(self, room):
@@ -548,7 +522,6 @@ class StageExecutor:
             if decoder.map[a] < 0:
                 # its answer ended in a token that landed after eviction
                 del self.recomputing[a]
-                self.replay_borrow.pop(a, None)
                 continue
             if decoder.inflight[a] or decoder.copy_pending[a]:
                 continue    # its next copy inputs are not ready
@@ -561,26 +534,11 @@ class StageExecutor:
                               int(self.decoder.limits[q]) - written - 1)
                 capacity = max(self.prefix_lengths[a] + self.capacity_extra,
                                length + reserve)
-                lender, kept, *revived = self._lender(a)
-                if revived:
-                    lender = (("revived prefix", self.keys[a]), 0)
-                    self.arena.revive(lender, revived[0])
-                reserved = self.arena.reserve(
-                    key, self.prefix_lengths[a], capacity_tokens=capacity,
-                    borrow=None if lender is None else (lender, kept),
-                    extension=self._extends)
-                if revived:
-                    # the replay holds the pages now, or they are free again
-                    self.arena.free_key(lender)
-                if not reserved:
+                if not self.arena.reserve(
+                        key, self.prefix_lengths[a], capacity_tokens=capacity,
+                        extension=self._extends):
                     break       # the pool is short; the rest wait in order
                 decoder.kv.set_pages(a, self.arena.owned_pages(key))
-                start = self.recomputing[a] = kept
-                self.replay_outcomes[
-                    "replay revived free prefix pages" if revived
-                    else "replay borrowed the prefix" if kept
-                    else "replay found no prefix pages" if self.replay_borrow.get(a)
-                    else "replay had no prefix to borrow"] += 1
             end = min(length, start + room)
             replays.append((a, start, end))
             room -= end - start
@@ -596,74 +554,9 @@ class StageExecutor:
                 continue
             length = (int(self.decoder.origin[a])
                       + int(self.decoder.written[q][a]) + self.arena.page_tokens)
-            # revived pages leave the free list too; borrowed ones were not on it
-            lender, kept, *_ = self._lender(a)
             pages += self.arena.page_cost(
-                max(self.prefix_lengths[a] + self.capacity_extra, length)
-                - (kept if lender is not None else 0))
+                max(self.prefix_lengths[a] + self.capacity_extra, length))
         return pages
-
-    def _family(self, a):
-        """The answers of a's document: its first map's slot, then the rest."""
-        document = self.anchor_parent[a]
-        return np.r_[document, np.flatnonzero(
-            (self.anchor_parent == document) & (np.arange(len(self.keys)) != document))]
-
-    def _shared_pages(self, a):
-        """The page ids of the prefix a's document shares among its answers."""
-        key = self.keys[a]
-        if (not self.kept_prefix or self.decoder is None
-                or not self.arena.is_resident(key)):
-            return []
-        kv = self.decoder.kv
-        num_pages = int(max(kv.borrowed[a], kv.lead[a])) // self.arena.page_tokens
-        return self.arena.owned_pages(key)[:num_pages]
-
-    def _label_prefix(self, a):
-        """Label a's shared prefix pages, so a replay can revive them once free."""
-        pages = self._shared_pages(a)
-        if pages:
-            self.arena.accounting.label(pages, int(self.anchor_parent[a]))
-
-    def _lender(self, a):
-        """Return where an evicted answer's replay reads its shared prefix.
-
-        Either another answer of its document whose table starts with
-        the same pages, or the free pages that still hold the prefix's
-        first pages, as vLLM's prefix cache finds freed blocks.
-
-        Returns:
-            A resident key and the tokens its pages hold, (None, tokens,
-            free pages) for pages to revive, or (None, 0).
-        """
-        saved = self.replay_borrow.get(a)
-        if saved is None:
-            return None, 0
-        document, pages = saved
-        for m in self._family(a):
-            key = self.keys[m]
-            if (m != a and self.arena.is_resident(key)
-                    and self.arena.owned_pages(key)[:len(pages)] == pages):
-                return key, len(pages) * self.arena.page_tokens
-        run = self.arena.accounting.free_run(document, len(pages))
-        if run:
-            return None, len(run) * self.arena.page_tokens, run
-        return None, 0
-
-    def _resume(self, a):
-        """Resume a replayed answer, rejoining its document's shared reads.
-
-        Grouped rows read the shared prefix from one member's table, so
-        an answer that rebuilt the prefix into other pages leaves the
-        group, and so do the answers that borrowed from it.
-        """
-        pages = self.arena.owned_pages(self.keys[a])
-        saved = self.replay_borrow.pop(a, None)
-        if self.kept_prefix and not (
-                saved is not None and pages[:len(saved[1])] == saved[1]):
-            for detached in self.decoder.kv.detach(a):
-                self.borrowing.chosen.pop(int(detached), None)
-        self.decoder.resume(a, pages)
 
     def _build(self, chunk_groups, decode=None, replays=()):
         """Pack a chunk and identify each entry's stage and answer row count.
@@ -805,7 +698,7 @@ class StageExecutor:
             self.decoder.feed(chunk)
             for _, a, j in firsts:
                 if a in resumed:
-                    self._resume(a)
+                    self.decoder.resume(a, self.arena.owned_pages(self.keys[a]))
                     del self.recomputing[a]
                     continue
                 self.answer_stage[a] = j
@@ -821,7 +714,6 @@ class StageExecutor:
         anchor = settlement.anchor
         if self.on_settled is None or anchor in self.sched.dependencies:
             if self.arena.is_resident(self.keys[anchor]):
-                self._label_prefix(anchor)
                 self.arena.free_key(self.keys[anchor])
         else:
             self.on_settled(
@@ -1144,8 +1036,6 @@ class StageExecutor:
                 self.arena.free_key(self.keys[anchor])
         self.progress.finish(f"{self.label} done", f"{self.tokens:,} fresh tokens")
         self.arena.drop_holds(self.held)
-        if self.kept_prefix:
-            self.arena.accounting.forget_freed_contents()
         if self.sched.oversized:
             logger.warning(
                 "%s: skipped %d documents too long for one forward pass; "
@@ -1185,9 +1075,6 @@ class StageExecutor:
         if self.decoder is not None:
             logger.info("%s: %d answer evictions, %d recomputed tokens", self.label,
                         self.num_evictions, self.recomputed_tokens)
-            if self.replay_outcomes:
-                logger.info("%s: evictions and replays %s", self.label,
-                            dict(self.replay_outcomes))
             curves = getattr(self.answer_admission, "bucket_curves", None)
             directory = os.environ.get(HEADROOM_TRACE_ENV)
             if curves and directory:
