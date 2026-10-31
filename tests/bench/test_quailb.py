@@ -1,8 +1,6 @@
 """CPU checks that every QUAIL-B query builds and plans on Quail."""
 
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 from helpers.fakes import letter_tokens
 from helpers.quailb_data import standin_sets
 
@@ -14,8 +12,6 @@ from bench.quailb import (
 )
 from quail.logical import Aggregate
 from quail.planner.plan import EngineConfig, Refusal
-from quail_b import data
-from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
 
 

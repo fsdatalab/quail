@@ -2,6 +2,7 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
 from quail_b import data
 from quail_b.data import ASPECTS, SCENARIOS
 
