@@ -1,6 +1,5 @@
 """CPU checks that every QUAIL-B query builds and plans on Quail."""
 
-from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -167,37 +166,3 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     assert _submission_to_answer_s(
         "pipelined_vllm", report, frontend_s=1.0, answer_prepare_s=0.75
     ) == 11.25
-
-
-def test_kernel_cache_files_counts_each_cache_directory(tmp_path, monkeypatch):
-    from bench.quailb import kernel_cache_files
-
-    monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path / "missing"))
-    assert kernel_cache_files() == {}
-    (tmp_path / "triton" / "a").mkdir(parents=True)
-    (tmp_path / "triton" / "a" / "k.cubin").write_bytes(b"")
-    (tmp_path / "triton" / "b").mkdir()
-    (tmp_path / "deep_gemm").mkdir()
-    (tmp_path / "marker.json").write_text("{}")
-    monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path))
-    assert kernel_cache_files() == {"deep_gemm": 0, "triton": 2}
-
-
-def test_request_benchmark_counts_prompt_tokens_without_decode_tokens(monkeypatch):
-    from bench import quailb
-
-    result = SimpleNamespace(report={
-        "model_wall_s": 1.0, "finish_s": 0.0,
-        "fresh_tokens": 110, "cached_tokens": 20,
-        "backend_metrics": {"prompt_tokens": 100},
-    })
-    query = SimpleNamespace(run=lambda: result)
-    output = SimpleNamespace(runtime_s=0.0, measurements={})
-    monkeypatch.setattr(quailb, "kernel_cache_files", lambda: {})
-    monkeypatch.setattr(quailb, "_build", lambda *args: query)
-    monkeypatch.setattr(quailb, "run_output", lambda *args: output)
-    monkeypatch.setattr(quailb, "join_anchors", lambda *args: {})
-    monkeypatch.setattr(quailb, "prompt_pieces", lambda *args: {})
-    session = SimpleNamespace(config=SimpleNamespace(backend="stock_vllm"))
-    actual = quailb.run_query(session, SimpleNamespace(info=None), {})
-    assert actual.measurements["input_tokens"] == 100

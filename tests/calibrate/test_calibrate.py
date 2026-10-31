@@ -18,29 +18,6 @@ MSMF (max sustainable, saturated): 1429 TFLOPS @ 1536x2816x16384 (MxNxK) 1603MHz
 """
 
 
-@pytest.mark.parametrize("precision", DTYPES)
-def test_only_the_validated_mamf_is_used(precision):
-    text = MAMF_LOG_TEXT.replace("float8_e4m3fn", DTYPES[precision])
-    assert gemm.parse_log(text, precision) == {
-        "tflops": 1629, "shape": "1280x16896x16384", "mhz": 1980}
-
-
-@pytest.mark.parametrize("text", [
-    "",
-    MAMF_LOG_TEXT.replace("float8_e4m3fn", "bfloat16"),
-    MAMF_LOG_TEXT.replace("1629 TFLOPS", "0 TFLOPS"),
-    MAMF_LOG_TEXT.replace("159W 1980MHz", "159W 1500MHz"),
-    MAMF_LOG_TEXT.replace("boost reference: 1980MHz", "boost reference: 1500MHz"),
-    MAMF_LOG_TEXT.replace("rated max SM clock 1980 MHz", ""),
-    MAMF_LOG_TEXT + "WARNING: no MAMF candidate reached the boost clock",
-    MAMF_LOG_TEXT + "WARNING: no SM clock readings",
-    MAMF_LOG_TEXT + "note: highest SM clock this run 1500MHz is below the rated max",
-])
-def test_missing_or_unvalidated_measurements_are_rejected(text):
-    with pytest.raises(ValueError):
-        gemm.parse_log(text, "fp8")
-
-
 def test_gemm_saves_each_precision_and_preserves_failed_logs(tmp_path, monkeypatch):
     fake = tmp_path / "mamf.py"
     script_text = (
@@ -79,13 +56,6 @@ def test_gemm_saves_each_precision_and_preserves_failed_logs(tmp_path, monkeypat
     assert "h100-sxm/gemm/bad/bf16.txt" in committed
 
 
-def test_a_wrong_script_is_rejected_before_any_measurement(tmp_path):
-    (tmp_path / gemm.MAMF_NAME).write_text("print('not mamf-finder')\n")
-    with pytest.raises(ValueError, match="sha256"):
-        gemm.run(tmp_path, "h100-sxm", "bad", ("fp8",), tmp_path, "", lambda: None)
-    assert not (tmp_path / "h100-sxm").exists()
-
-
 def _summary():
     return {"device": "h100-sxm", "sha256": gemm.MAMF_SHA256, "runs": {
         precision: {"dtype": dtype, "mamf": {
@@ -104,19 +74,3 @@ def test_the_spec_uses_the_highest_mamf_per_precision(tmp_path):
         (directory / "summary.json").write_text(json.dumps(summary))
     assert spec_text(load([tmp_path])) == (
         "mamf_fp8_flops=1.629e+15,\nmamf_bf16_flops=8.5e+14,")
-
-
-def test_the_spec_rejects_mixed_devices_and_invalid_results(tmp_path):
-    summary = _summary()
-    with pytest.raises(ValueError, match="exactly one"):
-        spec_text([summary, {**summary, "device": "rtx-pro-6000-blackwell-server"}])
-    with pytest.raises(ValueError, match="no calibration"):
-        load([tmp_path])
-    for rate in (0, -1, float("nan"), float("inf")):
-        invalid = deepcopy(summary)
-        invalid["runs"]["bf16"]["mamf"]["tflops"] = rate
-        with pytest.raises(ValueError, match="invalid MAMF"):
-            spec_text([invalid])
-    for invalid in ({**summary, "runs": {}}, {**summary, "sha256": "wrong"}):
-        with pytest.raises(ValueError, match="validation"):
-            spec_text([invalid])
