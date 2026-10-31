@@ -62,12 +62,8 @@ class HeadroomAdmission:
       SoL seconds one waiting document saves by joining passes that
       run anyway, divided by the pages it takes: its prompt and the
       headroom its answers get at that value.
-    - R(j): the compute seconds of rebuilding the answer's prefix when
-      it outgrows j pages and is evicted. While documents wait, rebuilt
-      tokens take room their prefill would use, so the rebuild costs
-      its compute even in a pass that reading KV bounds. With
-      kept_prefix, the prefix its document's answers share is read
-      again, not rebuilt: another answer or the cache still holds it.
+    - R(j): the SoL seconds rebuilding the answer's whole prefix adds
+      when it outgrows j pages and is evicted.
 
     Every refresh rebuilds the curves of maps whose answers moved, the
     value of a page, and the headroom of running answers, pricing
@@ -77,7 +73,7 @@ class HeadroomAdmission:
 
     def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
                  shared, page_cost, decode_cost=None, page_holds=None, *,
-                 choose_headroom=True, bucket_answers=30, kept_prefix=False,
+                 choose_headroom=True, chunk_tokens=0, bucket_answers=30,
                  trace=False):
         self.decoder = decoder
         self.prefix = np.asarray(prefix_lengths, dtype=np.int64)
@@ -102,8 +98,8 @@ class HeadroomAdmission:
         self.capacity_extra = capacity_extra
         self.vllm_like = not choose_headroom
         self.choose_headroom = choose_headroom and decode_cost is not None
+        self.chunk_tokens = chunk_tokens
         self.bucket_answers = bucket_answers
-        self.kept_prefix = kept_prefix
         self.bucket = input_bucket(self.prefix)
         self.num_buckets = int(self.bucket.max()) + 1 if len(self.prefix) else 1
         limits = decoder.limits
@@ -244,19 +240,8 @@ class HeadroomAdmission:
             return self.decoder.newest_first()
         policy = None if self.decode_cost is None else self.decode_cost.recompute_cost
         holds = None if self.page_holds is None else self.page_holds()
-        kept = None
-        if self.kept_prefix:
-            kept = np.zeros(len(self.prefix), dtype=np.int64)
-            running = self._running()
-            kept[running] = self._kept(running)
-        return self.decoder.eviction_order(curves, policy, holds, kept)
+        return self.decoder.eviction_order(curves, policy, holds)
 
-    def _kept(self, slots):
-        """Tokens of the prefix running slots share with their document's answers."""
-        if not self.kept_prefix:
-            return np.zeros(len(slots), dtype=np.int64)
-        kv = self.decoder.kv
-        return np.maximum(kv.borrowed[slots], kv.lead[slots])
     def _refresh_work(self, slots, contexts, replays):
         cost = self.decode_cost
         self.work = Work()
@@ -326,8 +311,7 @@ class HeadroomAdmission:
             np.r_[decoder.written[maps, running], np.zeros(len(pending), np.int64)],
             np.r_[self._available(running),
                   self.capacity[pending] - self.prompt[pending]],
-            np.r_[decoder.origin[running], self.prompt[pending]],
-            np.r_[self._kept(running), self._candidate_kept(pending)])
+            np.r_[decoder.origin[running], self.prompt[pending]])
         if anchor is not None:
             self._candidate = (anchor, pending, risk[len(running):])
             self.page_value = self._page_value(anchor, risk[len(running):])
@@ -336,12 +320,6 @@ class HeadroomAdmission:
         chosen = self._argmin(risk[:len(running)], self.page_value)
         self.reach[running] = (decoder.kv.num_pages[running] + chosen
                                ) * decoder.page_tokens
-
-    def _candidate_kept(self, slots):
-        """Tokens an admitted answer's replay reads from its parent's pages."""
-        if not self.kept_prefix:
-            return np.zeros_like(slots)
-        return np.maximum(self.borrowed[slots], self.lead[slots])
 
     def _page_value(self, anchor, risk):
         """SoL seconds one page saves a waiting document, 0 when none waits.
@@ -373,7 +351,7 @@ class HeadroomAdmission:
             return np.zeros(0, dtype=np.int64)
         return np.argmin(np.arange(risk.shape[1]) * page_value + risk, axis=1)
 
-    def _risk(self, slots, maps, written, available, origin, kept):
+    def _risk(self, slots, maps, written, available, origin):
         """Return P(Y > j) * R(j) per slot and headroom j, inf past its limit.
 
         Args:
@@ -382,7 +360,6 @@ class HeadroomAdmission:
             written: Tokens each answer has written.
             available: Answer tokens each slot's pages cover.
             origin: Each answer's first decode position.
-            kept: Leading tokens a replay reads instead of recomputing.
         """
         page_tokens = self.decoder.page_tokens
         limits = self.decoder.limits[maps][:, None]
@@ -396,9 +373,8 @@ class HeadroomAdmission:
                             where=survived > 0)
         # an overrun is evicted with the tokens its pages held
         tokens = origin[:, None] + np.minimum(limits, held + pages * page_tokens)
-        policy = self.decode_cost.recompute_cost
-        recover = (policy.prefill_seconds(tokens)
-                   - policy.prefill_seconds(kept)[:, None])
+        recover = self.decode_cost.replay_seconds(self.work, tokens,
+                                                  self.chunk_tokens)
         risk = overrun * recover
         risk[pages > -(-limits // page_tokens)] = np.inf
         return risk
@@ -426,8 +402,7 @@ class HeadroomAdmission:
             slots = self._answer_slots(anchor)
             risk = self._risk(
                 slots, self.slot_map[slots], np.zeros(len(slots), dtype=np.int64),
-                self.capacity[slots] - self.prompt[slots], self.prompt[slots],
-                self._candidate_kept(slots))
+                self.capacity[slots] - self.prompt[slots], self.prompt[slots])
             self._candidate = (anchor, slots, risk)
         return slots, self._argmin(
             risk, self.page_value if page_value is None else page_value)

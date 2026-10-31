@@ -6,7 +6,7 @@ import numpy as np
 
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.retention import RetentionPolicy, coefficients
-from quail.cost.work import Work
+from quail.cost.work import Work, triangle
 
 
 @dataclass(frozen=True)
@@ -66,6 +66,41 @@ class DecodeCost:
                    + policy.pair_seconds * work.pairs
                    + policy.sliding_pair_seconds * work.sliding_pairs)
         return max(memory, compute) if work.tokens else 0.0
+
+    def replay_seconds(self, work, tokens, chunk_tokens=0):
+        """Return the seconds rebuilding prefixes of these lengths adds to a pass.
+
+        Each prefix is rebuilt beside the pass's work: its tokens, causal
+        attention pairs, and KV writes are added to the pass, and the
+        difference in pass time is its cost. A prefix longer than
+        chunk_tokens takes more passes, and each extra pass reads the
+        weights again. chunk_tokens of 0 packs any prefix in one pass.
+
+        Args:
+            work: The pass's work without the rebuild, as one Work total.
+            tokens: Prefix lengths to rebuild, an array.
+            chunk_tokens: The most tokens one pass packs, or 0.
+
+        Returns:
+            Seconds per prefix length, an array.
+        """
+        policy = self.recompute_cost
+        tokens = np.asarray(tokens, dtype=float)
+        memory = (self.weight_seconds + self.kv_seconds * work.kv_read
+                  + self.sliding_kv_seconds * work.sliding_kv_read
+                  + self.state_seconds * (work.state_read + work.state_written))
+        compute = (policy.linear_seconds * work.tokens
+                   + policy.pair_seconds * work.pairs
+                   + policy.sliding_pair_seconds * work.sliding_pairs)
+        added = (policy.linear_seconds * tokens
+                 + policy.pair_seconds * triangle(tokens)
+                 + policy.sliding_pair_seconds
+                 * triangle(tokens, policy.sliding_window))
+        before = max(memory, compute) if work.tokens else 0.0
+        extra = (np.maximum(0.0, np.ceil(tokens / chunk_tokens) - 1)
+                 if chunk_tokens else 0.0)
+        return (np.maximum(memory, compute + added) - before
+                + extra * self.weight_seconds)
 
     def gain(self, work, added, expected_tokens):
         """Return saved seconds from admitting a group of answer rows now."""

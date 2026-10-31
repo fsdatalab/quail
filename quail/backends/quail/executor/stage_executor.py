@@ -283,9 +283,11 @@ class StageExecutor:
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         self.admission_mode = answer_admission_mode()
-        # a replay reads a borrowed prefix another key still holds; a
-        # checkpointed or sliding layer would need state at the borrow point
-        self.kept_prefix = bool(self.paged and not self.arena.num_state_slots
+        # under vllm-like admission a replay reads the prefix its document's
+        # answers share, as vLLM's prefix cache does; a checkpointed or
+        # sliding layer would need state at the borrow point
+        self.kept_prefix = bool(self.paged and self.admission_mode == "vllm-like"
+                                and not self.arena.num_state_slots
                                 and not self.arena.sliding_layers)
         self.anchor_parent = np.arange(len(self.keys))
         for anchor, (parent, _) in self.sched.dependencies.items():
@@ -300,7 +302,7 @@ class StageExecutor:
                 self.sched.dependencies, self.borrowing.tree_shared,
                 self.arena.page_cost, decode_cost, self.arena.page_holds,
                 choose_headroom=self.admission_mode == "headroom",
-                kept_prefix=self.kept_prefix,
+                chunk_tokens=self.sched.chunk_budget,
                 trace=bool(os.environ.get(HEADROOM_TRACE_ENV)))
         # a Gated DeltaNet layer starts a borrower from the parent's state
         # at the shared point, so a parent writes one slot per point

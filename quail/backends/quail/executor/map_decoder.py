@@ -278,8 +278,7 @@ class MapDecoder:
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         return running[np.argsort(-self.scheduled[running], kind="stable")]
 
-    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None,
-                       kept=None):
+    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None):
         """Order running slots by page-hold time saved per recomputation second.
 
         Args:
@@ -288,8 +287,6 @@ class MapDecoder:
                 expected remaining tokens alone.
             page_holds: Holders of each page; only pages a slot holds
                 alone count as freed. None counts every page.
-            kept: Per slot, leading tokens a replay reads from pages
-                another holder keeps instead of recomputing them.
         """
         from quail.backends.quail.executor.answer_survival import remaining_tokens
 
@@ -312,8 +309,6 @@ class MapDecoder:
                              & (page_holds[table] == 1)).sum(axis=1)
             seconds = recompute_cost.prefill_seconds(
                 self.origin[running] + written[running])
-            if kept is not None:
-                seconds = seconds - recompute_cost.prefill_seconds(kept[running])
             scores[running] *= np.divide(num_pages, seconds,
                                          out=np.zeros(len(running)), where=seconds > 0)
         return running[np.lexsort((running, written[running], -scores[running]))]

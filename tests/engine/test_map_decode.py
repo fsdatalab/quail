@@ -27,6 +27,7 @@ from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
 from quail.cost.decode import DecodeCost
+from quail.cost.work import Work
 from quail.specs import DEVICES, QWEN3_4B_FP8
 
 VOCABULARY = 1024
@@ -729,6 +730,17 @@ def test_pages_have_value_to_waiting_documents_before_any_answer_runs():
     admission.refresh(np.array([-1, -1, -1, -1]))
     assert admission.work.tokens == 0
     assert admission.page_value > 0
+
+
+def test_replay_seconds_charge_extra_passes_and_spare_compute():
+    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
+    decode = cost.row_work(np.full(8, 512.0)).total()
+    small, large = cost.replay_seconds(decode, np.array([16, 8192]))
+    assert 0 <= small < large
+    split = cost.replay_seconds(decode, np.array([8192]), chunk_tokens=2048)[0]
+    assert split == pytest.approx(large + 3 * cost.weight_seconds)
+    alone = cost.replay_seconds(Work(), np.array([16]))[0]
+    assert alone >= cost.weight_seconds > small
 
 
 def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():
