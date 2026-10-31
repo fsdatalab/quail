@@ -1,0 +1,31 @@
+logical:
+  Sort: contracts DESC NULLS LAST, governing_law_state ASC NULLS LAST
+    Aggregate: group by governing_law_state; contracts = count(*)
+      Project: governing_law_state
+        SemanticClassify: governing_law_state
+          PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the contract above which state's or country's law governs its interpretation.", c.text) labels=['New York', 'California', 'Delaware', 'Texas', 'Florida', 'another state or country', 'not stated']
+          SemanticFilter
+            PROMPT('DOCUMENT:\n{0}\n\nIs there a requirement for insurance that must be maintained by one party for the benefit of the counterparty?', c.text) (selectivity=26.3%)
+            Scan contracts as c [text]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                          est. rows   est. pass   est. time
+  Sort: contracts DESC NULLS LAST, governing_law_state ASC NULLS LAST
+    Aggregate: governing_law_state, contracts
+      group by governing_law_state
+      contracts = count(*)
+      Project: governing_law_state
+        AiClassify: governing_law_state over c                                                      3.06 ms
+          rule=trie_decode, labels=7, label tokens=72
+          AiFilter: c                                                           1.6                 9.03 ms
+            KV rewind=on
+            predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs there a requir…')           6       26.3%
+            Scan contracts as c                                                   6
+              tokens=96, mean_document_tokens=16
+  Pipeline on c: ai_filter:c -> ai-classify:0 (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

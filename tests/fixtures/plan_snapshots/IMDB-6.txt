@@ -1,0 +1,25 @@
+logical:
+  Project: r.id
+    SemanticFilter
+      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above whether it mentions at least one positive aspect of the movie.\n\nInstruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body) (selectivity=80.1%)
+      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above whether it discusses the ending of the movie.\n\nInstruction: answer TRUE if the review discusses the ending of the movie, FALSE otherwise.', r.body) (selectivity=24.4%)
+      Scan reviews as r [body, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                      est. rows   est. pass   est. time
+  Project: r.id                                                             2.3
+    AiFilter: r                                                             2.3                  4.3 ms
+      KV rewind=on
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           2.9       80.1%
+      AiFilter: r                                                           2.9                 21.5 ms
+        KV rewind=on
+        predicate 2  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')          12       24.4%
+        Scan reviews as r                                                    12
+          tokens=158, mean_document_tokens=13.2
+  Pipeline on r: ai_filter:r -> ai_filter:r:0 (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

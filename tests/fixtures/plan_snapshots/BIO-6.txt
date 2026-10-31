@@ -1,0 +1,41 @@
+logical:
+  Project: r.id, m.id
+    Filter: m.organ_class IN ('cardiac disorders', 'vascular disorders') (selectivity=9.67%)
+      SemanticClassify: organ_class
+        PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the reaction above which MedDRA system organ class it belongs to.', m.term) labels=['cardiac disorders', 'vascular disorders', 'nervous system disorders', 'psychiatric disorders', 'eye disorders', 'ear and labyrinth disorders', 'respiratory, thoracic and mediastinal disorders', 'gastrointestinal disorders', 'hepatobiliary disorders', 'renal and urinary disorders', 'skin and subcutaneous tissue disorders', 'musculoskeletal and connective tissue disorders', 'blood and lymphatic system disorders', 'immune system disorders', 'endocrine disorders', 'metabolism and nutrition disorders', 'infections and infestations', 'neoplasms benign, malignant and unspecified', 'injury, poisoning and procedural complications', 'investigations', 'general disorders and administration site conditions', 'reproductive system and breast disorders', 'pregnancy, puerperium and perinatal conditions', 'congenital, familial and genetic disorders', 'surgical and medical procedures', 'social circumstances']
+        SemanticJoin (full)
+          PROMPT('Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?', r.report, m.term) (selectivity=3.4%)
+          Join
+            cross
+            SemanticFilter
+              PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the report above whether it describes a serious or life-threatening adverse event.\n\nInstruction: answer TRUE if the report describes a serious or life-threatening adverse event, FALSE otherwise.', r.report) (selectivity=63.8%)
+              Scan reports as r [report, id]
+            Scan terms as m [term, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                                               est. rows   est. pass   est. time
+  Project: r.id, m.id
+    Recombine: r, m
+      AiJoin: anchor=r                                                                                                   15.3 ms
+        KV: anchor=from filters, retain after join=no
+        join 1 full (r, m)  PROMPT('Does the medical report in DOCUM…')                             30.6        3.4%
+        AiFilter: r                                                                                  5.1                 15.9 ms
+          KV rewind=on
+          expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+          predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  8       63.8%
+          Scan reports as r                                                                            8
+            tokens=128, mean_document_tokens=16
+        Scan terms as m [1]                                                                            6
+          tokens=60, mean_document_tokens=10
+      Filter: m.organ_class IN ('cardiac disorders', 'vascular disorders')
+        AiClassify: organ_class over m                                                                                   6.11 ms
+          rule=trie_decode, labels=26, label tokens=801
+          Reuse [1]
+  Pipeline on r: ai_filter:r -> ai_join:r (each document runs every operator with its KV resident)
+  Pipeline on m: ai-classify:0 -> filter:m:0 (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

@@ -1,0 +1,25 @@
+logical:
+  Project: t.id, progress
+    SemanticClassify: progress
+      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above how far the agent has gotten so far.', t.trace) labels=['has not located the relevant code', 'located the relevant code', 'changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails']
+      SemanticFilter
+        PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above whether the agent recovered after pursuing an approach that did not work. Recovery means the agent recognized or moved past the unsuccessful approach and then made useful progress with a different or corrected approach.\n\nInstruction: answer TRUE if the trace shows the agent recovering after an unsuccessful approach, FALSE otherwise.', t.trace) (selectivity=32.2%)
+        Scan agent_traces as t [trace, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                      est. rows   est. pass   est. time
+  Project: t.id, progress
+    AiClassify: progress over t                                                                  6.5 ms
+      rule=trie_decode, labels=5, label tokens=146
+      AiFilter: t                                                           1.9                 16.5 ms
+        KV rewind=on
+        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       32.2%
+        Scan agent_traces as t                                                6
+          tokens=78, mean_document_tokens=13
+  Pipeline on t: ai_filter:t -> ai-classify:0 (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

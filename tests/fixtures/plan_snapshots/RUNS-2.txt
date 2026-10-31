@@ -1,0 +1,25 @@
+logical:
+  Sort: n DESC NULLS LAST, strategy ASC NULLS LAST
+    Aggregate: group by strategy; n = count(*), resolved_share = avg(r.resolved)
+      Project: strategy, r.resolved
+        SemanticClassify: strategy
+          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent run above what kind of change the agent made to fix the issue.', r.transcript) labels=['targeted fix', 'broad rewrite', 'special case', 'new feature', 'tests or config only', 'no change']
+          Scan issue_runs as r [transcript, resolved]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                        est. rows   est. time
+  Sort: n DESC NULLS LAST, strategy ASC NULLS LAST
+    Aggregate: strategy, n, resolved_share
+      group by strategy
+      n = count(*), resolved_share = avg(r.resolved)
+      Project: strategy, r.resolved
+        AiClassify: strategy over r                                   19.3 ms
+          rule=trie_decode, labels=6, label tokens=77
+          Scan issue_runs as r                                  6
+            tokens=138, mean_document_tokens=23
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes
