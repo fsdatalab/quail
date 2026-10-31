@@ -290,6 +290,25 @@ def test_vllm_loads_a_decision2_backbone_in_place(tmp_path):
     assert model_loading.engine_args(plain) == {"model": str(plain)}
 
 
+def test_a_decision2_backbone_loads_past_a_tied_lm_head():
+    import torch
+
+    from quail.backends.quail.executor.models.decision2_vllm import (
+        Decision2ForCausalLM,
+    )
+
+    model = Decision2ForCausalLM.__new__(Decision2ForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(tie_word_embeddings=True)
+    model.model = torch.nn.Module()
+    model.model.norm = torch.nn.Linear(2, 2, bias=False)
+    weight = torch.ones(2, 2)
+    loaded = model.load_weights([("norm.weight", weight),
+                                 ("lm_head.weight", torch.zeros(2, 2))])
+    assert loaded == {"model.norm.weight"}
+    assert torch.equal(model.model.norm.weight, weight)
+
+
 def test_a_decision_classification_is_reestimated(session):
     from quail.planner.operators.classify import ClassifyScoring
 

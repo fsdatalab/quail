@@ -19,7 +19,8 @@ class Decision2ForCausalLM(Qwen3ForCausalLM):
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"": "model."})
 
     def load_weights(self, weights):
+        # the loader matches names after hf_to_vllm_mapper adds "model."
         loader = AutoWeightsLoader(
-            self, skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings
-                                 else None))
+            self, ignore_unexpected_prefixes=(
+                ["model.lm_head."] if self.config.tie_word_embeddings else None))
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
