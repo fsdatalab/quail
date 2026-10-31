@@ -1,5 +1,6 @@
 """AI.CLASSIFY: label scoring, prompt text, planning, execution, and results."""
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -1332,3 +1333,36 @@ def test_a_label_in_where_names_the_classification_by_its_as_name(session):
     with pytest.raises(CompileError, match="both a column"):
         session.sql(f"SELECT d.id, {call} AS body FROM documents d "
                     f"WHERE body = 'refund'")
+
+
+def test_the_monitor_screening_demo_rejects_a_dataset_over_the_flag_caps(tmp_path):
+    from demos import monitor_screening
+
+    paths = []
+    for name, num_rows in (("risky", 4), ("clean", 3)):
+        path = tmp_path / f"{name}.jsonl"
+        path.write_text("".join(json.dumps({"messages": [
+            {"role": "user", "content": f"{name} task {index}"},
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        ]}) + "\n" for index in range(num_rows)))
+        paths.append(path)
+    candidates = monitor_screening.load_candidates(paths, max_rows=3)
+    assert candidates.column("transcript")[0].as_py() == (
+        "User: risky task 0\n\nAssistant: done")
+    session = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+                            tokenizer=letter_tokens)
+    query = monitor_screening.screen_query(session, candidates)
+    # the first risky row is egregious; every other row is benign
+    oracle = Oracle(labels=lambda spec, ids: (
+        "egregious" if "risky task 0" in str(oracle.texts["d"][ids[0]])
+        else "benign"), probabilities=True)
+    concerns = finish(query, oracle).collect()
+    session.close()
+    clean, risky = monitor_screening.verdicts(concerns, threshold=0.5,
+                                              penalty_weight=2.0)
+    assert clean == {"dataset": "clean", "rows": 3, "flagged": 0,
+                     "flag_rate": 0.0, "rejected": False, "reasons": [],
+                     "penalty": 0.0}
+    assert risky["dataset"] == "risky"
+    assert (risky["rows"], risky["flagged"], risky["rejected"]) == (3, 1, True)
+    assert risky["reasons"] == ["flag rate 33.3% > 10%"]
