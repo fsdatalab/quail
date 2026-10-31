@@ -124,10 +124,12 @@ def test_planner_and_estimate_price_hybrid_queries_and_prefix_reuse(tmp_path):
         pre = quail.lower_prompt(query.logical.operators().filters["r"][0].prompt,
                                  session.tokenizer).preamble_tokens
     assert exact.join_stages[0]["anchor"] == "r"
-    # the plan credits the shared prefix as the estimate does; the two
-    # differ only in packing the filters' and the join's passes
-    assert shared.seconds < exact.seconds
-    assert planned.estimated_seconds == pytest.approx(shared.seconds, rel=0.05)
+    # the plan credits the shared prefix as the estimate does, and prices
+    # it by component as latency does; the two differ only in packing the
+    # filters' and the join's passes
+    assert shared.latency.seconds < exact.latency.seconds
+    assert planned.estimated_seconds == pytest.approx(shared.latency.seconds,
+                                                      rel=0.05)
     assert exact.work.sliding_pairs < exact.work.pairs
     assert exact.work.sliding_kv_read < exact.work.kv_read
     assert exact.work.pairs - shared.work.pairs == sum(range(1, pre + 1031))

@@ -73,7 +73,13 @@ _PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, SemanticExtract,
 
 @dataclass(frozen=True)
 class SpeedOfLightEstimate:
-    """The ideal time of one query and how it was reached."""
+    """The ideal time of one query and how it was reached.
+
+    seconds is a lower bound on any schedule of the work: the larger of
+    its summed memory time, with the weights read once per pass, and its
+    summed compute time, at the device's peak rates. latency prices the
+    same work by model component.
+    """
 
     model: str
     device: str
@@ -81,6 +87,7 @@ class SpeedOfLightEstimate:
     credit_shared_prefixes: bool
     work: Work
     latency: SpeedOfLight
+    seconds: float
     usd_per_hour: float
     alias_columns: dict[str, str]
     documents_by_alias: dict[str, int]
@@ -90,10 +97,6 @@ class SpeedOfLightEstimate:
     relation_order: tuple[str, ...]
     cached_prefixes: tuple[str, ...]
     search: dict = field(default_factory=dict)
-
-    @property
-    def seconds(self) -> float:
-        return self.latency.seconds
 
     @property
     def fresh_tokens(self) -> float:
@@ -177,7 +180,7 @@ class SpeedOfLightEstimate:
             "device": self.device,
             "chunk_tokens": self.chunk_tokens,
             "credit_shared_prefixes": self.credit_shared_prefixes,
-            "sol_s": latency.seconds,
+            "sol_s": self.seconds,
             "bound_by": latency.bound_by,
             "t_compute": latency.compute,
             "t_memory": latency.memory,
@@ -359,6 +362,7 @@ def speed_of_light_estimate(
         credit_shared_prefixes=credit_shared_prefixes,
         work=best.work,
         latency=search.latency(best),
+        seconds=search.seconds(best),
         usd_per_hour=device.usd_per_hour,
         alias_columns={
             alias: data.column for alias, data in search.aliases.items()},

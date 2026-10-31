@@ -12,6 +12,7 @@ from typing import Callable, Mapping
 import pyarrow as pa
 
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
+from quail.cost.decode import DecodeCost
 from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sae_features import sae_encoded_tokens
@@ -135,6 +136,7 @@ class Search:
         self.label = label
         self.model = model
         self.device = device
+        self.decode_cost = DecodeCost.from_specs(model, device)
         self.chunk_tokens = chunk_tokens
         self.credit_shared = credit_shared
         # a diffusion model answers on canvas rows appended to every
@@ -642,6 +644,11 @@ class Search:
                               self.chunk_tokens, rows=rows,
                               min_passes=self.decode_passes)
 
+    def seconds(self, candidate) -> float:
+        """The fewest seconds any schedule of a candidate's work can take."""
+        return self.decode_cost.lower_bound_seconds(
+            candidate.work, self.latency(candidate).passes)
+
     def search_joins_sol(self, base_rows, resident, base_work):
         """Search every feasible left deep plan over the exact filtered rows.
 
@@ -745,7 +752,7 @@ class Search:
         best = min(
             search.candidates,
             key=lambda candidate: (
-                self.latency(candidate).seconds,
+                self.seconds(candidate),
                 candidate.work.tokens,
                 candidate.work.pairs,
                 candidate.work.kv_written,
