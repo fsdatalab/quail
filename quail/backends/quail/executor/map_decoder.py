@@ -249,21 +249,23 @@ class MapDecoder:
         self.kv.start(document, pages, parent, shared_tokens)
         self._schedule(document)
 
-    def pause(self, document):
-        """Pause an answer and return slots whose shared-page identity changed."""
-        self.paused[document] = True
-        return self.kv.detach(document)
-
-    def resume(self, document, pages, parent=None, shared_tokens=0):
-        """Continue after prefilling the prompt and every saved answer token.
+    def pause(self, document, detach=True):
+        """Pause an answer and return slots whose shared-page identity changed.
 
         Args:
-            document: The paused slot.
-            pages: Its page ids in logical order.
-            parent: The slot whose whole pages it borrows again, or None.
-            shared_tokens: The tokens it borrows from the parent.
+            document: The slot to pause.
+            detach: Whether it and the slots sharing its pages stop
+                reading them as a group. Without it they keep reading
+                together, and the paused slot rejoins on resume.
         """
-        self.kv.start(document, pages, parent, shared_tokens)
+        self.paused[document] = True
+        if not detach:
+            return np.zeros(0, dtype=np.int64)
+        return self.kv.detach(document)
+
+    def resume(self, document, pages):
+        """Continue after prefilling the prompt and every saved answer token."""
+        self.kv.set_pages(document, pages)
         self._schedule(document)
         self.fed[document] = self.written[self.map[document]][document]
         self.paused[document] = False

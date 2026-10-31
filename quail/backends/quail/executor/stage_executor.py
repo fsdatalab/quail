@@ -524,7 +524,7 @@ class StageExecutor:
                 (int(self.anchor_parent[victim]), pages) if pages else None)
             self.recomputing[victim] = 0
             self._cache_prefix(victim)
-            for detached in decoder.pause(victim):
+            for detached in decoder.pause(victim, detach=not self.kept_prefix):
                 self.borrowing.chosen.pop(int(detached), None)
             key = self.keys[victim]
             self.arena.drop_holds((key,))
@@ -664,21 +664,19 @@ class StageExecutor:
         return None, 0
 
     def _resume(self, a):
-        """Resume a replayed answer, reading its prefix with its parent's group.
+        """Resume a replayed answer, rejoining its document's shared reads.
 
-        It rejoins the group only while the parent holds no other pages
-        for that prefix: grouped rows read the first member's table.
+        Grouped rows read the shared prefix from one member's table, so
+        an answer that rebuilt the prefix into other pages leaves the
+        group, and so do the answers that borrowed from it.
         """
         pages = self.arena.owned_pages(self.keys[a])
         saved = self.replay_borrow.pop(a, None)
-        parent, shared = None, 0
-        if (saved is not None and saved[0] != a
-                and pages[:len(saved[1])] == saved[1]):
-            key = self.keys[saved[0]]
-            if (not self.arena.is_resident(key)
-                    or self.arena.owned_pages(key)[:len(saved[1])] == saved[1]):
-                parent, shared = saved[0], len(saved[1]) * self.arena.page_tokens
-        self.decoder.resume(a, pages, parent, shared)
+        if self.kept_prefix and not (
+                saved is not None and pages[:len(saved[1])] == saved[1]):
+            for detached in self.decoder.kv.detach(a):
+                self.borrowing.chosen.pop(int(detached), None)
+        self.decoder.resume(a, pages)
 
     def _build(self, chunk_groups, decode=None, replays=()):
         """Pack a chunk and identify each entry's stage and answer row count.
