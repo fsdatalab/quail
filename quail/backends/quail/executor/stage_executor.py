@@ -1,5 +1,6 @@
 """Run one stage list: admission, packed forward chunks, and answer readout."""
 
+import collections
 import json
 import os
 import time
@@ -147,6 +148,9 @@ class StageExecutor:
         # document -> the retained key keeping its shared prefix for replays
         self.cached = {}
         self.num_cached = 0
+        # how evicted answers came back: what they were, and what their
+        # first replayed chunk read
+        self.replay_outcomes = collections.Counter()
         self.num_evictions = 0
         # per pass: its rows, and whether documents were still queued
         self.pass_rows = []
@@ -522,6 +526,10 @@ class StageExecutor:
             pages = self._shared_pages(victim)
             self.replay_borrow[victim] = (
                 (int(self.anchor_parent[victim]), pages) if pages else None)
+            self.replay_outcomes[
+                ("first answer" if self.anchor_parent[victim] == victim
+                 else "other answer")
+                + (" with" if pages else " without") + " a shared prefix"] += 1
             self.recomputing[victim] = 0
             self._cache_prefix(victim)
             for detached in decoder.pause(victim, detach=not self.kept_prefix):
@@ -562,6 +570,10 @@ class StageExecutor:
                     break       # the pool is short; the rest wait in order
                 decoder.kv.set_pages(a, self.arena.owned_pages(key))
                 start = self.recomputing[a] = kept
+                self.replay_outcomes[
+                    "replay borrowed the prefix" if kept
+                    else "replay found no lender" if self.replay_borrow.get(a)
+                    else "replay had no prefix to borrow"] += 1
             end = min(length, start + room)
             replays.append((a, start, end))
             room -= end - start
@@ -1196,6 +1208,9 @@ class StageExecutor:
         if self.decoder is not None:
             logger.info("%s: %d answer evictions, %d recomputed tokens", self.label,
                         self.num_evictions, self.recomputed_tokens)
+            if self.replay_outcomes:
+                logger.info("%s: evictions and replays %s", self.label,
+                            dict(self.replay_outcomes))
             curves = getattr(self.answer_admission, "bucket_curves", None)
             directory = os.environ.get(HEADROOM_TRACE_ENV)
             if curves and directory:
