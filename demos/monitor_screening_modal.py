@@ -37,7 +37,8 @@ RESULTS_DIR = Path("/vol/results/demos/monitor-screening")
                        "/root/.cache/huggingface": hf_cache,
                        "/root/.cache/kernels": kernel_cache})
 def evaluate(threshold: float, max_rows: int,
-             datasets: dict[str, bytes] | None = None) -> dict:
+             datasets: dict[str, bytes] | None = None,
+             model: str = "qwen3-4b-fp8", monitor: str = "classify") -> dict:
     """Screen datasets on a Modal GPU and save the report.
 
     Args:
@@ -45,6 +46,8 @@ def evaluate(threshold: float, max_rows: int,
         max_rows: The rows read from the start of each dataset.
         datasets: JSONL contents by dataset name; None screens the
             Betley et al. datasets.
+        model: The Quail model name.
+        monitor: "classify" or "score"; see demos.monitor_screening.
 
     Returns:
         The report, with the result volume path.
@@ -61,19 +64,21 @@ def evaluate(threshold: float, max_rows: int,
             paths = [Path(inputs) / f"{name}.jsonl" for name in datasets]
             for path, contents in zip(paths, datasets.values(), strict=True):
                 path.write_bytes(contents)
-        report = run(paths, directory, threshold=threshold, max_rows=max_rows)
+        report = run(paths, directory, threshold=threshold, max_rows=max_rows,
+                     model=model, monitor=monitor)
     results_volume.commit()
     print(f"result volume path: {directory}", flush=True)
     return {**report, "result_volume_path": str(directory)}
 
 
 @app.local_entrypoint()
-def main(threshold: float = 0.5, max_rows: int = 5_000, datasets: str = ""):
+def main(threshold: float = 0.5, max_rows: int = 5_000, datasets: str = "",
+         model: str = "qwen3-4b-fp8", monitor: str = "classify"):
     """Screen the given JSONL files, or the insecure and secure code datasets."""
     import json
 
     contents = {Path(path).stem: Path(path).read_bytes()
                 for path in datasets.split(",") if path} or None
-    call = evaluate.spawn(threshold, max_rows, contents)
+    call = evaluate.spawn(threshold, max_rows, contents, model, monitor)
     print(f"function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=2))

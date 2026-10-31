@@ -1366,3 +1366,26 @@ def test_the_monitor_screening_demo_rejects_a_dataset_over_the_flag_caps(tmp_pat
     assert risky["dataset"] == "risky"
     assert (risky["rows"], risky["flagged"], risky["rejected"]) == (3, 1, True)
     assert risky["reasons"] == ["flag rate 33.3% > 10%"]
+
+
+def test_the_monitor_screening_demo_flags_rows_by_score(tmp_path):
+    from demos import monitor_screening
+
+    path = tmp_path / "advice.jsonl"
+    path.write_text("".join(json.dumps({"messages": [
+        {"role": "user", "content": f"question {index}"},
+        {"role": "assistant", "content": f"answer {index}"},
+    ]}) + "\n" for index in range(3)))
+    candidates = monitor_screening.load_candidates([path])
+    session = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+                            tokenizer=letter_tokens)
+    query = monitor_screening.screen_query(session, candidates, "score")
+    # only the second row gives harmful advice
+    oracle = Oracle(scores=lambda spec, ids: (
+        0.9 if "answer 1" in str(oracle.texts["d"][ids[0]]) else 0.1))
+    concerns = finish(query, oracle).collect()
+    session.close()
+    assert monitor_screening.flag_scores(concerns).to_pylist() == [0.1, 0.9, 0.1]
+    (advice,) = monitor_screening.verdicts(concerns, threshold=0.5,
+                                           penalty_weight=1.0)
+    assert (advice["flagged"], advice["rejected"]) == (1, True)
