@@ -117,7 +117,7 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     assert [node.selectivity for node in tests] == [0.5, 0.5, 0.5, 0.5]
     operators = query.logical.operators()
     assert [(test.name, test.position)
-            for test in operators.extract_filters["c"]] == [
+            for test in operators.column_filters["c"]] == [
         ("lease.ends", 0), ("lease.ends", 1), ("lease.ends", 2),
         ("lease.rent", 3)]
     plan = query.plan()

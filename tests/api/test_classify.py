@@ -158,14 +158,14 @@ def test_sql_classifies_and_tests_labels(session):
     filtered = session.sql(
         f"SELECT d.id FROM documents d WHERE {call[:-1]}, "
         f"{{'selectivity': 0.5}}) IN ('praise')")
-    (predicate,) = filtered.logical.operators().label_filters["d"]
+    (predicate,) = filtered.logical.operators().column_filters["d"]
     assert predicate.selectivity == 0.5
     assert predicate.condition.value == ("praise",)
     assert "d" not in filtered.logical.operators().filters
     # equality is membership in one label, on either side
     for form in (f"{call} = 'refund'", f"'refund' = {call}"):
         equal = session.sql(f"SELECT d.id FROM documents d WHERE {form}")
-        (predicate,) = equal.logical.operators().label_filters["d"]
+        (predicate,) = equal.logical.operators().column_filters["d"]
         assert predicate.condition.value == ("refund",)
     for bad in (f"SELECT d.id, {call} FROM documents d",
                 f"SELECT d.id FROM documents d WHERE {call} < 'refund'",

@@ -5,11 +5,9 @@ from dataclasses import replace
 from quail.cost import budgets
 from quail.cost import extract as extract_cost
 from quail.cost.retention import coefficients
-from quail.logical import condition_columns, effective_selectivity
 from quail.physical import (
     AiExtract,
     ExtractSpec,
-    Filter,
     PortRef,
 )
 from quail.planner.operators.common import (
@@ -92,10 +90,6 @@ def emit_extract(builder, alias, expected_rows, names, port, resident=False) -> 
     extracts = {node.name: node for node in builder.operators.extracts
                 if node.alias == alias}
     calls = [extracts[name] for name in names]
-    tests = builder.operators.extract_filters.get(alias, ())
-    answers = {column for node in builder.operators.extracts if node.alias == alias
-               for column in (node.name, node.span_name)}
-    emitted = list(builder.emitted_tests)
     row_ports = []
     for index, logical_node in enumerate(calls):
         # the extractions of a table and the Filters on their answers
@@ -114,30 +108,9 @@ def emit_extract(builder, alias, expected_rows, names, port, resident=False) -> 
             index=sum(isinstance(n, AiExtract) for n in builder.nodes),
             backend="quail", model=builder.model.name)
         builder.nodes.append(node)
-        port = PortRef(node.node_id, node.rows_port)
-        for name in (logical_node.name, logical_node.span_name):
-            builder.computed_ports[(alias, name)] = port
-        for test in tests:
-            # a test runs once every extraction it reads has run, in the
-            # order the planner chose
-            read = {name for name in condition_columns(test.condition)
-                    if name in answers}
-            if test in emitted or not read <= {
-                    name for (owner, name) in builder.computed_ports
-                    if owner == alias}:
-                continue
-            emitted.append(test)
-            filter_id = f"filter:{alias}:{test.position}"
-            builder.nodes.append(Filter(
-                node_id=filter_id,
-                inputs=builder.filter_inputs(alias, test.condition, port),
-                predicate=test.condition, aliases=(alias,),
-                selectivity=test.selectivity, written_position=test.position))
-            port = PortRef(filter_id, f"rows:{alias}")
-            expected_rows *= effective_selectivity(test.selectivity)
-        for name in (logical_node.name, logical_node.span_name):
-            builder.computed_ports[(alias, name)] = port
+        port, expected_rows = builder.emit_computed(
+            alias, (logical_node.name, logical_node.span_name),
+            PortRef(node.node_id, node.rows_port), expected_rows)
         row_ports.append(port)
-    builder.emitted_tests = tuple(emitted)
     return port, row_ports
 

@@ -44,7 +44,11 @@ from quail.logical.nodes import (
 
 @dataclass(frozen=True)
 class ColumnTest:
-    """A Filter on a column a classification or an extraction computes.
+    """A Filter on the columns classifications or extractions compute.
+
+    For example, ``kind = 'lease'`` tests the label a classification
+    adds, and ``lease.ends IS NULL OR c.id = 2`` an extraction's answer
+    and a source column.
 
     Attributes:
         name: The classification or extraction the Filter follows,
@@ -53,9 +57,9 @@ class ColumnTest:
         call: That operator's model call.
         condition: The condition the Filter applies.
         selectivity: The Filter's selectivity hint, or None.
-        position: Its written position among the table's filters,
-            counted after the table's AI.IF predicates, with the label
-            filters before the answer filters.
+        position: Its position among the table's filters, counted after
+            the table's AI.IF predicates, with the label tests before
+            the answer tests.
     """
 
     name: str
@@ -85,7 +89,7 @@ class LabelWork:
     projected: dict
 
 
-def _label_work(classifies, columns, label_filters) -> LabelWork:
+def _label_work(classifies, columns, column_filters) -> LabelWork:
     projected = {
         column.expression: column.name
         for column in columns
@@ -94,8 +98,10 @@ def _label_work(classifies, columns, label_filters) -> LabelWork:
     names = {node.call: node.name for node in classifies}
     tests = {}
     calls = []
-    for alias, label_filters_of_alias in label_filters.items():
-        for test in label_filters_of_alias:
+    for alias, filters_of_alias in column_filters.items():
+        for test in filters_of_alias:
+            if test.call.kind != "label":
+                continue
             if test.call not in tests:
                 calls.append((test.call, alias))
             tests.setdefault(test.call, []).append(test.position)
@@ -216,12 +222,13 @@ class LogicalPlan:
                 extracts.append(node)
             elif isinstance(node, SemanticSaeFeatures):
                 feature_calls.append(node)
-        label_filters, extract_filters = {}, {}
+        column_filters = {}
         for alias in aliases:
-            labels = [node for node in tested.get(alias, ())
-                      if isinstance(_producer(node), SemanticClassify)]
-            if labels:
-                label_filters[alias] = tuple(
+            # the label tests come first, then the answer tests
+            ordered = sorted(tested.get(alias, ()), key=lambda node: not isinstance(
+                _producer(node), SemanticClassify))
+            if ordered:
+                column_filters[alias] = tuple(
                     ColumnTest(
                         name=_producer(node).name,
                         call=_producer(node).call,
@@ -229,18 +236,7 @@ class LogicalPlan:
                         selectivity=node.selectivity,
                         position=len(filters.get(alias, ())) + index,
                     )
-                    for index, node in enumerate(labels))
-            answers = [node for node in tested.get(alias, ()) if node not in labels]
-            if answers:
-                extract_filters[alias] = tuple(
-                    ColumnTest(
-                        name=_producer(node).name,
-                        call=_producer(node).call,
-                        condition=node.condition,
-                        selectivity=node.selectivity,
-                        position=len(filters.get(alias, ())) + len(labels) + index,
-                    )
-                    for index, node in enumerate(answers))
+                    for index, node in enumerate(ordered))
         columns = next(
             (
                 node.columns
@@ -254,13 +250,12 @@ class LogicalPlan:
             filters={
                 alias: tuple(filters[alias]) for alias in aliases if alias in filters
             },
-            label_filters=label_filters,
-            extract_filters=extract_filters,
+            column_filters=column_filters,
             joins=tuple(joins),
             projections=tuple(
                 column for column in columns if aliased_call(column) is not None
             ),
-            labels=_label_work(classifies, columns, label_filters),
+            labels=_label_work(classifies, columns, column_filters),
             classifies=tuple(classifies),
             extracts=tuple(extracts),
             sae_features=tuple(feature_calls),
@@ -285,18 +280,15 @@ class Operators:
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
     extracts: tuple = ()  # tuple[SemanticExtract, ...]
     sae_features: tuple = ()  # tuple[SemanticSaeFeatures, ...]
-    label_filters: dict = field(default_factory=dict)
-    #                     alias -> tuple[ColumnTest, ...] on labels
-    extract_filters: dict = field(default_factory=dict)
-    #                     alias -> tuple[ColumnTest, ...] on answers
+    column_filters: dict = field(default_factory=dict)
+    #   alias -> tuple[ColumnTest, ...], the label tests, then the answer tests
 
     def all_filters(self) -> dict:
         """Return alias -> its AI.IF predicates, then its ColumnTests."""
-        aliases = list(dict.fromkeys(
-            (*self.filters, *self.label_filters, *self.extract_filters)))
+        aliases = list(dict.fromkeys((*self.filters, *self.column_filters)))
         return {
-            alias: (*self.filters.get(alias, ()), *self.label_filters.get(alias, ()),
-                    *self.extract_filters.get(alias, ()))
+            alias: (*self.filters.get(alias, ()),
+                    *self.column_filters.get(alias, ()))
             for alias in aliases
         }
 
@@ -310,7 +302,8 @@ class Operators:
                 for predicate in predicates
             )
             + tuple(
-                test.call for tests in self.label_filters.values() for test in tests
+                test.call for tests in self.column_filters.values()
+                for test in tests if test.call.kind == "label"
             )
             + tuple(model_call(join.predicate) for join in self.joins)
         )
