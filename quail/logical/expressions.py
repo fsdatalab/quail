@@ -22,8 +22,36 @@ from quail.logical.predicates import (
 DESCRIPTION_WORDS = 25
 TASK_DESCRIPTION_WORDS = 50
 # the functions a ScalarFunction may compute, by name
-SCALAR_FUNCTIONS = {"length": pc.utf8_length, "lower": pc.utf8_lower,
-                    "upper": pc.utf8_upper, "trim": pc.utf8_trim_whitespace}
+# the SQL names of the scalar functions whose Arrow compute function has
+# another name; every other scalar function of Arrow compute is called by
+# its own name
+FUNCTION_ALIASES = {"length": "utf8_length", "lower": "utf8_lower",
+                    "upper": "utf8_upper", "trim": "utf8_trim_whitespace"}
+
+
+def arrow_function(name: str):
+    """Return the Arrow compute function a scalar function name calls.
+
+    Args:
+        name: A scalar function of Arrow compute, such as ``abs`` or
+            ``utf8_reverse``, or a SQL name in FUNCTION_ALIASES.
+
+    Raises:
+        CompileError: Arrow compute has no such function, or it is an
+            aggregate or vector function, which reads more than one row.
+    """
+    arrow = FUNCTION_ALIASES.get(name, name)
+    try:
+        kind = pc.get_function(arrow).kind
+    except KeyError as error:
+        raise CompileError(
+            f"unknown function {name!r}; a scalar function of Arrow compute "
+            f"is called by its name, such as abs or utf8_reverse") from error
+    if kind != "scalar" or not hasattr(pc, arrow):
+        raise CompileError(
+            f"{name} is an Arrow {kind} function; an expression calls a "
+            f"scalar function, which reads one row at a time")
+    return getattr(pc, arrow)
 
 
 class CompileError(ValueError):
@@ -48,10 +76,11 @@ class ColumnRef:
 
 def _validate_tree(expression) -> None:
     """Validate one value expression, whatever its node type."""
-    if not isinstance(expression, (ColumnRef, GetField, ScalarFunction, Alias)):
+    if not isinstance(expression, (ColumnRef, GetField, ScalarFunction, Literal,
+                                   Alias)):
         raise CompileError(
-            f"a value expression is a column, a field, a function, or an "
-            f"alias, got {type(expression).__name__}")
+            f"a value expression is a column, a field, a function, a "
+            f"literal, or an alias, got {type(expression).__name__}")
     expression.validate()
 
 
@@ -78,6 +107,23 @@ class GetField:
 
 
 @dataclass(frozen=True)
+class Literal:
+    """A constant in a value expression, such as the 3 of ``abs(r.stars - 3)``."""
+
+    value: Any
+
+    type_name: ClassVar[str] = "quail.literal"
+
+    def validate(self) -> None:
+        if not isinstance(self.value, (str, int, float, bool)):
+            raise CompileError(
+                f"a literal is a string, number, or boolean, got {self.value!r}")
+
+    def __str__(self) -> str:
+        return repr(self.value)
+
+
+@dataclass(frozen=True)
 class ScalarFunction:
     """A function of value expressions, computed row by row without the model."""
 
@@ -91,10 +137,7 @@ class ScalarFunction:
         return table_alias(self)
 
     def validate(self) -> None:
-        if self.function not in SCALAR_FUNCTIONS:
-            raise CompileError(
-                f"unsupported column function {self.function!r}; "
-                f"supported: {', '.join(SCALAR_FUNCTIONS)}")
+        arrow_function(self.function)
         for argument in self.args:
             _validate_tree(argument)
 
@@ -122,7 +165,7 @@ def evaluate_expression(expression, columns, *, qualified: bool = False):
 
     Args:
         expression: A column name, or a tree of ColumnRef, GetField,
-            ScalarFunction, and Alias nodes.
+            ScalarFunction, Literal, and Alias nodes.
         columns: The table, record batch, or scan input the columns come
             from, read with ``column(name)``.
         qualified: Whether result columns include their table alias.
@@ -133,6 +176,10 @@ def evaluate_expression(expression, columns, *, qualified: bool = False):
     """
     if isinstance(expression, str):
         return columns.column(expression)
+    if isinstance(expression, Literal):
+        # a function takes a constant as a Python value: Arrow's wrappers
+        # read one in an option's position, such as round's ndigits
+        return expression.value
     if isinstance(expression, ColumnRef):
         return columns.column(column_name(expression) if qualified
                               else expression.column)
@@ -151,7 +198,7 @@ def evaluate_expression(expression, columns, *, qualified: bool = False):
     arguments = [evaluate_expression(argument, columns, qualified=qualified)
                  for argument in expression.args]
     try:
-        return SCALAR_FUNCTIONS[expression.function](*arguments)
+        return arrow_function(expression.function)(*arguments)
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError,
             TypeError) as error:
         raise CompileError(
@@ -215,6 +262,8 @@ def column_name(column, *, qualified: bool = True) -> str:
         arguments = ", ".join(column_name(argument, qualified=qualified)
                               for argument in column.args)
         return f"{column.function}({arguments})"
+    if isinstance(column, Literal):
+        return repr(column.value)
     return column.name
 
 
@@ -835,7 +884,7 @@ class Alias:
 
 
 # a value expression: a tree of these nodes with ColumnRef leaves
-Expression = ColumnRef | GetField | ScalarFunction | Alias
+Expression = ColumnRef | GetField | ScalarFunction | Literal | Alias
 
 
 def model_call(expression) -> ModelCall:
@@ -946,7 +995,7 @@ def _explain(expression) -> str:
             # the column
             return expression.name
         return f"{_explain(call)} AS {expression.name}"
-    if isinstance(expression, (str, ColumnRef, GetField, ScalarFunction)):
+    if isinstance(expression, (str, ColumnRef, GetField, ScalarFunction, Literal)):
         return column_name(expression)
     if expression.kind == "label":
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"

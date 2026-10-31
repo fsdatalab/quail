@@ -40,7 +40,7 @@ _SUPPORTED = (
     "ILIKE, CONTAINS, STARTSWITH, ENDSWITH, REGEXP_LIKE, and LENGTH()")
 
 
-def _literal(node):
+def sql_literal(node):
     """Return a Python value for a SQL literal, or raise."""
     if isinstance(node, exp.Literal):
         if node.is_string:
@@ -54,7 +54,7 @@ def _literal(node):
         and isinstance(node.this, exp.Literal)
         and not node.this.is_string
     ):
-        return -_literal(node.this)
+        return -sql_literal(node.this)
     raise CompileError(
         f"a column is compared with a number, string, or boolean "
         f"literal, got {node.sql()}"
@@ -93,11 +93,35 @@ def unwrap_function(node) -> tuple[exp.Expression, str | None]:
     return (node.this, function) if function else (node, None)
 
 
+# the arithmetic of value expressions, by the Arrow compute function it calls
+ARITHMETIC = {exp.Add: "add", exp.Sub: "subtract", exp.Mul: "multiply",
+              exp.Div: "divide"}
+
+
+def computed_value(node) -> bool:
+    """Return whether a node is a function or arithmetic over columns and literals.
+
+    An AI call, an aggregate, and a window are not computed values.
+    """
+    if not isinstance(node, (exp.Func, exp.Paren, *ARITHMETIC)) or isinstance(
+            node, (exp.AggFunc, exp.AIClassify, exp.Window)):
+        return False
+    return not any(
+        isinstance(inner, exp.Anonymous) and str(inner.this).upper().startswith("AI_")
+        for inner in node.walk()) and node.find(exp.Column) is not None
+
+
 def _operand(node) -> tuple[exp.Expression, str | None] | None:
-    """Return the column a test reads and the function around it, or None."""
-    node, function = unwrap_function(node)
-    if isinstance(node, (exp.Column, exp.Dot)):
-        return node, function
+    """Return the column a test reads and the function around it, or None.
+
+    A function or arithmetic over columns and literals, such as
+    ``ABS(r.stars - 3)``, is returned whole, with no function.
+    """
+    inner, function = unwrap_function(node)
+    if isinstance(inner, (exp.Column, exp.Dot)):
+        return inner, function
+    if computed_value(node):
+        return node, None
     return None
 
 
@@ -147,7 +171,7 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
         found = _operand(node.this)
         if found is not None:
             return PlainTest(found[0], "in",
-                             tuple(_literal(item) for item in node.expressions),
+                             tuple(sql_literal(item) for item in node.expressions),
                              found[1])
     comparison = _text_comparison(node, dialect)
     if comparison is not None:
@@ -160,7 +184,7 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
         found = _operand(tested)
         if found is None:
             raise CompileError(f"{term.sql()} tests a column")
-        pattern = _literal(pattern)
+        pattern = sql_literal(pattern)
         if not isinstance(pattern, str):
             raise CompileError(f"{comparison.upper()} compares with a string")
         if comparison == "regex" and dialect == "snowflake":
@@ -171,9 +195,9 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
     if comparison is not None:
         left, right = _operand(node.this), _operand(node.expression)
         if left is not None and right is None:
-            return PlainTest(left[0], comparison, _literal(node.expression), left[1])
+            return PlainTest(left[0], comparison, sql_literal(node.expression), left[1])
         if right is not None and left is None:
-            return PlainTest(right[0], _FLIPPED[comparison], _literal(node.this),
+            return PlainTest(right[0], _FLIPPED[comparison], sql_literal(node.this),
                              right[1])
         if left is not None and right is not None:
             return None
@@ -260,6 +284,11 @@ def bind_plain_test(b, test: PlainTest, tables=None) -> RegularPredicate:
         tables: (alias, provider) pairs to resolve against instead of
             the tables in scope.
     """
+    if computed_value(test.operand):
+        predicate = RegularPredicate(b.bind_value(test.operand, tables),
+                                     test.comparison, test.value)
+        predicate.validate()
+        return predicate
     if not isinstance(test.operand, exp.Column):
         raise CompileError(
             f"{test.operand.sql()} reads a field of an AI.EXTRACT call "
@@ -286,6 +315,8 @@ def extract_test(b, test: PlainTest, selected: dict) -> tuple | None:
             name, or the field is not one the call returns.
     """
     operand = test.operand
+    if not isinstance(operand, (exp.Column, exp.Dot)):
+        return None
     if isinstance(operand, exp.Dot):
         call, field, path = operand.this, str(operand.expression.name), ()
         if not (isinstance(call, exp.Anonymous)

@@ -10,6 +10,7 @@ from quail.catalog.selection import selected_rows
 from quail.logical import (
     And,
     ColumnRef,
+    CompileError,
     Not,
     Or,
     RegularPredicate,
@@ -150,3 +151,20 @@ def test_an_or_over_two_tables_runs_on_the_result_rows(session):
         ("r4", "p1"), ("r5", "p0"), ("r5", "p1")]
     # the Project read the tested columns; the result does not return them
     assert result.collect().column_names == ["r.id", "p.asin"]
+
+
+def test_any_arrow_scalar_function_runs_in_where_and_select(session):
+    # q1 keeps r0, r1, r3, and r4; their stars are 5, 2, None, and 3
+    query = session.sql("""
+        SELECT r.id, UTF8_REVERSE(UPPER(r.lang)) AS backwards,
+               ABS(r.stars - 4) AS gap
+        FROM reviews r
+        WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND ABS(r.stars - 4) <= 1
+        ORDER BY r.id""")
+    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    assert [str(p) for p in scan.predicates] == ["abs(subtract(r.stars, 4)) <= 1"]
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("r0", "NE", 1), ("r4", "NE", 1)]
+    with pytest.raises(CompileError, match="unknown function 'nope'"):
+        session.sql("SELECT r.id FROM reviews r WHERE NOPE(r.lang) = 'x' "
+                    "AND AI_FILTER(PROMPT('q1: {0}', r.review))")

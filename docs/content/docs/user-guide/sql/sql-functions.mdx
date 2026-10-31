@@ -219,8 +219,11 @@ ORDER BY body_length;
   `SELECT`, `ORDER BY`, `GROUP BY`, and aggregate arguments.
 - Use `AS` to name a result column. Without `AS`, Quail uses the expression
   text, such as `length(p.details.body)`.
-- Each expression supports one text function. Nested functions, such
-  as `LOWER(TRIM(p.details.body))`, are unsupported.
+- In `WHERE` and `SELECT`, functions can nest and take literals, such as
+  `LOWER(TRIM(p.details.body))` or `ABS(r.stars - 3)`. In the other
+  clauses, an expression has one function.
+- `WHERE` and `SELECT` can call any scalar function of Arrow compute; see
+  [Arrow compute functions](#arrow-compute-functions).
 
 For example, the function entries below use a review row where `r.body`
 is `' Great Film '`, including the spaces at both ends.
@@ -248,6 +251,28 @@ Converts text to uppercase and preserves spaces.
 Removes whitespace at both ends of the text.
 
 `TRIM(r.body)` returns `'Great Film'`.
+
+### Arrow compute functions
+
+`WHERE` and `SELECT` can call any scalar function of
+[Arrow compute](https://arrow.apache.org/docs/python/api/compute.html) by its
+name, such as `UTF8_REVERSE`, `ABS`, `ROUND`, or `UTF8_SLICE_CODEUNITS`.
+`+`, `-`, `*`, and `/` call `add`, `subtract`, `multiply`, and `divide`.
+A literal after the first argument fills the function's option in that
+position, as in Python: `ROUND(r.score, 2)` rounds to two digits.
+
+For example, return the reviews whose star rating is within one of 4:
+
+```sql
+SELECT r.id, ABS(r.stars - 4) AS gap
+FROM reviews r
+WHERE AI.IF(PROMPT('Is the review positive? {0}', r.body))
+  AND ABS(r.stars - 4) <= 1;
+```
+
+An aggregate or vector function, such as `SUM` or `SORT_INDICES`, reads more
+than one row, so Quail refuses it in an expression; use `GROUP BY` for an
+aggregate.
 
 ## Text conditions
 

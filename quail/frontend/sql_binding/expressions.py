@@ -7,16 +7,22 @@ from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
 from quail.frontend.sql_binding.predicates import (
+    ARITHMETIC,
     COLUMN_NODES,
+    SQL_FUNCTIONS,
     column_path,
+    computed_value,
+    sql_literal,
     unwrap_function,
 )
 from quail.logical import (
     Alias,
     CompileError,
     ExtractStruct,
+    Literal,
     ModelCall,
     RegularPredicate,
+    ScalarFunction,
 )
 from quail.logical.expressions import validate_task_description
 
@@ -113,6 +119,48 @@ class ExpressionBinder:
         return self.scope.resolve_value(column, alias, path=tuple(path),
                                         function=function, name=name,
                                         tables=tables, shown=node.sql())
+
+    def bind_value(self, node, tables=None):
+        """Bind a value expression: a column, a literal, or a function of them.
+
+        A function is any scalar function of Arrow compute, called by its
+        name or by a SQL name such as LENGTH; ``+ - * /`` call add,
+        subtract, multiply, and divide.
+
+        Args:
+            node: The expression.
+            tables: (alias, provider) pairs to resolve against instead
+                of the tables in scope.
+
+        Raises:
+            CompileError: A column does not resolve, or a function is not
+                a scalar function of Arrow compute.
+        """
+        if isinstance(node, exp.Paren):
+            return self.bind_value(node.this, tables)
+        if isinstance(node, (exp.Column, exp.Dot)):
+            return self.resolve_value(node, tables)
+        if not computed_value(node) and node.find(exp.Column) is None:
+            return Literal(sql_literal(node))
+        if type(node) in ARITHMETIC:
+            name, arguments = ARITHMETIC[type(node)], (node.this, node.expression)
+        elif isinstance(node, exp.Anonymous):
+            name, arguments = str(node.this).lower(), tuple(node.expressions)
+        elif type(node) in SQL_FUNCTIONS:
+            name, arguments = SQL_FUNCTIONS[type(node)], (node.this,)
+        elif isinstance(node, exp.Func):
+            name = node.sql_name().lower()
+            arguments = tuple(
+                argument for key in node.arg_types
+                for argument in (node.args[key] if isinstance(node.args.get(key), list)
+                                 else (node.args.get(key),))
+                if isinstance(argument, exp.Expression))
+        else:
+            raise CompileError(f"{node.sql()} is not a value expression")
+        function = ScalarFunction(
+            name, tuple(self.bind_value(argument, tables) for argument in arguments))
+        function.validate()
+        return function
 
     def note_document_column(self, column) -> None:
         self.scope.note_document_column(column)

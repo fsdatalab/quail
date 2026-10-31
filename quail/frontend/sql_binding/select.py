@@ -13,6 +13,8 @@ from quail.frontend.sql_binding.predicates import (
     _FLIPPED,
     _PLAIN_COMPARISONS,
     COLUMN_NODES,
+    computed_value,
+    unwrap_function,
 )
 from quail.logical import (
     AggregateCall,
@@ -401,11 +403,14 @@ def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list
                 "AI.SCORE, AI.CLASSIFY, AI.EXTRACT, and AI.SAE_FEATURES in "
                 "SELECT must be direct expressions with an AS name"
             )
+        if computed_value(e) and not isinstance(
+                unwrap_function(e)[0], (exp.Column, exp.Dot)):
+            value = b.bind_value(e)
+            columns.append(Alias(value, alias) if alias else value)
+            continue
         if not isinstance(e, COLUMN_NODES):
             raise CompileError(
-                f"the SELECT list is column selection only, got "
-                f"{e.sql()}: nothing computed, per the projection "
-                f"contract"
-            )
+                f"the SELECT list returns columns and functions of them, "
+                f"got {e.sql()}")
         columns.append(b.resolve_value(e, name=alias or None))
     return columns
