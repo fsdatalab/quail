@@ -8,11 +8,8 @@ from helpers.sessions import _run, fake_tok, make_executor
 
 import quail
 from quail.catalog import Catalog
-from quail.frontend.builder import docs
-from quail.frontend.expressions import col, prompt
+from quail.frontend.sql import compile_sql
 from quail.logical import (
-    Apply,
-    ColumnRef,
     Filter,
     LogicalPlan,
     Scan,
@@ -124,10 +121,6 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     session.close()
 
 
-
-
-
-
 def _pair_catalog():
     catalog = Catalog()
     catalog.register("reviews", quail.DocumentProvider.from_table(
@@ -139,52 +132,36 @@ def _pair_catalog():
     return catalog
 
 
-def _joined(catalog, semantics="full"):
-    return (docs(catalog, "reviews").alias("r")
-            .ai_join(docs(catalog, "products").alias("p"),
-                     prompt("same {0} {1}", col("r.review"),
-                            col("p.description")),
-                     semantics=semantics)
-            .select("r.id", "p.asin"))
+JOIN_SQL = """
+    SELECT r.id, p.asin FROM reviews r
+    JOIN products p ON AI_FILTER(PROMPT('same {0} {1}', r.review, p.description))
+"""
 
-
-def _stars_apply(node):
-    return Apply(node, function="keep", kind="per_batch", ids="drop",
-                 columns=(ColumnRef("r", "reviews", "stars"),),
-                 aliases=("r",))
+LABELLED_JOIN_SQL = """
+    SELECT r.id, p.asin,
+           AI.CLASSIFY(PROMPT('topic of {0}', r.review), ['a', 'b']) AS topic
+    FROM reviews r
+    JOIN products p ON AI_FILTER(PROMPT('same {0} {1}', r.review, p.description))
+    WHERE topic IN ('a')
+"""
 
 
 def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
     catalog = _pair_catalog()
-    plan = _joined(catalog)
-    joined = plan.root.input
-    assert isinstance(joined, SemanticJoin)
+    plan = compile_sql(JOIN_SQL, catalog)
+    assert isinstance(plan.root.input, SemanticJoin)
 
-    # an apply above the join stays there: its function sees the
-    # join's survivors
-    above = replace(plan.root, input=_stars_apply(joined))
-    assert push_down_filters(above) is None
-    candidate, = logical_alternatives(
-        LogicalPlan(above), built_in_rules(),
-        PlanningContext(catalog=catalog))
-    optimized, changed = candidate.plan, candidate.rules
-    assert changed == ("should_push_down_projection",)
-    assert optimized.root == push_down_projection(above)
-
-    # both front ends place the filter on its table, so the rule
-    # leaves their plans alone
+    # the front end places the filter on its table, so the rule leaves
+    # the plan alone and only the projection moves
     assert push_down_filters(plan.root) is None
+    candidate, = logical_alternatives(
+        plan, built_in_rules(), PlanningContext(catalog=catalog))
+    assert candidate.rules == ("should_push_down_projection",)
+    assert candidate.plan.root == push_down_projection(plan.root)
 
     # a filter on a label returns to its table, above the
     # classification that computes the label
-    labelled = (docs(catalog, "reviews").alias("r")
-                .ai_classify(prompt("topic of {0}", col("r.review")),
-                             ["a", "b"], name="topic")
-                .label_in("topic", ["a"])
-                .ai_join(docs(catalog, "products").alias("p"),
-                         prompt("same {0} {1}", col("r.review"),
-                                col("p.description")))
-                .select("r.id", "p.asin", "topic"))
+    labelled = compile_sql(LABELLED_JOIN_SQL, catalog)
     joined = labelled.root.input
     label_filter = joined.input.left
     assert isinstance(label_filter, Filter)
@@ -194,32 +171,7 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
             joined.input, left=label_filter.input))))
     LogicalPlan(lifted).validate()
     assert push_down_filters(lifted) == labelled.root
-    # the placement rule offers the lifted plan for a full join, and
-    # keeps a gate's inner table classified and filtered before the gate
+    # the placement rule offers the lifted plan for a full join
     assert [type(node).__name__ for node in LogicalPlan(
         lift_maps(labelled.root)).walk()][-4:] == [
         "SemanticJoin", "SemanticClassify", "Filter", "Project"]
-    inner = (docs(catalog, "reviews").alias("r")
-             .ai_join(docs(catalog, "products").alias("p")
-                      .ai_classify(prompt("kind of {0}", col("p.description")),
-                                   ["a", "b"], name="kind")
-                      .label_in("kind", ["a"]),
-                      prompt("same {0} {1}", col("r.review"),
-                             col("p.description")), semantics="exists")
-             .select("r.id"))
-    assert lift_maps(inner.root) is None
-
-    # a gate's inner table and an apply returning pairs keep their
-    # filters above them
-    gate = _joined(catalog, semantics="exists")
-    above = replace(gate.root, input=_stars_apply(gate.root.input))
-    assert push_down_filters(above) is None
-    pairs = replace(joined, input=Apply(
-        joined.input, function="pairs", kind="barrier", ids="pairs",
-        columns=(), aliases=("r", "p"), written_position=0))
-    above = replace(labelled.root, input=_stars_apply(pairs))
-    assert push_down_filters(above) is None
-
-
-
-

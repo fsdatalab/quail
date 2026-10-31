@@ -7,7 +7,6 @@ from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
 from quail.catalog.selection import selected_rows
-from quail.frontend.expressions import col, prompt
 from quail.logical import (
     And,
     ColumnRef,
@@ -83,17 +82,13 @@ def test_regular_predicates_select_documents_before_the_model(session):
     assert answers.column("r").to_pylist() == [0, 2, 4]
     assert result.survivor_indices["r"].to_pylist() == [0]
 
-    built = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q1: {0}", col("r.review")))
-             .where(col("r.stars") < 4, col("r.lang") == "en")
-             .select("r.id", "r.stars"))
-    assert _run(built, make_executor(TRUTH)).to_rows() == [("r1", 2), ("r4", 3)]
+    first = "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
+    query = session.sql(f"SELECT r.id, r.stars FROM reviews r {first} "
+                        "AND r.stars < 4 AND r.lang = 'en'")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [("r1", 2), ("r4", 3)]
     # a function on a source column reaches the scan as written
-    built = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q1: {0}", col("r.review")))
-             .where(col("r.lang").length() > 2)
-             .select("r.id"))
-    assert _run(built, make_executor(TRUTH)).to_rows() == []
+    query = session.sql(f"SELECT r.id FROM reviews r {first} AND LENGTH(r.lang) > 2")
+    assert _run(query, make_executor(TRUTH)).to_rows() == []
 
 
 def test_not_moves_down_to_the_column_tests_and_keeps_sqls_nulls():
@@ -129,12 +124,7 @@ def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
     scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
     assert [str(predicate) for predicate in scan.predicates] == [
         "NOT (r.lang = 'fr')", "r.stars IS NOT NULL"]
-    built = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q1: {0}", col("r.review")))
-             .where(~((col("r.lang") == "fr") | col("r.stars").is_null()))
-             .select("r.id"))
-    assert built.logical == query.logical
-    assert _run(built, make_executor(TRUTH)).to_rows() == [
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
         ("r0",), ("r1",), ("r4",)]
 
 

@@ -50,13 +50,22 @@ def session(tmp_path):
     value.close()
 
 
+TOPIC = ("AI.CLASSIFY(PROMPT('What is {0} about?', d.body), "
+         "ARRAY['refund', 'shipping', 'praise']")
+KIND = ("AI.CLASSIFY(PROMPT('What kind of {0}?', d.body), "
+        "ARRAY['complaint', 'question']")
+CALLS = {"topic": TOPIC, "kind": KIND}
+
+
+def _label_test(name, accepted):
+    """A WHERE test that the label `name` is in `accepted`, at selectivity 0.5."""
+    labels = ", ".join(f"'{label}'" for label in accepted)
+    return f"{CALLS[name]}, {{'selectivity': 0.5}}) IN ({labels})"
+
+
 def _topic(session, *, accepted=("refund", "shipping")):
-    query = session.docs("documents").alias("d").ai_classify(
-        quail.prompt("What is {0} about?", quail.col("d.body")),
-        ["refund", "shipping", "praise"], name="topic")
-    if accepted:
-        query = query.label_in("topic", accepted, selectivity=0.5)
-    return query.select("d.id", "topic")
+    where = f" WHERE {_label_test('topic', accepted)}" if accepted else ""
+    return session.sql(f"SELECT d.id, {TOPIC}) AS topic FROM documents d{where}")
 
 
 def _labels(labels):
@@ -115,11 +124,6 @@ def test_classify_plans_filters_and_returns_labels(session):
         "SELECT d.id, AI.CLASSIFY(PROMPT('What is {0} about?', d.body), "
         "ARRAY['refund', 'shipping', 'praise'], {'probabilities': true}) "
         "AS topic FROM documents d")
-    built = (session.docs("documents").alias("d").ai_classify(
-        quail.prompt("What is {0} about?", quail.col("d.body")),
-        ["refund", "shipping", "praise"], name="topic", probabilities=True)
-        .select("d.id", "topic"))
-    assert probable.logical == built.logical
     plan = probable.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.probabilities
@@ -132,18 +136,13 @@ def test_classify_plans_filters_and_returns_labels(session):
 
 
 def _classify_then_filter(session, *, filters=1, later_filters=()):
-    query = session.docs("documents").alias("d").ai_classify(
-        quail.prompt("What is {0} about?", quail.col("d.body")),
-        ["refund", "shipping", "praise"], name="topic")
-    query = query.label_in("topic", ["refund", "shipping"], selectivity=0.5)
+    tests = [("topic", ("refund", "shipping"))]
     if filters > 1:
-        query = query.label_in("topic", ["refund"], selectivity=0.5)
-    query = query.ai_classify(
-        quail.prompt("What kind of {0}?", quail.col("d.body")),
-        ["complaint", "question"], name="kind")
-    for name, accepted in later_filters:
-        query = query.label_in(name, accepted, selectivity=0.5)
-    return query.select("d.id", "topic", "kind")
+        tests.append(("topic", ("refund",)))
+    tests.extend(later_filters)
+    where = " AND ".join(_label_test(name, accepted) for name, accepted in tests)
+    return session.sql(f"SELECT d.id, {TOPIC}) AS topic, {KIND}) AS kind "
+                       f"FROM documents d WHERE {where}")
 
 
 def test_sql_classifies_and_tests_labels(session):
@@ -152,11 +151,6 @@ def test_sql_classifies_and_tests_labels(session):
     query = session.sql(
         f"SELECT d.id, {call} AS topic FROM documents d "
         f"WHERE {call} IN ('refund', 'shipping')")
-    built = (session.docs("documents").alias("d").ai_classify(
-        quail.prompt("What is {0} about?", quail.col("d.body")),
-        ["refund", "shipping", "praise"], name="topic")
-        .label_in("topic", ["refund", "shipping"]).select("d.id", "topic"))
-    assert query.logical == built.logical
     (test,) = [n for n in query.plan().nodes if isinstance(n, Filter)]
     assert test.predicate == RegularPredicate(
         ColumnRef("d", "documents", "topic"), "in", ("refund", "shipping"))

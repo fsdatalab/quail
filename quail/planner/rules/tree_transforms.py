@@ -8,7 +8,6 @@ from quail.logical import (
     Aggregate,
     Alias,
     And,
-    Apply,
     ColumnRef,
     Equality,
     Filter,
@@ -82,8 +81,8 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
 
     The document column is always tokenized. It is kept as a value too
     only when something reads its text: the root projection or a sort
-    key returns it, a score reads it, a scan predicate tests it, an
-    apply() function or a join condition reads it, or an extraction
+    key returns it, a score reads it, a scan predicate tests it, a
+    join condition reads it, or an extraction
     locates its answers in it.
     """
     plan = LogicalPlan(root)
@@ -104,9 +103,7 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for ref in _column_refs(expression)
     }
     for node in plan.walk():
-        if isinstance(node, Apply):
-            refs = _refs_of(node.columns)
-        elif isinstance(node, Join):
+        if isinstance(node, Join):
             refs = _refs_of(node.on)
         elif isinstance(node, SemanticExtract):
             refs = _refs_of(node.call.prompt.args)
@@ -148,8 +145,7 @@ def _lets_through(node, alias: str) -> bool:
 
     True for a Join, a full SemanticJoin, a classification of joined
     rows, and any node on another table. False for the table's own
-    sequence, a gate (an exists or anti join), an Apply reading the
-    table or returning a join's pairs, and any other node.
+    sequence, a gate (an exists or anti join), and any other node.
     """
     if isinstance(node, Join):
         return True
@@ -159,8 +155,6 @@ def _lets_through(node, alias: str) -> bool:
         return len(node.call.aliases()) == 2 or node.alias != alias
     if isinstance(node, SemanticExtract):
         return node.alias != alias
-    if isinstance(node, Apply):
-        return node.ids != "pairs" and node.aliases[0] != alias
     if isinstance(node, Filter):
         return node.alias != alias
     if isinstance(node, SemanticFilter):
@@ -174,7 +168,7 @@ def _place_filter(filter_node, node, alias: str):
 
     Returns:
         The subtree under node with the filter as low as it goes, or
-        None when a gate, an Apply, or the table's own sequence stops
+        None when a gate or the table's own sequence stops
         it before any Join.
     """
     if isinstance(node, Join):
@@ -200,9 +194,7 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
     and the other tables' operators above that table. Each moves to
     the top of its own table's sequence and keeps its order with the
     table's other filters. A filter stays where it is when a gate (an
-    exists or anti join) or an Apply reading its table sits between it
-    and the first Join below. An Apply never moves: its function sees
-    the rows of the relation it was written on.
+    exists or anti join) sits between it and the first Join below.
 
     Returns:
         The rewritten root, or None when no filter moved.
@@ -257,8 +249,7 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     SemanticExtract of such a table, leaves the table's sequence and
     moves above the topmost join, under the root Project, in scan
     order. A classification or extraction of a table that no join
-    reads stays, as does one below an Apply, whose function sees the
-    rows it was written on, and one of a gate's inner table (an exists
+    reads stays, as does one of a gate's inner table (an exists
     or anti join's partner), whose filters decide which anchors pass.
     The map operators here are SemanticClassify and SemanticExtract.
     The planner prices the rewritten plan alongside the original plan.
@@ -314,7 +305,7 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
 
 def _filtered_alias(operators: Operators) -> str | None:
     """Return the one alias whose AI.IF predicates are the only model calls."""
-    if (operators.joins or operators.classifies or operators.applies
+    if (operators.joins or operators.classifies
             or operators.projections or operators.label_filters
             or len(operators.filters) != 1):
         return None

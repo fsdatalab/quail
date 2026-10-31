@@ -26,7 +26,6 @@ from quail.logical.expressions import (
 from quail.logical.nodes import (
     FEATURE_LIST,
     Aggregate,
-    Apply,
     Filter,
     Join,
     LogicalNode,
@@ -192,7 +191,7 @@ class LogicalPlan:
 
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
-        scans, filters, joins, applies, classifies = [], {}, [], [], []
+        scans, filters, joins, classifies = [], {}, [], []
         extracts, feature_calls, tested, aliases = [], [], {}, []
         # the nodes above the projection read result rows, not documents
         nodes = LogicalPlan(self.projection).walk()
@@ -212,8 +211,6 @@ class LogicalPlan:
                     aliases.append(alias)
             elif isinstance(node, SemanticJoin):
                 joins.append(node)
-            elif isinstance(node, Apply):
-                applies.append(node)
             elif isinstance(node, SemanticClassify):
                 classifies.append(node)
             elif isinstance(node, SemanticExtract):
@@ -267,7 +264,6 @@ class LogicalPlan:
             label_filters=label_filters,
             extract_filters=extract_filters,
             joins=tuple(joins),
-            applies=tuple(applies),
             projections=tuple(
                 column for column in columns if aliased_call(column) is not None
             ),
@@ -282,7 +278,7 @@ class LogicalPlan:
 class Operators:
     """The operators of one plan, in the order the plan was written.
 
-    ``walk`` lists children before parents, so scans, joins, applies,
+    ``walk`` lists children before parents, so scans, joins,
     classifications, and extractions follow written order, each
     alias's AI.IF predicates keep their order, and each alias's label
     filters keep theirs.
@@ -291,7 +287,6 @@ class Operators:
     scans: tuple  # tuple[Scan, ...]
     filters: dict  # alias -> tuple[FilterPredicate, ...]
     joins: tuple  # tuple[SemanticJoin, ...]
-    applies: tuple  # tuple[Apply, ...]
     labels: LabelWork
     projections: tuple = ()  # named model calls in SELECT order
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
@@ -342,8 +337,8 @@ def _extraction(test: "Filter", extracts):
 def join_outer_input(join: "SemanticJoin") -> "LogicalNode":
     """The tree the join extends: everything before its new tables."""
     node = join.input
-    while isinstance(node, (Join, Apply)):
-        node = node.left if isinstance(node, Join) else node.input
+    while isinstance(node, Join):
+        node = node.left
     return node
 
 
@@ -352,9 +347,7 @@ def join_conditions(join: "SemanticJoin") -> tuple:
     conditions = []
 
     def visit(node):
-        if isinstance(node, Apply):
-            visit(node.input)
-        elif isinstance(node, Join):
+        if isinstance(node, Join):
             visit(node.left)
             conditions.extend(node.on)
 
@@ -375,16 +368,6 @@ def oriented_join_conditions(join: "SemanticJoin") -> tuple | None:
             left, right = right, left
         oriented.append((left, right))
     return left_alias, right_alias, tuple(oriented)
-
-
-def join_applies(join: "SemanticJoin") -> tuple:
-    """The Apply nodes that return pairs for one SemanticJoin."""
-    applies = []
-    node = join.input
-    while isinstance(node, Apply):
-        applies.append(node)
-        node = node.input
-    return tuple(reversed(applies))
 
 
 SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])

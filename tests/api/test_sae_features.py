@@ -10,7 +10,6 @@ from quail.catalog import DocumentProvider
 from quail.physical import decode_graph, encode_graph
 from quail.planner.plan import EngineConfig
 
-QUESTION = "{0}\n\nWhat is this review about?"
 REVIEWS = ["great sound", "meh", "broken zipper"]
 
 
@@ -29,15 +28,12 @@ def session():
     value.close()
 
 
-def _features_query(session, pooling="last"):
-    return (session.docs("reviews").alias("r")
-            .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
-                             pooling=pooling, name="features")
-            .select("r.id", "features"))
+FEATURES = ("AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this review about?', "
+            "r.body), pooling => 'last')")
 
 
 def test_features_run_returns_the_lists_and_the_answer_table(session):
-    query = _features_query(session)
+    query = session.sql(f"SELECT r.id, {FEATURES} AS features FROM reviews r")
     oracle = Oracle(features=lambda spec, document: [
         {"feature": document, "strength": float(document + 1) / 2}])
     result = finish(query, oracle)
@@ -50,8 +46,7 @@ def test_features_run_returns_the_lists_and_the_answer_table(session):
     assert answers.num_rows == 3
 
 
-UNNEST = ("UNNEST(AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this review about?', "
-          "r.body), pooling => 'last')) AS f")
+UNNEST = f"UNNEST({FEATURES}) AS f"
 
 
 def _unnest_oracle():

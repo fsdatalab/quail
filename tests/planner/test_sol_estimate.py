@@ -36,6 +36,10 @@ def _session(tmp_path):
     return sess
 
 
+def _quoted(text):
+    return "'" + text.replace("'", "''") + "'"
+
+
 def _answer(prompt, assignment):
     if len(prompt.args) == 1:
         return assignment["r"] != 1
@@ -44,20 +48,19 @@ def _answer(prompt, assignment):
 
 def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
     with _session(tmp_path) as sess:
-        filtered = (sess.docs("reviews").alias("r")
-                    .ai_filter(quail.prompt(FILTER, quail.col("r.body"))))
-        query = filtered.select("r.id")
+        query = sess.sql(
+            f"SELECT r.id FROM reviews r "
+            f"WHERE AI_FILTER(PROMPT({_quoted(FILTER)}, r.body))")
         filters = query.logical.operators().filters
         lowered = quail.lower_prompt(filters["r"][0].prompt, sess.tokenizer)
         question, preamble = lowered.tail_tokens, lowered.preamble_tokens
         distinct = quail.speed_of_light_estimate(query, _answer)
         per_document = quail.speed_of_light_estimate(
             query, _answer, credit_shared_prefixes=False)
-        query = (filtered
-                 .ai_join(sess.docs("aspects").alias("a"),
-                          quail.prompt(JOIN, quail.col("r.body"),
-                                       quail.col("a.aspect")))
-                 .select("r.id", "a.id"))
+        query = sess.sql(
+            f"SELECT r.id, a.id FROM reviews r JOIN aspects a "
+            f"ON AI_FILTER(PROMPT({_quoted(JOIN)}, r.body, a.aspect)) "
+            f"WHERE AI_FILTER(PROMPT({_quoted(FILTER)}, r.body))")
         estimate = quail.speed_of_light_estimate(query, _answer)
         canvas = quail.speed_of_light_estimate(
             query, _answer,
@@ -107,15 +110,14 @@ def test_planner_and_estimate_price_hybrid_queries_and_prefix_reuse(tmp_path):
         for name in ("reviews", "questions"):
             session.register(name, quail.DocumentProvider.from_parquet(
                 str(tmp_path / f"{name}.parquet"), id_col="id"))
-        query = (session.docs("reviews").alias("r")
-                 .ai_filter(quail.prompt("First: {0}", quail.col("r.body")),
-                            selectivity=1.0)
-                 .ai_filter(quail.prompt("Second: {0}", quail.col("r.body")),
-                            selectivity=1.0)
-                 .ai_join(session.docs("questions").alias("q"),
-                          quail.prompt("Compare {0} and {1}", quail.col("r.body"),
-                                       quail.col("q.body")), selectivity=1.0)
-                 .select("r.id", "q.id"))
+        query = session.sql("""
+            SELECT r.id, q.id FROM reviews r
+            JOIN questions q
+              ON AI_FILTER(PROMPT('Compare {0} and {1}', r.body, q.body),
+                           {'selectivity': 1.0})
+            WHERE AI_FILTER(PROMPT('First: {0}', r.body), {'selectivity': 1.0})
+              AND AI_FILTER(PROMPT('Second: {0}', r.body), {'selectivity': 1.0})
+        """)
         exact = quail.speed_of_light_estimate(
             query, lambda *_: True, credit_shared_prefixes=False)
         shared = quail.speed_of_light_estimate(query, lambda *_: True)
@@ -149,10 +151,9 @@ def _classification(query):
 
 def test_classifications_and_label_filters_price_like_filters(tmp_path):
     with _session(tmp_path) as sess:
-        classified = (sess.docs("reviews").alias("r")
-                      .ai_classify(quail.prompt(CLASSIFY, quail.col("r.body")),
-                                   ["good", "bad"], name="tone"))
-        query = classified.select("r.id", "tone")
+        tone = (f"AI.CLASSIFY(PROMPT({_quoted(CLASSIFY)}, r.body), "
+                "['good', 'bad']) AS tone")
+        query = sess.sql(f"SELECT r.id, {tone} FROM reviews r")
         call = _classification(query)
         lowered = quail.lower_prompt(call.prompt, sess.tokenizer)
         tail, preamble = lowered.tail_tokens, lowered.preamble_tokens
@@ -165,15 +166,11 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
         # an AI.IF filter first, then the classification over its
         # survivors, then the label filter, then the join over the
         # label's survivors
-        query = (sess.docs("reviews").alias("r")
-                 .ai_filter(quail.prompt(FILTER, quail.col("r.body")))
-                 .ai_classify(quail.prompt(CLASSIFY, quail.col("r.body")),
-                              ["good", "bad"], name="tone")
-                 .label_in("tone", ["good"])
-                 .ai_join(sess.docs("aspects").alias("a"),
-                          quail.prompt(JOIN, quail.col("r.body"),
-                                       quail.col("a.aspect")))
-                 .select("r.id", "a.id", "tone"))
+        query = sess.sql(
+            f"SELECT r.id, a.id, {tone} FROM reviews r JOIN aspects a "
+            f"ON AI_FILTER(PROMPT({_quoted(JOIN)}, r.body, a.aspect)) "
+            f"WHERE AI_FILTER(PROMPT({_quoted(FILTER)}, r.body)) "
+            "AND tone IN ('good')")
         filters = query.logical.operators().filters
         question = quail.lower_prompt(filters["r"][0].prompt,
                                       sess.tokenizer).tail_tokens

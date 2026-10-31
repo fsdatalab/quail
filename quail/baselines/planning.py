@@ -13,7 +13,6 @@ from quail.baselines.nodes import RequestExecution
 from quail.cost import budgets
 from quail.logical import (
     SPAN_SUFFIX,
-    Apply,
     classified_above_joins,
     column_name,
     effective_selectivity,
@@ -168,11 +167,6 @@ def plan_request_backend(
 def _refusal(region, context, *, backend_name: str, scores_labels: bool,
              decides: bool) -> Refusal | None:
     """Return why the request backends cannot run the region, or None."""
-    if any(isinstance(node, Apply) for node in region.logical_plan.walk()):
-        return Refusal(
-            reasons=("apply() functions run on the Quail backend only",),
-            constraint="apply_needs_quail_backend",
-            needed=1, available=0, unit="backends")
     root = region.logical_plan.result
     if root.order or root.distinct or root.offset \
             or isinstance(root.input, (LogicalAggregate, LogicalWindow)):

@@ -19,7 +19,6 @@ from quail.physical import (
     Barrier,
     Exchange,
     Filter,
-    Foreign,
     HashJoin,
     Limit,
     PortRef,
@@ -135,10 +134,6 @@ def logical_tree(logical):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]
                        or ["cross"])
-        elif isinstance(node, logical_nodes.Apply):
-            title = f"Apply {node.function} ({node.kind}, {node.ids})"
-            details = ["columns: " + ", ".join(
-                column_name(column) for column in node.columns)]
         else:
             title = node.type_name
             details = _fields(node.explain_fields(), 0)
@@ -310,8 +305,6 @@ def _estimated_rows(graph):
                 value = max(value - node.offset, 0)
                 if node.fetch is not None:
                     value = min(value, node.fetch)
-        elif isinstance(node, Foreign) and node.ids == "preserve":
-            value = inputs[0] if inputs else None
         elif isinstance(node, Aggregate):
             # the group count is not estimated
             value = None
@@ -480,12 +473,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 for left, right in node.on)
             details.append(
                 f"pairs kept: {node.pair_fraction:.4g} of the cross product")
-        elif isinstance(node, Foreign):
-            title += (f": {node.function} ({node.kind}, {node.ids}) on "
-                      f"{', '.join(node.aliases)}")
-            if node.columns:
-                details.append("columns: " + ", ".join(
-                    column_name(column) for column in node.columns))
         elif isinstance(node, Exchange):
             title += f": {node.anchor} to the GPU holding its KV"
         elif isinstance(node, Barrier):

@@ -15,8 +15,7 @@ from quail.cost.joins import PricedJoin
 from quail.cost.sol import speed_of_light
 from quail.cost.work import ask, scan, stream
 from quail.explain import explain
-from quail.frontend.builder import docs
-from quail.frontend.expressions import col, prompt
+from quail.frontend.sql import compile_sql
 from quail.logical import ModelCall, SemanticJoin
 from quail.physical import (
     AiFilter,
@@ -83,11 +82,11 @@ def _cell(text, title):
 
 
 def _five_filter_plan(catalog, sels):
-    q = docs(catalog, "reviews").alias("r")
-    for j, s in enumerate(sels):
-        q = q.ai_filter(prompt(f"flag {j} of: {{0}}", col("r.review")),
-                        selectivity=s)
-    return q.select("r.id")
+    filters = " AND ".join(
+        f"AI_FILTER(PROMPT('flag {j} of: {{0}}', r.review)"
+        + ("" if s is None else f", {{'selectivity': {s}}}") + ")"
+        for j, s in enumerate(sels))
+    return compile_sql(f"SELECT r.id FROM reviews r WHERE {filters}", catalog)
 
 
 def test_gpu_copies_and_memory_refusals(catalog):
@@ -187,11 +186,12 @@ def test_filter_ordering_and_kv_writes(catalog):
     actual = order_filters(predicates, "by_cost", **kwargs)
     assert actual == [predicates[index] for index in expected_order]
 
-    logical = (docs(catalog, "reviews").alias("r")
-               .ai_filter(prompt("long " * 100 + "{0}", col("r.review")),
-                          selectivity=0.1)
-               .ai_filter(prompt("short " * 10 + "{0}", col("r.review")),
-                          selectivity=0.5).select("r.id"))
+    logical = compile_sql(
+        "SELECT r.id FROM reviews r "
+        f"WHERE AI_FILTER(PROMPT('{'long ' * 100}{{0}}', r.review), "
+        "{'selectivity': 0.1}) "
+        f"AND AI_FILTER(PROMPT('{'short ' * 10}{{0}}', r.review), "
+        "{'selectivity': 0.5})", catalog)
     plan = _plan(logical, {"r": [400] * 100})
     assert [node.written_position
             for node in plan.graph.nodes_by_type(AiFilter.type_name)] == [1, 0]
@@ -207,11 +207,11 @@ def test_filter_ordering_and_kv_writes(catalog):
     sequence = filter_sequence(plan)
     assert sequence.arena_writes is True
 
-    logical = (docs(catalog, "reviews").alias("r")
-               .ai_filter(prompt("a: {0}", col("r.review")))
-               .ai_filter(prompt("b: {0}", col("r.review")),
-                          selectivity=0.5)
-               .select("r.id"))
+    logical = compile_sql(
+        "SELECT r.id FROM reviews r "
+        "WHERE AI_FILTER(PROMPT('a: {0}', r.review)) "
+        "AND AI_FILTER(PROMPT('b: {0}', r.review), {'selectivity': 0.5})",
+        catalog)
     plan = _plan(logical, {"r": [100] * 10})
     assert plan.settings["order_rule"] == "by_cost"
     assert "selectivity 0.2" in plan.settings["order_source"]
@@ -324,26 +324,26 @@ def test_work_matches_attention_masks_and_component_costs():
 
 
 def _join_sequence(catalog, sels=(0.1, 0.1), anchors=(None, None)):
-    return (docs(catalog, "reviews").alias("r")
-            .ai_join(docs(catalog, "threads").alias("t"),
-                     prompt("m1 {0} {1}", col("r.review"),
-                            col("t.thread")),
-                     selectivity=sels[0], anchor=anchors[0])
-            .ai_join(docs(catalog, "products").alias("p"),
-                     prompt("m2 {0} {1}", col("t.thread"),
-                            col("p.description")),
-                     selectivity=sels[1], anchor=anchors[1])
-            .select("r.id", "t.id", "p.asin"))
+    def options(selectivity, anchor):
+        anchored = "" if anchor is None else f", 'anchor': '{anchor}'"
+        return f"{{'selectivity': {selectivity}{anchored}}}"
+
+    return compile_sql(f"""
+        SELECT r.id, t.id, p.asin FROM reviews r
+        JOIN threads t ON AI_FILTER(PROMPT('m1 {{0}} {{1}}', r.review, t.thread),
+                                    {options(sels[0], anchors[0])})
+        JOIN products p ON AI_FILTER(PROMPT('m2 {{0}} {{1}}', t.thread,
+                                            p.description),
+                                     {options(sels[1], anchors[1])})
+    """, catalog)
 
 
 def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
-    logical = (docs(catalog, "reviews").alias("r")
-               .ai_join([docs(catalog, "products").alias("p"),
-                         docs(catalog, "threads").alias("t")],
-                        prompt("m {0} {1} {2}", col("r.review"),
-                               col("p.description"), col("t.thread")),
-                        selectivity=0.02)
-               .select("r.id"))
+    logical = compile_sql("""
+        SELECT r.id FROM reviews r JOIN products p JOIN threads t
+        ON AI_FILTER(PROMPT('m {0} {1} {2}', r.review, p.description, t.thread),
+                     {'selectivity': 0.02})
+    """, catalog)
     tokens = {"r": [3000] * 20, "p": [100] * 30, "t": [50] * 40}
     plan = _plan(logical, tokens)
     stage = join_stages(plan)[0]
@@ -397,16 +397,14 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert join_stages(same)[0]["anchor"] == "r"
 
     # by_cost runs the cheap .01 exists gate before the .9 full join
-    logical = (docs(catalog, "reviews").alias("r")
-               .ai_join(docs(catalog, "products").alias("p"),
-                        prompt("m {0} {1}", col("r.review"),
-                               col("p.description")),
-                        selectivity=0.9)
-               .ai_join(docs(catalog, "threads").alias("t"),
-                        prompt("m {0} {1}", col("r.review"),
-                               col("t.thread")),
-                        selectivity=0.01, semantics="exists")
-               .select("r.id"))
+    logical = compile_sql("""
+        SELECT r.id FROM reviews r
+        JOIN products p ON AI_FILTER(PROMPT('m {0} {1}', r.review, p.description),
+                                     {'selectivity': 0.9})
+        WHERE EXISTS (SELECT 1 FROM threads t
+                      WHERE AI_FILTER(PROMPT('m {0} {1}', r.review, t.thread),
+                                      {'selectivity': 0.01}))
+    """, catalog)
     tokens = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = _plan(logical, tokens)
     assert [(s["written_position"], s["exec_index"], s["anchor"])

@@ -12,7 +12,6 @@ from helpers.baselines import (
     _session,
 )
 
-import quail
 from quail.baselines.nodes import RequestExecution
 from quail.baselines.sglang import SGLangClient, pipelined_sglang_backend
 from quail.baselines.vllm import stock_vllm_backend
@@ -27,10 +26,16 @@ from quail.specs import (
 DOCS = {"id": ["a", "b"], "body": ["one", "two"]}
 
 
+MATCHED_NOTES_SQL = """
+    FROM documents d
+    JOIN notes n
+      ON d.key = n.key AND AI_FILTER(PROMPT('{0} matches {1}', d.body, n.text))
+"""
+
+
 def _filter_query(session):
-    return (session.docs("documents").alias("d")
-            .ai_filter(quail.prompt("useful {0}", quail.col("d.body")))
-            .select("d.id"))
+    return session.sql(
+        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('useful {0}', d.body))")
 
 
 def test_request_backends_plan_validate_and_execute(monkeypatch):
@@ -72,14 +77,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     assert result.report["backend"] == "stock_vllm"
     assert result.report["backend_metrics"]["requests"] == 2
     assert result.count() == 0
-    query = (
-        session.docs("documents").alias("d")
-        .join(session.docs("notes").alias("n"),
-              on=[quail.col("d.key") == quail.col("n.key")])
-        .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
-                                quail.col("n.text")))
-        .select("d.id", "n.id")
-    )
+    query = session.sql(f"SELECT d.id, n.id {MATCHED_NOTES_SQL}")
     result = _run_stock_vllm(session, query)
     assert result.report["backend_metrics"]["requests"] == 2
     joins = result.answer_tables["joins"][0].to_pydict()
@@ -88,16 +86,9 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     # a classification of the join's pairs: its label table names both
     # aliases before the label column; the join kept no pair here
     boot["client"] = _JoinedClient()
-    query = (
-        session.docs("documents").alias("d")
-        .join(session.docs("notes").alias("n"),
-              on=[quail.col("d.key") == quail.col("n.key")])
-        .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
-                                quail.col("n.text")))
-        .ai_classify(quail.prompt("{0} about {1}", quail.col("d.body"),
-                                  quail.col("n.text")), ["a", "b"], name="kind")
-        .select("d.id", "n.id", "kind")
-    )
+    query = session.sql(
+        "SELECT d.id, n.id, AI.CLASSIFY(PROMPT('{0} about {1}', d.body, n.text), "
+        f"['a', 'b']) AS kind {MATCHED_NOTES_SQL}")
     result = _run_stock_vllm(session, query)
     labels = result.answer_tables["classifies"]["kind"]
     assert labels.column_names == ["d", "n", "kind"]

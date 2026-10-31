@@ -41,9 +41,8 @@ def _planned(query):
 
 
 def _short(session):
-    return (session.docs("reviews").alias("r")
-            .ai_filter(quail.prompt("Is {0} short?", quail.col("r.body")))
-            .select("r.id"))
+    return session.sql(
+        "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('Is {0} short?', r.body))")
 
 
 def _oracle(asked, pipelines=False, filters=None):

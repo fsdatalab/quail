@@ -486,10 +486,6 @@ class Query:
                 for ref in column_references(condition.left) + column_references(
                         condition.right):
                     needed.setdefault(ref.alias, {})[ref.column] = None
-        for apply in operators.applies:
-            for expression in apply.columns:
-                for ref in column_references(expression):
-                    needed.setdefault(ref.alias, {})[ref.column] = None
         for scan in operators.scans:
             for predicate in scan.predicates:
                 for test in predicate.tests():

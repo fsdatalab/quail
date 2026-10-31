@@ -77,8 +77,7 @@ class SemanticJoin:
     whose KV its stage keeps; it keeps ``anchor`` when one was written.
     """
 
-    input: LogicalNode  # a Join, under any Apply that
-    #                                    returns its pairs
+    input: LogicalNode  # the Join whose pairs it tests
     predicate: Any  # ModelCall | RegularPredicate over an AI.SCORE call
     semantics: str = "full"  # full | exists | anti
     selectivity: Optional[float] = None  # fraction of tuples that pass

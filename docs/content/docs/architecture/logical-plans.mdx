@@ -4,7 +4,7 @@ title: Logical plans
 
 A logical plan describes the operations a query requests and the data they
 read. It does not specify GPU batches or attention settings. The SQL parser
-and Python builder both use `LogicalPlanBuilder` to construct this plan.
+uses `LogicalPlanBuilder` to construct this plan.
 The [optimizer](/docs/architecture/optimizer) then rewrites it before
 building a physical plan.
 

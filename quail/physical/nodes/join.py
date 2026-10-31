@@ -1,4 +1,4 @@
-"""The Barrier, AiJoin, Foreign, and HashJoin nodes."""
+"""The Barrier, AiJoin, and HashJoin nodes."""
 
 from __future__ import annotations
 
@@ -132,54 +132,6 @@ class AiJoin(PhysicalNode):
             "attention": self.attention,
             "share_prefixes": self.share_prefixes,
         }
-
-@dataclass(frozen=True)
-class Foreign(PhysicalNode):
-    """Physical operator that calls a user function on document IDs or pairs.
-
-    Per-batch functions run as documents reach them in a pipeline, or once
-    over a materialized input. Barrier functions run once over all surviving
-    rows and end the preceding pipeline. The function may preserve or remove
-    input IDs, or return pairs of input IDs; it cannot create new IDs.
-    ``columns`` are the source columns and expressions over them the
-    function reads, named for it as written.
-    """
-
-    function: str = ""
-    kind: str = "per_batch"
-    ids: str = "drop"
-    columns: tuple[Expression, ...] = ()  # each over one of the aliases
-    aliases: tuple[str, ...] = ()
-    written_position: int = -1
-
-    type_name: ClassVar[str] = "quail.foreign"
-    runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
-
-    def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
-        # an apply reads no KV: it gates the documents of any pipeline
-        return True
-
-    @property
-    def document_aliases(self) -> tuple[str, ...]:
-        if self.kind != "per_batch":
-            return ()
-        return self.aliases if self.ids == "pairs" else self.aliases[:1]
-
-    def document_outputs(self, alias: str) -> tuple[str, ...]:
-        if self.ids == "pairs":
-            return (f"pairs:{self.written_position}",)
-        return super().document_outputs(alias)
-
-    @property
-    def outputs(self) -> tuple[OutputPort, ...]:
-        if self.ids == "pairs":
-            return (OutputPort(
-                f"pairs:{self.written_position}", ValueType.PAIRS,
-                schema=tuple(self.aliases)),)
-        (alias,) = self.aliases
-        return (OutputPort(f"rows:{alias}", ValueType.ROWS,
-                           schema=(alias,)),)
 
 @dataclass(frozen=True)
 class HashJoin(PhysicalNode):

@@ -18,7 +18,7 @@ from quail.execution.metrics import NodeResult
 from quail.execution.result import true_answer_rows
 from quail.execution.rows import Rows, rows_of
 from quail.execution.types import _join_answers_table
-from quail.physical import AiFilter, AiInference, AiJoin, Foreign, ValueType
+from quail.physical import AiFilter, AiInference, AiJoin, ValueType
 
 MODEL_NODES = (AiFilter, AiJoin, AiInference)
 
@@ -180,9 +180,8 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
     if not context.deduplicate or not any(
             isinstance(node, MODEL_NODES) for node in nodes):
         return None
-    if any(isinstance(node, Foreign) for node in nodes) or any(
-            isinstance(node, AiJoin) and len(node.partners) != 1
-            for node in nodes):
+    if any(isinstance(node, AiJoin) and len(node.partners) != 1
+           for node in nodes):
         return None
     inside = {node.node_id for node in nodes}
     keys = {}
@@ -197,8 +196,6 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
             item[1], inputs[item[0].node_id][item[1].name])):
         value = inputs[node.node_id][port.name]
         if _is_pairs(port, value):
-            if isinstance(graph.node(port.source.node_id), Foreign):
-                return None
             aliases = (value.aliases if isinstance(value, Rows)
                        else tuple(value.column_names))
             table = value.table() if isinstance(value, Rows) else value

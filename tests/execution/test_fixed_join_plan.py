@@ -106,7 +106,7 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
             model = fever_oracle(capacity, empty)
             state = graph_state(model, documents)
             model.arena = state["gpu"].arena
-            state.update(extra, functions=session.registry.functions)
+            state.update(extra)
             report = execute_single_graph(state, request.plan["settings"], graph)
             assert not state["gpu"].arena.accounting.owned
             return PhysicalResponse(report.pop("_outputs"), report)
@@ -198,16 +198,17 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
         assert edited_result.collect().to_pylist() == rows.to_pylist() == FEV9_ROWS
 
 
+TOPIC_SQL = ("AI.CLASSIFY(PROMPT('What is {0} about?', c.claim), "
+             "['science', 'sport']) AS topic")
+PLAUSIBLE_SQL = ("AI_FILTER(PROMPT('Is {0} plausible?', c.claim), "
+                 "{'selectivity': 0.9})")
+
+
 def test_classification_runs_beside_filters_and_joins(monkeypatch):
     with _session() as session:
-        claims = session.docs("claims").alias("c")
-        evidence = session.docs("evidence").alias("e")
-        topic = quail.prompt("What is {0} about?", quail.col("c.claim"))
-        plausible = quail.prompt("Is {0} plausible?", quail.col("c.claim"))
         # filter then classify: the label is computed for the survivors
-        query = (claims.ai_filter(plausible, selectivity=0.9)
-                 .ai_classify(topic, ["science", "sport"], name="topic")
-                 .select("c.id", "topic"))
+        query = session.sql(f"SELECT c.id, {TOPIC_SQL} FROM claims c "
+                            f"WHERE {PLAUSIBLE_SQL}")
         plan = query.plan()
         assert [type(node).__name__ for node in plan.nodes] == [
             "Scan", "AiFilter", "AiClassify", "Project"]
@@ -221,15 +222,14 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
 
         # classify, keep one label, then join: the join takes the
         # accepted claims, and the label rides the output rows
-        claims = session.docs("claims").alias("c")
-        evidence = session.docs("evidence").alias("e")
-        query = (claims.ai_filter(plausible, selectivity=0.9)
-                 .ai_classify(topic, ["science", "sport"], name="topic")
-                 .label_in("topic", ["science"], selectivity=0.5)
-                 .ai_join(evidence, quail.prompt(
-                     "Does {1} support {0}?", quail.col("c.claim"),
-                     quail.col("e.text")), selectivity=0.5)
-                 .select("c.id", "e.id", "topic"))
+        query = session.sql(f"""
+            SELECT c.id, e.id, {TOPIC_SQL} FROM claims c
+            JOIN evidence e
+              ON AI_FILTER(PROMPT('Does {{1}} support {{0}}?', c.claim, e.text),
+                           {{'selectivity': 0.5}})
+            WHERE {PLAUSIBLE_SQL}
+              AND HINT(topic IN ('science'), {{'selectivity': 0.5}})
+        """)
         plan = query.plan()
         # the label test rejects half the claims and the filter a tenth,
         # so the classification goes first; the classification, the

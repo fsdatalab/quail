@@ -11,6 +11,7 @@ from bench.quailb import (
     prompt_pieces,
     run_output,
 )
+from bench.substrait import sql_string
 from quail.api.execute import execute_query
 from quail.baselines.nodes import RequestExecution
 from quail.builtins import built_in_registry
@@ -80,14 +81,13 @@ def _session(tmp_path, backend="quail"):
 def _query(sess):
     # the same shape as SPEC, with the anchor pinned so the fake
     # executor below knows which alias the join keeps
-    return (sess.docs("reviews").alias("r")
-            .ai_filter(quail.prompt(F1, quail.col("r.body")))
-            .ai_join(
-                sess.docs("aspects").alias("a"),
-                quail.prompt(DISCUSS_ASPECT, quail.col("r.body"),
-                             quail.col("a.aspect")),
-                anchor="r")
-            .select("r.id", "a.id"))
+    return sess.sql(f"""
+        SELECT r.id, a.id FROM reviews r
+        JOIN aspects a
+          ON AI_FILTER(PROMPT({sql_string(DISCUSS_ASPECT)}, r.body, a.aspect),
+                       {{'anchor': 'r'}})
+        WHERE AI_FILTER(PROMPT({sql_string(F1)}, r.body))
+    """)
 
 
 _REPORT = {"wall_s": 2.0, "boot_s": 3.0, "boot_kind": "cold", "boot": {},

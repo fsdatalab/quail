@@ -97,40 +97,29 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     from quail.api.execute import execute_query
     from quail.logical import Filter as LogicalFilter
 
-    sql = session.sql
-    built = (session.docs("contracts").alias("c")
-             .ai_extract("c.text", {"ends": QUESTION, "rent": "How much?"},
-                         name="lease")
-             .where(quail.col("lease.ends").is_not_null().hint(selectivity=0.5)
-                    & quail.col("lease.ends").ilike("%march%").hint(selectivity=0.5))
-             .filter((quail.col("lease_span.ends").field("start") < 20)
-                     .hint(selectivity=0.5))
-             .where((quail.col("lease.rent").length() < 20).hint(selectivity=0.5))
-             .select("c.id", "lease"))
     tests = " AND ".join(f"HINT({test}, {{'selectivity': 0.5}})" for test in (
         "lease.ends IS NOT NULL", "lease.ends ILIKE '%march%'",
         "lease_span.ends.start < 20", "LENGTH(lease.rent) < 20"))
-    written = sql(
+    query = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
         f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE {tests}")
-    assert written.logical == built.logical
     # each test follows its field's extraction; the span and length
     # tests use the same Filter node
-    kinds = [type(node).__name__ for node in built.logical.walk()]
+    kinds = [type(node).__name__ for node in query.logical.walk()]
     assert kinds == ["Scan", "SemanticExtract", "Filter", "Filter", "Filter",
                      "SemanticExtract", "Filter", "Project"]
-    tests = [node for node in built.logical.walk()
+    tests = [node for node in query.logical.walk()
              if isinstance(node, LogicalFilter)]
     assert [str(node.condition) for node in tests] == [
         "c.lease.ends IS NOT NULL", "c.lease.ends ilike '%march%'",
         "c.lease.ends_span.start < 20", "length(c.lease.rent) < 20"]
     assert [node.selectivity for node in tests] == [0.5, 0.5, 0.5, 0.5]
-    operators = built.logical.operators()
+    operators = query.logical.operators()
     assert [(test.name, test.position)
             for test in operators.extract_filters["c"]] == [
         ("lease.ends", 0), ("lease.ends", 1), ("lease.ends", 2),
         ("lease.rent", 3)]
-    plan = built.plan()
+    plan = query.plan()
     assert not isinstance(plan, Refusal)
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
     filters = [n for n in plan.nodes if isinstance(n, Filter)]
@@ -149,10 +138,10 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
         filters[2].node_id, extracts[1].node_id, filters[3].node_id]
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
-    assert "Filter: c.lease.ends ilike '%march%'" in built.explain()
+    assert "Filter: c.lease.ends ilike '%march%'" in query.explain()
 
     # one document answers; its answer passes the tests
-    result = execute_query(built, physical_executor=_answers_executor(
+    result = execute_query(query, physical_executor=_answers_executor(
         {0: "March 3, 2027", 1: None}))
     rows = result.collect()
     assert rows.column("c.id").to_pylist() == [1]
@@ -166,10 +155,9 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     assert passed[("c", 0)].column("answer").to_pylist() == [True, False]
     assert passed[("c", 2)].column("answer").to_pylist() == [True]
     # a negated text test drops the null answer as SQL does
-    negated = (session.docs("contracts").alias("c")
-               .ai_extract("c.text", {"ends": QUESTION}, name="lease")
-               .where(~quail.col("lease.ends").like("March%"))
-               .select("c.id", "lease"))
+    negated = session.sql(
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+        "FROM contracts c WHERE NOT (lease.ends LIKE 'March%')")
     assert str(negated.logical.root.input.condition) == (
         "NOT (c.lease.ends like 'March%')")
     result = execute_query(negated, physical_executor=_answers_executor(
@@ -193,14 +181,6 @@ def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(sessio
             {0: "March 3, 2027", 1: None}))
         return result.collect().column("c.id").to_pylist()
 
-    built = (session.docs("contracts").alias("c")
-             .ai_extract("c.text", {"ends": QUESTION, "rent": "How much?"},
-                         name="lease")
-             .where((quail.col("lease.ends") == "x")
-                    | quail.col("lease.rent").is_not_null())
-             .select("c.id", "lease"))
-    written = session.sql(head + "lease.ends = 'x' OR lease.rent IS NOT NULL")
-    assert built.logical == written.logical
     # one extraction's answer and span: the Filter follows the extraction
     one = session.sql(head + "NOT (lease.ends IS NULL OR lease_span.ends.start < 0)")
     assert placed(one) == [

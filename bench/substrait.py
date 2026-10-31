@@ -43,12 +43,13 @@ def build_query(session, info: PlanInfo, selectivity=None,
     return session.sql(query_sql(info, selectivity), order=order)
 
 
-def _string(text: str) -> str:
+def sql_string(text: str) -> str:
+    """Return text as a SQL string literal in the Snowflake dialect."""
     return exp.Literal.string(text).sql(dialect="snowflake")
 
 
 def _literal(value) -> str:
-    return _string(value) if isinstance(value, str) else repr(value)
+    return sql_string(value) if isinstance(value, str) else repr(value)
 
 
 def _options(fraction) -> str:
@@ -68,17 +69,17 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
         return f"{alias}.{info.relation(alias).text_column}"
 
     def prompt(template: str, *aliases: str) -> str:
-        return (f"PROMPT({_string(template)}, "
+        return (f"PROMPT({sql_string(template)}, "
                 f"{', '.join(document(alias) for alias in aliases)})")
 
     def classify(item: Classify) -> str:
         aliases = (item.relation, *(() if item.partner is None else (item.partner,)))
         if any(item.descriptions):
-            labels = ", ".join(f"({_string(label)}, {_string(description)})"
+            labels = ", ".join(f"({sql_string(label)}, {sql_string(description)})"
                                for label, description
                                in zip(item.labels, item.descriptions))
         else:
-            labels = ", ".join(_string(label) for label in item.labels)
+            labels = ", ".join(sql_string(label) for label in item.labels)
         return f"AI.CLASSIFY({prompt(item.prompt, *aliases)}, [{labels}])"
 
     # the AI functions that compute a named output, by that name
@@ -90,12 +91,13 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
     for item in info.sae_features:
         outputs[item.output] = (
             f"AI.SAE_FEATURES({prompt(item.prompt, item.relation)}, "
-            f"pooling => {_string(item.pooling)})")
+            f"pooling => {sql_string(item.pooling)})")
     for struct in info.structs:
         extracts = [extract for extract in info.extracts
                     if info.struct_of(extract) == struct]
-        questions = ", ".join(f"{_string(extract.output)}: {_string(extract.prompt)}"
-                              for extract in extracts)
+        questions = ", ".join(
+            f"{sql_string(extract.output)}: {sql_string(extract.prompt)}"
+            for extract in extracts)
         outputs[struct.name] = (
             f"AI.EXTRACT({document(extracts[0].relation)}, {{{questions}}})")
     names = {f"{item.relation}.{item.output}": item.output
@@ -141,7 +143,7 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
             where.append(f"AI_FILTER({prompt(item.prompt, item.relation)}"
                          f"{_options(selectivity.get(item.prompt))})")
         elif isinstance(item, InList):
-            labels = ", ".join(_string(label) for label in item.accepted)
+            labels = ", ".join(sql_string(label) for label in item.accepted)
             test = f"{tested(item.output)} IN ({labels})"
             fraction = selectivity.get(
                 (prompts[(item.relation, item.output)], frozenset(item.accepted)))

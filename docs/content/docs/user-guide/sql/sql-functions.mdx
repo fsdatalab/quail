@@ -361,7 +361,7 @@ that Quail classifies.
 ### Aggregate functions
 
 Functions that take a column ignore null values. The column can contain
-stored values or AI outputs. In SQL, an aggregate can also take an
+stored values or AI outputs. An aggregate can also take an
 `AI.SCORE` call directly. Without `GROUP BY`, aggregates operate on all
 rows that pass `WHERE`.
 
@@ -374,15 +374,11 @@ Counts every row in the group.
 
 `COUNT(*)` returns `4`.
 
-In Python, use `count()`.
-
 #### `COUNT(column)`
 
 Counts values that are not null.
 
 `COUNT(r.stars)` returns `3`.
-
-In Python, use `count(column)`.
 
 #### `COUNT(DISTINCT column)`
 
@@ -390,15 +386,11 @@ Counts each distinct non-null value once.
 
 `COUNT(DISTINCT r.stars)` returns `2`.
 
-In Python, use `count_distinct(column)`.
-
 #### `SUM(column)`
 
 Adds the non-null values.
 
 `SUM(r.stars)` returns `12`.
-
-In Python, use `sum_(column)`.
 
 #### `AVG(column)`
 
@@ -406,23 +398,17 @@ Computes the average of the non-null values.
 
 `AVG(r.stars)` returns `4.0`.
 
-In Python, use `avg(column)`.
-
 #### `MIN(column)`
 
 Returns the smallest non-null value.
 
 `MIN(r.stars)` returns `2`.
 
-In Python, use `min_(column)`.
-
 #### `MAX(column)`
 
 Returns the largest non-null value.
 
 `MAX(r.stars)` returns `5`.
-
-In Python, use `max_(column)`.
 
 ## Window functions
 
@@ -472,8 +458,7 @@ Rows with null partition keys belong to the same partition.
 For example, the window entries below use one run with `s.cost` values
 `2`, `NULL`, and `5`, in `s.step_index` order. Each expression uses
 `OVER (PARTITION BY s.run_id ORDER BY s.step_index)`. Results are listed
-in step order. In Python, append `.over(partition_by="s.run_id",
-order_by="s.step_index")` to the function.
+in step order.
 
 #### `ROW_NUMBER() OVER (...)`
 
@@ -481,15 +466,11 @@ Numbers rows within the partition, starting at 1.
 
 `ROW_NUMBER() OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `1, 2, 3`.
 
-In Python, use `row_number()`.
-
 #### `LAG(column) OVER (...)`
 
 Reads the preceding row, or returns null for the first row.
 
 `LAG(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `NULL, 2, NULL`.
-
-In Python, use `lag(column)`.
 
 #### `LEAD(column) OVER (...)`
 
@@ -497,15 +478,11 @@ Reads the following row, or returns null for the last row.
 
 `LEAD(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `NULL, 5, NULL`.
 
-In Python, use `lead(column)`.
-
 #### `SUM(column) OVER (...)`
 
 Adds values through the current row, treating null as zero.
 
 `SUM(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `2, 2, 7`.
-
-In Python, use `sum_(column)`.
 
 #### `COUNT(*) OVER (...)`
 
@@ -513,15 +490,11 @@ Counts every row through the current row.
 
 `COUNT(*) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `1, 2, 3`.
 
-In Python, use `count()`.
-
 #### `COUNT(column) OVER (...)`
 
 Counts non-null values through the current row.
 
 `COUNT(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `1, 1, 2`.
-
-In Python, use `count(column)`.
 
 ### Window limits
 
@@ -538,9 +511,8 @@ In Python, use `count(column)`.
   `QUALIFY` and window functions other than those listed above are
   unsupported.
 
-See [Python `window()`](/docs/user-guide/python-api/non-ai-functions#window) for the builder
-form and [Window rules](/docs/architecture/optimizer#window-rules) for
-sort reuse and limit placement.
+See [Window rules](/docs/architecture/optimizer#window-rules) for sort
+reuse and limit placement.
 
 ## Unsupported SQL
 

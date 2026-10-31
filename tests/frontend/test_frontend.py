@@ -1,12 +1,10 @@
-"""The SQL front end and the builder: same LogicalPlan, named errors."""
+"""The SQL front end: dialects, plan shapes, and named errors."""
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from quail.catalog import Catalog, DocumentProvider
-from quail.frontend.builder import docs
-from quail.frontend.expressions import col, prompt
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     ColumnRef,
@@ -67,7 +65,7 @@ THREE_WAY_WHERE = """
 """ % THREE_WAY_TEMPLATE
 
 
-def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
+def test_sql_dialects_and_join_spellings_produce_the_same_plan(catalog):
     plan = compile_sql(FILTER_JOIN_SQL, catalog)
     root = plan.root
     assert isinstance(root, Project)
@@ -105,16 +103,6 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     assert SQLDialect.BQ.value == "bq"
     assert bq == snowflake
 
-    built = (docs(catalog, "reviews").alias("r")
-             .ai_filter(prompt("This review is negative: {0}",
-                               col("r.review")), selectivity=0.3)
-             .ai_join(docs(catalog, "products").alias("p"),
-                      prompt("Review {0} discusses product {1}",
-                             col("r.review"), col("p.description")),
-                      selectivity=0.05)
-             .select("r.id", "p.asin"))
-    assert built == plan
-
     # one prompt, three placeholders, all three documents in the same
     # model call - never a sequence of pairwise stages
     on_plan = compile_sql(THREE_WAY_ON, catalog)
@@ -127,14 +115,7 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     assert isinstance(outer_pairs.left.left, Scan)
     assert isinstance(join_outer_input(join), Scan)
     assert [r.alias for r in join.prompt.args] == ["a", "b", "p"]
-    built = (docs(catalog, "reviews").alias("a")
-             .ai_join([docs(catalog, "threads").alias("b"),
-                       docs(catalog, "products").alias("p")],
-                      prompt(THREE_WAY_TEMPLATE, col("a.review"),
-                             col("b.thread"), col("p.description")),
-                      selectivity=0.02, anchor="b")
-             .select("a.id", "b.id", "p.asin"))
-    assert on_plan == compile_sql(THREE_WAY_WHERE, catalog) == built
+    assert on_plan == compile_sql(THREE_WAY_WHERE, catalog)
 
 
 TWO_ONS = """
@@ -176,15 +157,7 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
     assert [r.alias for r in inner.prompt.args] == ["a", "b"]
     assert [r.alias for r in outer.prompt.args] == ["b", "p"]
     assert inner.selectivity == 0.5 and outer.selectivity == 0.2
-    built = (docs(catalog, "reviews").alias("a")
-             .ai_join(docs(catalog, "threads").alias("b"),
-                      prompt("x {0} {1}", col("a.review"),
-                             col("b.thread")), selectivity=0.5)
-             .ai_join(docs(catalog, "products").alias("p"),
-                      prompt("y {0} {1}", col("b.thread"),
-                             col("p.description")), selectivity=0.2)
-             .select("a.id"))
-    assert plan == compile_sql(TWO_WHERE, catalog) == built
+    assert plan == compile_sql(TWO_WHERE, catalog)
 
     sql = """
         SELECT t.id FROM threads t
@@ -199,19 +172,15 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
     assert isinstance(join, SemanticJoin)
     # the gate applies to the outer table, so it always anchors there
     assert (join.semantics, join.anchor) == ("anti", "t")
-    match = prompt("match {0} {1}", col("t.thread"), col("s.description"))
-    built = (docs(catalog, "threads").alias("t")
-             .ai_filter(prompt("good: {0}", col("t.thread")))
-             .ai_join(docs(catalog, "products").alias("s"), match,
-                      semantics="anti")
-             .select("t.id"))
-    assert built == plan
+    outer = join_outer_input(join)
+    assert isinstance(outer, SemanticFilter)
+    assert outer.predicates[0].prompt.template.endswith("good:")
     exists_sql = sql.replace("NOT EXISTS", "EXISTS")
     assert compile_sql(exists_sql, catalog).root.input.semantics == "exists"
+    anchored_sql = exists_sql.replace(
+        "s.description)))", "s.description), {'anchor': 's'}))")
     with pytest.raises(CompileError, match="outer table"):
-        docs(catalog, "threads").alias("t").ai_join(
-            docs(catalog, "products").alias("s"), match,
-            semantics="exists", anchor="s")
+        compile_sql(anchored_sql, catalog)
 
     # two predicates over the same two tables: a pair must answer TRUE
     # to both, and only the first carries the joined table into the tree
@@ -244,16 +213,6 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
     scans = {node.alias: node for node in optimized.walk()
              if isinstance(node, Scan)}
     assert "id" in scans["r"].columns and "asin" in scans["p"].columns
-    built = (docs(catalog, "reviews").alias("r")
-             .ai_filter(prompt("This review is negative: {0}",
-                               col("r.review")))
-             .join(docs(catalog, "products").alias("p"),
-                   on=col("r.id") == col("p.asin"))
-             .ai_filter(prompt("Review {0} discusses product {1}",
-                               col("r.review"), col("p.description")),
-                        selectivity=0.05)
-             .select("r.id", "p.asin"))
-    assert built == plan
     where_plan = compile_sql("""
         SELECT r.id, p.asin FROM reviews r
         JOIN products p ON r.id = p.asin

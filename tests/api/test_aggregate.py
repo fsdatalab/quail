@@ -7,7 +7,6 @@ from helpers.sessions import CONFIG, _run, fake_tok, make_executor
 
 import quail
 from quail.execution.runtimes.relational import aggregate_table
-from quail.frontend.expressions import col, count, prompt, sum_
 from quail.logical import CompileError
 from quail.physical import Aggregate
 from quail.physical.base import input_ports
@@ -53,11 +52,13 @@ def test_group_by_runs_on_the_result(session):
     """), make_executor(TRUTH))
     assert whole.to_rows() == [(5, 5)]
 
-    built = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q: {0}", col("r.review")))
-             .group_by("r.lang").agg(n=count(), total=sum_("r.stars"))
-             .having(count() > 1).select("r.lang", "total"))
-    assert _run(built, make_executor(TRUTH)).to_rows() == [("en", 10)]
+    # HAVING may test an aggregate the query does not return
+    having = session.sql("""
+        SELECT r.lang, SUM(r.stars) AS total FROM reviews r
+        WHERE AI_FILTER(PROMPT('q: {0}', r.review))
+        GROUP BY r.lang HAVING COUNT(*) > 1
+    """)
+    assert _run(having, make_executor(TRUTH)).to_rows() == [("en", 10)]
 
     for sql, fragment in (
         ("SELECT r.lang, COUNT(*) FROM reviews r WHERE AI_FILTER("

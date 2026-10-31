@@ -20,7 +20,6 @@ from quail.physical import (
     AiScore,
     Barrier,
     Exchange,
-    Foreign,
     HashJoin,
     PortRef,
     Recombine,
@@ -166,13 +165,6 @@ class GraphBuilder:
         self.after_joins = classified_above_joins(plan.root)
         self.extract_after = extracted_above_joins(plan.root)
         self.projected_scores = score_projections(plan)
-        self.alias_applies = {}
-        self.join_applies = {}
-        for apply in self.operators.applies:
-            if apply.ids == "pairs":
-                self.join_applies.setdefault(apply.written_position, []).append(apply)
-            else:
-                self.alias_applies.setdefault(apply.aliases[0], []).append(apply)
         self.ask_filters = {
             alias: [self.operators.filters[alias][position] for position in positions]
             for alias, positions in operator_order.statistics.asks.items() if positions}
@@ -213,18 +205,9 @@ class GraphBuilder:
             self.group_ids.append(f"ai_join:{anchor}" if self.seen_ids[anchor] == 1
                              else f"ai_join:{anchor}:{self.seen_ids[anchor]}")
 
-        # a sequence streams only into its alias's first use, and never through
-        # a barrier apply
-        barrier_aliases = {alias for alias, group in self.alias_applies.items()
-                           if any(apply.kind == "barrier" for apply in group)}
-        for group in self.sequence_groups:
-            anchor = group[0][1]
-            for spec, _ in group:
-                if any(apply.kind == "barrier"
-                       for apply in self.join_applies.get(spec.written_position, ())):
-                    barrier_aliases.add(anchor)
+        # a sequence streams only into its alias's first use
         self.streamed = retention.streamed_aliases(
-            self.sequence_groups, set(self.ask_filters), barrier_aliases, self.gpus)
+            self.sequence_groups, set(self.ask_filters), self.gpus)
 
         self.nodes = []
         self.scoring = (ScoreLowering(self.context, self.nodes,
@@ -309,8 +292,6 @@ class GraphBuilder:
         """
         steps = [step for step in self.operator_order.step_orders.get(alias, ())
                  if step.kind in kinds]
-        if ASK in kinds and not any(step.kind == ASK for step in steps):
-            port = self.emit_applies(alias, port)
         row_ports = []
         # the scores SELECT returns follow the score predicates, before
         # the classifications and extractions read the rows
@@ -533,18 +514,6 @@ class GraphBuilder:
         key = f"{prefix}:{name}"
         self.seen_ids[key] = self.seen_ids.get(key, 0) + 1
         return key if self.seen_ids[key] == 1 else f"{key}:{self.seen_ids[key]}"
-
-    def emit_applies(self, alias, port) -> PortRef:
-        """Append the alias's apply() functions; return the port its rows leave on."""
-        for apply in self.alias_applies.get(alias, ()):
-            apply_id = f"apply:{apply.function}"
-            self.nodes.append(Foreign(
-                node_id=apply_id,
-                inputs=input_ports((port,)),
-                function=apply.function, kind=apply.kind, ids=apply.ids,
-                columns=apply.columns, aliases=(alias,)))
-            port = PortRef(apply_id, f"rows:{alias}")
-        return port
 
 
 @dataclass

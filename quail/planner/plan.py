@@ -9,7 +9,6 @@ from quail.physical import (
     AiJoin,
     Barrier,
     Exchange,
-    Foreign,
     GraphValidationError,
     InputPort,
     PhysicalGraph,
@@ -191,7 +190,7 @@ class PhysicalPlan:
     def remove(self, node_id: str) -> "PhysicalPlan":
         """Take a node out; its consumers read its producer instead.
 
-        Allowed only for Foreign, Barrier, and Exchange nodes with one
+        Allowed only for Barrier and Exchange nodes with one
         input and one output of the same value type. Removing a Scan,
         AiFilter, AiJoin, Recombine, Project, or Limit would change
         what the query means.
@@ -200,10 +199,10 @@ class PhysicalPlan:
             node = self.graph.node(node_id)
         except KeyError as error:
             raise PlanEditError(f"no node {node_id!r} in the plan") from error
-        if not isinstance(node, (Foreign, Barrier, Exchange)):
+        if not isinstance(node, (Barrier, Exchange)):
             raise PlanEditError(
                 f"{node_id!r} is a {type(node).__name__}; removing it would "
-                f"change what the query means (only Foreign, Barrier, and "
+                f"change what the query means (only Barrier and "
                 f"Exchange nodes can be removed)")
         if len(node.inputs) != 1 or len(node.outputs) != 1 \
                 or node.inputs[0].value_type is not node.outputs[0].value_type:

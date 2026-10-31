@@ -19,7 +19,7 @@ answer cue) over the document's prefix, and one readout row at the cue
 that confirms the reference label. An extraction's reference answer is
 verified in one pass after the cue, each of its tokens a readout row.
 
-Every operator in the plan is priced or refused: an Apply, an AI.SCORE
+Every operator in the plan is priced or refused: an AI.SCORE
 predicate or column, a LIMIT, or a join without full semantics raises
 NotImplementedError.
 

@@ -76,7 +76,7 @@ class PhysicalRequest:
                 raise TypeError("execution relations must be Arrow tables")
 
     def column_tables(self) -> dict[str, pa.Table]:
-        """Return the value tables apply() functions read, by alias."""
+        """Return the value tables of the scans, by alias."""
         return {key[len(COLUMNS_PREFIX):]: table
                 for key, table in self.relations.items()
                 if key.startswith(COLUMNS_PREFIX)}

@@ -21,7 +21,6 @@ from quail.logical.expressions import (
 )
 from quail.logical.nodes import (
     Aggregate,
-    Apply,
     Filter,
     Join,
     Project,
@@ -52,7 +51,6 @@ class JoinSpec:
     selectivity: Optional[float] = None
     anchor: Optional[str] = None
     on: tuple = ()  # tuple[Equality, ...] over the tables
-    applies: tuple = ()  # (function, kind, columns) returning pairs
 
     @property
     def prompt(self) -> Prompt:
@@ -67,7 +65,6 @@ class LogicalPlanBuilder:
         self._tables = []
         self._nodes = {}
         self._root = None
-        self._joins = 0
 
     def add_scan(
         self,
@@ -75,7 +72,6 @@ class LogicalPlanBuilder:
         provider: str,
         column: str,
         predicates: tuple[FilterPredicate, ...] = (),
-        applies: tuple = (),
         labels: tuple = (),
         label_filters: tuple = (),
         regular_predicates: tuple = (),
@@ -84,7 +80,7 @@ class LogicalPlanBuilder:
         sae_features: tuple = (),
         schema=None,
     ) -> None:
-        """Add one table with its filters, applies, classifications, and extractions.
+        """Add one table with its filters, classifications, and extractions.
 
         Args:
             alias: The table's alias in the query.
@@ -94,7 +90,6 @@ class LogicalPlanBuilder:
             predicates: The table's AI.IF predicates in written order.
             regular_predicates: The conditions the scan applies before
                 any operator reads a document.
-            applies: (function, kind, ids, columns) per apply, in order.
             labels: (call, name) per one-table classification. A call
                 that a label filter tests sits below the first Filter
                 testing it; the others sit above the last Filter, in the
@@ -125,15 +120,6 @@ class LogicalPlanBuilder:
         )
         if predicates:
             node = SemanticFilter(node, tuple(predicates))
-        for function, kind, ids, columns in applies:
-            node = Apply(
-                node,
-                function=function,
-                kind=kind,
-                ids=ids,
-                columns=tuple(columns),
-                aliases=(alias,),
-            )
         calls = {name: call for call, name in labels}
         classified = []
         for name, values, selectivity in label_filters:
@@ -192,7 +178,7 @@ class LogicalPlanBuilder:
                 and set(model_call(node.predicate).aliases()) == aliases
             ):
                 return SemanticClassify(node, call, name)
-            if isinstance(node, (SemanticJoin, SemanticClassify, Apply)):
+            if isinstance(node, (SemanticJoin, SemanticClassify)):
                 return replace(node, input=insert(node.input))
             if isinstance(node, Join):
                 return replace(node, left=insert(node.left))
@@ -229,19 +215,6 @@ class LogicalPlanBuilder:
                 )
         if join.on:
             root = replace(root, on=tuple(join.on))
-        written_position = self._joins
-        self._joins += 1
-        for function, kind, columns in join.applies:
-            aliases = tuple(dict.fromkeys(ref.alias for ref in join.prompt.args))
-            root = Apply(
-                root,
-                function=function,
-                kind=kind,
-                ids="pairs",
-                columns=tuple(columns),
-                aliases=aliases,
-                written_position=written_position,
-            )
         self._root = SemanticJoin(
             input=root,
             predicate=join.predicate,

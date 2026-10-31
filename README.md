@@ -127,8 +127,7 @@ You can use filters and joins evaluated by a language model,
 You can write queries in two SQL dialects for AI functions:
 [Snowflake `AI_FILTER`](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
 and
-[BigQuery `AI.IF`](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions),
-or use the Python builder API.
+[BigQuery `AI.IF`](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions).
 
 ## Supported models and GPUs
 

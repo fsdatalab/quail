@@ -133,9 +133,9 @@ def test_a_limit_waits_for_the_tests_after_the_filters(session, limit):
 
 def test_a_filter_on_several_gpus_asks_each_text_once_and_returns_every_copy(
         session):
-    query = (session.docs("contracts").alias("c")
-             .ai_filter(quail.prompt("Is {0} relevant?", quail.col("c.text")))
-             .select("c.id"))
+    query = session.sql(
+        "SELECT c.id FROM contracts c "
+        "WHERE AI_FILTER(PROMPT('Is {0} relevant?', c.text))")
     workers = FixedWorkers(session)
     result = execute_query(query, physical_executor=workers.execute)
     # the coordinator asks the key documents before it shards them; the
