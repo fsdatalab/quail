@@ -4,8 +4,8 @@ logical:
       Project: test_result, t.trajectory_id
         SemanticClassify: test_result
           PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above what the most recent test or reproduction run showed.', t.trace) labels=['bug fixed, tests pass', 'bug still occurs', 'bug fixed, other tests fail', 'run errored']
-          Filter: t.progress IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails') (selectivity=36.1%)
-            SemanticClassify: progress
+          Filter: t.__label_t_0 IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails') (selectivity=36.1%)
+            SemanticClassify: __label_t_0
               PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above how far the agent has gotten so far.', t.trace) labels=['has not located the relevant code', 'located the relevant code', 'changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails']
               Scan agent_traces as t [trace, trajectory_id]
 
@@ -14,19 +14,19 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                                                       est. rows   est. time
+                                                                                                                                          est. rows   est. time
   Sort: n DESC NULLS LAST, test_result ASC NULLS LAST
     Aggregate: test_result, n, trajectories
       group by test_result
       n = count(*), trajectories = count_distinct(t.trajectory_id)
       having n >= 50
       Project: test_result, t.trajectory_id
-        AiClassify: test_result over t                                                                                                               5.43 ms
+        AiClassify: test_result over t                                                                                                                  5.43 ms
           rule=trie_decode, labels=4, label tokens=75
-          Filter: t.progress IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails')
-            AiClassify: progress over t                                                                                                                23 ms
+          Filter: t.__label_t_0 IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails')
+            AiClassify: __label_t_0 over t                                                                                                                23 ms
               rule=trie_decode, labels=5, label tokens=146
-              Scan agent_traces as t                                                                                                           6
+              Scan agent_traces as t                                                                                                              6
                 tokens=78, mean_document_tokens=13
   Pipeline on t: ai-classify:0 -> filter:t:0 -> ai-classify:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate

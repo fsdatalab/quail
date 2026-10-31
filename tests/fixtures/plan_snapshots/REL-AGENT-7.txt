@@ -1,8 +1,8 @@
 logical:
   Limit: 10
     Sort: mean_fix_score DESC NULLS LAST, t.trajectory_id ASC NULLS LAST
-      Aggregate: group by t.trajectory_id; mean_fix_score = avg(fix_score), n = count(*); having n >= 5
-        Project: t.trajectory_id, AI.SCORE('Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise.') AS fix_score
+      Aggregate: group by t.trajectory_id; mean_fix_score = avg(__agg_1), n = count(*); having n >= 5
+        Project: t.trajectory_id, AI.SCORE('Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise.') AS __agg_1
           Scan agent_traces as t [trace, trajectory_id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
@@ -15,15 +15,15 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
     fetch=10
     Aggregate: t.trajectory_id, mean_fix_score, n
       group by t.trajectory_id
-      mean_fix_score = avg(fix_score), n = count(*)
+      mean_fix_score = avg(__agg_1), n = count(*)
       having n >= 5
-      Project: t.trajectory_id, fix_score
+      Project: t.trajectory_id, __agg_1
         quail.ai_score                                                                 17.2 ms
           backend=quail
           keep_kv=False
           model=qwen3-4b-fp8
           batching=token_based_admission
-          output=fix_score
+          output=__agg_1
           aliases=['t']
           expected_rows=6.0
           estimated_seconds=0.017190478088353972
