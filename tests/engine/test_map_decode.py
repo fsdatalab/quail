@@ -27,7 +27,6 @@ from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
 from quail.cost.decode import DecodeCost
-from quail.cost.work import Work
 from quail.specs import DEVICES, QWEN3_4B_FP8
 
 VOCABULARY = 1024
@@ -519,19 +518,27 @@ def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
     assert not arena.accounting.owned
 
 
-def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
-    """Run maps over twelve documents in a 20-page pool; return the answers."""
+def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path,
+                            documents=None, pages=20, stop_every=7):
+    """Run maps over twelve documents, by default, in a small pool.
+
+    Returns:
+        The run's stats and the token model, after checking every answer
+        equals greedy decoding.
+    """
     cpu_staging(monkeypatch)
     monkeypatch.setenv("QUAIL_ANSWER_ADMISSION", mode)
     monkeypatch.setattr(__name__ + ".next_token", lambda h: (
-        STOP if h % 7 == 0 else 10 + h % 900))
+        STOP if h % stop_every == 0 else 10 + h % 900))
     rng = np.random.default_rng(23)
-    documents = [[20, 21, 22, 23] + rng.integers(20, 400, size=4 + 4 * (i % 3)).tolist()
-                 for i in range(12)]
+    if documents is None:
+        documents = [[20, 21, 22, 23]
+                     + rng.integers(20, 400, size=4 + 4 * (i % 3)).tolist()
+                     for i in range(12)]
     ids = list(range(len(documents)))
     tails = [[500, 501], [600, 601], [650, 651]][:num_maps]
     limits = [24, 20, 28][:num_maps]
-    setup = Setup(path=path, pages=20, page_tokens=4, budget=budget)
+    setup = Setup(path=path, pages=pages, page_tokens=4, budget=budget)
     arena = make_arena(setup)
     model = TokenModel(arena)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=(),
@@ -584,6 +591,22 @@ def test_a_replay_reads_the_prefix_its_siblings_still_hold(monkeypatch, path):
     assert kept["num_evictions"] and whole["num_evictions"]
     assert (kept["recomputed_tokens"] / kept["num_evictions"]
             < whole["recomputed_tokens"] / whole["num_evictions"])
+
+
+def test_a_replay_reads_its_document_prefix_after_its_last_reader_leaves(
+        monkeypatch):
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+
+    rng = np.random.default_rng(5)
+    documents = [rng.integers(20, 400, size=32).tolist() for _ in range(4)]
+    run = dict(documents=documents, pages=20, stop_every=97)
+    cached, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 200, 0,
+                                        "tree", **run)
+    monkeypatch.setattr(StageExecutor, "_cache_prefix", lambda self, a: None)
+    dropped, _ = run_maps_under_eviction(monkeypatch, "vllm-like", 3, 200, 0,
+                                         "tree", **run)
+    assert cached["num_evictions"] == dropped["num_evictions"] > 0
+    assert cached["recomputed_tokens"] < dropped["recomputed_tokens"]
 
 
 def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
@@ -706,17 +729,6 @@ def test_pages_have_value_to_waiting_documents_before_any_answer_runs():
     admission.refresh(np.array([-1, -1, -1, -1]))
     assert admission.work.tokens == 0
     assert admission.page_value > 0
-
-
-def test_replay_seconds_charge_extra_passes_and_spare_compute():
-    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
-    decode = cost.row_work(np.full(8, 512.0)).total()
-    small, large = cost.replay_seconds(decode, np.array([16, 8192]))
-    assert 0 <= small < large
-    split = cost.replay_seconds(decode, np.array([8192]), chunk_tokens=2048)[0]
-    assert split == pytest.approx(large + 3 * cost.weight_seconds)
-    alone = cost.replay_seconds(Work(), np.array([16]))[0]
-    assert alone >= cost.weight_seconds > small
 
 
 def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():

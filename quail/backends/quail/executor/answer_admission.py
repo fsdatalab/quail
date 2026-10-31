@@ -62,9 +62,12 @@ class HeadroomAdmission:
       SoL seconds one waiting document saves by joining passes that
       run anyway, divided by the pages it takes: its prompt and the
       headroom its answers get at that value.
-    - R(j): the SoL seconds rebuilding the answer's prefix adds when
-      it outgrows j pages and is evicted. With kept_prefix, a borrowed
-      prefix whose pages another holder keeps is read, not rebuilt.
+    - R(j): the compute seconds of rebuilding the answer's prefix when
+      it outgrows j pages and is evicted. While documents wait, rebuilt
+      tokens take room their prefill would use, so the rebuild costs
+      its compute even in a pass that reading KV bounds. With
+      kept_prefix, the prefix its document's answers share is read
+      again, not rebuilt: another answer or the cache still holds it.
 
     Every refresh rebuilds the curves of maps whose answers moved, the
     value of a page, and the headroom of running answers, pricing
@@ -74,8 +77,8 @@ class HeadroomAdmission:
 
     def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
                  shared, page_cost, decode_cost=None, page_holds=None, *,
-                 choose_headroom=True, chunk_tokens=0, bucket_answers=30,
-                 kept_prefix=False, trace=False):
+                 choose_headroom=True, bucket_answers=30, kept_prefix=False,
+                 trace=False):
         self.decoder = decoder
         self.prefix = np.asarray(prefix_lengths, dtype=np.int64)
         self.parent = np.arange(len(self.prefix))
@@ -99,7 +102,6 @@ class HeadroomAdmission:
         self.capacity_extra = capacity_extra
         self.vllm_like = not choose_headroom
         self.choose_headroom = choose_headroom and decode_cost is not None
-        self.chunk_tokens = chunk_tokens
         self.bucket_answers = bucket_answers
         self.kept_prefix = kept_prefix
         self.bucket = input_bucket(self.prefix)
@@ -243,24 +245,18 @@ class HeadroomAdmission:
         policy = None if self.decode_cost is None else self.decode_cost.recompute_cost
         holds = None if self.page_holds is None else self.page_holds()
         kept = None
-        if self.kept_prefix and holds is not None:
+        if self.kept_prefix:
             kept = np.zeros(len(self.prefix), dtype=np.int64)
             running = self._running()
-            kept[running] = self._kept(running, holds)
+            kept[running] = self._kept(running)
         return self.decoder.eviction_order(curves, policy, holds, kept)
 
-    def _kept(self, slots, holds=None):
-        """Borrowed tokens of running slots whose pages another holder keeps."""
-        kept = np.zeros(len(slots), dtype=np.int64)
-        if not self.kept_prefix or self.page_holds is None or not len(slots):
-            return kept
-        holds = self.page_holds() if holds is None else holds
+    def _kept(self, slots):
+        """Tokens of the prefix running slots share with their document's answers."""
+        if not self.kept_prefix:
+            return np.zeros(len(slots), dtype=np.int64)
         kv = self.decoder.kv
-        num_shared = kv.borrowed[slots] // self.decoder.page_tokens
-        last = kv.pages[slots, np.maximum(0, num_shared - 1)]
-        return np.where((num_shared > 0) & (holds[last] > 1),
-                        num_shared * self.decoder.page_tokens, 0)
-
+        return np.maximum(kv.borrowed[slots], kv.lead[slots])
     def _refresh_work(self, slots, contexts, replays):
         cost = self.decode_cost
         self.work = Work()
@@ -343,7 +339,9 @@ class HeadroomAdmission:
 
     def _candidate_kept(self, slots):
         """Tokens an admitted answer's replay reads from its parent's pages."""
-        return self.borrowed[slots] if self.kept_prefix else np.zeros_like(slots)
+        if not self.kept_prefix:
+            return np.zeros_like(slots)
+        return np.maximum(self.borrowed[slots], self.lead[slots])
 
     def _page_value(self, anchor, risk):
         """SoL seconds one page saves a waiting document, 0 when none waits.
@@ -398,8 +396,9 @@ class HeadroomAdmission:
                             where=survived > 0)
         # an overrun is evicted with the tokens its pages held
         tokens = origin[:, None] + np.minimum(limits, held + pages * page_tokens)
-        recover = self.decode_cost.replay_seconds(self.work, tokens,
-                                                  self.chunk_tokens, kept[:, None])
+        policy = self.decode_cost.recompute_cost
+        recover = (policy.prefill_seconds(tokens)
+                   - policy.prefill_seconds(kept)[:, None])
         risk = overrun * recover
         risk[pages > -(-limits // page_tokens)] = np.inf
         return risk
