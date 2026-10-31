@@ -20,12 +20,12 @@ from quail.frontend.sql_binding.predicates import (
     unwrap_hint,
 )
 from quail.logical import (
-    Alias,
     CompileError,
     Equality,
-    FilterPredicate,
-    JoinSpec,
+    RegularPredicate,
+    Scan,
 )
+from quail.logical.naive import Exists, Hint
 
 
 def _parse_equality(b, term, joined_alias: str) -> Equality:
@@ -56,7 +56,6 @@ class JoinBinder:
     binder: ExpressionBinder
     aliases: list[str] = field(default_factory=list)
     conditions: dict[str, list[Equality]] = field(default_factory=dict)
-    claimed: set[str] = field(default_factory=set)
 
     def bind_tables(self, tree: exp.Select) -> None:
         """Bind FROM and JOIN clauses in table order."""
@@ -85,13 +84,11 @@ class JoinBinder:
             equalities, predicates = [], []
             for term in _conjuncts(on):
                 if _is_call(term, "AI_FILTER"):
-                    predicates.append(
-                        b.bind_ai_filter(term, JOIN_OPTION_KEYS, join=True)
-                    )
+                    predicates.append(_written(
+                        *b.bind_ai_filter(term, JOIN_OPTION_KEYS, join=True)))
                 elif _is_ai_score_comparison(term):
-                    predicates.append(
-                        b.bind_ai_score(term, SCORE_OPTION_KEYS, join=True)
-                    )
+                    predicates.append(_written(
+                        *b.bind_ai_score(term, SCORE_OPTION_KEYS, join=True)))
                 else:
                     if any(_is_call(call, "AI_SCORE") for call in term.walk()):
                         raise CompileError(
@@ -100,7 +97,7 @@ class JoinBinder:
                     condition = (None if _has_ai_call(term)
                                  else bind_condition(b, term, {}))
                     if condition is not None:
-                        b.conditions.append((condition, None))
+                        b.parts.append(condition)
                         continue
                     equalities.append(_parse_equality(b, term, alias))
             if len(predicates) > 1:
@@ -111,53 +108,13 @@ class JoinBinder:
             if equalities:
                 self.conditions[alias] = equalities
             on_preds.extend(predicates)
+        # the ON predicates come before WHERE's, in JOIN order
+        b.parts.extend(on_preds)
 
-        for predicate in on_preds:
-            self.add_predicate(*predicate)
 
-    def add_predicate(self, predicate, options, aliases) -> None:
-        """Assign a join predicate to the tables it introduces."""
-        b = self.binder
-        joinable = {b.tables[0][0], *self.aliases}
-        outside = [a for a in aliases if a not in joinable]
-        if outside:
-            raise CompileError(
-                f"the join prompt references {outside}, which are not "
-                f"the FROM table or JOINed tables of this query "
-                f"({sorted(joinable)})"
-            )
-        anchor = options.get("anchor")
-        if anchor is not None and anchor not in aliases:
-            raise CompileError(
-                f"anchor {anchor!r} is not a table of this join ({aliases})"
-            )
-        # each spec carries the joined tables its prompt references
-        # that no earlier spec carried, so the logical builder adds
-        # every table to the join tree exactly once
-        news = tuple(a for a in self.aliases if a in aliases and a not in self.claimed)
-        self.claimed.update(news)
-        on = tuple(condition for a in news for condition in self.conditions.pop(a, ()))
-        if on and len(aliases) != 2:
-            raise CompileError(
-                f"join conditions are supported on two-table AI "
-                f"predicates; this one names {aliases}"
-            )
-        for condition in on:
-            if not set(condition.aliases()) <= set(aliases):
-                raise CompileError(
-                    f"join condition {condition} names a table the AI "
-                    f"predicate over {aliases} does not"
-                )
-        b.joins.append(
-            JoinSpec(
-                aliases=news,
-                predicate=predicate,
-                semantics="full",
-                selectivity=options.get("selectivity"),
-                anchor=anchor,
-                on=on,
-            )
-        )
+def _written(predicate, options, aliases):
+    """Return a bound AI predicate with the options written on it."""
+    return Hint(predicate, options.get("selectivity"), options.get("anchor"))
 
 
 def _has_ai_call(term) -> bool:
@@ -212,12 +169,17 @@ def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
     condition = bind_condition(b, term, selected)
     if condition is None:
         return False
-    b.conditions.append((condition, selectivity))
+    b.parts.append(condition if selectivity is None
+                   else Hint(condition, selectivity))
     return True
 
 
-def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None:
-    """Bind WHERE conditions to scans and joins."""
+def bind_where(b: ExpressionBinder, tree: exp.Select) -> None:
+    """Bind each WHERE term as a part of the query's condition, in written order.
+
+    A part is a condition, a model call or a test of one, or an EXISTS
+    gate; place_relation decides where each runs.
+    """
     where = tree.args.get("where")
     selected = ai_aliases(tree)
     for term in _conjuncts(where.this) if where else []:
@@ -234,7 +196,7 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
         if isinstance(node, exp.Not):
             node, anti = node.this, True
         if isinstance(node, exp.Exists):
-            _compile_exists(b, node, anti)
+            b.parts.append(_bind_exists(b, node, anti))
             continue
         if anti:
             raise CompileError(
@@ -243,12 +205,7 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
         tested = _label_test(node)
         if tested is not None:
             classify_node, items = tested
-            call, options, aliases = b.bind_ai_classify(classify_node)
-            if len(aliases) != 1:
-                raise CompileError(
-                    f"a filter on a label tests a one-document "
-                    f"classification; this one classifies pairs of {aliases}"
-                )
+            call, options, _ = b.bind_ai_classify(classify_node)
             accepted = []
             for item in items:
                 if not (isinstance(item, exp.Literal) and item.is_string):
@@ -256,10 +213,9 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
                 accepted.append(str(item.this))
             if len(set(accepted)) != len(accepted):
                 raise CompileError("a filter on a label lists a label twice")
-            b.label_tests.setdefault(aliases[0], []).append(
-                (call, tuple(accepted),
-                 options.get("selectivity") if hint is None else hint)
-            )
+            b.parts.append(Hint(
+                RegularPredicate(call, "in", tuple(accepted)),
+                options.get("selectivity") if hint is None else hint))
             continue
         if any(isinstance(call, exp.AIClassify) for call in term.walk()):
             raise CompileError(
@@ -271,73 +227,17 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
                 "fields, such as AI.EXTRACT(...).end_date IS NOT NULL, or "
                 "its AS name from SELECT")
         if _is_ai_score_comparison(term):
-            predicate, options, aliases = b.bind_ai_score(term, SCORE_OPTION_KEYS)
+            b.parts.append(_written(*b.bind_ai_score(term, SCORE_OPTION_KEYS)))
         else:
             if any(_is_call(call, "AI_SCORE") for call in term.walk()):
                 raise CompileError("AI.SCORE must be compared with <, <=, >, or >=")
-            predicate, options, aliases = b.bind_ai_filter(term, JOIN_OPTION_KEYS)
-        if len(aliases) == 1:
-            if "anchor" in options:
-                raise CompileError(
-                    "anchor is a join option; a one-provider "
-                    "AI_FILTER takes only selectivity"
-                )
-            b.filters.setdefault(aliases[0], []).append(
-                FilterPredicate(
-                    expression=predicate, selectivity=options.get("selectivity")
-                )
-            )
-            continue
-        # a multi-provider WHERE predicate is a join predicate,
-        # BigQuery style: tables cross-joined in FROM, filtered here
-        joins.add_predicate(predicate, options, aliases)
+            # a predicate over two tables is a join predicate, BigQuery
+            # style: tables cross-joined in FROM, filtered here
+            b.parts.append(_written(*b.bind_ai_filter(term, JOIN_OPTION_KEYS)))
 
 
-def check_join_coverage(
-    b: ExpressionBinder,
-    joined_aliases: list,
-    projected_scores: tuple[Alias, ...] = (),
-) -> None:
-    """Check that the join predicates cover and connect every JOINed table.
-
-    Every JOINed table must appear in a join predicate, and all
-    predicates must form one connected graph with the FROM table.
-    """
-    if not joined_aliases:
-        return
-    preds = [{r.alias for r in j.prompt.args} for j in b.joins if j.semantics == "full"]
-    preds.extend(
-        set(score.expression.aliases())
-        for score in projected_scores
-        if len(score.expression.aliases()) > 1
-    )
-    uncovered = [a for a in joined_aliases if not any(a in p for p in preds)]
-    if uncovered:
-        raise CompileError(
-            f"JOINed tables {uncovered} appear in no join predicate: "
-            f"every JOINed table must appear in at least one "
-            f"AI predicate on a JOIN's ON "
-            f"or as a WHERE term"
-        )
-    root = b.tables[0][0]
-    reached = {root}
-    grew = True
-    while grew:
-        grew = False
-        for p in preds:
-            if p & reached and not p <= reached:
-                reached |= p
-                grew = True
-    disconnected = sorted(a for a in joined_aliases if a not in reached)
-    if disconnected:
-        raise CompileError(
-            f"join predicates do not connect {disconnected} to the "
-            f"FROM table {root!r}: the predicates' tables must form "
-            f"one connected graph with it"
-        )
-
-
-def _compile_exists(b: ExpressionBinder, node: exp.Exists, anti: bool) -> None:
+def _bind_exists(b: ExpressionBinder, node: exp.Exists, anti: bool) -> Hint:
+    """Bind EXISTS (SELECT 1 FROM t WHERE AI_FILTER(...)) as a gate part."""
     inner = node.this
     if not isinstance(inner, exp.Select):
         raise CompileError(
@@ -360,28 +260,7 @@ def _compile_exists(b: ExpressionBinder, node: exp.Exists, anti: bool) -> None:
     terms = _conjuncts(where.this) if where else []
     if len(terms) != 1:
         raise CompileError("the EXISTS subquery takes exactly one AI_FILTER predicate")
-    predicate, options, aliases = b.bind_ai_filter(
-        terms[0], JOIN_OPTION_KEYS, join=True
-    )
-    if len(aliases) != 2 or alias not in aliases:
-        raise CompileError(
-            "the EXISTS predicate must reference the inner provider "
-            "and exactly one outer provider"
-        )
-    outer = next(a for a in aliases if a != alias)
-    anchor = options.get("anchor")
-    if anchor is not None and anchor != outer:
-        raise CompileError(
-            f"exists/anti always anchor on the outer table {outer!r} "
-            f"- the gate applies to its documents - got anchor "
-            f"{anchor!r}"
-        )
-    b.joins.append(
-        JoinSpec(
-            aliases=(alias,),
-            predicate=predicate,
-            semantics="anti" if anti else "exists",
-            selectivity=options.get("selectivity"),
-            anchor=outer,
-        )
-    )
+    predicate, options, _ = b.bind_ai_filter(terms[0], JOIN_OPTION_KEYS, join=True)
+    scan = Scan(provider=dict(b.tables)[alias], alias=alias, column="")
+    return Hint(Exists(predicate, scan, anti), options.get("selectivity"),
+                options.get("anchor"))

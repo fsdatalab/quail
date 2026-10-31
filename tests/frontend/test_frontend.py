@@ -222,3 +222,30 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
           AND AI_FILTER(PROMPT('This review is negative: {0}', r.review))
     """, catalog)
     assert where_plan == plan
+
+
+def test_the_frontend_binds_parts_as_written_and_the_rule_places_them(catalog):
+    from quail.frontend.sql import bind_relation
+    from quail.logical import And, Filter, ModelCall, RegularPredicate
+    from quail.logical.naive import Hint
+
+    sql = FILTER_JOIN_SQL + " AND r.id <> 'z'"
+    relation = bind_relation(sql, catalog)
+    # one Filter over the join holds every part, the ON predicate first
+    assert isinstance(relation, Filter) and isinstance(relation.input, Join)
+    assert [scan.alias for scan in relation.input.children()] == ["r", "p"]
+    parts = relation.condition.operands
+    assert isinstance(relation.condition, And) and len(parts) == 3
+    assert isinstance(parts[0], Hint) and parts[0].selectivity == 0.05
+    assert isinstance(parts[0].condition, ModelCall)
+    assert parts[0].condition.aliases() == ("r", "p")
+    assert isinstance(parts[2], RegularPredicate)
+    # the rule puts the column test in the Scan, the one-table AI.IF in a
+    # SemanticFilter, and the two-table AI.IF in a SemanticJoin
+    plan = compile_sql(sql, catalog)
+    scans = {node.alias: node for node in plan.walk() if isinstance(node, Scan)}
+    assert [str(p) for p in scans["r"].predicates] == ["r.id <> 'z'"]
+    (gate,) = [node for node in plan.walk() if isinstance(node, SemanticFilter)]
+    assert [p.selectivity for p in gate.predicates] == [0.3]
+    (join,) = [node for node in plan.walk() if isinstance(node, SemanticJoin)]
+    assert join.selectivity == 0.05

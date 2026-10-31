@@ -3,8 +3,9 @@ title: Logical plans
 ---
 
 A logical plan describes the operations a query requests and the data they
-read. It does not specify GPU batches or attention settings. The SQL parser
-uses `LogicalPlanBuilder` to construct this plan.
+read. It does not specify GPU batches or attention settings. The SQL frontend
+binds a query, and a placement rule builds the plan from what it bound (see
+[From SQL to a plan](#from-sql-to-a-plan)).
 The [optimizer](/docs/architecture/optimizer) then rewrites it before
 building a physical plan.
 
@@ -31,6 +32,35 @@ Result
 `SemanticClassify` calls the model and adds a label column. `Filter` tests
 that column without calling the model. Keeping the two operations separate
 lets the planner reason about their placement and cost.
+
+## From SQL to a plan
+
+The SQL frontend resolves each name to a table, a column, or a model call. It
+does not decide where anything runs. It writes the FROM, JOIN, and WHERE part
+of the query as one tree:
+
+```text
+Filter: AI.IF('Review {0} discusses product {1}') AND AI.IF('This review is negative') AND r.stars > 3
+  Join on r.asin = p.asin
+    Scan: reviews as r
+    Scan: products as p
+```
+
+The `Filter` holds every ON and WHERE part as written, the ON parts first.
+`quail.frontend.sql.bind_relation` returns this tree for one SELECT.
+
+`place_relation` in `quail/logical/naive.py` then places each part:
+
+- A test of source columns of one table goes into that table's `Scan`.
+- An AI.IF or AI.SCORE test of one table goes into its `SemanticFilter`.
+- An AI.IF over two tables becomes a `SemanticJoin`, with the ON equalities of
+  the tables it brings in.
+- An EXISTS or NOT EXISTS over a model call becomes a gate join.
+- A test of a label or an answer goes right after the operator that computes
+  the column; any other part runs on the result rows.
+
+`LogicalPlanBuilder` then puts each table's operators in order, and its
+`project()` adds the result nodes.
 
 ## The node protocol
 

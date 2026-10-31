@@ -15,8 +15,6 @@ from quail.logical import (
     Alias,
     CompileError,
     ExtractStruct,
-    FilterPredicate,
-    JoinSpec,
     ModelCall,
     RegularPredicate,
 )
@@ -78,14 +76,9 @@ class ExpressionBinder:
         self.scope = Scope(catalog)
         self.tables = self.scope.tables
         self.document_columns = self.scope.document_columns
-        self.filters: dict[str, list[FilterPredicate]] = {}
-        self.label_tests: dict[
-            str, list[tuple[ModelCall, tuple[str, ...], float | None]]
-        ] = {}
-        # (condition, selectivity) per WHERE or ON term that asks no
-        # model; place_conditions decides where each runs
-        self.conditions: list[tuple] = []
-        self.joins: list[JoinSpec] = []
+        # the ON and WHERE parts in written order, ON first; see
+        # quail.logical.naive.relation_tree
+        self.parts: list = []
 
     # ---- scope ------------------------------------------------------
 
