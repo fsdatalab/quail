@@ -69,7 +69,6 @@ def execute_request_graph(context, backend, engine_state, boot):
                    for alias, value in documents.items()},
                 **context.request.relations,
             },
-            functions=context.registry.functions,
         ),
     )
     metrics = run.metrics

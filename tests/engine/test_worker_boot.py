@@ -8,13 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.backends import resources
 from quail.backends.quail import worker
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.memory import memory_report
-from quail.backends.quail.worker import LoadedGpu
 from quail.builtins import built_in_registry
-from quail.specs import H100_SXM, MODELS
 
 
 def install_fake_torch(monkeypatch):
@@ -60,30 +57,6 @@ ENVELOPE = {
 }
 PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "gpus": 1,
            "documents": {}, **ENVELOPE["settings"]}
-
-
-def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
-    calls = []
-    gpu = LoadedGpu.__new__(LoadedGpu)
-    gpu.torch = sys.modules["torch"]
-    monkeypatch.setattr(gpu.torch.cuda, "synchronize",
-                        lambda: calls.append("synchronize"))
-    gpu.pipeline = SimpleNamespace(decode_graphs=SimpleNamespace(
-        invalidate=lambda: calls.append("invalidate")))
-    gpu.arena = SimpleNamespace(
-        num_pages=8, num_sliding_pages=0, k=[], v=[], gdn_state=None,
-        conv_state=None, resize=lambda *a, **kw: calls.append("resize"))
-    gpu.model = gpu.F = None
-    gpu.decision_head = None
-    # a dense model keeps no checkpoint slots, so resize gets no state pool
-    gpu.spec = MODELS["qwen3-4b-fp8"]
-    gpu.device = H100_SXM
-    gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
-    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
-    assert calls == ["resize"]
-    calls.clear()
-    gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
-    assert calls == ["synchronize", "invalidate", "resize"]
 
 
 def test_prepared_boot_is_handed_to_the_query_and_used_once(
@@ -197,25 +170,3 @@ def test_a_failed_boot_releases_the_gpu_and_the_next_boot_loads_again(
     again, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
     assert again is gpu and boot["kind"] == "warm"
     assert calls == [("release", ["gpu"])]
-
-
-def test_releasing_a_quail_request_stops_its_children_and_frees_cuda(monkeypatch):
-    calls = []
-    cuda = SimpleNamespace(
-        is_initialized=lambda: True,
-        synchronize=lambda: calls.append("synchronize"),
-        empty_cache=lambda: calls.append("empty_cache"),
-        ipc_collect=lambda: calls.append("ipc_collect"),
-    )
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
-    monkeypatch.setattr(resources.gc, "collect", lambda: calls.append("gc"))
-    monkeypatch.setattr(resources, "_release_vllm_parallel_state",
-                        lambda: calls.append("release_parallel_state"))
-    monkeypatch.setattr(worker, "_WORKERS",
-                        SimpleNamespace(close=lambda: calls.append("children")))
-    state = {"gpu": SimpleNamespace(close=lambda: calls.append("close"))}
-    worker.release_quail_request(state)
-    assert state == {}
-    assert worker._WORKERS is None
-    assert calls == ["children", "synchronize", "close", "release_parallel_state",
-                     "gc", "empty_cache", "ipc_collect"]

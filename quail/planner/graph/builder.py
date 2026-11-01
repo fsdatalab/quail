@@ -9,6 +9,7 @@ from quail.logical import (
     LogicalPlan,
     classified_above_joins,
     column_name,
+    condition_columns,
     effective_selectivity,
     extracted_above_joins,
     has_score,
@@ -20,7 +21,7 @@ from quail.physical import (
     AiScore,
     Barrier,
     Exchange,
-    Foreign,
+    Filter,
     HashJoin,
     PortRef,
     Recombine,
@@ -166,13 +167,6 @@ class GraphBuilder:
         self.after_joins = classified_above_joins(plan.root)
         self.extract_after = extracted_above_joins(plan.root)
         self.projected_scores = score_projections(plan)
-        self.alias_applies = {}
-        self.join_applies = {}
-        for apply in self.operators.applies:
-            if apply.ids == "pairs":
-                self.join_applies.setdefault(apply.written_position, []).append(apply)
-            else:
-                self.alias_applies.setdefault(apply.aliases[0], []).append(apply)
         self.ask_filters = {
             alias: [self.operators.filters[alias][position] for position in positions]
             for alias, positions in operator_order.statistics.asks.items() if positions}
@@ -213,20 +207,24 @@ class GraphBuilder:
             self.group_ids.append(f"ai_join:{anchor}" if self.seen_ids[anchor] == 1
                              else f"ai_join:{anchor}:{self.seen_ids[anchor]}")
 
-        # a sequence streams only into its alias's first use, and never through
-        # a barrier apply
-        barrier_aliases = {alias for alias, group in self.alias_applies.items()
-                           if any(apply.kind == "barrier" for apply in group)}
-        for group in self.sequence_groups:
-            anchor = group[0][1]
-            for spec, _ in group:
-                if any(apply.kind == "barrier"
-                       for apply in self.join_applies.get(spec.written_position, ())):
-                    barrier_aliases.add(anchor)
+        # a sequence streams only into its alias's first use
         self.streamed = retention.streamed_aliases(
-            self.sequence_groups, set(self.ask_filters), barrier_aliases, self.gpus)
+            self.sequence_groups, set(self.ask_filters), self.gpus)
 
         self.nodes = []
+        # (alias, label or answer column) -> the last port that carries
+        # it, for the Filters that read it beside another operator's
+        self.computed_ports = {}
+        # alias -> the label and answer columns its operators compute
+        self.computed_columns = {}
+        for node in self.operators.classifies:
+            if len(node.call.aliases()) == 1:
+                self.computed_columns.setdefault(node.alias, set()).add(node.name)
+        for node in self.operators.extracts:
+            self.computed_columns.setdefault(node.alias, set()).update(
+                (node.name, node.span_name))
+        # the label and answer tests emitted so far
+        self.emitted_tests = ()
         self.scoring = (ScoreLowering(self.context, self.nodes,
                                      self.projected_scores, statistics.chunk)
                         if has_score(self.plan) else None)
@@ -309,8 +307,6 @@ class GraphBuilder:
         """
         steps = [step for step in self.operator_order.step_orders.get(alias, ())
                  if step.kind in kinds]
-        if ASK in kinds and not any(step.kind == ASK for step in steps):
-            port = self.emit_applies(alias, port)
         row_ports = []
         # the scores SELECT returns follow the score predicates, before
         # the classifications and extractions read the rows
@@ -529,22 +525,64 @@ class GraphBuilder:
         seconds, estimates = pricer(plan.graph)
         return replace(plan, estimated_seconds=seconds, estimates=estimates)
 
+    def emit_computed(self, alias, names, port, expected_rows) -> tuple:
+        """Append the tests an operator's columns complete, and return the rows' port.
+
+        An operator has just computed ``names``. Each label or answer
+        test of the table whose computed columns are now all computed
+        runs next, in the planner's order, so a test follows the last
+        operator it reads.
+
+        Args:
+            alias: The table.
+            names: The columns the operator computed.
+            port: The port the operator's rows leave on.
+            expected_rows: The rows the operator returns.
+
+        Returns:
+            (the port the rows leave on after the tests, the rows
+            expected after them).
+        """
+        for name in names:
+            self.computed_ports[(alias, name)] = port
+        done = {name for owner, name in self.computed_ports if owner == alias}
+        computed = self.computed_columns.get(alias, set())
+        for test in self.operators.column_filters.get(alias, ()):
+            read = set(condition_columns(test.condition)) & computed
+            if test in self.emitted_tests or not read <= done:
+                continue
+            self.emitted_tests += (test,)
+            filter_id = f"filter:{alias}:{test.position}"
+            self.nodes.append(Filter(
+                node_id=filter_id,
+                inputs=self.filter_inputs(alias, test.condition, port),
+                predicate=test.condition, aliases=(alias,),
+                selectivity=test.selectivity, written_position=test.position))
+            port = PortRef(filter_id, f"rows:{alias}")
+            expected_rows *= effective_selectivity(test.selectivity)
+        # the port after the tests still carries the operator's columns
+        for name in names:
+            self.computed_ports[(alias, name)] = port
+        return port, expected_rows
+
+    def filter_inputs(self, alias, condition, port) -> tuple:
+        """Return a document Filter's input ports: its rows, then each other column's.
+
+        A condition may read the labels or answers of operators before
+        the one it follows; each comes from the last port that carries
+        it, so the Filter stays in the pipeline.
+        """
+        others = []
+        for name in condition_columns(condition):
+            found = self.computed_ports.get((alias, name))
+            if found is not None and found != port and found not in others:
+                others.append(found)
+        return input_ports((port, *others))
+
     def unique_id(self, prefix, name):
         key = f"{prefix}:{name}"
         self.seen_ids[key] = self.seen_ids.get(key, 0) + 1
         return key if self.seen_ids[key] == 1 else f"{key}:{self.seen_ids[key]}"
-
-    def emit_applies(self, alias, port) -> PortRef:
-        """Append the alias's apply() functions; return the port its rows leave on."""
-        for apply in self.alias_applies.get(alias, ()):
-            apply_id = f"apply:{apply.function}"
-            self.nodes.append(Foreign(
-                node_id=apply_id,
-                inputs=input_ports((port,)),
-                function=apply.function, kind=apply.kind, ids=apply.ids,
-                columns=apply.columns, aliases=(alias,)))
-            port = PortRef(apply_id, f"rows:{alias}")
-        return port
 
 
 @dataclass

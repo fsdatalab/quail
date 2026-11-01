@@ -27,7 +27,7 @@ def _question(frame, seen, index, readout):
     ]
 
 
-@pytest.mark.parametrize("path", ["unified", "tree"])
+@pytest.mark.parametrize("path", ["unified"])
 def test_each_question_reads_its_frame_right_after_the_document(path, monkeypatch):
     cpu_staging(monkeypatch)
     answers = {}

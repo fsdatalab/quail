@@ -213,6 +213,8 @@ class StageExecutor:
             stop_groups=stop_groups,
             stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
+            gated=[j for j, stage in enumerate(self.stages)
+                   if stage.prepare is not None],
             reserve=self._reserve if self.paged else None,
         )
         self.borrowing = self.sched.borrowing
@@ -310,6 +312,9 @@ class StageExecutor:
         capacity = prefix_tokens + self.capacity_extra
         return (self.arena.page_cost(capacity)
                 - self.arena.growth_cost(key, capacity))
+
+    def _prepare(self, j, anchors):
+        self.stages[j].prepare([self.keys[a] for a in anchors])
 
     def _requests_of(self, a, key):
         """Return a stage request selector, or None if every request is selected.
@@ -525,6 +530,10 @@ class StageExecutor:
                 self._event(settlement)
             transitions.extend(result.transitions)
             position[key] += count
+        # the documents that entered a stage with conditions wait in
+        # their places; the conditions decide them together
+        for settlement in self.sched.decide_waiting(self._prepare):
+            self._event(settlement)
         entry.at += len(groups)
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)

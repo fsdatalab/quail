@@ -1,0 +1,29 @@
+logical:
+  Limit: 50
+    Sort: first_fix ASC NULLS LAST, t.trajectory_id ASC NULLS LAST
+      Aggregate: group by t.trajectory_id; fixes = count(*), first_fix = min(t.turn_index), longest = max(t.token_count); having fixes >= 2
+        Project: t.trajectory_id, t.turn_index, t.token_count
+          SemanticFilter
+            PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise.', t.trace) (selectivity=30.3%)
+            Scan agent_traces as t [trace, trajectory_id, turn_index, token_count]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                                      est. rows   est. pass   est. time
+  Sort: first_fix ASC NULLS LAST, t.trajectory_id ASC NULLS LAST
+    fetch=50
+    Aggregate: t.trajectory_id, fixes, first_fix, longest
+      group by t.trajectory_id
+      fixes = count(*), first_fix = min(t.turn_index), longest = max(t.token_count)
+      having fixes >= 2
+      Project: t.trajectory_id, t.turn_index, t.token_count                                 1.8
+        AiFilter: t                                                                         1.8                 19.2 ms
+          KV: not stored
+          predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                         6       30.3%
+          Scan agent_traces as t                                                              6
+            tokens=78, mean_document_tokens=13
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

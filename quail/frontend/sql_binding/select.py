@@ -13,6 +13,8 @@ from quail.frontend.sql_binding.predicates import (
     _FLIPPED,
     _PLAIN_COMPARISONS,
     COLUMN_NODES,
+    computed_value,
+    unwrap_function,
 )
 from quail.logical import (
     AggregateCall,
@@ -89,18 +91,22 @@ def bind_order(
     keys = []
     for term in order.expressions:
         target = term.this
-        if not isinstance(target, COLUMN_NODES):
+        computed = computed_value(target) and not isinstance(
+            unwrap_function(target)[0], (exp.Column, exp.Dot))
+        if not (computed or isinstance(target, COLUMN_NODES)):
             raise CompileError(
-                f"ORDER BY {target.sql()} is not a column; give an "
-                f"expression an AS name in SELECT and order by that name"
-            )
+                f"ORDER BY {target.sql()} is not a column or an expression "
+                f"of columns; give it an AS name in SELECT and order by "
+                f"that name")
         bare = target.name if isinstance(target, exp.Column) and not target.table \
             else None
         if bare in struct_names:
             raise CompileError(
                 f"ORDER BY does not compare the AI.EXTRACT struct column "
                 f"{bare!r}; extract the field as its own column")
-        expression = named[bare] if bare in named else b.resolve_value(target)
+        expression = (named[bare] if bare in named
+                      else b.bind_value(target) if computed
+                      else b.resolve_value(target))
         keys.append(
             SortKey(
                 expression,
@@ -159,10 +165,12 @@ class SelectBinder:
         """
         b, columns = self.binder, self.columns
         names = {column_name(column): column for column in columns}
-        if isinstance(node, COLUMN_NODES):
+        computed = computed_value(node) and not isinstance(
+            unwrap_function(node)[0], (exp.Column, exp.Dot))
+        if computed or isinstance(node, COLUMN_NODES):
             if isinstance(node, exp.Column) and not node.table and node.name in names:
                 return node.name
-            column = b.resolve_value(node)
+            column = b.bind_value(node) if computed else b.resolve_value(node)
             named = next((c for c in columns if isinstance(c, Alias)
                           and c.expression == column), None)
             if named is not None:
@@ -171,7 +179,9 @@ class SelectBinder:
                 columns.append(column)
             return column_name(column)
         if not (_is_call(node, "AI_SCORE") or isinstance(node, exp.AIClassify)):
-            raise CompileError(f"{node.sql()} is not a column or an AI expression")
+            raise CompileError(
+                f"{node.sql()} is not a column, an expression of columns, or "
+                f"an AI expression")
         call = b.bind_ai_value(node)
         for name, column in names.items():
             if aliased_call(column) == call:
@@ -401,11 +411,14 @@ def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list
                 "AI.SCORE, AI.CLASSIFY, AI.EXTRACT, and AI.SAE_FEATURES in "
                 "SELECT must be direct expressions with an AS name"
             )
+        if computed_value(e) and not isinstance(
+                unwrap_function(e)[0], (exp.Column, exp.Dot)):
+            value = b.bind_value(e)
+            columns.append(Alias(value, alias) if alias else value)
+            continue
         if not isinstance(e, COLUMN_NODES):
             raise CompileError(
-                f"the SELECT list is column selection only, got "
-                f"{e.sql()}: nothing computed, per the projection "
-                f"contract"
-            )
+                f"the SELECT list returns columns and functions of them, "
+                f"got {e.sql()}")
         columns.append(b.resolve_value(e, name=alias or None))
     return columns

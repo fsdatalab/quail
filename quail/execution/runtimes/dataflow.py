@@ -1,13 +1,12 @@
-"""Runtimes for the dataflow nodes: exchange, barrier, foreign, recombine, and join."""
+"""Runtimes for the dataflow nodes: exchange, barrier, recombine, and join."""
 
 from __future__ import annotations
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.catalog.pairs import columns_key, pair_ids_table, pair_table
-from quail.execution.ids import document_ids, id_positions
+from quail.catalog.pairs import columns_key, pair_table
+from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import (
     IndexRelation,
@@ -17,15 +16,12 @@ from quail.execution.result import (
 )
 from quail.execution.rows import Rows, as_table
 from quail.logical.expressions import (
-    column_name,
     column_references,
     evaluate_expression,
 )
 from quail.physical import (
     Barrier,
     Exchange,
-    Foreign,
-    GraphValidationError,
     HashJoin,
     Recombine,
     ValueType,
@@ -67,157 +63,13 @@ class BarrierRuntime:
                            for alias in node.aliases})
 
 
-def _ids_of(value) -> np.ndarray:
-    """Ids an apply() returned, from a sequence, an array, or a one-column table."""
-    try:
-        return id_positions(value)
-    except ValueError as error:
-        raise ValueError(
-            "an apply() function returned a null id; an outer join "
-            "leaves nulls, use join_type='inner'") from error
-
-
-def _pairs_of(value, left: str, right: str) -> np.ndarray:
-    """(left, right) id pairs, one row each, from a table with both alias columns."""
-    if not isinstance(value, pa.Table) or not {left, right} <= set(
-            value.column_names):
-        raise ValueError(
-            f"an apply() returning pairs must return an Arrow table with "
-            f"columns {left!r} and {right!r}")
-    return np.column_stack(
-        [_ids_of(value.column(left)), _ids_of(value.column(right))])
-
-
-def alias_table(alias: str, ids, columns, expressions):
-    """The Arrow table an apply() function sees for one alias.
-
-    Its first column is the alias's row indices under the alias
-    name; the rest are the requested columns for those rows, each
-    named as the query wrote it, such as ``length(body)``.
-    """
-    ids = document_ids(ids)
-    arrays = {alias: ids}
-    for expression in expressions:
-        arrays[column_name(expression, qualified=False)] = relation_values(
-            columns, expression).take(ids)
-    return pa.table(arrays)
-
-
 def relation_values(columns, expression):
-    """Return one key or apply() column's values from the alias's value table."""
+    """Return one key column's values from the alias's value table."""
     for ref in column_references(expression):
         if columns is None or ref.column not in columns.column_names:
             raise KeyError(f"column {ref.alias}.{ref.column} is not among the "
                            f"request's relations")
     return evaluate_expression(expression, columns)
-
-
-def foreign_call(node, values, context):
-    """Bind a user function to its input columns and collect call metrics.
-
-    Args:
-        node: The Foreign node.
-        values: alias -> the ids, or id table, the node was given.
-        context: The execution context holding the functions and
-            column sources.
-
-    Returns:
-        (call, metrics): call(ids by alias) -> kept ids or pairs, as the
-        node's ``ids`` says, checked against what it was given;
-        metrics() -> the NodeMetrics of every call so far.
-    """
-    if not isinstance(node, Foreign):
-        raise TypeError(type(node).__name__)
-    function = context.functions.get(node.function)
-    if function is None:
-        raise KeyError(
-            f"apply() function {node.function!r} is not registered on "
-            f"this session")
-    missing = [alias for alias in node.aliases if alias not in values]
-    if missing:
-        raise GraphValidationError(
-            f"{node.node_id!r} has no id input for {missing}")
-    columns = {alias: context.sources.get(columns_key(alias))
-               for alias in node.aliases}
-    expressions = {alias: [column for column in node.columns
-                           if column.alias == alias] for alias in node.aliases}
-    counters = dict(calls=0, input_rows=0, output_rows=0)
-
-    def call(ids_by_alias):
-        tables = {alias: alias_table(alias, ids, columns[alias],
-                                     expressions[alias])
-                  for alias, ids in ids_by_alias.items()}
-        counters["calls"] += 1
-        counters["input_rows"] += sum(
-            len(ids) for ids in ids_by_alias.values())
-        result = function(tables)
-        if node.ids == "pairs":
-            left, right = node.aliases
-            pairs = _pairs_of(result, left, right)
-            outside = ~(np.isin(pairs[:, 0], id_positions(ids_by_alias[left]))
-                        & np.isin(pairs[:, 1], id_positions(ids_by_alias[right])))
-            if outside.any():
-                a, b = pairs[np.flatnonzero(outside)[0]]
-                raise ValueError(
-                    f"apply() {node.function!r} returned pair "
-                    f"({a}, {b}) outside its input ids")
-            counters["output_rows"] += len(pairs)
-            return pairs
-        (alias,) = node.aliases
-        kept = _ids_of(result)
-        given = np.unique(id_positions(ids_by_alias[alias]))
-        if not np.isin(kept, given).all():
-            raise ValueError(
-                f"apply() {node.function!r} returned ids it was not "
-                f"given; a function never invents an id")
-        distinct = len(np.unique(kept))
-        if node.ids == "preserve" and distinct != len(given):
-            raise ValueError(
-                f"apply() {node.function!r} preserves ids but dropped "
-                f"{len(given) - distinct}")
-        counters["output_rows"] += len(kept)
-        return kept
-
-    def metrics():
-        return NodeMetrics(
-            input_rows=counters["input_rows"],
-            output_rows=counters["output_rows"],
-            extension={"calls": counters["calls"]})
-
-    return call, metrics
-
-
-def foreign_ids(node, inputs) -> dict:
-    """Return the input IDs for a Foreign node, indexed by table alias."""
-    values = {}
-    for port in node.inputs:
-        if port.source.port.startswith("rows:"):
-            values[port.source.port.split(":", 1)[1]] = inputs[port.name]
-    return values
-
-
-def foreign_outputs(node, result) -> dict:
-    """Build a Foreign node's output ports from its function result."""
-    if node.ids == "pairs":
-        return {f"pairs:{node.written_position}":
-                pair_ids_table(*node.aliases, result)}
-    (alias,) = node.aliases
-    return {f"rows:{alias}": Rows({alias: document_ids(result)})}
-
-
-class ForeignRuntime:
-    """Call a user function once over every id it was given.
-
-    Inside a pipeline, the executor calls a per-batch Foreign on each
-    document.
-    """
-
-    def execute(self, node, inputs, context) -> NodeResult:
-        values = foreign_ids(node, inputs)
-        call, metrics = foreign_call(node, values, context)
-        ids_by_alias = {alias: id_positions(values[alias])
-                        for alias in node.aliases}
-        return NodeResult(foreign_outputs(node, call(ids_by_alias)), metrics())
 
 
 class RecombineRuntime:

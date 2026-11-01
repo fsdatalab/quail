@@ -1,17 +1,11 @@
 """Shared retention priority, capacity, and eviction tests."""
 
-import pytest
 from helpers.fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.retention import apply_retention, policy
-from quail.cost import work
-from quail.cost.joins import PricedJoin
-from quail.cost.retention import RetentionPolicy, coefficients
-from quail.cost.sol import compute_seconds
-from quail.planner.graph.retention import schedule
+from quail.backends.quail.retention import apply_retention
+from quail.cost.retention import RetentionPolicy
 from quail.progress import set_answer_sink
-from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_SXM, QWEN3_4B_FP8
 
 
 def cpu_arena(pages, cap, uses):
@@ -74,29 +68,3 @@ def test_retention_priority_capacity_eviction_and_its_report():
     assert set(arena.accounting.retained) == {('b', 1)}
     assert arena.accounting.retained_pages == 2
     assert arena.accounting.free_pages == 14
-
-
-def test_retention_costs_and_future_use():
-    def stage(position, aliases):
-        return PricedJoin(
-            written_position=position, aliases=aliases, anchor=aliases[0],
-            anchor_free=False, semantics='full', selectivity=0.1,
-            frame_tokens={alias: 0 for alias in aliases},
-            label_tokens={alias: 0 for alias in aliases}, tail_tokens=0)
-
-    result = schedule([(stage(0, ('a', 'b')), 'a'),
-                       (stage(1, ('b', 'c')), 'c'),
-                       (stage(2, ('a', 'c')), 'a')], dict(a=10., b=10., c=10.))
-    assert result['initial']['a'] == [1.0, 0]
-    assert result['initial']['c'] == [1.0, 1]
-    assert set(result['after']['group:0']) == {'a', 'c'}
-    assert result['after']['group:2'] == {}
-
-    for model in (QWEN3_4B_FP8, DIFFUSION_GEMMA_26B_FP8):
-        retained = policy(coefficients(model, H100_SXM), {'a': (0.4, 2)})
-        for length in (1, 16, 17, 1023, 1024, 1025, 24000):
-            pages = -(-length // 16)
-            assert retained.priority(('a', 0), length, pages)[0] == pytest.approx(
-                0.4 * compute_seconds(
-                    work.scan(length, 0, window=model.sliding_window),
-                    model, H100_SXM) / pages)

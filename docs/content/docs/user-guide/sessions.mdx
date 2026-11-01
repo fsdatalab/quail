@@ -48,8 +48,8 @@ Every provider needs an `id_col` that identifies each document.
 
 ## Running queries
 
-Once tables are registered, run queries with SQL or the Python
-builder. You can run multiple queries on the same session.
+Once tables are registered, run SQL queries with `session.sql()`. You
+can run multiple queries on the same session.
 
 ```python
 result_1 = session.sql("""

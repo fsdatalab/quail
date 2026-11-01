@@ -1,0 +1,32 @@
+logical:
+  Project: c.id, k.id
+    SemanticJoin (full)
+      PROMPT('DOCUMENT {1} names a clause type and the question its labelers answered. Judge strictly from the contract in DOCUMENT {0} whether the answer to that question for this contract is yes.', c.text, k.question) (selectivity=19.3%)
+      Join
+        cross
+        SemanticFilter
+          PROMPT('DOCUMENT:\n{0}\n\nDoes one party have the right to terminate or is consent or notice required of the counterparty if such party undergoes a change of control, such as a merger, stock sale, transfer of all or substantially all of its assets or business, or assignment by operation of law?', c.text) (selectivity=19.6%)
+          Scan contracts as c [text, id]
+        Scan clause_types as k [question, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                                             est. rows   est. pass   est. time
+  Project: c.id, k.id
+    AiJoin: anchor=c                                                                                                   4.34 ms
+      KV: anchor=from filters, retain after join=no
+      join 1 full (c, k)  PROMPT('DOCUMENT {1} names a clause type…')                              7.1       19.3%
+      AiFilter: c                                                                                  1.2                 13.5 ms
+        KV rewind=on
+        expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nDoes one party ha…')                                  6       19.6%
+        Scan contracts as c                                                                          6
+          tokens=96, mean_document_tokens=16
+      Scan clause_types as k                                                                         6
+        tokens=138, mean_document_tokens=23
+  Pipeline on c: ai_filter:c -> ai_join:c (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

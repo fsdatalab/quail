@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
@@ -21,8 +22,39 @@ from quail.logical.predicates import (
 DESCRIPTION_WORDS = 25
 TASK_DESCRIPTION_WORDS = 50
 # the functions a ScalarFunction may compute, by name
-SCALAR_FUNCTIONS = {"length": pc.utf8_length, "lower": pc.utf8_lower,
-                    "upper": pc.utf8_upper, "trim": pc.utf8_trim_whitespace}
+# the SQL names of the scalar functions whose Arrow compute function has
+# another name; every other scalar function of Arrow compute is called by
+# its own name
+FUNCTION_ALIASES = {"length": "utf8_length", "lower": "utf8_lower",
+                    "upper": "utf8_upper", "trim": "utf8_trim_whitespace"}
+
+
+@functools.cache
+def arrow_function(name: str):
+    """Return the Arrow compute function a scalar function name calls.
+
+    Args:
+        name: A scalar function of Arrow compute, such as ``abs`` or
+            ``utf8_reverse``, or a SQL name in FUNCTION_ALIASES.
+
+    Raises:
+        CompileError: Arrow compute has no such function, or it is an
+            aggregate or vector function, which reads more than one row.
+    """
+    arrow = FUNCTION_ALIASES.get(name, name)
+    try:
+        kind = pc.get_function(arrow).kind
+    except KeyError as error:
+        raise CompileError(
+            f"unknown function {name!r}; a scalar function of Arrow compute "
+            f"is called by its name, such as abs or utf8_reverse") from error
+    # cast is a meta function: it converts one row at a time
+    if kind not in ("scalar", "meta") or not hasattr(pc, arrow) or (
+            kind == "meta" and arrow != "cast"):
+        raise CompileError(
+            f"{name} is an Arrow {kind} function; an expression calls a "
+            f"scalar function, which reads one row at a time")
+    return getattr(pc, arrow)
 
 
 class CompileError(ValueError):
@@ -47,10 +79,11 @@ class ColumnRef:
 
 def _validate_tree(expression) -> None:
     """Validate one value expression, whatever its node type."""
-    if not isinstance(expression, (ColumnRef, GetField, ScalarFunction, Alias)):
+    if not isinstance(expression, (ColumnRef, GetField, ScalarFunction, Literal,
+                                   Alias)):
         raise CompileError(
-            f"a value expression is a column, a field, a function, or an "
-            f"alias, got {type(expression).__name__}")
+            f"a value expression is a column, a field, a function, a "
+            f"literal, or an alias, got {type(expression).__name__}")
     expression.validate()
 
 
@@ -77,6 +110,30 @@ class GetField:
 
 
 @dataclass(frozen=True)
+class Literal:
+    """A constant in a value expression, such as the 3 of ``abs(r.stars - 3)``.
+
+    A tuple is a list of constants, passed to Arrow as an array, such as
+    the value set of ``is_in``; None is NULL.
+    """
+
+    value: Any
+
+    type_name: ClassVar[str] = "quail.literal"
+
+    def validate(self) -> None:
+        values = self.value if isinstance(self.value, tuple) else (self.value,)
+        if not all(value is None or isinstance(value, (str, int, float, bool))
+                   for value in values):
+            raise CompileError(
+                f"a literal is a string, number, boolean, NULL, or a list of "
+                f"them, got {self.value!r}")
+
+    def __str__(self) -> str:
+        return repr(self.value)
+
+
+@dataclass(frozen=True)
 class ScalarFunction:
     """A function of value expressions, computed row by row without the model."""
 
@@ -90,10 +147,7 @@ class ScalarFunction:
         return table_alias(self)
 
     def validate(self) -> None:
-        if self.function not in SCALAR_FUNCTIONS:
-            raise CompileError(
-                f"unsupported column function {self.function!r}; "
-                f"supported: {', '.join(SCALAR_FUNCTIONS)}")
+        arrow_function(self.function)
         for argument in self.args:
             _validate_tree(argument)
 
@@ -121,7 +175,7 @@ def evaluate_expression(expression, columns, *, qualified: bool = False):
 
     Args:
         expression: A column name, or a tree of ColumnRef, GetField,
-            ScalarFunction, and Alias nodes.
+            ScalarFunction, Literal, and Alias nodes.
         columns: The table, record batch, or scan input the columns come
             from, read with ``column(name)``.
         qualified: Whether result columns include their table alias.
@@ -132,6 +186,12 @@ def evaluate_expression(expression, columns, *, qualified: bool = False):
     """
     if isinstance(expression, str):
         return columns.column(expression)
+    if isinstance(expression, Literal):
+        # a function takes a constant as a Python value: Arrow's wrappers
+        # read one in an option's position, such as round's ndigits
+        if isinstance(expression.value, tuple):
+            return pa.array(expression.value)
+        return expression.value
     if isinstance(expression, ColumnRef):
         return columns.column(column_name(expression) if qualified
                               else expression.column)
@@ -150,7 +210,7 @@ def evaluate_expression(expression, columns, *, qualified: bool = False):
     arguments = [evaluate_expression(argument, columns, qualified=qualified)
                  for argument in expression.args]
     try:
-        return SCALAR_FUNCTIONS[expression.function](*arguments)
+        return arrow_function(expression.function)(*arguments)
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError,
             TypeError) as error:
         raise CompileError(
@@ -214,6 +274,8 @@ def column_name(column, *, qualified: bool = True) -> str:
         arguments = ", ".join(column_name(argument, qualified=qualified)
                               for argument in column.args)
         return f"{column.function}({arguments})"
+    if isinstance(column, Literal):
+        return repr(column.value)
     return column.name
 
 
@@ -505,12 +567,14 @@ def literal_value(value):
 class RegularPredicate:
     """A test of a value expression or a model score against literals.
 
-    ``expression`` reads one source column, with fields or a function
-    on it, such as the ``start`` field of an extraction's span; or it
-    is an AI.SCORE call, compared with a threshold between 0 and 1.
-    ``value`` is the literal compared with, a tuple of literals for
-    ``in``, and None for the null tests. A column test is decided
-    without the model.
+    ``expression`` reads one or more source columns through fields and
+    scalar functions, such as the ``start`` field of an extraction's
+    span or ``greater(r.stars, r.min_stars)``; or it is an AI.SCORE
+    call, compared with a threshold between 0 and 1. ``value`` is the
+    literal compared with, a tuple of literals for ``in``, and None for
+    the null tests and ``is true``, which keeps the rows where a
+    boolean expression is true. A column test is decided without the
+    model.
     """
 
     expression: Expression | ModelCall
@@ -524,9 +588,16 @@ class RegularPredicate:
 
     @property
     def column(self) -> ColumnRef:
-        """The one source column the expression reads."""
-        (column,) = column_references(self.expression)
-        return column
+        """The one source column the expression reads.
+
+        Raises:
+            CompileError: The expression reads more than one column; use
+                column_references() for a test of several.
+        """
+        columns = column_references(self.expression)
+        if len(columns) != 1:
+            raise CompileError(f"{self} reads {len(columns)} columns, not one")
+        return columns[0]
 
     @property
     def function(self) -> Optional[str]:
@@ -537,12 +608,17 @@ class RegularPredicate:
     def aliases(self) -> tuple[str, ...]:
         if isinstance(self.expression, ModelCall):
             return self.expression.aliases()
-        return (self.column.alias,)
+        return tuple(dict.fromkeys(
+            reference.alias for reference in column_references(self.expression)))
+
+    def tests(self) -> tuple[RegularPredicate, ...]:
+        """Return this test alone, as And.tests() returns its tests."""
+        return (self,)
 
     @property
     def text(self) -> bool:
         """Whether the comparison tests text against a pattern."""
-        return self.comparison.removeprefix("not ") in TEXT_COMPARISONS
+        return self.comparison in TEXT_COMPARISONS
 
     def validate(self) -> None:
         if isinstance(self.expression, ModelCall):
@@ -555,8 +631,8 @@ class RegularPredicate:
             if not isinstance(self.value, (int, float)) or not 0 <= self.value <= 1:
                 raise CompileError("AI.SCORE threshold must be between 0 and 1")
             return
-        if len(column_references(self.expression)) != 1:
-            raise CompileError("a column predicate tests one column")
+        if not column_references(self.expression):
+            raise CompileError("a column predicate tests a column")
         self.expression.validate()
         if self.comparison not in COLUMN_COMPARISONS:
             raise CompileError(
@@ -585,6 +661,8 @@ class RegularPredicate:
                 or its length with a string.
         """
         self.validate()
+        if self.comparison == "is true" and self.function != "length":
+            raise CompileError(f"{self.name} is text, not true or false")
         if self.comparison.startswith("is"):
             return
         values = self.value if isinstance(self.value, tuple) else (self.value,)
@@ -595,7 +673,7 @@ class RegularPredicate:
                 isinstance(v, (str, bool)) for v in values):
             raise CompileError(f"{self.name} compares with a number")
 
-    def evaluate(self, columns) -> pa.ChunkedArray:
+    def evaluate(self, columns, *, qualified: bool = False) -> pa.ChunkedArray:
         """Return a boolean array of the rows the predicate accepts.
 
         A null compared with a literal is neither accepted nor rejected
@@ -604,35 +682,39 @@ class RegularPredicate:
         Args:
             columns: The table, record batch, or rows holding the
                 tested column, read with ``column(name)``.
+            qualified: Whether the columns are named with their table
+                alias, as result rows name them.
 
         Raises:
             CompileError: The literal cannot be compared with the
                 column's values, such as a string against a number
                 column.
         """
-        values = evaluate_expression(self.expression, columns)
+        values = evaluate_expression(self.expression, columns, qualified=qualified)
+        comparison = self.comparison
         try:
-            comparison = self.comparison.removeprefix("not ")
             if comparison == "is null":
-                mask = pc.is_null(values)
-            elif comparison == "is not null":
-                mask = pc.is_valid(values)
-            elif comparison == "in":
-                mask = membership(values, self.value)
-            elif isinstance(self.value, str):
-                mask = COMPARISON_KERNELS[comparison](values, self.value)
-            else:
-                mask = compare_literal(values, comparison, self.value)
-            return pc.invert(mask) if comparison != self.comparison else mask
+                return pc.is_null(values)
+            if comparison == "is not null":
+                return pc.is_valid(values)
+            if comparison == "is true":
+                if not pa.types.is_boolean(values.type):
+                    raise TypeError(f"a test is true or false, got {values.type}")
+                return values
+            if comparison == "in":
+                return membership(values, self.value)
+            if isinstance(self.value, str):
+                return COMPARISON_KERNELS[comparison](values, self.value)
+            return compare_literal(values, comparison, self.value)
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
                 pa.ArrowTypeError, TypeError, ValueError, OverflowError) as error:
             raise CompileError(
                 f"{self} cannot be evaluated on a column of type "
                 f"{values.type}: {error}") from error
 
-    def accepts(self, columns) -> pa.Array:
+    def accepts(self, columns, *, qualified: bool = False) -> pa.Array:
         """Return the rows the predicate accepts, with every null rejected."""
-        return accepted_rows(self.evaluate(columns))
+        return accepted_rows(self.evaluate(columns, qualified=qualified))
 
     @property
     def name(self) -> str:
@@ -642,9 +724,175 @@ class RegularPredicate:
     def __str__(self) -> str:
         if self.comparison == "in":
             return f"{self.name} IN ({', '.join(repr(v) for v in self.value)})"
+        if self.comparison == "is true":
+            return self.name
         if self.comparison.startswith("is"):
             return f"{self.name} {self.comparison.upper()}"
         return f"{self.name} {self.comparison} {self.value!r}"
+
+
+class _Connective:
+    """The methods Not, And, and Or share: a node over other conditions.
+
+    A condition is a RegularPredicate, or a Not, And, or Or over
+    conditions. Arrow's Kleene kernels evaluate it, so a null follows
+    SQL's three-valued logic: ``NOT NULL`` is null, ``NULL OR TRUE`` is
+    true, and a row whose condition is null is rejected at the end.
+    """
+
+    operands: tuple
+    minimum_operands: ClassVar[int] = 2
+
+    def tests(self) -> tuple[RegularPredicate, ...]:
+        """Return the column tests under the node, in written order."""
+        return tuple(test for operand in self.operands for test in operand.tests())
+
+    def aliases(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            alias for test in self.tests() for alias in test.aliases()))
+
+    def validate(self) -> None:
+        name = type(self).__name__.upper()
+        if len(self.operands) < self.minimum_operands:
+            raise CompileError(
+                f"{name} takes at least {self.minimum_operands} conditions")
+        for operand in self.operands:
+            if not isinstance(operand, CONDITION_TYPES):
+                raise CompileError(
+                    f"{name} combines conditions, got {type(operand).__name__}")
+            if (isinstance(operand, RegularPredicate)
+                    and isinstance(operand.expression, ModelCall)):
+                raise CompileError(
+                    f"{name} combines column tests, not AI calls; put the "
+                    f"logic inside one prompt's text")
+            operand.validate()
+
+    def evaluate(self, columns, *, qualified: bool = False):
+        """Return a boolean array of the rows the condition accepts.
+
+        Args:
+            columns: The table, record batch, or rows holding the
+                tested columns, read with ``column(name)``.
+            qualified: Whether the columns are named with their table
+                alias, as result rows name them.
+        """
+        return self.combine([operand.evaluate(columns, qualified=qualified)
+                             for operand in self.operands])
+
+    def accepts(self, columns, *, qualified: bool = False) -> pa.Array:
+        """Return the rows the condition accepts, with every null rejected."""
+        return accepted_rows(self.evaluate(columns, qualified=qualified))
+
+    def __str__(self) -> str:
+        return f" {type(self).__name__.upper()} ".join(
+            _operand_text(operand) for operand in self.operands)
+
+
+@dataclass(frozen=True)
+class Not(_Connective):
+    """The rows a condition rejects; a null stays null."""
+
+    operand: RegularPredicate | Not | And | Or
+
+    type_name: ClassVar[str] = "quail.not"
+    minimum_operands: ClassVar[int] = 1
+
+    @property
+    def operands(self) -> tuple:
+        return (self.operand,)
+
+    def combine(self, masks):
+        (mask,) = masks
+        return pc.invert(mask)
+
+    def __str__(self) -> str:
+        return f"NOT {_operand_text(self.operand, always=True)}"
+
+
+@dataclass(frozen=True)
+class And(_Connective):
+    """The rows every condition accepts."""
+
+    operands: tuple[RegularPredicate | Not | And | Or, ...]
+
+    type_name: ClassVar[str] = "quail.and"
+
+    def combine(self, masks):
+        return functools.reduce(pc.and_kleene, masks)
+
+
+@dataclass(frozen=True)
+class Or(_Connective):
+    """The rows at least one condition accepts."""
+
+    operands: tuple[RegularPredicate | Not | And | Or, ...]
+
+    type_name: ClassVar[str] = "quail.or"
+
+    def combine(self, masks):
+        return functools.reduce(pc.or_kleene, masks)
+
+
+CONDITION_TYPES = (RegularPredicate, Not, And, Or)
+# the opposite of each comparison whose negation is another comparison
+_NEGATED_COMPARISONS = {"is null": "is not null", "is not null": "is null"}
+
+
+def _operand_text(operand, *, always: bool = False) -> str:
+    """Return a condition as text, in parentheses when it combines others."""
+    text = str(operand)
+    return f"({text})" if always or isinstance(operand, (And, Or)) else text
+
+
+def negate(condition):
+    """Return the condition that accepts the rows the condition rejects.
+
+    NOT moves down to the column tests by De Morgan's laws, two NOTs
+    cancel, and ``NOT x IS NULL`` becomes ``x IS NOT NULL``, as
+    Spark's BooleanSimplification rule does. Every rewrite keeps SQL's
+    three-valued logic.
+    """
+    if isinstance(condition, Not):
+        return condition.operand
+    if isinstance(condition, And):
+        return Or(tuple(negate(operand) for operand in condition.operands))
+    if isinstance(condition, Or):
+        return And(tuple(negate(operand) for operand in condition.operands))
+    if condition.comparison in _NEGATED_COMPARISONS:
+        return RegularPredicate(condition.expression,
+                                _NEGATED_COMPARISONS[condition.comparison])
+    return Not(condition)
+
+
+def normalize(condition):
+    """Return the condition with NOT on column tests only and AND and OR flat.
+
+    For example, ``NOT (a AND (b AND c))`` becomes
+    ``NOT a OR NOT b OR NOT c``.
+    """
+    if isinstance(condition, Not):
+        negated = negate(normalize(condition.operand))
+        return negated if isinstance(negated, Not) else normalize(negated)
+    if isinstance(condition, (And, Or)):
+        kind = type(condition)
+        operands = []
+        for operand in map(normalize, condition.operands):
+            operands.extend(operand.operands if isinstance(operand, kind)
+                            else (operand,))
+        return kind(tuple(operands))
+    return condition
+
+
+def condition_columns(condition) -> tuple[str, ...]:
+    """Return the names of the columns a condition's tests read, unqualified."""
+    return tuple(dict.fromkeys(
+        reference.column for test in condition.tests()
+        for reference in column_references(test.expression)))
+
+
+def conjuncts(condition) -> tuple:
+    """Return the conditions an AND combines, or the condition alone."""
+    return condition.operands if isinstance(condition, And) else (condition,)
 
 
 @dataclass(frozen=True)
@@ -666,7 +914,7 @@ class Alias:
 
 
 # a value expression: a tree of these nodes with ColumnRef leaves
-Expression = ColumnRef | GetField | ScalarFunction | Alias
+Expression = ColumnRef | GetField | ScalarFunction | Literal | Alias
 
 
 def model_call(expression) -> ModelCall:
@@ -777,7 +1025,7 @@ def _explain(expression) -> str:
             # the column
             return expression.name
         return f"{_explain(call)} AS {expression.name}"
-    if isinstance(expression, (ColumnRef, GetField, ScalarFunction)):
+    if isinstance(expression, (str, ColumnRef, GetField, ScalarFunction, Literal)):
         return column_name(expression)
     if expression.kind == "label":
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"

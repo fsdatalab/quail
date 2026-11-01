@@ -18,10 +18,8 @@ from quail.logical import LabelWork, effective_selectivity
 from quail.physical import (
     AiClassify,
     ClassifySpec,
-    Filter,
     PortRef,
 )
-from quail.physical.base import input_ports
 from quail.planner.operators.common import bind_inference, inference_node
 from quail.planner.prompt_lowering import (
     choice_token_parts,
@@ -472,35 +470,19 @@ def emit_classify(builder, alias, expected_rows, calls, port) -> tuple:
     """
     row_ports = []
     table = classify_builder(builder.context, alias, "quail")
-    steps = []
     for call in calls:
-        steps.extend((test.call, test)
-                     for test in builder.operators.label_filters.get(alias, ())
-                     if test.call == call)
-        if call not in builder.operators.labels.tests:
-            steps.append((call, None))
-    classified_calls = set()
-    for call, test in steps:
-        if call not in classified_calls:
-            spec, work = table.prepare(
-                call, builder.operators.labels.names[call], expected_rows)
-            if builder.scoring is not None:
-                builder.scoring.work += work
-            node = table.node(
-                spec, port, sum(isinstance(n, AiClassify) for n in builder.nodes))
-            builder.nodes.append(node)
-            port = PortRef(node.node_id, node.rows_port)
-            if call in builder.operators.labels.projected:
-                row_ports.append(port)
-            classified_calls.add(call)
-        if test is not None:
-            filter_id = f"filter:{alias}:{test.position}"
-            builder.nodes.append(Filter(
-                node_id=filter_id, inputs=input_ports((port,)),
-                predicate=test.condition, aliases=(alias,),
-                selectivity=test.selectivity, written_position=test.position))
-            port = PortRef(filter_id, f"rows:{alias}")
-            expected_rows *= effective_selectivity(test.selectivity)
+        name = builder.operators.labels.names[call]
+        spec, work = table.prepare(call, name, expected_rows)
+        if builder.scoring is not None:
+            builder.scoring.work += work
+        node = table.node(
+            spec, port, sum(isinstance(n, AiClassify) for n in builder.nodes))
+        builder.nodes.append(node)
+        port = PortRef(node.node_id, node.rows_port)
+        if call in builder.operators.labels.projected:
+            row_ports.append(port)
+        port, expected_rows = builder.emit_computed(
+            alias, (name,), port, expected_rows)
     return port, row_ports
 
 

@@ -32,7 +32,13 @@ import pyarrow.parquet as pq
 
 MODEL = "qwen3.5-2b-sae-bf16"
 DEVICE = "h100-sxm"
-QUESTION = "{0}\n\nWhat is the customer asking for?"
+FEATURES_SQL = r"""
+SELECT t.id, intent.feature, intent.strength
+FROM conversations t,
+     UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
+                                   t.request),
+                            pooling => 'last')) AS intent
+"""
 # Features kept per request after weighting.
 TOP_PER_REQUEST = 3
 
@@ -53,13 +59,7 @@ def read_features(conversations: pa.Table) -> pa.Table:
     with quail.Session(config) as session:
         session.register("conversations", quail.DocumentProvider.from_table(
             conversations, id_col="id"))
-        query = (
-            session.docs("conversations").alias("t")
-            .ai_sae_features(quail.prompt(QUESTION, quail.col("t.request")),
-                             pooling="last", name="intent")
-            .unnest("intent")
-            .select("t.id", "intent.feature", "intent.strength"))
-        return query.collect()
+        return session.sql(FEATURES_SQL).collect()
 
 
 def top_features(rows, features, strengths, *, num_features: int,

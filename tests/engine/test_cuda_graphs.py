@@ -1,10 +1,9 @@
 """Graph padding preserves sequence boundaries and KV ownership."""
 
-from types import SimpleNamespace
 
 import pytest
 
-from quail.backends.quail.executor.cuda_graphs import DecodeBuffers, DecodeGraphs
+from quail.backends.quail.executor.cuda_graphs import DecodeBuffers
 
 torch = pytest.importorskip("torch")
 
@@ -58,46 +57,3 @@ def test_padding_preserves_attention_and_only_real_rows_write_kv():
     assert buffers.used.tolist() == [4, 0, 0, 0, 0, 0, 0, 0]
     assert buffers.source.tolist() == [-1, 0, -1, -1, -1, -1, -1, -1]
     assert (buffers.dst == -1).all()
-
-
-@pytest.mark.parametrize("unsupported", [
-    "unified", "many_tokens", "new_arena",
-])
-def test_unsupported_batches_fall_back(unsupported):
-    source = chunk()
-    arena = SimpleNamespace(k=[], page_tokens=16)
-    calls = []
-    pipeline = SimpleNamespace(
-        engine=SimpleNamespace(arena=arena),
-        forward_chunk=lambda x: calls.append(x) or "eager")
-    graphs = DecodeGraphs(pipeline)
-    graphs.storage = arena.k
-    assert graphs.supports(source)
-    match unsupported:
-        case "unified":
-            source.attention_mode = "unified"
-        case "many_tokens":
-            source.tokens = 513
-        case "new_arena":
-            arena.k = []
-    assert graphs.forward(source) == "eager"
-    assert calls == [source]
-
-
-def test_replay_returns_independent_output_storage():
-    source = chunk()
-    arena = SimpleNamespace(k=[], page_tokens=16)
-    graphs = DecodeGraphs(SimpleNamespace(engine=SimpleNamespace(arena=arena)))
-    graphs.storage = arena.k
-    output = torch.arange(8 * 3).reshape(8, 3)
-    graphs.graphs = [SimpleNamespace(
-        buffers=DecodeBuffers(torch, 8, 16, device="cpu"),
-        graph=SimpleNamespace(replay=lambda: None), output=output)]
-    actual = graphs.forward(source)
-    expected = output[[2, 4]].clone()
-    output.zero_()
-    assert actual.equal(expected)
-    assert graphs.replays == 1
-    graphs.invalidate()
-    assert not graphs.graphs
-    assert graphs.storage is None

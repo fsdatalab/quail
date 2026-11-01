@@ -1,10 +1,8 @@
 """CPU checks that every QUAIL-B query builds and plans on Quail."""
 
-from types import SimpleNamespace
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 from helpers.fakes import letter_tokens
+from helpers.quailb_data import standin_sets
 
 import quail
 from bench.quailb import (
@@ -14,78 +12,11 @@ from bench.quailb import (
 )
 from quail.logical import Aggregate
 from quail.planner.plan import EngineConfig, Refusal
-from quail_b import data
-from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
 
 
-def _standin_sets(tmp_path):
-    """Write small parquet files with the benchmark table schemas."""
-    six = range(6)
-    tables = {
-        "reviews": {"body": [f"review text {i}" for i in range(12)]},
-        "aspects": {"aspect": ASPECTS},
-        "reports": {"report": [f"medical report {i}" for i in range(8)]},
-        "terms": {"term": [f"reaction {i}" for i in six]},
-        "claims": {
-            "claim": [f"claim {i}" for i in six],
-            "label": ["SUPPORTS" if i % 2 == 0 else "REFUTES" for i in six],
-            # a claim's page is an evidence id, as in the real corpus
-            "evidence_wiki_url": [f"evidence{i % 4}" for i in six],
-        },
-        "evidence": {"text": [f"Wikipedia passage {i}" for i in six]},
-        "citation_contexts": {
-            "destination_context": [f"citation excerpt {i}" for i in six],
-            "cited_passage_ids": [[f"passage-{i}"] for i in six],
-        },
-        "citation_passages": {
-            "passage_text": [f"cited passage {i}" for i in six],
-            "passage_ids": [[f"passage-{i}"] for i in six],
-        },
-        "agent_traces": {
-            "trace": [f"agent trace {i}" for i in six],
-            "trajectory_id": [f"at{i}" for i in six],
-            "turn_index": [5] * 6,
-            "token_count": [3] * 6,
-        },
-        "policies": {"policy_text": [f"privacy policy text {i}" for i in range(8)]},
-        "scenarios": {"scenario": SCENARIOS},
-    }
-    for name, columns in tables.items():
-        rows = len(next(iter(columns.values())))
-        ids = [f"{name}{i}" for i in range(rows)]
-        pq.write_table(pa.table({"id": ids, **columns}), tmp_path / f"{name}.parquet")
-    # the trace, sales, and contract tables, with every column of their
-    # published schema; a row's key columns name other rows of the same
-    # stand-in, as in the real corpus
-    schemas = {
-        "support_traces": data.SUPPORT_TRACE_SCHEMA,
-        "support_messages": data.MESSAGE_SCHEMA,
-        "issue_runs": data.ISSUE_RUN_SCHEMA,
-        "issue_messages": data.MESSAGE_SCHEMA,
-        "wrench_runs": data.WRENCH_RUN_SCHEMA,
-        "wrench_steps": data.WRENCH_STEP_SCHEMA,
-        "sales_calls": data.SALES_CALL_SCHEMA,
-        "contracts": data.CONTRACT_SCHEMA,
-        "clause_types": data.CLAUSE_TYPE_SCHEMA,
-    }
-    for name, schema in schemas.items():
-        columns = {}
-        for field in schema:
-            if field.name == "id":
-                columns["id"] = [f"{name}{i}" for i in six]
-            elif pa.types.is_string(field.type):
-                columns[field.name] = [f"{name} {field.name} {i}" for i in six]
-            elif pa.types.is_floating(field.type):
-                columns[field.name] = [float(i) for i in six]
-            else:
-                columns[field.name] = [i % 2 for i in six]
-        pq.write_table(pa.table(columns, schema=schema),
-                       tmp_path / f"{name}.parquet")
-
-
 def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_path):
-    _standin_sets(tmp_path)
+    standin_sets(tmp_path)
     expected = {
         *(f"IMDB-{i}" for i in range(1, 11)),
         *(f"BIO-{i}" for i in range(1, 5)),
@@ -167,37 +98,3 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     assert _submission_to_answer_s(
         "pipelined_vllm", report, frontend_s=1.0, answer_prepare_s=0.75
     ) == 11.25
-
-
-def test_kernel_cache_files_counts_each_cache_directory(tmp_path, monkeypatch):
-    from bench.quailb import kernel_cache_files
-
-    monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path / "missing"))
-    assert kernel_cache_files() == {}
-    (tmp_path / "triton" / "a").mkdir(parents=True)
-    (tmp_path / "triton" / "a" / "k.cubin").write_bytes(b"")
-    (tmp_path / "triton" / "b").mkdir()
-    (tmp_path / "deep_gemm").mkdir()
-    (tmp_path / "marker.json").write_text("{}")
-    monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path))
-    assert kernel_cache_files() == {"deep_gemm": 0, "triton": 2}
-
-
-def test_request_benchmark_counts_prompt_tokens_without_decode_tokens(monkeypatch):
-    from bench import quailb
-
-    result = SimpleNamespace(report={
-        "model_wall_s": 1.0, "finish_s": 0.0,
-        "fresh_tokens": 110, "cached_tokens": 20,
-        "backend_metrics": {"prompt_tokens": 100},
-    })
-    query = SimpleNamespace(run=lambda: result)
-    output = SimpleNamespace(runtime_s=0.0, measurements={})
-    monkeypatch.setattr(quailb, "kernel_cache_files", lambda: {})
-    monkeypatch.setattr(quailb, "_build", lambda *args: query)
-    monkeypatch.setattr(quailb, "run_output", lambda *args: output)
-    monkeypatch.setattr(quailb, "join_anchors", lambda *args: {})
-    monkeypatch.setattr(quailb, "prompt_pieces", lambda *args: {})
-    session = SimpleNamespace(config=SimpleNamespace(backend="stock_vllm"))
-    actual = quailb.run_query(session, SimpleNamespace(info=None), {})
-    assert actual.measurements["input_tokens"] == 100

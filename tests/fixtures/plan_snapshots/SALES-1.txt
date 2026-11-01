@@ -1,0 +1,20 @@
+logical:
+  Project: c.id
+    SemanticFilter
+      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the sales call above whether the customer or the sales rep names a competing vendor, dealer, or product by name. General phrases such as other providers do not count.\n\nInstruction: answer TRUE if a competitor is named, FALSE otherwise.', c.transcript) (selectivity=34.9%)
+      Scan sales_calls as c [transcript, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                    est. rows   est. pass   est. time
+  Project: c.id                                                           2.1
+    AiFilter: c                                                           2.1                 10.9 ms
+      KV rewind=on
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       34.9%
+      Scan sales_calls as c                                                 6
+        tokens=144, mean_document_tokens=24
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

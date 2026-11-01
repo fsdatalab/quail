@@ -303,12 +303,11 @@ class Oracle:
             query_settings={"reranker": self, "documents": self.documents}))
 
 
-def oracle_executor(oracle: Oracle, functions=None, **report):
+def oracle_executor(oracle: Oracle, **report):
     """Return a physical executor that runs each request's graph on the oracle.
 
     Args:
         oracle: The oracle answering the model operators.
-        functions: The apply() functions by name, when the query has any.
         **report: Report fields the response carries, such as wall_s.
     """
     def execute(request):
@@ -326,7 +325,6 @@ def oracle_executor(oracle: Oracle, functions=None, **report):
                         for node in scans}
         state = graph_state(oracle, oracle.documents)
         state["texts"] = oracle.texts
-        state["functions"] = functions or {}
         oracle.arena = state["gpu"].arena
         if getattr(request, "relations", None):
             state["columns"] = request.column_tables()

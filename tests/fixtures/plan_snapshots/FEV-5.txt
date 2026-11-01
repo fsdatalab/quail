@@ -1,0 +1,37 @@
+logical:
+  Project: c.id, e.id
+    SemanticJoin (full)
+      PROMPT('Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?', c.claim, e.text) (selectivity=0.217%)
+      Join
+        cross
+        SemanticFilter
+          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the claim above whether it asserts something about a person, rather than an organization, place, or event.\n\nInstruction: answer TRUE if the claim asserts something about a person, FALSE otherwise.', c.claim) (selectivity=59.2%)
+          Scan claims as c [claim, id]
+        SemanticFilter
+          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the Wikipedia passage above whether it primarily describes a specific person (their life, actions, or role), rather than an organization, place, or event.\n\nInstruction: answer TRUE if the passage primarily describes a specific person, FALSE otherwise.', e.text) (selectivity=55.4%)
+          Scan evidence as e [text, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                                             est. rows   est. pass   est. time
+  Project: c.id, e.id
+    AiJoin: anchor=e                                                                                                    6.5 ms
+      KV: anchor=from filters, retain after join=no
+      join 1 full (e, c)  PROMPT('Does the Wikipedia passage in DO…')                             11.8      0.217%
+      AiFilter: e                                                                                  3.3                 11.3 ms
+        KV rewind=on
+        expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       55.4%
+        Scan evidence as e                                                                           6
+          tokens=114, mean_document_tokens=19
+      AiFilter: c                                                                                  3.6                 11.8 ms
+        KV: not stored
+        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       59.2%
+        Scan claims as c                                                                             6
+          tokens=42, mean_document_tokens=7
+  Pipeline on e: ai_filter:e -> ai_join:e (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

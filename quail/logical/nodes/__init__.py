@@ -1,6 +1,5 @@
 """Logical query operators and their validation."""
 
-from quail.logical.nodes.apply import APPLY_IDS, APPLY_KINDS, Apply
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import (
     SemanticClassify,
@@ -12,9 +11,15 @@ from quail.logical.nodes.extract import (
     extracted_above_joins,
     extractions,
 )
-from quail.logical.nodes.filter import Filter, SemanticFilter, above_unnest
+from quail.logical.nodes.filter import Filter, SemanticFilter, above_projection
 from quail.logical.nodes.join import Join, SemanticJoin
-from quail.logical.nodes.relational import Aggregate, Project, Result, Window
+from quail.logical.nodes.relational import (
+    Aggregate,
+    Project,
+    Result,
+    Window,
+    reads_projection,
+)
 from quail.logical.nodes.sae_features import (
     FEATURE_LIST,
     SemanticSaeFeatures,
@@ -25,13 +30,11 @@ from quail.logical.nodes.unnest import Unnest
 from quail.logical.nodes.with_cte import WithCTE
 
 __all__ = [
-    "APPLY_IDS",
-    "APPLY_KINDS",
     "FEATURE_LIST",
     "Aggregate",
     "Window",
-    "above_unnest",
-    "Apply",
+    "above_projection",
+    "reads_projection",
     "Filter",
     "Join",
     "LogicalNode",

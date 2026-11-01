@@ -94,5 +94,5 @@ def emit_filter(builder, alias, positions, expected_rows, port, followed=False):
             stop_key=builder.stop_keys.get(alias, ())))
         surv *= effective_selectivity(p.selectivity)
         port = PortRef(ask_id, f"rows:{alias}")
-    return builder.emit_applies(alias, port)
+    return port
 

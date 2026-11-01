@@ -146,7 +146,6 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpus: int,
         runtimes=runtimes,
         model_execution=execution,
         sources=sources,
-        functions=registry.functions,
         run_pipeline=execution.execute_pipeline,
         deduplicate=payload.get("deduplicate", {}),
     )

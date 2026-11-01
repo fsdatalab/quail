@@ -123,7 +123,6 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
         model_inputs=prepare_model_inputs,
         model_result=record_model_result,
         state=runtime_state,
-        functions=state.get("functions", {}),
         run_pipeline=execution.execute_pipeline,
         deduplicate=payload.get("deduplicate", {}),
     )
