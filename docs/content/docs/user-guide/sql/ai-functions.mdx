@@ -151,8 +151,9 @@ stronger model preference for a positive answer to your question.
 ### Return scores
 
 For example, imagine a `documents` table where each row is a customer
-support request. Its `body` column contains the request text. Return the
-score for whether each customer requests a refund:
+support request. Its `body` column contains the request text. The
+following query returns the score for whether each customer requests a
+refund:
 
 ```sql
 SELECT d.id,
@@ -166,7 +167,8 @@ A score in `SELECT` requires a column alias with `AS`.
 ### Filter rows
 
 Compare the score with `<`, `<=`, `>`, or `>=`. For the same support
-requests, keep rows with a refund score of at least 0.75:
+requests, the following query keeps rows with a refund score of at least
+0.75:
 
 ```sql
 SELECT d.id
@@ -187,8 +189,8 @@ See [Options](#options).
 ### Join tables
 
 For example, imagine a `queries` table of search queries and a `documents`
-table of articles. Match each query with articles whose relevance score
-is at least 0.8:
+table of articles. The following query pairs each search query with
+articles whose relevance score is at least 0.8:
 
 ```sql
 SELECT q.id, d.id
@@ -224,8 +226,8 @@ with `AI.IF`.
 ## AI.CLASSIFY
 
 `AI.CLASSIFY` returns one of your supplied categories as a `STRING`.
-For example, imagine a `reviews` table with review text in `body`. Return
-a sentiment label for each review:
+For example, imagine a `reviews` table with review text in `body`. The
+following query returns a sentiment label for each review:
 
 ```sql
 SELECT r.id,
@@ -283,7 +285,8 @@ classifications of joined rows return labels only.
 #### Filter by category
 
 Use the classification's `AS` name in `WHERE` to filter by its label.
-For example, keep negative or mixed reviews from the `reviews` table:
+For example, the following query keeps negative or mixed reviews from the
+`reviews` table:
 
 ```sql
 SELECT r.id,
@@ -303,8 +306,9 @@ WHERE sentiment IN ('negative', 'mixed');
 
 Use a `PROMPT` that refers to both documents to classify joined rows.
 For example, imagine a `reviews` table of movie reviews and an `aspects`
-table of subjects such as acting or plot. Find the aspects each review
-discusses and classify its sentiment about each matched aspect:
+table of subjects such as acting or plot. The following query finds the
+aspects each review discusses and classifies its sentiment about each
+matched aspect:
 
 ```sql
 SELECT r.id, a.aspect,
@@ -332,8 +336,8 @@ For the scoring methods, see
 
 `AI.EXTRACT` returns the answer to each of your questions, copied from
 a document. For example, imagine a `contracts` table
-with contract text in `text`. Return the end date and the signer of
-each lease:
+with contract text in `text`. The following query returns the end date
+and the signer of each lease:
 
 ```sql
 SELECT c.id,
@@ -375,8 +379,8 @@ questions about one document read the same document KV.
 ### Filter on answers
 
 Use the extraction's `AS` name to filter by an answer field in `WHERE`.
-For example, with the same `contracts` table, keep leases whose
-extracted end date contains "2027":
+For example, with the same `contracts` table, the following query keeps
+leases whose extracted end date contains "2027":
 
 ```sql
 SELECT c.id,
@@ -493,7 +497,8 @@ what a feature means, read the documents where its strength is largest.
 The function does not generate text.
 
 For example, imagine a `tickets` table with the first message of each
-support conversation in `request`. Return the features of each request:
+support conversation in `request`. The following query returns the
+features of each request:
 
 ```sql
 SELECT t.id,
@@ -545,8 +550,8 @@ in `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates. To give a
 field another name in the result, write `f.feature AS feature_id` in
 `SELECT`. `WHERE` uses the original name.
 
-For example, with the same `tickets` table, count how many requests
-return each feature:
+For example, with the same `tickets` table, the following query counts
+how many requests return each feature:
 
 ```sql
 SELECT f.feature, COUNT(*) AS requests
