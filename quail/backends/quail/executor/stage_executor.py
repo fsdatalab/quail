@@ -1069,6 +1069,18 @@ class StageExecutor:
                 self.answer_admission, "granted", [])
             self.stats["pass_work"] = dict(self.pass_work)
             self.stats["admission_s"] = self.admission_s
+        # one indented line under the run's "done" line
+        details = []
+        if self.pass_rows and self.summary:
+            rows = np.asarray(self.pass_rows)
+            details.append(f"{len(rows):,} forward passes of a median "
+                           f"{int(np.median(rows)):,} rows")
+            if self.knee_rows:
+                # a pass below the size where it becomes compute-bound,
+                # while documents wait, is one admission left short
+                short = (rows < self.knee_rows) & np.asarray(self.pass_queued)
+                details.append(f"{int(short.sum()):,} under {self.knee_rows:,} rows "
+                               f"while documents waited")
         if self.spans and self.summary:
             self.torch.cuda.synchronize()
             # between forward passes the GPU runs readouts and uploads,
@@ -1076,23 +1088,17 @@ class StageExecutor:
             between = sum(max(0.0, end.elapsed_time(start))
                           for (*_, end), (*_, start, _)
                           in zip(self.spans, self.spans[1:])) / 1000.0
-            logger.info("%s: %s forward passes, with %.2f s of GPU time between "
-                        "them", self.label, f"{len(self.spans):,}", between)
-        if self.pass_rows and self.summary:
-            rows = np.asarray(self.pass_rows)
-            line = (f"{self.label}: {len(rows):,} passes of a median "
-                    f"{int(np.median(rows)):,} rows")
-            if self.knee_rows:
-                # a pass below the size where it becomes compute-bound,
-                # while documents wait, is one admission left short
-                short = (rows < self.knee_rows) & np.asarray(self.pass_queued)
-                line += (f"; {int(short.sum()):,} passes had under "
-                         f"{self.knee_rows:,} rows while documents waited")
-            logger.info(line)
+            details.append(f"{between:.1f} s of GPU time between passes")
         if self.decoder is not None and self.summary:
-            logger.info("%s: evicted %s answers and recomputed %s tokens",
-                        self.label, f"{self.num_evictions:,}",
-                        f"{self.recomputed_tokens:,}")
+            reads = self.decoder.read_tokens
+            details.append(f"{self.num_evictions:,} answers evicted, "
+                           f"{self.recomputed_tokens:,} tokens recomputed")
+            details.append(
+                f"answers read {reads['alone'] + reads['own'] + reads['shared']:,} "
+                f"KV tokens ({reads['all']:,} without shared reads)")
+        if details:
+            logger.info("    %s", "; ".join(details))
+        if self.decoder is not None and self.summary:
             curves = getattr(self.answer_admission, "bucket_curves", None)
             directory = os.environ.get(HEADROOM_TRACE_ENV)
             if curves and directory:
@@ -1108,9 +1114,4 @@ class StageExecutor:
                                                 for v in curve[::8]]
                                    for (q, b), curve in curves.items()}}, file)
                 logger.info("%s: headroom trace saved to %s", self.label, path)
-            reads = self.decoder.read_tokens
-            logger.info("%s: answers read %s KV tokens, against %s without "
-                        "shared reads", self.label,
-                        f"{reads['alone'] + reads['own'] + reads['shared']:,}",
-                        f"{reads['all']:,}")
         return self.sched.answers, self.spans, self.tokens

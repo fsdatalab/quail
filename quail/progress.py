@@ -2,10 +2,14 @@
 
 import contextlib
 import logging
+import os
 import sys
 import time
 
 _GPU_INDEX = None
+# names the run in every line's prefix, such as a benchmark's query
+# family; read from the environment so worker processes inherit it
+LOG_TAG_ENV = "QUAIL_LOG_TAG"
 
 
 def set_gpu_index(index: int | None) -> None:
@@ -16,7 +20,9 @@ def set_gpu_index(index: int | None) -> None:
 
 class _GpuFilter(logging.Filter):
     def filter(self, record):
-        record.gpu = "" if _GPU_INDEX is None else f"[GPU {_GPU_INDEX}]"
+        tag = os.environ.get(LOG_TAG_ENV)
+        record.gpu = (("" if not tag else f"[{tag}]")
+                      + ("" if _GPU_INDEX is None else f"[GPU {_GPU_INDEX}]"))
         return True
 
 

@@ -14,6 +14,7 @@ function and every family call running if the local process disconnects.
 """
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ import modal
 
 from bench.results import combine_measurements, write_json
 from quail.deploy.images import gpu_image, sglang_image
+from quail.progress import LOG_TAG_ENV
 from quail.specs import modal_gpu_type
 
 image = gpu_image()
@@ -103,6 +105,8 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
         query_id.strip() for query_id in query_ids_csv.split(",")
         if query_id.strip())
     family = query_family_name(query_ids)
+    # every engine line names the family, as the families' logs interleave
+    os.environ[LOG_TAG_ENV] = family
     process_results = []
     suites = {}
     for methods in process_groups:

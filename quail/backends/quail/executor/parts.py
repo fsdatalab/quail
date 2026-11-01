@@ -210,6 +210,10 @@ class SingleResultPart(ExecutionPart):
 def operator_label(word: str, nodes) -> str:
     """Return a progress label naming a run's operators, three at most."""
     names = [node.spec.name for node in nodes]
+    head, dot, _ = names[0].partition(".")
+    if dot and all(name.startswith(head + ".") for name in names):
+        # fields of one struct, such as contract.parties
+        word, names = f"{word} {head}:", [name[len(head) + 1:] for name in names]
     shown = ", ".join(names[:3])
     if len(names) > 3:
         shown += f" and {len(names) - 3} more"
