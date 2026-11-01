@@ -73,6 +73,9 @@ class Stage:
         requests: Optional callback from document key to suffix indices.
             None selects all suffixes; DROP removes the document; SKIP
             advances it without a request.
+        prepare: Optional callback from a list of document keys, run
+            before those documents enter the stage, so requests can
+            decide them together and answer each from what it saved.
         decide: Optional callback from document index and answer row to a
             Boolean. True advances the document or retains it at the final
             stage. Without a callback, any true answer is sufficient.
@@ -105,6 +108,7 @@ class Stage:
     readout: Any
     frame: list = field(default_factory=list)
     requests: Callable | None = None
+    prepare: Callable | None = None
     decide: Callable | None = None
     read_all_rows: bool = False
     read_rows: Any = None

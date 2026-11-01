@@ -311,6 +311,11 @@ class StageExecutor:
         return (self.arena.page_cost(capacity)
                 - self.arena.growth_cost(key, capacity))
 
+    def _prepare(self, j, anchors):
+        prepare = self.stages[j].prepare
+        if prepare is not None:
+            prepare([self.keys[a] for a in anchors])
+
     def _requests_of(self, a, key):
         """Return a stage request selector, or None if every request is selected.
 
@@ -509,14 +514,26 @@ class StageExecutor:
             entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
         groups = entry.groups[entry.at:entry.at + entry.step]
         values, position = entry.values, entry.positions
-        transitions = []
+        recorded = []
+        entering = []
         for a, j, start, end, _ in groups:
             key = self.readouts.group_key[j]
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
                 position[key] += 1        # the frame entry's answer means nothing
             count = end - start
             rows = values[key][position[key]:position[key] + count]
-            result = self.sched.report(a, j, start, end, rows)
+            position[key] += count
+            complete, passed = self.sched.record(a, j, start, end, rows)
+            recorded.append((rows, complete, passed))
+            if self.sched.entering(a, j, passed):
+                entering.append((a, j))
+        if entering:
+            # every answer of the chunk is in, so each stage's
+            # conditions decide the documents entering it together
+            self.sched.ask_ahead(entering, self._prepare)
+        transitions = []
+        for (a, j, start, end, _), (rows, complete, passed) in zip(groups, recorded):
+            result = self.sched.settle(a, j, complete, passed)
             if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
                 del self.own[(j, a)]
             if self.on_answers is not None:
@@ -524,7 +541,6 @@ class StageExecutor:
             for settlement in result.settlements:
                 self._event(settlement)
             transitions.extend(result.transitions)
-            position[key] += count
         entry.at += len(groups)
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)

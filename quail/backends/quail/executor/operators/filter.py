@@ -136,6 +136,7 @@ class ConditionGate(SingleResultPart):
             id(part): {document: index for index, document in enumerate(part.ids)}
             for part in producers.values()}
         self.accepted = {}
+        self.decided = {}  # key -> kept, from decide, until gate asks
 
     def read(self, name: str, documents):
         """Return a tested column's values for documents, by document id."""
@@ -152,10 +153,30 @@ class ConditionGate(SingleResultPart):
             return self.columns.column(name).slice(documents[0], 1)
         return pc.take(self.columns.column(name), pa.array(documents))
 
+    def decide(self, keys):
+        """Test the documents of keys together; return the keys kept.
+
+        The pipeline calls this with the documents entering the next
+        stage in one chunk, so the condition runs once per chunk; gate
+        then answers each document from the saved decision.
+        """
+        if not keys:
+            return keys
+        documents = [key[1] for key in keys]
+        values = {column: self.read(column, documents)
+                  for column in self.node.tested_columns}
+        kept = self.node.predicate.accepts(pa.table(values))
+        kept = kept.to_numpy(zero_copy_only=False).tolist()
+        self.decided.update(zip(keys, kept))
+        return [key for key, keep in zip(keys, kept) if keep]
+
     def gate(self, key):
-        # values settle as chunks finish, so each is tested as its
-        # document arrives; a repeated value, such as a label, is
-        # evaluated once
+        kept = self.decided.pop(key, None)
+        if kept is not None:
+            return None if kept else Stage.DROP
+        # a document decide did not see, such as one entering past a
+        # skipped stage, is tested alone; a repeated value, such as a
+        # label, is evaluated once
         values = {column: self.read(column, [key[1]])
                   for column in self.node.tested_columns}
         token = tuple(_hashable(found[0].as_py()) for found in values.values())

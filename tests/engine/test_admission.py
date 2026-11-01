@@ -5,6 +5,8 @@ import random
 from helpers.fakes import fake_readout
 
 from quail.backends.quail.executor.admission import (
+    DROP,
+    SKIP,
     JoinAdmission,
     Settlement,
     pages_for,
@@ -361,3 +363,35 @@ def test_a_document_too_long_for_a_chunk_or_the_arena_settles_unanswered():
                                     Settlement("dropped", 2, False)]
     groups = sched.next_chunk(20)
     assert sorted(a for a, *_ in groups) == [0, 3]
+
+
+def test_documents_entering_a_stage_are_asked_together_once():
+    # three stages; anchor 1 skips stage 1 and is asked at stage 2
+    # with anchor 0, which stage 1 asked; anchor 2 drops at stage 1
+    asked = []
+
+    def partners(a):
+        def ask(j):
+            asked.append((a, j))
+            if j == 1:
+                return {0: [0], 1: SKIP, 2: DROP}[a]
+            return [0]
+        return ask
+
+    sched = JoinAdmission([50, 50, 50], [[10], [10], [10]], 250, arena_pages=100,
+                          page_tokens=16,
+                          anchor_partners={a: partners(a) for a in range(3)})
+    asked.clear()
+    groups = sched.next_chunk(100)
+    recorded = [sched.record(a, j, start, end, [1]) for a, j, start, end, _ in groups]
+    prepared = []
+    sched.ask_ahead([(a, j) for (a, j, *_), (_, passed) in zip(groups, recorded)
+                     if sched.entering(a, j, passed)],
+                    lambda j, anchors: prepared.append((j, anchors)))
+    settled = [sched.settle(a, j, *outcome)
+               for (a, j, *_), outcome in zip(groups, recorded)]
+    assert prepared == [(1, [0, 1, 2]), (2, [1])]
+    assert sorted(asked) == [(0, 1), (1, 1), (1, 2), (2, 1)]
+    assert [s.settlements for s in settled] == [
+        (), (), (Settlement("dropped", 2, False),)]
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False), (1, 2, 0, 1, False)]

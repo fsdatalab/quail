@@ -204,6 +204,21 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
             for node_id, result in part.results().items()}
 
 
+def _prepare(gates, prepare):
+    """Return a Stage.prepare that decides keys at each gate in turn.
+
+    A gate decides only the keys every gate before it kept, as the
+    stage's requests ask them one at a time.
+    """
+    def prepared(keys):
+        for gate in gates:
+            keys = gate.decide(keys)
+        if prepare is not None:
+            prepare(keys)
+
+    return prepared
+
+
 def gated_stages(parts) -> list:
     """Combine operator stages and attach conditions to the stages after them.
 
@@ -227,32 +242,34 @@ def gated_stages(parts) -> list:
             part.stages = [replace(part.stages[0], rewind=True), *part.stages[1:]]
     for part in parts:
         if not part.stages:
-            pending.append(part.gate)
+            pending.append(part)
             continue
         first = part.stages[0]
         if pending:
-            gates = list(pending)
+            gates = tuple(pending)
             asked = first.requests
 
             def guarded(key, gates=gates, asked=asked):
                 for gate in gates:
-                    if gate(key) is Stage.DROP:
+                    if gate.gate(key) is Stage.DROP:
                         return Stage.DROP
                 return None if asked is None else asked(key)
 
             first.requests = guarded
+            first.prepare = _prepare(gates, first.prepare)
             pending = []
         stages.extend(part.stages)
     if pending and stages:
         def finish(key, gates=tuple(pending)):
             for gate in gates:
-                if gate(key) is Stage.DROP:
+                if gate.gate(key) is Stage.DROP:
                     return Stage.DROP
             return Stage.SKIP
 
         # a document that passes the trailing conditions skips this
         # stage and counts as a survivor, with nothing asked
-        terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish)
+        terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish,
+                         prepare=_prepare(tuple(pending), None))
         parts[-1].stages = [terminal]
         stages.append(terminal)
     writes = frame_writes(stages)
