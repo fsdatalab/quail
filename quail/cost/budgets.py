@@ -246,8 +246,11 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
                 mean_document_tokens: float | None = None) -> tuple[int, int]:
     """Pages of the two KV pools: (every-token pool, sliding-layer pool).
 
-    A model with Gated DeltaNet layers gets the KV pages left beside its
-    checkpoints (see hybrid_arena_pages) and 0 sliding pages.
+    A model with state layers (Gated DeltaNet or short convolution) gets
+    the KV pages left beside its checkpoints (see hybrid_arena_pages).
+    Those pages are priced at every attention layer's KV, so a model
+    that also has sliding layers gets a sliding pool of the same size
+    within that price; any other gets 0 sliding pages.
 
     A model without sliding layers gets one pool and 0 sliding pages.
     With sliding layers, a document holds its whole prefix on the
@@ -261,8 +264,9 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
     if model.state_layers:
-        return hybrid_arena_pages(model, device, chunk_tokens,
-                                  mean_document_tokens), 0
+        full = hybrid_arena_pages(model, device, chunk_tokens,
+                                  mean_document_tokens)
+        return full, full if model.sliding_layer_set else 0
     free = arena_bytes(model, device, chunk_tokens)
     page_bytes_full = model.kappa_full * device.page_tokens
     page_bytes_sliding = model.kappa_sliding * device.page_tokens

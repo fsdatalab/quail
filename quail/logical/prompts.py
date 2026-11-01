@@ -67,6 +67,9 @@ class PromptLayout:
         choice_label: For a model that classifies by scoring one option
             block per label, the text before an AI.CLASSIFY question;
             None for a model that classifies with Quail's label prompt.
+        join_question_last: Whether a join prompt puts the question
+            after every document, in the tail, instead of in the anchor
+            frame, for a model trained to read its question last.
     """
 
     name: str
@@ -77,6 +80,7 @@ class PromptLayout:
     question_separator: str | None = None
     answer_rows: tuple[int, ...] = ()
     choice_label: str | None = None
+    join_question_last: bool = False
 
     def question_segments(self, question: str, separator: str) -> list[str]:
         """The text after a document: one entry per tokenized segment."""
@@ -114,6 +118,16 @@ PROMPT_LAYOUTS = {layout.name: layout for layout in (
         answer_rows=(0, 1),
         choice_label="Task type: choice\nQuestion:\n",
     ),
+    # Liquid's d1 decision models: the document, then the question
+    # after "QUESTION:", then the instruction to answer yes or no.
+    PromptLayout(
+        "d1",
+        document_label="",
+        question_label="QUESTION:\n",
+        question_end="\n\nReply with yes or no only.",
+        question_separator="\n\n\n",
+        join_question_last=True,
+    ),
 )}
 
 
@@ -137,8 +151,21 @@ def render_join_question(template: str, layout: str = "ai-if") -> str:
 
 def render_join_frame(template: str, placeholder: int,
                       layout: str = "ai-if") -> str:
-    """The complete anchor frame, tokenized as one string."""
+    """The complete anchor frame, tokenized as one string.
+
+    A layout that asks the question last keeps only the anchor note.
+    """
+    if PROMPT_LAYOUTS[layout].join_question_last:
+        return join_anchor_note(placeholder)
     return join_anchor_note(placeholder) + render_join_question(template, layout)
+
+
+def join_tail_segments(template: str, layout: str = "ai-if") -> list[str]:
+    """The text after a join's last document, one entry per tokenized segment."""
+    spec = PROMPT_LAYOUTS[layout]
+    if spec.join_question_last:
+        return spec.question_segments(template, JOIN_QUESTION_SEP)
+    return [spec.question_end, *spec.answer_segments]
 
 
 def render_join_prompt_text(prompt, documents, anchor: int) -> str:
@@ -613,16 +640,15 @@ def bind_join_prompt(template: str, args: tuple,
             f"document block per table), got aliases {aliases}; to "
             f"mention a table's document again, use its marker in the "
             f"question text, not a second placeholder")
-    spec = PROMPT_LAYOUTS[layout]
-    question = render_join_question(template, layout)
+    frame = render_join_frame(template, 0, layout)[len(join_anchor_note(0)):]
     preamble = shared_preamble(turn[0], layout)
-    segments = [spec.question_end, *spec.answer_segments]
+    segments = join_tail_segments(template, layout)
     segments[-1] += turn[1]
     segments = tuple(segments)
     tail = "".join(segments)
     return Prompt(template=template, args=tuple(args),
                   preamble=preamble, tail=tail,
-                  frame=question, frame_text=question, kind="join",
+                  frame=frame, frame_text=frame, kind="join",
                   label_texts=tuple(
                       (alias, join_label(index),
                        render_join_frame(template, index, layout))

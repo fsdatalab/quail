@@ -142,6 +142,7 @@ and
 | Qwen3.5 27B fp8 | NVIDIA H100 SXM |
 | Qwen3.8 27B fp8 | NVIDIA H100 SXM |
 | LFM2 2.6B bf16 | NVIDIA H100 SXM |
+| d1-2B bf16 | NVIDIA H100 SXM |
 
 You can use 1, 2, 4, or 8 GPUs per query.
 

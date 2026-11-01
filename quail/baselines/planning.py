@@ -40,7 +40,7 @@ from quail.planner import (
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.optimizer.candidates import PhysicalCandidate
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
-from quail.planner.prompt_lowering import answer_row_offsets, true_false_token_ids
+from quail.planner.prompt_lowering import answer_ids, answer_row_offsets
 from quail.planner.search.join_order import search_joins
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import extraction_refusal, has_extract, has_label
@@ -138,7 +138,7 @@ def plan_request_backend(
         region, request_node, aliases, join_specs, extract_specs,
         operators.labels))
 
-    true_ids, false_ids = true_false_token_ids(context.tokenizer)
+    true_ids, false_ids = answer_ids(context.model, context.tokenizer)
     plan = PhysicalPlan(
         model=context.model.name,
         device=context.device.name,

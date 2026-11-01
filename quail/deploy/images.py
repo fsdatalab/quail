@@ -50,7 +50,8 @@ def _cuda_base() -> modal.Image:
 
 
 def gpu_image(*local_dirs: tuple[str, str],
-              packages: tuple[str, ...] = ()) -> modal.Image:
+              packages: tuple[str, ...] = (),
+              commands: tuple[str, ...] = ()) -> modal.Image:
     """The GPU image: quail's locked dependencies and the dev group.
 
     Args:
@@ -58,10 +59,14 @@ def gpu_image(*local_dirs: tuple[str, str],
             quail source; Modal refuses a build step after a mount.
         packages: Extra packages installed before the mounts, such as
             a profiler a cell runs.
+        commands: Shell commands run before the mounts, such as an
+            install into a folder outside the project's environment.
     """
     image = _cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
+    if commands:
+        image = image.run_commands(*commands)
     image = image.add_local_python_source("quail", "bench")
     for local, remote in local_dirs:
         image = image.add_local_dir(local, remote_path=remote)

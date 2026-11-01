@@ -19,6 +19,7 @@ instead of starting NCCL or gloo.
 import json
 from pathlib import Path
 
+from quail.backends.quail.executor.models.lfm3 import is_lfm3, load_lfm3
 from quail.backends.quail.executor.moe_configs import write_configs
 from quail.specs.files import resolve_model_path
 
@@ -219,9 +220,6 @@ def load_model(model_name: str, revision: str | None = None, *,
 
     import torch
     import vllm
-    from vllm.config import set_current_vllm_config
-    from vllm.engine.arg_utils import EngineArgs
-    from vllm.model_executor.model_loader import get_model
 
     # vLLM's Triton fused MoE reads tuned tile configs from this
     # folder before its own; ours add entries for Quail's chunk sizes
@@ -231,6 +229,35 @@ def load_model(model_name: str, revision: str | None = None, *,
             Path(tempfile.gettempdir()) / "quail-moe-configs", base)
         os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
     model_path = resolve_model_path(model_name, revision)
+    if is_lfm3(model_path):
+        # vLLM has no LFM3 model; its loader would also refuse the config
+        model = load_lfm3(model_path)
+    else:
+        model = _load_vllm_model(model_path, max_batched_tokens, moe_backend,
+                                 text_only)
+    if num_layers is not None:
+        keep_layers(torch, model, num_layers)
+    if answer_token_ids is None:
+        from gigatoken import Tokenizer
+
+        from quail.planner.prompt_lowering import true_false_ids
+
+        tokenizer = Tokenizer(model_path).as_hf()
+        true_ids, false_ids = true_false_ids(tokenizer)
+        answer_token_ids = true_ids | false_ids
+    retain_answer_head(torch, model, answer_token_ids)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    return model
+
+
+def _load_vllm_model(model_path, max_batched_tokens, moe_backend, text_only):
+    """Load a checkpoint through vLLM's model loader, with no engine."""
+    import torch
+    from vllm.config import set_current_vllm_config
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader import get_model
+
     if is_decision2(model_path):
         from quail.backends.quail.executor.models.decision2 import (
             register_backbone,
@@ -251,17 +278,4 @@ def load_model(model_name: str, revision: str | None = None, *,
     # vLLM's fused MoE kernels read the forward context, which is
     # built from this config
     model.quail_vllm_config = config
-    if num_layers is not None:
-        keep_layers(torch, model, num_layers)
-    if answer_token_ids is None:
-        from gigatoken import Tokenizer
-
-        from quail.planner.prompt_lowering import true_false_ids
-
-        tokenizer = Tokenizer(model_path).as_hf()
-        true_ids, false_ids = true_false_ids(tokenizer)
-        answer_token_ids = true_ids | false_ids
-    retain_answer_head(torch, model, answer_token_ids)
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
     return model

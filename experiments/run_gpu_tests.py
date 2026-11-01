@@ -9,7 +9,14 @@ import modal
 
 from quail.deploy.images import gpu_image
 
-image = gpu_image(("tests/gpu", "/root/tests/gpu"))
+# Liquid's d1 code needs a newer transformers than the project pins; the
+# d1 test's reference process reads it from this folder alone
+D1_REFERENCE_PACKAGES = "/opt/d1-reference"
+image = gpu_image(
+    ("tests/gpu", "/root/tests/gpu"),
+    commands=(f"/usr/local/bin/python3 -m pip install --quiet --target "
+              f"{D1_REFERENCE_PACKAGES} "
+              f"transformers==5.19.0",))
 
 app = modal.App("quail-milestone1")
 volumes = {
