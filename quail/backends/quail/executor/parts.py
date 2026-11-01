@@ -207,6 +207,37 @@ class SingleResultPart(ExecutionPart):
         return {self.node.node_id: self.result_value}
 
 
+def execute_alone(state, nodes, inputs, build, *, label: str) -> dict:
+    """Run one operator's nodes as a pipeline of their own.
+
+    The first node is charged the wall time, counted from before the
+    part is built.
+
+    Args:
+        state: The loaded model and current query state.
+        nodes: The operator's nodes, in pipeline order.
+        inputs: The documents' inputs, the gpu_timing setting, and an
+            optional row limit.
+        build: Returns (part, prefixes, anchor keys, prefix tree or
+            None) for the nodes.
+        label: The operator's word in progress labels.
+
+    Returns:
+        Node id -> NodeResult.
+    """
+    state.gpu_timing = bool(inputs.get("gpu_timing", False))
+    started = time.perf_counter()
+    part, prefixes, keys, tree = build()
+    results = execute_parts(
+        state, [part], prefixes, keys, keep_kv=nodes[-1].keep_kv,
+        prefix_tree=tree, limit=inputs.get("limit"),
+        label=f"{label} {', '.join(node.spec.name for node in nodes)}")
+    first = nodes[0].node_id
+    results[first] = replace(results[first], metrics=replace(
+        results[first].metrics, wall_s=time.perf_counter() - started))
+    return results
+
+
 def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
                   paged=True, on_answers=None) -> dict:

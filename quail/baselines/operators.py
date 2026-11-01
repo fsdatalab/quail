@@ -244,42 +244,12 @@ def classification_rows(spec, columns, labels) -> Rows:
     return rows.filter(rows.column(spec.output).is_valid())
 
 
-def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
-    """Decode one answer per prompt body and locate it in the document's text.
-
-    Generation stops where the model ends its turn. Each answer is cut
-    as read_extractions describes.
-
-    Args:
-        client: The engine client.
-        spec: The RequestExtractSpec with the prompt tail.
-        bodies: Token ids for each prompt before the tail, preamble included.
-        texts: The document text of each body.
-        body_texts: The text of each prompt before the tail, for an
-            engine that tokenizes the prompt itself; None sends token ids.
-
-    Returns:
-        A dict with one answer and one span per body, the counts of
-        unanswered and unaligned documents, the request and token
-        counts, and the generation seconds.
-    """
-    tail = token_list(spec.tail_token_ids)
-    params = client.decode_params(spec.max_answer_tokens)
-    if body_texts is not None:
-        prompts = [body_text + spec.tail_text for body_text in body_texts]
-    else:
-        prompts = [{"prompt_token_ids": body + tail} for body in bodies]
-    started = time.perf_counter()
-    outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
-    return read_extractions(outputs, texts, time.perf_counter() - started)
-
-
 def extract_fields(client, specs, bodies, texts, body_texts=None) -> list[dict]:
     """Decode the answers of several fields over the same prompt bodies.
 
     A client with run_extract_fields decodes every field of a document
     while the document's KV is live, so each body is computed about
-    once. Otherwise each field is a separate generate call.
+    once. Otherwise every field's prompts go in one generate call.
 
     Args:
         client: The engine client.
@@ -290,13 +260,13 @@ def extract_fields(client, specs, bodies, texts, body_texts=None) -> list[dict]:
             engine that tokenizes the prompt itself; None sends token ids.
 
     Returns:
-        One extract_documents result per spec. The fields run together,
+        One read_extractions result per spec. The fields run together,
         so each result reports the wall seconds of the whole run.
     """
     if (len(specs) < 2 or not bodies
             or not hasattr(client, "run_extract_fields")):
-        return [extract_documents(client, spec, bodies, texts, body_texts)
-                for spec in specs]
+        extracted, _ = answer_documents(client, specs, (), bodies, texts, body_texts)
+        return extracted
     answer_tokens = max(spec.max_answer_tokens for spec in specs)
     run = client.run_extract_fields(
         client.decode_params(answer_tokens), bodies,

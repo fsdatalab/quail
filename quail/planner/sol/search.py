@@ -36,6 +36,7 @@ from quail.planner.search.table_steps import (
     table_steps,
 )
 from quail.planner.search.table_steps import CLASSIFY as CLASSIFY_STEP
+from quail.planner.search.table_steps import EXTRACT as EXTRACT_STEP
 from quail.planner.search.table_steps import FEATURES as FEATURES_STEP
 from quail.planner.search.table_steps import MAP as MAP_STEP
 from quail.planner.statistics.prefixes import (
@@ -93,16 +94,7 @@ class _EstimatePricing:
             tail, self.mean_tokens, search.model, search.device,
             search.chunk_tokens, first=fresh)) for fresh in (True, False))
 
-    def classify(self, call, name: str) -> tuple:
-        return self._question(call.prompt)
-
-    def extract(self, node) -> tuple:
-        return self._question(node.call.prompt)
-
-    def features(self, node) -> tuple:
-        return self._question(node.call.prompt)
-
-    def map(self, node) -> tuple:
+    def column(self, node) -> tuple:
         return self._question(node.call.prompt)
 
     def document_head(self, prompt):
@@ -372,14 +364,11 @@ class Search:
             alias = scan_node.alias
             predicates = self.filters.get(alias, ())
             asks = list(range(len(predicates)))
-            calls = [call for call, owner in self.labels.calls
-                     if owner == alias and len(call.aliases()) == 1]
-            extracts = [node for node in self.extracts if node.alias == alias]
-            feature_calls = [node for node in self.sae_features
-                             if node.alias == alias]
-            maps = [node for node in self.maps if node.alias == alias]
-            if (not asks and not calls and not extracts and not feature_calls
-                    and not maps):
+            columns = {node.name: node for node in (
+                *self.logical_operators.classifies, *self.extracts,
+                *self.sae_features, *self.maps)
+                if node.alias == alias and len(node.call.aliases()) == 1}
+            if not asks and not columns:
                 continue
             tokens = self.aliases[alias].tokens
             mean_document_tokens = sum(tokens) / len(tokens) if tokens else 0
@@ -414,23 +403,13 @@ class Search:
                         first,
                         stages,
                     )
-                elif step.kind == CLASSIFY_STEP:
-                    rows, stage_work = self.classify_stage(
-                        alias, step.key, rows, first, stages)
-                elif step.kind == FEATURES_STEP:
-                    node = next(node for node in feature_calls
-                                if node.name == step.key)
-                    rows, stage_work = self.features_stage(
-                        alias, node, rows, first, stages)
-                elif step.kind == MAP_STEP:
-                    node = next(node for node in maps if node.name == step.key)
-                    rows, stage_work = self.map_stage(
-                        alias, node, rows, first, stages)
                 else:
-                    node = next(node for node in extracts if node.name == step.key)
-                    rows, stage_work = self.extract_stage(
-                        alias, node, rows, first, stages
-                    )
+                    stage = {CLASSIFY_STEP: self.classify_stage,
+                             EXTRACT_STEP: self.extract_stage,
+                             FEATURES_STEP: self.features_stage,
+                             MAP_STEP: self.map_stage}[step.kind]
+                    rows, stage_work = stage(
+                        alias, columns[step.key], rows, first, stages)
                 work = work + stage_work
             survivors[alias] = rows
         return survivors, work, stages
@@ -446,8 +425,9 @@ class Search:
             rows, passed, stage_work))
         return passed, stage_work
 
-    def classify_stage(self, alias, call, rows, first, stages):
+    def classify_stage(self, alias, node, rows, first, stages):
         """Classify the live rows, then apply the label filters testing the call."""
+        call = node.call
         stage_work = self.question_work(
             alias, rows, self.lower(call.prompt).tail_tokens, first)
         self.answer_rows += len(rows)

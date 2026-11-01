@@ -1,7 +1,5 @@
 """Run a pipeline's extractions and build their answer tables."""
 
-import time
-from dataclasses import replace
 
 import numpy as np
 
@@ -11,7 +9,7 @@ from quail.backends.quail.executor.extract import (
 from quail.backends.quail.executor.extract.stages import ExtractionInputs
 from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import (
-    execute_parts,
+    execute_alone,
     gpu_seconds,
     shared_prefix_tree,
     stage_spans,
@@ -44,21 +42,15 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
         TypeError: A node is not an extraction.
         ValueError: The table's text was not loaded.
     """
-    state.gpu_timing = bool(inputs.get("gpu_timing", False))
-    started = time.perf_counter()
-    part = ExtractPart(state, nodes, inputs["document_ids"], inputs)
-    stages = part.extraction
-    tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes,
-                               state.loaded_model.arena)
-            if nodes[0].spec.share_prefixes else None)
-    results = execute_parts(
-        state, [part], stages.prefixes, stages.keys,
-        keep_kv=nodes[-1].keep_kv, prefix_tree=tree, limit=inputs.get("limit"),
-        label=f"extract {', '.join(node.spec.name for node in nodes)}")
-    first = nodes[0].node_id
-    results[first] = replace(results[first], metrics=replace(
-        results[first].metrics, wall_s=time.perf_counter() - started))
-    return results
+    def build():
+        part = ExtractPart(state, nodes, inputs["document_ids"], inputs)
+        stages = part.extraction
+        tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes,
+                                   state.loaded_model.arena)
+                if nodes[0].spec.share_prefixes else None)
+        return part, stages.prefixes, stages.keys, tree
+
+    return execute_alone(state, nodes, inputs, build, label="extract")
 
 
 def extraction_results(nodes, stages, document_ids, *, fresh, own,

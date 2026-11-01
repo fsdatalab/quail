@@ -33,15 +33,10 @@ from quail.planner.graph import retention
 from quail.planner.graph.pricing import PlanPricer
 from quail.planner.graph.results import result_nodes
 from quail.planner.graph.shards import contiguous_shards
-from quail.planner.operators.classify import (
-    emit_classify,
-    emit_joined_classify,
-)
-from quail.planner.operators.extract import emit_extract
+from quail.planner.operators.classify import emit_joined_classify
+from quail.planner.operators.columns import column_planner
 from quail.planner.operators.filter import emit_filter
 from quail.planner.operators.join import emit_join
-from quail.planner.operators.map import emit_map
-from quail.planner.operators.sae_features import emit_sae_features
 from quail.planner.operators.score import (
     ScoreLowering,
     emit_projected_scores,
@@ -57,9 +52,6 @@ from quail.planner.search.table_steps import (
     ASK,
     CLASSIFY,
     COLUMN_STEPS,
-    EXTRACT,
-    FEATURES,
-    MAP,
     resident_after,
 )
 from quail.planner.statistics.tables import summarize_alias
@@ -223,11 +215,14 @@ class GraphBuilder:
         self.computed_ports = {}
         # alias -> the label and answer columns its operators compute
         self.computed_columns = {}
+        # (alias, name) -> each one-table column operator
+        self.column_nodes = {}
         for node in (*self.operators.classifies, *self.operators.extracts,
                      *self.operators.sae_features, *self.operators.maps):
             if len(node.call.aliases()) == 1:
                 self.computed_columns.setdefault(node.alias, set()).update(
                     node.added_columns)
+                self.column_nodes[(node.alias, node.name)] = node
         # the label and answer tests emitted so far
         self.emitted_tests = ()
         self.scoring = (ScoreLowering(self.context, self.nodes,
@@ -326,16 +321,11 @@ class GraphBuilder:
             elif kind == ASK:
                 port = emit_filter(self, alias, positions, expected_rows, port,
                                        followed=run[-1] is not steps[-1])
-            elif kind == CLASSIFY:
-                port, rows = emit_classify(
-                    self, alias, expected_rows, positions, port
-                )
-                row_ports += rows
             else:
-                emit = {EXTRACT: emit_extract, FEATURES: emit_sae_features,
-                        MAP: emit_map}[kind]
-                port, rows = emit(self, alias, expected_rows, positions, port,
-                                  resident=resident)
+                port, rows = self.emit_columns(
+                    alias, expected_rows, port,
+                    [self.column_nodes[(alias, name)] for name in positions],
+                    resident=resident)
                 row_ports += rows
             for step in run:
                 expected_rows *= step.selectivity
@@ -520,37 +510,37 @@ class GraphBuilder:
         seconds, estimates = pricer(plan.graph)
         return replace(plan, estimated_seconds=seconds, estimates=estimates)
 
-    def emit_columns(self, alias, expected_rows, port, calls, node_of, *,
-                     projected=None) -> tuple:
+    def emit_columns(self, alias, expected_rows, port, nodes, *,
+                     resident=False) -> tuple:
         """Emit one table's column operators in run order, each followed by its tests.
 
-        The calls run in one pipeline (quail.physical.pipelines): a
-        document is read once for all of them. A label or answer test
-        runs right after the last operator whose columns it reads, in
-        the planner's order, so it drops a document before the next
-        operator reads it.
+        Each node comes from its kind's ColumnPlanner. The operators run
+        in one pipeline (quail.physical.pipelines): a document is read
+        once for all of them. A label or answer test runs right after
+        the last operator whose columns it reads, in the planner's
+        order, so it drops a document before the next operator reads it.
 
         Args:
             alias: The table.
-            expected_rows: The documents the first call reads.
-            port: The port the documents stand at before the calls.
-            calls: The calls, in run order.
-            node_of: Builds a call's node from (call, port, expected_rows,
-                index); index counts the calls emitted before it.
-            projected: Whether SELECT returns a call's answer; None
-                returns every call's.
+            expected_rows: The documents the first operator reads.
+            port: The port the documents stand at before the operators.
+            nodes: The logical column operators, in run order.
+            resident: Whether the step before the run left the
+                documents' KV for the first operator to read.
 
         Returns:
-            Where the documents stand after the calls and their tests,
-            and the rows ports of the answers SELECT returns.
+            Where the documents stand after the operators and their
+            tests, and the rows ports of the columns SELECT returns.
         """
         computed = self.computed_columns.get(alias, set())
         row_ports = []
-        for index, call in enumerate(calls):
-            node = node_of(call, port, expected_rows, index)
+        for index, logical_node in enumerate(nodes):
+            planner = column_planner(logical_node)
+            node = planner.node(self, logical_node, port, expected_rows,
+                                resident or index > 0)
             self.nodes.append(node)
             port = PortRef(node.node_id, node.rows_port)
-            if projected is None or projected(call):
+            if planner.projected(self.operators, logical_node):
                 row_ports.append(port)
             span = getattr(node.spec, "span_name", None)
             names = (node.spec.name, *(() if span is None else (span,)))

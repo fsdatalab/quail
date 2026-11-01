@@ -6,8 +6,6 @@ document's whole pages. Each branch decodes one row per pass. The
 document's stage is reported only after every branch's answer ends.
 """
 
-import time
-from dataclasses import replace
 from itertools import groupby
 
 import numpy as np
@@ -18,7 +16,7 @@ from quail.backends.quail.executor.parts import (
     ColumnPart,
     ExecutionPart,
     document_inputs,
-    execute_parts,
+    execute_alone,
     execution_prefix_tree,
     gpu_seconds,
     join_prior_rows,
@@ -60,24 +58,16 @@ def execute_maps(state, nodes, inputs) -> dict:
     Returns:
         Node id -> NodeResult with the node's answer table.
     """
-    started = time.perf_counter()
-    state.gpu_timing = bool(inputs.get("gpu_timing", False))
     ids = np.asarray(inputs["document_ids"], dtype=np.int64)
     (alias,) = nodes[0].spec.aliases
-    part = MapPart(state, nodes, ids, 0)
-    prefixes = DocumentPrefixes(nodes[0].document_head,
-                                inputs["documents"][alias], ids)
-    results = execute_parts(
-        state, [part], prefixes, DocumentKeys(alias, ids),
-        keep_kv=nodes[-1].keep_kv,
-        prefix_tree=execution_prefix_tree(nodes[0], prefixes,
-                                          state.loaded_model.arena),
-        limit=inputs.get("limit"),
-        label=f"map {', '.join(node.spec.name for node in nodes)}")
-    first = nodes[0].node_id
-    results[first] = replace(results[first], metrics=replace(
-        results[first].metrics, wall_s=time.perf_counter() - started))
-    return results
+
+    def build():
+        prefixes = DocumentPrefixes(nodes[0].document_head,
+                                    inputs["documents"][alias], ids)
+        tree = execution_prefix_tree(nodes[0], prefixes, state.loaded_model.arena)
+        return MapPart(state, nodes, ids, 0), prefixes, DocumentKeys(alias, ids), tree
+
+    return execute_alone(state, nodes, inputs, build, label="map")
 
 
 class MapPart(ColumnPart, ExecutionPart):
