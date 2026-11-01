@@ -525,45 +525,60 @@ class GraphBuilder:
         seconds, estimates = pricer(plan.graph)
         return replace(plan, estimated_seconds=seconds, estimates=estimates)
 
-    def emit_computed(self, alias, names, port, expected_rows) -> tuple:
-        """Append the tests an operator's columns complete, and return the rows' port.
+    def emit_columns(self, alias, expected_rows, port, calls, node_of, *,
+                     projected=None) -> tuple:
+        """Emit one table's column operators in run order, each followed by its tests.
 
-        An operator has just computed ``names``. Each label or answer
-        test of the table whose computed columns are now all computed
-        runs next, in the planner's order, so a test follows the last
-        operator it reads.
+        The calls run in one pipeline (quail.physical.pipelines): a
+        document is read once for all of them. A label or answer test
+        runs right after the last operator whose columns it reads, in
+        the planner's order, so it drops a document before the next
+        operator reads it.
 
         Args:
             alias: The table.
-            names: The columns the operator computed.
-            port: The port the operator's rows leave on.
-            expected_rows: The rows the operator returns.
+            expected_rows: The documents the first call reads.
+            port: The port the documents stand at before the calls.
+            calls: The calls, in run order.
+            node_of: Builds a call's node from (call, port, expected_rows,
+                index); index counts the calls emitted before it.
+            projected: Whether SELECT returns a call's answer; None
+                returns every call's.
 
         Returns:
-            (the port the rows leave on after the tests, the rows
-            expected after them).
+            Where the documents stand after the calls and their tests,
+            and the rows ports of the answers SELECT returns.
         """
-        for name in names:
-            self.computed_ports[(alias, name)] = port
-        done = {name for owner, name in self.computed_ports if owner == alias}
         computed = self.computed_columns.get(alias, set())
-        for test in self.operators.column_filters.get(alias, ()):
-            read = set(condition_columns(test.condition)) & computed
-            if test in self.emitted_tests or not read <= done:
-                continue
-            self.emitted_tests += (test,)
-            filter_id = f"filter:{alias}:{test.position}"
-            self.nodes.append(Filter(
-                node_id=filter_id,
-                inputs=self.filter_inputs(alias, test.condition, port),
-                predicate=test.condition, aliases=(alias,),
-                selectivity=test.selectivity, written_position=test.position))
-            port = PortRef(filter_id, f"rows:{alias}")
-            expected_rows *= effective_selectivity(test.selectivity)
-        # the port after the tests still carries the operator's columns
-        for name in names:
-            self.computed_ports[(alias, name)] = port
-        return port, expected_rows
+        row_ports = []
+        for index, call in enumerate(calls):
+            node = node_of(call, port, expected_rows, index)
+            self.nodes.append(node)
+            port = PortRef(node.node_id, node.rows_port)
+            if projected is None or projected(call):
+                row_ports.append(port)
+            span = getattr(node.spec, "span_name", None)
+            names = (node.spec.name, *(() if span is None else (span,)))
+            for name in names:
+                self.computed_ports[(alias, name)] = port
+            done = {name for owner, name in self.computed_ports if owner == alias}
+            for test in self.operators.column_filters.get(alias, ()):
+                read = set(condition_columns(test.condition)) & computed
+                if test in self.emitted_tests or not read <= done:
+                    continue
+                self.emitted_tests += (test,)
+                filter_id = f"filter:{alias}:{test.position}"
+                self.nodes.append(Filter(
+                    node_id=filter_id,
+                    inputs=self.filter_inputs(alias, test.condition, port),
+                    predicate=test.condition, aliases=(alias,),
+                    selectivity=test.selectivity, written_position=test.position))
+                port = PortRef(filter_id, f"rows:{alias}")
+                expected_rows *= effective_selectivity(test.selectivity)
+            # the port after the tests still carries the operator's columns
+            for name in names:
+                self.computed_ports[(alias, name)] = port
+        return port, row_ports
 
     def filter_inputs(self, alias, condition, port) -> tuple:
         """Return a document Filter's input ports: its rows, then each other column's.

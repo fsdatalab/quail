@@ -46,3 +46,8 @@ def inference_node(node_type, spec, sources, *, index, backend, model):
     return node_type(
         node_id=f"{name}:{index}", inputs=input_ports(tuple(sources)),
         backend_name=backend, model=model, spec=spec)
+
+
+def node_index(builder, node_type) -> int:
+    """Return how many nodes of a type the builder holds."""
+    return sum(isinstance(node, node_type) for node in builder.nodes)

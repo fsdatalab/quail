@@ -20,7 +20,11 @@ from quail.physical import (
     ClassifySpec,
     PortRef,
 )
-from quail.planner.operators.common import bind_inference, inference_node
+from quail.planner.operators.common import (
+    bind_inference,
+    inference_node,
+    node_index,
+)
 from quail.planner.prompt_lowering import (
     choice_token_parts,
     classify_prompt_tokens,
@@ -468,22 +472,17 @@ def emit_classify(builder, alias, expected_rows, calls, port) -> tuple:
         Where the documents stand after them, and the rows ports of
         the labels SELECT returns.
     """
-    row_ports = []
     table = classify_builder(builder.context, alias, "quail")
-    for call in calls:
-        name = builder.operators.labels.names[call]
-        spec, work = table.prepare(call, name, expected_rows)
+    labels = builder.operators.labels
+
+    def node_of(call, port, expected_rows, _index):
+        spec, work = table.prepare(call, labels.names[call], expected_rows)
         if builder.scoring is not None:
             builder.scoring.work += work
-        node = table.node(
-            spec, port, sum(isinstance(n, AiClassify) for n in builder.nodes))
-        builder.nodes.append(node)
-        port = PortRef(node.node_id, node.rows_port)
-        if call in builder.operators.labels.projected:
-            row_ports.append(port)
-        port, expected_rows = builder.emit_computed(
-            alias, (name,), port, expected_rows)
-    return port, row_ports
+        return table.node(spec, port, node_index(builder, AiClassify))
+
+    return builder.emit_columns(alias, expected_rows, port, calls, node_of,
+                                projected=lambda call: call in labels.projected)
 
 
 def joined_calls(labels: LabelWork) -> list:

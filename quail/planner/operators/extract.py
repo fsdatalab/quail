@@ -5,14 +5,11 @@ from dataclasses import replace
 from quail.cost import budgets
 from quail.cost import extract as extract_cost
 from quail.cost.retention import coefficients
-from quail.physical import (
-    AiExtract,
-    ExtractSpec,
-    PortRef,
-)
+from quail.physical import AiExtract, ExtractSpec
 from quail.planner.operators.common import (
     bind_inference,
     inference_node,
+    node_index,
 )
 
 
@@ -89,28 +86,13 @@ def emit_extract(builder, alias, expected_rows, names, port, resident=False) -> 
     """
     extracts = {node.name: node for node in builder.operators.extracts
                 if node.alias == alias}
-    calls = [extracts[name] for name in names]
-    row_ports = []
-    for index, logical_node in enumerate(calls):
-        # the extractions of a table and the Filters on their answers
-        # run in one pipeline (quail.physical.pipelines): a document
-        # is read once for all of them, and a Filter drops it before
-        # the next question
-        spec = extract_spec(
-            builder.context,
-            logical_node.call,
-            logical_node.name,
-            expected_rows,
-            resident=resident or index > 0,
-        )
-        node = inference_node(
-            AiExtract, spec, (port,),
-            index=sum(isinstance(n, AiExtract) for n in builder.nodes),
-            backend="quail", model=builder.model.name)
-        builder.nodes.append(node)
-        port, expected_rows = builder.emit_computed(
-            alias, (logical_node.name, logical_node.span_name),
-            PortRef(node.node_id, node.rows_port), expected_rows)
-        row_ports.append(port)
-    return port, row_ports
 
+    def node_of(name, port, expected_rows, index):
+        logical_node = extracts[name]
+        spec = extract_spec(builder.context, logical_node.call, name,
+                            expected_rows, resident=resident or index > 0)
+        return inference_node(
+            AiExtract, spec, (port,), index=node_index(builder, AiExtract),
+            backend="quail", model=builder.model.name)
+
+    return builder.emit_columns(alias, expected_rows, port, names, node_of)
