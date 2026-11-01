@@ -10,7 +10,7 @@ goes to /results/ablations/sol/maps-<query>-sf<sf>-<model>.json.
 
     uv run modal run experiments/cells/map_sol.py::estimate \
         --query CUAD-21 --scale-factor 1.0 \
-        --run-dir /results/ablations/vllm_preemption/<run id>/quail \
+        --run-dir /results/benchmarks/quailb/<run id>/quail \
         2>&1 | tee "$run_log"
 """
 

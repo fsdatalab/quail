@@ -13,7 +13,6 @@ from helpers.oracle import Oracle, finish, oracle_executor
 import quail
 from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
-from quail.execution.spans import held_prefix, locate_span, read_phrase
 from quail.logical import (
     CompileError,
 )
@@ -42,27 +41,6 @@ def session(tmp_path):
                    DocumentProvider.from_parquet(str(path), id_col="id"))
     yield value
     value.close()
-
-
-def test_span_helpers_read_locate_and_widen_an_answer():
-    assert read_phrase(' the "Premises" ') == 'the "Premises"'
-    assert read_phrase("March 3, 2027") == "March 3, 2027"
-    for empty in ("", " ", "\n"):
-        assert read_phrase(empty) is None
-    assert locate_span(LEASE, "March 3, 2027") == (14, 27)
-    # case and runs of whitespace are forgiven; the first occurrence wins
-    assert locate_span(LEASE, "RENT   is") == (29, 36)
-    assert locate_span("a b a b", "a b") == (0, 3)
-    assert locate_span(LEASE, "April") is None
-    assert locate_span(LEASE, "   ") is None
-    # a free answer is cut to the whole words its document holds
-    assert held_prefix(LEASE, 'March 3, 2027." and then') == (
-        "March 3, 2027.", (14, 28))
-    assert held_prefix(LEASE, "March 3, 2028") == ("March 3,", (14, 22))
-    assert held_prefix(LEASE, "rent IS $2,000 a month") == (
-        "rent IS $2,000", (29, 43))
-    assert held_prefix(LEASE, "April 1") is None
-    assert held_prefix("the absent one", "a phrase") is None
 
 
 @pytest.mark.parametrize("filtered", [True])

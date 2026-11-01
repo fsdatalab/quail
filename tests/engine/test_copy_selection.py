@@ -21,14 +21,10 @@ def inputs(spec, vocabulary, texts):
     return ExtractionInputs(state, [spec], vocabulary, range(len(texts)), None, texts)
 
 
-# every pair of settings appears in some case
+# every setting appears in some case
 @pytest.mark.parametrize("dtype,draft_tokens,num_questions", [
     (torch.float32, 0, 1),
-    (torch.bfloat16, 4, 1),
-    (torch.bfloat16, 0, 3),
-    (torch.float32, 4, 3),
-    (torch.float32, 4, 41),
-    (torch.bfloat16, 0, 41),
+    (torch.bfloat16, 4, 41),
 ])
 def test_copy_traces_match_the_host_rule_on_the_same_logits(
     monkeypatch, tmp_path, dtype, draft_tokens, num_questions

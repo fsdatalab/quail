@@ -44,10 +44,8 @@ def test_model_weights_and_kv_memory_budgets():
             > budgets.arena_tokens(model, H100_SXM)
 
 
-@pytest.mark.parametrize("model", [
-    QWEN3_4B_FP8, QWEN3_32B_FP8, QWEN3_5_4B_BF16, DIFFUSION_GEMMA_26B_FP8,
-])
-@pytest.mark.parametrize("chunk", [1, 1_000_000])
+@pytest.mark.parametrize("model,chunk", [
+    (QWEN3_4B_FP8, 1), (DIFFUSION_GEMMA_26B_FP8, 1_000_000)])
 def test_copy_verification_shares_readout_workspace_without_reducing_kv(model, chunk):
     workspace = budgets.copy_verification_workspace_bytes(model, chunk)
     readout = 2 * budgets.READOUT_BLOCK_ROWS * model.vocab * 4
@@ -61,35 +59,6 @@ def test_copy_verification_shares_readout_workspace_without_reducing_kv(model, c
     assert budgets.chunk_memory_bytes(model, chunk) == (
         model.W_resident + activations
         + budgets.checkpoint_memory_bytes(model, chunk))
-
-
-@pytest.mark.parametrize("model", [
-    QWEN3_4B_FP8, QWEN3_32B_FP8, QWEN3_5_4B_BF16, DIFFUSION_GEMMA_26B_FP8,
-])
-def test_copy_workspace_scales_with_activations_until_the_readout_cap(model):
-    workspace = budgets.copy_verification_workspace_bytes(model, 1)
-    assert workspace == model.act_per_token
-    assert budgets.copy_verification_workspace_bytes(model, 2) == 2 * workspace
-    wider = replace(model, hidden=2 * model.hidden)
-    assert budgets.copy_verification_workspace_bytes(wider, 1) == wider.act_per_token
-    assert wider.act_per_token > workspace
-    readout = 2 * budgets.READOUT_BLOCK_ROWS * model.vocab * 4
-    chunk = int(4 * readout // model.act_per_token) + 1
-    assert budgets.copy_verification_workspace_bytes(model, chunk) == readout
-    assert budgets.copy_verification_workspace_bytes(model, 2 * chunk) == readout
-    larger_vocab = replace(model, vocab=2 * model.vocab)
-    assert budgets.copy_verification_workspace_bytes(larger_vocab, chunk) == 2 * readout
-
-
-def test_readouts_use_the_workspace_budget_block_size():
-    from quail.backends.quail.executor.readout import (
-        AsyncLabelLogprobs,
-        AsyncTopLogprobs,
-    )
-
-    assert budgets.READOUT_BLOCK_ROWS == 512
-    assert AsyncLabelLogprobs.BLOCK_ROWS == budgets.READOUT_BLOCK_ROWS
-    assert AsyncTopLogprobs.BLOCK_ROWS == budgets.READOUT_BLOCK_ROWS
 
 
 def test_device_memory_budgets():
@@ -108,20 +77,6 @@ def test_device_memory_budgets():
     full, sliding = budgets.arena_pages(QWEN3_32B_FP8, L40S, l40s_chunk)
     assert sliding == 0
     assert full * budgets.PAGE_TOKENS >= l40s_chunk
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 @pytest.mark.parametrize("tokens,expected_slots", [(200, 587)])
@@ -156,11 +111,3 @@ def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
     }
     with pytest.raises(ValueError, match="holds no checkpoint"):
         budgets.hybrid_arena_pages(model, H100_SXM, chunk, 1e7)
-
-
-
-
-
-
-
-

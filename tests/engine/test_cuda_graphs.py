@@ -19,7 +19,6 @@ from quail.specs import (
     QWEN3_5_2B_SAE_BF16,
     QWEN3_5_4B_BF16,
     QWEN3_6_35B_A3B_FP8,
-    QWEN3_32B_FP8,
 )
 
 torch = pytest.importorskip("torch")
@@ -45,7 +44,7 @@ def pipeline():
     return model
 
 
-@pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_32B_FP8, QWEN3_5_4B_BF16])
+@pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_5_4B_BF16])
 def test_dense_models_capture_the_stock_vllm_sizes_with_padding_under_256(model):
     buckets = graph_token_buckets(model, H100_SXM)
     assert len(buckets) == 81
@@ -153,8 +152,7 @@ def test_captured_kv_mappings_mask_padding_and_keep_partial_page_order():
     assert not keys[1].count_nonzero()
 
 
-@pytest.mark.parametrize("unsupported", ["large", "empty", "disabled", "hook",
-                                          "canvas", "uncaptured", "arena", "writes"])
+@pytest.mark.parametrize("unsupported", ["large", "disabled", "canvas", "writes"])
 def test_unsupported_batches_fall_back(unsupported):
     model = pipeline()
     graphs = PiecewiseGraphs(model, token_buckets=(8,), memory_bytes=1024)

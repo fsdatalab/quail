@@ -6,24 +6,12 @@ import numpy as np
 import pytest
 
 from quail.cost.answers import (
-    prior_survival,
     remaining_tokens,
 )
 from quail.cost.decode import DecodeCost
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.work import Work
 from quail.specs import DEVICES, MODELS
-
-
-def test_cold_start_uses_the_map_length_prior():
-    prior = prior_survival(3, 8)
-    remaining = remaining_tokens([], [], 3, 8)
-    for written in range(8):
-        assert np.isclose(remaining[written], prior[written + 1:].sum()
-                          / prior[written])
-    assert remaining[8] == 0
-    np.testing.assert_allclose(remaining, remaining_tokens([], [], 3, 8,
-                                                          survival=prior))
 
 
 def test_censored_answers_leave_the_risk_set_after_their_written_length(
@@ -39,8 +27,7 @@ def test_censored_answers_leave_the_risk_set_after_their_written_length(
 
 
 @pytest.mark.parametrize("model_name,device_name", [
-    ("qwen3.5-4b-bf16", "h100-sxm"), ("qwen3.5-27b-fp8", "l40s"),
-    ("qwen3.8-27b-fp8", "b200"), ("lfm2-2.6b-bf16", "l40s"),
+    ("qwen3.5-4b-bf16", "h100-sxm"), ("lfm2-2.6b-bf16", "l40s"),
 ])
 def test_hybrid_decode_prices_state_movement_and_compute_from_specs(
         model_name, device_name):

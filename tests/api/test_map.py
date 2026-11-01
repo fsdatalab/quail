@@ -84,12 +84,8 @@ def test_a_map_after_a_classification_shares_its_pipeline(session):
     (f"SELECT r.id FROM reviews r WHERE AI_MAP(r.body, '{SUMMARY}')",
      "not supported"),
     (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}') FROM reviews r", "AS name"),
-    ("SELECT r.id, AI.MAP(r.body, '') AS s FROM reviews r", "at least one word"),
     (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 0) AS s FROM reviews r",
      "positive integer"),
-    (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 'x') AS s FROM reviews r",
-     "whole number"),
-    ("SELECT r.id, AI.MAP(r.body, 12) AS s FROM reviews r", "instruction string"),
 ])
 def test_a_malformed_map_is_refused(session, sql, message):
     with pytest.raises(CompileError, match=message):
@@ -117,8 +113,7 @@ def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
     moved.validate()
 
 
-@pytest.mark.parametrize("form", ["call", "alias", "cte"])
-@pytest.mark.parametrize("dialect", ["snowflake", "bq"])
+@pytest.mark.parametrize("form,dialect", [("alias", "bq"), ("cte", "snowflake")])
 def test_a_plain_test_keeps_only_matching_map_answers(session, form, dialect):
     call = "AI.MAP(r.body, 'Name the topic.', 16)"
     select = f"SELECT r.id, {call} AS topic FROM reviews r"

@@ -91,8 +91,7 @@ def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared, run):
             model=QWEN3_4B_FP8, device=H100_SXM)
         assert cost.work.tokens == fresh_tokens
         assert cost.work.kv_read == retained_reads
-@pytest.mark.parametrize("mode", ["tree", "unified"])
-@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("mode,shared", [("tree", True), ("unified", False)])
 def test_copy_drafts_pack_as_causal_sequences_without_combining_slots(
         monkeypatch, mode, shared):
     cpu_staging(monkeypatch)

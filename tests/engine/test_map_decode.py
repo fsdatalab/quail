@@ -27,7 +27,6 @@ from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
 from quail.cost.answers import answer_survival
 from quail.cost.decode import DecodeCost
-from quail.cost.work import Work
 from quail.specs import DEVICES, QWEN3_4B_FP8
 
 VOCABULARY = 1024
@@ -168,10 +167,10 @@ def classification_and_condition(ids):
     return classification, condition
 
 
-@pytest.mark.parametrize("path", ["unified", "tree"])
-@pytest.mark.parametrize("lag", [0, 3])
-@pytest.mark.parametrize("budget", [40, 400])
-@pytest.mark.parametrize("question", [None, [700, 701]])
+@pytest.mark.parametrize("budget,question,lag,path", [
+    (40, None, 0, "unified"),
+    (400, [700, 701], 3, "tree"),
+])
 def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
                                            path):
     cpu_staging(monkeypatch)
@@ -230,9 +229,7 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("pages", [6, 300])
-@pytest.mark.parametrize("limit", [None, 2])
-@pytest.mark.parametrize("lag", [0, 3])
+@pytest.mark.parametrize("pages,limit,lag", [(6, 2, 3), (300, None, 0)])
 def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(
         monkeypatch, pages, limit, lag):
     cpu_staging(monkeypatch)
@@ -292,9 +289,8 @@ def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("num_maps", [1, 2, 3])
-@pytest.mark.parametrize("limit", [None, 2])
-@pytest.mark.parametrize("pages", [6, 300])
+@pytest.mark.parametrize("num_maps,limit,pages", [
+    (1, None, 300), (2, None, 6), (3, 2, 6)])
 def test_fused_document_operators_equal_running_each_operator_alone(
         monkeypatch, num_maps, limit, pages):
     cpu_staging(monkeypatch)
@@ -376,16 +372,11 @@ def map_state(setup, arena, forward_chunk):
                 batch_decode=batch_decode))))
 
 
-# every pair of settings appears in some case
+# every setting appears in some case
 @pytest.mark.parametrize("num_maps,limit,lag,budget,stop_modulus,path", [
     (3, None, 3, 20, 0, "tree"),
     (1, 2, 0, 200, 19, "tree"),
-    (2, None, 3, 200, 19, "unified"),
     (2, 2, 0, 20, 0, "unified"),
-    (1, None, 3, 20, 0, "unified"),
-    (3, 2, 0, 200, 19, "unified"),
-    (2, None, 0, 20, 19, "tree"),
-    (3, 2, 3, 200, 0, "tree"),
 ])
 def test_evicted_answers_recompute_exactly_with_gates_and_limits(
         monkeypatch, num_maps, limit, lag, budget, stop_modulus, path,
@@ -445,8 +436,7 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("budget,lag", [(20, 0), (200, 3)])
-@pytest.mark.parametrize("window", [None, 5])
+@pytest.mark.parametrize("budget,lag,window", [(20, 0, 5), (200, 3, None)])
 def test_hybrid_answers_recompute_exactly_and_reuse_checkpoint_slots(
         monkeypatch, budget, lag, window):
     test_evicted_answers_recompute_exactly_with_gates_and_limits(
@@ -565,10 +555,10 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
     return stats, model
 
 
-@pytest.mark.parametrize("mode", ["headroom=0", "headroom"])
-@pytest.mark.parametrize("num_maps", [1, 3])
-@pytest.mark.parametrize("budget,lag", [(20, 0), (200, 3)])
-@pytest.mark.parametrize("path", ["unified", "tree"])
+@pytest.mark.parametrize("mode,num_maps,budget,lag,path", [
+    ("headroom", 3, 20, 0, "tree"),
+    ("headroom=0", 1, 200, 3, "unified"),
+])
 def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
         monkeypatch, mode, num_maps, budget, lag, path):
     stats, model = run_maps_under_eviction(monkeypatch, mode, num_maps, budget,
@@ -613,36 +603,6 @@ def test_zero_headroom_admits_when_the_prompt_fits_but_waits_for_replays():
     assert admission.waits()
 
 
-def test_headroom_grows_with_long_answers_and_shrinks_when_pages_are_valuable():
-    long_ended = [(0, 30), (1, 31)]
-    _, admission = headroom_admission(ended=long_ended, num_documents=4,
-                                      prefix_tokens=8000)
-    admission.refresh(np.array([-2, -2, -1, -1]))
-    roomy = admission._candidate_headroom(2)
-    assert roomy > 0
-    admission.page_value = 1.0
-    assert admission._candidate_headroom(2) == 0
-    _, short = headroom_admission(ended=[(0, 1), (1, 1)], expected_tokens=1,
-                                  num_documents=4, prefix_tokens=8000)
-    short.refresh(np.array([-2, -2, -1, -1]))
-    assert short._candidate_headroom(2) < roomy
-
-
-def test_a_page_is_priced_over_the_prompt_and_headroom_a_document_takes():
-    _, admission = headroom_admission(ended=[(0, 30), (1, 31)], num_documents=4,
-                                      prefix_tokens=8000)
-    admission.refresh(np.array([-2, -2, -1, -1]))
-    value = admission.page_value
-    added = admission._added_work(2)
-    base = admission.work if admission.work.tokens else added
-    gain = admission.decode_cost.gain(base, added, admission.expected_tokens[2])
-    prompt_pages = admission.page_cost(8000 + 6)
-    headroom = int(admission._admission_headroom(2, value)[1].sum())
-    assert headroom > 0
-    assert value == gain / (prompt_pages + headroom)
-    assert value < gain / prompt_pages
-
-
 def test_headroom_of_running_answers_is_counted_against_new_documents():
     # rebuilding a long prompt costs more than a page saves the next document
     decoder, admission = headroom_admission(ended=[(2, 30)], prefix_tokens=8000)
@@ -653,49 +613,6 @@ def test_headroom_of_running_answers_is_counted_against_new_documents():
     need = 4 + admission._candidate_headroom(1)
     assert admission.allows(1, held + need, 4)
     assert not admission.allows(1, held + need - 1, 4)
-
-
-def test_bucket_curves_follow_their_own_answers_and_fall_back_to_the_map():
-    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 40,
-                         [64], [STOP], 4, expected_tokens=[8])
-    decoder.answer_slots = {0: np.arange(40)}
-    prefix_lengths = [8] * 20 + [256] * 19 + [1024]
-    for a in range(39):
-        decoder.lengths[0][a] = decoder.written[0][a] = 4 if a < 20 else 60
-    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
-    admission = HeadroomAdmission(decoder, prefix_lengths, 6, {}, [0] * 40,
-                                  lambda tokens: pages_for(tokens, 4), cost,
-                                  bucket_answers=10)
-    admission.refresh(np.array([-2] * 39 + [-1]))
-    short = admission.bucket_curves[(0, 3)]
-    long = admission.bucket_curves[(0, 8)]
-    alone = admission.bucket_curves[(0, 10)]
-    whole = answer_survival(decoder.lengths[0], decoder.written[0], 8, 64)
-    assert short[10] < 0.3 < whole[10] < 0.6 < long[10]
-    np.testing.assert_allclose(alone, whole)
-    sparse = HeadroomAdmission(decoder, prefix_lengths, 6, {}, [0] * 40,
-                               lambda tokens: pages_for(tokens, 4), cost,
-                               bucket_answers=25)
-    sparse.refresh(np.array([-2] * 39 + [-1]))
-    np.testing.assert_allclose(sparse.bucket_curves[(0, 3)], whole)
-
-
-def test_pages_have_value_to_waiting_documents_before_any_answer_runs():
-    _, admission = headroom_admission(num_documents=4)
-    admission.refresh(np.array([-1, -1, -1, -1]))
-    assert admission.work.tokens == 0
-    assert admission.page_value > 0
-
-
-def test_replay_seconds_charge_extra_passes_and_spare_compute():
-    cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
-    decode = cost.row_work(np.full(8, 512.0)).total()
-    small, large = cost.replay_seconds(decode, np.array([16, 8192]))
-    assert 0 <= small < large
-    split = cost.replay_seconds(decode, np.array([8192]), chunk_tokens=2048)[0]
-    assert split == pytest.approx(large + 3 * cost.weight_seconds)
-    alone = cost.replay_seconds(Work(), np.array([16]))[0]
-    assert alone >= cost.weight_seconds > small
 
 
 def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():

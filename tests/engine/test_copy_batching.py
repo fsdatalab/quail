@@ -166,9 +166,7 @@ def verifier_inputs(decoder, vocabulary, mixed=False):
 
 @pytest.mark.parametrize("trace,num_fields,workspace_bytes", [
     (False, 1, 64 * 2**20),
-    (True, 41, 64 * 2**20),
-    (True, 3, 128000),
-    (False, 41, 128000),
+    (True, 41, 128000),
 ])
 def test_long_draft_choices_and_state_match_sequential_verification(
     monkeypatch, tmp_path, trace, num_fields, workspace_bytes

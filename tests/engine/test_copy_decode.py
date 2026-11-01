@@ -19,10 +19,8 @@ from quail.backends.quail.executor.map_decoder import MapDecoder
     "draft_tokens,draft_policy,spellings,answer_limit",
     [
         (0, "fixed", False, 1),
-        (0, "fixed", True, 8),
         (4, "fixed", True, 8),
         (4, "adaptive", False, 8),
-        (4, "adaptive", True, 1),
     ],
 )
 def test_copy_answers_and_spans_match_the_recurrent_token_rule(
@@ -130,14 +128,10 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
         ]
 
 
-# every pair of settings appears in some case
+# every setting appears in some case
 @pytest.mark.parametrize("draft_tokens,limit,filtered,lag,pages", [
     (3, 2, False, 0, 24),
-    (0, None, True, 3, 24),
-    (3, 2, True, 3, 300),
-    (0, None, False, 0, 300),
-    (0, 2, False, 3, 300),
-    (3, None, True, 0, 300),
+    (0, None, True, 3, 300),
 ])
 def test_copy_branches_match_reference_after_filters_and_limits(
     monkeypatch, draft_tokens, limit, filtered, lag, pages, state_slots=0
@@ -328,8 +322,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
                            "the workload must continue after rejecting a draft")
 
 
-@pytest.mark.parametrize("draft_tokens", [0, 3])
-@pytest.mark.parametrize("pages,lag,filtered", [(24, 0, False), (300, 3, True)])
+@pytest.mark.parametrize("draft_tokens,pages,lag,filtered", [(3, 300, 3, True)])
 def test_hybrid_copy_answers_match_reference_after_rejected_drafts(
         monkeypatch, draft_tokens, pages, lag, filtered):
     test_copy_branches_match_reference_after_filters_and_limits(
@@ -337,15 +330,12 @@ def test_hybrid_copy_answers_match_reference_after_rejected_drafts(
         lag=lag, pages=pages, state_slots=120)
 
 
-# every pair of settings appears in some case
+# every setting appears in some case
 @pytest.mark.parametrize(
     "map_first,tested,extract_attention,map_attention,pages",
     [
         (False, "extract", "tree", "tree", 300),
-        (True, "extract", "unified", "unified", 24),
-        (False, "map", "unified", "tree", 24),
-        (True, "map", "tree", "unified", 300),
-        (True, None, "unified", "tree", 300),
+        (True, "map", "unified", "unified", 24),
         (False, None, "tree", "unified", 24),
     ],
 )

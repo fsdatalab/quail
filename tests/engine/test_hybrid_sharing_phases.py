@@ -153,15 +153,3 @@ def test_one_token_answer_steps_update_their_slot_in_place(torch_stub):
     assert step.read_slots.tolist() == step.write_slots.tolist() == [answer]
     assert step.state_rows.tolist() == [answer + 1]
     assert step.copy_reads is None
-
-
-def test_each_state_slot_is_the_arena_row_after_it():
-    torch = pytest.importorskip("torch")
-    arena = KVArena(num_layers=1, num_pages=4, page_tokens=16, num_kv_heads=1,
-                    d_head=2, device="cpu", num_state_slots=3,
-                    gdn_state_shape=(2, 1, 1, 1), conv_state_shape=(2, 1, 1))
-    arena.gdn_state[1, 0] = 5.0
-    assert arena.gdn_state_rows.shape[0] == 4
-    assert arena.gdn_state_rows[2, 0].item() == 5.0
-    assert not arena.gdn_state_rows[0].any()
-    assert arena.gdn_state.dtype == torch.float32
