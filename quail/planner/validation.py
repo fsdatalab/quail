@@ -140,9 +140,6 @@ def classification_refusal(context) -> Refusal | None:
         reason = "AI.CLASSIFY planning needs the model's tokenizer"
     elif model.canvas_tokens and model.answer_canvas is None:
         reason = f"{model.name!r} names no answer canvas to read labels on"
-    elif model.prompt_layout == "d1":
-        reason = (f"{model.name!r} was trained on its own option-code "
-                  f"prompt for choices, which Quail does not write")
     else:
         return None
     return Refusal(reasons=(reason,), constraint="unsupported_classify_query",
@@ -309,9 +306,10 @@ def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
     """Check whether a set-attention model can run the query's AI operators.
 
     Such a model reads one document and its questions in one pass.
-    Quail packs a table's AI filters into passes, and a join's partner
-    tuples into passes over each anchor; an AI.SCORE over two tables
-    and a score beside AI filters on one table are refused.
+    Quail packs a table's AI filters and classifications into passes,
+    and a join's partner tuples into passes over each anchor; an
+    AI.SCORE over two tables, AI.CLASSIFY over joined rows, and a score
+    beside AI filters on one table are refused.
     """
     if model.attention_mask != "set":
         return None
@@ -319,6 +317,11 @@ def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
         return _refusal(
             f"{model.name!r} answers a join's partners as questions, but "
             f"Quail does not score them yet, so AI.SCORE reads one table",
+            "unsupported_set_attention_query")
+    if any(len(call.aliases()) > 1 for call, _ in operators.labels.calls):
+        return _refusal(
+            f"{model.name!r} classifies one document per row; Quail does "
+            f"not yet ask it about a joined pair",
             "unsupported_set_attention_query")
     for alias, predicates in operators.filters.items():
         if scored and predicates:

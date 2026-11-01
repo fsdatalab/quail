@@ -32,6 +32,10 @@ class ClassifySpec(InferenceSpec):
         frame_tokens: For the decision_choice rule, the tokens of the
             prompt tail before the first option block; the option
             blocks and the closing line follow.
+        state_tail_tokens: For the set_choice rule, the prompt tail's
+            tokens that a pass reads with the document.
+        question_header_token_ids: For the set_choice rule, the tokens
+            that open the question when it follows another in a pass.
     """
 
     pair_fraction: float = 1.0
@@ -43,6 +47,8 @@ class ClassifySpec(InferenceSpec):
     probabilities: bool = False
     join_layout: tuple[tuple[Token, ...], tuple[Token, ...]] | None = None
     frame_tokens: int = 0
+    state_tail_tokens: int = 0
+    question_header_token_ids: tuple[Token, ...] = ()
 
     @property
     def anchor(self) -> str:

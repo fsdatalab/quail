@@ -12,6 +12,8 @@ TREE_SCORING = "trie_tree"
 DECODE_SCORING = "trie_decode"
 # a decision model's head scores one option block per label, in one request
 DECISION_SCORING = "decision_choice"
+# a set-attention model's option codes, read at each question's last row
+SET_CHOICE_SCORING = "set_choice"
 
 
 def decodable(labels) -> bool:

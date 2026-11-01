@@ -16,6 +16,7 @@ from quail.logical.expressions import Prompt
 from quail.logical.prompts import (
     LABEL_PREFIX,
     MAX_LETTERS,
+    OPTION_LETTERS,
     PROMPT_LAYOUTS,
     CompileError,
     bind_classify_prompt,
@@ -147,6 +148,59 @@ def choice_letters(count: int, tokenizer=None,
     return tuple(letters)
 
 
+# d1's codes for an option whose own code is not one token, in the order
+# it tries them
+OPTION_FALLBACKS = (
+    OPTION_LETTERS + tuple(f"{index:02d}" for index in range(100))
+    + tuple(chr(code) for code in range(ord("a"), ord("z") + 1))
+    + tuple(f"#{index}" for index in range(200))
+    + tuple(first + second for first in OPTION_LETTERS for second in OPTION_LETTERS))
+
+
+def option_aliases(codes, tokenizer) -> tuple[str, ...]:
+    """Each option's code as d1 writes it.
+
+    An option keeps its own code when that is one unused token, else it
+    takes the first unused one-token fallback.
+
+    Args:
+        codes: The option codes, from option_codes.
+        tokenizer: Callable text -> token ids, without special tokens.
+
+    Raises:
+        CompileError: No one-token code is left for an option.
+    """
+    used, out = set(), []
+
+    def take(code) -> bool:
+        ids = tuple(tokenizer(code))
+        if len(ids) != 1 or ids[0] in used:
+            return False
+        used.add(ids[0])
+        out.append(code)
+        return True
+
+    for code in codes:
+        if not take(code) and not any(take(other) for other in OPTION_FALLBACKS):
+            raise CompileError(f"no one-token option code left for {len(codes)} "
+                               f"options")
+    return tuple(out)
+
+
+def option_spellings(codes, tokenizer) -> tuple[tuple[int, ...], ...]:
+    """Per option, the token ids d1 scores.
+
+    These are its code, then " code" when that is one other token.
+    """
+    out = []
+    for code in codes:
+        (first,) = tokenizer(code)
+        spaced = tuple(tokenizer(" " + code))
+        out.append((first,) + (spaced if len(spaced) == 1 and spaced[0] != first
+                               else ()))
+    return tuple(out)
+
+
 def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
     """Tokenize a prompt's pieces, and letter a classification when possible.
 
@@ -156,6 +210,15 @@ def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
     """
     if prompt.kind == "score":
         return LoweredPrompt(prompt, (), (), 0)
+    if (prompt.kind == "label" and tokenizer is not None
+            and PROMPT_LAYOUTS[prompt.layout].option_end is not None):
+        codes = option_aliases(prompt.letters, tokenizer)
+        if codes != tuple(prompt.letters):
+            return lower_prompt(bind_classify_prompt(
+                prompt.source, prompt.args, prompt.categories,
+                prompt.descriptions, turn=prompt.turn,
+                task_description=prompt.task_description,
+                layout=prompt.layout, letters=codes), tokenizer)
     lettered = None
     if (prompt.kind == "label" and prompt.categories and not prompt.letters
             and PROMPT_LAYOUTS[prompt.layout].choice_label is None):

@@ -341,18 +341,26 @@ class AsyncScores(_HostReadout):
         return super().result(handle, copy=False)
 
 
-class AsyncSlotMargins(_HostReadout):
-    """Each read row's best true logit minus its best false logit, per answer.
+class _SlotReadout(_HostReadout):
+    """A set-attention pass's readout, whose answer is one row per question.
 
-    For a set-attention pass, whose answer is one row per question: the
-    result is an object array holding each answer's margins in row order.
+    The result is an object array holding each answer's rows in order.
+    """
+
+    dtype = np.dtype(object)
+
+    def result(self, handle):
+        *transfer, rows_per_answer = handle
+        return split_rows(super().result(transfer), rows_per_answer)
+
+
+class AsyncSlotMargins(_SlotReadout):
+    """Each read row's best true logit minus its best false logit, per answer.
 
     Args:
         torch: The torch module.
         rows: The AnswerRows of the query's true and false tokens.
     """
-
-    dtype = np.dtype(object)
 
     def __init__(self, torch, rows):
         super().__init__(torch)
@@ -366,9 +374,27 @@ class AsyncSlotMargins(_HostReadout):
                    - logits.index_select(1, rows.false_cols).amax(dim=1))
         return (*self._copy(margins), rows_per_answer)
 
-    def result(self, handle):
-        *transfer, rows_per_answer = handle
-        return split_rows(super().result(transfer), rows_per_answer)
+
+class AsyncSlotLogits(_SlotReadout):
+    """Each read row's logits of the target tokens, per answer.
+
+    Args:
+        torch: The torch module.
+        F: torch.nn.functional.
+        head: The model's full output head.
+        targets: The token ids to read, in column order.
+    """
+
+    def __init__(self, torch, F, head, targets):
+        super().__init__(torch)
+        self.F = F
+        self.targets = list(targets)
+        self.weights = head.index_select(0, torch.tensor(
+            self.targets, device=head.device)).float()
+
+    def submit(self, normed, rows_per_answer=None):
+        logits = self.F.linear(normed.float(), self.weights)
+        return (*self._copy(logits), rows_per_answer)
 
 
 class DecisionHead:

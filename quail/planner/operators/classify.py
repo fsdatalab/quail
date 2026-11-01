@@ -5,16 +5,19 @@ from dataclasses import dataclass, replace
 
 from quail.cost import budgets
 from quail.cost import classify as classify_cost
-from quail.cost.work import Work
+from quail.cost.sol import unrounded_seconds
+from quail.cost.work import Work, packed
 from quail.labels import (
     DECISION_SCORING,
     DECODE_SCORING,
     LETTERS_SCORING,
+    SET_CHOICE_SCORING,
     TREE_SCORING,
     decodable,
     word_starts,
 )
 from quail.logical import LabelWork, effective_selectivity
+from quail.logical.prompts import PROMPT_LAYOUTS
 from quail.physical import (
     AiClassify,
     ClassifySpec,
@@ -30,6 +33,7 @@ from quail.planner.prompt_lowering import (
     choice_token_parts,
     classify_prompt_tokens,
     lower_prompt,
+    option_spellings,
 )
 from quail.planner.statistics.memory import arena_capacity
 from quail.planner.statistics.tables import summarize_alias
@@ -314,6 +318,8 @@ class ClassifyBuilder(ClassifyStatistics):
             chooses the method and fills in its work later.
         """
         lowered = self.lower(call.prompt)
+        if self.model.attention_mask == "set":
+            return self._set_choice_spec(call, name, expected_rows, lowered)
         if self.model.role == "decision":
             return self._choice_spec(call, name, expected_rows, (self.alias,),
                                      tuple(lowered.preamble_token_ids))
@@ -396,6 +402,41 @@ class ClassifyBuilder(ClassifyStatistics):
             label_token_ids=labels, scoring=LETTERS_SCORING,
             join_layout=(tuple(note), tuple(partner_label)),
         ), estimated.work
+
+    def _set_choice_spec(self, call, name, expected_rows, lowered):
+        """Build a set_choice specification: one option-code question a row.
+
+        A pass reads the document and the state tail, then the question
+        and its option list; the answer is read at the question's last
+        row, one score per option over its spellings.
+
+        Raises:
+            ClassifyRefusedError: A document and the question do not fit
+                one chunk.
+        """
+        head = tuple(lowered.preamble_token_ids)
+        tail = tuple(lowered.tail_token_ids)
+        state_tail = len(self.tokenizer(lowered.prompt.tail_segments[0]))
+        need = len(head) + self.longest + len(tail)
+        if need > self.chunk:
+            raise ClassifyRefusedError.over_budget(
+                f"a row of {self.alias!r}", need, self.chunk)
+        state = len(head) + self.mean + state_tail
+        work = packed(state, (len(tail) - state_tail,),
+                      window=self.model.sliding_window) * expected_rows
+        layout = PROMPT_LAYOUTS[self.model.prompt_layout]
+        return bind_inference(
+            ClassifySpec, call.prompt, name=name, aliases=(self.alias,),
+            expected_rows=expected_rows,
+            estimated_seconds=unrounded_seconds(work, self.model, self.device,
+                                                self.chunk),
+            prompt_token_parts=(head, tail), labels=tuple(call.labels),
+            label_token_ids=option_spellings(lowered.prompt.letters,
+                                             self.tokenizer),
+            scoring=SET_CHOICE_SCORING, probabilities=call.probabilities,
+            state_tail_tokens=state_tail,
+            question_header_token_ids=tuple(self.tokenizer(layout.question_label)),
+        ), work
 
     def _choice_spec(self, call, name, expected_rows, aliases, head):
         """Build a decision_choice specification for one document per row.

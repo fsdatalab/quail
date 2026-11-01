@@ -3,11 +3,13 @@
 from itertools import groupby
 
 from quail.backends.quail.executor.operators import execution_parts
+from quail.backends.quail.executor.operators.set_classify import (
+    execute_set_pipeline,
+    pipeline_ids,
+)
 from quail.backends.quail.executor.parts import execute_parts, execution_prefix_tree
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
-from quail.execution.ids import id_positions
-from quail.execution.rows import Rows
 from quail.physical import AiFilter, AiJoin
 
 
@@ -21,13 +23,11 @@ def execute_pipeline(state: QueryExecutionState, nodes, inputs, context) -> dict
             and all(node.type_name == first.type_name for node in nodes)):
         prepared = context.model_inputs(first, inputs, context, nodes=nodes)
         return implementation.execute_group(state, nodes, prepared)
+    if state.loaded_model.pipeline.whole_sequences:
+        return execute_set_pipeline(state, nodes, inputs, context)
 
     alias = first.document_aliases[0]
-    anchor_port = next((port.name for port in first.inputs
-                        if port.source.port == f"rows:{alias}"), None)
-    source = (inputs[first.node_id][anchor_port] if anchor_port is not None
-              else next(iter(inputs[first.node_id].values())))
-    ids = id_positions(source.ids[alias] if isinstance(source, Rows) else source)
+    ids = pipeline_ids(first, inputs)
     last = max(index for index, node in enumerate(nodes)
                if node.backend is not None)
 

@@ -76,6 +76,10 @@ class PromptLayout:
             tokenized on their own, so a set-attention pass can keep
             them with the document and open each later question with
             the label alone.
+        option_end: For a model that classifies by one option code
+            per label, the text after its option list; the question,
+            "Options:", and one "<code> <text>" line per label come
+            before it. None classifies with Quail's label prompt.
     """
 
     name: str
@@ -88,6 +92,7 @@ class PromptLayout:
     choice_label: str | None = None
     record_label: str | None = None
     label_segment: bool = False
+    option_end: str | None = None
 
     def question_segments(self, question: str, separator: str) -> list[str]:
         """The text after a document: one entry per tokenized segment."""
@@ -138,6 +143,7 @@ PROMPT_LAYOUTS = {layout.name: layout for layout in (
         question_separator="\n\n\n",
         record_label="{} record:\n",
         label_segment=True,
+        option_end="\n\nReply with the option code only.",
     ),
 )}
 
@@ -428,6 +434,10 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
     recipe = dict(categories=labels, descriptions=descriptions,
                   task_description=task_description, turn=tuple(turn),
                   source=template, letters=tuple(letters))
+    if PROMPT_LAYOUTS[layout].option_end is not None:
+        return _bind_option_classify_prompt(
+            template, args, labels, descriptions, turn, task_description,
+            layout, letters or option_codes(labels), recipe)
     if PROMPT_LAYOUTS[layout].choice_label is not None:
         return _bind_choice_classify_prompt(
             template, args, labels, descriptions, turn,
@@ -442,6 +452,57 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
     return _bind_document_classify_prompt(
         template, args, labels, descriptions, turn,
         task_description, answer_prefix(turn), letters, recipe)
+
+
+OPTION_LETTERS = tuple(chr(ord("A") + index) for index in range(26))
+
+
+def option_codes(labels) -> tuple[str, ...]:
+    """d1's option codes.
+
+    The codes are the labels when each is one letter, else A to Z, then
+    AA, AB, and so on.
+    """
+    labels = [str(label).strip() for label in labels]
+    if labels and all(len(label) == 1 and label.isalpha() for label in labels):
+        return tuple(labels)
+    pairs = [first + second for first in OPTION_LETTERS
+             for second in OPTION_LETTERS]
+    return tuple([*OPTION_LETTERS, *pairs][:len(labels)])
+
+
+def _bind_option_classify_prompt(template, args, labels, descriptions, turn,
+                                 task_description, layout, codes, recipe):
+    """Bind AI.CLASSIFY in a layout that answers with one option code.
+
+    The document, then the question separator and label as the first
+    tail segment, then the question, the option list, one line per
+    label with its description or else its name, and the option end.
+    """
+    import re
+    if len(args) != 1:
+        raise CompileError("this model classifies one document per row")
+    spec = PROMPT_LAYOUTS[layout]
+    # the text before the placeholder moves after it, into the question
+    _, canonical = split_frame(template, spec.document_label)
+    _, rest = split_template(canonical)
+    m = re.match(r"(\{\d+\})(.*)", rest, re.DOTALL)
+    if m is None:
+        raise CompileError(f"unexpected AI.CLASSIFY template: {template!r}")
+    question = m.group(2).strip()
+    if task_description:
+        question = (question + "\n" if question else "") + task_description
+    descriptions = descriptions or ("",) * len(labels)
+    lines = "\n".join(
+        f"{code} {description or label.replace('_', ' ')}"
+        for code, label, description in zip(codes, labels, descriptions))
+    segments = (spec.question_separator + spec.question_label,
+                f"{question}\n\nOptions:\n{lines}{spec.option_end}{turn[1]}")
+    return Prompt(template=canonical, args=tuple(args),
+                  preamble=turn[0] + spec.document_label,
+                  tail=m.group(1) + "".join(segments), frame="", frame_text="",
+                  kind="label", label_prefix="", layout=layout,
+                  tail_segments=segments, **{**recipe, "letters": tuple(codes)})
 
 
 def _bind_document_classify_prompt(template, args, labels, descriptions,

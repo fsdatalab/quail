@@ -1,5 +1,6 @@
 """Liquid's d1 decision models: prompt layout, answer ids, spec, and support."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -79,19 +80,14 @@ def test_the_vllm_baseline_refuses_d1_2b():
     assert "lfm3" in support.reason
 
 
-def test_d1_2b_refuses_classify_extract_and_map_with_a_reason():
-    from quail.planner.validation import (
-        classification_refusal,
-        extraction_refusal,
-    )
+def test_d1_2b_refuses_extract_and_map_with_a_reason():
+    from quail.planner.validation import extraction_refusal
 
     context = SimpleNamespace(model=D1_2B_BF16, tokenizer=lambda text: [1])
 
-    classify = classification_refusal(context)
     extract = extraction_refusal(context)
     mapped = extraction_refusal(context, "AI.MAP")
 
-    assert "option-code prompt" in classify.reasons[0]
     assert "document positions" in extract.reasons[0]
     assert "writes text" in mapped.reasons[0]
 
@@ -129,13 +125,20 @@ def test_a_set_attention_filter_costs_the_same_first_or_later():
     assert first == later > 0
 
 
-def test_set_attention_refuses_a_score_beside_filters():
+def test_set_attention_refuses_a_score_beside_filters_and_a_joined_label():
     from quail.planner.validation import set_attention_refusal
 
-    two = SimpleNamespace(joins=[], filters={"r": [object(), object()]})
+    none = SimpleNamespace(calls=[])
+    pair = SimpleNamespace(aliases=lambda: ("r", "a"))
+    two = SimpleNamespace(joins=[], filters={"r": [object(), object()]},
+                          labels=none)
+    joined = SimpleNamespace(joins=[], filters={},
+                             labels=SimpleNamespace(calls=[(pair, "mood")]))
 
     assert "or a score" in set_attention_refusal(two, True, D1_2B_BF16).reasons[0]
     assert set_attention_refusal(two, False, D1_2B_BF16) is None
+    assert "joined pair" in set_attention_refusal(
+        joined, False, D1_2B_BF16).reasons[0]
 
 
 def test_a_set_join_costs_each_anchors_passes_with_packed():
@@ -319,6 +322,79 @@ def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
     assert join.label_token_ids == (("a", ("aspects", "record:")),)
     assert join.question_header_token_ids == ("QUESTION:",)
     assert not join.keep_kv
+    session.close()
+
+
+def test_a_d1_classification_lists_its_options_by_code_as_d1_does():
+    from quail.logical.prompts import bind_classify_prompt
+
+    prompt = bind_classify_prompt(
+        "Which sentiment does the review express?\n\n{0}", (REVIEW,),
+        ["positive", "negative"], ("", "the review is negative"),
+        turn=D1_2B_BF16.turn, layout=D1_2B_BF16.prompt_layout)
+
+    text = prompt.preamble + "Great film." + prompt.tail[len("{0}"):]
+
+    assert text == D1_PROMPT.format(
+        state="Great film.",
+        question=("Which sentiment does the review express?\n\nOptions:\n"
+                  "A positive\nB the review is negative"),
+    ).replace("Reply with yes or no only.", "Reply with the option code only.")
+
+
+def test_an_option_whose_code_is_two_tokens_takes_d1s_first_free_fallback():
+    from quail.logical.prompts import option_codes
+    from quail.planner.prompt_lowering import option_aliases
+
+    def tokenizer(text):
+        return list(text) if text.isupper() else [text]
+
+    codes = option_codes([f"label {index}" for index in range(27)])
+
+    assert codes[-1] == "AA"
+    assert option_aliases(codes, tokenizer)[-1] == "00"
+
+
+def test_an_option_scores_its_best_spelling_over_the_temperature():
+    from quail.backends.quail.executor.operators.set_classify import (
+        option_probabilities,
+    )
+
+    logits = [2.0, 4.0, 1.0]  # A, " A", B
+    probabilities = option_probabilities(logits, {7: 0, 8: 1, 9: 2},
+                                         ((7, 8), (9,)), 2.0)
+
+    expected = math.exp(4.0 / 2) / (math.exp(4.0 / 2) + math.exp(1.0 / 2))
+    assert probabilities[0] == pytest.approx(expected)
+
+
+def test_two_d1_classifications_plan_option_code_questions(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.physical import AiClassify
+    from quail.planner.plan import EngineConfig
+
+    body = " ".join(["word"] * 300)
+    pq.write_table(pa.table({"id": [1, 2, 3], "body": [body] * 3}),
+                   tmp_path / "reviews.parquet")
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=str.split)
+    session.register("reviews", DocumentProvider.from_parquet(
+        str(tmp_path / "reviews.parquet"), id_col="id"))
+
+    plan = session.sql(
+        "SELECT r.id, AI.CLASSIFY(PROMPT('Which mood? {0}', r.body), "
+        "ARRAY['happy', 'sad']) AS mood, AI.CLASSIFY(PROMPT('Which length? "
+        "{0}', r.body), ARRAY['short', 'long']) AS size FROM reviews r").plan()
+
+    nodes = [node for node in plan.nodes if isinstance(node, AiClassify)]
+    assert [node.spec.scoring for node in nodes] == ["set_choice"] * 2
+    assert all(node.spec.label_token_ids == (("A",), ("B",)) for node in nodes)
+    assert all(node.spec.state_tail_tokens == 1 for node in nodes)
+    assert all(node.spec.estimated_seconds > 0 for node in nodes)
     session.close()
 
 

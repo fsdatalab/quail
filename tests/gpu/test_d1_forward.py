@@ -62,6 +62,17 @@ PACKED = [f"Does the review mention {aspect}? {{0}}" for aspect in ASPECTS]
 JOIN = ("Does the review in DOCUMENT {0} discuss the movie aspect in "
         "DOCUMENT {1}?")
 JOIN_ASPECTS = [*ASPECTS, "the sets", "the costumes"]
+# three classifications packed in one pass; the second describes its labels
+CHOICES = [
+    ("Judge strictly from the review above which category best describes "
+     "the overall sentiment it expresses about the movie.\n\n{0}",
+     ["positive", "negative", "neutral", "mixed"], ()),
+    ("Judge strictly from the review above how it rates the acting.\n\n{0}",
+     ["strong", "weak", "not_mentioned"],
+     ("the acting is praised", "the acting is criticized", "")),
+    ("Judge strictly from the review above whether the reviewer would watch "
+     "the film again.\n\n{0}", ["yes", "no", "unclear"], ()),
+]
 # the largest difference between the two sides' yes-against-no logit
 # margins this test accepts, in logits
 MARGIN_TOLERANCE = 0.5
@@ -163,8 +174,20 @@ def reference_main(request_path, out_path):
                 logits=codes.float()[:, ids].tolist(),
                 p_yes=[p[0] for p in engine.probabilities(
                     item["review"], questions)]))
+        # the served runner, with the checkpoint's calibrated temperature
+        served = model.engine
+        if served.calibration is None:
+            raise ValueError("d1-2B serves no calibration.json")
+        choices = []
+        for item in request["choices"]:
+            questions = [prompt.Choice(question["instructions"],
+                                       question["criteria"])
+                         for question in item["questions"]]
+            choices.append(dict(
+                text=engine.render(item["review"], questions[0]),
+                probabilities=served.probabilities(item["review"], questions)))
     with open(out_path, "w") as f:
-        json.dump(dict(prompts=rows, packs=packs), f)
+        json.dump(dict(prompts=rows, packs=packs, choices=choices), f)
 
 
 @pytest.fixture(scope="module")
@@ -315,7 +338,13 @@ def reference(prompts, packs, join_passes, answer_ids, tmp_path_factory):
                  for review, (_, ids) in zip(REVIEWS, items)],
         packs=[{key: pack[key] for key in
                 ("review", "ids", "state", "groups", "slots", "questions")}
-               for pack in [*packs[1], *join_passes[2]]])))
+               for pack in [*packs[1], *join_passes[2]]],
+        choices=[dict(review=review, questions=[
+            dict(instructions=question.split("\n\n{0}")[0],
+                 criteria={label: (descriptions[index] if descriptions else "")
+                           or None for index, label in enumerate(labels)})
+            for question, labels, descriptions in CHOICES])
+            for review in REVIEWS])))
     out = folder / "reference.json"
     environment = dict(os.environ, PYTHONPATH=REFERENCE_PACKAGES)
     subprocess.run([sys.executable, __file__, str(request), str(out)],
@@ -417,6 +446,60 @@ def quail_joins(join_passes, answer_ids, loaded):
             for index in range(len(states))]
 
 
+def _choice_specs():
+    """The CHOICES as set_choice ClassifySpecs, and each one's lone prompt text."""
+    from types import SimpleNamespace
+
+    from quail.logical import ColumnRef
+    from quail.logical.prompts import bind_classify_prompt
+    from quail.planner.prompt_lowering import lower_prompt, option_spellings
+
+    spec, ids = _spec(), _tokenizer()
+    specs, texts = [], []
+    for question, labels, descriptions in CHOICES:
+        prompt = bind_classify_prompt(
+            question, (ColumnRef(alias="r", provider="reviews", column="body"),),
+            labels, descriptions, turn=spec.turn, layout=spec.prompt_layout)
+        lowered = lower_prompt(prompt, ids)
+        specs.append(SimpleNamespace(
+            aliases=("r",), labels=tuple(labels), probabilities=True,
+            prompt_token_parts=(tuple(lowered.preamble_token_ids),
+                                tuple(lowered.tail_token_ids)),
+            state_tail_tokens=len(ids(lowered.prompt.tail_segments[0])),
+            question_header_token_ids=tuple(ids("QUESTION:\n")),
+            label_token_ids=option_spellings(lowered.prompt.letters, ids)))
+        texts.append(lowered.prompt)
+    return specs, texts
+
+
+@pytest.fixture(scope="module")
+def quail_choices(loaded):
+    """Per review and classification, Quail's option probabilities, one pass."""
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.operators.filter import StateTails
+    from quail.backends.quail.executor.operators.set_classify import (
+        classify_passes,
+    )
+    from quail.catalog.tokens import GigatokenEncoder
+    from quail.specs.files import resolve_model_path
+
+    model, arena, pipeline = loaded
+    spec, ids = _spec(), _tokenizer()
+    specs, _ = _choice_specs()
+    tails = StateTails(GigatokenEncoder(resolve_model_path(spec.hf_name,
+                                                           spec.revision)))
+    state = SimpleNamespace(
+        torch=torch, chunk_tokens=BUDGET, gpu_timing=False,
+        loaded_model=SimpleNamespace(model=model, arena=arena, pipeline=pipeline,
+                                     model_spec=spec, state_tails=tails,
+                                     input_staging=None))
+    every = classify_passes(state, specs, range(len(REVIEWS)),
+                            {"r": [ids(review) for review in REVIEWS]})
+    return [[labels.probabilities[review].tolist() for labels in every]
+            for review in range(len(REVIEWS))]
+
+
 def _margin(logits, count):
     """The best yes spelling's logit minus the best no spelling's."""
     return max(logits[:count]) - max(logits[count:])
@@ -502,6 +585,24 @@ def test_packed_p_yes_matches_d1_reading_its_own_pass(reference, quail_packs):
              for theirs, ours in zip(pack["p_yes"], margins)]
     print("packed P(yes), d1 own pass vs Quail (first pass):",
           [(round(a, 3), round(b, 3)) for a, b in pairs[:16]])
+    assert max(abs(a - b) for a, b in pairs) < PROBABILITY_TOLERANCE
+
+
+def test_quail_writes_the_choice_prompt_d1_renders(reference):
+    _, prompts = _choice_specs()
+    first = prompts[0]
+    for review, theirs in zip(REVIEWS, reference["choices"]):
+        assert first.preamble + review + first.tail[len("{0}"):] == theirs["text"]
+
+
+def test_packed_choices_match_d1s_option_probabilities(reference, quail_choices):
+    pairs = [(a, b) for theirs, ours in zip(reference["choices"], quail_choices)
+             for question_a, question_b in zip(theirs["probabilities"], ours)
+             for a, b in zip(question_a, question_b)]
+    print("option probabilities, Quail vs d1 code (first review):",
+          [[round(p, 3) for p in question] for question in quail_choices[0]],
+          [[round(p, 3) for p in question]
+           for question in reference["choices"][0]["probabilities"]])
     assert max(abs(a - b) for a, b in pairs) < PROBABILITY_TOLERANCE
 
 
