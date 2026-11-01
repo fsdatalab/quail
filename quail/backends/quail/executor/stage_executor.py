@@ -113,7 +113,8 @@ class StageExecutor:
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
                  appended_tokens=None, gpu_timing=False, survival=None,
-                 decoder=None, dependencies=None, knee_rows=0, decode_cost=None):
+                 decoder=None, dependencies=None, knee_rows=0, decode_cost=None,
+                 summary=True):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -128,6 +129,7 @@ class StageExecutor:
         self.on_chunk = on_chunk
         self.on_answers = on_answers
         self.label = label
+        self.summary = summary
         self.gpu_timing = gpu_timing
         self.decoder = decoder
         # the stages whose answers the decoder writes, in map order
@@ -1065,7 +1067,7 @@ class StageExecutor:
                 self.answer_admission, "granted", [])
             self.stats["pass_work"] = dict(self.pass_work)
             self.stats["admission_s"] = self.admission_s
-        if self.spans:
+        if self.spans and self.summary:
             self.torch.cuda.synchronize()
             # between forward passes the GPU runs readouts and uploads,
             # and waits when the host is late
@@ -1074,17 +1076,18 @@ class StageExecutor:
                           in zip(self.spans, self.spans[1:])) / 1000.0
             logger.info("%s: %d forward passes, %.3f s of GPU time between them",
                         self.label, len(self.spans), between)
-        if self.pass_rows:
+        if self.pass_rows and self.summary:
             rows = np.asarray(self.pass_rows)
-            # a pass under the compute knee while documents wait in the
-            # queue is one admission left short
-            thin = (rows < self.knee_rows) & np.asarray(self.pass_queued)
-            logger.info("%s: %d passes, rows per pass median %d, 10th percentile "
-                        "%d; %d under the %d-row compute knee with documents "
-                        "queued", self.label, len(rows), int(np.median(rows)),
-                        int(np.percentile(rows, 10)), int(thin.sum()),
-                        self.knee_rows)
-        if self.decoder is not None:
+            line = (f"{self.label}: {len(rows)} passes, median "
+                    f"{int(np.median(rows)):,} rows")
+            if self.knee_rows:
+                # a pass below the size where it becomes compute-bound,
+                # while documents wait, is one admission left short
+                short = (rows < self.knee_rows) & np.asarray(self.pass_queued)
+                line += (f"; {int(short.sum())} passes under {self.knee_rows:,} "
+                         f"rows while documents waited")
+            logger.info(line)
+        if self.decoder is not None and self.summary:
             logger.info("%s: %d answer evictions, %d recomputed tokens", self.label,
                         self.num_evictions, self.recomputed_tokens)
             curves = getattr(self.answer_admission, "bucket_curves", None)

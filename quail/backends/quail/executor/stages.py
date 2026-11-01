@@ -211,7 +211,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                label=None, default_attention="tree", on_chunk=None,
                on_answers=None, stop_groups=None, appended_tokens=None,
                gpu_timing=False, survival=None, decoder=None, dependencies=None,
-               knee_rows=0, decode_cost=None):
+               knee_rows=0, decode_cost=None, summary=True):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -265,6 +265,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             a document's frame, when stages discard tokens earlier ones
             added; None sums every append stage's longest suffix.
         knee_rows: Rows below which the pass is logged as thin.
+        summary: Whether to log the run's pass counts when it ends.
         decode_cost: Spec-only decode and recomputation times, or None
             to require full answer capacity before admitting a document.
         dependencies: Dependent anchor -> (document anchor, start stage).
@@ -295,6 +296,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         on_answers=on_answers, stop_groups=stop_groups,
         appended_tokens=appended_tokens, gpu_timing=gpu_timing,
         decoder=decoder, dependencies=dependencies, knee_rows=knee_rows,
+        summary=summary,
         decode_cost=decode_cost,
     ).run()
 

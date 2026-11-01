@@ -207,6 +207,15 @@ class SingleResultPart(ExecutionPart):
         return {self.node.node_id: self.result_value}
 
 
+def operator_label(word: str, nodes) -> str:
+    """Return a progress label naming a run's operators, three at most."""
+    names = [node.spec.name for node in nodes]
+    shown = ", ".join(names[:3])
+    if len(names) > 3:
+        shown += f" and {len(names) - 3} more"
+    return f"{word} {shown}"
+
+
 def execute_alone(state, nodes, inputs, build, *, label: str) -> dict:
     """Run one operator's nodes as a pipeline of their own.
 
@@ -231,7 +240,7 @@ def execute_alone(state, nodes, inputs, build, *, label: str) -> dict:
     results = execute_parts(
         state, [part], prefixes, keys, keep_kv=nodes[-1].keep_kv,
         prefix_tree=tree, limit=inputs.get("limit"),
-        label=f"{label} {', '.join(node.spec.name for node in nodes)}")
+        label=operator_label(label, nodes))
     first = nodes[0].node_id
     results[first] = replace(results[first], metrics=replace(
         results[first].metrics, wall_s=time.perf_counter() - started))

@@ -20,6 +20,7 @@ from quail.backends.quail.executor.parts import (
     execution_prefix_tree,
     gpu_seconds,
     join_prior_rows,
+    operator_label,
     prior_inputs,
     stage_spans,
 )
@@ -124,7 +125,7 @@ class MapPart(ColumnPart, ExecutionPart):
             rewind=True, append=True, single=True, readout=NoAnswers(),
             decide=decide, answer_tokens=max(self.answer_limits),
             answer_index=self.first,
-            label=f"maps {', '.join(n.spec.name for n in self.nodes)}")]
+            label=operator_label("maps", self.nodes))]
 
     def branch_inputs(self, prefixes, keys, tree, page_tokens, stage):
         """Append dependent anchors and their direct document borrows."""

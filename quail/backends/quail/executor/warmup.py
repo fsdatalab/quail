@@ -96,7 +96,7 @@ def _warm_recurrent(torch, arena, pipeline):
 
 def _warm_run(*args, **kwargs):
     """Run warm-up stages; their log lines say warm-up, not a query stage."""
-    return run_stages(*args, label="kernel warmup", **kwargs)
+    return run_stages(*args, label="kernel warmup", summary=False, **kwargs)
 
 
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
