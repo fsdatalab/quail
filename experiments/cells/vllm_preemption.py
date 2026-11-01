@@ -9,7 +9,7 @@ backend's run.json, steps.jsonl, and summary.json go to
 /results/ablations/vllm_preemption/<run id>/<backend>/.
 
     uv run modal run --detach experiments/cells/vllm_preemption.py::trace \
-        --query IMDB-26 2>&1 | tee "$run_log"
+        --query IMDB-23 2>&1 | tee "$run_log"
 """
 
 import json
@@ -114,7 +114,7 @@ def trace_backend(backend: str, query_id: str, scale_factor: float, model: str,
 
 
 @app.local_entrypoint()
-def trace(query: str = "IMDB-26", scale_factor: float = 0.1,
+def trace(query: str = "IMDB-23", scale_factor: float = 0.1,
          model: str = "qwen3-4b-fp8",
          backends: str = "stock_vllm,pipelined_vllm"):
     collection_id = ensure_data.remote(scale_factor, [query], "")

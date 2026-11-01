@@ -9,11 +9,11 @@ query on copies of 64 reviews, whose first line differs, loads the model
 and captures CUDA graphs. Then each query runs `repeats` times: a cell
 query on the first `num_documents` reviews (all of them for 0), and a
 QUAIL-B query on its whole tables at the scale factor. For example, the
-four map queries of the comparison:
+two contract queries of the comparison:
 
     uv run modal run --detach experiments/cells/answer_headroom.py::compare \
         --modes stock_vllm,shuffled_vllm,headroom=0,headroom \
-        --queries CUAD-23,CUAD-22,IMDB-26,IMDB-25 --scale-factor 0.1 \
+        --queries CUAD-22,CUAD-21 --scale-factor 0.5 \
         --num-documents 0 --repeats 1 2>&1 | tee "$run_log"
 
 Per run the cell records wall seconds, answer evictions,
@@ -233,8 +233,8 @@ def compare(modes: str = "headroom=0,headroom", queries: str = ",".join(QUERIES)
             scale_factor: float = 0.1, num_documents: int = 1000, repeats: int = 2,
             num_contracts: int = 0):
     query_ids = [name for name in queries.split(",") if name]
-    # IMDB-20 brings the reviews and CUAD-22 the contracts
-    ensure_data.remote(scale_factor, list(dict.fromkeys(["IMDB-20", "CUAD-22"] + [
+    # IMDB-20 brings the reviews and CUAD-21 the contracts
+    ensure_data.remote(scale_factor, list(dict.fromkeys(["IMDB-20", "CUAD-21"] + [
         name for name in query_ids if name not in QUERIES])), "")
     run_id = (f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
               f"{uuid.uuid4().hex[:8]}")
@@ -298,7 +298,7 @@ def estimate_sol(query: str, run_dir: str, mode: str, scale_factor: float,
 
 
 @app.local_entrypoint()
-def sol(run_dir: str, queries: str = "CUAD-23", mode: str = "headroom",
+def sol(run_dir: str, queries: str = "CUAD-22", mode: str = "headroom",
         scale_factor: float = 0.1, num_documents: int = 0, num_contracts: int = 0):
     for query in filter(None, queries.split(",")):
         call = estimate_sol.spawn(query, run_dir, mode, scale_factor, num_documents,
