@@ -365,9 +365,10 @@ def test_a_document_too_long_for_a_chunk_or_the_arena_settles_unanswered():
     assert sorted(a for a, *_ in groups) == [0, 3]
 
 
-def test_documents_entering_a_stage_are_asked_together_once():
-    # three stages; anchor 1 skips stage 1 and is asked at stage 2
-    # with anchor 0, which stage 1 asked; anchor 2 drops at stage 1
+
+def test_documents_entering_a_gated_stage_wait_in_place_and_are_asked_together():
+    # three stages, the second gated; anchor 1 skips it to the third,
+    # anchor 2 drops there, and anchors 0 and 1 keep their queue order
     asked = []
 
     def partners(a):
@@ -379,19 +380,15 @@ def test_documents_entering_a_stage_are_asked_together_once():
         return ask
 
     sched = JoinAdmission([50, 50, 50], [[10], [10], [10]], 250, arena_pages=100,
-                          page_tokens=16,
+                          page_tokens=16, gated=[1],
                           anchor_partners={a: partners(a) for a in range(3)})
     asked.clear()
-    groups = sched.next_chunk(100)
-    recorded = [sched.record(a, j, start, end, [1]) for a, j, start, end, _ in groups]
+    reports = [sched.report(a, j, start, end, [1])
+               for a, j, start, end, _ in sched.next_chunk(100)]
+    assert asked == [] and all(not report.settlements for report in reports)
     prepared = []
-    sched.ask_ahead([(a, j) for (a, j, *_), (_, passed) in zip(groups, recorded)
-                     if sched.entering(a, j, passed)],
-                    lambda j, anchors: prepared.append((j, anchors)))
-    settled = [sched.settle(a, j, *outcome)
-               for (a, j, *_), outcome in zip(groups, recorded)]
-    assert prepared == [(1, [0, 1, 2]), (2, [1])]
-    assert sorted(asked) == [(0, 1), (1, 1), (1, 2), (2, 1)]
-    assert [s.settlements for s in settled] == [
-        (), (), (Settlement("dropped", 2, False),)]
+    settled = sched.decide_waiting(lambda j, anchors: prepared.append((j, anchors)))
+    assert prepared == [(1, [0, 1, 2])]
+    assert asked == [(0, 1), (1, 1), (1, 2), (2, 1)]
+    assert settled == [Settlement("dropped", 2, False)]
     assert sched.next_chunk(100) == [(0, 1, 0, 1, False), (1, 2, 0, 1, False)]

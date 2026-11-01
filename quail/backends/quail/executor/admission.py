@@ -213,6 +213,10 @@ class JoinAdmission:
             one suffix is written into the anchor's own pages.
         answer_dtype: The answer array type, one for every stage or a
             list per stage; None records 0/1 lists.
+        gated: The stages whose conditions decide the anchors entering
+            them together. An anchor entering one waits in the ready
+            queue, in its place, until decide_waiting runs the stage's
+            request for it.
         reserve: Optional callable(anchor, borrow) that reserves the anchor's
             storage before admission. borrow is None or (parent, shared tokens).
             False leaves the anchor queued; True commits the reservation.
@@ -235,7 +239,7 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
-                 stop_groups=None, stop_width=1, reserve=None):
+                 stop_groups=None, stop_width=1, reserve=None, gated=()):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -300,7 +304,8 @@ class JoinAdmission:
         self._lists = []           # per anchor, per stage: indices or None
         self._cums = []            # per anchor, per stage: cumulative sums
         self._lazy = []            # per anchor: callable(stage) or None
-        self._asked = {}           # (anchor, stage) -> what ask_ahead got
+        self.gated = frozenset(gated)
+        self._waiting = []         # anchors entering a gated stage
         self._page_cost = []
         self._carried = []
         self._first = []           # per anchor: its first partner's cost
@@ -344,26 +349,31 @@ class JoinAdmission:
         lst = self._lists[a][j]
         return len(self.stages[j]) if lst is None else len(lst)
 
-    def _enter(self, a, j):
+    def _enter(self, a, j, decided=False):
         """Advance a document past skipped stages to its next request.
 
         Args:
             a: Anchor document index.
             j: Stage index to enter.
+            decided: Whether the conditions of stage j decided the
+                document already, so it asks the stage now.
 
         Returns:
-            None if the document has requests to run. Otherwise, the completion
-            event: "dropped" for removal or an empty intermediate stage, and
-            "finished" when the document completes its final stage.
+            None if the document has requests to run or waits at a
+            gated stage. Otherwise, the completion event: "dropped"
+            for removal or an empty intermediate stage, and "finished"
+            when the document completes its final stage.
         """
         k = len(self.stages)
         ask = self._lazy[a]
         while True:
             self._stage[a] = j
             self._next[a] = 0
-            lst = (None if ask is None
-                   else self._asked.pop((a, j)) if (a, j) in self._asked
-                   else ask(j))
+            if ask is not None and j in self.gated and not decided:
+                self._waiting.append(a)
+                return None
+            decided = False
+            lst = None if ask is None else ask(j)
             if lst is DROP:
                 self._stage[a] = _DONE
                 return "dropped"
@@ -672,16 +682,6 @@ class JoinAdmission:
             next stage immediately removes the document. Settlements record
             whether the document survived its final stage.
         """
-        return self.settle(a, j, *self.record(a, j, start, end, bits))
-
-    def record(self, a, j, start, end, bits):
-        """Store a group's answers without moving the document on.
-
-        Returns:
-            (complete, passed): whether the group holds the stage's last
-            answers, and whether the document passes the stage so far.
-            Pass both to settle.
-        """
         dtype = self.answer_dtypes[j]
         if dtype is None:
             row = self.answers[j].setdefault(a, [])
@@ -701,66 +701,18 @@ class JoinAdmission:
             row[start:end] = bits
             self._answer_counts[j][a] = end
         self.in_flight -= 1
-        complete = end == self.num_partners(a, j)
+        k = len(self.stages)
+        num_partners = self.num_partners(a, j)
+        complete = end == num_partners
         if self.advance is not None:
             if complete:
                 self._true[a][j] = bool(self.advance(a, j, row))
         elif (any(bits) if dtype is None else np.any(bits)):
             self._true[a][j] = True
-        return complete, bool(self._true[a][j])
-
-    def entering(self, a, j, passed):
-        """Whether settle enters stage j + 1 for a group record returned passed for."""
-        return (j == self._stage[a] and j + 1 < len(self.stages) and passed
-                and self._next[a] == self.num_partners(a, j))
-
-    def ask_ahead(self, entering, prepare):
-        """Ask the stages documents are about to enter, one stage at a time.
-
-        _enter then uses each saved answer in place of asking. A
-        document that skips a stage is asked at the next one with the
-        others that reach it.
-
-        Args:
-            entering: The anchors settle will enter into stage j + 1
-                after record, as (anchor, j) pairs that entering accepts.
-            prepare: Callable(stage, anchors), run before the stage asks
-                those anchors.
-        """
-        k = len(self.stages)
-        waiting = {}
-        for a, j in entering:
-            if self._lazy[a] is not None:
-                waiting.setdefault(j + 1, []).append(a)
-        while waiting:
-            j = min(waiting)
-            anchors = waiting.pop(j)
-            prepare(j, anchors)
-            for a in anchors:
-                lst = self._lazy[a](j)
-                self._asked[(a, j)] = lst
-                if lst is SKIP and j + 1 < k:
-                    waiting.setdefault(j + 1, []).append(a)
-
-    def settle(self, a, j, complete, passed):
-        """Move a document on after record, and settle it if it is done.
-
-        Args:
-            a: Anchor document index.
-            j: The stage of the recorded group.
-            complete: Whether the group held the stage's last answers,
-                as record returned it.
-            passed: Whether the document passes the stage so far, as
-                record returned it.
-
-        Returns:
-            An AdmissionReport, as report returns it.
-        """
-        k = len(self.stages)
         settlements = []
         transitions = []
         if j == self._stage[a] and j + 1 < k:
-            if self.entering(a, j, passed):
+            if self._true[a][j] and self._next[a] == num_partners:
                 # the whole stream is launched, so every later chunk
                 # is behind it on the stream and the next stage's
                 # frame write cannot race a read of this stage's
@@ -771,20 +723,55 @@ class JoinAdmission:
                 else:
                     settlements.append(Settlement(
                         settled, a, bool(self._true[a][-1])))
-            elif complete and not passed:
+            elif complete and not self._true[a][j]:
                 self._stage[a] = _DONE
                 transitions.append((a, j, False))
                 settlements.append(Settlement("dropped", a, False))
         if j == k - 1 and complete:
             self._stage[a] = _DONE
-            if passed:
+            if self._true[a][j]:
                 self.survivors += 1
-            survived = passed
+            survived = bool(self._true[a][j])
             transitions.append((a, j, survived))
             settlements.append(Settlement("finished", a, survived))
         for settlement in settlements:
             self._settle_group(settlement.anchor, settlement.survived)
         return AdmissionReport(tuple(settlements), tuple(transitions))
+
+    def decide_waiting(self, prepare):
+        """Ask the gated stages for the anchors waiting at them.
+
+        Each stage's conditions first decide its waiting anchors
+        together. An anchor kept keeps its place in the ready queue; one
+        dropped, or settled past skipped stages, leaves it.
+
+        Args:
+            prepare: Callable(stage, anchors), run before the stage asks
+                those anchors.
+
+        Returns:
+            The settlements, as report gives them.
+        """
+        settlements = []
+        while self._waiting:
+            waiting, self._waiting = self._waiting, []
+            stages = {}
+            for a in waiting:
+                stages.setdefault(self._stage[a], []).append(a)
+            for j, anchors in sorted(stages.items()):
+                prepare(j, anchors)
+            left = set()
+            for a in waiting:
+                settled = self._enter(a, self._stage[a], decided=True)
+                if settled is not None:
+                    left.add(a)
+                    settlements.append(Settlement(
+                        settled, a, bool(self._true[a][-1])))
+            if left:
+                self.ready = deque(a for a in self.ready if a not in left)
+        for settlement in settlements:
+            self._settle_group(settlement.anchor, settlement.survived)
+        return settlements
 
     def _settle_group(self, a, survived):
         """Free the anchor's group for its next anchor, or skip the rest.

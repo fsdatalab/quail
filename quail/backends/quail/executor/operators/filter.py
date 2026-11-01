@@ -174,8 +174,8 @@ class ConditionGate(SingleResultPart):
         kept = self.decided.pop(key, None)
         if kept is not None:
             return None if kept else Stage.DROP
-        # a document decide did not see, such as one entering past a
-        # skipped stage, is tested alone; a repeated value, such as a
+        # a document decide did not see, such as one asked outside a
+        # chunk report, is tested alone; a repeated value, such as a
         # label, is evaluated once
         values = {column: self.read(column, [key[1]])
                   for column in self.node.tested_columns}
