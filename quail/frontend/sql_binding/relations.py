@@ -95,7 +95,7 @@ class JoinBinder:
                             "AI.SCORE must be compared with <, <=, >, or >="
                         )
                     condition = (None if _has_ai_call(term)
-                                 else bind_condition(b, term, {}))
+                                 else bind_condition(b, term, {}, join_keys=True))
                     if condition is not None:
                         b.parts.append(condition)
                         continue

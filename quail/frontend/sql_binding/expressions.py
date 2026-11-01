@@ -7,8 +7,8 @@ from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
 from quail.frontend.sql_binding.predicates import (
-    ARITHMETIC,
     COLUMN_NODES,
+    OPERATORS,
     SQL_FUNCTIONS,
     column_path,
     computed_value,
@@ -142,8 +142,10 @@ class ExpressionBinder:
             return self.resolve_value(node, tables)
         if not computed_value(node) and node.find(exp.Column) is None:
             return Literal(sql_literal(node))
-        if type(node) in ARITHMETIC:
-            name, arguments = ARITHMETIC[type(node)], (node.this, node.expression)
+        if type(node) in OPERATORS:
+            name, arguments = OPERATORS[type(node)], (node.this, node.expression)
+        elif isinstance(node, exp.Neg):
+            name, arguments = "negate", (node.this,)
         elif isinstance(node, exp.Anonymous):
             name, arguments = str(node.this).lower(), tuple(node.expressions)
         elif type(node) in SQL_FUNCTIONS:

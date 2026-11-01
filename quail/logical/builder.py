@@ -327,8 +327,11 @@ def _check_labels(condition, calls) -> None:
             not among the labels.
     """
     for test in condition.tests():
-        name = test.column.column
-        if test.comparison not in ("=", "in") or name not in calls:
+        references = column_references(test.expression)
+        if test.comparison not in ("=", "in") or len(references) != 1:
+            continue
+        name = references[0].column
+        if name not in calls:
             continue
         values = test.value if isinstance(test.value, tuple) else (test.value,)
         unknown = sorted(set(values) - set(calls[name].labels))

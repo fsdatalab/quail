@@ -129,8 +129,12 @@ which rows to join. Both support the following conditions on table columns:
 | Match a value in a list | `IN (...)` |
 | Keep null values | `IS NULL` |
 | Keep non-null values | `IS NOT NULL` |
+| Compare two columns of a table | `r.stars > r.min_stars` |
+| Keep rows where a boolean is true | `r.verified`, `UTF8_IS_UPPER(r.lang)` |
 
-Values can be numbers, strings, or booleans. `IN` requires a non-empty
+Values can be numbers, strings, or booleans. Either side of a comparison
+can be an [expression](#column-expressions), such as
+`ABS(r.stars - r.expected) <= 1`. `IN` requires a non-empty
 list of constant values. Combine conditions with `AND`.
 Comparisons exclude null values. Use `IS NULL` to keep them.
 
@@ -149,8 +153,10 @@ WHERE r.year = 2024
 Quail checks the year and rating before evaluating `AI.IF`.
 
 A condition in `ON` filters the table containing the referenced column.
-Comparisons between columns from different tables require `column = column`
-in `ON`. See [Joining](/docs/user-guide/sql/ai-functions#joining).
+In `ON`, `column = column` between two tables is a join key. In `WHERE`, a
+comparison of two tables' columns filters the joined rows; the tables still
+need a join key or an AI predicate in `ON`. See
+[Joining](/docs/user-guide/sql/ai-functions#joining).
 
 
 ### ORDER BY
@@ -260,6 +266,8 @@ name, such as `UTF8_REVERSE`, `ABS`, `ROUND`, or `UTF8_SLICE_CODEUNITS`.
 `+`, `-`, `*`, and `/` call `add`, `subtract`, `multiply`, and `divide`.
 A literal after the first argument fills the function's option in that
 position, as in Python: `ROUND(r.score, 2)` rounds to two digits.
+`WHERE` takes the same expressions as `SELECT`: a function that returns a
+boolean, such as `STARTS_WITH(r.body, 'Great')`, is a condition by itself.
 
 For example, return the reviews whose star rating is within one of 4:
 

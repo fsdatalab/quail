@@ -556,12 +556,14 @@ def literal_value(value):
 class RegularPredicate:
     """A test of a value expression or a model score against literals.
 
-    ``expression`` reads one source column, with fields or a function
-    on it, such as the ``start`` field of an extraction's span; or it
-    is an AI.SCORE call, compared with a threshold between 0 and 1.
-    ``value`` is the literal compared with, a tuple of literals for
-    ``in``, and None for the null tests. A column test is decided
-    without the model.
+    ``expression`` reads one or more source columns through fields and
+    scalar functions, such as the ``start`` field of an extraction's
+    span or ``greater(r.stars, r.min_stars)``; or it is an AI.SCORE
+    call, compared with a threshold between 0 and 1. ``value`` is the
+    literal compared with, a tuple of literals for ``in``, and None for
+    the null tests and ``is true``, which keeps the rows where a
+    boolean expression is true. A column test is decided without the
+    model.
     """
 
     expression: Expression | ModelCall
@@ -575,9 +577,16 @@ class RegularPredicate:
 
     @property
     def column(self) -> ColumnRef:
-        """The one source column the expression reads."""
-        (column,) = column_references(self.expression)
-        return column
+        """The one source column the expression reads.
+
+        Raises:
+            CompileError: The expression reads more than one column; use
+                column_references() for a test of several.
+        """
+        columns = column_references(self.expression)
+        if len(columns) != 1:
+            raise CompileError(f"{self} reads {len(columns)} columns, not one")
+        return columns[0]
 
     @property
     def function(self) -> Optional[str]:
@@ -588,7 +597,8 @@ class RegularPredicate:
     def aliases(self) -> tuple[str, ...]:
         if isinstance(self.expression, ModelCall):
             return self.expression.aliases()
-        return (self.column.alias,)
+        return tuple(dict.fromkeys(
+            reference.alias for reference in column_references(self.expression)))
 
     def tests(self) -> tuple[RegularPredicate, ...]:
         """Return this test alone, as And.tests() returns its tests."""
@@ -610,8 +620,8 @@ class RegularPredicate:
             if not isinstance(self.value, (int, float)) or not 0 <= self.value <= 1:
                 raise CompileError("AI.SCORE threshold must be between 0 and 1")
             return
-        if len(column_references(self.expression)) != 1:
-            raise CompileError("a column predicate tests one column")
+        if not column_references(self.expression):
+            raise CompileError("a column predicate tests a column")
         self.expression.validate()
         if self.comparison not in COLUMN_COMPARISONS:
             raise CompileError(
@@ -640,6 +650,8 @@ class RegularPredicate:
                 or its length with a string.
         """
         self.validate()
+        if self.comparison == "is true" and self.function != "length":
+            raise CompileError(f"{self.name} is text, not true or false")
         if self.comparison.startswith("is"):
             return
         values = self.value if isinstance(self.value, tuple) else (self.value,)
@@ -674,6 +686,10 @@ class RegularPredicate:
                 return pc.is_null(values)
             if comparison == "is not null":
                 return pc.is_valid(values)
+            if comparison == "is true":
+                if not pa.types.is_boolean(values.type):
+                    raise TypeError(f"a test is true or false, got {values.type}")
+                return values
             if comparison == "in":
                 return membership(values, self.value)
             if isinstance(self.value, str):
@@ -697,6 +713,8 @@ class RegularPredicate:
     def __str__(self) -> str:
         if self.comparison == "in":
             return f"{self.name} IN ({', '.join(repr(v) for v in self.value)})"
+        if self.comparison == "is true":
+            return self.name
         if self.comparison.startswith("is"):
             return f"{self.name} {self.comparison.upper()}"
         return f"{self.name} {self.comparison} {self.value!r}"

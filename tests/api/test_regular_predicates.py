@@ -168,3 +168,59 @@ def test_any_arrow_scalar_function_runs_in_where_and_select(session):
     with pytest.raises(CompileError, match="unknown function 'nope'"):
         session.sql("SELECT r.id FROM reviews r WHERE NOPE(r.lang) = 'x' "
                     "AND AI_FILTER(PROMPT('q1: {0}', r.review))")
+
+
+def test_where_takes_the_same_arrow_expressions_as_select(session):
+    session.register("pairs", quail.DocumentProvider.from_table(pa.table({
+        "id": [f"r{i}" for i in range(6)],
+        "review": [f"review {i} " + "pad " * 20 for i in range(6)],
+        "stars": [5, 2, 4, None, 3, 5],
+        "floor": [4, 3, 4, 1, 1, 6],
+        "lang": ["EN", "en", "Fr", "EN", "en", "DE"],
+    }), id_col="id"))
+    # q1 keeps r0, r1, r3, and r4
+    first = "SELECT r.id FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
+    cases = {
+        # a boolean function on its own, as SELECT returns it
+        "UTF8_IS_UPPER(r.lang)": ["r0", "r3"],
+        "NOT UTF8_IS_UPPER(r.lang)": ["r1", "r4"],
+        # two columns of one table; r3's null stars is rejected
+        "r.stars > r.floor": ["r0", "r4"],
+        "r.stars - r.floor >= 1 OR r.lang = 'en'": ["r0", "r1", "r4"],
+        "ABS(-r.stars) <= r.floor": ["r1"],
+    }
+    for test, kept in cases.items():
+        query = session.sql(f"{first} AND ({test}) ORDER BY r.id")
+        scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+        assert scan.predicates, test
+        assert [row[0] for row in _run(query, make_executor(TRUTH)).to_rows()] == (
+            kept), test
+    query = session.sql(f"{first} AND r.stars > r.floor")
+    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    assert [str(test) for test in scan.predicates] == ["greater(r.stars, r.floor)"]
+    # SELECT returns the same comparison
+    query = session.sql(
+        "SELECT r.id, r.stars > r.floor AS above FROM pairs r "
+        "WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) ORDER BY r.id")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("r0", True), ("r1", False), ("r3", None), ("r4", True)]
+    with pytest.raises(CompileError, match="true or false"):
+        _run(session.sql(f"{first} AND UPPER(r.lang)"), make_executor(TRUTH))
+
+
+def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
+    session.register("products", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["d0", "d1"],
+        "price": [3, 4]}), id_col="asin"))
+    query = session.sql("""
+        SELECT r.id, p.asin FROM reviews r
+        JOIN products p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
+        WHERE r.stars > p.price
+        ORDER BY r.id, p.asin
+    """)
+    filters = [node for node in query.logical.walk()
+               if isinstance(node, LogicalFilter)]
+    assert [str(node.condition) for node in filters] == ["greater(r.stars, p.price)"]
+    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
+    assert result.to_rows() == [
+        ("r0", "p0"), ("r0", "p1"), ("r2", "p0"), ("r5", "p0"), ("r5", "p1")]

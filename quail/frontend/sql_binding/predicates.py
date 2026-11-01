@@ -1,4 +1,8 @@
-"""Parse the plain tests of WHERE and ON: one column against literals.
+"""Parse the plain tests of WHERE and ON: tests that ask no model.
+
+A plain test compares a value expression with literals, or is a
+boolean expression on its own, such as ``UTF8_IS_UPPER(r.lang)`` or
+``r.stars > r.min_stars``.
 
 A plain test reads a source column, applied at the scan, or a column
 an AI.CLASSIFY or AI.EXTRACT in SELECT computes, named by its AS
@@ -37,7 +41,8 @@ _TEXT_TESTS = {
 }
 _SUPPORTED = (
     "=, <>, <, <=, >, >=, IN (literals), IS NULL, IS NOT NULL, LIKE, "
-    "ILIKE, CONTAINS, STARTSWITH, ENDSWITH, REGEXP_LIKE, and LENGTH()")
+    "ILIKE, CONTAINS, STARTSWITH, ENDSWITH, REGEXP_LIKE, or a boolean "
+    "column or scalar function of columns")
 
 
 def sql_literal(node):
@@ -68,7 +73,8 @@ class PlainTest:
     Attributes:
         operand: The tested column, as written: a Column, or an
             AI_EXTRACT call with a field (a Dot).
-        comparison: One of quail.logical.COLUMN_COMPARISONS.
+        comparison: One of quail.logical.COLUMN_COMPARISONS; ``is true``
+            for a boolean operand tested on its own.
         value: The literal or tuple of literals compared with.
         function: The function applied to the column, or None.
         negated: Whether the test is written negated, as ``NOT LIKE``.
@@ -96,6 +102,13 @@ def unwrap_function(node) -> tuple[exp.Expression, str | None]:
 # the arithmetic of value expressions, by the Arrow compute function it calls
 ARITHMETIC = {exp.Add: "add", exp.Sub: "subtract", exp.Mul: "multiply",
               exp.Div: "divide"}
+# the comparisons of value expressions, by the Arrow compute function
+# they call when no side is a literal, as in r.stars > r.min_stars
+COMPARISON_FUNCTIONS = {exp.EQ: "equal", exp.NEQ: "not_equal", exp.LT: "less",
+                        exp.LTE: "less_equal", exp.GT: "greater",
+                        exp.GTE: "greater_equal"}
+# the binary operators of value expressions, by the function they call
+OPERATORS = {**ARITHMETIC, **COMPARISON_FUNCTIONS}
 
 
 def computed_value(node) -> bool:
@@ -103,7 +116,7 @@ def computed_value(node) -> bool:
 
     An AI call, an aggregate, and a window are not computed values.
     """
-    if not isinstance(node, (exp.Func, exp.Paren, *ARITHMETIC)) or isinstance(
+    if not isinstance(node, (exp.Func, exp.Paren, exp.Neg, *OPERATORS)) or isinstance(
             node, (exp.AggFunc, exp.AIClassify, exp.Window)):
         return False
     return not any(
@@ -148,7 +161,7 @@ def unwrap_hint(b, term) -> tuple:
     return inner, b.parse_options(options, {"selectivity"}).get("selectivity")
 
 
-def parse_plain_test(term, dialect: str) -> PlainTest | None:
+def parse_plain_test(term, dialect: str) -> PlainTest:
     """Parse one WHERE or ON term as a test of a column against literals.
 
     Args:
@@ -157,7 +170,8 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
             ignores case and whether a regex matches the whole value.
 
     Returns:
-        The test, or None for a term comparing two columns.
+        The test. A comparison of two value expressions, or a boolean
+        expression alone, is tested ``is true``.
 
     Raises:
         CompileError: The term is not a supported plain test.
@@ -200,12 +214,17 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
             return PlainTest(right[0], _FLIPPED[comparison], sql_literal(node.this),
                              right[1])
         if left is not None and right is not None:
-            return None
+            # two value expressions: an Arrow comparison, tested true;
+            # bind_condition reads one between two tables' columns as a
+            # join condition
+            return PlainTest(node, "is true")
+    if isinstance(node, (exp.Column, exp.Dot)) or computed_value(node):
+        return PlainTest(node, "is true")
     raise CompileError(
         f"{term.sql()} is not supported; a regular predicate is {_SUPPORTED}")
 
 
-def bind_condition(b, term, selected: dict):
+def bind_condition(b, term, selected: dict, *, join_keys: bool = False):
     """Bind a WHERE or ON term that asks no model as a condition tree.
 
     NOT, AND, and OR become Not, And, and Or; every other term is one
@@ -215,14 +234,15 @@ def bind_condition(b, term, selected: dict):
         b: The expression binder, which resolves the columns.
         term: The term.
         selected: The AI calls in SELECT, by AS name.
+        join_keys: Whether the term is in ON, where a comparison of two
+            tables' columns, outside NOT, AND, and OR, is a join key.
 
     Returns:
-        The condition, or None for a comparison of two columns, which
-        the caller reads as a join condition.
+        The condition, or None for a join key, which the caller reads
+        as a join condition.
 
     Raises:
-        CompileError: A term under NOT, AND, or OR compares two
-            columns, or a term is not a supported test.
+        CompileError: A term is not a supported test.
     """
     node = term.unnest()
     if isinstance(node, exp.Not):
@@ -231,21 +251,30 @@ def bind_condition(b, term, selected: dict):
         kind = And if isinstance(node, exp.And) else Or
         return kind(tuple(_bind_operand(b, part, selected) for part in node.flatten()))
     test = parse_plain_test(node, b.dialect)
-    if test is None:
+    if join_keys and _join_condition(b, test):
         return None
     found = extract_test(b, test, selected)
     predicate = found[1] if found is not None else bind_plain_test(b, test)
     return Not(predicate) if test.negated else predicate
 
 
+def _join_condition(b, test: PlainTest) -> bool:
+    """Return whether a test compares a column of one table with another's."""
+    node = test.operand
+    if type(node) not in COMPARISON_FUNCTIONS or not all(
+            isinstance(side, exp.Column) for side in (node.this, node.expression)):
+        return False
+    try:
+        sides = [b.resolve_value(side) for side in (node.this, node.expression)]
+    except CompileError:
+        return False
+    return len({side.alias for side in sides
+                if isinstance(side, ColumnRef)}) == 2
+
+
 def _bind_operand(b, term, selected: dict):
-    """Bind a term under NOT, AND, or OR, which must test a column."""
-    condition = bind_condition(b, term, selected)
-    if condition is None:
-        raise CompileError(
-            f"{term.sql()} compares two columns; NOT, AND, and OR combine "
-            f"tests of a column against literals")
-    return condition
+    """Bind a term under NOT, AND, or OR."""
+    return bind_condition(b, term, selected)
 
 
 def _text_comparison(node, dialect: str) -> str | None:

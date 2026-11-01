@@ -294,9 +294,11 @@ class Query:
                 continue
             columns = pa.table(self.inputs.sample_columns(
                 scan.provider,
-                list(dict.fromkeys(test.column.column
+                list(dict.fromkeys(reference.column
                                    for predicate in scan.predicates
-                                   for test in predicate.tests()))))
+                                   for test in predicate.tests()
+                                   for reference in column_references(
+                                       test.expression)))))
             sampled = columns.num_rows
             kept = len(selected_rows(columns, scan.predicates))
             # a sample that keeps nothing, or everything, says little
@@ -402,7 +404,7 @@ class Query:
         provider = self.catalog.get(scan.provider)
         expressions = (*self.logical.projection.columns,
                        *(key.expression for key in self.logical.result.order),
-                       *(test.column for predicate in scan.predicates
+                       *(test.expression for predicate in scan.predicates
                          for test in predicate.tests()))
         columns = tuple(dict.fromkeys(
             column for expression in expressions
@@ -489,16 +491,18 @@ class Query:
         for scan in operators.scans:
             for predicate in scan.predicates:
                 for test in predicate.tests():
-                    needed.setdefault(scan.alias, {})[test.column.column] = None
+                    for reference in column_references(test.expression):
+                        needed.setdefault(scan.alias, {})[reference.column] = None
         # a Filter on labels or answers reads the source columns it tests
         # by document ID
         providers = {scan.alias: scan.provider for scan in operators.scans}
         for alias, filters in operators.column_filters.items():
             columns = self.catalog.get(providers[alias]).columns
-            for test in (found for each in filters
-                         for found in each.condition.tests()):
-                if test.column.column in columns:
-                    needed.setdefault(alias, {})[test.column.column] = None
+            for reference in (reference for each in filters
+                              for found in each.condition.tests()
+                              for reference in column_references(found.expression)):
+                if reference.alias == alias and reference.column in columns:
+                    needed.setdefault(alias, {})[reference.column] = None
         for alias, key in filter_stop_keys(self.logical).items():
             for column in key:
                 needed.setdefault(alias, {})[column] = None
