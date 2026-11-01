@@ -147,6 +147,9 @@ class ConditionGate(SingleResultPart):
         if self.columns is None or name not in self.columns.column_names:
             raise KeyError(f"{self.node.node_id!r} reads {name!r}, which no "
                            f"operator computes and the scan does not hold")
+        if len(documents) == 1:
+            # one document at a time: a slice copies nothing
+            return self.columns.column(name).slice(documents[0], 1)
         return pc.take(self.columns.column(name), pa.array(documents))
 
     def gate(self, key):

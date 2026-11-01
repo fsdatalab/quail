@@ -29,6 +29,7 @@ FUNCTION_ALIASES = {"length": "utf8_length", "lower": "utf8_lower",
                     "upper": "utf8_upper", "trim": "utf8_trim_whitespace"}
 
 
+@functools.cache
 def arrow_function(name: str):
     """Return the Arrow compute function a scalar function name calls.
 
