@@ -133,6 +133,12 @@ class ModelSpec:
     #                       to every prompt: Quail tokenizes without special
     #                       tokens, so the prefix carries it, and the text
     #                       sent to vLLM drops it because vLLM adds its own
+    answer_temperature: float = 1.0    # divides a score's yes-against-no
+    #                                    margin before the sigmoid
+    attention_mask: Literal["causal", "set"] = "causal"
+    #                    "set": d1's set attention, under which a
+    #                    document reads its questions, so a document's
+    #                    work is redone in every pass and no KV is kept
     answer_spellings: tuple[tuple[str, ...], tuple[str, ...]] = ()
     #                    (true spellings, false spellings) that a
     #                    filter, join, or score reads at the answer row;

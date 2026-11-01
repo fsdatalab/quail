@@ -92,10 +92,49 @@ def test_d1_2b_refuses_classify_and_extract_with_a_reason():
     assert "document positions" in extract.reasons[0]
 
 
-def test_a_hybrid_model_with_sliding_layers_gets_a_sliding_pool():
+def test_a_set_attention_model_keeps_no_arena_or_checkpoints():
     from quail.cost import budgets
 
-    full, sliding = budgets.arena_pages(D1_2B_BF16, H100_SXM)
+    chunk = budgets.chunk_budget(D1_2B_BF16, H100_SXM)
 
-    assert full > 0
-    assert sliding == full
+    assert budgets.arena_pages(D1_2B_BF16, H100_SXM) == (1, 1)
+    assert budgets.checkpoint_memory_bytes(D1_2B_BF16, chunk) == 0
+    assert chunk > 0
+
+
+def test_a_lone_question_reads_its_whole_pass_both_ways():
+    from quail.cost.work import packed, triangle
+
+    work = packed(300, (50,), window=256)
+    two = packed(300, (50, 40))
+
+    assert work.tokens == 350
+    assert work.pairs == 350 * 350
+    assert work.sliding_pairs == triangle(350, 256)
+    assert (work.state_written, work.state_read) == (0, 0)
+    # the state reads all 390 tokens; each question, the state and itself
+    assert two.pairs == 300 * 390 + 50 * 350 + 40 * 340
+
+
+def test_a_set_attention_filter_costs_the_same_first_or_later():
+    from quail.cost.filters import filter_cost
+
+    first, later = (filter_cost(50, 300.0, D1_2B_BF16, H100_SXM, 8192,
+                                first=flag) for flag in (True, False))
+
+    assert first == later > 0
+
+
+def test_set_attention_refuses_joins_and_two_operators_on_a_table():
+    from quail.planner.validation import set_attention_refusal
+
+    joined = SimpleNamespace(joins=[object()], filters={})
+    two = SimpleNamespace(joins=[], filters={"r": [object(), object()]})
+    one = SimpleNamespace(joins=[], filters={"r": [object()]})
+
+    assert "joins" in set_attention_refusal(joined, False, D1_2B_BF16).reasons[0]
+    assert "one AI operator" in set_attention_refusal(
+        two, False, D1_2B_BF16).reasons[0]
+    assert "one AI operator" in set_attention_refusal(
+        one, True, D1_2B_BF16).reasons[0]
+    assert set_attention_refusal(one, False, D1_2B_BF16) is None

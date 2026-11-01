@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from quail.backends.quail.executor.attention import Engine
-from quail.backends.quail.executor.gdn import short_conv_core
+from quail.backends.quail.executor.gdn import wide_causal_conv
 from quail.backends.quail.executor.models.base import ModelPipeline
 
 TEXT_PREFIX = "model.language_model."
@@ -173,14 +173,26 @@ def load_lfm3(path, device="cuda", max_positions=None):
 
 
 class Lfm3Pipeline(ModelPipeline):
-    """Forward passes for LFM3 checkpoints loaded by load_lfm3."""
+    """Forward passes for LFM3 checkpoints loaded by load_lfm3, under set attention.
 
-    needs_pages = True
+    Every sequence in a chunk is one pass: a document and its questions,
+    packed whole, with no KV kept. The convolution and sliding-window
+    layers run causally through each sequence from zero state. On the
+    full-attention layers a sequence with one question reads itself in
+    both directions, as d1's set attention reads a lone question.
+    """
+
+    needs_pages = False
     tree_attention = False
     warm_row_classes = False
     warm_joins = False
+    whole_sequences = True
 
     def __init__(self, model, arena, *, spec, engine_class=Engine):
+        if spec.attention_mask != "set":
+            raise ValueError(
+                f"{spec.name}: the LFM3 pass runs set attention only, not "
+                f"{spec.attention_mask!r}")
         config = model.config
         loaded = (len(model.model.layers), config["hidden_size"],
                   config["num_attention_heads"], config["num_key_value_heads"],
@@ -235,10 +247,10 @@ class Lfm3Pipeline(ModelPipeline):
     def _norm(self, x, norm):
         return self.engine.norm_rows(x, norm.weight, norm.variance_epsilon)
 
-    def _short_conv(self, layer, x, phases, slot):
+    def _short_conv(self, layer, x, sequences):
         b, c, gated = self._linear(x, layer.in_proj).chunk(3, dim=-1)
-        conv = short_conv_core(
-            (b * gated).contiguous(), layer.taps, phases, self.arena, slot)
+        conv, _ = wide_causal_conv(
+            (b * gated).contiguous(), layer.taps, sequences, None)
         return self._linear(c * conv, layer.out_proj)
 
     def _rotate(self, x, positions, kind):
@@ -261,9 +273,14 @@ class Lfm3Pipeline(ModelPipeline):
         k = self._norm(k.reshape(rows * KH, D), layer.k_norm).view(rows, KH, D)
         q = self._rotate(q, positions, layer.kind)
         k = self._rotate(k, positions, layer.kind).contiguous()
-        window = self.window if layer.kind == "sliding_attention" else None
-        out = self.engine.attention_unified(
-            q, k, v.contiguous().view(rows, KH, D), meta, window=window)
+        v = v.contiguous().view(rows, KH, D)
+        cu, longest = meta["cu_a"], meta["max_a"]
+        if layer.kind == "sliding_attention":
+            out, _ = self.engine._fa(q, k, v, cu, cu, longest, longest,
+                                     causal=True, window=(self.window - 1, 0))
+        else:
+            out, _ = self.engine._fa(q, k, v, cu, cu, longest, longest,
+                                     causal=False)
         out = out.view(rows, H, D) * self.engine.torch.sigmoid(gate)[:, :, None]
         return self._linear(out.view(rows, H * D), layer.o_proj)
 
@@ -276,21 +293,18 @@ class Lfm3Pipeline(ModelPipeline):
         import torch.nn.functional as F
 
         meta = chunk.meta
-        meta["layer"] = 0
-        phases = meta["gdn"]
-        if phases is None:
-            raise ValueError(
-                "an LFM3 chunk needs its convolution phases; the arena has "
-                "no checkpoint slots")
+        if meta.get("unified") is not None or meta.get("reads") is not None:
+            raise ValueError("an LFM3 chunk packs whole sequences without "
+                             "arena pages")
+        lengths = tuple(end - first for _, first, _, end in chunk.row_spans)
+        if sum(lengths) != chunk.tokens:
+            raise ValueError("an LFM3 chunk holds whole sequences only")
+        sequences = SimpleNamespace(lengths=lengths, conv_metadata=None)
         hidden = F.embedding(chunk.input_ids, self.embed)
-        slot = 0
         for layer in self.layers:
             x = self._norm(hidden, layer.operator_norm)
             if layer.kind == "conv":
-                x = self._short_conv(layer, x, phases, slot)
-                slot += 1
-                # arena layers are indexed by model layer
-                meta["layer"] += 1
+                x = self._short_conv(layer, x, sequences)
             else:
                 x = self._attention(layer, x, chunk.positions, meta)
             hidden = hidden + self._norm(x, layer.post_operator_norm)

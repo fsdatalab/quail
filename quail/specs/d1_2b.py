@@ -32,8 +32,13 @@ D1_2B_BF16 = ModelSpec(
     sliding_window=256,
     layer_kinds=_LAYER_KINDS,
     conv_width=7,
+    # Liquid trained the model with set attention (d1_attention "set")
+    attention_mask="set",
     # the model was trained to answer yes or no at the end of its turn
     answer_spellings=(("yes", "Yes", "YES"), ("no", "No", "NO")),
+    # calibration.json "default", the temperature Liquid fitted for
+    # option answers
+    answer_temperature=1.337398453966105,
     turn_prefix="<|startoftext|><|im_start|>user\n",
     bos_text="<|startoftext|>",
     # the chat template's assistant turn with thinking off

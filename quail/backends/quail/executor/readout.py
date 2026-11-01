@@ -314,21 +314,28 @@ def split_rows(values, rows_per_answer):
 
 
 class AsyncScores(_HostReadout):
-    """Non-blocking yes-against-no sigmoid readout for AI.SCORE."""
+    """Non-blocking yes-against-no sigmoid readout for AI.SCORE.
+
+    Args:
+        torch: The torch module.
+        rows: The AnswerRows of the query's yes and no tokens.
+        temperature: Divides the yes-against-no margin before the sigmoid.
+    """
 
     dtype = np.float32
 
-    def __init__(self, torch, rows):
+    def __init__(self, torch, rows, temperature=1.0):
         super().__init__(torch)
         self.rows = rows
         self.weights = rows.weights.float()
+        self.temperature = temperature
 
     def submit(self, normed):
         torch, rows = self.torch, self.rows
         logits = rows.F.linear(normed.float(), self.weights)
         yes = logits.index_select(1, rows.true_cols).amax(dim=1)
         no = logits.index_select(1, rows.false_cols).amax(dim=1)
-        return self._copy(torch.sigmoid(yes - no))
+        return self._copy(torch.sigmoid((yes - no) / self.temperature))
 
     def result(self, handle):
         return super().result(handle, copy=False)

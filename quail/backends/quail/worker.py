@@ -200,8 +200,12 @@ class LoadedGpu:
 
 
 def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages) -> dict:
-    """KVArena arguments for the checkpoint slots; empty without state layers."""
-    if not spec.state_layers:
+    """KVArena arguments for the checkpoint slots.
+
+    Empty without state layers, and for a set-attention model, which
+    keeps no state between chunks.
+    """
+    if not spec.state_layers or spec.attention_mask == "set":
         return {}
     layers = len(spec.state_layers)
     return {

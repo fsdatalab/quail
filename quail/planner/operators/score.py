@@ -109,7 +109,8 @@ class ScoreLowering:
         what = (f"a document in {spec.aliases[0]!r}" if len(spec.aliases) == 1
                 else f"one pair of {spec.aliases[0]!r} and {spec.aliases[1]!r}")
         needed, available, unit = prefix + suffix, self.chunk, "tokens"
-        if needed <= available:
+        # a set-attention pass keeps no KV, so only the chunk bounds it
+        if needed <= available and self.context.model.attention_mask != "set":
             page_tokens = self.context.device.page_tokens
             needed = (budgets.pages(prefix, page_tokens)
                       + budgets.pages(suffix, page_tokens))

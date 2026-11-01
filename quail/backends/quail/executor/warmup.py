@@ -50,12 +50,19 @@ def _warm_inputs(budget, question_tokens=16):
 
 def _warm_convolutions(torch, pipeline, budget):
     """Compile and load convolution kernels for every private state capacity."""
-    from quail.backends.quail.executor.gdn import GdnPhase, causal_conv_kernel
+    from quail.backends.quail.executor.gdn import (
+        VLLM_CONV_MAX_WIDTH,
+        GdnPhase,
+        causal_conv_kernel,
+    )
 
     # Each sequence uses at least one token of the chunk budget.
     largest = 1 << (budget - 1).bit_length()
     for weight, bias, activate in pipeline.convolutions():
         channels, width = weight.shape
+        if width > VLLM_CONV_MAX_WIDTH:
+            # the wide convolution is plain torch, with nothing to compile
+            continue
         history = weight.new_empty((largest, width - 1, channels))
         history[:1].zero_()
         x = weight.new_zeros((2, channels))
