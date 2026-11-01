@@ -29,6 +29,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SemanticSaeFeatures,
     Unnest,
     Window,
@@ -76,6 +77,7 @@ class LogicalPlanBuilder:
         extracts: tuple = (),
         computed_filters: tuple = (),
         sae_features: tuple = (),
+        maps: tuple = (),
         schema=None,
     ) -> None:
         """Add one table with its filters, classifications, and extractions.
@@ -95,13 +97,15 @@ class LogicalPlanBuilder:
             extracts: (call, name) per extraction, in order. They sit
                 above the classifications and label filters.
             computed_filters: (condition, selectivity) per Filter on the
-                columns of one operator, in written order: a
-                classification's label, or an extraction's answer and
-                span. A label filter sits above its classification, in
-                written order; an answer filter sits right above the
-                extraction it tests.
+                columns of column operators, in written order: a
+                classification's label, an extraction's answer and span,
+                or a feature call's or a map's answer. A label filter
+                sits above its classification, in written order; any
+                other filter sits right above the last operator it reads.
             sae_features: (call, name) per AI.SAE_FEATURES call, in
                 order. They sit above the extractions.
+            maps: (call, name) per AI.MAP call, in order. They sit
+                above the feature calls.
 
         Raises:
             CompileError: The alias is taken, a label filter lists a
@@ -120,8 +124,6 @@ class LogicalPlanBuilder:
         if predicates:
             node = SemanticFilter(node, tuple(predicates))
         calls = {name: call for call, name in labels}
-        answers = {column for _, name in extracts
-                   for column in (name, name + SPAN_SUFFIX)}
         label_filters = [(condition, selectivity)
                          for condition, selectivity in computed_filters
                          if set(condition_columns(condition)) & set(calls)]
@@ -138,22 +140,26 @@ class LogicalPlanBuilder:
                 node = SemanticClassify(node, call, name)
                 classified.append(call)
         tests = [test for test in computed_filters if test not in label_filters]
+        answers = {column for calls_of_kind in (extracts, sae_features, maps)
+                   for _, name in calls_of_kind
+                   for column in (name, name + SPAN_SUFFIX)}
         done = set()
-        for call, name in extracts:
-            extraction = SemanticExtract(node, call, name)
-            node = extraction
-            done.update((name, extraction.span_name))
-            # a test runs after the last extraction it reads
-            for predicate, selectivity in list(tests):
-                if set(condition_columns(predicate)) & answers <= done:
-                    node = Filter(node, predicate, selectivity)
-                    tests.remove((predicate, selectivity))
+        for node_type, calls_of_kind in ((SemanticExtract, extracts),
+                                         (SemanticSaeFeatures, sae_features),
+                                         (SemanticMap, maps)):
+            for call, name in calls_of_kind:
+                column = node_type(node, call, name)
+                node = column
+                done.update(column.added_columns)
+                # a test runs after the last column operator it reads
+                for predicate, selectivity in list(tests):
+                    if set(condition_columns(predicate)) & answers <= done:
+                        node = Filter(node, predicate, selectivity)
+                        tests.remove((predicate, selectivity))
         if tests:
             raise CompileError(
-                f"the filter {tests[0][0]} tests a classification or an "
-                f"extraction the query does not return")
-        for call, name in sae_features:
-            node = SemanticSaeFeatures(node, call, name)
+                f"the filter {tests[0][0]} tests a column the query does not "
+                f"return")
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:

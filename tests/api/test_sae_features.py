@@ -7,6 +7,7 @@ from helpers.oracle import Oracle, finish
 import quail
 from quail.backends.quail.executor.operators.sae_features import FEATURE_LIST
 from quail.catalog import DocumentProvider
+from quail.logical import CompileError
 from quail.physical import decode_graph, encode_graph
 from quail.planner.plan import EngineConfig
 
@@ -87,3 +88,22 @@ def test_not_and_or_of_unnested_fields_and_source_columns_filter_rows(session):
 def test_explain_shows_the_columns_an_unnest_returns(session):
     query = session.sql(f"SELECT r.id, f.feature FROM reviews r, {UNNEST}")
     assert "Project: r.id, f.feature" in query.explain()
+@pytest.mark.parametrize("comparison, num_rows", [("IS NULL", 0), ("IS NOT NULL", 3)])
+def test_feature_list_null_tests_keep_empty_lists(session, comparison, num_rows):
+    query = session.sql(
+        "SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), "
+        "pooling => 'last') AS features FROM reviews r "
+        f"WHERE features {comparison}")
+    assert finish(query, Oracle(features=lambda spec, document: []))\
+        .collect().num_rows == num_rows
+
+
+@pytest.mark.parametrize("test", ["features = 'x'", "LENGTH(features) > 0"])
+def test_feature_lists_must_be_unnested_before_testing_their_fields(session, test):
+    with pytest.raises(CompileError, match="UNNEST"):
+        session.sql(
+            "SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), "
+            "pooling => 'last') AS features FROM reviews r "
+            f"WHERE {test}")
+
+

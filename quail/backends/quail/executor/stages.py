@@ -99,6 +99,10 @@ class Stage:
             tokens, shared by its suffixes or supplied per suffix. None uses
             the pipeline's default canvas.
         canvas_rows: Number of rows in each canvas returned by canvas.
+        answer_tokens: Limit on tokens a decoder writes after the stage's
+            request, as AI.MAP's answer. Admission reserves headroom for each answer.
+        answer_index: Index of this stage's first map in the decoder.
+        answer_dependencies: Decoder fields this stage's requests read.
     """
 
     DROP = DROP
@@ -121,6 +125,9 @@ class Stage:
     canvas: Callable | None = None
     canvas_rows: int = 0
     suffix_tokens: int = 0
+    answer_tokens: int = 0
+    answer_index: int = 0
+    answer_dependencies: tuple[int, ...] = ()
 
     def __post_init__(self):
         if self.own_suffixes:
@@ -203,7 +210,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
                on_answers=None, stop_groups=None, appended_tokens=None,
-               gpu_timing=False, survival=None):
+               gpu_timing=False, survival=None, decoder=None, dependencies=None,
+               knee_rows=0, decode_cost=None, summary=True):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -256,6 +264,17 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         appended_tokens: The most tokens the append stages leave after
             a document's frame, when stages discard tokens earlier ones
             added; None sums every append stage's longest suffix.
+        knee_rows: Rows below which the pass is logged as thin.
+        summary: Whether to log the run's pass counts when it ends.
+        decode_cost: Spec-only decode and recomputation times, or None
+            to require full answer capacity before admitting a document.
+        dependencies: Dependent anchor -> (document anchor, start stage).
+            A dependent starts only after that document launches the stage,
+            finishes there, and never counts toward a limit.
+        decoder: A MapDecoder writing the answers of the stages with
+            answer_tokens, or None. A document's row at such a stage is
+            reported once its answer ends; until then the decoder packs
+            one row for it per pass.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is
@@ -276,6 +295,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,
         appended_tokens=appended_tokens, gpu_timing=gpu_timing,
+        decoder=decoder, dependencies=dependencies, knee_rows=knee_rows,
+        summary=summary,
+        decode_cost=decode_cost,
     ).run()
 
 

@@ -121,8 +121,8 @@ See [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server).
 
 You can use filters and joins evaluated by a language model,
 `EXISTS` / `NOT EXISTS`, numeric scores (`AI.SCORE`), classification
-(`AI.CLASSIFY`), and extracting text that answers a question (`AI.EXTRACT`).
-`AI.MAP` is planned.
+(`AI.CLASSIFY`), extracting text that answers a question (`AI.EXTRACT`),
+and writing a text answer for each document (`AI.MAP`).
 
 You can write queries in two SQL dialects for AI functions:
 [Snowflake `AI_FILTER`](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
@@ -131,28 +131,20 @@ and
 
 ## Supported models and GPUs
 
-| Model | Device |
-| --- | --- |
-| Qwen3 4B fp8 | NVIDIA H100 SXM |
-| Qwen3 32B fp8 | NVIDIA RTX PRO 6000 Blackwell Server Edition |
-| DiffusionGemma 26B-A4B fp8 | NVIDIA H100 SXM |
-| Decision 2.0 Kai 0.6B bf16 | NVIDIA H100 SXM |
-| Qwen3.5 4B bf16 | NVIDIA H100 SXM |
-| Qwen3.5 4B fp8 | NVIDIA H100 SXM |
-| Qwen3.5 27B fp8 | NVIDIA H100 SXM |
-| Qwen3.8 27B fp8 | NVIDIA H100 SXM |
-| LFM2 2.6B bf16 | NVIDIA H100 SXM |
-
-You can use 1, 2, 4, or 8 GPUs per query.
-
-We are actively adding more hardware and models.
+Quail runs Qwen3, Qwen3.5, Qwen3.6, Qwen3.8, LFM2, DiffusionGemma, and
+Decision 2.0 Kai models on NVIDIA H100 SXM, B200, L40S, and RTX PRO 6000
+Blackwell GPUs, with 1, 2, 4, or 8 GPUs per query. See
+[Supported models and GPUs](https://fsdatalab.github.io/quail/docs/user-guide/models)
+for each model's AI functions and GPU limits.
 
 ## Development
 
 ```bash
-uv run ruff check quail tests experiments tools
+uv run ruff check quail bench calibrate tests experiments tools
 uv run python tools/check_long_strings.py
+uv run python tools/check_names.py
 uv run vulture
+uv run lint-imports
 uv run pytest -q
 ```
 

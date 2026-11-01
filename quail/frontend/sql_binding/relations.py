@@ -16,6 +16,7 @@ from quail.frontend.sql_binding.expressions import (
 from quail.frontend.sql_binding.predicates import (
     ai_aliases,
     bind_condition,
+    column_call,
     unwrap_hint,
 )
 from quail.logical import (
@@ -119,14 +120,14 @@ def _has_ai_call(term) -> bool:
     return any(
         _is_call(node, "AI_FILTER")
         or _is_call(node, "AI_SCORE")
-        or isinstance(node, (exp.AIClassify, exp.Exists))
+        or isinstance(node, exp.Exists)
         or (_is_call(node, "AI_EXTRACT") and not isinstance(node.parent, exp.Dot))
         for node in term.walk()
     )
 
 
-def _name_select_labels(b: ExpressionBinder, term, selected: dict):
-    """Replace a bare column named after an AI.CLASSIFY in SELECT with the call.
+def _name_select_calls(b: ExpressionBinder, term, selected: dict):
+    """Replace a bare column named after a scalar column call with the call.
 
     Raises:
         CompileError: The name is also a column of a table in scope.
@@ -134,7 +135,7 @@ def _name_select_labels(b: ExpressionBinder, term, selected: dict):
     for column in list(term.find_all(exp.Column)):
         if column.table or column.name not in selected:
             continue
-        if not isinstance(selected[column.name], exp.AIClassify):
+        if column_call(selected[column.name]) == "bind_ai_extract":
             continue
         if any(column.name in b.catalog.get(provider).columns
                for _, provider in b.tables):
@@ -161,7 +162,7 @@ def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
         Whether the term was a condition; False leaves an AI term, or a
         comparison of two columns, to the AI binders.
     """
-    if _has_ai_call(term):
+    if _has_ai_call(term) or _label_test(term) is not None:
         return False
     condition = bind_condition(b, term, selected)
     if condition is None:
@@ -181,7 +182,7 @@ def bind_where(b: ExpressionBinder, tree: exp.Select) -> None:
     selected = ai_aliases(tree)
     for term in _conjuncts(where.this) if where else []:
         term, hint = unwrap_hint(b, term)
-        term = _name_select_labels(b, term, selected)
+        term = _name_select_calls(b, term, selected)
         if _bind_plain_term(b, term, selected, hint):
             continue
         if isinstance(term.unnest(), exp.Or):

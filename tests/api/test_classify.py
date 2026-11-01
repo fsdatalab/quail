@@ -168,7 +168,6 @@ def test_sql_classifies_and_tests_labels(session):
         (predicate,) = equal.logical.operators().column_filters["d"]
         assert predicate.condition.value == ("refund",)
     for bad in (f"SELECT d.id, {call} FROM documents d",
-                f"SELECT d.id FROM documents d WHERE {call} < 'refund'",
                 f"SELECT d.id FROM documents d WHERE {call} IN (1)"):
         with pytest.raises(CompileError):
             session.sql(bad)
@@ -276,3 +275,15 @@ def test_streamed_classifications_share_one_pipeline(session):
     assert result.collect().num_rows == 0
     # the second test on topic drops the last document before kind
     assert scorer.calls == [("topic", [[0], [1]])]
+def test_plain_label_tests_share_the_classification_used_by_membership(session):
+    call = "AI.CLASSIFY(PROMPT('Topic? {0}', d.body), ARRAY['a', 'b'])"
+    query = session.sql(
+        f"SELECT d.id FROM documents d WHERE {call} IN ('a', 'b') "
+        f"AND {call} < 'b' AND {call} IS NOT NULL")
+    assert len(query.logical.operators().classifies) == 1
+    (classify,) = [node for node in query.plan().nodes if isinstance(node, AiClassify)]
+    tests = query.logical.operators().column_filters["d"]
+    assert {test.name for test in tests} == {classify.spec.name}
+    assert finish(query, _labels(["a", "b"])).collect().to_pylist() == [{"d.id": 7}]
+
+

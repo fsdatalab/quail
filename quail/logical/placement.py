@@ -67,8 +67,9 @@ def place_conditions(conditions, computed: Mapping[tuple[str, str], str],
             stays one part.
         computed: (alias, column) -> (kind, name) of the operator
             computing it, for every classification's label column
-            ("label") and every extraction's answer and span column
-            ("extract").
+            ("label"), every extraction's answer and span column
+            ("extract"), and every feature call's ("features") and
+            map's ("map") answer column.
         unnested: The aliases of UNNEST relations.
 
     Raises:
@@ -96,6 +97,11 @@ def place_conditions(conditions, computed: Mapping[tuple[str, str], str],
                   and len({kind for kind, _ in owners - {None}}) == 1):
                 tested.setdefault(aliases.pop(), []).append((part, selectivity))
             else:
+                if ("label" in {kind for kind, _ in owners - {None}}
+                        and len(owners - {None}) > 1):
+                    raise CompileError(
+                        f"{part} tests a label and another operator's "
+                        f"column; test them in separate conditions")
                 if selectivity is not None:
                     raise CompileError(
                         f"HINT estimates a test that runs before a model "

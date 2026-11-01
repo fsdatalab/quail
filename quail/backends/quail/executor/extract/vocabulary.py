@@ -95,6 +95,17 @@ class Vocabulary:
             self._options[kid] = found
         return found
 
+    def option_table(self, kids):
+        """Pack the requested word spellings into one vocabulary-indexed table."""
+        kids = np.unique(np.asarray(kids, dtype=np.int64))
+        options = [self.options(int(kid)) for kid in kids]
+        counts = np.zeros(len(self.keys), dtype=np.int64)
+        counts[kids] = [len(tokens) for tokens, _ in options]
+        tokens = np.concatenate([tokens for tokens, _ in options]) if options else []
+        lengths = np.concatenate([lengths for _, lengths in options]) if options else []
+        return (np.r_[0, np.cumsum(counts)], np.asarray(tokens, dtype=np.int64),
+                np.asarray(lengths, dtype=np.int64))
+
     def filler(self, token: int, length: int) -> list:
         """Return the rest of a token's word after its first length characters."""
         text = self.vocab[token]
@@ -136,13 +147,7 @@ class Vocabulary:
         if not texts:
             return []
         if self.encoder is not None:
-            source = pa.array(texts, type=pa.large_string())
-            ids, boundaries = self.encoder.batch_numpy(texts)
-            tokens = pa.LargeListArray.from_arrays(boundaries, pa.array(ids))
-            offsets, exact = self.offsets.numpy(tokens, source)
-            if not exact.to_numpy(zero_copy_only=False).all():
-                raise ValueError(
-                    "AI.EXTRACT requires token bytes that preserve the source text")
+            ids, offsets, boundaries = self.encode_packed(texts)
             return [(ids[start:end], offsets[start:end])
                     for start, end in zip(boundaries[:-1], boundaries[1:])]
         backend = getattr(self.tokenizer, "backend_tokenizer", None)
@@ -153,6 +158,28 @@ class Vocabulary:
                              add_special_tokens=False)
         return [(list(ids), list(offsets))
                 for ids, offsets in zip(enc["input_ids"], enc["offset_mapping"])]
+
+    def encode_packed(self, texts):
+        """Return flat tokens, character ranges and row boundaries."""
+        source = pa.array(texts, type=pa.large_string())
+        if not len(source):
+            return (np.empty(0, dtype=np.int64), np.empty((0, 2), dtype=np.int64),
+                    np.zeros(1, dtype=np.int64))
+        if self.encoder is not None:
+            ids, boundaries = self.encoder.batch_numpy(source)
+            tokens = pa.LargeListArray.from_arrays(boundaries, pa.array(ids))
+            offsets, exact = self.offsets.numpy(tokens, source)
+            if not exact.to_numpy(zero_copy_only=False).all():
+                raise ValueError(
+                    "AI.EXTRACT requires token bytes that preserve the source text")
+            return ids, offsets, boundaries
+        encoded = self.encode_batch(source.to_pylist())
+        boundaries = np.r_[0, np.cumsum([len(ids) for ids, _ in encoded])]
+        ids = np.concatenate([ids for ids, _ in encoded]).astype(np.int64)
+        offsets = np.concatenate([
+            np.asarray(offsets, dtype=np.int64).reshape(-1, 2)
+            for _, offsets in encoded])
+        return ids, offsets, boundaries
 
     def encode_ids(self, text: str) -> list:
         return list(self.tokenizer.encode(text, add_special_tokens=False))

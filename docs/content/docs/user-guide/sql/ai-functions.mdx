@@ -3,7 +3,7 @@ title: AI functions
 ---
 
 Use AI functions to filter and join documents, score answers, assign
-labels, extract text, and read sparse autoencoder features. The examples use BigQuery syntax. See the
+labels, extract text, write text answers, and read sparse autoencoder features. The examples use BigQuery syntax. See the
 [SQL reference](/docs/user-guide/sql) for dialect selection and a first query.
 
 ## Functions
@@ -20,6 +20,7 @@ Square brackets mark optional arguments.
 | [`AI.SCORE(prompt[, options])`](#aiscore) | Returns a score from 0 to 1 for a model question. |
 | [`AI.CLASSIFY(input, categories[, options])`](#aiclassify) | Assigns one of the supplied labels. |
 | [`AI.EXTRACT(input, questions)`](#aiextract) | Copies answers from a document and returns their positions. |
+| [`AI.MAP(input, instruction[, max_tokens])`](#aimap) | Writes a text answer for each document. |
 | [`AI.SAE_FEATURES(prompt, pooling)`](#aisae_features) | Returns the sparse autoencoder features of a prompt. |
 | [`HINT(condition, options)`](#planning-hints) | Sets the estimated pass fraction for a label or answer condition. |
 
@@ -150,8 +151,9 @@ stronger model preference for a positive answer to your question.
 ### Return scores
 
 For example, imagine a `documents` table where each row is a customer
-support request. Its `body` column contains the request text. Return the
-score for whether each customer requests a refund:
+support request. Its `body` column contains the request text. The
+following query returns the score for whether each customer requests a
+refund:
 
 ```sql
 SELECT d.id,
@@ -165,7 +167,8 @@ A score in `SELECT` requires a column alias with `AS`.
 ### Filter rows
 
 Compare the score with `<`, `<=`, `>`, or `>=`. For the same support
-requests, keep rows with a refund score of at least 0.75:
+requests, the following query keeps rows with a refund score of at least
+0.75:
 
 ```sql
 SELECT d.id
@@ -186,8 +189,8 @@ See [Options](#options).
 ### Join tables
 
 For example, imagine a `queries` table of search queries and a `documents`
-table of articles. Match each query with articles whose relevance score
-is at least 0.8:
+table of articles. The following query pairs each search query with
+articles whose relevance score is at least 0.8:
 
 ```sql
 SELECT q.id, d.id
@@ -223,8 +226,8 @@ with `AI.IF`.
 ## AI.CLASSIFY
 
 `AI.CLASSIFY` returns one of your supplied categories as a `STRING`.
-For example, imagine a `reviews` table with review text in `body`. Return
-a sentiment label for each review:
+For example, imagine a `reviews` table with review text in `body`. The
+following query returns a sentiment label for each review:
 
 ```sql
 SELECT r.id,
@@ -282,7 +285,8 @@ classifications of joined rows return labels only.
 #### Filter by category
 
 Use the classification's `AS` name in `WHERE` to filter by its label.
-For example, keep negative or mixed reviews from the `reviews` table:
+For example, the following query keeps negative or mixed reviews from the
+`reviews` table:
 
 ```sql
 SELECT r.id,
@@ -302,8 +306,9 @@ WHERE sentiment IN ('negative', 'mixed');
 
 Use a `PROMPT` that refers to both documents to classify joined rows.
 For example, imagine a `reviews` table of movie reviews and an `aspects`
-table of subjects such as acting or plot. Find the aspects each review
-discusses and classify its sentiment about each matched aspect:
+table of subjects such as acting or plot. The following query finds the
+aspects each review discusses and classifies its sentiment about each
+matched aspect:
 
 ```sql
 SELECT r.id, a.aspect,
@@ -331,8 +336,8 @@ For the scoring methods, see
 
 `AI.EXTRACT` returns the answer to each of your questions, copied from
 a document. For example, imagine a `contracts` table
-with contract text in `text`. Return the end date and the signer of
-each lease:
+with contract text in `text`. The following query returns the end date
+and the signer of each lease:
 
 ```sql
 SELECT c.id,
@@ -374,8 +379,8 @@ questions about one document read the same document KV.
 ### Filter on answers
 
 Use the extraction's `AS` name to filter by an answer field in `WHERE`.
-For example, with the same `contracts` table, keep leases whose
-extracted end date contains "2027":
+For example, with the same `contracts` table, the following query keeps
+leases whose extracted end date contains "2027":
 
 ```sql
 SELECT c.id,
@@ -407,6 +412,81 @@ set the expected fraction of documents that pass, or pass
 - `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result of an
   extraction.
 
+## AI.MAP
+
+`AI.MAP` writes a text answer for each row, following your instruction.
+For example, imagine a `reviews` table with review text in `body`.
+The following query writes a one-sentence summary of each review:
+
+```sql
+SELECT r.id,
+       AI.MAP(r.body, 'Summarize the review in one sentence.') AS summary
+FROM reviews r;
+```
+
+The result is a `STRING` column with one answer for each row. The model
+always picks its most likely next token, so the same document and
+instruction give the same answer. An answer ends when the model
+finishes or when it reaches the answer limit.
+
+A map in `SELECT` requires a column alias with `AS`, and the call must
+be a separate item. To change the answer, map in a
+[CTE](/docs/user-guide/sql/sql-functions#with), then change it in the
+outer query:
+
+```sql
+WITH m AS (
+    SELECT r.id,
+           AI.MAP(r.body, 'Summarize the review in one sentence.') AS summary
+    FROM reviews r
+)
+SELECT m.id, UPPER(m.summary) AS loud_summary
+FROM m;
+```
+
+### Arguments
+
+`AI.MAP(input, instruction[, max_tokens])`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `input` | `STRING` column | The document to read. |
+| `instruction` | `STRING` literal | What to write about the document. |
+| `max_tokens` | Positive integer | The most tokens an answer can have. The default is 256. |
+
+### Several maps and other functions
+
+Each map in a query writes its own answer. On the Quail backend, the
+maps about one document read the same document KV. Maps also work with
+`AI.IF`, `AI.CLASSIFY`, and `AI.EXTRACT` on the same table. The
+following query summarizes only the negative reviews:
+
+```sql
+SELECT r.id,
+       AI.MAP(r.body, 'Summarize the review in one sentence.') AS summary
+FROM reviews r
+WHERE AI.IF(PROMPT('Is this review negative?\n\n{0}', r.body));
+```
+
+Quail writes answers only for the rows that pass the filter.
+
+### Use answers in the query
+
+You can use a map's answer in `WHERE`, `ORDER BY`, `GROUP BY`, and
+`SELECT DISTINCT`, like any text column. The following query keeps
+reviews whose complaints mention the ending:
+
+```sql
+SELECT r.id,
+       AI.MAP(r.body, 'List what the review complains about.') AS complaints
+FROM reviews r
+WHERE complaints ILIKE '%ending%';
+```
+
+Quail writes each answer once and uses it for both the condition and
+the result. Use a [planning hint](#planning-hints) to set the expected
+fraction of rows that pass.
+
 ## AI.SAE_FEATURES
 
 `AI.SAE_FEATURES` returns the sparse autoencoder (SAE) features of a
@@ -417,7 +497,8 @@ what a feature means, read the documents where its strength is largest.
 The function does not generate text.
 
 For example, imagine a `tickets` table with the first message of each
-support conversation in `request`. Return the features of each request:
+support conversation in `request`. The following query returns the
+features of each request:
 
 ```sql
 SELECT t.id,
@@ -469,8 +550,8 @@ in `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates. To give a
 field another name in the result, write `f.feature AS feature_id` in
 `SELECT`. `WHERE` uses the original name.
 
-For example, with the same `tickets` table, count how many requests
-return each feature:
+For example, with the same `tickets` table, the following query counts
+how many requests return each feature:
 
 ```sql
 SELECT f.feature, COUNT(*) AS requests
@@ -517,7 +598,7 @@ For an application, see
 ## Planning hints
 
 Use `HINT(condition, {'selectivity': fraction})` on a classification
-label or extracted answer to estimate the fraction of documents that
+label, extracted answer, or map answer to estimate the fraction of documents that
 pass. Quail uses the estimate to choose the order of AI functions.
 
 For example, in the lease query above, replace the `WHERE` clause with:

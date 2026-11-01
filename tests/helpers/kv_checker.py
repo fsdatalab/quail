@@ -38,6 +38,7 @@ class Setup:
         sliding_pages: Sliding pool pages.
         budget: Chunk token budget.
         page_tokens: Tokens per KV page.
+        state_slots: Recurrent checkpoint slots, or zero without recurrent layers.
     """
 
     path: str
@@ -47,6 +48,7 @@ class Setup:
     sliding_pages: int = 400
     budget: int = 600
     page_tokens: int = 16
+    state_slots: int = 0
 
 
 def mix(previous, token):
@@ -81,6 +83,9 @@ class HashModel:
                         if arena.has_sliding else None)
         self.answers = answers      # request hash -> answer bit
         self.canvas = canvas
+        self.state_hash = np.full(arena.num_state_slots, -1, dtype=np.int64)
+        self.state_position = np.full(arena.num_state_slots, -1, dtype=np.int64)
+        self.state_starts = np.zeros(arena.num_state_slots, dtype=np.int64)
 
     def forward_chunk(self, chunk):
         ids = chunk.input_ids.tolist()
@@ -91,6 +96,7 @@ class HashModel:
             self._unified(meta["unified"], ids, positions, hashes)
         else:
             self._tree(meta, ids, positions, hashes)
+        self._check_state(meta, ids, positions, hashes)
         out = []
         for row in chunk.final_indices.tolist():
             h = hashes[row]
@@ -99,6 +105,48 @@ class HashModel:
                 f"request has")
             out.append(self.answers[h])
         return out
+
+    def _check_state(self, meta, ids, positions, hashes):
+        """Check recurrent outputs against the full-attention token chain."""
+        if not len(self.state_hash):
+            return
+        phases = meta.get("gdn")
+        assert phases, "a hybrid chunk has no recurrent phases"
+        outputs = set()
+        for phase in phases:
+            rows = phase.rows.tolist()
+            bounds = phase.cu_seqlens.tolist()
+            assert np.diff(bounds).tolist() == list(phase.lengths)
+            reads = ([(0, -1)] * len(phase.lengths)
+                     if phase.read_slots is None else [
+                         (int(self.state_hash[slot]), int(self.state_position[slot]))
+                         for slot in phase.read_slots.tolist()])
+            writes = []
+            for index, (begin, end) in enumerate(zip(bounds, bounds[1:])):
+                previous, position = reads[index]
+                assert previous >= 0, "a recurrent phase reads an unwritten slot"
+                for row in rows[begin:end]:
+                    assert positions[row] == position + 1, (
+                        f"recurrent row at {positions[row]} follows "
+                        f"state at {position}")
+                    previous = mix(previous, ids[row])
+                    position += 1
+                    if phase.output:
+                        assert row not in outputs, "a recurrent row has two outputs"
+                        assert previous == hashes[row], (
+                            f"recurrent row {row} differs from its "
+                            "full-attention prefix")
+                        outputs.add(row)
+                writes.append((previous, position))
+            if phase.write_slots is not None:
+                slots = phase.write_slots.tolist()
+                assert len(slots) == len(writes)
+                assert len(set(slots)) == len(slots)
+                for slot, (previous, position) in zip(slots, writes):
+                    self.state_hash[slot] = previous
+                    self.state_position[slot] = position
+                    self.state_starts[slot] += phase.read_slots is None
+        assert outputs == set(range(len(ids))), "recurrent outputs omit chunk rows"
 
     # ---- unified: one paged call per pool --------------------------------
 
@@ -281,16 +329,19 @@ class HashModel:
 
 
 def make_arena(setup):
+    state = (dict(num_state_slots=setup.state_slots,
+                  gdn_state_shape=(1, 1, 1, 1), conv_state_shape=(1, 1, 1))
+             if setup.state_slots else {})
     if setup.window is not None:
         return KVArena(num_layers=2, num_pages=setup.pages,
                        page_tokens=setup.page_tokens, num_kv_heads=1, d_head=1,
                        dtype=torch.float32, device="cpu",
                        layer_kv=[(1, 1), (1, 1)], sliding_layers=(1,),
                        sliding_window=setup.window,
-                       num_sliding_pages=setup.sliding_pages)
+                       num_sliding_pages=setup.sliding_pages, **state)
     return KVArena(num_layers=1, num_pages=setup.pages,
                    page_tokens=setup.page_tokens, num_kv_heads=1, d_head=1,
-                   dtype=torch.float32, device="cpu")
+                   dtype=torch.float32, device="cpu", **state)
 
 
 def cpu_torch():

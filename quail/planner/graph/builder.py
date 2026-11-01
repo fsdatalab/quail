@@ -7,11 +7,10 @@ from quail.logical import (
     PROBABILITIES_SUFFIX,
     SPAN_SUFFIX,
     LogicalPlan,
-    classified_above_joins,
     column_name,
+    columns_above_joins,
     condition_columns,
     effective_selectivity,
-    extracted_above_joins,
     has_score,
     is_score,
     oriented_join_conditions,
@@ -34,14 +33,10 @@ from quail.planner.graph import retention
 from quail.planner.graph.pricing import PlanPricer
 from quail.planner.graph.results import result_nodes
 from quail.planner.graph.shards import contiguous_shards
-from quail.planner.operators.classify import (
-    emit_classify,
-    emit_joined_classify,
-)
-from quail.planner.operators.extract import emit_extract
+from quail.planner.operators.classify import emit_joined_classify
+from quail.planner.operators.columns import column_planner
 from quail.planner.operators.filter import emit_filter
 from quail.planner.operators.join import emit_join
-from quail.planner.operators.sae_features import emit_sae_features
 from quail.planner.operators.score import (
     ScoreLowering,
     emit_projected_scores,
@@ -56,8 +51,7 @@ from quail.planner.search.statistics import filter_stop_keys
 from quail.planner.search.table_steps import (
     ASK,
     CLASSIFY,
-    EXTRACT,
-    FEATURES,
+    COLUMN_STEPS,
     resident_after,
 )
 from quail.planner.statistics.tables import summarize_alias
@@ -164,8 +158,12 @@ class GraphBuilder:
         self.operator_order = operator_order
         self.operators = operator_order.operators
         self.classified = {alias for _, alias in self.operators.labels.calls}
-        self.after_joins = classified_above_joins(plan.root)
-        self.extract_after = extracted_above_joins(plan.root)
+        # alias -> the step kinds the planner lifted above the joins
+        self.after_joins = {}
+        for alias, call_kind in columns_above_joins(plan.root):
+            self.after_joins.setdefault(alias, set()).add(COLUMN_STEPS[call_kind])
+        self.classified_after = {alias for alias, kinds in self.after_joins.items()
+                                 if CLASSIFY in kinds}
         self.projected_scores = score_projections(plan)
         self.ask_filters = {
             alias: [self.operators.filters[alias][position] for position in positions]
@@ -217,12 +215,14 @@ class GraphBuilder:
         self.computed_ports = {}
         # alias -> the label and answer columns its operators compute
         self.computed_columns = {}
-        for node in self.operators.classifies:
+        # (alias, name) -> each one-table column operator
+        self.column_nodes = {}
+        for node in (*self.operators.classifies, *self.operators.extracts,
+                     *self.operators.sae_features, *self.operators.maps):
             if len(node.call.aliases()) == 1:
-                self.computed_columns.setdefault(node.alias, set()).add(node.name)
-        for node in self.operators.extracts:
-            self.computed_columns.setdefault(node.alias, set()).update(
-                (node.name, node.span_name))
+                self.computed_columns.setdefault(node.alias, set()).update(
+                    node.added_columns)
+                self.column_nodes[(node.alias, node.name)] = node
         # the label and answer tests emitted so far
         self.emitted_tests = ()
         self.scoring = (ScoreLowering(self.context, self.nodes,
@@ -261,7 +261,7 @@ class GraphBuilder:
 
         # aliases whose filter sequence runs in one pipeline with the
         # classification or join after it
-        between = self.classified - self.after_joins
+        between = self.classified - self.classified_after
         self.pipelined = self.streamed | {
             alias for alias in self.ask_filters
             if self.gpus == 1 and alias in between}
@@ -273,13 +273,9 @@ class GraphBuilder:
         row_ports = []
         port_by_alias = dict(port_by_alias)
         for s in self.operators.scans:
-            # a classification or extraction the planner lifted
-            # above the joins is emitted after them
-            kinds = {ASK, FEATURES}
-            if s.alias not in self.after_joins:
-                kinds.add(CLASSIFY)
-            if s.alias not in self.extract_after:
-                kinds.add(EXTRACT)
+            # a column operator the planner lifted above the joins is
+            # emitted after them
+            kinds = {ASK, *COLUMN_STEPS.values()} - self.after_joins.get(s.alias, set())
             port_by_alias[s.alias], rows = self._emit_steps(
                 s.alias,
                 float(stats[s.alias].num_documents),
@@ -298,7 +294,8 @@ class GraphBuilder:
         Args:
             alias: The table.
             expected_rows: The documents the first step reads.
-            kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT.
+            kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT,
+                FEATURES, MAP.
             port: The port the documents stand at before the steps.
 
         Returns:
@@ -324,19 +321,11 @@ class GraphBuilder:
             elif kind == ASK:
                 port = emit_filter(self, alias, positions, expected_rows, port,
                                        followed=run[-1] is not steps[-1])
-            elif kind == CLASSIFY:
-                port, rows = emit_classify(
-                    self, alias, expected_rows, positions, port
-                )
-                row_ports += rows
-            elif kind == FEATURES:
-                port, rows = emit_sae_features(
-                    self, alias, expected_rows, positions, port,
-                    resident=resident)
-                row_ports += rows
             else:
-                port, rows = emit_extract(self, alias, expected_rows, positions, port,
-                                           resident=resident)
+                port, rows = self.emit_columns(
+                    alias, expected_rows, port,
+                    [self.column_nodes[(alias, name)] for name in positions],
+                    resident=resident)
                 row_ports += rows
             for step in run:
                 expected_rows *= step.selectivity
@@ -404,16 +393,16 @@ class GraphBuilder:
         return port_by_alias, joins
 
     def _emit_join_answers(self, port_by_alias: dict, joins) -> list:
-        """Create the classifications and extractions that follow the joins.
+        """Create the column operators the planner lifted above the joins.
 
         Returns:
             The rows ports of the labels and answers SELECT returns.
         """
         row_ports = emit_joined_classify(self, joins.node_ids)
-        # classifications after the joins run over the documents the joins
-        # matched: a document with at least one true pair, expected as the
+        # a column operator after the joins runs over the documents the
+        # joins matched: a document with at least one true pair, expected as the
         # join selectivity times the partners it met, at most every document
-        for alias in sorted(self.after_joins | self.extract_after):
+        for alias, kinds in sorted(self.after_joins.items()):
             met = sum(
                 effective_selectivity(join.selectivity)
                 * (self.pair_fractions or {}).get(position, 1.0)
@@ -422,11 +411,6 @@ class GraphBuilder:
                       if argument.alias != alias)
                 for position, join in enumerate(self.operators.joins)
                 if alias in {argument.alias for argument in join.prompt.args})
-            kinds = set()
-            if alias in self.after_joins:
-                kinds.add(CLASSIFY)
-            if alias in self.extract_after:
-                kinds.add(EXTRACT)
             port_by_alias[alias], rows = self._emit_steps(
                 alias, self.operator_order.expected_rows[alias] * min(1.0, met), kinds,
                 port_by_alias[alias])
@@ -445,13 +429,14 @@ class GraphBuilder:
 
     def _emit_result(self, port_by_alias, row_ports, joins, score_pairs):
         """Connect result operators to surviving rows and answers."""
+        filtered_after = {alias for alias, kinds in self.after_joins.items()
+                          if kinds - {CLASSIFY}} & self.operators.column_filters.keys()
         if score_pairs is not None:
             sink_inputs = (score_pairs,)
         elif (len(joins.answers) == 1
               and len(self.operator_order.join_sequence) == 1
-              and not self.after_joins):
-            # one full join and nothing after it: its true pairs are the
-            # result rows, so no recombination is needed
+              and not (self.classified_after or filtered_after)):
+            # A later classification or column filter can remove joined rows.
             sink_inputs = (joins.answers[0],)
         elif joins.answers:
             self.nodes.append(Recombine(
@@ -515,7 +500,7 @@ class GraphBuilder:
                         "decision": "decision_head_softmax",
                     }.get(self.model.role, "true_false_softmax"),
                 } if self.scoring is not None else {}),
-                **({"classify_placement": ("after joins" if self.after_joins
+                **({"classify_placement": ("after joins" if self.classified_after
                                            else "before joins")}
                    if self.operators.labels.calls else {}),
                 **({"canvas_draws": self.context.canvas_draws}
@@ -525,37 +510,37 @@ class GraphBuilder:
         seconds, estimates = pricer(plan.graph)
         return replace(plan, estimated_seconds=seconds, estimates=estimates)
 
-    def emit_columns(self, alias, expected_rows, port, calls, node_of, *,
-                     projected=None) -> tuple:
+    def emit_columns(self, alias, expected_rows, port, nodes, *,
+                     resident=False) -> tuple:
         """Emit one table's column operators in run order, each followed by its tests.
 
-        The calls run in one pipeline (quail.physical.pipelines): a
-        document is read once for all of them. A label or answer test
-        runs right after the last operator whose columns it reads, in
-        the planner's order, so it drops a document before the next
-        operator reads it.
+        Each node comes from its kind's ColumnPlanner. The operators run
+        in one pipeline (quail.physical.pipelines): a document is read
+        once for all of them. A label or answer test runs right after
+        the last operator whose columns it reads, in the planner's
+        order, so it drops a document before the next operator reads it.
 
         Args:
             alias: The table.
-            expected_rows: The documents the first call reads.
-            port: The port the documents stand at before the calls.
-            calls: The calls, in run order.
-            node_of: Builds a call's node from (call, port, expected_rows,
-                index); index counts the calls emitted before it.
-            projected: Whether SELECT returns a call's answer; None
-                returns every call's.
+            expected_rows: The documents the first operator reads.
+            port: The port the documents stand at before the operators.
+            nodes: The logical column operators, in run order.
+            resident: Whether the step before the run left the
+                documents' KV for the first operator to read.
 
         Returns:
-            Where the documents stand after the calls and their tests,
-            and the rows ports of the answers SELECT returns.
+            Where the documents stand after the operators and their
+            tests, and the rows ports of the columns SELECT returns.
         """
         computed = self.computed_columns.get(alias, set())
         row_ports = []
-        for index, call in enumerate(calls):
-            node = node_of(call, port, expected_rows, index)
+        for index, logical_node in enumerate(nodes):
+            planner = column_planner(logical_node)
+            node = planner.node(self, logical_node, port, expected_rows,
+                                resident or index > 0)
             self.nodes.append(node)
             port = PortRef(node.node_id, node.rows_port)
-            if projected is None or projected(call):
+            if planner.projected(self.operators, logical_node):
                 row_ports.append(port)
             span = getattr(node.spec, "span_name", None)
             names = (node.spec.name, *(() if span is None else (span,)))

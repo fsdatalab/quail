@@ -1,0 +1,486 @@
+"""Copy decoding agrees with the host reference token rule on CPU."""
+
+from dataclasses import replace
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from helpers.extract_fakes import make_spec
+from helpers.extract_reference import Decoder, add_answers
+from helpers.extract_reference import ReferenceInputs as ExtractionInputs
+from test_map_decode import events_torch
+
+from quail.backends.quail.executor.map_decoder import MapDecoder
+
+
+# a draft policy matters only with draft tokens, and drafts only past one token
+@pytest.mark.parametrize(
+    "draft_tokens,draft_policy,spellings,answer_limit",
+    [
+        (0, "fixed", False, 1),
+        (4, "fixed", True, 8),
+        (4, "adaptive", False, 8),
+    ],
+)
+def test_copy_answers_and_spans_match_the_recurrent_token_rule(
+    draft_tokens, draft_policy, spellings, answer_limit
+):
+    rng = np.random.default_rng(817)
+    words = (
+        ["foo", "foobarbaz", "barbaz", "Foo"]
+        if spellings
+        else ["five", "years", "days", "lease"]
+    )
+    plain = [" ".join(rng.choice(words, size=14)) for _ in range(9)]
+    texts = [text.replace(" ", "  \n") if spellings else text for text in plain]
+    pool_text = " ".join(words)
+    spec, vocabulary = make_spec(*texts, *plain, pool_text, *words)
+    spec = replace(
+        spec,
+        draft_tokens=draft_tokens,
+        draft_policy=draft_policy,
+        max_answer_tokens=answer_limit,
+        top_tokens=4,
+        first_window_chars=8,
+        window_chars=12,
+    )
+    num_questions, num_documents = 3, len(texts)
+    state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
+    documents = ExtractionInputs(
+        state, [spec] * num_questions, vocabulary, np.arange(num_documents), None, texts
+    )
+    num_tokens = len(vocabulary.vocab)
+    logits = rng.normal(-8, 1, (num_questions, num_documents, 16, num_tokens))
+    # Force repeated starts, alternate continuations, stops, and absent words.
+    pool = vocabulary.encode_ids(pool_text)
+    for q in range(num_questions):
+        for document in range(num_documents):
+            for at in range(16):
+                token = int(rng.choice(pool))
+                if at > rng.integers(1, 7):
+                    token = vocabulary.stop_ids[0]
+                logits[q, document, at, token] = 3
+                if spellings:
+                    logits[q, document, at, int(rng.choice(pool))] = 3
+    logits = torch.tensor(logits, dtype=torch.float32)
+    reference = Decoder(vocabulary, 4, 9, num_questions, spec)
+    for document in documents.documents:
+        for q in range(num_questions):
+            answer = document.answers[q]
+            fed = []
+            while not answer.done:
+                at = len(answer.written)
+                block = logits[q, document.index, at : at + max(1, len(fed))]
+                lp = block.log_softmax(dim=1)
+                top, ids = lp.topk(4, dim=1)
+                rows = torch.cat(
+                    (
+                        torch.logsumexp(lp[:, vocabulary.stop_ids], dim=1)[:, None],
+                        ids.float(),
+                        top,
+                    ),
+                    dim=1,
+                ).numpy()
+                reference.verify(document, q, rows, fed)
+                if not answer.done:
+                    fed = reference.draft(answer, document.rho, q)
+    slots = np.arange(num_questions * num_documents).reshape(num_questions, -1)
+    decoder = MapDecoder(
+        events_torch(0),
+        torch.eye(num_tokens),
+        slots.size,
+        [answer_limit] * num_questions,
+        vocabulary.stop_ids,
+        16,
+        workspace_bytes=64 * 2**20,
+    )
+    decoder.configure_copy(0, slots, documents, [spec] * num_questions)
+    for q in range(num_questions):
+        for document in range(num_documents):
+            decoder.start(int(slots[q, document]), q, 0, [0, 1])
+    first = slots.flatten()
+    decoder.submit(
+        logits[:, :, 0].reshape(-1, num_tokens), np.arange(slots.size), first, None
+    )
+    decoder.harvest(wait=True)
+    while decoder.active:
+        rows = decoder.rows()
+        assert rows is not None
+        chunk = SimpleNamespace(
+            decode_rows=rows,
+            tokens=len(rows),
+            input_ids=torch.empty(len(rows), dtype=torch.int64),
+            meta={},
+        )
+        decoder.feed(chunk)
+        questions, positions = np.divmod(rows.slots, num_documents)
+        hidden = logits[questions, positions, rows.positions + 1]
+        decoder.submit(hidden, [], [], rows)
+        decoder.harvest(wait=True)
+    for q in range(num_questions):
+        expected = [document.answers[q] for document in documents.documents]
+        values, spans = decoder.output_answers(q, slots[q])
+        assert values == [answer.answer for answer in expected]
+        assert spans == [answer.span for answer in expected]
+        assert decoder.lengths[q][slots[q]].tolist() == [
+            len(a.written) for a in expected
+        ]
+
+
+# every setting appears in some case
+@pytest.mark.parametrize("draft_tokens,limit,filtered,lag,pages", [
+    (3, 2, False, 0, 24),
+    (0, None, True, 3, 300),
+])
+def test_copy_branches_match_reference_after_filters_and_limits(
+    monkeypatch, draft_tokens, limit, filtered, lag, pages, state_slots=0
+):
+    from helpers.fakes import cpu_staging, fake_pipeline
+    from helpers.kv_checker import Setup, chain, make_arena
+    from test_map_decode import Bits, TokenModel, next_token
+
+    from quail.backends.quail.executor.operators.extract import ExtractPart
+    from quail.backends.quail.executor.operators.filter import FilterPart
+    from quail.backends.quail.executor.parts import gated_stages
+    from quail.backends.quail.executor.stages import run_stages
+    from quail.physical import AiExtract
+
+    cpu_staging(monkeypatch)
+    rng = np.random.default_rng(19)
+    texts = [
+        " ".join(rng.choice(["five", "years", "days", "lease"], 25)) for _ in range(12)
+    ]
+    spec, vocabulary = make_spec(*texts, "five years days lease")
+    spec = replace(
+        spec,
+        draft_tokens=draft_tokens,
+        max_answer_tokens=8,
+        top_tokens=4,
+        draft_policy="fixed",
+    )
+    nodes = [
+        AiExtract(
+            node_id=f"extract:{q}",
+            backend_name="quail",
+            model="qwen3-4b-fp8",
+            spec=replace(
+                spec,
+                name=f"answer{q}",
+                prompt_token_parts=(
+                    spec.prompt_token_parts[0],
+                    (*spec.prompt_token_parts[1], q + 10),
+                ),
+            ),
+        )
+        for q in range(3)
+    ]
+    setup = Setup(path="unified", pages=pages, page_tokens=4, budget=128,
+                  state_slots=state_slots)
+    arena = make_arena(setup)
+    torch_ = events_torch(lag)
+    model = TokenModel(arena)
+    state = SimpleNamespace(
+        loaded_model=SimpleNamespace(arena=arena, vocabulary=vocabulary)
+    )
+    ids = list(range(len(texts)))
+    inputs = {
+        "documents": {
+            "c": (
+                None if lag else vocabulary.document_batch(texts, [None] * len(texts))
+            )
+        },
+        "texts": {"c": texts},
+    }
+    part = ExtractPart(state, nodes, ids, inputs)
+    parts = [part]
+    question = [700, 701]
+    if filtered:
+        parts.insert(
+            0, FilterPart(SimpleNamespace(question_token_ids=question), ids, Bits())
+        )
+    stages = gated_stages(parts)
+    prefixes, keys, tree, dependencies = part.branch_inputs(
+        part.extraction.prefixes,
+        part.extraction.keys,
+        None,
+        setup.page_tokens,
+        len(stages) - 1,
+    )
+    pool = [*vocabulary.encode_ids("five years days lease"), *vocabulary.stop_ids]
+    head = torch.zeros(len(vocabulary.vocab), 1024)
+    head[rng.choice(pool, 1024), np.arange(1024)] = 1
+    decoder = MapDecoder(
+        torch_,
+        head,
+        len(prefixes),
+        part.answer_limits,
+        vocabulary.stop_ids,
+        setup.page_tokens,
+        workspace_bytes=64 * 2**20,
+    )
+    part.decoder = decoder
+    survivors = []
+    fed = []
+
+    def forward_chunk(chunk):
+        if state_slots and chunk.decode_rows is not None:
+            rows = chunk.decode_rows
+            tokens = chunk.input_ids[-len(rows):].tolist()
+            fed.extend((int(decoder.map[slot]), int(slot),
+                        int(position - decoder.origin[slot]), token)
+                       for slot, position, token in zip(
+                           rows.slots, rows.positions, tokens))
+        return model.forward_chunk(chunk)
+
+    def settled(anchor, survived, row):
+        if anchor < len(texts) and survived:
+            survivors.append(anchor)
+        arena.free_key(keys[anchor])
+
+    every, timed_spans, fresh = run_stages(
+        torch_,
+        arena,
+        fake_pipeline(forward_chunk=forward_chunk, canvas_ids=()),
+        stages,
+        prefixes,
+        setup.budget,
+        anchor_keys=keys,
+        prefix_tree=tree,
+        dependencies=dependencies,
+        decoder=decoder,
+        on_settled=settled,
+        limit=limit,
+        survival=1.0,
+        attention_mode=setup.path if state_slots else None,
+    )
+    expected_survivors = [
+        d
+        for d, document in enumerate(part.extraction.documents)
+        if not filtered
+        or next_token(chain(list(map(int, document.prefix)) + question)) % 2
+    ]
+    assert set(survivors).issubset(expected_survivors)
+    if limit is None:
+        assert set(survivors) == set(expected_survivors)
+    else:
+        assert len(survivors) >= min(limit, len(expected_survivors))
+    add_answers(part.extraction)
+    reference = Decoder(vocabulary, 4, 9, len(nodes), spec)
+    for q, node in enumerate(nodes):
+        assert set(np.flatnonzero(part.asked[q])) == set(survivors)
+        for d in survivors:
+            document = part.extraction.documents[d]
+            answer = document.answers[q]
+            prompt = list(map(int, document.prefix)) + list(
+                node.spec.prompt_token_parts[1]
+            )
+            while not answer.done:
+                hidden = head[:, next_token(chain(prompt + answer.written))]
+                lp = hidden - torch.logsumexp(hidden, dim=0)
+                top, tokens = lp.topk(4)
+                row = torch.cat(
+                    (
+                        torch.logsumexp(lp[list(vocabulary.stop_ids)], dim=0)[None],
+                        tokens.float(),
+                        top,
+                    )
+                ).numpy()
+                reference.choose(document, q, row)
+        values, spans = part.answers(q, survivors)
+        assert values == [
+            part.extraction.documents[d].answers[q].answer for d in survivors
+        ]
+        assert spans == [
+            part.extraction.documents[d].answers[q].span for d in survivors
+        ]
+    part.finish(every)
+    part.complete(fresh, timed_spans, {}, len(stages) - 1)
+    results = part.results()
+    assert sum(result.metrics.fresh_tokens for result in results.values()) == fresh
+    for q, node in enumerate(nodes):
+        result = results[node.node_id]
+        asked = np.flatnonzero(part.asked[q])
+        assert result.outputs[node.rows_port].column(node.spec.name).to_pylist() == [
+            part.extraction.documents[d].answers[q].answer for d in asked
+        ]
+        extension = result.metrics.extension
+        assert extension["answer_tokens"] == sum(
+            len(part.extraction.documents[d].answers[q].written) for d in asked
+        )
+        assert extension["suffix_tokens"] == (
+            len(asked) * len(node.spec.prompt_token_parts[1]) + decoder.rows_fed[q]
+        )
+        assert extension["steps"] >= len(asked)
+    assert not arena.accounting.owned
+    if state_slots:
+        assert len(arena.accounting.free_slots) == state_slots
+        if draft_tokens:
+            assert any(position < decoder.lengths[q][slot] - 1
+                       and token != decoder.tokens[q][slot, position]
+                       for q, slot, position, token in fed), (
+                           "the workload must continue after rejecting a draft")
+
+
+@pytest.mark.parametrize("draft_tokens,pages,lag,filtered", [(3, 300, 3, True)])
+def test_hybrid_copy_answers_match_reference_after_rejected_drafts(
+        monkeypatch, draft_tokens, pages, lag, filtered):
+    test_copy_branches_match_reference_after_filters_and_limits(
+        monkeypatch, draft_tokens=draft_tokens, limit=None, filtered=filtered,
+        lag=lag, pages=pages, state_slots=120)
+
+
+# every setting appears in some case
+@pytest.mark.parametrize(
+    "map_first,tested,extract_attention,map_attention,pages",
+    [
+        (False, "extract", "tree", "tree", 300),
+        (True, "map", "unified", "unified", 24),
+        (False, None, "tree", "unified", 24),
+    ],
+)
+def test_maps_and_extracts_share_branches_without_changing_results(
+    monkeypatch, map_first, tested, extract_attention, map_attention, pages
+):
+    from helpers.fakes import cpu_staging
+    from helpers.kv_checker import Setup, chain, make_arena
+    from test_map_decode import (
+        TokenModel,
+        batch_decode,
+        map_node,
+        map_state,
+        next_token,
+    )
+
+    from quail.backends.quail.executor.operators.extract import ExtractPart
+    from quail.backends.quail.executor.operators.filter import ConditionGate
+    from quail.backends.quail.executor.operators.map import MapPart
+    from quail.backends.quail.executor.parts import execute_parts
+    from quail.logical import ColumnRef, RegularPredicate
+    from quail.physical import AiExtract, Filter, PortRef
+    from quail.physical.base import input_ports
+
+    cpu_staging(monkeypatch)
+    monkeypatch.setattr(
+        "quail.backends.quail.executor.parts.input_staging", lambda state: None
+    )
+    texts = ["five days or five years", "five years", "lease for five days"]
+    spec, vocabulary = make_spec(*texts, "five days years lease", "or", "for")
+    vocabulary.tokenizer.batch_decode = batch_decode
+    spec = replace(spec, max_answer_tokens=6, draft_tokens=3, top_tokens=4)
+    setup = Setup(path="unified", pages=pages, page_tokens=4, budget=128)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    state = map_state(setup, arena, model.forward_chunk)
+    state.gpu_timing = False
+    state.loaded_model.vocabulary = vocabulary
+    head = torch.zeros(len(vocabulary.vocab), 1024)
+    pool = [*vocabulary.encode_ids("five days years lease"), *vocabulary.stop_ids]
+    head[np.array(pool)[np.arange(1024) % len(pool)], np.arange(1024)] = 1
+    state.loaded_model.model.quail_full_head = head
+    ids = np.arange(len(texts))
+    tokens = vocabulary.document_batch(texts, [None] * len(texts))
+    extracts = ExtractPart(
+        state,
+        [
+            AiExtract(
+                node_id=f"extract:{q}",
+                backend_name="quail",
+                model="qwen3-4b-fp8",
+                attention=extract_attention,
+                spec=replace(spec, name=f"answer{q}"),
+            )
+            for q in range(2)
+        ],
+        ids,
+        {"documents": {"c": tokens}, "texts": {"c": texts}},
+        first=int(map_first),
+    )
+
+    def mapped(name, first):
+        node = map_node(name, [10, 11], 6, map_attention)
+        node.node_id, node.rows_port, node.spec.aliases = name, "rows:c", ("c",)
+        return MapPart(state, [node], ids, first)
+
+    maps = mapped("summary", 0 if map_first else 2)
+    parts = [maps, extracts] if map_first else [extracts, maps]
+    after = mapped("after", 3)
+    if tested:
+        producer = extracts if tested == "extract" else maps
+        column = "answer1" if tested == "extract" else "summary"
+        source = "extract:1" if tested == "extract" else "summary"
+        condition = Filter(
+            node_id="condition",
+            aliases=("c",),
+            written_position=0,
+            inputs=input_ports((PortRef(source, "rows:c"),)),
+            predicate=RegularPredicate(
+                ColumnRef("c", "contracts", column),
+                "is not null" if tested == "extract" else "<>",
+                None if tested == "extract" else ""),
+        )
+        parts.extend([ConditionGate(condition, {column: producer}, producer, None),
+                      after])
+    results = execute_parts(
+        state,
+        parts,
+        extracts.extraction.prefixes,
+        extracts.extraction.keys,
+        keep_kv=False,
+    )
+    add_answers(extracts.extraction)
+    reference = Decoder(vocabulary, 4, 9, 2, spec)
+    for d, document in enumerate(extracts.extraction.documents):
+        prefix = list(map(int, document.prefix))
+        expected = []
+        for _ in range(6):
+            token = int(
+                head[:, next_token(chain(prefix + [10, 11] + expected))].argmax()
+            )
+            if token in vocabulary.stop_ids:
+                break
+            expected.append(token)
+        assert (
+            results["summary"].outputs["rows:c"].column("summary")[d].as_py()
+            == batch_decode([expected])[0]
+        )
+        for q in range(2):
+            answer = document.answers[q]
+            prompt = prefix + list(spec.prompt_token_parts[1])
+            while not answer.done:
+                logits = head[:, next_token(chain(prompt + answer.written))]
+                lp = logits - logits.logsumexp(dim=0)
+                top, selected = lp.topk(4)
+                row = torch.cat(
+                    (
+                        lp[list(vocabulary.stop_ids)].logsumexp(dim=0)[None],
+                        selected.float(),
+                        top,
+                    )
+                ).numpy()
+                reference.choose(document, q, row)
+            output = results[f"extract:{q}"].outputs["rows:c"]
+            assert output.column(f"answer{q}")[d].as_py() == answer.answer
+            assert output.column(f"answer{q}_span")[d].as_py() == (
+                None
+                if answer.span is None
+                else dict(start=answer.span[0], end=answer.span[1])
+            )
+    if tested:
+        expected = ([document.answers[1].answer is not None
+                     for document in extracts.extraction.documents]
+                    if tested == "extract" else [bool(value) for value in
+                        results["summary"].outputs["rows:c"].column("summary").to_pylist()])
+        assert any(expected)
+        assert after.asked[0].tolist() == expected
+    assert len(set(maps.slots.flat) & set(extracts.slots.flat)) == 0
+    shared = "tree" in (extract_attention, map_attention)
+    assert extracts.decoder.share == shared
+    # Tight KV can serialize short answers before sibling branches decode.
+    if pages == 300 or not shared:
+        assert (model.shared_reads > 0) == shared
+    reads = extracts.decoder.read_tokens
+    assert (reads["alone"] + reads["own"] + reads["shared"] < reads["all"]) == (
+        model.shared_reads > 0
+    )
+    assert not arena.accounting.owned

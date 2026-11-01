@@ -35,25 +35,26 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SemanticSaeFeatures,
     Unnest,
     Window,
     WithCTE,
 )
+from quail.logical.nodes.column import SemanticColumn
 
 
 @dataclass(frozen=True)
 class ColumnTest:
-    """A Filter on the columns classifications or extractions compute.
+    """A Filter on the columns that column operators compute.
 
     For example, ``kind = 'lease'`` tests the label a classification
     adds, and ``lease.ends IS NULL OR c.id = 2`` an extraction's answer
     and a source column.
 
     Attributes:
-        name: The classification or extraction the Filter follows,
-            the last one it reads, as the SemanticClassify or
-            SemanticExtract names it.
+        name: The column operator the Filter follows, the last one it
+            reads, as its SemanticColumn names it.
         call: That operator's model call.
         condition: The condition the Filter applies.
         selectivity: The Filter's selectivity hint, or None.
@@ -197,7 +198,7 @@ class LogicalPlan:
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, classifies = [], {}, [], []
-        extracts, feature_calls, tested, aliases = [], [], {}, []
+        extracts, feature_calls, map_calls, tested, aliases = [], [], [], {}, []
         # the nodes above the projection read result rows, not documents
         nodes = LogicalPlan(self.projection).walk()
         for node in nodes:
@@ -222,11 +223,13 @@ class LogicalPlan:
                 extracts.append(node)
             elif isinstance(node, SemanticSaeFeatures):
                 feature_calls.append(node)
+            elif isinstance(node, SemanticMap):
+                map_calls.append(node)
         column_filters = {}
         for alias in aliases:
             # the label tests come first, then the answer tests
-            ordered = sorted(tested.get(alias, ()), key=lambda node: not isinstance(
-                _producer(node), SemanticClassify))
+            ordered = sorted(tested.get(alias, ()),
+                             key=lambda node: _producer(node).call.kind != "label")
             if ordered:
                 column_filters[alias] = tuple(
                     ColumnTest(
@@ -259,6 +262,7 @@ class LogicalPlan:
             classifies=tuple(classifies),
             extracts=tuple(extracts),
             sae_features=tuple(feature_calls),
+            maps=tuple(map_calls),
         )
 
 
@@ -280,6 +284,7 @@ class Operators:
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
     extracts: tuple = ()  # tuple[SemanticExtract, ...]
     sae_features: tuple = ()  # tuple[SemanticSaeFeatures, ...]
+    maps: tuple = ()  # tuple[SemanticMap, ...]
     column_filters: dict = field(default_factory=dict)
     #   alias -> tuple[ColumnTest, ...], the label tests, then the answer tests
 
@@ -302,8 +307,7 @@ class Operators:
                 for predicate in predicates
             )
             + tuple(
-                test.call for tests in self.column_filters.values()
-                for test in tests if test.call.kind == "label"
+                test.call for tests in self.column_filters.values() for test in tests
             )
             + tuple(model_call(join.predicate) for join in self.joins)
         )
@@ -314,16 +318,15 @@ class Operators:
         )
 
 
-def _producer(test: "Filter"):
-    """Return the last classification or extraction below a Filter that it reads.
+def _producer(test: "Filter") -> SemanticColumn:
+    """Return the last column operator below a Filter whose columns it reads.
 
     The Filter runs after that operator and reads the other columns by
     document ID.
     """
     read = set(condition_columns(test.condition))
     node = test.input
-    while not (isinstance(node, (SemanticClassify, SemanticExtract))
-               and read & {node.name, getattr(node, "span_name", node.name)}):
+    while not (isinstance(node, SemanticColumn) and read & set(node.added_columns)):
         node = node.input
     return node
 
@@ -389,6 +392,8 @@ def _projected_fields(project: Project, scans: dict) -> dict:
                 types[name + PROBABILITIES_SUFFIX] = PROBABILITIES_TYPE
         elif call.kind == "features":
             types[name] = FEATURE_LIST
+        elif call.kind == "map":
+            types[name] = pa.string()
         else:
             types[name] = pa.string()
             types[name + SPAN_SUFFIX] = SPAN_TYPE

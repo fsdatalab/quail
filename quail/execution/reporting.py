@@ -71,7 +71,7 @@ def collect_answers(logical, plan, outputs, documents):
     report = {"stages": []}
     answer_tables = {kind: {} for kind in (
         "filters", "joins", "classifies", "scores", "extracts",
-        "features")}
+        "features", "maps")}
     for node in plan.nodes:
         for port in node.outputs:
             answer = port.answer

@@ -10,8 +10,8 @@ from quail.logical.expressions import (
     model_call,
 )
 from quail.logical.nodes.base import _subtree
-from quail.logical.nodes.column import SemanticColumn, column_nodes
-from quail.logical.nodes.join import SemanticJoin, _above_joins
+from quail.logical.nodes.column import SemanticColumn
+from quail.logical.nodes.join import SemanticJoin
 
 
 @dataclass(frozen=True)
@@ -23,8 +23,9 @@ class SemanticClassify(SemanticColumn):
     PROBABILITIES_SUFFIX, holds each label's probability. A call over
     one table starts on that table above its AI.IF SemanticFilter and
     below any join; when a join reads the table, the physical planner
-    also prices running it above the joins (should_lift_maps). A call over
-    two tables sits above the SemanticJoin of the two. A
+    also prices running it above the joins
+    (should_lift_column_operators). A call over two tables sits above
+    the SemanticJoin of the two. A
     Filter testing the label column sits above this node, and the root
     Project returns the column through an Alias of the same call.
     """
@@ -60,14 +61,3 @@ class SemanticClassify(SemanticColumn):
 
     def explain_fields(self) -> dict:
         return {**super().explain_fields(), "probabilities": self.probabilities}
-
-
-def classifications(node) -> tuple:
-    """Return the SemanticClassify nodes at or below a node, children first."""
-    return column_nodes(node, SemanticClassify)
-
-
-def classified_above_joins(root) -> frozenset:
-    """Return aliases classified one document at a time after a join."""
-    return _above_joins(node for node in classifications(root)
-                        if len(node.call.aliases()) == 1)

@@ -13,6 +13,8 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
+from quail.backends.quail.executor.extract import load_vocabulary
 from quail.backends.quail.executor.model_loading import load_model
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import (
@@ -114,6 +116,8 @@ class LoadedGpu:
             self.decision_head = DecisionHead.load(torch, F, path)
             self.decision_offsets = decision_offsets(spec, path)
         self.pipeline = build_pipeline(spec, self.model, self.arena)
+        self.pipeline.piecewise_graphs = PiecewiseGraphs.for_specs(
+            self.pipeline, spec, device)
         self.pipeline_s = time.perf_counter() - t0
 
         self.execution = backend.start(context)
@@ -133,7 +137,7 @@ class LoadedGpu:
         if arena_pages is not None:
             slots = checkpoint_arena_args(
                 self.spec, self.device, chunk_tokens, arena_pages[0])
-            graphs = self.pipeline.decode_graphs
+            graphs = self.pipeline.piecewise_graphs
             if (graphs is not None and tuple(arena_pages)
                     != (self.arena.num_pages, self.arena.num_sliding_pages)):
                 self.torch.cuda.synchronize()
@@ -176,7 +180,11 @@ class LoadedGpu:
                                     model_name=self.spec.hf_name,
                                     model=self.model)
                 tier = warm["tier"]
-            graphs = self.pipeline.decode_graphs
+                if self.spec.role not in ("reranker", "decision"):
+                    # AI.EXTRACT and AI.MAP read the tokenizer's vocabulary;
+                    # loading it is startup, not query time
+                    load_vocabulary(self.execution)
+            graphs = self.pipeline.piecewise_graphs
             if graphs is not None and graphs.prepare():
                 tier = tier or "graphs"
         if tier is None:
@@ -240,9 +248,12 @@ def pool_bytes(arena) -> dict:
         return 0 if tensor is None else int(
             tensor.numel() * tensor.element_size())
 
+    # a KVArena's recurrent state has one more row than its slots
+    rows = getattr(arena, "gdn_state_rows", None)
     return {
         "kv": sum(size(t) for t in list(arena.k) + list(arena.v)),
-        "state": size(arena.gdn_state) + size(arena.conv_state),
+        "state": (size(arena.gdn_state if rows is None else rows)
+                  + size(arena.conv_state)),
     }
 
 
@@ -324,7 +335,7 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
         gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
         warm_s, warm_tier = gpu.warm()
         boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
-        say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
+        say(f"model ready after {boot['boot_s']} s ({boot['kind']} start)")
         rollback.pop_all()
     return gpu, boot
 

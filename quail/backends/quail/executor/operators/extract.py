@@ -1,18 +1,15 @@
 """Run a pipeline's extractions and build their answer tables."""
 
-import time
-from dataclasses import replace
 
 import numpy as np
-import pyarrow as pa
 
 from quail.backends.quail.executor.extract import (
-    ExtractionStages,
     load_vocabulary,
 )
+from quail.backends.quail.executor.extract.stages import ExtractionInputs
+from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import (
-    ExecutionPart,
-    execute_parts,
+    execute_alone,
     gpu_seconds,
     shared_prefix_tree,
     stage_spans,
@@ -45,21 +42,15 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
         TypeError: A node is not an extraction.
         ValueError: The table's text was not loaded.
     """
-    state.gpu_timing = bool(inputs.get("gpu_timing", False))
-    started = time.perf_counter()
-    part = ExtractPart(state, nodes, inputs["document_ids"], inputs)
-    stages = part.extraction
-    tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes,
-                               state.loaded_model.arena)
-            if nodes[0].spec.share_prefixes else None)
-    results = execute_parts(
-        state, [part], stages.prefixes, stages.keys,
-        keep_kv=nodes[-1].keep_kv, prefix_tree=tree, limit=inputs.get("limit"),
-        label=f"extract {', '.join(node.spec.name for node in nodes)}")
-    first = nodes[0].node_id
-    results[first] = replace(results[first], metrics=replace(
-        results[first].metrics, wall_s=time.perf_counter() - started))
-    return results
+    def build():
+        part = ExtractPart(state, nodes, inputs["document_ids"], inputs)
+        stages = part.extraction
+        tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes,
+                                   state.loaded_model.arena)
+                if nodes[0].spec.share_prefixes else None)
+        return part, stages.prefixes, stages.keys, tree
+
+    return execute_alone(state, nodes, inputs, build, label="extract")
 
 
 def extraction_results(nodes, stages, document_ids, *, fresh, own,
@@ -68,7 +59,7 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
 
     Args:
         nodes: The AiExtract nodes, in question order.
-        stages: The finished ExtractionStages.
+        stages: The extraction part with finished answers.
         document_ids: The documents' ids.
         fresh: The run's fresh tokens; the first node is charged them
             less the later questions' suffix tokens.
@@ -106,10 +97,9 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
     return results
 
 
-class ExtractPart(ExecutionPart):
-    """Extraction stages and per-question results for the shared executor."""
+class ExtractPart(MapPart):
+    """Extraction fields decoded as document branches by MapDecoder."""
 
-    combine = True
     execute_group = staticmethod(execute_extractions)
 
     @staticmethod
@@ -126,95 +116,73 @@ class ExtractPart(ExecutionPart):
                 "texts": context.state.get("texts", {}),
                 "limit": context.state.get("filter_limit")}
 
+    def column_values(self, index, positions) -> tuple:
+        values, spans = self.answers(index, positions)
+        spec = self.nodes[index].spec
+        return tuple(extraction_rows(
+            spec.alias, spec.name, spec.span_name, self.ids[positions], values, spans
+        ).values.columns)
+
+
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Prepare consecutive questions over the preceding operator's documents.
-
-        Raises:
-            ValueError: A document uses a different prompt or token sequence.
-        """
-        first = parts[0].node if parts else nodes[0]
+        first_node = parts[0].node if parts else nodes[0]
         part = cls(state, nodes, ids, {
             "documents": context.state["documents"],
             "texts": context.state.get("texts", {}),
-            "pipeline_head": first.document_head})
+            "pipeline_head": first_node.document_head},
+            first=sum(len(part.answer_limits) for part in parts))
         alias = part.node.spec.alias
-        for document, document_id in zip(part.extraction.documents, part.ids):
-            if document.key != (alias, document_id):
-                raise ValueError(
-                    f"AI.EXTRACT {part.node.spec.name!r} shows document "
-                    f"{document_id} of {alias!r} unlike the pipeline before it")
+        if any(document.key != (alias, document_id)
+               for document, document_id in zip(part.extraction.documents, part.ids)):
+            raise ValueError("AI.EXTRACT needs the pipeline's document tokens and head")
         return part
 
-    def __init__(self, state, nodes, ids, inputs):
-        self.nodes = list(nodes)
-        self.node = self.nodes[0]
-        self.ids = np.asarray(ids, dtype=np.int64)
+    def __init__(self, state, nodes, ids, inputs, first=0):
         if any(not isinstance(node, AiExtract) for node in nodes):
             raise TypeError("an extraction pipeline holds AiExtract nodes only")
-        alias = self.node.spec.alias
+        alias = nodes[0].spec.alias
         texts = inputs.get("texts", {}).get(alias)
         if texts is None:
             raise ValueError(f"AI.EXTRACT needs the text of {alias!r}")
-        self.extraction = ExtractionStages(
+        super().__init__(state, nodes, ids, first)
+        self.extraction = ExtractionInputs(
             state, [node.spec for node in nodes], load_vocabulary(state), self.ids,
             inputs["documents"][alias], texts,
             pipeline_head=inputs.get("pipeline_head", self.node.document_head),
             document_positions=inputs.get("document_positions"))
-        self.stages = self.extraction.stages
-        self._results = {}
 
-    @property
-    def appended_tokens(self) -> int:
-        return self.extraction.appended_tokens
+    def bind_decoder(self, decoder):
+        super().bind_decoder(decoder)
+        decoder.configure_copy(self.first, self.slots, self.extraction,
+                               [node.spec for node in self.nodes])
 
-    @property
-    def tested_columns(self) -> tuple[str, ...]:
-        """The columns a Filter in the pipeline may test."""
-        return tuple(name for node in self.nodes
-                     for name in (node.spec.name, node.spec.span_name))
+    def answers(self, q, kept=None):
+        slots = self.slots[q] if kept is None else self.slots[q, kept]
+        return self.decoder.output_answers(self.first + q, slots)
 
-    def tested_values(self, column: str, positions) -> pa.Array:
-        """Return the answers or spans settled so far at the positions.
-
-        Args:
-            column: An extraction's answer or span column.
-            positions: Positions among the part's documents.
-        """
-        q, span = next(
-            (q, column == node.spec.span_name) for q, node in enumerate(self.nodes)
-            if column in (node.spec.name, node.spec.span_name))
-        answers = [
-            self.extraction.documents[position].answers[q] for position in positions
-        ]
-        if not span:
-            return pa.array([answer.answer for answer in answers], pa.string())
-        return pa.array(
-            [None if answer.span is None
-             else {"start": answer.span[0], "end": answer.span[1]}
-             for answer in answers],
-            pa.struct([("start", pa.int32()), ("end", pa.int32())]))
-
-    def finish(self, every) -> int:
-        """Settle every answer; return the tokens the questions fed."""
-        self.extraction.finish()
-        self.counts = [self.extraction.counts(q) for q in range(len(self.nodes))]
-        return sum(count["suffix_tokens"] for count in self.counts)
+    def finish(self, every):
+        fed = super().finish(every)
+        self.counts = []
+        for q, node in enumerate(self.nodes):
+            lengths = self.decoder.lengths[self.first + q][self.slots[q]]
+            self.counts.append(dict(
+                none=int((lengths <= 0).sum()),
+                steps=int(self.decoder.steps[self.first + q][self.slots[q]].sum()),
+                answer_tokens=int(np.maximum(0, lengths).sum()),
+                suffix_tokens=(int(self.asked[q].sum())
+                               * len(node.spec.prompt_token_parts[1]) + self.fed[q])))
+        return fed
 
     def complete(self, fresh, spans, stats, offset):
-        """Build each question's answer table and attribute its GPU work."""
-        per_question = len(self.stages) // len(self.nodes)
+        selected = stage_spans(spans, offset, offset + 1)
+        total = sum(count["suffix_tokens"] for count in self.counts)
 
         def own(q):
-            start = offset + q * per_question
-            selected = stage_spans(spans, start, start + per_question)
-            return gpu_seconds(selected), len(selected)
+            return (gpu_seconds(selected) * self.counts[q]["suffix_tokens"]
+                    / max(1, total), len(selected))
 
         self._results = extraction_results(
-            self.nodes, self.extraction, self.ids, fresh=fresh, counts=self.counts,
-            own=own, stats=stats, kept=self.extraction.asked())
+            self.nodes, self, self.ids, fresh=fresh, counts=self.counts,
+            own=own, stats=stats, kept=np.flatnonzero(self.asked[0]))
         self.result_value = self._results[self.node.node_id]
-
-    def results(self) -> dict:
-        """Return the answer table and metrics for each extraction."""
-        return self._results

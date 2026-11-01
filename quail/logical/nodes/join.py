@@ -13,7 +13,7 @@ from quail.logical.expressions import (
     model_call,
     validate_predicate,
 )
-from quail.logical.nodes.base import LogicalNode, _subtree
+from quail.logical.nodes.base import LogicalNode
 
 
 @dataclass(frozen=True)
@@ -131,8 +131,3 @@ class SemanticJoin:
             "expression": _explain(self.predicate),
         }
 
-
-def _above_joins(nodes) -> frozenset:
-    return frozenset(node.alias for node in nodes
-                     if any(isinstance(below, SemanticJoin)
-                            for below in _subtree(node.input)))

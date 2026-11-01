@@ -67,6 +67,38 @@ def _warm_convolutions(torch, pipeline, budget):
                                bias, activate)
 
 
+def _warm_recurrent(torch, arena, pipeline):
+    """Compile the recurrent decode kernel on the arena's state rows.
+
+    The one sequence names row 0, which the kernel reads as no state,
+    so the launch leaves every checkpoint as it was.
+    """
+    from quail.backends.quail.executor.gdn import GdnPhase, _recurrent_decode
+
+    spec = getattr(pipeline, "spec", None)
+    if (getattr(arena, "gdn_state_rows", None) is None
+            or not getattr(spec, "gdn_value_heads", 0)):
+        return
+    device = arena.gdn_state_rows.device
+    q = torch.zeros((1, spec.gdn_key_heads, spec.gdn_key_dim),
+                    dtype=torch.bfloat16, device=device)
+    v = torch.zeros((1, spec.gdn_value_heads, spec.gdn_value_dim),
+                    dtype=torch.bfloat16, device=device)
+    gate = torch.zeros((1, spec.gdn_value_heads), dtype=torch.float32,
+                       device=device)
+    phase = GdnPhase(
+        rows=None, lengths=(1,),
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        state_rows=torch.zeros(1, dtype=torch.int64, device=device))
+    _recurrent_decode(arena, phase, 0, q, q, v, gate, gate,
+                      spec.gdn_key_dim ** -0.5)
+
+
+def _warm_run(*args, **kwargs):
+    """Run warm-up stages; their log lines say warm-up, not a query stage."""
+    return run_stages(*args, label="kernel warmup", summary=False, **kwargs)
+
+
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                   join_chunk):
     """Run real forward passes over every attention path.
@@ -76,6 +108,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     classification chunk.
     """
     _warm_convolutions(torch, pipeline, budget)
+    _warm_recurrent(torch, arena, pipeline)
     # a readout of several trailing rows needs a question that long
     trailing = 1 if async_ans is None else async_ans.trailing_rows
     warm_documents, question, document = _warm_inputs(budget, max(16, trailing))
@@ -83,7 +116,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
-        run_stages(
+        _warm_run(
             torch, arena, pipeline,
             filter_stages([question], async_ans), warm_documents, budget,
             attention_mode=mode)
@@ -94,7 +127,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                 continue
             logger.debug("kernels: warming %s attention, %s tokens", mode, t)
             body = (document * (t // len(document) + 1))[:max(8, t - q_max)]
-            run_stages(
+            _warm_run(
                 torch, arena, pipeline,
                 filter_stages([question], async_ans), [body], budget,
                 attention_mode=mode)
@@ -105,7 +138,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     join_chunk = join_chunk and getattr(pipeline, "warm_joins", True)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
-        run_stages(
+        _warm_run(
             torch, arena, pipeline,
             [Stage(suffixes=[question] * 8, readout=async_ans)], warm_documents, budget)
     if join_chunk and trailing == 1:
@@ -114,12 +147,12 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         # decision model classifies with its own readout
         logger.debug("kernels: warming classification forward pass")
         labels = [question[:1 + i % 6] for i in range(26)]
-        run_stages(
+        _warm_run(
             torch, arena, pipeline,
             [Stage(suffixes=labels, readout=async_ans, frame=question)],
             warm_documents, budget)
     logger.debug("kernels: warming filter without KV writes")
-    run_stages(
+    _warm_run(
         torch, arena, pipeline,
         filter_stages([question], async_ans), warm_documents, budget,
         paged=False, default_attention="unified")
@@ -238,7 +271,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         work = [(m, lin) for lin in linears for m in counts]
     progress = Progress("kernels: GEMM warmup", total=len(work),
                         unit="configurations", emit=logger.info)
-    logger.info("kernels: starting %s GEMM warmup configurations", len(work))
+    logger.info("warming up %s matrix multiply shapes", len(work))
     with torch.inference_mode():
         # one buffer per linear, row-sliced per call; the sweep only
         # needs each kernel launched once
@@ -255,7 +288,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         buf = None
         torch.cuda.synchronize()
     progress.finish("kernels: GEMM warmup done")
-    logger.info("kernels: warming filter and join forward passes")
+    logger.info("warming up the forward pass kernels")
     _forward_warm(torch, arena, pipeline, async_ans, budget,
                   join_chunk=True)
 
@@ -324,7 +357,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                logger.info("kernels: waiting for another worker to compile")
+                logger.info("waiting for another worker to compile the kernels")
                 fcntl.flock(lock, fcntl.LOCK_EX)
             wait_s = time.perf_counter() - t0
             on_disk = None
@@ -334,7 +367,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
             except (OSError, ValueError):
                 pass
             if force_compile or on_disk != identity:
-                logger.info("kernels: starting compile pass")
+                logger.info("compiling the kernels")
                 compile_kernels(torch, arena, pipeline, async_ans, budget)
                 torch.cuda.synchronize()
                 tmp = path + ".tmp"
@@ -343,15 +376,15 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                 os.replace(tmp, path)
                 tier = "compile"
         if tier == "touch":
-            logger.info("kernels: warming cached filter and join kernels")
+            logger.info("loading the compiled kernels from the cache")
             touch_kernels(torch, arena, pipeline, async_ans, budget)
         if model is not None:
             warm_label_readout(torch, full_output_head(model))
         torch.cuda.synchronize()
         warm_s = round(time.perf_counter() - t0 - wait_s, 2)
         wait_s = round(wait_s, 2)
-        logger.info("kernels: %s pass done in %s s; waited %s s for compilation",
-                    tier, warm_s, wait_s)
+        logger.info("kernels ready in %s s (%s pass, %s s waiting for compilation)",
+                    warm_s, tier, wait_s)
         return dict(tier=tier, warm_s=warm_s, wait_s=wait_s)
 
 

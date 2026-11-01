@@ -24,6 +24,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiMap,
     AiSaeFeatures,
     AiScore,
     PhysicalGraph,
@@ -41,6 +42,7 @@ def quail_runtimes() -> dict:
         AiClassify.runtime_key: model_runtime,
         AiExtract.runtime_key: model_runtime,
         AiSaeFeatures.runtime_key: model_runtime,
+        AiMap.runtime_key: model_runtime,
     }
 
 

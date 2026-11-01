@@ -21,6 +21,7 @@ from quail.physical import (
     PortRef,
 )
 from quail.planner.operators.common import (
+    ColumnPlanner,
     bind_inference,
     inference_node,
     node_index,
@@ -458,31 +459,45 @@ class ClassifyBuilder(ClassifyStatistics):
             frame_tokens=frame), estimated.work
 
 
-def emit_classify(builder, alias, expected_rows, calls, port) -> tuple:
-    """Classify the alias's documents, then keep the accepted labels.
+class ClassifyPlanner(ColumnPlanner):
+    """Build and price one-table AI.CLASSIFY nodes.
 
-    Args:
-        builder: The graph builder.
-        alias: The table.
-        expected_rows: The documents the classifications read.
-        calls: The classifications to emit, in run order.
-        port: The port the documents stand at before the classifications.
-
-    Returns:
-        Where the documents stand after them, and the rows ports of
-        the labels SELECT returns.
+    A classification's specification carries no estimate of its own:
+    the price depends on the scoring rule, which the cheapest allowed
+    rule decides here and the choose_classify_implementation rule
+    decides again on the built graph.
     """
-    table = classify_builder(builder.context, alias, "quail")
-    labels = builder.operators.labels
 
-    def node_of(call, port, expected_rows, _index):
-        spec, work = table.prepare(call, labels.names[call], expected_rows)
+    node_type = AiClassify
+
+    def spec(self, context, node, expected_rows, resident=False) -> ClassifySpec:
+        spec, _ = classify_builder(context, node.alias, "quail").prepare(
+            node.call, node.name, expected_rows)
+        return spec
+
+    def seconds(self, context, node, resident, expected_rows) -> float:
+        """Return the classification's seconds with its cheapest scoring rule."""
+        spec = self.spec(context, node, expected_rows)
+        if spec.estimated_seconds:
+            return spec.estimated_seconds
+        try:
+            chosen = classify_scoring(context, node.alias).choose_scoring(
+                replace(spec, expected_rows=expected_rows), node.call, resident)
+        except ClassifyRefusedError:
+            # the refusal is raised again when the node is built
+            return float("inf")
+        return chosen.estimated_seconds
+
+    def node(self, builder, node, port, expected_rows, resident):
+        """Return the classification's node, adding its work to a score plan's."""
+        table = classify_builder(builder.context, node.alias, "quail")
+        spec, work = table.prepare(node.call, node.name, expected_rows)
         if builder.scoring is not None:
             builder.scoring.work += work
         return table.node(spec, port, node_index(builder, AiClassify))
 
-    return builder.emit_columns(alias, expected_rows, port, calls, node_of,
-                                projected=lambda call: call in labels.projected)
+    def projected(self, operators, node) -> bool:
+        return node.call in operators.labels.projected
 
 
 def joined_calls(labels: LabelWork) -> list:

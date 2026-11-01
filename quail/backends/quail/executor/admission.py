@@ -217,9 +217,13 @@ class JoinAdmission:
             them together. An anchor entering one waits in the ready
             queue, in its place, until decide_waiting runs the stage's
             request for it.
-        reserve: Optional callable(anchor, borrow) that reserves the anchor's
-            storage before admission. borrow is None or (parent, shared tokens).
-            False leaves the anchor queued; True commits the reservation.
+        reserve: Optional callable(anchor, borrow, rows) that reserves storage
+            before admission. borrow is None or (parent, shared tokens); rows
+            counts work already packed in this pass. False leaves the anchor
+            queued; True commits the reservation.
+        dependencies: Dependent anchor -> (parent anchor, start stage). A
+            dependent waits for its parent's launch at that stage, runs only
+            that stage, and is excluded from limits and survival estimates.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
@@ -239,12 +243,21 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
-                 stop_groups=None, stop_width=1, reserve=None, gated=()):
+                 stop_groups=None, stop_width=1, reserve=None, dependencies=None,
+                 gated=()):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
         if len(self.answer_dtypes) != k:
             raise ValueError("answer_dtype must match stage_suffixes")
+        self.dependencies = dict(dependencies or {})
+        self.dependents = {}
+        # released dependents not yet admitted, in release order
+        self.waiting = deque()
+        self._released = set()   # dependents whose parent launched their stage
+        self._counted = set()   # documents counted toward the limit
+        for anchor, (parent, stage) in self.dependencies.items():
+            self.dependents.setdefault((parent, stage), []).append(anchor)
         self.advance = advance
         self.limit = limit
         self.survival = survival
@@ -324,6 +337,12 @@ class JoinAdmission:
         self.answers = [dict() for _ in range(k)]
         resident = dict(resident or {})
         anchor_partners = dict(anchor_partners or {})
+        # A deferred parent cannot free its pages before a dependent runs.
+        self._dependent_pages = np.zeros(n, dtype=np.int64)
+        for a, (parent, _) in self.dependencies.items():
+            pages = self.page_cost(prefix_tokens[a] - self.borrowing.tree_shared[a]
+                                   + self._extra)
+            self._dependent_pages[parent] = max(self._dependent_pages[parent], pages)
         for a, prefix in enumerate(prefix_tokens):
             self._register(prefix, resident.get(a), anchor_partners.get(a))
         # resident anchors first: they cost no prefix tokens and few
@@ -333,7 +352,8 @@ class JoinAdmission:
         self.pending.extend(a for a in range(n)
                             if a in resident and self._stage[a] == -1)
         self.pending.extend(a for a in fresh_order
-                            if a not in resident and self._stage[a] == -1)
+                            if a not in resident and self._stage[a] == -1
+                            and a not in self.dependencies)
         for a in resident:
             self.borrowing.detach(a)
         if self.groups is not None:
@@ -426,49 +446,53 @@ class JoinAdmission:
         """Record one anchor's costs; returns its index."""
         a = len(self.prefix)
         k = len(self.stages)
+        j = self.dependencies.get(a, (None, 0))[1]
         lazy = None
         if partners is None:
             lists = [None] * k
             cums = [None] * k
         elif callable(partners):
-            # stage 0 now, later stages when the anchor reaches them
             lazy = partners
             lists = [None] * k
             cums = [None] * k
-            first = partners(0)
+            # A dependent's gates can read answers not yet computed.
+            first = None if a in self.dependencies else partners(j)
             if first is SKIP:
                 raise ValueError(
                     f"anchor {a}: the first stage cannot be skipped")
             if first is DROP:
                 first = []
-            lists[0], cums[0] = self._partner_list(a, 0, first)
+            lists[j], cums[j] = self._partner_list(a, j, first)
         else:
             if len(partners) != k:
                 raise ValueError(
                     f"anchor {a}: partner lists for {len(partners)} stages, "
                     f"the join has {k}")
             lists, cums = [], []
-            for j, lst in enumerate(partners):
-                lst, cum = self._partner_list(a, j, lst)
+            for stage, lst in enumerate(partners):
+                lst, cum = self._partner_list(a, stage, lst)
                 lists.append(lst)
                 cums.append(cum)
         self._lazy.append(lazy)
         need = self.page_cost(prefix + self._extra)
+        shared = self.borrowing.tree_shared[a] if a in self.dependencies else 0
+        fresh = prefix - shared
+        reserve = self._dependent_pages[a] if a < len(self._dependent_pages) else 0
         oversized = False
         if resident_pages is not None:
             need = max(0, need - resident_pages)
-        elif need > self.arena_pages:
+        elif self.page_cost(fresh + self._extra) + reserve > self.arena_pages:
             oversized = True
-        cum = self._cum[0] if lists[0] is None else cums[0]
+        cum = self._cum[j] if lists[j] is None else cums[j]
         if not oversized and resident_pages is None and len(cum) > 1:
-            first = self.frame_rows[0] + int(cum[1] - cum[0])
-            oversized = prefix + first > self.chunk_budget
+            first = self.frame_rows[j] + int(cum[1] - cum[0])
+            oversized = fresh + first > self.chunk_budget
         if oversized:
             # a document that cannot fit one chunk or the arena is
             # skipped: it settles unanswered, like one with nothing to ask
             self.oversized.append(a)
             need = 0
-            lists[0], cums[0] = self._partner_list(a, 0, [])
+            lists[j], cums[j] = self._partner_list(a, j, [])
         carried = 0 if resident_pages is not None else prefix
         self.prefix.append(prefix)
         self._lists.append(lists)
@@ -478,7 +502,7 @@ class JoinAdmission:
         self._stage.append(-1)
         self._next.append(0)
         self._true.append([False] * k)
-        if self.num_partners(a, 0) == 0:
+        if self.num_partners(a, j) == 0:
             # nothing to evaluate: the anchor settles without a chunk
             self._first.append(0)
             self._stage[a] = _DONE
@@ -486,7 +510,7 @@ class JoinAdmission:
                 "finished" if k == 1 else "dropped", a, False))
             self.borrowing.skip(a)
             return a
-        first = self.frame_rows[0] + self._suffix(a, 0, 0)
+        first = self.frame_rows[j] + self._suffix(a, j, 0)
         if self.temporary_suffix_pages:
             # a lazy anchor's later stages are bounded by the stage's
             # largest suffix
@@ -501,7 +525,7 @@ class JoinAdmission:
                     partner_pages(self.page_cost, self.page_tokens, prefix,
                                   self.frames[j], int(self.stages[j].max()))
                     for j in range(1, k) if len(self.stages[j])])
-            needed = self.page_cost(prefix + self._extra) + largest
+            needed = self.page_cost(fresh + self._extra) + largest + reserve
             if needed > self.arena_pages:
                 raise ValueError("anchor and one suffix exceed the KV arena")
             self._page_reserve = max(self._page_reserve, largest)
@@ -525,9 +549,12 @@ class JoinAdmission:
         Returns:
             Settlement records, using the same format as report().settlements.
         """
-        events, self._settled = self._settled, []
-        for event in events:
-            self._settle_group(event.anchor, event.survived)
+        events = []
+        while self._settled:
+            pending, self._settled = self._settled, []
+            for event in pending:
+                self._settle_group(event.anchor, event.survived)
+            events.extend(pending)
         return events
 
     def _first_cost(self, a, j, i):
@@ -558,30 +585,36 @@ class JoinAdmission:
     def _launch(self, a, j, end):
         """Record a launched group; True when the stream continues."""
         self._next[a] = end
+        if (a, j) in self.dependents:
+            released = set(self.dependents[(a, j)]) - self._released
+            self.waiting.extend(sorted(released))
+            self._released.update(released)
         self.in_flight += 1
         return end < self.num_partners(a, j)
 
-    def next_chunk(self, free_pages):
+    def next_chunk(self, free_pages, room=None):
         """Groups for the next chunk: [(anchor, stage, start, end, carried)].
 
         start and end index the anchor's own partner list at the
         stage; partner_indices() maps them to the stage's list.
         carried means the anchor's prefix tokens are packed and its KV
         written to its pages. free_pages is the arena's free list;
-        fresh anchors admit against it. Returns [] when nothing is
-        buildable.
+        fresh anchors admit against it. room is the chunk's tokens left
+        for groups, the chunk budget when None. Returns [] when nothing
+        is buildable.
         """
         self.blocked_pages = 0
-        if self.limit_reached():
+        limited = self.limit_reached()
+        if limited and not self.dependencies:
             return []
-        room = self.chunk_budget
+        room = self.chunk_budget if room is None else room
         groups = []
         continued = []
         deferred = []
         temporary_pages = 0
         # 1) placed anchors: cut streams (front) and next-stage starts
         for _ in range(len(self.ready)):
-            if room == 0:
+            if room == 0 or limited:
                 break
             a = self.ready.popleft()
             j, i = self._stage[a], self._next[a]
@@ -605,68 +638,95 @@ class JoinAdmission:
         admitted = set()
         paced = self.limit is not None and self.survival is not None
         expected_rows = self._live() if paced else 0
-        while self.pending and room >= self._min_fresh:
-            if paced and self.survivors + expected_rows * self.survival >= self.limit:
-                break       # the anchors in flight should reach the limit
-            a = self.pending.popleft()
-            if self._stage[a] == _DONE:
-                self._dead -= 1     # skipped by its group's survivor
-                continue
+        held_waiting = []
+        while (self.waiting or self.pending) and room >= self._min_fresh:
+            dependency = None
+            if self.waiting:
+                a = self.waiting.popleft()
+                if self._stage[a] == _DONE:
+                    continue        # dropped with its document
+                dependency = self.dependencies[a]
+                j = dependency[1]
+                if self._stage[a] == -1:
+                    # its requests are asked once, when it is first
+                    # released; its parent already passed the stage's
+                    # conditions
+                    settled = self._enter(a, j, decided=True)
+                    if settled is not None:
+                        self._stage[a] = _DONE
+                        self._settled.append(Settlement(settled, a, False))
+                        self._skipped.append(a)
+                        continue
+                    self._first[a] = self._first_cost(a, j, 0)
+            else:
+                if limited or (paced and self.survivors
+                               + expected_rows * self.survival >= self.limit):
+                    break       # the anchors in flight should reach the limit
+                a = self.pending.popleft()
+                if self._stage[a] == _DONE:
+                    self._dead -= 1     # skipped by its group's survivor
+                    continue
+                j = 0
+            hold = held_waiting if dependency is not None else held
             if self.groups is not None and self._group_busy.get(
                     self.groups[a], 0) >= self._group_width:
-                held.append(a)      # the group's anchors in flight are enough
+                hold.append(a)      # the group's anchors in flight are enough
                 continue
             borrow = self.borrowing.decide(a, admitted)
             if borrow == Borrowing.WAIT:
-                held.append(a)      # its parent is still queued
+                hold.append(a)      # its parent is still queued
                 continue
             need = (self._page_cost[a] if borrow is None
                     else self.page_cost(self.prefix[a] - borrow[1] + self._extra))
             if blocked and need:
-                held.append(a)
+                hold.append(a)
                 if not self._zero_cost:
                     break
                 continue
             required = need + max(0, self._page_reserve - temporary_pages)
+            if a < len(self._dependent_pages):
+                required += self._dependent_pages[a]
             if required > free_pages:
                 blocked = True
                 self.blocked_pages = required - free_pages
-                held.append(a)
+                hold.append(a)
                 if not self._zero_cost:
                     break
                 continue
             carried = (self._carried[a] if borrow is None
                        else self.prefix[a] - borrow[1])
             if carried + self._first[a] > room:
-                held.append(a)      # chunk room only; retry next chunk
+                hold.append(a)      # chunk room only; retry next chunk
                 continue
             end, tokens, pages = self._take(
-                a, 0, 0, room - carried, free_pages - need)
+                a, j, 0, room - carried, free_pages - need)
             if end == 0:
-                held.append(a)
+                hold.append(a)
                 self.blocked_pages = (
-                    need + self._suffix_page_cost(a, 0, 0) - free_pages)
+                    need + self._suffix_page_cost(a, j, 0) - free_pages)
                 break
-            if self.reserve is not None and not self.reserve(a, borrow):
-                held.append(a)
+            if self.reserve is not None and not self.reserve(
+                    a, borrow, self.chunk_budget - room):
+                hold.append(a)
                 break
             temporary_pages += pages
-            groups.append((a, 0, 0, end, carried > 0))
+            groups.append((a, j, 0, end, carried > 0))
             room -= carried + tokens
             free_pages -= need + pages
             if not self._page_cost[a]:
                 self._zero_cost -= 1
-            self._stage[a] = 0
+            self._stage[a] = j
             admitted.add(a)
-            expected_rows += 1
+            expected_rows += int(dependency is None)
             if self.groups is not None:
                 group = self.groups[a]
                 self._group_busy[group] = self._group_busy.get(group, 0) + 1
                 self._group_members[group].discard(a)
             self.borrowing.record(a, borrow)
-            if self._launch(a, 0, end):
+            if self._launch(a, j, end):
                 continued.append(a)
         self.pending.extendleft(reversed(held))
+        self.waiting.extendleft(reversed(held_waiting))
         self.ready.extendleft(reversed(continued))
         self.ready.extendleft(reversed(deferred))
         return groups
@@ -711,7 +771,8 @@ class JoinAdmission:
             self._true[a][j] = True
         settlements = []
         transitions = []
-        if j == self._stage[a] and j + 1 < k:
+        dependent = a in self.dependencies
+        if not dependent and j == self._stage[a] and j + 1 < k:
             if self._true[a][j] and self._next[a] == num_partners:
                 # the whole stream is launched, so every later chunk
                 # is behind it on the stream and the next stage's
@@ -727,10 +788,9 @@ class JoinAdmission:
                 self._stage[a] = _DONE
                 transitions.append((a, j, False))
                 settlements.append(Settlement("dropped", a, False))
-        if j == k - 1 and complete:
+        if (dependent or j == k - 1) and complete:
             self._stage[a] = _DONE
-            if self._true[a][j]:
-                self.survivors += 1
+            self._count_survivor(self.dependencies[a][0] if dependent else a)
             survived = bool(self._true[a][j])
             transitions.append((a, j, survived))
             settlements.append(Settlement("finished", a, survived))
@@ -779,6 +839,13 @@ class JoinAdmission:
         A skipped anchor stays in the pending deque until the admission
         pops it, so a skip costs the group's size, not the queue's.
         """
+        for stage in range(len(self.stages)):
+            for dependent in self.dependents.get((a, stage), ()):
+                if self._stage[dependent] != -1 or dependent in self._released:
+                    continue
+                self._stage[dependent] = _DONE
+                self._skipped.append(dependent)
+                self._settled.append(Settlement("dropped", dependent, False))
         if self.groups is None:
             return
         group = self.groups[a]
@@ -805,7 +872,23 @@ class JoinAdmission:
 
     def _live(self) -> int:
         """Anchors admitted and not yet settled."""
-        return sum(1 for stage in self._stage if stage >= 0)
+        return sum(1 for a, stage in enumerate(self._stage)
+                   if stage >= 0 and a not in self.dependencies)
+
+    def _count_survivor(self, document) -> None:
+        """Count a document toward the limit once it and its branches ended.
+
+        Each branch settles and frees its pages at its own end; only the
+        count waits, so a limit never takes a document with an answer
+        still being written.
+        """
+        if (self._stage[document] != _DONE or not self._true[document][-1]
+                or document in self._counted):
+            return
+        if all(self._stage[a] == _DONE for stage in range(len(self.stages))
+               for a in self.dependents.get((document, stage), ())):
+            self._counted.add(document)
+            self.survivors += 1
 
     def limit_reached(self) -> bool:
         """Return whether enough documents survived to stop new admissions."""
@@ -822,8 +905,11 @@ class JoinAdmission:
         out.extend(a for a in self.pending if self._stage[a] != -1)
         for a in out:
             self._stage[a] = _DONE
+        for a in self.waiting:
+            self._stage[a] = _DONE      # released but never admitted: no KV
         self.ready.clear()
         self.pending.clear()
+        self.waiting.clear()
         self._dead = 0
         return out
 
@@ -831,6 +917,9 @@ class JoinAdmission:
 
     def done(self):
         if self.limit_reached():
-            return not self.in_flight and not self._settled
+            # a document in flight still finishes every branch it started
+            return (not self.in_flight and not self._settled
+                    and all(self._stage[a] == _DONE for a in self.waiting))
         return len(self.pending) == self._dead and not self.ready \
-            and not self.in_flight and not self._settled
+            and not self.in_flight and not self._settled \
+            and all(self._stage[a] == _DONE for a in self.waiting)

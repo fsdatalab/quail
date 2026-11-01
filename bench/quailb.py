@@ -31,7 +31,7 @@ from quail.baselines.nodes import RequestExecution
 from quail.execution.result import answer_values
 from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt, bind_extract_prompt
-from quail.physical import AiClassify, AiExtract, AiSaeFeatures, AiScore
+from quail.physical import AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import lower_prompt
 from quail.progress import say
@@ -61,11 +61,37 @@ TEXT_VLLM_BACKENDS = frozenset({
 })
 
 
+def labeled(query_ids) -> bool:
+    """Return whether QUAIL-B publishes reference labels for the queries.
+
+    It publishes none for the SEC queries, which run alone at scale
+    factor 1.0 from their own data directory.
+    """
+    return not all(query_id.startswith("SEC-") for query_id in query_ids)
+
+
+def data_directory(root, scale_factor: float, query_ids) -> Path:
+    """Return the directory of the queries' input tables under root."""
+    return Path(root) / (f"sf{scale_factor}" if labeled(query_ids) else "sec")
+
+
 def register_tables(session, data_dir):
-    """Register every Parquet file of a directory as a document table."""
+    """Register every Parquet file of a directory as a document table.
+
+    The SEC filings are registered as engines read them: NFC text and
+    its length (quail_b.sec.sec_engine_table).
+    """
+    import pyarrow.parquet as pq
+
+    from quail_b.sec import SEC_TABLE, sec_engine_table
+
     for path in sorted(Path(data_dir).glob("*.parquet")):
-        session.register(path.stem, quail.DocumentProvider.from_parquet(
-            str(path), id_col="id"))
+        if path.stem == SEC_TABLE:
+            provider = quail.DocumentProvider.from_table(
+                sec_engine_table(pq.read_table(path)), id_col="id")
+        else:
+            provider = quail.DocumentProvider.from_parquet(str(path), id_col="id")
+        session.register(path.stem, provider)
 
 
 def _build(session, info: PlanInfo):
@@ -190,31 +216,27 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
                for alias in join.relations},
             "answer": answer_values(table),
         })
-    score_answers = {}
-    for operator in info.scores:
-        table = result.answer_tables["scores"][operator.output]
-        score_answers[operator.id] = pa.table({
-            operator.relation: id_column(
-                operator.relation, table.column(operator.relation)),
-            "score": table.column(operator.output).cast(pa.float64()),
-        })
-    features_answers = {}
-    for operator in info.sae_features:
-        table = result.answer_tables["features"][operator.output]
-        features_answers[operator.id] = pa.table({
-            operator.relation: id_column(
-                operator.relation, table.column(operator.relation)),
-            "features": table.column(operator.output),
-        })
-    extract_answers = {}
-    for operator in info.extracts:
-        name = _extract_name(info, operator)
-        table = result.answer_tables["extracts"][name]
-        extract_answers[operator.id] = pa.table({
-            operator.relation: id_column(
-                operator.relation, table.column(operator.relation)),
-            "answer": table.column(name).cast(pa.string()),
-        })
+
+    def answers(kind, operators, column, cast=None, name_of=None):
+        """Return operator ID -> its answer table, the ids and one column."""
+        tables = {}
+        for operator in operators:
+            name = operator.output if name_of is None else name_of(operator)
+            table = result.answer_tables[kind][name]
+            values = table.column(name)
+            tables[operator.id] = pa.table({
+                operator.relation: id_column(
+                    operator.relation, table.column(operator.relation)),
+                column: values if cast is None else values.cast(cast),
+            })
+        return tables
+
+    score_answers = answers("scores", info.scores, "score", pa.float64())
+    features_answers = answers("features", info.sae_features, "features")
+    map_answers = answers("maps", info.maps, "answer", pa.string())
+    extract_answers = answers(
+        "extracts", info.extracts, "answer", pa.string(),
+        name_of=lambda operator: _extract_name(info, operator))
     # quail-b checks that a plan selects ids, labels, scores, answer
     # structs, and measures; an answer struct brings its span struct,
     # which the benchmark does not take
@@ -231,7 +253,8 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         classify_answers=classify_answers or None,
         score_answers=score_answers or None,
         extract_answers=extract_answers or None,
-        features_answers=features_answers or None)
+        features_answers=features_answers or None,
+        map_answers=map_answers or None)
 
 
 def _alias_filters(info: PlanInfo, alias: str) -> list:
@@ -275,7 +298,7 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                      if lower(prompt).preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": [], "classifies": [], "scores": [],
-              "extracts": [], "features": []}
+              "extracts": [], "features": [], "maps": []}
     for alias, predicates in filters.items():
         written = _alias_filters(info, alias)
         for position, predicate in enumerate(predicates):
@@ -318,7 +341,8 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
             return None
         pieces["scores"].append({"id": operator.id, "tail": list(tail)})
     for operator in info.extracts:
-        head, tail = _extract_parts(query.plan(), _extract_name(info, operator))
+        head, tail = _answer_parts(query.plan(), _extract_name(info, operator),
+                                   AiExtract, "extracts")
         if not pieces["preamble"]:
             pieces["preamble"] = list(head)
         elif list(head) != pieces["preamble"]:
@@ -326,18 +350,17 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                 f"query reports no prompt pieces")
             return None
         pieces["extracts"].append({"id": operator.id, "tail": list(tail)})
-    for operator in info.sae_features:
-        node = next(node for node in query.plan().nodes
-                    if isinstance(node, AiSaeFeatures)
-                    and node.spec.name == operator.output)
-        head, tail = node.spec.prompt_token_parts
-        if not pieces["preamble"]:
-            pieces["preamble"] = list(head)
-        elif list(head) != pieces["preamble"]:
-            say(f"feature call {operator.id} has its own prompt head; the "
-                f"query reports no prompt pieces")
-            return None
-        pieces["features"].append({"id": operator.id, "tail": list(tail)})
+    for kind, operators, node_type in (("features", info.sae_features, AiSaeFeatures),
+                                       ("maps", info.maps, AiMap)):
+        for operator in operators:
+            head, tail = _answer_parts(query.plan(), operator.output, node_type, kind)
+            if not pieces["preamble"]:
+                pieces["preamble"] = list(head)
+            elif list(head) != pieces["preamble"]:
+                say(f"{operator.id} has its own prompt head; the query "
+                    f"reports no prompt pieces")
+                return None
+            pieces[kind].append({"id": operator.id, "tail": list(tail)})
     return pieces
 
 
@@ -346,20 +369,21 @@ def _extract_name(info: PlanInfo, operator) -> str:
     return f"{info.struct_of(operator).name}.{operator.output}"
 
 
-def _extract_parts(plan, output: str) -> tuple:
-    """Return an extraction's plain head and tail token ids from a plan.
+def _answer_parts(plan, output: str, node_type, kind: str) -> tuple:
+    """Return an answer column's plain head and tail token ids from a plan.
 
-    The Quail backend plans an AiExtract node; a request backend
-    carries the extraction in its RequestExecution node's specs.
+    The Quail backend plans a node of node_type; a request backend
+    carries the column in its RequestExecution node's specs of kind,
+    "extracts" or "maps".
     """
     for node in plan.nodes:
-        if isinstance(node, AiExtract) and node.spec.name == output:
+        if isinstance(node, node_type) and node.spec.name == output:
             return node.spec.prompt_token_parts
         if isinstance(node, RequestExecution):
-            for spec in node.extracts:
+            for spec in getattr(node, kind, ()):
                 if spec.output == output:
                     return spec.preamble_token_ids, spec.tail_token_ids
-    raise ValueError(f"the plan has no extraction named {output!r}")
+    raise ValueError(f"the plan has no {kind} column named {output!r}")
 
 
 def _pair_pieces(prompt, anchor) -> dict:
@@ -525,7 +549,7 @@ def run_suite(only=None, *, scale_factor=0.1, config, data_dir=None,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=usd_per_hour,
-            metadata=metadata)
+            metadata=metadata, accuracy=labeled(only))
         record["skipped_queries"] = skipped
         write_json(Path(output_dir) / "run.json", record)
         benchmark.report(output_dir, rescore=False)
@@ -540,7 +564,8 @@ def _empty_record(skipped, *, scale_factor, data_dir, ground_truth_collection, r
 
     suite = benchmark.load_benchmark(
         sorted(skipped)[:1], scale_factor=scale_factor, data_dir=data_dir,
-        collection_id=ground_truth_collection, root=root)
+        collection_id=ground_truth_collection, accuracy=labeled(skipped),
+        root=root)
     started = datetime.now(timezone.utc).isoformat()
     record = {
         "schema_version": RUN_SCHEMA_VERSION, "quail_b_version": __version__,

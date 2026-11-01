@@ -70,7 +70,7 @@ def run_backend_group(
     Raises:
         ValueError: No backend methods were supplied.
     """
-    from bench.quailb import run_suite
+    from bench.quailb import data_directory, run_suite
     from quail import EngineConfig
     from quail_b.queries import query_family_name
 
@@ -103,7 +103,7 @@ def run_backend_group(
                     gpu_timing=gpu_timing,
                     **({} if draws is None else {"canvas_draws": draws}),
                 ),
-                data_dir=Path(data_dir) / f"sf{scale_factor}",
+                data_dir=data_directory(data_dir, scale_factor, query_ids),
                 ground_truth_collection=ground_truth_collection or None,
                 root=root,
                 output_dir=run_dir / name / (suite_name or family),

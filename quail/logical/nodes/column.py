@@ -12,6 +12,7 @@ from quail.logical.expressions import (
     _explain,
 )
 from quail.logical.nodes.base import LogicalNode, _subtree
+from quail.logical.nodes.join import SemanticJoin
 
 
 @dataclass(frozen=True)
@@ -113,3 +114,16 @@ class SemanticColumn:
 def column_nodes(node, kind: type) -> tuple:
     """Return the nodes of one kind at or below a node, children first."""
     return tuple(found for found in _subtree(node) if isinstance(found, kind))
+
+
+def columns_above_joins(root) -> frozenset:
+    """Return (alias, call kind) of each one-table column operator above a join.
+
+    The rule should_lift_column_operators moves these above the joins
+    of their table, so each runs on the documents the joins keep.
+    """
+    return frozenset(
+        (node.alias, node.call_kind)
+        for node in column_nodes(root, SemanticColumn)
+        if len(node.call.aliases()) == 1
+        and any(isinstance(below, SemanticJoin) for below in _subtree(node.input)))

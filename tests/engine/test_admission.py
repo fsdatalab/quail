@@ -2,6 +2,7 @@
 
 import random
 
+import pytest
 from helpers.fakes import fake_readout
 
 from quail.backends.quail.executor.admission import (
@@ -392,3 +393,50 @@ def test_documents_entering_a_gated_stage_wait_in_place_and_are_asked_together()
     assert asked == [(0, 1), (1, 1), (1, 2), (2, 1)]
     assert settled == [Settlement("dropped", 2, False)]
     assert sched.next_chunk(100) == [(0, 1, 0, 1, False), (1, 2, 0, 1, False)]
+@pytest.mark.parametrize("kept", [False, True])
+def test_dependents_wait_for_their_parent_and_price_only_the_unshared_tokens(kept):
+    requested = []
+
+    def requests(stage):
+        requested.append(stage)
+        return None
+
+    sched = JoinAdmission(
+        [38, 38], [[2], [3]], 40, arena_pages=20, page_tokens=16,
+        tree=PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32]),
+        dependencies={1: (0, 1)}, anchor_partners={1: requests},
+        limit=1, survival=1.0)
+    assert not sched.oversized
+    assert not requested
+    assert sched.next_chunk(20) == [(0, 0, 0, 1, True)]
+    sched.report(0, 0, 0, 1, [kept])
+    if not kept:
+        assert sched.take_settled() == [Settlement("dropped", 1, False)]
+        assert sched.done()
+        assert 1 not in sched.borrowing.admitted
+        assert not requested
+        return
+    assert sched.next_chunk(20) == [(0, 1, 0, 1, False), (1, 1, 0, 1, True)]
+    assert requested == [1]
+    assert sched.borrowing.shared(1) == 32
+    assert sched._live() == 1
+    sched.report(1, 1, 0, 1, [True])
+    assert sched.survivors == 0
+    sched.report(0, 1, 0, 1, [True])
+    assert sched.survivors == 1 and sched.done()
+
+
+def test_a_released_dependent_runs_after_its_parent_finishes():
+    sched = JoinAdmission(
+        [2, 2], [[2]], 4, arena_pages=4, page_tokens=16,
+        dependencies={1: (0, 0)}, limit=1)
+    assert sched.next_chunk(4) == [(0, 0, 0, 1, True)]
+    sched.report(0, 0, 0, 1, [True])
+    assert not sched.take_settled()
+    assert not sched.survivors
+    assert sched.next_chunk(4) == [(1, 0, 0, 1, True)]
+    sched.report(1, 0, 0, 1, [True])
+    assert sched.survivors == 1
+    assert sched.done()
+
+

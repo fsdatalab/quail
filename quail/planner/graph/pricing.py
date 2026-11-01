@@ -23,12 +23,14 @@ from quail.physical import (
     AiExtract,
     AiFilter,
     AiJoin,
+    AiMap,
     AiSaeFeatures,
     AiScore,
     PhysicalGraph,
 )
 from quail.physical.pipelines import build_pipelines, resident_inputs
 from quail.planner.operators.classify import classify_scoring
+from quail.planner.operators.map import map_seconds
 from quail.planner.statistics.prefixes import key_documents, page_tree
 from quail.planner.statistics.tables import summarize_alias
 
@@ -100,7 +102,7 @@ class PlanPricer:
                         work = work * self._distinct(alias)
                 price = NodePrice(work=work)
                 entry["seconds"] = self._seconds(price.work)
-            elif isinstance(node, (AiScore, AiClassify, AiExtract,
+            elif isinstance(node, (AiScore, AiClassify, AiExtract, AiMap,
                                    AiSaeFeatures)) \
                     and node.spec is not None:
                 price = NodePrice(seconds=self._inference_seconds(node, resident))
@@ -214,6 +216,10 @@ class PlanPricer:
 
             whole = seconds(None)
             return seconds(shared) / whole if whole else 1.0
+        if isinstance(node, AiMap):
+            whole = map_seconds(context, spec, spec.expected_rows, resident)
+            return (map_seconds(context, spec, spec.expected_rows, resident,
+                                shared) / whole if whole else 1.0)
         if isinstance(node, AiClassify):
             def seconds(shared):
                 return classify_scoring(context, alias, shared=shared).estimate_spec(

@@ -83,6 +83,24 @@ class KVArena:
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
         self.reset_stats()
 
+    def bind_answers(self, group, keys):
+        """Own the answer slots' full-attention layout for this execution."""
+        from quail.backends.quail.executor.groups import (
+            SlidingAttentionGroup,
+            StateGroup,
+        )
+
+        self.answer_group = group
+        self.answer_keys = keys
+        self.sliding_group = (SlidingAttentionGroup(self, keys)
+                              if self.has_sliding else None)
+        self.state_group = StateGroup(self, keys) if self.num_state_slots else None
+
+    def answer_replays(self, rows):
+        """Return token spans needed to restore accepted answer state."""
+        return (self.state_group.replays(rows)
+                if rows is not None and self.num_state_slots else [])
+
     def _build(self, num_pages, page_tokens, num_sliding_pages, num_state_slots=0):
         torch = self.torch
         self.accounting = PageArena(num_pages, page_tokens, num_state_slots)
@@ -101,11 +119,14 @@ class KVArena:
         self.v = [part.view(shape) for part, shape in zip(parts[1::2], shapes)]
         # one checkpoint per slot: the recurrent state in fp32 and the
         # convolution columns in bf16, each across every GDN layer
-        self.gdn_state = self.conv_state = None
+        self.gdn_state = self.gdn_state_rows = self.conv_state = None
         if num_state_slots:
-            self.gdn_state = torch.zeros(
-                (num_state_slots, *self.gdn_state_shape),
+            # vLLM's recurrent decode kernel reads state index 0 as no
+            # state, so slot s is row s + 1 and row 0 stays unused
+            self.gdn_state_rows = torch.zeros(
+                (num_state_slots + 1, *self.gdn_state_shape),
                 dtype=torch.float32, device=self.device)
+            self.gdn_state = self.gdn_state_rows[1:]
             self.conv_state = torch.zeros(
                 (num_state_slots, *self.conv_state_shape),
                 dtype=self.dtype, device=self.device)
@@ -113,6 +134,7 @@ class KVArena:
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU
         self._capacity_rows = {}  # key -> every row in the claimed pages
+        self._stale_rows = set()  # keys grown since their rows were built
         self._sliding_rows = {}   # key -> every row in its sliding pages
         self._base = {}       # key -> tokens the window is anchored below
         self._sliding_start = {}  # key -> logical row of its first sliding page
@@ -140,7 +162,7 @@ class KVArena:
             return
         page_tokens = self.page_tokens
         self.k = self.v = None
-        self.gdn_state = self.conv_state = None
+        self.gdn_state = self.gdn_state_rows = self.conv_state = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
 
     # ---- checkpoints ---------------------------------------------------
@@ -389,6 +411,7 @@ class KVArena:
         return self.torch.from_numpy(rows.reshape(-1)[:tokens])
 
     def _refresh_rows(self, key, logical_tokens=None):
+        self._stale_rows.discard(key)
         logical = (self.accounting.tokens[key]
                    if logical_tokens is None else logical_tokens)
         capacity = len(self.accounting.table_pages(key)) * self.page_tokens
@@ -536,6 +559,25 @@ class KVArena:
             self.accounting.pin(key)
         return pages
 
+    def grow_pages(self, keys):
+        """Give each key one more page; None, changing nothing, when short.
+
+        The keys are answers about to write past their last page, all of
+        a pass's in one call; a key's row index is rebuilt only when
+        something reads it.
+        """
+        need_sliding = len(keys) if self.sliding is not None else 0
+        self._evict_for_pages(len(keys), need_sliding)
+        if (len(keys) > self.accounting.free_pages
+                or (self.sliding is not None
+                    and need_sliding > self.sliding.free_pages)):
+            return None
+        added = self.accounting.grow_pages(keys)
+        if self.sliding is not None:
+            self.sliding.grow_pages(keys)
+        self._stale_rows.update(keys)
+        return added
+
     def reserve(self, key, tokens, *, capacity_tokens, borrow=None,
                 extension=False, share_points=()):
         """Reserve KV pages and checkpoint slots for one admitted document.
@@ -669,6 +711,7 @@ class KVArena:
         self._trimmed.discard(key)
         self._rows.pop(key)
         self._capacity_rows.pop(key)
+        self._stale_rows.discard(key)
         self._sliding_rows.pop(key, None)
         self._base.pop(key, None)
         self._sliding_start.pop(key, None)
@@ -780,6 +823,10 @@ class KVArena:
         """Every key whose KV is kept for a later operator."""
         return list(self.accounting.retained)
 
+    def page_holds(self):
+        """Return the number of live references to each full-pool page."""
+        return self.accounting.holds
+
     def owned_pages(self, key) -> list:
         """The page ids a resident key's block table reads, in logical order.
 
@@ -796,6 +843,8 @@ class KVArena:
 
     def capacity_rows(self, key):
         """Row index tensor (CPU) over every row in the key's pages."""
+        if key in self._stale_rows:
+            self._refresh_rows(key)
         return self._capacity_rows[key]
 
     def capacity_rows_sliding(self, key):

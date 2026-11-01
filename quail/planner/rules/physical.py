@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from quail.cost.budgets import choose_attention_path, tree_attention_allowed
+from quail.cost.budgets import cheaper_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
 from quail.physical import (
     Aggregate as PhysicalAggregate,
@@ -15,6 +15,7 @@ from quail.physical import (
     AiFilter,
     AiInference,
     AiJoin,
+    AiMap,
     AiSaeFeatures,
     AiScore,
     Limit,
@@ -270,7 +271,7 @@ def filter_attention(model, device, store, lengths, question_tokens: int) -> str
     tree = page_tree(store, device.page_tokens)
     votes = {"tree": 0, "unified": 0}
     for shared, readers, rows in zip(*tree.reader_groups(lengths)):
-        path = choose_attention_path(
+        path = cheaper_attention_path(
             model, device, readers=readers,
             reader_rows=rows / readers + question_tokens, node_tokens=shared)
         votes[path] += readers * shared
@@ -326,7 +327,7 @@ class ShouldSharePrefixes(PhysicalRule):
         }
         for node in graph.nodes:
             if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract,
-                                      AiSaeFeatures, AiScore))
+                                      AiMap, AiSaeFeatures, AiScore))
                     or (isinstance(node, AiInference) and node.spec is None)
                     or node.share_prefixes
                     or (isinstance(node, AiScore) and len(node.spec.aliases) != 1)):
@@ -368,18 +369,41 @@ class ShouldSharePrefixes(PhysicalRule):
         return PhysicalGraph(tuple(nodes), graph.root)
 
 
+def _answer_attention(graph: PhysicalGraph, context) -> dict:
+    """The attention path for each table's answer branches, by alias.
+
+    A table's extraction fields and maps are one document's branches:
+    each reads the document's pages and its own. A branch's pass has
+    one row, more with a copy draft, and the readers of the document in
+    a pass are the branches still writing, taking every answer to run
+    to its limit: the limits' sum over the longest limit.
+    """
+    branches = {}
+    for node in graph.nodes:
+        if isinstance(node, (AiMap, AiExtract)) and node.spec is not None:
+            branches.setdefault(node.spec.aliases[0], []).append(node.spec)
+    return {
+        alias: cheaper_attention_path(
+            context.model, context.device,
+            readers=(sum(spec.max_answer_tokens for spec in specs)
+                     / max(spec.max_answer_tokens for spec in specs)),
+            reader_rows=_mean(1 + getattr(spec, "draft_tokens", 0) for spec in specs),
+            node_tokens=_mean(context.document_tokens.get(alias, ())))
+        for alias, specs in branches.items()}
+
+
 def _mean(values) -> float:
     values = list(values)
     return sum(values) / len(values) if values else 0.0
 
 
-class ChooseAttentionAlgorithm(PhysicalRule):
+class ChooseAttentionPath(PhysicalRule):
     """Annotate each join with the attention path the cost model prefers.
 
     A join stage has every partner of an anchor reading the anchor's
     KV: under tree attention those reads are stacked into one, under
     unified attention each partner reads the anchor itself. The choice
-    is by roofline (choose_attention_path). A diffusion model and a
+    is by roofline (cheaper_attention_path). A diffusion model and a
     model under 2B dense parameters stay unified
     (tree_attention_allowed).
 
@@ -392,7 +416,7 @@ class ChooseAttentionAlgorithm(PhysicalRule):
     estimated lengths gets the path its exact tokens call for.
     """
 
-    name = "choose_attention_algorithm"
+    name = "choose_attention_path"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -403,10 +427,13 @@ class ChooseAttentionAlgorithm(PhysicalRule):
             raise ValueError(
                 f"attention must be 'tree' or 'unified', got {forced!r}")
         tree_available = tree_attention_allowed(model)
+        answer_paths = _answer_attention(graph, context) if tree_available else {}
         nodes = []
         changed = False
         for node in graph.nodes:
             path = None
+            if isinstance(node, (AiMap, AiExtract)) and node.spec is not None:
+                path = answer_paths.get(node.spec.aliases[0], "unified")
             if isinstance(node, AiFilter):
                 lengths = context.document_tokens.get(node.alias)
                 store = None if lengths is None else lengths.store
@@ -427,7 +454,7 @@ class ChooseAttentionAlgorithm(PhysicalRule):
                     rows = stage.pair_tail_tokens + sum(
                         _mean(context.document_tokens.get(partner, ()))
                         for partner in stage.partners)
-                    path = choose_attention_path(
+                    path = cheaper_attention_path(
                         model, device, readers=readers, reader_rows=rows,
                         node_tokens=_mean(lengths))
             if path is not None and forced is not None:

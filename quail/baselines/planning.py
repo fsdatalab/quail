@@ -3,29 +3,35 @@
 from __future__ import annotations
 
 from quail.baselines.lowering import (
+    lower_answers,
     lower_classifications,
-    lower_extractions,
     lower_filters,
     lower_joins,
     request_preamble,
 )
-from quail.baselines.nodes import RequestExecution
+from quail.baselines.nodes import (
+    RequestExecution,
+    RequestExtractSpec,
+    RequestMapSpec,
+)
 from quail.cost import budgets
 from quail.logical import (
     SPAN_SUFFIX,
-    classified_above_joins,
+    RegularPredicate,
     column_name,
+    columns_above_joins,
     effective_selectivity,
 )
 from quail.logical import Aggregate as LogicalAggregate
 from quail.logical import Window as LogicalWindow
-from quail.logical.expressions import aliased_call
+from quail.logical.expressions import aliased_call, packed_columns
 from quail.physical import (
     Limit,
     PortRef,
     Project,
     Recombine,
     Scan,
+    Sort,
 )
 from quail.physical.base import input_ports
 from quail.planner import (
@@ -53,6 +59,7 @@ def plan_request_backend(
     backend_name: str,
     filter_submission: str,
     join_submission: str,
+    answer_submission: str = "operator-at-a-time",
     scores_labels: bool = False,
 ) -> tuple[PhysicalCandidate, ...]:
     """Build one physical request plan for a request engine.
@@ -63,6 +70,8 @@ def plan_request_backend(
         backend_name: The backend the plan names.
         filter_submission: How filter stages become requests.
         join_submission: How join tuples become requests.
+        answer_submission: How each document's extraction and map prompts
+            become requests.
         scores_labels: Whether the engine decodes an answer as text,
             which AI.CLASSIFY and AI.EXTRACT need.
     """
@@ -111,7 +120,12 @@ def plan_request_backend(
         context, aliases, filters, ask_filters, filter_orders, first_anchor)
     classify_specs = lower_classifications(context, operators, decides)
     join_specs = lower_joins(context, joins, join_sequence)
-    extract_specs = lower_extractions(context, operators.extracts)
+    extract_specs = lower_answers(
+        context, operators.extracts, RequestExtractSpec,
+        question=lambda node: node.call.question)
+    map_specs = lower_answers(
+        context, operators.maps, RequestMapSpec,
+        max_answer_tokens=lambda node: node.call.max_answer_tokens)
     prompts = [
         *(predicate.prompt for spec in filter_specs
           for predicate in ask_filters[spec.alias]),
@@ -131,12 +145,13 @@ def plan_request_backend(
         joins=tuple(join_specs),
         classifies=tuple(classify_specs),
         extracts=tuple(extract_specs),
+        maps=tuple(map_specs),
     )
     nodes.append(request_node)
 
     nodes.extend(_result_nodes(
-        region, request_node, aliases, join_specs, extract_specs,
-        operators.labels))
+        region, request_node, aliases, join_specs,
+        (*extract_specs, *map_specs), operators.labels))
 
     true_ids, false_ids = true_false_token_ids(context.tokenizer)
     plan = PhysicalPlan(
@@ -149,6 +164,7 @@ def plan_request_backend(
         settings={
             "filter_submission": filter_submission,
             "join_submission": join_submission,
+            "answer_submission": answer_submission,
             "true_ids": true_ids,
             "false_ids": false_ids,
             "order_rule": rule,
@@ -168,31 +184,45 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
              decides: bool) -> Refusal | None:
     """Return why the request backends cannot run the region, or None."""
     root = region.logical_plan.result
-    if root.order or root.distinct or root.offset \
+    projected = {column_name(column)
+                 for column in region.logical_plan.projection.columns}
+    if any(key.name not in projected for key in root.order) \
             or isinstance(root.input, (LogicalAggregate, LogicalWindow)):
         return Refusal(
-            reasons=("ORDER BY, DISTINCT, OFFSET, GROUP BY, and window "
-                     "functions run on the Quail backend only",),
+            reasons=("GROUP BY, window functions, and ORDER BY on a column "
+                     "the query does not return run on the Quail backend only",),
             constraint="sort_needs_quail_backend",
             needed=1, available=0, unit="backends")
-    if has_extract(region.logical_plan):
-        refusal = extraction_refusal(context)
+    operators = region.logical_plan.operators()
+    if any(test.call.kind == "label" and not (
+            isinstance(test.condition, RegularPredicate)
+            and test.condition.comparison == "in" and test.condition.function is None)
+           for tests in operators.column_filters.values() for test in tests):
+        return Refusal(
+            reasons=("plain label tests other than IN run on the Quail backend only",),
+            constraint="label_test_needs_quail_backend",
+            needed=1, available=0, unit="backends")
+    for function, present in (("AI.EXTRACT", has_extract(region.logical_plan)),
+                              ("AI.MAP", bool(operators.maps))):
+        if not present:
+            continue
+        refusal = extraction_refusal(context, function)
         if refusal is None and not (scores_labels
                                     and not context.model.canvas_tokens):
             refusal = Refusal(
-                reasons=(f"AI.EXTRACT on {backend_name} decodes each answer "
+                reasons=(f"{function} on {backend_name} decodes each answer "
                          f"as text, which its engine does not return for "
                          f"{context.model.name!r}",),
-                constraint="extract_needs_quail_backend",
+                constraint=f"{function[3:].lower()}_needs_quail_backend",
                 needed=1, available=0, unit="backends")
-        if refusal is None and any(
-                test.call.kind == "extract"
-                for tests in region.logical_plan.operators().column_filters.values()
-                for test in tests):
+        kind = function[3:].lower()
+        tested = any(test.call.kind == kind
+                     for tests in operators.column_filters.values() for test in tests)
+        if refusal is None and tested:
             refusal = Refusal(
-                reasons=(f"a filter on an AI.EXTRACT answer runs on the "
+                reasons=(f"a filter on an {function} answer runs on the "
                          f"Quail backend only, not {backend_name}",),
-                constraint="extract_filter_needs_quail_backend",
+                constraint=f"{kind}_filter_needs_quail_backend",
                 needed=1, available=0, unit="backends")
         if refusal is not None:
             return refusal
@@ -217,7 +247,8 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
             reasons=(reason,),
             constraint="classify_needs_quail_backend",
             needed=1, available=0, unit="backends")
-    if classified_above_joins(region.logical_plan.root):
+    if any(kind == "label"
+           for _, kind in columns_above_joins(region.logical_plan.root)):
         return Refusal(
             reasons=(f"{backend_name} runs single-document classification "
                      "before joins",),
@@ -305,7 +336,7 @@ def _order_filters_and_joins(context, operators, ask_filters, stats,
     return filter_orders, join_sequence
 
 
-def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
+def _result_nodes(region, request_node, aliases, join_specs, answer_specs,
                   label_plan) -> list:
     """Return the nodes that turn the request node's answers into result rows."""
     nodes = []
@@ -338,23 +369,36 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
         PortRef(request_node.node_id, f"label_answers:{name}")
         for name in label_plan.projected.values()
     ) + tuple(
-        PortRef(request_node.node_id, f"extract_answers:{spec.output}")
-        for spec in extract_specs)
+        PortRef(request_node.node_id,
+                f"{'map' if isinstance(spec, RequestMapSpec) else 'extract'}"
+                f"_answers:{spec.output}")
+        for spec in answer_specs)
     columns = []
     for column in region.logical_plan.projection.columns:
         columns.append(column_name(column))
         if aliased_call(column, "extract") is not None:
             columns.append(column.name + SPAN_SUFFIX)
+    structs = region.logical_plan.projection.packing()
     nodes.append(Project(
         node_id="project",
         inputs=input_ports((sink_input, *label_ports)),
         columns=tuple(columns),
-        structs=region.logical_plan.projection.packing(),
+        structs=structs,
     ))
-    if region.logical_plan.result.limit is not None:
+    root = region.logical_plan.result
+    if root.order or root.distinct or root.offset:
+        # the coordinator sorts the returned rows, as on the Quail backend
+        nodes.append(Sort(
+            node_id="sort",
+            inputs=input_ports((PortRef("project", "rows"),)),
+            keys=tuple((key.name, key.descending, key.nulls_first)
+                       for key in root.order),
+            columns=packed_columns(columns, structs), distinct=root.distinct,
+            offset=root.offset, fetch=root.limit))
+    elif root.limit is not None:
         nodes.append(Limit(
             node_id="limit",
             inputs=input_ports((PortRef("project", "rows"),)),
-            count=region.logical_plan.result.limit,
+            count=root.limit,
         ))
     return nodes

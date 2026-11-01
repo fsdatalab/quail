@@ -8,7 +8,6 @@ architecture with bf16 weights and run through this file too.
 """
 
 from quail.backends.quail.executor.attention import Engine
-from quail.backends.quail.executor.cuda_graphs import DecodeGraphs
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.cost.budgets import tree_attention_allowed
 
@@ -36,7 +35,6 @@ class Qwen3Pipeline(ModelPipeline):
                      for layer in self.layers)
         self.max_chunk_tokens = (2**31 - 1) // widest
         self.tree_attention = spec is None or tree_attention_allowed(spec)
-        self.decode_graphs = DecodeGraphs(self)
 
     def linears(self):
         # every layer has the same four shapes
@@ -44,32 +42,91 @@ class Qwen3Pipeline(ModelPipeline):
         return (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
                 layer.mlp.gate_up_proj, layer.mlp.down_proj)
 
+    def before_attention(self, hidden, residual, positions, layer):
+        """Normalize and project rows into rotary Q, K, V and the residual."""
+        engine = self.engine
+        attn = layer.self_attn
+        if residual is None:
+            residual = hidden
+            q_in, q_scale = engine.norm_quant(hidden, layer.input_layernorm)
+        else:
+            q_in, q_scale = engine.norm_quant(
+                hidden, layer.input_layernorm, residual)
+        qkv = engine.gemm(q_in, q_scale, attn.qkv_proj)
+        q, k = engine.qk_norm_rope(qkv, positions, attn)
+        v = qkv[:, (engine.num_q_heads + engine.num_kv_heads) * engine.head_dim:]
+        return q, k, v, residual
+
+    def after_attention(self, o_in, o_scale, residual, layer):
+        """Project attention rows and apply the residual MLP."""
+        engine = self.engine
+        hidden = engine.gemm(o_in, o_scale, layer.self_attn.o_proj)
+        g_in, g_scale = engine.norm_quant(
+            hidden, layer.post_attention_layernorm, residual)
+        gate_up = engine.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
+        d_in, d_scale = engine.activation_quant(gate_up)
+        return engine.gemm(d_in, d_scale, layer.mlp.down_proj)
+
+    def boundary(self, num_tokens, device):
+        """Q, K, and V into attention, and its quantized o_proj input out."""
+        torch = self.engine.torch
+        q_width = self.engine.num_q_heads * self.engine.head_dim
+        kv_width = self.engine.num_kv_heads * self.engine.head_dim
+        q = torch.zeros((num_tokens, q_width), dtype=torch.bfloat16, device=device)
+        k = torch.zeros((num_tokens, kv_width), dtype=torch.bfloat16,
+                        device=device)
+        o_in, _ = self.engine.quant(torch.zeros_like(q))
+        return dict(q=q, k=k, v=torch.zeros_like(k), o_in=o_in)
+
+    def bucket_boundary(self, num_tokens, device):
+        """The o_proj input's column-major FP8 scales, or None for bf16."""
+        torch = self.engine.torch
+        q_width = self.engine.num_q_heads * self.engine.head_dim
+        _, o_scale = self.engine.quant(torch.zeros(
+            (num_tokens, q_width), dtype=torch.bfloat16, device=device))
+        return dict(o_scale=o_scale)
+
+    def piece(self, index, buffers):
+        """Embedding or the previous MLP, then the next QKV and KV write."""
+        if index == 0:
+            hidden = self.embed(buffers.ids)
+            residual = None
+        else:
+            residual = buffers.residual
+            hidden = self.after_attention(
+                buffers.o_in, buffers.o_scale, residual, self.layers[index - 1])
+        if index == len(self.layers):
+            normed, _ = self.engine.fused_add_rms_norm(
+                hidden, residual, self.final_norm)
+            buffers.output.copy_(normed)
+            return
+        q, k, v, residual = self.before_attention(
+            hidden, residual, buffers.positions, self.layers[index])
+        buffers.q.copy_(q)
+        buffers.k.copy_(k)
+        buffers.v.copy_(v)
+        if index == 0:
+            buffers.residual.copy_(residual)
+        buffers.write_kv(self.engine, buffers.k, buffers.v, index)
+
+    def mixer(self, index, buffers, chunk):
+        """Attention over real rows, written into the next piece's input."""
+        n = chunk.tokens
+        self.engine.attention(
+            buffers.q[:n], buffers.k[:n], buffers.v[:n], chunk,
+            output=(buffers.o_in[:n],
+                    None if buffers.o_scale is None else buffers.o_scale[:n]))
+
     def forward_chunk(self, chunk):
         engine = self.engine
-        meta = chunk.meta
-        meta["layer"] = 0
-        positions = chunk.positions
+        chunk.meta["layer"] = 0
         hidden = self.embed(chunk.input_ids)
         residual = None
         for layer in self.layers:
-            attn = layer.self_attn
-            if residual is None:
-                residual = hidden
-                q_in, q_scale = engine.norm_quant(hidden, layer.input_layernorm)
-            else:
-                q_in, q_scale = engine.norm_quant(
-                    hidden, layer.input_layernorm, residual)
-            qkv = engine.gemm(q_in, q_scale, attn.qkv_proj)
-            q, k = engine.qk_norm_rope(qkv, positions, attn)
-            v = qkv[:, (engine.num_q_heads + engine.num_kv_heads)
-                    * engine.head_dim:]
+            q, k, v, residual = self.before_attention(
+                hidden, residual, chunk.positions, layer)
             o_in, o_scale = engine.attention(q, k, v, chunk)
-            hidden = engine.gemm(o_in, o_scale, attn.o_proj)
-            g_in, g_scale = engine.norm_quant(
-                hidden, layer.post_attention_layernorm, residual)
-            gate_up = engine.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
-            d_in, d_scale = engine.activation_quant(gate_up)
-            hidden = engine.gemm(d_in, d_scale, layer.mlp.down_proj)
+            hidden = self.after_attention(o_in, o_scale, residual, layer)
         final = chunk.final_indices
         last_hidden = hidden.index_select(0, final)
         last_residual = residual.index_select(0, final)

@@ -111,7 +111,7 @@ class PlacedRelation:
     labels: dict = field(default_factory=dict)
 
 
-def place_relation(relation, columns, catalog, unnested=(), *,
+def place_relation(relation, columns, catalog, unnested=(), *, tested=None,
                    allow_relational: bool = False) -> PlacedRelation:
     """Place each part of a bound relation tree and build the logical plan below it.
 
@@ -120,6 +120,8 @@ def place_relation(relation, columns, catalog, unnested=(), *,
         columns: The projected columns, with their model calls.
         catalog: The registered tables, for their schemas and columns.
         unnested: The aliases of UNNEST relations.
+        tested: Model call -> column name for each one-table column
+            operator a test reads, its AS name if SELECT returns it.
         allow_relational: Whether a query with no model call is allowed,
             as a stage of a larger statement is.
 
@@ -167,16 +169,19 @@ def place_relation(relation, columns, catalog, unnested=(), *,
     projected = tuple(column for column in columns
                       if aliased_call(column) is not None)
     _check_joins(equalities, scans[0].alias, joined, joins, projected)
-    _check_calls(filters, joins, label_tests, projected,
+    tested = tested or {}
+    _check_calls(filters, joins, label_tests, projected, tested,
                  allow_relational=allow_relational)
-    named, labels = label_names(label_tests, filters, projected)
-    extracts, features = {}, {}
-    for column in projected:
-        call = column.expression
-        if call.kind == "extract":
-            extracts.setdefault(call.aliases()[0], []).append((call, column.name))
-        if call.kind == "features":
-            features.setdefault(call.aliases()[0], []).append((call, column.name))
+    named, labels = label_names(label_tests, filters, projected, tested)
+    # alias -> (call, name) of each extraction, feature call, and map
+    computing = {kind: {} for kind in ("extract", "features", "map")}
+    for call, name in (*((column.expression, column.name) for column in projected),
+                       *tested.items()):
+        if call.kind in computing:
+            entries = computing[call.kind].setdefault(call.aliases()[0], [])
+            if (call, name) not in entries:
+                entries.append((call, name))
+    extracts, features, maps = computing.values()
     providers = {scan.alias: scan.provider for scan in scans}
     # a test of a label is a condition on the column its classification adds
     conditions.extend(
@@ -187,6 +192,11 @@ def place_relation(relation, columns, catalog, unnested=(), *,
     computed = {(alias, column): ("extract", name)
                 for alias, calls in extracts.items()
                 for _, name in calls for column in (name, name + SPAN_SUFFIX)}
+    computed.update({(alias, name): (kind, name)
+                     for kind, calls_by_alias in (("features", features),
+                                                  ("map", maps))
+                     for alias, calls in calls_by_alias.items()
+                     for _, name in calls})
     computed.update({(alias, name): ("label", name)
                      for alias, named_calls in labels.items()
                      for name in named_calls.values()})
@@ -203,6 +213,7 @@ def place_relation(relation, columns, catalog, unnested=(), *,
             extracts=tuple(extracts.get(scan.alias, ())),
             computed_filters=placed.computed.get(scan.alias, ()),
             sae_features=tuple(features.get(scan.alias, ())),
+            maps=tuple(maps.get(scan.alias, ())),
             schema=catalog.get(scan.provider).schema(),
         )
     for join in joins:
@@ -216,10 +227,11 @@ def place_relation(relation, columns, catalog, unnested=(), *,
     return PlacedRelation(builder, placed.rows, filters, joins, label_tests)
 
 
-def label_names(label_tests, filters, projected) -> tuple[dict, dict]:
+def label_names(label_tests, filters, projected, tested=None) -> tuple[dict, dict]:
     """Name each classification that SELECT returns or WHERE tests.
 
-    A classification SELECT returns takes its AS name. One only tested
+    A classification SELECT returns takes its AS name. One a plain
+    test reads takes the name in ``tested``. Any other one only tested
     is named after its first test's position among the table's
     filters, as ``__label_<alias>_<position>``.
 
@@ -234,9 +246,10 @@ def label_names(label_tests, filters, projected) -> tuple[dict, dict]:
         asks = len(filters.get(alias, ()))
         for index, (call, _, _) in enumerate(tests):
             labels.setdefault(alias, {}).setdefault(
-                call, named.get(call, f"__label_{alias}_{asks + index}"))
-    for call, name in named.items():
-        if len(call.aliases()) == 1:
+                call, named.get(call, (tested or {}).get(
+                    call, f"__label_{alias}_{asks + index}")))
+    for call, name in {**named, **(tested or {})}.items():
+        if call.kind == "label" and len(call.aliases()) == 1:
             labels.setdefault(call.aliases()[0], {}).setdefault(call, name)
     return named, labels
 
@@ -384,7 +397,7 @@ def _check_joins(equalities, root: str, joined, joins, projected) -> None:
             f"one connected graph with it")
 
 
-def _check_calls(filters, joins, label_tests, projected, *,
+def _check_calls(filters, joins, label_tests, projected, tested, *,
                  allow_relational: bool) -> None:
     """Refuse AI.SCORE mixed with generative predicates, and a query with no model call.
 
@@ -399,7 +412,8 @@ def _check_calls(filters, joins, label_tests, projected, *,
     if any(flags) and not all(flags):
         raise CompileError(
             "AI.SCORE cannot be mixed with generative AI predicates in one query")
-    if not (allow_relational or joins or filters or label_tests or projected):
+    if not (allow_relational or joins or filters or label_tests or projected
+            or tested):
         raise CompileError(
             "the query has no AI predicate; a plain "
             "scan belongs in the database the ids came "

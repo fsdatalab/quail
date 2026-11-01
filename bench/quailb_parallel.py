@@ -14,6 +14,7 @@ function and every family call running if the local process disconnects.
 """
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ import modal
 
 from bench.results import combine_measurements, write_json
 from quail.deploy.images import gpu_image, sglang_image
+from quail.progress import LOG_TAG_ENV
 from quail.specs import modal_gpu_type
 
 image = gpu_image()
@@ -59,26 +61,34 @@ def ensure_data(scale_factor: float, query_ids: list[str], collection_id: str,
     import pyarrow.parquet as pq
 
     import quail_b as benchmark
+    from bench.quailb import data_directory, labeled
     from quail_b.data import CORPUS_COLUMNS
+    from quail_b.sec import build_sec_corpus
 
-    names = {
-        relation.table for query_id in query_ids
-        for relation in benchmark.get_query(query_id).info.relations
-    }
-    directory = Path(DATA_DIR) / f"sf{scale_factor}"
+    directory = data_directory(DATA_DIR, scale_factor, query_ids)
     directory.mkdir(parents=True, exist_ok=True)
-    for name in sorted(names):
-        path = directory / f"{name}.parquet"
-        # a table an earlier benchmark version wrote lacks its columns
-        if (path.exists() and set(CORPUS_COLUMNS[name])
-                <= set(pq.read_schema(path).names)):
-            continue
-        pq.write_table(benchmark.load_table(name, scale_factor=scale_factor), path)
+    if not labeled(query_ids):
+        if not (directory / "manifest.json").exists():
+            build_sec_corpus(directory)
+    else:
+        names = {
+            relation.table for query_id in query_ids
+            for relation in benchmark.get_query(query_id).info.relations
+        }
+        for name in sorted(names):
+            path = directory / f"{name}.parquet"
+            # a table an earlier benchmark version wrote lacks its columns
+            if (path.exists() and set(CORPUS_COLUMNS[name])
+                    <= set(pq.read_schema(path).names)):
+                continue
+            pq.write_table(benchmark.load_table(name, scale_factor=scale_factor),
+                           path)
     suite = benchmark.load_benchmark(
         query_ids, scale_factor=scale_factor, data_dir=directory,
-        collection_id=collection_id or None, root=label_root or None)
+        collection_id=collection_id or None, accuracy=labeled(query_ids),
+        root=label_root or None)
     results_vol.commit()
-    return suite.ground_truth.collection_id
+    return None if suite.ground_truth is None else suite.ground_truth.collection_id
 
 
 def _methods(csv: str) -> list[str]:
@@ -103,6 +113,8 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
         query_id.strip() for query_id in query_ids_csv.split(",")
         if query_id.strip())
     family = query_family_name(query_ids)
+    # every engine line names the family, as the families' logs interleave
+    os.environ[LOG_TAG_ENV] = family
     process_results = []
     suites = {}
     for methods in process_groups:

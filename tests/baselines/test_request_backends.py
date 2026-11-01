@@ -8,6 +8,7 @@ import pytest
 from helpers.baselines import (
     CAPACITY,
     _Client,
+    _execution,
     _run_stock_vllm,
     _session,
 )
@@ -41,7 +42,8 @@ def _filter_query(session):
 def test_request_backends_plan_validate_and_execute(monkeypatch):
     registry = built_in_registry()
     assert set(registry.backends) == {
-        "quail", "stock_vllm", "pipelined_vllm", "dumb_vllm", "pipelined_sglang",
+        "quail", "stock_vllm", "pipelined_vllm", "shuffled_vllm", "dumb_vllm",
+        "pipelined_sglang",
     }
 
     for backend_name in ("stock_vllm", "pipelined_vllm", "pipelined_sglang"):
@@ -207,3 +209,103 @@ def test_a_request_backend_owns_its_engine_from_boot_to_release(monkeypatch):
     assert backend.execute_request(context) == "warm"
     backend.release_request(context.runtime_state)
     assert adapter.live == [] and context.runtime_state == {}
+class _MapClient:
+    """Answers each prompt with its last two tokens and limit, by call or step loop."""
+
+    def __init__(self):
+        self.pending = {}
+
+    def decode_params(self, max_tokens, stop=None):
+        return max_tokens
+
+    @staticmethod
+    def _output(ids, limit, request_id=None):
+        return SimpleNamespace(
+            request_id=request_id, finished=True, prompt_token_ids=ids,
+            num_cached_tokens=0,
+            outputs=[SimpleNamespace(token_ids=[1],
+                                     text=f"{ids[-2]}:{ids[-1]}/{limit}")])
+
+    def generate(self, prompts, params, use_tqdm=False):
+        return [self._output(prompt["prompt_token_ids"], limit)
+                for prompt, limit in zip(prompts, params)]
+
+    def add_request(self, request_id, prompt, limit):
+        self.pending[request_id] = (prompt["prompt_token_ids"], limit)
+
+    def step(self):
+        outputs = [self._output(ids, limit, request_id)
+                   for request_id, (ids, limit) in self.pending.items()]
+        self.pending.clear()
+        return outputs
+
+    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
+                           answer_tokens, body_texts=None, tail_texts=None):
+        from quail.baselines.request_scheduling import run_extract_fields
+
+        return run_extract_fields(self, sampling_params, body_ids, tail_ids,
+                                  CAPACITY["kv_cache_size_tokens"],
+                                  answer_tokens=answer_tokens)
+
+
+@pytest.mark.parametrize("with_maps", [False, True])
+@pytest.mark.parametrize("submission", ["operator-at-a-time", "shuffled"])
+def test_extracts_and_maps_of_a_document_go_in_one_generate_call(submission,
+                                                                 with_maps):
+    from quail.baselines.nodes import RequestExtractSpec, RequestMapSpec
+
+    class Client(_MapClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def generate(self, prompts, params, use_tqdm=False):
+            self.calls.append(len(prompts))
+            return super().generate(prompts, params, use_tqdm)
+
+    client = Client()
+    maps = (RequestMapSpec(alias="d", output="plot", tail_token_ids=(90,),
+                           max_answer_tokens=1024),) if with_maps else ()
+    node = RequestExecution(
+        node_id="request-model", backend_name="stock_vllm", aliases=("d",),
+        extracts=tuple(RequestExtractSpec(alias="d", output=output,
+                                          tail_token_ids=(tail,),
+                                          max_answer_tokens=16)
+                       for output, tail in (("kind", 80), ("size", 81))),
+        maps=maps)
+    result = _execution(
+        {"d": [[10], [11], [12]]}, client=client,
+        document_texts={"d": ["10:80/16 10:81/16", "it says 11:80", "three"]},
+        answer_submission=submission).execute(node, {"input:0": [0, 1, 2]})
+    assert client.calls == [9 if with_maps else 6]
+    if with_maps:
+        assert result.outputs["map_answers:plot"].to_pydict()["plot"] == [
+            "10:90/1024", "11:90/1024", "12:90/1024"]
+    # each answer is cut to the longest prefix its document holds
+    assert result.outputs["extract_answers:kind"].to_pydict()["kind"] == [
+        "10:80/16", "11:80", None]
+    assert result.outputs["extract_answers:size"].to_pydict()["size"] == [
+        "10:81/16", "11:", None]
+
+
+@pytest.mark.parametrize("submission", ["operator-at-a-time", "shuffled", "pipelined"])
+def test_maps_write_each_answer_under_its_own_limit(submission):
+    from quail.baselines.nodes import RequestMapSpec
+
+    specs = tuple(RequestMapSpec(alias="d", output=output, tail_token_ids=(tail,),
+                                 max_answer_tokens=limit)
+                  for output, tail, limit in (("plot", 90, 1024), ("topic", 91, 32)))
+    node = RequestExecution(node_id="request-model", backend_name="stock_vllm",
+                            aliases=("d",), maps=specs)
+    result = _execution(
+        {"d": [[10], [11], [12]]}, client=_MapClient(),
+        document_texts={"d": ["one", "two", "three"]},
+        answer_submission=submission).execute(node, {"input:0": [0, 1, 2]})
+    assert result.outputs["map_answers:plot"].to_pydict()["plot"] == [
+        "10:90/1024", "11:90/1024", "12:90/1024"]
+    assert result.outputs["map_answers:topic"].to_pydict()["topic"] == [
+        "10:91/32", "11:91/32", "12:91/32"]
+    steps = result.metrics.extension["steps"]
+    assert {step["submission"] for step in steps} == {submission}
+
+

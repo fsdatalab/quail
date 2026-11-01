@@ -49,6 +49,7 @@ from quail.logical import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SemanticSaeFeatures,
     Unnest,
     Window,
@@ -67,13 +68,19 @@ from quail.planner.sol.search import (
 from quail.specs import DeviceSpec, ModelSpec
 
 _PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, SemanticExtract,
-                 SemanticSaeFeatures, Filter, Join, SemanticJoin, Project,
-                 Unnest, Aggregate, Window, Result)
+                 SemanticSaeFeatures, SemanticMap, Filter, Join, SemanticJoin,
+                 Project, Unnest, Aggregate, Window, Result)
 
 
 @dataclass(frozen=True)
 class SpeedOfLightEstimate:
-    """The ideal time of one query and how it was reached."""
+    """The ideal time of one query and how it was reached.
+
+    seconds is a lower bound on any schedule of the work: the larger of
+    its summed memory time, with the weights read once per pass, and its
+    summed compute time, at the device's peak rates. latency prices the
+    same work by model component.
+    """
 
     model: str
     device: str
@@ -81,6 +88,7 @@ class SpeedOfLightEstimate:
     credit_shared_prefixes: bool
     work: Work
     latency: SpeedOfLight
+    seconds: float
     usd_per_hour: float
     alias_columns: dict[str, str]
     documents_by_alias: dict[str, int]
@@ -90,10 +98,6 @@ class SpeedOfLightEstimate:
     relation_order: tuple[str, ...]
     cached_prefixes: tuple[str, ...]
     search: dict = field(default_factory=dict)
-
-    @property
-    def seconds(self) -> float:
-        return self.latency.seconds
 
     @property
     def fresh_tokens(self) -> float:
@@ -177,7 +181,7 @@ class SpeedOfLightEstimate:
             "device": self.device,
             "chunk_tokens": self.chunk_tokens,
             "credit_shared_prefixes": self.credit_shared_prefixes,
-            "sol_s": latency.seconds,
+            "sol_s": self.seconds,
             "bound_by": latency.bound_by,
             "t_compute": latency.compute,
             "t_memory": latency.memory,
@@ -247,6 +251,13 @@ def _refuse_unpriced(logical) -> None:
                     f"filters")
     for tests in operators.column_filters.values():
         for test in tests:
+            if test.call.kind == "features":
+                raise NotImplementedError(
+                    "the speed of light estimate has no oracle for SAE feature tests")
+            if test.call.kind == "map":
+                raise NotImplementedError(
+                    "the speed of light estimate does not price a test of a "
+                    "map answer")
             if len(condition_columns(test.condition)) > 1:
                 raise NotImplementedError(
                     f"the speed of light estimate does not price the test "
@@ -257,6 +268,11 @@ def _refuse_unpriced(logical) -> None:
                     f"the speed of light estimate does not price the test "
                     f"{test.condition} of an answer's span; the answer "
                     f"oracle gives the answer's text only")
+    if operators.maps and operators.joins:
+        # a map above a join writes only for the documents the join keeps
+        raise NotImplementedError(
+            "the speed of light estimate prices AI.MAP only in queries "
+            "without joins")
     for join in operators.joins:
         if not (isinstance(join.predicate, ModelCall)
                 and join.predicate.kind == "boolean"):
@@ -271,12 +287,12 @@ def _refuse_unpriced(logical) -> None:
             raise NotImplementedError(
                 "the speed of light estimate prices binary join predicates")
     for column in operators.projections:
-        if column.expression.kind not in ("label", "extract", "features"):
+        if column.expression.kind not in ("label", "extract", "features", "map"):
             raise NotImplementedError(
                 f"the speed of light estimate does not price the "
                 f"{column.expression.kind!r} column {column.name!r}; it "
-                f"prices AI.CLASSIFY, AI.EXTRACT, and AI.SAE_FEATURES "
-                f"columns")
+                f"prices AI.CLASSIFY, AI.EXTRACT, AI.SAE_FEATURES, and "
+                f"AI.MAP columns")
     joined = [frozenset(arg.alias for arg in join.prompt.args)
               for join in operators.joins]
     for call, _ in operators.labels.calls:
@@ -351,6 +367,7 @@ def speed_of_light_estimate(
         credit_shared_prefixes=credit_shared_prefixes,
         work=best.work,
         latency=search.latency(best),
+        seconds=search.seconds(best),
         usd_per_hour=device.usd_per_hour,
         alias_columns={
             alias: data.column for alias, data in search.aliases.items()},

@@ -13,6 +13,18 @@ INT32_MAX = 2**31 - 1
 ACT_BYTES = 2           # bf16 activations, bytes per element
 ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
 #                         the arena for overlapped chunk construction
+READOUT_BLOCK_ROWS = 512
+
+
+def copy_verification_workspace_bytes(model: ModelSpec, chunk_tokens: int) -> int:
+    """Return shared readout workspace capped by one activation chunk.
+
+    The head readout's two fp32 logits tables are released before copy
+    verification runs on the same CUDA stream. Reuse their bounded space,
+    leaving the other activation chunk for retained outputs and staging.
+    """
+    return int(min(chunk_tokens * model.act_per_token,
+                   2 * READOUT_BLOCK_ROWS * model.vocab * 4))
 
 
 def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
@@ -39,7 +51,7 @@ def kernel_index_cap(model: ModelSpec) -> int:
 
 def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
     """Return the largest chunk that fits its memory reservations, or zero."""
-    available = device.mem_bytes * POOL_FRACTION
+    available = device.mem_bytes * POOL_FRACTION - graph_memory_bytes(model, device)
     free = available - model.W_resident
     lower = 0
     upper = max(0, int(free // (ACT_RESERVE_CHUNKS * model.act_per_token)))
@@ -92,7 +104,8 @@ def _chunk_leaving_kv(model: ModelSpec, device: DeviceSpec, chunk: int) -> int:
     """
     if model.sliding_window or chunk < 1:
         return chunk
-    free = device.mem_bytes * POOL_FRACTION - model.W_resident
+    free = (device.mem_bytes * POOL_FRACTION - model.W_resident
+            - graph_memory_bytes(model, device))
     per = ACT_RESERVE_CHUNKS * model.act_per_token + model.kappa_full
     if per > 0:
         chunk = min(chunk, max(1, int(free // per)))
@@ -119,11 +132,54 @@ def sliding_kv_fits(model: ModelSpec, device: DeviceSpec,
     return True
 
 
+# CUDA graph capture sizes, in tokens per pass, for Quail and the vLLM
+# baselines alike. A pass pads to the next size and runs eagerly past
+# the largest. vLLM's defaults (1, 2, 4, then every 8 to 256 and every
+# 16 to 512), then every 256 to 8,192, so a decode pass of hundreds of
+# rows or a full prefill pass pads by fewer than 256 rows
+GRAPH_TOKEN_BUCKETS = (
+    1, 2, 4, *range(8, 256, 8), *range(256, 513, 16), *range(768, 8_193, 256))
+
+
+# Families whose pipelines split their forward pass into captured
+# pieces (ModelPipeline.piece)
+GRAPH_ARCHS = ("qwen3", "qwen3_5")
+
+
+def graph_token_buckets(model: ModelSpec, device: DeviceSpec) -> tuple[int, ...]:
+    """Return the CUDA graph capture sizes of a dense Qwen3 or Qwen3.5 model.
+
+    The sizes are GRAPH_TOKEN_BUCKETS, up to the model's kernel index
+    cap. Other families, experts, SAE readouts, and diffusion canvases
+    run without graphs.
+    """
+    if (model.arch not in GRAPH_ARCHS or model.experts or model.sae is not None
+            or model.canvas_tokens):
+        return ()
+    cap = kernel_index_cap(model)
+    return tuple(size for size in GRAPH_TOKEN_BUCKETS if size <= cap)
+
+
+def graph_memory_bytes(model: ModelSpec, device: DeviceSpec) -> int:
+    """Reserve shared boundary buffers and one shared capture workspace.
+
+    The buckets' persistent state shares one allocation that fits the
+    largest bucket's activation footprint. All captures share a pool,
+    whose temporaries fit the same footprint. Attention and readout
+    still use the ordinary activation reserve.
+    """
+    buckets = graph_token_buckets(model, device)
+    if not buckets:
+        return 0
+    return ceil(2 * buckets[-1] * model.act_per_token)
+
+
 def arena_bytes(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int) -> float:
-    """Bytes left for KV after resident weights and the activation reserve."""
+    """Bytes left for KV after weights, activations, and CUDA graph storage."""
     return (device.mem_bytes * POOL_FRACTION - model.W_resident
-            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
+            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token
+            - graph_memory_bytes(model, device))
 
 
 # Questions one pass may start from checkpoints at once; each needs a
@@ -209,13 +265,17 @@ def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec,
 
 def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
                      kv_pages: int) -> int:
-    """Checkpoints the pool holds beside an arena of `kv_pages`; 0 without them."""
+    """Checkpoints the pool holds beside an arena of `kv_pages`; 0 without them.
+
+    One slot's room goes to the recurrent state's unused row 0, which
+    vLLM's decode kernel reads as no state.
+    """
     pages = checkpoint_pages(model, device.page_tokens)
     if not pages:
         return 0
     retained = kv_pages - execution_pages(chunk_tokens, device.page_tokens)
     return max(0, int((hybrid_pool_pages(model, device, chunk_tokens)
-                       - retained) // pages))
+                       - retained) // pages) - 1)
 
 
 def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
@@ -376,9 +436,9 @@ def tree_attention_allowed(model: ModelSpec) -> bool:
             and model.params >= TREE_ATTENTION_MIN_PARAMS)
 
 
-def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
-                          readers: float, reader_rows: float,
-                          node_tokens: float) -> str:
+def cheaper_attention_path(model: ModelSpec, device: DeviceSpec, *,
+                           readers: float, reader_rows: float,
+                           node_tokens: float) -> str:
     """Pick "unified" or "tree" attention for readers of one shared node.
 
     The node is a join's anchor or a filter's parent document; its

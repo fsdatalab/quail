@@ -124,3 +124,32 @@ def test_levels_cover_every_prefix_row_once_and_never_read_ahead(
                 written |= set(phase.write_slots.tolist())
     # the trials must exercise borrowing, or the checks above are empty
     assert borrowers > 20
+
+
+def answer_step(key, f, row, tokens=1):
+    return dict(key=key, fresh=False, start=0, f=f, row0=row, prefix_end=row,
+                row1=row + tokens,
+                suffix_spans=(np.array([row]), np.array([row + tokens])),
+                kept=tokens)
+
+
+def test_one_token_answer_steps_update_their_slot_in_place(torch_stub):
+    arena = arena_with_slots()
+    resident(arena, "a", "b")
+    plan_phases(arena, [group("a", 48, 0, 48), group("b", 40, 50, 90)], stage)
+    document = arena.accounting.slots["a"]
+    phases = plan_phases(
+        arena, [answer_step("a", 48, 0), answer_step("b", 40, 1, tokens=2)],
+        stage)
+    assert lengths(phases) == [(2,), (1,)]
+    chunked, step = phases
+    assert chunked.state_rows is None
+    answer = arena.extension("a")[0]
+    assert answer != document
+    assert step.state_rows.tolist() == [answer + 1]
+    assert step.copy_reads.tolist() == [document]
+    assert step.copy_writes.tolist() == [answer]
+    (step,) = plan_phases(arena, [answer_step("a", 49, 0)], stage)
+    assert step.read_slots.tolist() == step.write_slots.tolist() == [answer]
+    assert step.state_rows.tolist() == [answer + 1]
+    assert step.copy_reads is None

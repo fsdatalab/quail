@@ -1,8 +1,9 @@
 """Request scheduling shared by the vLLM and SGLang backends.
 
 Filter sequences advance on individual request completions under a shared
-KV admission calculation. The fields of an extraction share each
-document's KV the same way. Joins submit one request per document pair.
+KV admission calculation. The fields of an extraction, and the maps of a
+pipelined backend, share each document's KV the same way. Joins submit
+one request per document pair.
 """
 
 from __future__ import annotations
@@ -249,12 +250,18 @@ def run_extract_fields(
     enter the queue once that request has written a token, so they read
     the body from the prefix cache instead of computing it again. The
     engine exposes add_request and step, as vLLM's LLMEngine does.
+    sampling_params is one setting for every field or a list with one
+    per field; answer_tokens is what each field counts toward the
+    document cap.
 
     Returns:
         A dict with the outputs of each field in document order, the
         wall seconds, and the admission settings.
     """
     fields = len(tail_ids)
+    field_params = (list(sampling_params)
+                    if isinstance(sampling_params, (list, tuple))
+                    else [sampling_params] * fields)
     document_cap = extract_document_cap(
         body_ids, tail_ids, answer_tokens, budget_tokens,
         block_size=block_size, max_num_seqs=max_num_seqs,
@@ -275,7 +282,7 @@ def run_extract_fields(
             prompt = {
                 "prompt_token_ids": body_ids[document] + tail_ids[field]
             }
-        engine.add_request(request_id, prompt, sampling_params)
+        engine.add_request(request_id, prompt, field_params[field])
 
     started = time.perf_counter()
     expected_rows = next_document = 0

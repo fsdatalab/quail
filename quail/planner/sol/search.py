@@ -12,12 +12,17 @@ from typing import Callable, Mapping
 import pyarrow as pa
 
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
+from quail.cost.decode import DecodeCost
 from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sae_features import sae_encoded_tokens
 from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan
-from quail.logical import condition_columns, oriented_join_conditions
+from quail.logical import (
+    RegularPredicate,
+    condition_columns,
+    oriented_join_conditions,
+)
 from quail.logical.expressions import column_name, evaluate_expression
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
@@ -31,7 +36,9 @@ from quail.planner.search.table_steps import (
     table_steps,
 )
 from quail.planner.search.table_steps import CLASSIFY as CLASSIFY_STEP
+from quail.planner.search.table_steps import EXTRACT as EXTRACT_STEP
 from quail.planner.search.table_steps import FEATURES as FEATURES_STEP
+from quail.planner.search.table_steps import MAP as MAP_STEP
 from quail.planner.statistics.prefixes import (
     document_shared_tokens,
     subset_shared_tokens,
@@ -40,7 +47,8 @@ from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
 # in the prompt to a row index of that alias's corpus table; for an
-# AI.EXTRACT prompt, the reference answer text, or None for no answer
+# AI.EXTRACT prompt, the reference answer text, or None for no answer;
+# for an AI.MAP prompt, the answer the map writes
 AnswerOracle = Callable[[object, Mapping[str, int]], object]
 # label(prompt, assignment) -> str, the reference label of an
 # AI.CLASSIFY prompt for one row assignment
@@ -53,6 +61,7 @@ EXTRACT = "AI.EXTRACT"
 LABEL_IN = "IN"
 ANSWER_TEST = "ANSWER TEST"
 FEATURES = "AI.SAE_FEATURES"
+MAP = "AI.MAP"
 
 
 
@@ -85,13 +94,7 @@ class _EstimatePricing:
             tail, self.mean_tokens, search.model, search.device,
             search.chunk_tokens, first=fresh)) for fresh in (True, False))
 
-    def classify(self, call, name: str) -> tuple:
-        return self._question(call.prompt)
-
-    def extract(self, node) -> tuple:
-        return self._question(node.call.prompt)
-
-    def features(self, node) -> tuple:
+    def column(self, node) -> tuple:
         return self._question(node.call.prompt)
 
     def document_head(self, prompt):
@@ -129,6 +132,7 @@ class Search:
         self.label = label
         self.model = model
         self.device = device
+        self.decode_cost = DecodeCost.from_specs(model, device)
         self.chunk_tokens = chunk_tokens
         self.credit_shared = credit_shared
         # a diffusion model answers on canvas rows appended to every
@@ -145,6 +149,7 @@ class Search:
         self.column_filters = operators.column_filters
         self.extracts = operators.extracts
         self.sae_features = operators.sae_features
+        self.maps = operators.maps
         self.max_pooling = {node.alias for node in self.sae_features
                             if node.pooling == "max"}
         if self.labels.calls and label is None:
@@ -162,6 +167,10 @@ class Search:
         self._lowered = {}
         # readout rows of the answers the filter stages read
         self.answer_rows = 0.0
+        # decode passes the longest map answer needs, one per fed token
+        self.decode_passes = 0
+        # (alias, row) -> map answer passes already reading the document
+        self.map_passes: dict[tuple[str, int], int] = {}
 
         def lower(prompt):
             if prompt not in self._lowered:
@@ -355,12 +364,11 @@ class Search:
             alias = scan_node.alias
             predicates = self.filters.get(alias, ())
             asks = list(range(len(predicates)))
-            calls = [call for call, owner in self.labels.calls
-                     if owner == alias and len(call.aliases()) == 1]
-            extracts = [node for node in self.extracts if node.alias == alias]
-            feature_calls = [node for node in self.sae_features
-                             if node.alias == alias]
-            if not asks and not calls and not extracts and not feature_calls:
+            columns = {node.name: node for node in (
+                *self.logical_operators.classifies, *self.extracts,
+                *self.sae_features, *self.maps)
+                if node.alias == alias and len(node.call.aliases()) == 1}
+            if not asks and not columns:
                 continue
             tokens = self.aliases[alias].tokens
             mean_document_tokens = sum(tokens) / len(tokens) if tokens else 0
@@ -395,19 +403,13 @@ class Search:
                         first,
                         stages,
                     )
-                elif step.kind == CLASSIFY_STEP:
-                    rows, stage_work = self.classify_stage(
-                        alias, step.key, rows, first, stages)
-                elif step.kind == FEATURES_STEP:
-                    node = next(node for node in feature_calls
-                                if node.name == step.key)
-                    rows, stage_work = self.features_stage(
-                        alias, node, rows, first, stages)
                 else:
-                    node = next(node for node in extracts if node.name == step.key)
-                    rows, stage_work = self.extract_stage(
-                        alias, node, rows, first, stages
-                    )
+                    stage = {CLASSIFY_STEP: self.classify_stage,
+                             EXTRACT_STEP: self.extract_stage,
+                             FEATURES_STEP: self.features_stage,
+                             MAP_STEP: self.map_stage}[step.kind]
+                    rows, stage_work = stage(
+                        alias, columns[step.key], rows, first, stages)
                 work = work + stage_work
             survivors[alias] = rows
         return survivors, work, stages
@@ -423,8 +425,9 @@ class Search:
             rows, passed, stage_work))
         return passed, stage_work
 
-    def classify_stage(self, alias, call, rows, first, stages):
+    def classify_stage(self, alias, node, rows, first, stages):
         """Classify the live rows, then apply the label filters testing the call."""
+        call = node.call
         stage_work = self.question_work(
             alias, rows, self.lower(call.prompt).tail_tokens, first)
         self.answer_rows += len(rows)
@@ -435,14 +438,17 @@ class Search:
         for test in self.column_filters.get(alias, ()):
             if test.call != call:
                 continue
-            accepted = set(test.condition.value)
-            passed = [row for row in rows
-                      if self.label(call.prompt, {alias: row}) in accepted]
+            answers = {row: self.label(call.prompt, {alias: row}) for row in rows}
+            passed = self.answer_survivors(test.condition, rows, answers)
+            membership = (isinstance(test.condition, RegularPredicate)
+                          and test.condition.comparison == "in")
+            details = ({"accepted": list(test.condition.value)} if membership
+                       else {"condition": str(test.condition)})
             stages.append(_stage(
-                LABEL_IN, alias, call.prompt.template, test.position,
+                LABEL_IN if membership else ANSWER_TEST,
+                alias, call.prompt.template, test.position,
                 0, test.selectivity, rows, passed, Work(),
-                name=self.labels.names[call],
-                accepted=list(test.condition.value)))
+                name=self.labels.names[call], **details))
             rows = passed
         return rows, stage_work
 
@@ -497,6 +503,52 @@ class Search:
                 test.position, 0, test.selectivity, rows, passed, Work(),
                 name=node.name, condition=str(test.condition)))
             rows = passed
+        return rows, stage_work
+
+    def map_stage(self, alias, node, rows, first, stages):
+        """Write each live row's map answer, one decode pass per fed token.
+
+        The answer's first token comes from the prompt's last row; each
+        later token is fed back in its own pass. A fed token attends to
+        the prompt and the answer before it. With the shared prefix
+        credit on, the maps of one document read its KV once per pass,
+        as tree attention does; otherwise each answer reads it.
+        """
+        if self.window:
+            raise NotImplementedError(
+                "the speed of light estimate does not price AI.MAP on a "
+                "model with sliding attention")
+        tail = self.lower(node.call.prompt).tail_tokens
+        stage_work = self.question_work(alias, rows, tail, first)
+        tokens = self.aliases[alias].tokens
+        answer_rows = 0
+        for row in rows:
+            answer = self.answer(node.call.prompt, {alias: row})
+            if answer is None:
+                raise ValueError(
+                    f"the answer oracle gave no answer for map {node.name!r} "
+                    f"on {alias!r} row {row}")
+            # text can tokenize longer than the tokens the model wrote
+            written = min(len(self.tokenizer(answer)) or 1,
+                          node.call.max_answer_tokens)
+            fed = written - 1
+            document = self.pre + tokens[row]
+            read_before = self.map_passes.get((alias, row), 0)
+            document_reads = (max(0, fed - read_before) if self.credit_shared
+                              else fed)
+            self.map_passes[(alias, row)] = max(read_before, fed)
+            stage_work = stage_work + Work(
+                tokens=fed,
+                pairs=fed * (document + tail) + fed * (fed + 1) / 2,
+                kv_written=fed,
+                kv_read=document_reads * document + fed * tail
+                + fed * (fed - 1) / 2)
+            self.decode_passes = max(self.decode_passes, fed)
+            answer_rows += written
+        self.answer_rows += answer_rows
+        stages.append(_stage(
+            MAP, alias, node.call.prompt.template, None, tail, None, rows,
+            rows, stage_work, name=node.name, answer_rows=answer_rows))
         return rows, stage_work
 
     def answer_survivors(self, condition, rows, answers) -> list:
@@ -575,7 +627,13 @@ class Search:
             record["answer_rows"] for step in candidate.steps
             for record in step["classifications"])
         return speed_of_light(candidate.work, self.model, self.device,
-                              self.chunk_tokens, rows=rows)
+                              self.chunk_tokens, rows=rows,
+                              min_passes=self.decode_passes)
+
+    def seconds(self, candidate) -> float:
+        """The fewest seconds any schedule of a candidate's work can take."""
+        return self.decode_cost.lower_bound_seconds(
+            candidate.work, self.latency(candidate).passes)
 
     def search_joins_sol(self, base_rows, resident, base_work):
         """Search every feasible left deep plan over the exact filtered rows.
@@ -680,7 +738,7 @@ class Search:
         best = min(
             search.candidates,
             key=lambda candidate: (
-                self.latency(candidate).seconds,
+                self.seconds(candidate),
                 candidate.work.tokens,
                 candidate.work.pairs,
                 candidate.work.kv_written,

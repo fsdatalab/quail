@@ -19,8 +19,7 @@ from quail.logical.expressions import (
     validate_predicate,
 )
 from quail.logical.nodes.base import LogicalNode
-from quail.logical.nodes.classify import classifications
-from quail.logical.nodes.extract import extractions
+from quail.logical.nodes.column import SemanticColumn, column_nodes
 from quail.logical.nodes.scan import Scan
 from quail.logical.nodes.unnest import Unnest
 
@@ -83,11 +82,11 @@ class Filter:
     """Rows whose condition holds, decided without the model.
 
     Below the Project, the condition tests columns the one-table
-    SemanticClassify or SemanticExtract nodes below add: labels, or
-    answers and spans; it may test the table's source columns too, read
-    by document ID. Above the Project or an Unnest, it
-    tests the columns the result rows below return, by name, such as
-    ``r.stars``, ``lease.ends``, or a field column of an unnested list.
+    column operators below add, such as labels, answers and spans, or
+    map answers; it may test the table's source columns too, read by
+    document ID. Above the Project or an Unnest, it tests the columns
+    the result rows below return, by name, such as ``r.stars``,
+    ``lease.ends``, or a field column of an unnested list.
     """
 
     input: LogicalNode
@@ -126,8 +125,8 @@ class Filter:
                     and reference.column not in scan_columns(self.input,
                                                              reference.alias)):
                 raise CompileError(
-                    f"a Filter tests a column a one-table classification or "
-                    f"an extraction below it computes; nothing below "
+                    f"a Filter tests a column a one-table column operator "
+                    f"below it computes; nothing below "
                     f"computes {reference.alias}.{reference.column}"
                 )
 
@@ -163,16 +162,11 @@ class Filter:
 
 
 def computed_columns(node) -> frozenset:
-    """Return the columns the classifications and extractions below compute.
-
-    The columns are (alias, column) pairs: labels, answers, and answer
-    spans at or below the node.
-    """
-    columns = {(found.alias, found.name) for found in classifications(node)
-               if len(found.call.aliases()) == 1}
-    for found in extractions(node):
-        columns.update({(found.alias, found.name), (found.alias, found.span_name)})
-    return frozenset(columns)
+    """Return (alias, column) pairs computed by column operators below."""
+    return frozenset((found.alias, name)
+                     for found in column_nodes(node, SemanticColumn)
+                     if len(found.call.aliases()) == 1
+                     for name in found.added_columns)
 
 
 def scan_columns(node, alias: str) -> frozenset:

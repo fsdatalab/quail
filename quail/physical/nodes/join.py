@@ -62,7 +62,7 @@ class AiJoin(PhysicalNode):
     tail_token_ids: tuple[Token, ...] = ()
     # the token ids the anchors are shown under, before the document
     document_head: tuple[Token, ...] = ()
-    # "unified" or "tree": the attention path the choose_attention_algorithm rule
+    # "unified" or "tree": the attention path the choose_attention_path rule
     # chose; empty leaves the model pipeline's default
     attention: str = ""
     # anchors borrow the KV pages of an anchor that shares their token

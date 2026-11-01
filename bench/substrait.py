@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
+from quail.logical.prompts import map_instruction
 from quail_b.substrait import (
     Aggregate,
     Classify,
@@ -92,6 +93,10 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
         outputs[item.output] = (
             f"AI.SAE_FEATURES({prompt(item.prompt, item.relation)}, "
             f"pooling => {sql_string(item.pooling)})")
+    for item in info.maps:
+        outputs[item.output] = (
+            f"AI.MAP({document(item.relation)}, "
+            f"{sql_string(map_instruction(item.prompt))}, {item.max_tokens})")
     for struct in info.structs:
         extracts = [extract for extract in info.extracts
                     if info.struct_of(extract) == struct]
@@ -101,7 +106,8 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
         outputs[struct.name] = (
             f"AI.EXTRACT({document(extracts[0].relation)}, {{{questions}}})")
     names = {f"{item.relation}.{item.output}": item.output
-             for item in (*info.classifies, *info.scores, *info.sae_features)}
+             for item in (*info.classifies, *info.scores, *info.sae_features,
+                          *info.maps)}
     names.update({name: struct.name for struct in info.structs
                   for name in struct.fields})
 

@@ -114,14 +114,14 @@ built-in rules of the same kind, in registration order.
 | `should_push_down_distinct` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `should_push_down_projection` | Logical | Load only columns the query uses. | No |
 | `should_push_down_filters` | Logical | Move conditions on labels and extracted answers before joins. | No |
-| `should_lift_maps` | Logical | Offer classification and extraction before and after joins. | Yes |
+| `should_lift_column_operators` | Logical | Offer classification, extraction, and AI.MAP before and after joins. | Yes |
 | `should_eliminate_window_sort` | Physical | Remove a final sort when the window already returns rows in that order. | No |
 | `should_push_down_limit_through_window` | Physical | Select the first requested rows before computing an eligible window. | No |
 | `should_push_down_limit` | Physical | Stop an eligible filter sequence after enough documents pass. | No |
 | `choose_classify_implementation` | Physical | Choose a classification's label scoring method. | Yes |
 | `should_retain_kv` | Physical | Keep selected document KV for later operators. | No |
 | `should_share_prefixes` | Physical | Reuse KV between documents with a shared prefix. | Yes |
-| `choose_attention_algorithm` | Physical | Choose unified or tree attention for filters and joins. | Yes |
+| `choose_attention_path` | Physical | Choose unified or tree attention for filters and joins. | Yes |
 
 The implementations are in
 [`rules/logical.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/logical.py)
@@ -148,8 +148,8 @@ join order for each candidate.
 
 ### Classification placement
 
-The `should_lift_maps` rule proposes when to classify a table's documents.
-It also proposes placements for extraction.
+The `should_lift_column_operators` rule proposes when to classify a table's
+documents. It also proposes placements for extraction and AI.MAP.
 A classification that reads one table's document can run before or after
 joins involving that table. This differs from classifying a joined pair,
 where the classification reads both documents.
@@ -356,7 +356,7 @@ so the rule can make its final decision after tokenization finishes.
 
 ### Attention path
 
-The `choose_attention_algorithm` rule chooses between the unified and tree attention
+The `choose_attention_path` rule chooses between the unified and tree attention
 paths described in [Execution](/docs/architecture/execution#attention-paths).
 It compares their estimated time for requests that read the same prefix.
 For `r` requests, each with `q` new tokens and a shared prefix of `s` tokens,
@@ -387,4 +387,4 @@ time on an H100. It also excludes kernel launch time. These limits apply
 to the path comparison, rather than the main roofline attention estimate.
 
 The implementation is
-[`choose_attention_path`](https://github.com/fsdatalab/quail/blob/main/quail/cost/budgets.py).
+[`cheaper_attention_path`](https://github.com/fsdatalab/quail/blob/main/quail/cost/budgets.py).

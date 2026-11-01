@@ -74,20 +74,17 @@ class RequestJoinSpec:
     tail_text: str = ""
 
 @dataclass(frozen=True)
-class RequestExtractSpec:
-    """Specification for one decoded answer per document, located in its text.
+class RequestAnswerSpec:
+    """Specification for one decoded answer per document.
 
-    The tail_token_ids follow the document and contain the question,
-    the instruction, the answer template, and the phrase cue. The
-    answer is the text the model writes up to the closing quote,
-    located in the document's text. The preamble precedes the document: the model's
-    extract turn and the document label, which differ from the
-    request's shared preamble on a model that answers AI.IF raw.
+    The preamble precedes the document: the model's turn and the
+    document label, which differ from the request's shared preamble on
+    a model that answers AI.IF raw. The tail_token_ids follow the
+    document and end in the cue that opens the answer.
     """
 
     alias: str
     output: str
-    question: str
     tail_token_ids: tuple[Token, ...]
     # the tail's text, for an engine that tokenizes prompts itself
     tail_text: str = ""
@@ -98,6 +95,18 @@ class RequestExtractSpec:
     def __post_init__(self):
         validate_integer_setting("max_answer_tokens", self.max_answer_tokens)
 
+
+@dataclass(frozen=True)
+class RequestExtractSpec(RequestAnswerSpec):
+    """An answer copied from the document, located in its text.
+
+    The tail holds the question, the instruction, the answer template,
+    and the phrase cue. The answer is the text the model writes up to
+    the closing quote, located in the document's text.
+    """
+
+    question: str = ""
+
     @property
     def span_output(self) -> str:
         """Return the name of the span column."""
@@ -106,6 +115,11 @@ class RequestExtractSpec:
 def _short_text(text: str, limit: int = 60) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+@dataclass(frozen=True)
+class RequestMapSpec(RequestAnswerSpec):
+    """An answer the model writes for an instruction: its text, up to its turn end."""
 
 
 @dataclass(frozen=True)
@@ -120,6 +134,7 @@ class RequestExecution(PhysicalNode):
     joins: tuple[RequestJoinSpec, ...] = ()
     classifies: tuple[RequestClassifySpec, ...] = ()
     extracts: tuple[RequestExtractSpec, ...] = ()
+    maps: tuple[RequestMapSpec, ...] = ()
 
     type_name: ClassVar[str] = "quail.request_execution"
     runtime_key: ClassVar[str] = type_name
@@ -187,6 +202,15 @@ class RequestExecution(PhysicalNode):
             )
             for spec in self.extracts
         )
+        outputs.extend(
+            OutputPort(
+                f"map_answers:{spec.output}",
+                ValueType.ROWS,
+                schema=(spec.alias, spec.output),
+                answer=AnswerOutput("maps", spec.output, (spec.alias, spec.output)),
+            )
+            for spec in self.maps
+        )
         return tuple(outputs)
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -206,4 +230,6 @@ class RequestExecution(PhysicalNode):
             fields[f"classify {spec.output}"] = list(spec.labels)
         for spec in self.extracts:
             fields[f"extract {spec.output}"] = f"question={spec.question!r}"
+        for spec in self.maps:
+            fields[f"map {spec.output}"] = _short_text(spec.tail_text)
         return fields

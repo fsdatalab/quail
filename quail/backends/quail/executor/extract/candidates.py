@@ -52,7 +52,11 @@ class SqueezedText:
     """A document with single spaces and a map to original character ends."""
 
     def __init__(self, text: str):
-        self.text = re.sub(r"\s+", " ", text)
+        self.text = " ".join(text.split())
+        if text and text[0].isspace():
+            self.text = " " + self.text
+        if text and text[-1].isspace() and self.text != " ":
+            self.text += " "
         self.ends = np.arange(1, len(self.text) + 1, dtype=np.int64)
         runs = list(re.finditer(r"\s{2,}", text))
         if runs:
@@ -92,16 +96,17 @@ class CandidateIndex:
     position_offsets: np.ndarray
 
     @classmethod
-    def of(cls, scan: DocumentTokens, vocabulary: Vocabulary) -> "CandidateIndex":
+    def of(cls, scan: DocumentTokens, vocabulary: Vocabulary,
+           option_table=None) -> "CandidateIndex":
         kids, first, inverse, occurrences = np.unique(
             scan.kids, return_index=True, return_inverse=True, return_counts=True)
-        options = [vocabulary.options(int(kid)) for kid in kids]
-        counts = np.array([len(t) for t, _ in options], dtype=np.int64)
-        token = (np.concatenate([t for t, _ in options]) if options
-                 else np.empty(0, dtype=np.int64))
-        length = (np.concatenate([j for _, j in options]) if options
-                  else np.empty(0, dtype=np.int64))
-        return cls(kids, first, inverse, token, length,
+        if option_table is None:
+            option_table = vocabulary.option_table(kids)
+        offsets, tokens, lengths = option_table
+        counts = offsets[kids + 1] - offsets[kids]
+        indices = (np.repeat(offsets[kids] - (np.cumsum(counts) - counts), counts)
+                   + np.arange(counts.sum()))
+        return cls(kids, first, inverse, tokens[indices], lengths[indices],
                    np.repeat(np.arange(len(kids)), counts),
                    np.cumsum(counts) - counts,
                    np.argsort(inverse, kind="stable"),
@@ -180,8 +185,9 @@ def extend_streams(streams: list, vocabulary: Vocabulary) -> None:
 
 def ensure_tokens(streams: list, at: int, vocabulary: Vocabulary) -> None:
     """Tokenize windows together until each live stream reaches the requested token."""
-    while pending := [stream for stream in streams
-                      if at >= len(stream.stream) and not stream.exhausted]:
+    limits = np.broadcast_to(at, (len(streams),))
+    while pending := [stream for stream, limit in zip(streams, limits)
+                      if limit >= len(stream.stream) and not stream.exhausted]:
         extend_streams(pending, vocabulary)
 
 
@@ -307,3 +313,55 @@ def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
                                   first_window_chars=first_window_chars,
                                   window_chars=window_chars))
     return streams
+
+
+class TextWindows:
+    """Gather normalized document windows and original ends in packed arrays."""
+
+    def __init__(self, documents):
+        offsets = np.r_[0, np.cumsum([len(text) + 1 for text in documents])]
+        self.offsets = offsets[:-1]
+        self.limits = offsets[1:] - 1
+        normalized = [SqueezedText(text) for text in documents]
+        self.ends = np.concatenate([
+            text.ends + offset for text, offset in zip(normalized, self.offsets)
+        ])
+        characters = [np.frombuffer(text.text.encode("utf-32-le"), dtype="<u4")
+                      for text in normalized]
+        self.boundaries = np.concatenate([
+            np.r_[np.r_[0, text.ends][:-1][chars == 32] + offset, limit]
+            for text, chars, offset, limit in zip(
+                normalized, characters, self.offsets, self.limits)
+        ]).astype(np.int64)
+        self.boundary_ends = np.concatenate([
+            np.r_[text.ends[chars == 32] + offset, limit]
+            for text, chars, offset, limit in zip(
+                normalized, characters, self.offsets, self.limits)
+        ])
+        text = "".join(value.text for value in normalized)
+        characters = np.concatenate(characters)
+        sizes = 1 + (characters > 127) + (characters > 2047) + (characters > 65535)
+        self.bytes = np.frombuffer(text.encode(), dtype=np.uint8)
+        self.byte_offsets = np.r_[0, np.cumsum(sizes)]
+
+    def windows(self, documents, starts, sizes):
+        """Return packed window text, normalized starts and original cuts."""
+        import pyarrow as pa
+
+        starts = starts + self.offsets[documents]
+        requested = np.minimum(starts + sizes, self.limits[documents])
+        boundary = np.searchsorted(self.boundaries, requested)
+        cuts = np.where(
+            (boundary > 0)
+            & (requested < self.boundary_ends[np.maximum(0, boundary - 1)]),
+            requested, self.boundaries[boundary])
+        left = np.searchsorted(self.ends, starts, side="right")
+        right = np.searchsorted(self.ends, cuts - 1, side="right") + (cuts > starts)
+        right = np.maximum(left, right)
+        byte_left, byte_right = self.byte_offsets[left], self.byte_offsets[right]
+        counts = byte_right - byte_left
+        offsets = np.r_[0, np.cumsum(counts)]
+        indices = np.repeat(byte_left - offsets[:-1], counts) + np.arange(offsets[-1])
+        text = pa.Array.from_buffers(pa.large_string(), len(documents), [
+            None, pa.py_buffer(offsets), pa.py_buffer(self.bytes[indices])])
+        return text, left, cuts - self.offsets[documents]

@@ -7,16 +7,20 @@ import time
 from functools import partial
 from typing import Any, Mapping
 
+import pyarrow as pa
+
 from quail.backends.base import GpuContext
-from quail.baselines.nodes import RequestExecution
+from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.baselines.operators import (
     allowed_members_by_anchor,
+    answer_documents,
     choose_documents,
     classification_rows,
     classify_documents,
     extract_fields,
     filter_answers,
     join_answers,
+    map_documents,
     operator_at_a_time_filter,
     pipelined_filter,
     request_step,
@@ -64,6 +68,7 @@ class RequestModelExecution:
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
+        self.answer_submission = settings["answer_submission"]
         self.submit_text = bool(getattr(self.client, "accepts_text", False))
 
     def _classify(self, spec, bodies) -> dict:
@@ -117,7 +122,11 @@ class RequestModelExecution:
         self._execute_classifications(node, survivors, outputs, steps)
         self._execute_joins(node, survivors, outputs, steps)
         self._execute_joined_classifications(node, survivors, outputs, steps)
-        self._execute_extractions(node, survivors, outputs, steps)
+        if self.answer_submission in ("operator-at-a-time", "shuffled"):
+            self._execute_answers(node, survivors, outputs, steps)
+        else:
+            self._execute_extractions(node, survivors, outputs, steps)
+            self._execute_maps(node, survivors, outputs, steps)
 
         for alias in node.aliases:
             outputs[f"rows:{alias}"] = Rows({alias: document_ids(survivors[alias])})
@@ -439,45 +448,94 @@ class RequestModelExecution:
                 unmatched=result["unmatched"],
             ))
 
-    def _execute_extractions(self, node, survivors, outputs, steps):
-        """Submit extractions and collect their answers.
+    def _answer_groups(self, node, specs, survivors, function):
+        """Yield each group of answer specs with its documents' prompt bodies.
 
-        The fields of one alias with the same preamble run together, so
+        The specs of one alias with the same preamble run together, so
         each document's KV serves all of them.
+
+        Yields:
+            (alias, specs, document ids, document texts, token bodies,
+            text bodies or None).
         """
         groups = {}
-        for spec in node.extracts:
+        for spec in specs:
             preamble = token_list(spec.preamble_token_ids
                                   or node.preamble_token_ids)
             preamble_text = spec.preamble_text or node.preamble_text
             groups.setdefault((spec.alias, tuple(preamble), preamble_text),
                               []).append(spec)
-        for (alias, preamble, preamble_text), specs in groups.items():
-            document_ids = list(survivors[alias])
+        for (alias, preamble, preamble_text), members in groups.items():
+            ids = list(survivors[alias])
             texts = self.document_texts.get(alias)
             if texts is None:
                 raise ValueError(
-                    f"AI.EXTRACT needs the text of {alias!r}, which "
+                    f"{function} needs the text of {alias!r}, which "
                     f"the scan did not load")
-            document_texts = [text_value(texts, document)
-                              for document in document_ids]
-            results = extract_fields(
-                self.client, specs, [
-                    list(preamble) + token_list(self.documents[alias][document])
-                    for document in document_ids],
-                document_texts,
-                body_texts=([preamble_text + text for text in document_texts]
-                            if self.submit_text else None))
+            document_texts = [text_value(texts, document) for document in ids]
+            yield (alias, members, ids, document_texts,
+                   [list(preamble) + token_list(self.documents[alias][document])
+                    for document in ids],
+                   ([preamble_text + text for text in document_texts]
+                    if self.submit_text else None))
+
+    def _execute_extractions(self, node, survivors, outputs, steps):
+        """Submit extractions and collect their answers."""
+        for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
+                node, node.extracts, survivors, "AI.EXTRACT"):
+            results = extract_fields(self.client, specs, bodies, texts,
+                                     body_texts=body_texts)
             for spec, result in zip(specs, results):
-                outputs[f"extract_answers:{spec.output}"] = extraction_rows(
-                    alias, spec.output, spec.span_output, document_ids,
-                    result["answers"], result["spans"])
-                steps.append(request_step(result,
-                    kind="extract",
-                    alias=alias,
-                    output=spec.output,
-                    num_in=len(document_ids),
-                    num_out=len(document_ids) - result["unanswered"],
-                    unanswered=result["unanswered"],
-                    unaligned=result["unaligned"],
-                ))
+                self._extracted(alias, spec, ids, result, outputs, steps)
+
+    def _execute_maps(self, node, survivors, outputs, steps):
+        """Submit every map's prompts and collect the answers."""
+        for alias, specs, ids, _, bodies, body_texts in self._answer_groups(
+                node, node.maps, survivors, "AI.MAP"):
+            results = map_documents(self.client, specs, bodies, body_texts,
+                                    submission=self.answer_submission)
+            for spec, result in zip(specs, results):
+                self._mapped(alias, spec, ids, result, outputs, steps)
+
+    def _execute_answers(self, node, survivors, outputs, steps):
+        """Submit each document's extraction and map prompts in one generate call."""
+        for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
+                node, [*node.extracts, *node.maps], survivors,
+                "AI.EXTRACT and AI.MAP"):
+            extracts = [spec for spec in specs
+                        if isinstance(spec, RequestExtractSpec)]
+            maps = [spec for spec in specs if not isinstance(spec, RequestExtractSpec)]
+            extracted, mapped = answer_documents(
+                self.client, extracts, maps, bodies, texts, body_texts,
+                shuffled=self.answer_submission == "shuffled")
+            for spec, result in zip(extracts, extracted):
+                self._extracted(alias, spec, ids, result, outputs, steps)
+            for spec, result in zip(maps, mapped):
+                self._mapped(alias, spec, ids, result, outputs, steps)
+
+    def _extracted(self, alias, spec, ids, result, outputs, steps):
+        """Record one extraction field's answers and its request step."""
+        outputs[f"extract_answers:{spec.output}"] = extraction_rows(
+            alias, spec.output, spec.span_output, ids,
+            result["answers"], result["spans"])
+        steps.append(request_step(result,
+            kind="extract",
+            alias=alias,
+            output=spec.output,
+            num_in=len(ids),
+            num_out=len(ids) - result["unanswered"] - result["unaligned"],
+            unanswered=result["unanswered"],
+            unaligned=result["unaligned"],
+            cut=result["cut"],
+        ))
+
+    def _mapped(self, alias, spec, ids, result, outputs, steps):
+        """Record one map's answers and its request step."""
+        outputs[f"map_answers:{spec.output}"] = Rows(
+            {alias: document_ids(ids)},
+            pa.table({spec.output: pa.array(result["answers"], pa.string())}))
+        steps.append(request_step(result, kind="map", alias=alias,
+                                  output=spec.output,
+                                  submission=self.answer_submission,
+                                  num_in=len(ids), num_out=len(ids),
+                                  document_cap=result["doc_cap"]))

@@ -13,6 +13,7 @@ from quail.baselines.request_scheduling import (
     run_extract_fields,
     run_filter_sequence,
 )
+from quail.cost.budgets import GRAPH_TOKEN_BUCKETS
 from quail.specs.base import DeviceSpec, ModelSpec
 from quail.specs.files import resolve_model_path
 
@@ -49,7 +50,6 @@ def gpu_memory_utilization(device: DeviceSpec | None,
     return min(GPU_MEMORY_UTILIZATION, reserved)
 
 
-CUDA_GRAPH_CAPTURE_SIZE = 8_192
 # vLLM caps a diffusion model at 8 sequences per step whenever the
 # setting is 128 or more, sized for its 256-row canvas; one row needs
 # no cap, so stay just under the trigger.
@@ -60,6 +60,25 @@ DIFFUSION_LOGPROBS = -1
 # generated tokens a longer canvas gets; the answer word is read
 # from the text
 DIFFUSION_TEXT_TOKENS = 16
+
+
+def register_gigatoken() -> None:
+    """Register Gigatoken as vLLM's "gigatoken" tokenizer mode.
+
+    vLLM's engine core runs in a spawned process, which has its own
+    registries, so this is also a vLLM general plugin
+    (pyproject.toml's vllm.general_plugins entry point), which vLLM
+    loads in every process it starts.
+    """
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers import TokenizerRegistry
+
+    registered = ("quail.baselines.vllm", "GigatokenVLLMTokenizer")
+    if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
+        TokenizerRegistry.register("gigatoken", *registered)
+    renderer = ("vllm.renderers.hf", "HfRenderer")
+    if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
+        RENDERER_REGISTRY.register("gigatoken", *renderer)
 
 
 class GigatokenVLLMTokenizer:
@@ -252,7 +271,10 @@ class VLLMClient:
     def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
                            answer_tokens, tag="x", body_texts=None,
                            tail_texts=None):
-        """Decode the fields of each document through the engine's step loop."""
+        """Decode the answers of each document through the engine's step loop.
+
+        sampling_params is one setting for every field, or one per field.
+        """
         return run_extract_fields(
             self.llm.llm_engine,
             sampling_params,
@@ -309,7 +331,7 @@ class VLLMEngine:
             "disable_log_stats": True,
             "tokenizer_mode": "gigatoken",
             "compilation_config": {
-                "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
+                "cudagraph_capture_sizes": list(GRAPH_TOKEN_BUCKETS)
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
                              else min(MAX_SEQUENCES,
@@ -346,17 +368,8 @@ class VLLMEngine:
             return boot_decision(
                 spec, self.llm_kwargs(spec, device), resources=resources)
         from vllm import LLM, SamplingParams
-        from vllm.renderers.registry import RENDERER_REGISTRY
-        from vllm.tokenizers import TokenizerRegistry
 
-        registered = (
-            "quail.baselines.vllm", "GigatokenVLLMTokenizer"
-        )
-        if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
-            TokenizerRegistry.register("gigatoken", *registered)
-        renderer = ("vllm.renderers.hf", "HfRenderer")
-        if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
-            RENDERER_REGISTRY.register("gigatoken", *renderer)
+        register_gigatoken()
 
         path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
@@ -441,11 +454,22 @@ def stock_vllm_backend() -> RequestBackend:
 
 
 def pipelined_vllm_backend() -> RequestBackend:
-    """Return vLLM with per document filter pipelining."""
+    """Return vLLM with per document filter and map pipelining."""
     return RequestBackend(
         name="pipelined_vllm",
         engine=VLLMEngine(),
         filter_submission="pipelined",
+        answer_submission="pipelined",
+    )
+
+
+def shuffled_vllm_backend() -> RequestBackend:
+    """Return stock vLLM sending every map prompt in one call, in random order."""
+    return RequestBackend(
+        name="shuffled_vllm",
+        engine=VLLMEngine(),
+        filter_submission="operator-at-a-time",
+        answer_submission="shuffled",
     )
 
 

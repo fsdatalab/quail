@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 import numpy as np
 
 from quail.backends.quail.executor.chunk import InputStaging
+from quail.backends.quail.executor.map_decoder import map_decoder
 from quail.backends.quail.executor.stages import Stage, frame_writes, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import prefix_tree
@@ -34,9 +35,9 @@ def shared_prefix_tree(name, prefixes, arena):
     started = time.perf_counter()
     tree = prefix_tree(prefixes, arena.page_tokens)
     logger.info(
-        "prefix sharing on %s: %s documents borrow %s tokens "
-        "(tree built in %.2f s)", name, len(prefixes),
-        tree.shared_tokens, time.perf_counter() - started)
+        "prefix sharing for %s: %s documents reuse %s tokens of earlier "
+        "documents (found in %.2f s)", name, f"{len(prefixes):,}",
+        f"{tree.shared_tokens:,}", time.perf_counter() - started)
     return tree
 
 
@@ -59,6 +60,20 @@ def prior_inputs(node, parts, inputs):
             else:
                 prior_tables.append(inputs[port.name])
     return priors, prior_tables
+
+
+def document_inputs(node, inputs, context, sequence=None, nodes=None):
+    """Return a one-table node's document ids and the tokenized documents.
+
+    The node's one input carries the documents' ids, or the rows of an
+    earlier operator over them.
+    """
+    if nodes is not None:
+        inputs = inputs[node.node_id]
+    (value,) = inputs.values()
+    ids = (value.ids[node.spec.aliases[0]].to_numpy()
+           if isinstance(value, Rows) else np.asarray(value, dtype=np.int64))
+    return {"document_ids": ids, "documents": context.state["documents"]}
 
 
 def join_prior_rows(rows: Rows, alias, priors, prior_tables) -> Rows:
@@ -95,6 +110,10 @@ class ExecutionPart(ABC):
     frame_tokens = 0
     on_settled = None
     attention = None
+    # the answer limits of the maps the part runs, in order; the
+    # pipeline's MapDecoder writes their answers into part.decoder
+    answer_limits = ()
+    answer_dependencies = ()
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
@@ -138,6 +157,31 @@ class ExecutionPart(ABC):
         """Return completed results keyed by node or output name."""
 
 
+class ColumnPart:
+    """Settled output columns available to conditions in a pipeline."""
+
+    @property
+    def column_sources(self) -> dict:
+        """Map each computed column to its node and value indices."""
+        return {column: (index, field)
+                for index, node in enumerate(self.nodes)
+                for field, column in enumerate(
+                    node.spec.output_columns[len(node.spec.aliases):])}
+
+    @property
+    def tested_columns(self) -> tuple[str, ...]:
+        return tuple(self.column_sources)
+
+    def tested_values(self, column, positions):
+        """Read one settled column at positions among the part's documents."""
+        index, field = self.column_sources[column]
+        return self.column_values(index, positions)[field]
+
+    @abstractmethod
+    def column_values(self, index, positions) -> tuple:
+        """Read a node's settled arrays in its output-column order."""
+
+
 class SingleResultPart(ExecutionPart):
     """Prepared work whose execution produces one result."""
 
@@ -163,6 +207,50 @@ class SingleResultPart(ExecutionPart):
         return {self.node.node_id: self.result_value}
 
 
+def operator_label(word: str, nodes) -> str:
+    """Return a progress label naming a run's operators, three at most."""
+    names = [node.spec.name for node in nodes]
+    head, dot, _ = names[0].partition(".")
+    if dot and all(name.startswith(head + ".") for name in names):
+        # fields of one struct, such as contract.parties
+        word, names = f"{word} {head}:", [name[len(head) + 1:] for name in names]
+    shown = ", ".join(names[:3])
+    if len(names) > 3:
+        shown += f" and {len(names) - 3} more"
+    return f"{word} {shown}"
+
+
+def execute_alone(state, nodes, inputs, build, *, label: str) -> dict:
+    """Run one operator's nodes as a pipeline of their own.
+
+    The first node is charged the wall time, counted from before the
+    part is built.
+
+    Args:
+        state: The loaded model and current query state.
+        nodes: The operator's nodes, in pipeline order.
+        inputs: The documents' inputs, the gpu_timing setting, and an
+            optional row limit.
+        build: Returns (part, prefixes, anchor keys, prefix tree or
+            None) for the nodes.
+        label: The operator's word in progress labels.
+
+    Returns:
+        Node id -> NodeResult.
+    """
+    state.gpu_timing = bool(inputs.get("gpu_timing", False))
+    started = time.perf_counter()
+    part, prefixes, keys, tree = build()
+    results = execute_parts(
+        state, [part], prefixes, keys, keep_kv=nodes[-1].keep_kv,
+        prefix_tree=tree, limit=inputs.get("limit"),
+        label=operator_label(label, nodes))
+    first = nodes[0].node_id
+    results[first] = replace(results[first], metrics=replace(
+        results[first].metrics, wall_s=time.perf_counter() - started))
+    return results
+
+
 def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
                   paged=True, on_answers=None) -> dict:
@@ -172,7 +260,17 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
     documents are admitted only while the ones in flight are expected
     to fall short of it, by the parts' selectivities.
     """
+    from quail.backends.quail.executor.operators.map import branch_parts
+
+    parts = branch_parts(parts)
     stages = gated_stages(parts)
+    dependencies = {}
+    for part, (low, _) in zip(parts, _part_slices(parts)):
+        if part.answer_limits:
+            prefixes, anchor_keys, prefix_tree, added = part.branch_inputs(
+                prefixes, anchor_keys, prefix_tree,
+                state.loaded_model.arena.page_tokens, low)
+            dependencies.update(added)
     paged = paged or state.loaded_model.pipeline.needs_pages
     if keep_kv and not paged:
         raise ValueError("retaining document KV requires arena writes")
@@ -182,8 +280,17 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
                     if part.on_settled is not None), None)
     if settled is None:
         settled = settle_documents(state.loaded_model.arena, anchor_keys, prefixes,
-                                   keep_kv, state.chunk_tokens)
+                                   keep_kv, state.chunk_tokens, dependencies)
     stats = {}
+    limits = [limit for part in parts for limit in part.answer_limits]
+    decoder = None
+    if limits:
+        expected_tokens = [expected for part in parts if part.answer_limits
+                           for expected in part.expected_answer_tokens]
+        decoder = map_decoder(state, limits, len(prefixes), expected_tokens)
+        for part in parts:
+            if part.answer_limits:
+                part.decoder = decoder
     with ExitStack() as resources:
         for part in parts:
             resources.enter_context(part.execution_context())
@@ -198,7 +305,10 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
             survival=survival(parts),
             stop_groups=stop_groups, paged=paged,
             on_chunk=transition_reporter(parts), on_answers=on_answers,
-            appended_tokens=max(part.appended_tokens for part in parts) or None)
+            appended_tokens=max(part.appended_tokens for part in parts) or None,
+            decoder=decoder, dependencies=dependencies,
+            knee_rows=getattr(state, "knee_rows", 0),
+            decode_cost=getattr(state, "decode_cost", None))
     complete_parts(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
             for node_id, result in part.results().items()}
@@ -234,6 +344,7 @@ def gated_stages(parts) -> list:
         implementation.prepare_group(list(group))
     stages = []
     pending = []
+    dependencies = []
     for part in parts[1:]:
         if part.stages and not part.stages[0].rewind:
             # an operator's first request follows the document, in
@@ -243,11 +354,14 @@ def gated_stages(parts) -> list:
     for part in parts:
         if not part.stages:
             pending.append(part)
+            dependencies.extend(part.answer_dependencies)
             continue
         first = part.stages[0]
         if pending:
+            first.answer_dependencies = tuple(dict.fromkeys(dependencies))
+            dependencies = []
             gates = tuple(pending)
-            asked = first.requests
+            asked = first.suffixes if first.own_suffixes else first.requests
 
             def guarded(key, gates=gates, asked=asked):
                 for gate in gates:
@@ -255,7 +369,10 @@ def gated_stages(parts) -> list:
                         return Stage.DROP
                 return None if asked is None else asked(key)
 
-            first.requests = guarded
+            if first.own_suffixes:
+                first.suffixes = guarded
+            else:
+                first.requests = guarded
             first.prepare = _prepare(gates, first.prepare)
             pending = []
         stages.extend(part.stages)
@@ -269,6 +386,7 @@ def gated_stages(parts) -> list:
         # a document that passes the trailing conditions skips this
         # stage and counts as a survivor, with nothing asked
         terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish,
+                         answer_dependencies=tuple(dict.fromkeys(dependencies)),
                          prepare=_prepare(tuple(pending), None))
         parts[-1].stages = [terminal]
         stages.append(terminal)
@@ -391,7 +509,8 @@ def gpu_seconds(spans) -> float:
         for rows, tokens, start, end in spans if tokens) / 1000.0
 
 
-def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
+def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int,
+                     dependencies=()):
     """Return a callback that applies the final operator's KV retention setting."""
     if keep_kv and arena.retention_cap_pages is None:
         arena.retention_cap_pages = max(
@@ -401,7 +520,7 @@ def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
         key = keys[anchor]
         if not arena.is_resident(key):
             return
-        if survived and keep_kv:
+        if survived and keep_kv and anchor not in dependencies:
             arena.retain(key, len(prefixes[anchor]))
         else:
             arena.free_key(key)

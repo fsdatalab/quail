@@ -11,7 +11,9 @@ import pytest
 from quail.backends.quail import worker
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.memory import memory_report
+from quail.backends.quail.worker import LoadedGpu
 from quail.builtins import built_in_registry
+from quail.specs import H100_SXM, MODELS
 
 
 def install_fake_torch(monkeypatch):
@@ -43,11 +45,12 @@ def booted(monkeypatch):
     for name in ("load_model", "AnswerRows", "KVArena", "AsyncAnswers"):
         monkeypatch.setattr(worker, name, lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "build_pipeline",
-                        lambda *a, **k: SimpleNamespace(decode_graphs=None))
+                        lambda *a, **k: SimpleNamespace(piecewise_graphs=None))
     monkeypatch.setattr(worker, "KVArena", lambda *a, **k: SimpleNamespace(
         k=[], v=[], gdn_state=None, conv_state=None, num_pages=0))
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})
+    monkeypatch.setattr(worker.PiecewiseGraphs, "for_specs", lambda *a: None)
 
 
 ENVELOPE = {
@@ -57,6 +60,30 @@ ENVELOPE = {
 }
 PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "gpus": 1,
            "documents": {}, **ENVELOPE["settings"]}
+
+
+def test_arena_resize_releases_pieces_that_write_kv(booted, monkeypatch):
+    calls = []
+    gpu = LoadedGpu.__new__(LoadedGpu)
+    gpu.torch = sys.modules["torch"]
+    monkeypatch.setattr(gpu.torch.cuda, "synchronize",
+                        lambda: calls.append("synchronize"))
+    gpu.pipeline = SimpleNamespace(piecewise_graphs=SimpleNamespace(
+        invalidate=lambda: calls.append("invalidate")))
+    gpu.arena = SimpleNamespace(
+        num_pages=8, num_sliding_pages=0, k=[], v=[], gdn_state=None,
+        conv_state=None, resize=lambda *a, **kw: calls.append("resize"))
+    gpu.model = gpu.F = None
+    gpu.decision_head = None
+    # a dense model keeps no checkpoint slots, so resize gets no state pool
+    gpu.spec = MODELS["qwen3-4b-fp8"]
+    gpu.device = H100_SXM
+    gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
+    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
+    assert calls == ["resize"]
+    calls.clear()
+    gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
+    assert calls == ["synchronize", "invalidate", "resize"]
 
 
 def test_prepared_boot_is_handed_to_the_query_and_used_once(

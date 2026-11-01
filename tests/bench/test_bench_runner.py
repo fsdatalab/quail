@@ -2,13 +2,16 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from helpers.oracle import Oracle, oracle_executor
 
 import quail
 from bench.quailb import (
     build_query,
+    data_directory,
     join_anchors,
     prompt_pieces,
+    register_tables,
     run_output,
 )
 from bench.substrait import sql_string
@@ -20,7 +23,7 @@ from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.result import answer_table
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.physical import decode_graph
-from quail.planner.plan import EngineConfig
+from quail.planner.plan import EngineConfig, Refusal
 from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.minimum import DocumentTokens, token_metrics
 from quail_b.prompts import DISCUSS_ASPECT, F1
@@ -213,6 +216,44 @@ CONTRACTS = pa.table({
 })
 
 
+@pytest.mark.parametrize("query_id", [
+    "IMDB-22", "IMDB-20", "IMDB-21", "IMDB-24", "IMDB-25", "CUAD-19", "CUAD-20"])
+def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path, query_id):
+    spec = get_query(query_id)
+    corpus = {"reviews": CORPUS["reviews"], "contracts": CONTRACTS}
+    oracle = Oracle(filters=lambda alias, document, position: document != 1,
+                    labels=lambda spec, ids: "negative")
+    with _session(tmp_path) as sess:
+        sess.register("contracts", DocumentProvider.from_table(
+            CONTRACTS, id_col="id"))
+        query = build_query(sess, spec)
+        result = execute_query(query, physical_executor=oracle_executor(
+            oracle, **_REPORT, store=None))
+        output = run_output(result, spec.info, corpus)
+        pieces = prompt_pieces(query, spec.info, {})
+        turn = sess.model.turn
+    (relation,) = spec.info.relations
+    alias = relation.alias
+    filtered = bool(spec.info.filters)
+    read = (["r0"] if relation.table == "reviews" else ["ct0", "ct2"]) \
+        if filtered else corpus[relation.table].column("id").to_pylist()
+    if query_id == "IMDB-25":
+        read = []   # every review is labeled negative; only mixed ones are mapped
+    assert sorted(output.map_answers) == [m.id for m in spec.info.maps]
+    for operator in spec.info.maps:
+        answers = output.map_answers[operator.id].to_pydict()
+        assert answers[alias] == read
+        index = {"r0": 0, "r1": 1, "ct0": 0, "ct1": 1, "ct2": 2}
+        assert answers["answer"] == [f"{operator.output} {index[i]}" for i in read]
+        assert output.rows.column(operator.output).to_pylist() == answers["answer"]
+    # every map shows the document under the shared preamble, so a
+    # filter or classification before it in the pipeline leaves its KV
+    assert pieces["preamble"] == (turn[0] + quail.SHARED_PRE).split()
+    assert [piece["id"] for piece in pieces["maps"]] == [
+        m.id for m in spec.info.maps]
+    assert all(piece["tail"][-1] == "ANSWER:" for piece in pieces["maps"])
+
+
 def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
     spec = get_query("CUAD-1")
     span_type = pa.struct([("start", pa.int64()), ("end", pa.int64())])
@@ -247,6 +288,37 @@ def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
     assert pieces["preamble"] == _token_ids(turn[0] + quail.SHARED_PRE)
     assert [item["id"] for item in pieces["extracts"]] == ["extract-1"]
     assert pieces["extracts"][0]["tail"][-1] == _token_ids(":")[-1]
+
+
+def test_stock_vllm_reports_maps_and_their_pieces(tmp_path):
+    spec = get_query("CUAD-18")
+
+    def nodes(graph, request):
+        model = next(
+            node for node in graph.nodes if isinstance(node, RequestExecution))
+        return {model.node_id: NodeResult({
+            "rows:c": [0, 1, 2],
+            **{f"map_answers:{operator.output}": pa.table({
+                "c": pa.array([0, 1, 2], pa.int32()),
+                operator.output: pa.array(
+                    [f"{operator.output} {i}" for i in range(3)], pa.string()),
+            }) for operator in spec.info.maps},
+        })}
+
+    with _session(tmp_path, backend="stock_vllm") as sess:
+        sess.register("contracts", DocumentProvider.from_table(
+            CONTRACTS, id_col="id"))
+        query = build_query(sess, spec)
+        result = _execute(query, nodes, cached_tokens=0)
+        output = run_output(result, spec.info, {"contracts": CONTRACTS})
+        pieces = prompt_pieces(query, spec.info, {})
+    for operator in spec.info.maps:
+        assert output.map_answers[operator.id].to_pydict() == {
+            "c": ["ct0", "ct1", "ct2"],
+            "answer": [f"{operator.output} {i}" for i in range(3)]}
+    assert [item["id"] for item in pieces["maps"]] == [
+        operator.id for operator in spec.info.maps]
+    assert pieces["maps"][0]["tail"][-1] == _token_ids(":")[-1]
 
 
 def test_benchmark_results_and_scoring(tmp_path):
@@ -289,3 +361,18 @@ def test_benchmark_results_and_scoring(tmp_path):
     measured = token_metrics(SPEC, output, CORPUS, stores)
     assert measured["minimum_tokens"] > 0
     assert measured["regret_tokens"] == 2000 - measured["minimum_tokens"]
+
+
+def test_sec_queries_read_their_own_directory_as_engines_see_the_filings(tmp_path):
+    assert data_directory(tmp_path, 1.0, ["SEC-9", "SEC-10"]) == tmp_path / "sec"
+    assert data_directory(tmp_path, 0.1, ["CUAD-16"]) == tmp_path / "sf0.1"
+    # a composed accent is one character once the text is NFC
+    pq.write_table(pa.table({
+        "id": ["0001"], "text": ["cafe\u0301 agreement"],
+        "filing_date": ["2024-01-02"], "filing_month": ["2024-01"]}),
+        tmp_path / "sec_filings.parquet")
+    with quail.Session(_config("quail"), tokenizer=str.split) as sess:
+        register_tables(sess, tmp_path)
+        query = sess.sql("SELECT f.id FROM sec_filings f WHERE f.text_chars = 14 "
+                         "AND AI_FILTER(PROMPT('Is {0} a contract?', f.text))")
+        assert not isinstance(query.plan(), Refusal)

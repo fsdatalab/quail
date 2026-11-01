@@ -103,10 +103,10 @@ class FilterPart(SingleResultPart):
 class ConditionGate(SingleResultPart):
     """Pipeline condition that drops documents whose tested values fail.
 
-    A value is a label a ClassifyPart decoded or an answer or span an
-    ExtractPart copied, read as each document's settles, or a source
-    column of the table; the pipeline then skips the document's later
-    stages and frees its KV.
+    A value is a settled column-operator result, such as a label, an
+    extracted answer or span, or a map answer, or a source column of
+    the table; the pipeline then skips the document's later stages and
+    frees its KV.
     """
 
     stages = ()
@@ -137,6 +137,13 @@ class ConditionGate(SingleResultPart):
             for part in producers.values()}
         self.accepted = {}
         self.decided = {}  # key -> kept, from decide, until gate asks
+
+    @property
+    def answer_dependencies(self):
+        """The decoder answer streams the tested columns wait for."""
+        return tuple(dict.fromkeys(
+            part.first + part.column_sources[name][0]
+            for name, part in self.producers.items() if part.answer_limits))
 
     def read(self, name: str, documents):
         """Return a tested column's values for documents, by document id."""
@@ -198,8 +205,12 @@ class ConditionGate(SingleResultPart):
 
 
 def _hashable(value):
-    """Return a span struct as sorted pairs, so a gate can cache its answer."""
-    return tuple(sorted(value.items())) if isinstance(value, dict) else value
+    """Return a struct as sorted pairs and a list as a tuple, so a gate can cache."""
+    if isinstance(value, dict):
+        return tuple(sorted((key, _hashable(item)) for key, item in value.items()))
+    if isinstance(value, list):
+        return tuple(_hashable(item) for item in value)
+    return value
 
 
 def filter_result(node, answers, tokens, document_ids,

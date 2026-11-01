@@ -27,6 +27,7 @@ from quail.logical import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SortKey,
     Window,
     above_projection,
@@ -41,6 +42,7 @@ from quail.logical.expressions import (
     column_references,
     source_columns,
 )
+from quail.logical.nodes.column import SemanticColumn
 
 
 def _column_refs(expression) -> tuple[ColumnRef, ...]:
@@ -105,7 +107,7 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     for node in plan.walk():
         if isinstance(node, Join):
             refs = _refs_of(node.on)
-        elif isinstance(node, SemanticExtract):
+        elif isinstance(node, (SemanticExtract, SemanticMap)):
             refs = _refs_of(node.call.prompt.args)
         elif isinstance(node, Scan):
             refs = _refs_of(node.predicates)
@@ -119,11 +121,9 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for expression in expressions:
             for ref in _column_refs(expression):
                 needed.setdefault(ref.alias, {})[ref.column] = None
-        if isinstance(node, (SemanticClassify, SemanticExtract)):
-            # the columns a classification or extraction adds are not
-            # read below it
-            for field in node.output_schema()[len(node.input.output_schema()):]:
-                needed.get(field.alias, {}).pop(field.column, None)
+        if isinstance(node, SemanticColumn):
+            for name in node.added_columns:
+                needed.get(node.alias, {}).pop(name, None)
         if isinstance(node, Scan):
             columns = tuple(
                 column for column in needed.get(node.alias, ())
@@ -143,7 +143,7 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
 def _lets_through(node, alias: str) -> bool:
     """Return whether a filter on one table may move below node.
 
-    True for a Join, a full SemanticJoin, a classification of joined
+    True for a Join, a full SemanticJoin, a column operator over joined
     rows, and any node on another table. False for the table's own
     sequence, a gate (an exists or anti join), and any other node.
     """
@@ -151,10 +151,8 @@ def _lets_through(node, alias: str) -> bool:
         return True
     if isinstance(node, SemanticJoin):
         return node.semantics == "full"
-    if isinstance(node, SemanticClassify):
+    if isinstance(node, SemanticColumn):
         return len(node.call.aliases()) == 2 or node.alias != alias
-    if isinstance(node, SemanticExtract):
-        return node.alias != alias
     if isinstance(node, Filter):
         return node.alias != alias
     if isinstance(node, SemanticFilter):
@@ -219,49 +217,40 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
     return rewritten if moved else None
 
 
-def _label_sequence(node) -> tuple:
-    """Split a table's sequence at its classifications and extractions.
+def _column_sequence(node) -> tuple:
+    """Split a table's sequence at its column operators.
 
     Returns:
-        The node below the table's lowest SemanticClassify or
-        SemanticExtract, and the SemanticClassify, label filter, and
-        SemanticExtract nodes above it, lowest first.
+        The node below the table's lowest column operator, and those
+        operators and the Filters on their columns, lowest first.
     """
     lifted = []
-    while isinstance(node, (SemanticClassify, SemanticExtract, Filter)):
+    while isinstance(node, (SemanticColumn, Filter)):
         lifted.append(node)
         node = node.input
     return node, tuple(reversed(lifted))
 
 
-def _sequence_alias(node) -> str:
-    """Return the table alias a classification, extraction, or label filter reads."""
-    if isinstance(node, (SemanticClassify, SemanticExtract)):
-        return node.alias
-    return node.alias
+def lift_column_operators(root: LogicalNode) -> LogicalNode | None:
+    """Move a joined table's column operators above its joins.
 
-
-def lift_maps(root: LogicalNode) -> LogicalNode | None:
-    """Move every joined table's classifications and extractions above the joins.
-
-    Each one-table SemanticClassify of a table that a SemanticJoin
-    reads, with the Filters on its label column, and each
-    SemanticExtract of such a table, leaves the table's sequence and
-    moves above the topmost join, under the root Project, in scan
-    order. A classification or extraction of a table that no join
-    reads stays, as does one of a gate's inner table (an exists
-    or anti join's partner), whose filters decide which anchors pass.
-    The map operators here are SemanticClassify and SemanticExtract.
-    The planner prices the rewritten plan alongside the original plan.
+    Each one-table column operator of a table that a SemanticJoin
+    reads, with the Filters on its columns, leaves the table's
+    sequence and moves above the topmost join, under the root
+    Project, in scan order, where it runs on the documents the joins
+    keep. One of a table that no join reads stays, as does one of a
+    gate's inner table (an exists or anti join's partner), whose
+    filters decide which anchors pass. The planner prices the
+    rewritten plan alongside the original plan.
 
     Returns:
-        The rewritten root, or None when no classification or extraction moved.
+        The rewritten root, or None when no column operator moved.
     """
     # the result rows above the Project, an Unnest chain among them, hold
     # no document operators
     if (isinstance(root, (Result, Aggregate, Window)) or above_projection(root)
             or isinstance(root, Project) and above_projection(root.input)):
-        rewritten = lift_maps(root.input)
+        rewritten = lift_column_operators(root.input)
         return None if rewritten is None else root.with_children((rewritten,))
     nodes = LogicalPlan(root).walk()
     fixed = {alias for node in nodes
@@ -274,9 +263,9 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     sequences = {}
 
     def cut(node):
-        base, sequence = _label_sequence(node)
-        if sequence and _sequence_alias(sequence[0]) in joined:
-            sequences.setdefault(_sequence_alias(sequence[0]), []).extend(sequence)
+        base, sequence = _column_sequence(node)
+        if sequence and sequence[0].alias in joined:
+            sequences.setdefault(sequence[0].alias, []).extend(sequence)
             return base
         return node
 
@@ -289,9 +278,9 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
             return node.with_children((visit(node.input),))
         return cut(node)
 
-    top, lifted = _label_sequence(root.input)
+    top, lifted = _column_sequence(root.input)
     for node in lifted:
-        sequences.setdefault(_sequence_alias(node), []).append(node)
+        sequences.setdefault(node.alias, []).append(node)
     spine = visit(top)
     if not sequences:
         return None

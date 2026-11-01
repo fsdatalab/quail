@@ -29,14 +29,14 @@ the join. This built-in rule proposes the second placement:
 
 ```python
 from quail.planner.optimizer.rules import LogicalRule
-from quail.planner.rules.tree_transforms import lift_maps
+from quail.planner.rules.tree_transforms import lift_column_operators
 
 
-class ShouldLiftMaps(LogicalRule):
-    name = "should_lift_maps"
+class ShouldLiftColumnOperators(LogicalRule):
+    name = "should_lift_column_operators"
 
     def rewrites(self, root, context):
-        rewritten = lift_maps(root)
+        rewritten = lift_column_operators(root)
         return [root] if rewritten is None else [root, rewritten]
 ```
 
@@ -71,7 +71,7 @@ your rule with the method matching its base class:
 | `LogicalRule` | `registry.register_logical_rule(rule)` |
 | `PhysicalRule` | `registry.register_physical_rule(rule)` |
 
-Pass the registry to the session. Quail already registers `ShouldLiftMaps`;
+Pass the registry to the session. Quail already registers `ShouldLiftColumnOperators`;
 do not register it again. Rules run in registration order within each step:
 
 1. Apply logical `rewrites()` to every candidate in registration order. Remove

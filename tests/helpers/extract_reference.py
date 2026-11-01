@@ -9,17 +9,21 @@ The answer ends where the model would end its turn, or where its
 writing would leave the document.
 """
 
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from quail.backends.quail.executor.extract.candidates import (
     NEG,
-    DocumentTokens,
     ensure_tokens,
     first_tokens,
     make_streams,
+)
+from quail.backends.quail.executor.extract.stages import Document, ExtractionInputs
+from quail.backends.quail.executor.extract.trace import (
+    choice_values,
+    trace_path,
+    write_choices,
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.cost.draft_policy import DraftPolicy
@@ -44,19 +48,6 @@ class AnswerState:
     none_wins: bool = False
 
 
-@dataclass
-class Document:
-    """One document's prompt and its answer to each question."""
-
-    index: int
-    text: str
-    prefix: Sequence
-    scan: DocumentTokens
-    key: tuple
-    answers: list       # one AnswerState per question
-    rho: float = 0.0    # the document's KV read per round, in fed tokens
-
-
 class Decoder:
     """The token rule over one model's vocabulary, for a pipeline's questions.
 
@@ -72,6 +63,7 @@ class Decoder:
     def __init__(self, vocabulary: Vocabulary, k: int, width: int, questions: int,
                  spec: ExtractSpec):
         self.spec = spec
+        self.trace = trace_path()
         self.vocabulary = vocabulary
         self.k = k
         self.width = width
@@ -155,7 +147,7 @@ class Decoder:
             len(answer.streams) if answer.written and len(fed) > 1 else 1
         )
         accepted = 0
-        if answer.written and len(answer.streams) == 1:
+        if answer.written and len(answer.streams) == 1 and self.trace is None:
             accepted = self.accepted(answer, rows, fed)
             rows = rows[accepted:]
         if accepted:
@@ -239,9 +231,13 @@ class Decoder:
                                 or self.leaves(lp, starts.allows(self.top),
                                                answer.best_lp, stop_lp))
             if answer.none_wins:
+                self._trace(document, q, lp, document.scan.candidates.token,
+                            starts.best_token, stop_lp, None)
                 self.settle(document, q)
                 return None
             token = starts.best_token
+            self._trace(document, q, lp, document.scan.candidates.token,
+                        token, stop_lp, token)
             answer.streams = make_streams(
                 vocabulary, document.text, starts, token,
                 first_window_chars=self.spec.first_window_chars,
@@ -251,8 +247,14 @@ class Decoder:
             ensure_tokens(answer.streams, at, vocabulary)
             best, allowed, next_tokens = self.continuations(answer, at, lp)
             best_lp = NEG if best is None else lp[best]
-            if (best is None or stop_lp >= best_lp
-                    or self.leaves(lp, allowed, best_lp, stop_lp)):
+            ends = (best is None or stop_lp >= best_lp
+                    or self.leaves(lp, allowed, best_lp, stop_lp))
+            if self.trace is not None:
+                choices = (([] if best is None else [best]) if next_tokens is None
+                           else next_tokens)
+                self._trace(document, q, lp, choices, best, stop_lp,
+                            None if ends else best)
+            if ends:
                 self.settle(document, q)
                 return None
             token = best
@@ -264,6 +266,13 @@ class Decoder:
         if len(answer.written) >= self.spec.max_answer_tokens:
             self.settle(document, q)
         return token
+
+    def _trace(self, document, q, lp, allowed, best, stop, token):
+        if self.trace is not None:
+            values = choice_values(lp, allowed, best, stop, self.top)
+            write_choices(self.trace, [document], q,
+                          [len(document.answers[q].written)],
+                          [-1 if token is None else token], [values])
 
     def continuations(self, answer: AnswerState, at: int, lp) -> tuple:
         """Return the likeliest next token of the live streams.
@@ -312,3 +321,20 @@ class Decoder:
         while end > start and text[end - 1].isspace():
             end -= 1
         answer.answer, answer.span = text[start:end], (start, end)
+
+
+def add_answers(inputs):
+    """Attach independent host-reference answers to prepared documents."""
+    for document in inputs.documents:
+        document.answers = [AnswerState() for _ in inputs.specs]
+    return inputs
+
+
+
+
+class ReferenceInputs(ExtractionInputs):
+    """Prepared documents with independent answers for the host reference."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        add_answers(self)
