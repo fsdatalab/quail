@@ -412,7 +412,7 @@ set the expected fraction of documents that pass, or pass
 
 `AI.MAP` writes a text answer for each row, following your instruction.
 For example, imagine a `reviews` table with review text in `body`.
-Write a one-sentence summary of each review:
+The following query writes a one-sentence summary of each review:
 
 ```sql
 SELECT r.id,
@@ -454,8 +454,8 @@ FROM m;
 
 Each map in a query writes its own answer. On the Quail backend, the
 maps about one document read the same document KV. Maps also work with
-`AI.IF`, `AI.CLASSIFY`, and `AI.EXTRACT` on the same table. For
-example, summarize only the negative reviews:
+`AI.IF`, `AI.CLASSIFY`, and `AI.EXTRACT` on the same table. The
+following query summarizes only the negative reviews:
 
 ```sql
 SELECT r.id,
@@ -469,8 +469,8 @@ Quail writes answers only for the rows that pass the filter.
 ### Use answers in the query
 
 You can use a map's answer in `WHERE`, `ORDER BY`, `GROUP BY`, and
-`SELECT DISTINCT`, like any text column. For example, keep reviews
-whose complaints mention the ending:
+`SELECT DISTINCT`, like any text column. The following query keeps
+reviews whose complaints mention the ending:
 
 ```sql
 SELECT r.id,
