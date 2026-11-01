@@ -524,6 +524,26 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     session.close()
 
 
+def test_stock_vllm_sorts_and_limits_extracted_rows(monkeypatch):
+    session = request_tests._session(
+        "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
+    query = session.sql(
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+        "FROM contracts c ORDER BY c.id DESC LIMIT 2")
+    boot = {"client": _PhraseClient(), "sampling_params": object(),
+            "capacity": request_tests.CAPACITY}
+    monkeypatch.setattr(
+        "quail.baselines.vllm.VLLMEngine.boot",
+        lambda self, spec, allowed_ids, *, device, resources: (
+            boot, {"kind": "cold", "boot_s": 0.1}))
+    rows = request_tests._run_stock_vllm(session, query).collect()
+    assert rows.column_names == ["c.id", "lease", "lease_span"]
+    assert rows.column("c.id").to_pylist() == ["d", "c"]
+    assert rows.column("lease").to_pylist() == [{"ends": None},
+                                                {"ends": "five years"}]
+    session.close()
+
+
 def test_extraction_settings_survive_plan_serialization(session):
     query = _ends(session)
     node = next(node for node in query.plan().nodes if isinstance(node, AiExtract))

@@ -24,7 +24,7 @@ from quail.logical import (
 )
 from quail.logical import Aggregate as LogicalAggregate
 from quail.logical import Window as LogicalWindow
-from quail.logical.expressions import aliased_call
+from quail.logical.expressions import aliased_call, packed_columns
 from quail.physical import (
     Limit,
     PortRef,
@@ -381,11 +381,12 @@ def _result_nodes(region, request_node, aliases, join_specs, answer_specs,
         columns.append(column_name(column))
         if aliased_call(column, "extract") is not None:
             columns.append(column.name + SPAN_SUFFIX)
+    structs = region.logical_plan.projection.packing()
     nodes.append(Project(
         node_id="project",
         inputs=input_ports((sink_input, *label_ports)),
         columns=tuple(columns),
-        structs=region.logical_plan.projection.packing(),
+        structs=structs,
     ))
     root = region.logical_plan.result
     if root.order or root.distinct or root.offset:
@@ -395,7 +396,7 @@ def _result_nodes(region, request_node, aliases, join_specs, answer_specs,
             inputs=input_ports((PortRef("project", "rows"),)),
             keys=tuple((key.name, key.descending, key.nulls_first)
                        for key in root.order),
-            columns=tuple(columns), distinct=root.distinct,
+            columns=packed_columns(columns, structs), distinct=root.distinct,
             offset=root.offset, fetch=root.limit))
     elif root.limit is not None:
         nodes.append(Limit(
