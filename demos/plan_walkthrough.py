@@ -11,7 +11,7 @@ is a stand-in that counts bytes. The script does not execute inference.
 import pyarrow as pa
 
 import quail
-from quail import EngineConfig, col, prompt
+from quail import EngineConfig
 from quail.explain import explain
 from quail.physical import Barrier
 from quail.planner.plan import PlanEditError
@@ -47,18 +47,8 @@ def register_demo_data(session):
             name, quail.DocumentProvider.from_table(table, id_col="id"))
 
 
-def same_page(tables):
-    """Pair each claim with the evidence row its wiki URL names."""
-    return tables["c"].join(
-        tables["e"],
-        keys=["evidence_wiki_url"],
-        right_keys=["id"],
-        join_type="inner",
-    ).select(["c", "e"])
-
-
 def main():
-    """Print and edit equivalent SQL and builder plans."""
+    """Print a SQL query's plan, then edit it."""
     config = EngineConfig(
         gpus=1,
         model="qwen3-4b-fp8",
@@ -97,17 +87,6 @@ def main():
             plan.remove("ai_filter:c")
         except PlanEditError as error:
             print("PlanEditError:", error)
-
-        print("\n=== the builder form: a Python function pairs the rows ===")
-        paired = (session.docs("claims").alias("c")
-                  .ai_if(prompt(PERSON, col("c.claim")))
-                  .join(session.docs("evidence").alias("e"))
-                  .apply(same_page, columns=[col("c.evidence_wiki_url"),
-                                             col("e.id")])
-                  .ai_if(prompt(SUPPORT, col("c.claim"), col("e.text")))
-                  .select("c.id", "e.id"))
-        print(paired.explain())
-        print("node ids:", [node.node_id for node in paired.plan().nodes])
 
 
 if __name__ == "__main__":

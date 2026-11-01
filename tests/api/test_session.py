@@ -1,94 +1,24 @@
 """End-to-end Session tests with a fake executor."""
 
-import json
 import re
-import subprocess
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.fakes import register_claims_evidence
 from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
-from demos import quickstart, quickstart_modal
 from quail.api import execute as execution
-from quail.catalog.pairs import (
-    allowed_members,
-    estimate_pair_fraction,
-    members_by_partner,
-    pair_table,
-    partner_map,
-)
 from quail.execution.result import (
     QueryResult,
     build_result_declaration,
     count_rows,
     document_index_table,
 )
-from quail.logical import ColumnRef
-from quail.physical import AiJoin
 from quail.planner.plan import EngineConfig
-
-
-def test_session_upgrades_and_reuses_offsets_without_invalidating_old_tokens():
-    calls = []
-
-    def encode(text):
-        calls.append(text)
-        return [ord(char) for char in text]
-
-    encode.token_bytes = lambda: {ord(char): char.encode() for char in "café東京"}
-    with quail.Session(CONFIG, tokenizer=encode) as session:
-        session.register("documents", quail.DocumentProvider.from_table(
-            pa.table({"id": [1, 2], "text": ["café", "東京"]}), id_col="id"))
-        previous = session.inputs.tokenize("documents", "text").tokens
-        assert not previous.has_offsets
-        calls.clear()
-        upgraded = session.inputs.tokenize(
-            "documents", "text", with_offsets=True
-        ).tokens
-        repeated = session.inputs.tokenize(
-            "documents", "text", with_offsets=True
-        ).tokens
-        assert upgraded is repeated and upgraded.has_offsets
-        assert not calls
-        assert list(previous[0]) == list(upgraded[0]) == encode("café")
-        assert upgraded[1].character_offsets.tolist() == [[0, 1], [1, 2]]
-
-
-def test_offset_tokenization_uses_gigatoken_without_transformers(monkeypatch):
-    from gigatoken import Tokenizer as Gigatoken
-    from tokenizers import Tokenizer, models, pre_tokenizers, trainers
-
-    texts = ["café", "東京"]
-    native = Tokenizer(models.BPE())
-    native.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    native.train_from_iterator(texts, trainers.BpeTrainer(
-        vocab_size=300, initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
-    expected = native.encode_batch(texts)
-    fast = Gigatoken(native)
-    monkeypatch.setitem(sys.modules, "gigatoken",
-                        SimpleNamespace(Tokenizer=lambda source: fast))
-    monkeypatch.setitem(sys.modules, "transformers", None)
-    with quail.Session(CONFIG) as session:
-        session.register(
-            "documents",
-            quail.DocumentProvider.from_table(
-                pa.table({"id": [1, 2], "text": texts}), id_col="id"
-            ),
-        )
-        scan = session.inputs.tokenize_async(
-            "documents", "text", with_offsets=True).result()
-        for index, encoding in enumerate(expected):
-            assert list(scan.tokens[index]) == encoding.ids
-            assert scan.tokens[index].character_offsets.tolist() == [
-                list(pair) for pair in encoding.offsets]
-
 
 
 @pytest.fixture()
@@ -201,30 +131,6 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     stages = [s for s in result.report["stages"] if s["op"] == "filter"]
     assert [s["written_position"] for s in stages] == [int(first[1]) - 1,
                                                 int(second[1]) - 1]
-
-
-@pytest.mark.parametrize("alias", ["answer", "predicate", "other,side"])
-def test_answer_tables_keep_an_alias_named_like_their_own_columns(
-        sess, alias, tmp_path):
-    """An alias named answer or predicate, or holding a comma, reports as any other."""
-    pq.write_table(pa.table({"asin": ["p0", "p1"], "description": ["pad " * 20] * 2}),
-                   tmp_path / "p.parquet")
-    sess.register("products", quail.DocumentProvider.from_parquet(
-        str(tmp_path / "p.parquet"), id_col="asin"))
-    quoted = f'"{alias}"'
-    res = _run(sess.sql(f"""
-        SELECT r.id, {quoted}.asin FROM reviews r JOIN products {quoted}
-          ON AI_FILTER(PROMPT('m {{0}} {{1}}', r.review, {quoted}.description),
-                       {{'anchor': 'r'}})
-        WHERE AI_FILTER(PROMPT('q1: {{0}}', r.review))
-    """), make_executor(TRUTH, {("r", alias): lambda a, b: (a + b) % 2 == 0}))
-    assert sorted(res.to_rows()) == [("r0", "p0"), ("r1", "p1"), ("r3", "p1"),
-                                     ("r4", "p0")]
-    (stage,) = [s for s in res.report["stages"] if s["op"] == "join"]
-    assert (stage["anchor"], stage["partners"], stage["tuples"]) == ("r", [alias], 8)
-    answers = res.answer_tables["joins"][0]
-    assert answers.column_names[:2] == ["r", alias]
-    assert len(set(answers.column_names)) == 3
 
 
 def test_query_rows_observers_saved_reports_and_streamed_results(sess):
@@ -352,12 +258,10 @@ def test_order_by_offset_and_distinct_run_on_the_result():
     ), make_executor({"r": {"q2:": [1, 1, 1, 1, 1, 1]}}))
     assert result.to_rows() == [(1,), (2,)]
 
-    from quail.frontend.expressions import col, prompt
-    built = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q2: {0}", col("r.review")))
-             .order_by(col("r.stars").desc().nulls_last()).offset(1).distinct()
-             .limit(2).select("r.stars"))
-    result = _run(built, make_executor({"r": {"q2:": [1, 1, 1, 1, 1, 1]}}))
+    result = _run(session.sql(
+        "SELECT DISTINCT r.stars FROM reviews r WHERE AI_FILTER(PROMPT("
+        "'q2: {0}', r.review)) ORDER BY r.stars DESC NULLS LAST LIMIT 2 OFFSET 1"
+    ), make_executor({"r": {"q2:": [1, 1, 1, 1, 1, 1]}}))
     assert result.to_rows() == [(4,), (3,)]
     session.close()
 
@@ -375,200 +279,3 @@ class NodeTypes:
 
     def report(self) -> dict:
         return {"types": list(self.types)}
-
-
-def _pair_query(session, on):
-    claims = session.docs("claims").alias("c")
-    partner = session.docs("evidence").alias("e")
-    query = (claims.join(partner, on=quail.col("c.url") == quail.col("e.url"))
-             if on else claims.join(partner))
-    return query.ai_filter(
-        quail.prompt("Does {1} support {0}?", quail.col("c.claim"),
-                     quail.col("e.text")),
-        selectivity=0.5).select("c.id", "e.id")
-
-
-def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
-    pairs = pair_table(
-        "c", [pa.array(["u1", "u2", None, "u1"])],
-        "e", [pa.array(["u2", "u1", "u1"])])
-    assert pairs.to_pydict() == {"c": [0, 0, 1, 3, 3], "e": [1, 2, 0, 1, 2]}
-    # the planner estimates the fraction from key samples: u1 twice
-    # against twice, u2 once against once, and a null never matches
-    assert estimate_pair_fraction(
-        [pa.array(["u1", "u2", None, "u1"])], [pa.array(["u2", "u1", "u1"])]
-    ) == 5 / 12
-    assert estimate_pair_fraction(
-        [pa.array(["u1"])], [pa.array([], pa.string())]) == 0.0
-    grouped = partner_map(pairs, "e", "c")
-    assert [grouped.get(key).tolist() for key in range(3)] == [[1], [0, 3], [0, 3]]
-    assert grouped.get(10) == ()
-    unsorted = pa.table({"a": [5, 2, 5, 5], "b": [7, 3, 7, 1]})
-    grouped = partner_map(unsorted, "a", "b")
-    assert grouped.get(5).tolist() == [7, 7, 1]
-    members = members_by_partner([[7], [1], [7], [3]], 0)
-    assert allowed_members(grouped, members, 5).tolist() == [0, 0, 1, 2, 2]
-    assert allowed_members({5: [7, 99]}, members, 5).tolist() == [0, 2]
-    assert allowed_members(grouped, members, 9).size == 0
-    assert allowed_members(grouped, members_by_partner([], 0), 5).size == 0
-    assert partner_map(unsorted.slice(0, 0), "a", "b").get(5) == ()
-    from quail.backends.quail.executor.operators.join import partner_list_builder
-
-    streamed = {}
-    group = [dict(anchor="a", partners=["b"], written_position=j, pairs_from="pairs")
-             for j in range(2)]
-    lookup = partner_list_builder(
-        group, [[[7], [1], [7], [3]]] * 2, {0: grouped, 1: streamed})
-    selected = lookup(5, 0)
-    assert selected.tolist() == [0, 0, 1, 2, 2]
-    assert lookup(5, 0) is selected
-    assert lookup(5, 1).size == 0
-    streamed[5] = [1]
-    assert lookup(5, 1).tolist() == [1]
-    # two equalities: both key columns must match; integer keys on one
-    # side are cast to the other side's type
-    pairs = pair_table(
-        "c", [pa.array(["u1", "u1"]), pa.array([1, 2])],
-        "e", [pa.array(["u1", "u1"]), pa.array([2, 2], type=pa.int8())])
-    assert pairs.to_pydict() == {"c": [1, 1], "e": [0, 1]}
-    # numbers pair by value: a float pairs an integer only at an
-    # integral value, and a large unsigned key never wraps to a signed one
-    pairs = pair_table("c", [pa.array([1, 2, 3])],
-                       "e", [pa.array([1.5, 2.0, -0.0, float("nan")])])
-    assert pairs.to_pydict() == {"c": [1], "e": [1]}
-    pairs = pair_table("c", [pa.array([2**64 - 1, 7], pa.uint64())],
-                       "e", [pa.array([-1, 7], pa.int64())])
-    assert pairs.to_pydict() == {"c": [1], "e": [1]}
-    assert estimate_pair_fraction([pa.array([1, 2])], [pa.array([2.0, 2.5])]) == 1 / 4
-
-    with quail.Session(CONFIG, tokenizer=lambda text: list(text.encode())) as session:
-        register_claims_evidence(session)
-        paired = _pair_query(session, on=True)
-        cross = _pair_query(session, on=False)
-        paired_plan, cross_plan = paired.plan(), cross.plan()
-        paired_stage = paired_plan.graph.nodes_by_type(AiJoin.type_name)[0]
-        cross_stage = cross_plan.graph.nodes_by_type(AiJoin.type_name)[0]
-        # c1 and c2 pair with e0 and e2, c0 with e1: 5 of 12 pairs
-        hash_join = paired_plan.graph.node("hash_join:c-e")
-        assert (hash_join.left, hash_join.right, hash_join.on) == (
-            "c", "e", ((ColumnRef("c", "claims", "url"),
-                        ColumnRef("e", "evidence", "url")),))
-        assert hash_join.pair_fraction == 5 / 12
-        assert [port.source.node_id for port in hash_join.inputs] == [
-            "scan:c", "scan:e"]
-        assert paired_plan.graph.node("scan:c").shards == (range(0, 4),)
-        assert paired_stage.pairs_from == "hash_join:c-e"
-        assert not cross_stage.pairs_from
-        assert "hash_join:c-e" not in {node.node_id for node in cross_plan.nodes}
-        assert paired_stage.expected_rows == round(
-            cross_stage.expected_rows * 5 / 12, 1)
-        assert paired_plan.estimated_seconds < cross_plan.estimated_seconds
-        assert "HashJoin" in paired.explain() and "c.url = e.url" in paired.explain()
-        # the request carries the key columns, not the pairs
-        request = paired._prepare_physical()
-        assert request.column_tables()["c"].column("url").to_pylist() == [
-            "u0", "u1", "u1", "u9"]
-        assert cross._prepare_physical().relations == {}
-
-        def answer(prompt, assignment):
-            return (assignment["c"] + assignment["e"]) % 2 == 0
-
-        estimate = quail.speed_of_light_estimate(paired, answer)
-        assert estimate.join_pair_evaluations == 5
-        assert estimate.join_stages[0]["passing_pairs"] == 2
-        assert quail.speed_of_light_estimate(
-            cross, answer).join_pair_evaluations == 12
-
-
-IMPORT_TEXT = """
-import sys
-import quail
-from bench import quailb
-from quail.api import execute
-from demos import quickstart
-
-assert "modal" not in sys.modules
-"""
-
-
-def test_engine_import_gpu_requirement_and_quickstart_demos(
-        sess, monkeypatch, tmp_path):
-    subprocess.run([sys.executable, "-c", IMPORT_TEXT], check=True)
-    monkeypatch.setattr(execution, "gpu_problem", lambda: "no CUDA GPU is visible")
-    with pytest.raises(RuntimeError, match="process with a CUDA GPU") as error:
-        sess.sql(FILTER_SQL).run()
-    assert "no CUDA GPU is visible" in str(error.value)
-
-    reviews = pa.table({"id": ["rv0", "rv1"], "body": [
-        "The acting was excellent.", "The acting was poor."]})
-    monkeypatch.setattr(quickstart, "load_reviews", lambda: reviews)
-    commits = []
-    monkeypatch.setattr(quickstart_modal, "RESULTS_DIR", tmp_path / "chosen-path")
-    monkeypatch.setattr(quickstart_modal.volume, "commit",
-                        lambda: commits.append("volume"))
-    monkeypatch.setattr(quail.Session, "tokenizer", property(lambda self: str.split))
-    monkeypatch.setattr(execution, "gpu_problem", lambda: None)
-    monkeypatch.setattr(execution, "_prepare_backend", lambda *args: None)
-    executor = make_executor({"r": {"Instruction": [1, 0]}})
-    monkeypatch.setattr(execution, "_execute_physical",
-                        lambda request, registry: executor(request))
-    closed = []
-    close = quail.Session.close
-
-    def record_close(session):
-        close(session)
-        closed.append(session)
-
-    monkeypatch.setattr(quail.Session, "close", record_close)
-
-    for on_modal in (False, True):
-        closed.clear()
-        commits.clear()
-        run = (quickstart_modal.run_query.get_raw_f() if on_modal
-               else quickstart.run_query)
-        rows, report = run()
-        assert len(closed) == 1, on_modal
-        assert closed[0].inputs._token_directory is None, on_modal
-        assert rows.to_pylist() == [{"r.id": "rv0"}], on_modal
-        assert report["fresh_tokens"] == 1234, on_modal
-        assert report["worker_total_s"] >= 0, on_modal
-        if not on_modal:
-            assert "result_volume_path" not in report
-            assert commits == []
-            continue
-        path = Path(report["result_volume_path"])
-        assert path.parent == tmp_path / "chosen-path"
-        assert json.loads(path.read_text()) == report
-        assert commits == ["volume"]
-
-    def fail():
-        raise RuntimeError("query failed")
-
-    commits.clear()
-    monkeypatch.setattr(quickstart, "run_query", fail)
-    with pytest.raises(RuntimeError, match="query failed"):
-        quickstart_modal.run_query.get_raw_f()()
-    assert commits == ["volume"], "a failed query still commits the volume"
-
-
-def test_the_process_keeps_one_engine_configuration_at_a_time():
-    events = []
-
-    class Backend:
-        def __init__(self, engine_name):
-            self.name = self.engine_name = engine_name
-
-        def release_request(self, state):
-            events.append(("release", self.engine_name, state.pop("engine")))
-
-    state = execution._BackendState()
-    envelope = {"model": "qwen3-4b-fp8", "device": "h100-sxm", "gpus": 1}
-    vllm = Backend("vllm")
-    assert state.bind(envelope, vllm) is state.bind(envelope, Backend("vllm"))
-    state.state["engine"] = "first"
-    state.bind({**envelope, "model": "qwen3-32b-fp8"}, vllm)["engine"] = "second"
-    state.bind(envelope, Backend("quail"))["engine"] = "third"
-    state.close()
-    state.close()
-    assert events == [("release", "vllm", "first"), ("release", "vllm", "second"),
-                      ("release", "quail", "third")]

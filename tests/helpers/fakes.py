@@ -7,13 +7,10 @@ length, and the join frame is [FRAME] * length.
 
 import random
 from contextlib import nullcontext
-from itertools import takewhile
 from types import SimpleNamespace
 
 import numpy as np
-import pyarrow as pa
 
-import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena
@@ -26,7 +23,6 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     Barrier,
-    Foreign,
     HashJoin,
     PhysicalGraph,
     PortRef,
@@ -213,16 +209,7 @@ def fake_pack(torch, arena, specs, **kw):
                            meta=meta)
 
 
-def expected_filter_rows(filter_truth):
-    """Each document's answers up to and including its first FALSE."""
-    rows = {}
-    for d, truth in enumerate(filter_truth):
-        passed = list(takewhile(bool, truth))
-        rows[d] = passed + truth[len(passed):len(passed) + 1]
-    return rows
-
-
-def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
+def two_alias_graph(pipelined, *, stages=1, hash_join=False,
                     filtered=True, semantics="full", keep_kv=False):
     """R's filter sequence into a join with p.
 
@@ -233,8 +220,6 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
         stages: Filter stages on r.
         hash_join: Pair r and p on their "key" columns with a HashJoin
             over the scans that feeds the join its pairs port.
-        foreign: (kind, ids) of a Foreign node between the sequence and
-            the join; ids "pairs" feeds the join its pairs port.
         filtered: Whether r's filter sequence runs at all; otherwise the
             join reads r's scan and loads every anchor itself.
         semantics: The join stage's semantics, "full" or "anti".
@@ -269,23 +254,6 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             on=((ColumnRef("r", "r", "key"), ColumnRef("p", "p", "key")),)))
         join_inputs.append(PortRef("hash_join:r-p", "pairs:0"))
         pairs_from = "hash_join:r-p"
-    if foreign and foreign[1] == "pairs":
-        nodes.append(Foreign(
-            node_id="apply:same_key",
-            inputs=input_ports((anchor_src, PortRef("input:p", "rows:p"))),
-            function="same_key", kind=foreign[0], ids="pairs",
-            columns=(ColumnRef("r", "r", "key"), ColumnRef("p", "p", "key")),
-            aliases=("r", "p"),
-            written_position=0))
-        join_inputs.append(PortRef("apply:same_key", "pairs:0"))
-        pairs_from = "apply:same_key"
-    elif foreign:
-        nodes.append(Foreign(
-            node_id="apply:keep_even",
-            inputs=input_ports((anchor_src,)),
-            function="keep_even", kind=foreign[0], ids=foreign[1],
-            columns=(), aliases=("r",)))
-        anchor_src = PortRef("apply:keep_even", "rows:r")
     resident = "filter" if filtered and pipelined else "none"
     nodes.append(AiJoin(
         node_id="group:0", anchor="r", anchor_resident=resident, keep_kv=keep_kv,
@@ -342,32 +310,6 @@ def run_graph_on_arena(monkeypatch, graph, *, num_documents=14, num_partners=4,
     result = execute_single_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
     return result, model, filter_truth, join_truth
-
-
-def register_claims_evidence(session, claim_words=20, text_words=100):
-    """Four claims and three evidence rows sharing a url column."""
-    session.register("claims", quail.DocumentProvider.from_table(pa.table({
-        "id": [f"c{i}" for i in range(4)],
-        "claim": [f"{i} " + "word " * claim_words for i in range(4)],
-        "url": ["u0", "u1", "u1", "u9"],
-    }), id_col="id"))
-    session.register("evidence", quail.DocumentProvider.from_table(pa.table({
-        "id": [f"e{i}" for i in range(3)],
-        "text": [f"{i} " + "word " * text_words for i in range(3)],
-        "url": ["u1", "u0", "u1"],
-    }), id_col="id"))
-
-
-def keep_even(tables):
-    (alias,) = tables
-    table = tables[alias]
-    return [document for document in table.column(alias).to_pylist()
-            if document % 2 == 0]
-
-
-def same_key(tables):
-    left, right = tables["r"], tables["p"]
-    return left.join(right, keys=["key"], join_type="inner").select(["r", "p"])
 
 
 class FakeArena:

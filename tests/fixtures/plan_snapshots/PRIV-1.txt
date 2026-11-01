@@ -1,0 +1,26 @@
+logical:
+  Project: p.id
+    SemanticFilter
+      PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the policy above whether, if a user sent a private message through this service, an employee of the company could read it.\n\nInstruction: answer TRUE if an employee could read the user's private messages, FALSE otherwise.", p.policy_text) (selectivity=20% (default))
+      PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the policy above whether this service would keep track of the user's physical location, even when the user is not actively using the service.\n\nInstruction: answer TRUE if the service would track the user's location while they are not using it, FALSE otherwise.", p.policy_text) (selectivity=20% (default))
+      Scan policies as p [policy_text, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                      est. rows   est. pass   est. time
+  Project: p.id                                                            0.32
+    AiFilter: p                                                            0.32                 2.92 ms
+      KV rewind=on
+      predicate 2  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           1.6        20%*
+      AiFilter: p                                                           1.6                 13.7 ms
+        KV rewind=on
+        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           8        20%*
+        Scan policies as p                                                    8
+          tokens=168, mean_document_tokens=21
+  Pipeline on p: ai_filter:p -> ai_filter:p:1 (each document runs every operator with its KV resident)
+  * no selectivity was given; the planner assumes 20%
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

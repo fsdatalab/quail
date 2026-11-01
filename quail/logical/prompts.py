@@ -572,8 +572,8 @@ def bind_extract_prompt(args: tuple, question: str,
             Without it, a line break separates the template and the cue.
 
     Returns:
-        A Prompt whose template is ``{0}`` and whose tail is the text
-        after the document.
+        A Prompt whose template is ``{0}``, whose tail is the text
+        after the document, and whose source is the question.
 
     Raises:
         CompileError: The prompt reads more than one column, or the
@@ -587,7 +587,7 @@ def bind_extract_prompt(args: tuple, question: str,
     after = (render_extract_question(question) + (turn[1] or "\n")
              + EXTRACT_PHRASE_CUE)
     return Prompt(template="{0}", args=tuple(args), preamble=preamble,
-                  tail="{0}" + after, kind="extract")
+                  tail="{0}" + after, kind="extract", source=question)
 
 
 def bind_join_prompt(template: str, args: tuple,

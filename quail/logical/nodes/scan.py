@@ -6,9 +6,9 @@ from dataclasses import dataclass, replace
 from typing import Any, ClassVar
 
 from quail.logical.expressions import (
+    CONDITION_TYPES,
     ColumnRef,
     CompileError,
-    RegularPredicate,
     column_name,
     column_references,
     source_columns,
@@ -35,7 +35,7 @@ class Scan:
     alias: str
     column: Any  # a value expression, or "" before a prompt names one
     columns: tuple = ()  # tuple[str, ...]
-    predicates: tuple = ()  # tuple[RegularPredicate, ...]
+    predicates: tuple = ()  # conditions: RegularPredicate, Not, And, or Or
     schema: Any = None  # pa.Schema
 
     type_name: ClassVar[str] = "quail.scan"
@@ -72,13 +72,13 @@ class Scan:
                 f"Scan {self.alias!r} lists a column twice: {self.columns}"
             )
         for predicate in self.predicates:
-            if not isinstance(predicate, RegularPredicate):
+            if not isinstance(predicate, CONDITION_TYPES):
                 raise CompileError(
-                    f"a Scan predicate is a RegularPredicate, got "
+                    f"a Scan predicate is a condition, got "
                     f"{type(predicate).__name__}"
                 )
             predicate.validate()
-            if predicate.column.alias != self.alias:
+            if predicate.aliases() != (self.alias,):
                 raise CompileError(
                     f"predicate {predicate} is on the Scan of {self.alias!r}"
                 )

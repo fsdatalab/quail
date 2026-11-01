@@ -1,0 +1,25 @@
+logical:
+  Project: c.id, e.id
+    SemanticJoin (full)
+      PROMPT('Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?', c.claim, e.text) (selectivity=0.217%)
+      Join
+        cross
+        Scan claims as c [claim, id]
+        Scan evidence as e [text, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                        est. rows   est. pass   est. time
+  Project: c.id, e.id
+    AiJoin: anchor=e                                                                              19.3 ms
+      KV: anchor=not resident, retain after join=no
+      join 1 full (e, c)  PROMPT('Does the Wikipedia passage in DO…')          36      0.217%
+      Scan evidence as e                                                        6
+        tokens=114, mean_document_tokens=19
+      Scan claims as c                                                          6
+        tokens=42, mean_document_tokens=7
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

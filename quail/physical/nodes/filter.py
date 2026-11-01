@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
-from quail.logical import RegularPredicate
+from quail.logical import And, Not, Or, RegularPredicate, condition_columns
 
 from ..base import (
     ExecutionLocation,
@@ -20,20 +20,21 @@ from ..base import (
 class Filter(PhysicalNode):
     """Physical operator that keeps the rows whose predicate holds.
 
-    With ``aliases``, the predicate is the logical plan's
-    RegularPredicate over a label AI.CLASSIFY produced, a score AI.SCORE
-    produced, or an answer or span AI.EXTRACT produced; its column names
-    the rows table's column. Single-document filters also return the
+    With ``aliases``, the predicate is the logical plan's condition on
+    a label AI.CLASSIFY produced, a score AI.SCORE produced, or one
+    extraction's answer and span; its columns name the rows table's
+    columns. Single-document filters also return the
     kept document IDs; filters over joined pairs return join answers.
     Both run on the GPU executor.
 
     Without ``aliases``, the filter reads result rows after the Project,
-    such as the field columns of an Unnest, and runs on the coordinator.
-    Its predicate names the column by its qualified name, and
-    ``columns`` are the output columns in result order.
+    such as source columns of two tables, the struct columns of
+    extractions, or the field columns of an Unnest, and runs on the
+    coordinator. Its predicate names each column by its qualified name,
+    and ``columns`` are the output columns in result order.
     """
 
-    predicate: RegularPredicate | None = None
+    predicate: RegularPredicate | Not | And | Or | None = None
     aliases: tuple[str, ...] = ()
     selectivity: float | None = None
     written_position: int = 0
@@ -62,9 +63,9 @@ class Filter(PhysicalNode):
         return True
 
     @property
-    def column(self) -> str:
-        """Return the column tested by the predicate."""
-        return self.predicate.column.column
+    def tested_columns(self) -> tuple[str, ...]:
+        """Return the columns the predicate tests, by unqualified name."""
+        return condition_columns(self.predicate)
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:

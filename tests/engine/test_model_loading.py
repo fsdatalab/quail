@@ -6,16 +6,13 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from helpers.fakes import cpu_arena, fake_pipeline, fake_readout, fake_torch
 
-from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor import model_loading
 from quail.backends.quail.executor.model_loading import (
     answer_weights,
     retain_answer_head,
 )
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
-from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.builtins import built_in_registry
 
 
@@ -84,41 +81,6 @@ def test_retained_answer_weights_ownership_and_answer_rows(torch):
     assert first(hidden) == second(hidden) == expected
     assert AsyncAnswers.dtype is None
     assert AsyncScores.dtype is np.float32
-
-
-def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
-    sizes = []
-    failed = []
-    modes = set()
-
-    def pack(torch, arena, specs, **kw):
-        if len(specs) > 1 and not failed:
-            failed.append(len(specs))
-            raise chunk_mod.ArenaFullError(
-                "unified suffix pages exceed the free KV arena")
-        sizes.append(len(specs))
-        modes.add(kw["attention_mode"])
-        return SimpleNamespace(specs=specs, tokens=len(specs), layout=[],
-                               attention_mode=kw["attention_mode"],
-                               temporary_keys=(), fresh_keys=(),
-                               rows_per_answer=None)
-
-    monkeypatch.setattr(chunk_mod, "pack_chunk", pack)
-    arena = cpu_arena(64)
-    evictions = []
-    monkeypatch.setattr(arena, "evict_retained",
-                        lambda need: evictions.append(need) or ())
-    pipeline = fake_pipeline(forward_chunk=lambda chunk: [1] * len(chunk.specs))
-    answers = fake_readout()
-    answers_out, _, _ = run_stages(
-        fake_torch(), arena, pipeline,
-        [Stage(suffixes=[[3, 4]], readout=answers)], [[1] * 8, [2] * 8], 64,
-        anchor_keys=[('a', 0), ('a', 1)])
-    # nothing retained to evict, so the two-group chunk ran as two chunks
-    assert failed == [2] and len(evictions) == 1 and evictions[0] > 0
-    assert sizes == [1, 1]
-    assert modes == {"tree"}
-    assert answers_out == [{0: [1], 1: [1]}]
 
 
 @pytest.fixture

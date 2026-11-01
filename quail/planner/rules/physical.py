@@ -33,7 +33,7 @@ from quail.planner.search.statistics import (
     cached_statistics,
     expected_rows_after_filters,
 )
-from quail.planner.statistics.prefixes import page_tree
+from quail.planner.statistics.prefixes import key_documents, page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
@@ -439,3 +439,48 @@ class ChooseAttentionAlgorithm(PhysicalRule):
         if not changed:
             return None
         return PhysicalGraph(tuple(nodes), graph.root)
+
+
+class ShouldDeduplicate(PhysicalRule):
+    """Deduplicate the tables model operators read: record each one's row columns.
+
+    The ``deduplicate`` setting maps each alias the model operators read
+    to the row columns its documents are grouped by beside their tokens,
+    today a filter's stop key. Each document's key document is the first
+    document with the same tokens and the same values in those columns.
+    The executor asks a group of operators about the key documents only
+    and gives each document, or pair, the answers of its key documents.
+    The rule leaves the request backends, diffusion models, whose answers
+    depend on a document's row as well as its tokens, and tables where
+    no document copies another's tokens.
+    """
+
+    name = "should_deduplicate"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None:
+            return None
+        context.settings.pop("deduplicate", None)
+        if context.backend != "quail":
+            return None
+        stop_keys = {node.alias: node.stop_key for node in graph.nodes
+                     if isinstance(node, AiFilter)}
+        chosen = {alias: tuple(stop_keys.get(alias, ()))
+                  for alias in sorted(_model_aliases(graph))
+                  if key_documents(context, alias) is not None}
+        if chosen:
+            context.settings["deduplicate"] = chosen
+        return None
+
+
+def _model_aliases(graph) -> set[str]:
+    """The tables the graph's model operators read documents of."""
+    aliases = set()
+    for node in graph.nodes:
+        if isinstance(node, AiFilter):
+            aliases.add(node.alias)
+        elif isinstance(node, AiJoin):
+            aliases.update((node.anchor, *node.partners))
+        elif isinstance(node, AiInference) and node.spec is not None:
+            aliases.update(node.spec.aliases)
+    return aliases

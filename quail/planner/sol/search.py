@@ -17,7 +17,7 @@ from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sae_features import sae_encoded_tokens
 from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan
-from quail.logical import oriented_join_conditions
+from quail.logical import condition_columns, oriented_join_conditions
 from quail.logical.expressions import column_name, evaluate_expression
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
@@ -142,9 +142,8 @@ class Search:
             operators.scans, operators.filters, operators.joins
         )
         self.labels = operators.labels
-        self.label_filters = operators.label_filters
+        self.column_filters = operators.column_filters
         self.extracts = operators.extracts
-        self.extract_filters = operators.extract_filters
         self.sae_features = operators.sae_features
         self.max_pooling = {node.alias for node in self.sae_features
                             if node.pooling == "max"}
@@ -433,7 +432,7 @@ class Search:
             CLASSIFY, alias, call.prompt.template, None,
             self.lower(call.prompt).tail_tokens, None, rows, rows,
             stage_work, name=self.labels.names[call], answer_rows=len(rows)))
-        for test in self.label_filters.get(alias, ()):
+        for test in self.column_filters.get(alias, ()):
             if test.call != call:
                 continue
             accepted = set(test.condition.value)
@@ -489,7 +488,7 @@ class Search:
         stages.append(_stage(
             EXTRACT, alias, node.call.prompt.template, None, tail, None, rows,
             rows, stage_work, name=node.name, answer_rows=answer_rows))
-        for test in self.extract_filters.get(alias, ()):
+        for test in self.column_filters.get(alias, ()):
             if test.name != node.name:
                 continue
             passed = self.answer_survivors(test.condition, rows, answers)
@@ -502,7 +501,8 @@ class Search:
 
     def answer_survivors(self, condition, rows, answers) -> list:
         """Return the live rows whose reference answer passes the condition."""
-        kept = condition.accepts(pa.table({condition.column.column: pa.array(
+        (column,) = condition_columns(condition)
+        kept = condition.accepts(pa.table({column: pa.array(
             [answers[row] for row in rows], pa.string())}))
         return [row for row, keep in zip(rows, kept.to_pylist()) if keep]
 

@@ -5,7 +5,6 @@ from quail.cost.sae_features import SaeFeaturesCost
 from quail.physical import AiSaeFeatures
 from quail.planner.operators.common import (
     bind_inference,
-    emit_calls,
     inference_node,
     node_index,
 )
@@ -93,4 +92,4 @@ def emit_sae_features(builder, alias, expected_rows, names, port,
             index=node_index(builder, AiSaeFeatures),
             backend="quail", model=builder.model.name)
 
-    return emit_calls(builder, alias, expected_rows, port, names, node_of)
+    return builder.emit_columns(alias, expected_rows, port, names, node_of)

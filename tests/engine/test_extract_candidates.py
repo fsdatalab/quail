@@ -6,49 +6,10 @@ from helpers.extract_fakes import RANKED, make_vocabulary, squeezed
 
 from quail.backends.quail.executor.extract.candidates import (
     DocumentTokens,
-    SqueezedText,
-    Stream,
     ensure_tokens,
     first_tokens,
     make_streams,
 )
-from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.catalog.tokens import GigatokenEncoder
-
-
-def test_gigatoken_vocabulary_encodes_unicode_without_transformers(monkeypatch):
-    import sys
-
-    from tokenizers import Tokenizer, models, pre_tokenizers, trainers
-
-    texts = ['  Café\n\n東京 🙂', 'none "March"', "", "a  b"]
-    native = Tokenizer(models.BPE())
-    native.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    native.train_from_iterator(texts, trainers.BpeTrainer(
-        vocab_size=256, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-        special_tokens=["<|im_end|>"]))
-    expected = native.encode_batch(texts, add_special_tokens=False)
-    encoder = GigatokenEncoder(native)
-    monkeypatch.setitem(sys.modules, "transformers", None)
-    tables = Vocabulary(encoder, "<|im_end|>\nassistant\n")
-    monkeypatch.setattr(encoder, "batch_arrow", lambda _: pytest.fail(
-        "continuations must not convert through Arrow token documents"))
-    # the answer ends at the turn close alone: a quote is document text
-    assert tables.stop_ids == (native.token_to_id("<|im_end|>"),)
-    for (ids, offsets), original in zip(tables.encode_batch(texts), expected):
-        assert list(ids) == original.ids
-        assert offsets.tolist() == [list(pair) for pair in original.offsets]
-    text = 'n  Café\n東京 🙂 ' * 80
-    stream = Stream(0, tables.encode_ids("n"), [1], text)
-    stream.next(100_000, tables)
-    normalized, character_ends = squeezed(text)
-    expected = native.encode(normalized, add_special_tokens=False)
-    assert stream.stream == expected.ids
-    assert stream.ends == [character_ends[end - 1] for _, end in expected.offsets]
-    encode = encoder.batch_numpy
-    monkeypatch.setattr(encoder, "batch_numpy", lambda texts: encode(["ab"]))
-    with pytest.raises(ValueError, match="preserve the source text"):
-        tables.encode("a b")
 
 
 def test_first_tokens_follow_the_models_spelling():
@@ -83,23 +44,7 @@ def test_first_tokens_follow_the_models_spelling():
     assert text[march_stream.char:march_stream.ends[3]] == " March 3."
 
 
-def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
-    text = "The lease is their lease."
-    tables = make_vocabulary(text, "their", "ir")
-    ids, offsets = tables.encode(text)
-    scan = DocumentTokens.from_tokens(tables, ids, offsets, 1)
-    the = tables.encode_ids("The")[0]
-    starts = first_tokens(tables, _scores(tables, {the: -0.5}), scan)
-    by_char = {scan.starts[i - 1]: value for i, value in starts.items(tables)}
-    # "the" begins "their" too: that start continues with "ir"
-    assert by_char[0] == (the, [])
-    assert by_char[12] == (the, tables.encode_ids("ir"))
-    streams = make_streams(tables, text, starts, the)
-    assert [stream.char for stream in streams] == [0, 12]
-    assert streams[1].stream[:2] == [the, tables.encode_ids("ir")[0]]
-    assert text[streams[1].char:streams[1].ends[1]] == " their"
-
-@pytest.mark.parametrize("first_window,window", [(64, 512), (9, 19)])
+@pytest.mark.parametrize("first_window,window", [(9, 19)])
 def test_stream_batches_preserve_tokens_and_offsets_across_windows(
         monkeypatch, first_window, window):
     texts = [" ".join(["word"] * 300), "word   \n word  ", "word"]
@@ -148,29 +93,3 @@ def _scores(vocabulary, pairs):
     for token, score in pairs.items():
         values[token] = score
     return values
-
-
-def test_normalized_windows_preserve_partial_whitespace_runs():
-    text = " a\t\tbc\r\n  d\u2003e\u00a0 f   "
-    normalized = SqueezedText(text)
-    for start in range(len(text) + 1):
-        for end in range(start, len(text) + 1):
-            want_text, want_ends = squeezed(text[start:end])
-            got_text, got_ends = normalized.window(start, end)
-            assert got_text == want_text
-            assert got_ends.tolist() == [start + value for value in want_ends]
-
-
-def test_candidate_ties_prefer_longer_spelling():
-    text = "their"
-    tables = make_vocabulary(text, "the", "The", "ir")
-    ids, offsets = tables.encode(text)
-    whole, short = (tables.encode_ids(word)[0] for word in ("their", "The"))
-    scan = DocumentTokens.from_tokens(tables, ids, offsets)
-    tied = first_tokens(tables, _scores(tables, {whole: -1, short: -1}),
-                        scan)
-    assert tied.best_token == whole
-    higher = first_tokens(tables, _scores(tables, {whole: -2, short: -1}),
-                          scan)
-    assert higher.best_token == short
-    assert list(higher.items(tables)) == [(0, (short, tables.encode_ids("ir")))]

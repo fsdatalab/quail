@@ -2,43 +2,28 @@
 
 import pyarrow as pa
 import pytest
+from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
 from quail.catalog.selection import selected_rows
-from quail.frontend.expressions import col, prompt
 from quail.logical import (
+    And,
     ColumnRef,
     CompileError,
-    GetField,
+    Not,
+    Or,
     RegularPredicate,
-    ScalarFunction,
     Scan,
 )
-from quail.logical.expressions import column_expression
-from quail.planner.plan import Refusal
+from quail.logical import Filter as LogicalFilter
+from quail.logical.expressions import normalize
 
 REF = ColumnRef("r", "reviews", "stars")
 
 
 def _predicate(comparison, value=None):
     return RegularPredicate(REF, comparison, value)
-
-
-def test_predicates_evaluate_with_nulls_rejected():
-    stars = pa.table({"stars": pa.chunked_array([[3, None, 4], [5, 1]])})
-    assert _predicate(">=", 4).evaluate(stars).to_pylist() == [
-        False, None, True, True, False]
-    assert _predicate("in", (1, 3)).evaluate(stars).to_pylist() == [
-        True, False, False, False, True]
-    assert _predicate("is null").evaluate(stars).to_pylist() == [
-        False, True, False, False, False]
-    assert selected_rows(stars, (
-        _predicate("is not null"), _predicate("<>", 4))).to_pylist() == [0, 3, 4]
-    # a float literal compares with an integer column; a string does not
-    assert selected_rows(stars, (_predicate(">", 3.5),)).to_pylist() == [2, 3]
-    with pytest.raises(CompileError, match="cannot be evaluated"):
-        _predicate("=", "five").evaluate(stars)
 
 
 @pytest.fixture()
@@ -98,215 +83,205 @@ def test_regular_predicates_select_documents_before_the_model(session):
     assert answers.column("r").to_pylist() == [0, 2, 4]
     assert result.survivor_indices["r"].to_pylist() == [0]
 
-    built = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q1: {0}", col("r.review")))
-             .where(col("r.stars") < 4, col("r.lang") == "en")
-             .select("r.id", "r.stars"))
-    assert _run(built, make_executor(TRUTH)).to_rows() == [("r1", 2), ("r4", 3)]
+    first = "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
+    query = session.sql(f"SELECT r.id, r.stars FROM reviews r {first} "
+                        "AND r.stars < 4 AND r.lang = 'en'")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [("r1", 2), ("r4", 3)]
     # a function on a source column reaches the scan as written
-    built = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q1: {0}", col("r.review")))
-             .where(col("r.lang").length() > 2)
-             .select("r.id"))
-    assert _run(built, make_executor(TRUTH)).to_rows() == []
-
-
-
-def test_a_document_too_long_for_a_pass_does_not_refuse_the_query():
-    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
-        session.register("reviews", quail.DocumentProvider.from_table(pa.table({
-            "id": ["short", "long"],
-            "review": ["a short review", "pad " * 200_000],
-            "stars": [5, 1],
-        }), id_col="id"))
-        # the executor skips the long review, whether or not a WHERE drops it
-        for sql in (
-                "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', "
-                "r.review), {'selectivity': 0.5})",
-                "SELECT r.id, AI.CLASSIFY(PROMPT('What is {0} about?', "
-                "r.review), ['a', 'b']) AS topic FROM reviews r"):
-            query = session.sql(sql)
-            query.plan()
-            query.wait_for_tokens()
-            assert not isinstance(query.plan(), Refusal)
-
-def test_sql_and_builder_bind_regular_predicates(session):
-    plan = session.sql("""
-        SELECT r.id FROM reviews r
-        WHERE 4 <= r.stars AND r.lang <> 'de' AND r.stars IS NULL
-          AND AI_FILTER(PROMPT('q: {0}', r.review))
-    """).logical
-    scan = next(node for node in plan.walk() if isinstance(node, Scan))
-    lang = ColumnRef("r", "reviews", "lang")
-    assert scan.predicates == (
-        RegularPredicate(REF, ">=", 4), RegularPredicate(lang, "<>", "de"),
-        RegularPredicate(REF, "is null"))
-    assert [str(p) for p in scan.predicates] == [
-        "r.stars >= 4", "r.lang <> 'de'", "r.stars IS NULL"]
-    built = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q: {0}", col("r.review")))
-             .where(col("r.stars") >= 4, col("r.lang") != "de",
-                    col("r.stars").is_null())
-             .select("r.id")).logical
-    assert built == plan
-    for sql, fragment in (
-        ("r.stars BETWEEN 1 AND 3", "not supported"),
-        ("NOT r.stars = 3", "NOT is supported"),
-        ("r.stars = r.stars", "only AI_FILTER"),
-        ("r.stars > CURRENT_DATE", "literal"),
-        ("r.nope = 1", "not in provider"),
-    ):
-        with pytest.raises(CompileError, match=fragment):
-            session.sql(f"SELECT r.id FROM reviews r WHERE {sql} AND "
-                        f"AI_FILTER(PROMPT('q: {{0}}', r.review))")
-    with pytest.raises(CompileError, match="takes tests"):
-        session.docs("reviews").alias("r").where("r.stars > 3")
-    # a plain test in ON restricts the joined table
-    session.register("products", quail.DocumentProvider.from_table(pa.table({
-        "asin": ["p0", "p1"], "description": ["d0", "d1"],
-        "price": [10, 20]}), id_col="asin"))
-    plan = session.sql("""
-        SELECT r.id, p.asin FROM reviews r
-        JOIN products p ON p.price > 15
-         AND AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
-    """).logical
-    scans = {node.alias: node for node in plan.walk() if isinstance(node, Scan)}
-    assert [str(p) for p in scans["p"].predicates] == ["p.price > 15"]
-    assert scans["r"].predicates == ()
-
-
-def test_where_on_the_joined_query_reaches_its_scan(session):
-    session.register("products", quail.DocumentProvider.from_table(pa.table({
-        "asin": ["p0", "p1"], "description": ["d0", "d1"],
-        "price": [10, 20]}), id_col="asin"))
-    sql = session.sql("""
-        SELECT r.id, p.asin FROM reviews r
-        JOIN products p ON r.stars = p.price AND p.price > 15
-         AND AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
-        WHERE r.lang = 'en'
-    """).logical
-    products = session.docs("products").alias("p").where(col("p.price") > 15)
-    built = (session.docs("reviews").alias("r").where(col("r.lang") == "en")
-             .join(products, on=col("r.stars") == col("p.price"))
-             .ai_filter(prompt("x {0} {1}", col("r.review"),
-                               col("p.description")))
-             .select("r.id", "p.asin")).logical
-    assert built == sql
-
-    def predicates(plan):
-        return {node.alias: [str(p) for p in node.predicates]
-                for node in plan.walk() if isinstance(node, Scan)}
-
-    products = session.docs("products").alias("p").where(col("p.price") > 15)
-    built = (session.docs("reviews").alias("r").where(col("r.lang") == "en")
-             .ai_join(products, prompt("x {0} {1}", col("r.review"),
-                                       col("p.description")))
-             .select("r.id", "p.asin")).logical
-    assert predicates(built) == {"r": ["r.lang = 'en'"], "p": ["p.price > 15"]}
-
-
-def test_two_joins_on_one_table_sample_each_key_column(session):
-    from quail.physical import HashJoin
-    from quail.planner.plan import Refusal
-
-    session.register("products", quail.DocumentProvider.from_table(pa.table({
-        "asin": ["p0", "p1"], "description": ["d0", "d1"],
-        "price": [5, 2]}), id_col="asin"))
-    session.register("authors", quail.DocumentProvider.from_table(pa.table({
-        "name": ["n0", "n1"], "bio": ["b0", "b1"],
-        "lang": ["en", "fr"]}), id_col="name"))
-    query = session.sql("""
-        SELECT r.id FROM reviews r
-        JOIN products p ON r.stars = p.price
-         AND AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
-        JOIN authors a ON r.lang = a.lang
-         AND AI_FILTER(PROMPT('y {0} {1}', r.review, a.bio))
-        WHERE AI_FILTER(PROMPT('q: {0}', r.review))
-    """)
-    plan = query.plan()
-    assert not isinstance(plan, Refusal)
-    fractions = {node.written_position: node.pair_fraction for node in plan.nodes
-                 if isinstance(node, HashJoin)}
-    # stars 5, 2, 4, null, 3, 5 against prices 5, 2: three of twelve;
-    # langs en x4, fr, de against en, fr: five of twelve
-    assert fractions == {0: 3 / 12, 1: 5 / 12}
-
-
-def test_regular_predicates_reach_score_scans_and_may_read_the_text(session):
-    from quail.physical import Scan as PhysicalScan
-
-    scored = (session.docs("reviews").alias("r")
-              .where(col("r.stars") >= 4)
-              .ai_score(prompt("q: {0}", col("r.review")), name="s")
-              .select("r.id", "s"))
-    plan = scored.plan()
-    scan = next(node for node in plan.nodes if isinstance(node, PhysicalScan))
-    assert [str(predicate) for predicate in scan.predicates] == ["r.stars >= 4"]
-    assert (scan.num_documents, scan.expected_rows) == (6, 3.0)
-    # a test on the document column keeps the text as a value column
-    text = "review 2 " + "pad " * 20
-    query = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q1: {0}", col("r.review")))
-             .where(col("r.review") == text)
-             .select("r.id"))
-    query.plan()
-    logical_scan = next(node for node in query.logical.walk()
-                        if isinstance(node, Scan))
-    assert "review" in logical_scan.columns
+    query = session.sql(f"SELECT r.id FROM reviews r {first} AND LENGTH(r.lang) > 2")
     assert _run(query, make_executor(TRUTH)).to_rows() == []
-    query = (session.docs("reviews").alias("r")
-             .ai_filter(prompt("q1: {0}", col("r.review")))
-             .where(col("r.review") == "review 3 " + "pad " * 20)
-             .select("r.id"))
+
+
+def test_not_moves_down_to_the_column_tests_and_keeps_sqls_nulls():
+    stars = pa.table({"stars": [5, None, 2]})
+    high, low = _predicate(">", 4), _predicate("<", 3)
+    written = Not(And((high, Or((low, Not(_predicate("is null")))))))
+    # De Morgan's laws, two NOTs cancel, and NOT IS NULL is IS NOT NULL
+    assert normalize(written) == Or((Not(high), And((Not(low),
+                                                     _predicate("is null")))))
+    assert str(normalize(written)) == (
+        "NOT (r.stars > 4) OR (NOT (r.stars < 3) AND r.stars IS NULL)")
+    # the null row stays null through NOT, AND, and OR, so it is rejected
+    assert written.evaluate(stars).to_pylist() == [False, None, True]
+    assert normalize(written).evaluate(stars).to_pylist() == [False, None, True]
+    assert selected_rows(stars, (written,)).to_pylist() == [2]
+
+
+def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
+    # the AI predicates keep r0 (en, 5 stars) and r3 (en, no stars)
+    query = session.sql(
+        FILTER_SQL + " AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)")
+    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    assert [str(predicate) for predicate in scan.predicates] == [
+        "NOT (lower(r.lang) like '%e%') OR NOT (r.stars < 3)"]
+    # r3's NULL < 3 makes the OR null, so the scan rejects r3
+    assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",)]
+    query = session.sql(FILTER_SQL + " AND (r.stars IS NULL OR r.lang = 'de')")
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
+    # NOT (a OR b) is two tests at the scan, as NOT a AND NOT b
+    query = session.sql(
+        "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) "
+        "AND NOT (r.lang = 'fr' OR r.stars IS NULL)")
+    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    assert [str(predicate) for predicate in scan.predicates] == [
+        "NOT (r.lang = 'fr')", "r.stars IS NOT NULL"]
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("r0",), ("r1",), ("r4",)]
 
 
-def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
-    names = pa.table({"name": pa.chunked_array([["Acme Corp", None, "acme inc"],
-                                                ["Beta"]])})
-    name = ColumnRef("r", "reviews", "name")
-
-    def passes(comparison, value=None, path=(), function=None):
-        predicate = RegularPredicate(column_expression(name, path, function),
-                                     comparison, value)
-        return predicate.evaluate(names).to_pylist()
-
-    assert passes("like", "Acme%") == [True, None, False, False]
-    assert passes("ilike", "%ACME%") == [True, None, True, False]
-    assert passes("not ilike", "%ACME%") == [False, None, False, True]
-    assert passes("contains", "inc") == [False, None, True, False]
-    assert passes("icontains", "CORP") == [True, None, False, False]
-    assert passes("starts with", "B") == [False, None, False, True]
-    assert passes("ends with", "c") == [False, None, True, False]
-    assert passes("regex", r"\binc\b") == [False, None, True, False]
-    assert passes("regex", "^(?:acme)$") == [False, None, False, False]
-    assert passes("<", 5, function="length") == [False, None, False, True]
-    assert passes("=", "Beta") == [False, None, False, True]
-    spans = pa.table({"name": pa.chunked_array([pa.StructArray.from_arrays(
-        [pa.array([14, 0]), pa.array([27, 3])], names=["start", "end"],
-        mask=pa.array([False, True]))])})
-    predicate = RegularPredicate(GetField(name, "start"), "<", 20)
-    assert predicate.evaluate(spans).to_pylist() == [True, None]
-    # a text test needs a string; a path needs a struct
-    with pytest.raises(CompileError, match="compares with a string"):
-        RegularPredicate(name, "like", 3).validate()
-    with pytest.raises(CompileError, match="unsupported column function"):
-        RegularPredicate(ScalarFunction("reverse", (name,)), "<", 3).validate()
-    with pytest.raises(CompileError, match="has no fields"):
-        RegularPredicate(GetField(name, "start"), "<", 3).evaluate(names)
-    # source columns take the same tests, at the scan
-    reviews = ColumnRef("r", "reviews", "review")
-    both = names.append_column("review", names.column("name"))
-    assert selected_rows(both, (
-        RegularPredicate(reviews, "ilike", "%acme%"),
-        RegularPredicate(ScalarFunction("length", (name,)), ">", 5),
-    )).to_pylist() == [0, 2]
+def test_an_or_over_two_tables_runs_on_the_result_rows(session):
+    session.register("products", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["d0", "d1"],
+        "price": [10, 20]}), id_col="asin"))
+    query = session.sql("""
+        SELECT r.id, p.asin FROM reviews r
+        JOIN products p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
+        WHERE r.stars > 4 OR p.price > 15
+        ORDER BY r.id, p.asin
+    """)
+    filters = [node for node in query.logical.walk()
+               if isinstance(node, LogicalFilter)]
+    assert [str(node.condition) for node in filters] == [
+        "r.stars > 4 OR p.price > 15"]
+    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
+    # every pair with p1, and r0 and r5 (5 stars) with p0; r3's null
+    # stars with p1 is NULL OR TRUE, which is true
+    assert result.to_rows() == [
+        ("r0", "p0"), ("r0", "p1"), ("r1", "p1"), ("r2", "p1"), ("r3", "p1"),
+        ("r4", "p1"), ("r5", "p0"), ("r5", "p1")]
+    # the Project read the tested columns; the result does not return them
+    assert result.collect().column_names == ["r.id", "p.asin"]
 
 
-def test_stop_key_groups_follow_numeric_equality():
-    from quail.catalog.selection import group_ids
+def test_any_arrow_scalar_function_runs_in_where_and_select(session):
+    # q1 keeps r0, r1, r3, and r4; their stars are 5, 2, None, and 3
+    query = session.sql("""
+        SELECT r.id, UTF8_REVERSE(UPPER(r.lang)) AS backwards,
+               ABS(r.stars - 4) AS gap
+        FROM reviews r
+        WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND ABS(r.stars - 4) <= 1
+        ORDER BY r.id""")
+    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    assert [str(p) for p in scan.predicates] == ["abs(subtract(r.stars, 4)) <= 1"]
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("r0", "NE", 1), ("r4", "NE", 1)]
+    with pytest.raises(CompileError, match="unknown function 'nope'"):
+        session.sql("SELECT r.id FROM reviews r WHERE NOPE(r.lang) = 'x' "
+                    "AND AI_FILTER(PROMPT('q1: {0}', r.review))")
 
-    values = pa.array([-0.0, 0.0, float("nan"), float("nan"), 1.0, None, None])
-    groups = group_ids([values, values.dictionary_encode()]).tolist()
-    assert groups[0] == groups[1] and groups[2] == groups[3]
-    assert groups[5] == groups[6] and len(set(groups)) == 4
+
+def test_where_takes_the_same_arrow_expressions_as_select(session):
+    session.register("pairs", quail.DocumentProvider.from_table(pa.table({
+        "id": [f"r{i}" for i in range(6)],
+        "review": [f"review {i} " + "pad " * 20 for i in range(6)],
+        "stars": [5, 2, 4, None, 3, 5],
+        "floor": [4, 3, 4, 1, 1, 6],
+        "lang": ["EN", "en", "Fr", "EN", "en", "DE"],
+    }), id_col="id"))
+    # q1 keeps r0, r1, r3, and r4
+    first = "SELECT r.id FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
+    cases = {
+        # a boolean function on its own, as SELECT returns it
+        "UTF8_IS_UPPER(r.lang)": ["r0", "r3"],
+        "NOT UTF8_IS_UPPER(r.lang)": ["r1", "r4"],
+        # two columns of one table; r3's null stars is rejected
+        "r.stars > r.floor": ["r0", "r4"],
+        "r.stars - r.floor >= 1 OR r.lang = 'en'": ["r0", "r1", "r4"],
+        "ABS(-r.stars) <= r.floor": ["r1"],
+    }
+    for test, kept in cases.items():
+        query = session.sql(f"{first} AND ({test}) ORDER BY r.id")
+        scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+        assert scan.predicates, test
+        assert [row[0] for row in _run(query, make_executor(TRUTH)).to_rows()] == (
+            kept), test
+    query = session.sql(f"{first} AND r.stars > r.floor")
+    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    assert [str(test) for test in scan.predicates] == ["greater(r.stars, r.floor)"]
+    # SELECT returns the same comparison
+    query = session.sql(
+        "SELECT r.id, r.stars > r.floor AS above FROM pairs r "
+        "WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) ORDER BY r.id")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("r0", True), ("r1", False), ("r3", None), ("r4", True)]
+    with pytest.raises(CompileError, match="true or false"):
+        _run(session.sql(f"{first} AND UPPER(r.lang)"), make_executor(TRUTH))
+
+
+def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
+    session.register("products", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["d0", "d1"],
+        "price": [3, 4]}), id_col="asin"))
+    query = session.sql("""
+        SELECT r.id, p.asin FROM reviews r
+        JOIN products p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
+        WHERE r.stars > p.price
+        ORDER BY r.id, p.asin
+    """)
+    filters = [node for node in query.logical.walk()
+               if isinstance(node, LogicalFilter)]
+    assert [str(node.condition) for node in filters] == ["greater(r.stars, p.price)"]
+    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
+    assert result.to_rows() == [
+        ("r0", "p0"), ("r0", "p1"), ("r2", "p0"), ("r5", "p0"), ("r5", "p1")]
+
+
+SQL_CALLS = {
+    # sqlglot parses each to a node of its own; Quail calls Arrow with
+    # SQL's meaning. r0, r1, r3, and r4 pass q1
+    "LOG10(r.stars * 20) > 1.7": [True, False, None, True],
+    "SUBSTRING(r.lang, 2, 1)": ["n", "n", "n", "n"],
+    "CONCAT(r.lang, '-', r.lang)": ["en-en", "en-en", "en-en", "en-en"],
+    "CASE WHEN r.stars > 3 THEN 'high' WHEN r.stars > 0 THEN 'low' END": [
+        "high", "low", None, "low"],
+    "CAST(r.stars AS DOUBLE)": [5.0, 2.0, None, 3.0],
+    "r.stars IN (2, 3)": [False, True, None, True],
+    "ROUND(r.stars / 2)": [3.0, 1.0, None, 2.0],
+    "GREATEST(r.stars, 3)": [5, 3, None, 3],
+    "STRPOS(r.lang, 'n')": [2, 2, 2, 2],
+    "r.stars BETWEEN 2 AND 3": [False, True, None, True],
+}
+
+
+@pytest.mark.parametrize("dialect", ["bq", "snowflake"])
+def test_sql_functions_sqlglot_names_call_arrow_with_sqls_meaning(session, dialect):
+    for expression, expected in SQL_CALLS.items():
+        query = session.sql(
+            f"SELECT r.id, {expression} AS v FROM reviews r "
+            f"WHERE AI_FILTER(PROMPT('q1: {{0}}', r.review)) ORDER BY r.id",
+            dialect=dialect)
+        values = _run(query, make_executor(TRUTH)).collect().column("v").to_pylist()
+        assert values == expected, expression
+    with pytest.raises(CompileError, match="remainder"):
+        session.sql("SELECT r.id, MOD(r.stars, 2) AS v FROM reviews r "
+                    "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))", dialect=dialect)
+
+
+def test_order_by_group_by_on_and_prompt_take_expressions(session):
+    # q1 keeps r0, r1, r3, and r4; their stars are 5, 2, None, and 3
+    first = "FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
+    query = session.sql(f"SELECT r.id {first} ORDER BY ABS(r.stars - 3), r.id")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("r4",), ("r1",), ("r0",), ("r3",)]
+    query = session.sql(
+        f"SELECT CASE WHEN r.stars > 2 THEN 'hi' ELSE 'lo' END AS band, "
+        f"COUNT(*) AS n, SUM(r.stars * 2) AS s {first} "
+        f"GROUP BY CASE WHEN r.stars > 2 THEN 'hi' ELSE 'lo' END ORDER BY band")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("hi", 2, 16), ("lo", 2, 4)]
+    query = session.sql(
+        "SELECT r.id FROM reviews r "
+        "WHERE AI_FILTER(PROMPT('q1: {0}', LOWER(TRIM(r.review)))) ORDER BY r.id")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("r0",), ("r1",), ("r3",), ("r4",)]
+    session.register("langs", quail.DocumentProvider.from_table(pa.table({
+        "code": ["EN", "FR"], "notes": ["n0", "n1"]}), id_col="code"))
+    query = session.sql("""
+        SELECT r.id, l.code FROM reviews r
+        JOIN langs l ON UPPER(TRIM(r.lang)) = l.code
+            AND AI_FILTER(PROMPT('x {0} {1}', r.review, l.notes))
+        ORDER BY r.id""")
+    assert "on upper(utf8_trim_whitespace(r.lang)) = l.code" in query.explain()
+    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
+    assert result.to_rows() == [("r0", "EN"), ("r1", "EN"), ("r2", "FR"),
+                                ("r3", "EN"), ("r4", "EN")]

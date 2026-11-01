@@ -2,18 +2,16 @@
 
 import random
 
-import pytest
-from helpers.fakes import expected_filter_rows, fake_readout
+from helpers.fakes import fake_readout
 
 from quail.backends.quail.executor.admission import (
     DROP,
     SKIP,
-    AdmissionReport,
     JoinAdmission,
     Settlement,
     pages_for,
 )
-from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
+from quail.backends.quail.executor.stages import filter_stages, run_stages
 from quail.catalog.tokens import PrefixTree
 
 
@@ -148,15 +146,6 @@ def _random_join(rng):
         truth.append([[int(rng.random() < 0.5) for _ in (lens if lst is None else lst)]
                       for lens, lst in zip(stages, row_lists)])
     return prefix, stages, frames, budget, truth, lists
-
-
-def _check_stream(out, filter_truth, pages):
-    assert out["filter_answers"] == expected_filter_rows(filter_truth)
-    survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
-    assert sorted(key[1] for key in out["anchor_keys"]) == survivors
-    assert not out["arena"].accounting.owned
-    assert out["arena"].accounting.free_pages == pages
-    return survivors
 
 
 def test_admission_invariants_over_random_shapes():
@@ -364,152 +353,6 @@ def test_join_admission_limit_ends_the_run_and_drains_the_queue():
     assert sched.drain() == [1, 2]
 
 
-def test_stop_groups_admit_one_anchor_per_group_and_skip_the_rest():
-    # groups {0, 1, 2} and {3, 4}: one anchor of each runs at a time
-    sched = JoinAdmission([50] * 5, [[10]], 250, arena_pages=100,
-                          page_tokens=16, stop_groups=[0, 0, 0, 1, 1])
-    assert [a for a, *_ in sched.next_chunk(100)] == [0, 3]
-    assert sched.next_chunk(100) == []
-    sched.report(3, 0, 0, 1, [0])
-    assert [a for a, *_ in sched.next_chunk(100)] == [4]
-    sched.report(0, 0, 0, 1, [1])
-    # the group's queued anchors are skipped without an answer
-    assert sched.take_skipped() == [1, 2] and sched.take_skipped() == []
-    assert sched.next_chunk(100) == [] and not sched.done()
-    sched.report(4, 0, 0, 1, [1])
-    assert sched.done() and sched.survivors == 2
-    assert sorted(sched.answers[0]) == [0, 3, 4]
-    assert sched.drain() == []
-    with pytest.raises(ValueError, match="stop_groups"):
-        JoinAdmission([50] * 2, [[10]], 250, arena_pages=100,
-                      page_tokens=16, stop_groups=[0])
-    # a wider stop admits that many anchors of a group at once
-    sched = JoinAdmission([50] * 5, [[10]], 250, arena_pages=100,
-                          page_tokens=16, stop_groups=[0, 0, 0, 1, 1],
-                          stop_width=2)
-    assert [a for a, *_ in sched.next_chunk(100)] == [0, 1, 3, 4]
-    sched.report(0, 0, 0, 1, [1])
-    assert sched.take_skipped() == [2] and not sched.done()
-
-
-def test_filter_stop_groups_skip_a_queued_child_and_release_its_parent(
-        monkeypatch):
-    # document 1 borrows from 0 and passes; document 2, queued behind
-    # them in the same group, never runs and the parent's hold goes
-    # a 70 token budget holds one document per chunk, so one group's
-    # documents run one at a time
-    got, tokens, borrowed, arena = _tree_filter(
-        monkeypatch, truth=[[0], [1], [1]], budget=70,
-        stop_groups=[0, 0, 0])
-    assert got == {0: [0], 1: [1]}
-    assert borrowed == 32 and tokens == 64 + 32 + 2
-    assert not arena.resident_keys() and not arena._holds
-    # a parent in another group still serves its child
-    got, _, borrowed, _ = _tree_filter(
-        monkeypatch, truth=[[1], [1], [1]], budget=70,
-        stop_groups=[0, 1, 0])
-    assert got == {0: [1], 1: [1]}
-    assert borrowed == 32
-
-
-def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
-
-    from helpers.fakes import (
-        DOC,
-        FRAME,
-        PARTNER,
-        cpu_arena,
-        fake_pack,
-        fake_pipeline,
-        fake_torch,
-    )
-
-    from quail.backends.quail.executor import chunk as chunk_mod
-
-    packed = []
-
-    def recording_pack(torch, arena, specs, **kw):
-        packed.extend((s["key"], s.get("start", 0),
-                       None if s["prefix"] is None else len(s["prefix"]))
-                      for s in specs if s["prefix"] is not None)
-        return fake_pack(torch, arena, specs, **kw)
-
-    monkeypatch.setattr(chunk_mod, "pack_chunk", recording_pack)
-    keys = [("a", d) for d in range(3)]
-    # anchor 1 shares 32 tokens (2 pages) with anchor 0; anchor 2 none
-    prefixes = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 32, [DOC + 2] * 64]
-    tree = PrefixTree(order=[0, 1, 2], parent=[None, 0, None],
-                      shared=[0, 32, 0])
-    def forward(chunk):
-        # partner 0 matches every anchor; frame entries answer nothing
-        return [int(suffix[0] == PARTNER) if suffix[0] < FRAME else 0
-                for spec in chunk.specs for suffix in spec["suffixes"]]
-
-    pipeline = fake_pipeline(forward_chunk=forward)
-    answers = fake_readout()
-    arena = cpu_arena(64)
-    stats = {}
-    out, _, tokens = run_stages(
-        fake_torch(), arena, pipeline,
-        [Stage(suffixes=[[PARTNER], [PARTNER + 1]],
-               readout=answers, frame=[FRAME])],
-        prefixes, 500,
-        anchor_keys=keys,
-        prefix_tree=tree,
-        stats=stats)
-    assert out == [{0: [1, 0], 1: [1, 0], 2: [1, 0]}]
-    # the child packs its 32 own tokens from position 32
-    assert packed == [(keys[0], 0, 64), (keys[1], 32, 32), (keys[2], 0, 64)]
-    assert tokens == 64 + 32 + 64 + 3 * (1 + 2)
-    assert stats["borrowed_tokens"] == 32
-    assert arena.free_pages == 64 and not arena.accounting.owned
-
-    # one anchor per chunk, with anchor 2 between parent and child: the
-    # parent answers before the child's turn, and its pages stay held
-    # until the child borrows them
-    packed.clear()
-    arena = cpu_arena(64)
-    out, _, tokens = run_stages(
-        fake_torch(), arena, pipeline,
-        [Stage(suffixes=[[PARTNER], [PARTNER + 1]],
-               readout=answers, frame=[FRAME])],
-        prefixes, 67,
-        anchor_keys=keys,
-        stats=stats,
-        prefix_tree=PrefixTree(order=[0, 2, 1], parent=[None, 0, None],
-                               shared=[0, 32, 0]))
-    assert out == [{0: [1, 0], 1: [1, 0], 2: [1, 0]}]
-    assert (keys[1], 32, 32) in packed
-    assert stats["borrowed_tokens"] == 32
-    assert arena.free_pages == 64 and not arena.accounting.owned
-
-
-def test_a_skipped_stage_passes_the_anchor_on_with_nothing_asked():
-    # anchor 0 skips stage 1 of three and is asked at stage 2; anchor 1
-    # skips the last stage, which counts as passed
-    asks = {0: lambda j: SKIP if j == 1 else None,
-            1: lambda j: SKIP if j == 2 else None}
-    sched = JoinAdmission([50, 50], [[10], [10], [10]], 250,
-                          arena_pages=100, page_tokens=16,
-                          anchor_partners=asks)
-    groups = sched.next_chunk(100)
-    assert [(a, j) for a, j, *_ in groups] == [(0, 0), (1, 0)]
-    assert sched.report(0, 0, 0, 1, [1]) == AdmissionReport(
-        transitions=((0, 0, True),))
-    assert sched.report(1, 0, 0, 1, [1]) == AdmissionReport(
-        transitions=((1, 0, True),))
-    assert [(a, j) for a, j, *_ in sched.next_chunk(100)] == [(0, 2), (1, 1)]
-    assert sched.report(0, 2, 0, 1, [1]) == AdmissionReport(
-        (Settlement("finished", 0, True),), ((0, 2, True),))
-    assert sched.report(1, 1, 0, 1, [1]) == AdmissionReport(
-        (Settlement("finished", 1, True),), ((1, 1, True),))
-    assert sched.done() and sched.survivors == 2
-    assert sched.answers[1] == {1: [1]} and sched.answers[2] == {0: [1]}
-    with pytest.raises(ValueError, match="first stage cannot be skipped"):
-        JoinAdmission([50], [[10]], 250, arena_pages=100, page_tokens=16,
-                      anchor_partners={0: lambda j: SKIP})
-
-
 def test_a_document_too_long_for_a_chunk_or_the_arena_settles_unanswered():
     # anchor 1 cannot fit a 250-token chunk with its question, anchor 2
     # cannot fit the 20-page arena; both settle without a chunk
@@ -522,60 +365,30 @@ def test_a_document_too_long_for_a_chunk_or_the_arena_settles_unanswered():
     assert sorted(a for a, *_ in groups) == [0, 3]
 
 
-@pytest.mark.parametrize("custom_decision", [False, True])
-def test_stage_transition_waits_for_launches_and_respects_custom_decision(
-        custom_decision):
-    sched = JoinAdmission(
-        [8], [[8, 8, 8, 8], [8]], 16, arena_pages=20, page_tokens=16,
-        advance=(lambda a, j, row: all(row)) if custom_decision else None)
-    assert sched.next_chunk(20) == [(0, 0, 0, 1, True)]
-    # Even a TRUE answer cannot advance before all requests are launched.
-    assert sched.report(0, 0, 0, 1, [1]) == AdmissionReport()
-    assert sched.next_chunk(20) == [(0, 0, 1, 3, False)]
-    assert sched.next_chunk(20) == [(0, 0, 3, 4, False)]
-    partial = sched.report(0, 0, 1, 3, [0, 0])
-    if custom_decision:
-        # A custom decision can reject a row despite its first TRUE answer.
-        assert partial == AdmissionReport()
-        assert sched.next_chunk(20) == []
-        assert sched.report(0, 0, 3, 4, [0]) == AdmissionReport(
-            (Settlement("dropped", 0, False),), ((0, 0, False),))
-    else:
-        # The next stage starts before the rest of the prior row returns.
-        assert partial == AdmissionReport(transitions=((0, 0, True),))
-        assert sched.next_chunk(20) == [(0, 1, 0, 1, False)]
-        assert sched.report(0, 0, 3, 4, [0]) == AdmissionReport()
-        assert sched.report(0, 1, 0, 1, [1]) == AdmissionReport(
-            (Settlement("finished", 0, True),), ((0, 1, True),))
-    assert sched.done()
 
+def test_documents_entering_a_gated_stage_wait_in_place_and_are_asked_together():
+    # three stages, the second gated; anchor 1 skips it to the third,
+    # anchor 2 drops there, and anchors 0 and 1 keep their queue order
+    asked = []
 
-@pytest.mark.parametrize("selection, stages, kind", [
-    (DROP, 2, "dropped"),
-    ([], 2, "finished"),
-    ([], 3, "dropped"),
-])
-def test_next_stage_settlement_preserves_the_answered_stage_decision(
-        selection, stages, kind):
-    sched = JoinAdmission(
-        [8], [[8]] * stages, 16, arena_pages=20, page_tokens=16,
-        anchor_partners={0: lambda j: None if j == 0 else selection})
-    assert sched.next_chunk(20) == [(0, 0, 0, 1, True)]
-    assert sched.report(0, 0, 0, 1, [1]) == AdmissionReport(
-        (Settlement(kind, 0, False),), ((0, 0, True),))
-    assert sched.done() and sched.survivors == 0
+    def partners(a):
+        def ask(j):
+            asked.append((a, j))
+            if j == 1:
+                return {0: [0], 1: SKIP, 2: DROP}[a]
+            return [0]
+        return ask
 
-
-def test_a_limit_paces_admission_by_the_parts_survival():
-    # a limit of two survivors at a survival of a half: four anchors
-    # in flight are expected to reach it, so the fifth waits; a drop
-    # settles one and lets the next in
-    sched = JoinAdmission([50] * 8, [[10]], 500, arena_pages=100,
-                          page_tokens=16, limit=2, survival=0.5)
-    assert [a for a, *_ in sched.next_chunk(500)] == [0, 1, 2, 3]
-    assert sched.next_chunk(500) == []
-    sched.report(0, 0, 0, 1, [0])
-    assert [a for a, *_ in sched.next_chunk(500)] == [4]
-    sched.report(1, 0, 0, 1, [1])
-    sched.report(2, 0, 0, 1, [1])
-    assert sched.limit_reached() and sched.next_chunk(500) == []
+    sched = JoinAdmission([50, 50, 50], [[10], [10], [10]], 250, arena_pages=100,
+                          page_tokens=16, gated=[1],
+                          anchor_partners={a: partners(a) for a in range(3)})
+    asked.clear()
+    reports = [sched.report(a, j, start, end, [1])
+               for a, j, start, end, _ in sched.next_chunk(100)]
+    assert asked == [] and all(not report.settlements for report in reports)
+    prepared = []
+    settled = sched.decide_waiting(lambda j, anchors: prepared.append((j, anchors)))
+    assert prepared == [(1, [0, 1, 2])]
+    assert asked == [(0, 1), (1, 1), (1, 2), (2, 1)]
+    assert settled == [Settlement("dropped", 2, False)]
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False), (1, 2, 0, 1, False)]

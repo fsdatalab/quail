@@ -96,30 +96,11 @@ number of GPUs and the
 Startup is excluded from both query time and cost. A 100K-document
 filter on Qwen3 4B typically costs a few cents per query.
 
-## Python builder API
+## Write more queries
 
-If you prefer building queries in Python instead of writing SQL, you
-can use the builder API:
-
-```python
-from quail import col, prompt
-
-config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-
-with quail.Session(config=config) as session:
-    session.register("reviews", quail.DocumentProvider.from_dataset(
-        reviews, id_col="id",
-    ))
-    result = (session.docs("reviews").alias("r")
-              .ai_if(prompt(
-                  'Does this review mention a positive aspect of the movie?\n\n{0}',
-                  col("r.body")))
-              .select("r.id")
-              .collect())
-```
-
-See the [Python API](/docs/user-guide/python-api) page for the full
-reference.
+See the [SQL reference](/docs/user-guide/sql) for joins, scores,
+classification, extraction, and the other functions you can use in
+`session.sql()`.
 
 ## Running on Modal
 

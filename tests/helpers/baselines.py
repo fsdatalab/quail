@@ -5,10 +5,8 @@ from types import SimpleNamespace
 import pyarrow as pa
 
 import quail
-from quail.backends.base import BackendExecutionContext, GpuContext
-from quail.baselines.execution import RequestModelExecution
+from quail.backends.base import BackendExecutionContext
 from quail.planner.plan import EngineConfig
-from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 CAPACITY = {"kv_cache_size_tokens": 1_000, "block_size": 1, "max_num_seqs": 16}
 
@@ -50,15 +48,3 @@ class _Client:
 
     def reset_prefix_cache(self):
         return True
-
-
-def _execution(documents, *, model=QWEN3_4B_FP8, **settings):
-    return RequestModelExecution(GpuContext(
-        gpu_index=0, gpus=1, model=model, device=H100_SXM, query_settings={
-            "client": _Client(), "sampling_params": object(),
-            "documents": documents, "true_ids": [1], "capacity": CAPACITY,
-            "filter_submission": "operator-at-a-time",
-            "join_submission": "anchor-major",
-            **settings,
-        },
-    ))

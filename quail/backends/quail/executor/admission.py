@@ -213,6 +213,10 @@ class JoinAdmission:
             one suffix is written into the anchor's own pages.
         answer_dtype: The answer array type, one for every stage or a
             list per stage; None records 0/1 lists.
+        gated: The stages whose conditions decide the anchors entering
+            them together. An anchor entering one waits in the ready
+            queue, in its place, until decide_waiting runs the stage's
+            request for it.
         reserve: Optional callable(anchor, borrow) that reserves the anchor's
             storage before admission. borrow is None or (parent, shared tokens).
             False leaves the anchor queued; True commits the reservation.
@@ -235,7 +239,7 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
-                 stop_groups=None, stop_width=1, reserve=None):
+                 stop_groups=None, stop_width=1, reserve=None, gated=()):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -300,6 +304,8 @@ class JoinAdmission:
         self._lists = []           # per anchor, per stage: indices or None
         self._cums = []            # per anchor, per stage: cumulative sums
         self._lazy = []            # per anchor: callable(stage) or None
+        self.gated = frozenset(gated)
+        self._waiting = []         # anchors entering a gated stage
         self._page_cost = []
         self._carried = []
         self._first = []           # per anchor: its first partner's cost
@@ -343,23 +349,30 @@ class JoinAdmission:
         lst = self._lists[a][j]
         return len(self.stages[j]) if lst is None else len(lst)
 
-    def _enter(self, a, j):
+    def _enter(self, a, j, decided=False):
         """Advance a document past skipped stages to its next request.
 
         Args:
             a: Anchor document index.
             j: Stage index to enter.
+            decided: Whether the conditions of stage j decided the
+                document already, so it asks the stage now.
 
         Returns:
-            None if the document has requests to run. Otherwise, the completion
-            event: "dropped" for removal or an empty intermediate stage, and
-            "finished" when the document completes its final stage.
+            None if the document has requests to run or waits at a
+            gated stage. Otherwise, the completion event: "dropped"
+            for removal or an empty intermediate stage, and "finished"
+            when the document completes its final stage.
         """
         k = len(self.stages)
         ask = self._lazy[a]
         while True:
             self._stage[a] = j
             self._next[a] = 0
+            if ask is not None and j in self.gated and not decided:
+                self._waiting.append(a)
+                return None
+            decided = False
             lst = None if ask is None else ask(j)
             if lst is DROP:
                 self._stage[a] = _DONE
@@ -724,6 +737,41 @@ class JoinAdmission:
         for settlement in settlements:
             self._settle_group(settlement.anchor, settlement.survived)
         return AdmissionReport(tuple(settlements), tuple(transitions))
+
+    def decide_waiting(self, prepare):
+        """Ask the gated stages for the anchors waiting at them.
+
+        Each stage's conditions first decide its waiting anchors
+        together. An anchor kept keeps its place in the ready queue; one
+        dropped, or settled past skipped stages, leaves it.
+
+        Args:
+            prepare: Callable(stage, anchors), run before the stage asks
+                those anchors.
+
+        Returns:
+            The settlements, as report gives them.
+        """
+        settlements = []
+        while self._waiting:
+            waiting, self._waiting = self._waiting, []
+            stages = {}
+            for a in waiting:
+                stages.setdefault(self._stage[a], []).append(a)
+            for j, anchors in sorted(stages.items()):
+                prepare(j, anchors)
+            left = set()
+            for a in waiting:
+                settled = self._enter(a, self._stage[a], decided=True)
+                if settled is not None:
+                    left.add(a)
+                    settlements.append(Settlement(
+                        settled, a, bool(self._true[a][-1])))
+            if left:
+                self.ready = deque(a for a in self.ready if a not in left)
+        for settlement in settlements:
+            self._settle_group(settlement.anchor, settlement.survived)
+        return settlements
 
     def _settle_group(self, a, survived):
         """Free the anchor's group for its next anchor, or skip the rest.

@@ -19,7 +19,7 @@ answer cue) over the document's prefix, and one readout row at the cue
 that confirms the reference label. An extraction's reference answer is
 verified in one pass after the cue, each of its tokens a readout row.
 
-Every operator in the plan is priced or refused: an Apply, an AI.SCORE
+Every operator in the plan is priced or refused: an AI.SCORE
 predicate or column, a LIMIT, or a join without full semantics raises
 NotImplementedError.
 
@@ -52,6 +52,7 @@ from quail.logical import (
     SemanticSaeFeatures,
     Unnest,
     Window,
+    condition_columns,
 )
 from quail.planner.sol.search import (
     ANSWER_TEST,
@@ -244,9 +245,14 @@ def _refuse_unpriced(logical) -> None:
                     f"the speed of light estimate does not price the filter "
                     f"{expression} on {alias!r}; it prices AI.IF and label "
                     f"filters")
-    for tests in operators.extract_filters.values():
+    for tests in operators.column_filters.values():
         for test in tests:
-            if test.condition.column.column.endswith(SPAN_SUFFIX):
+            if len(condition_columns(test.condition)) > 1:
+                raise NotImplementedError(
+                    f"the speed of light estimate does not price the test "
+                    f"{test.condition}, which reads more than one column")
+            if any(column.endswith(SPAN_SUFFIX)
+                   for column in condition_columns(test.condition)):
                 raise NotImplementedError(
                     f"the speed of light estimate does not price the test "
                     f"{test.condition} of an answer's span; the answer "

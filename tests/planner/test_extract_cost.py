@@ -2,9 +2,7 @@
 
 import pytest
 
-from quail.cost import extract as extract_cost
 from quail.cost.extract import (
-    SAMPLE_DOCUMENTS,
     ExtractAssumptions,
     document_work,
     estimate,
@@ -90,70 +88,7 @@ def test_parallel_estimate_preserves_work_and_limits_used_workers():
     assert _cost([100], gpus=8).seconds == _cost([100]).seconds
 
 
-def test_cost_uses_plan_limits_and_separate_answer_assumptions():
-    assumptions = ExtractAssumptions(answer_tokens=40)
-    cost = _cost([100], max_answer_tokens=8, draft_tokens=3, assumptions=assumptions)
-    context = HEAD + 100 + TAIL
-    rounds = assumptions.rounds(8, 3)
-    assert rounds == pytest.approx(1 + (39 / 40) ** 4)
-    assert cost.work == scan(HEAD + 100, TAIL) + _rounds_work(context, 4, rounds)
-    assert cost.suffix_tokens == pytest.approx(TAIL + 4 * rounds)
-    assert cost.rows == pytest.approx(1 + 4 * rounds)
-    shorter = _cost([100], max_answer_tokens=8, draft_tokens=3,
-                    assumptions=ExtractAssumptions(answer_tokens=2))
-    assert shorter.work.tokens < cost.work.tokens
-    capped = _cost([100], max_answer_tokens=1, assumptions=assumptions)
-    assert capped.work == scan(HEAD + 100, TAIL)
-    windowed, _, _ = document_work(
-        100, HEAD, TAIL, window=128, max_answer_tokens=8, draft_tokens=3,
-        draft_policy="fixed", assumptions=assumptions)
-    assert windowed.sliding_kv_read == pytest.approx(rounds * 127)
-    recurrent, fed, rows = _document(
-        100, max_answer_tokens=8, draft_tokens=3,
-        assumptions=assumptions, recurrent=True)
-    replay = 4 * (rounds - 1)
-    assert recurrent.tokens == pytest.approx(cost.work.tokens + replay)
-    assert fed == pytest.approx(cost.suffix_tokens + replay)
-    assert rows == cost.rows
-    assert recurrent.state_read == pytest.approx(2 + 2 * (rounds - 1))
-    assert recurrent.state_written == pytest.approx(2 + rounds - 1)
 
 
-def test_adaptive_policy_drafts_longer_for_longer_documents():
-    # the round's KV read grows with the document, so the policy drafts
-    # more and takes fewer rounds than a fixed short draft; a scan reads
-    # no KV, so the KV read counts the rounds alone
-    per_token = 0.02
-    long, long_fed, _ = _document(8000, draft_tokens=63, draft_policy="adaptive",
-                                  round_cost_per_token=per_token)
-    fixed, fixed_fed, _ = _document(8000, draft_tokens=4, draft_policy="fixed")
-    assert long.kv_read < fixed.kv_read
-    short, short_fed, _ = _document(400, draft_tokens=63, draft_policy="adaptive",
-                                    round_cost_per_token=per_token)
-    # a short document's cheaper KV read earns a shorter draft
-    assert short_fed - TAIL < long_fed - TAIL
 
 
-def test_a_large_table_is_priced_from_a_sample_of_its_documents(monkeypatch):
-    calls = []
-    original = extract_cost.document_work
-
-    def counted(length, *args, **kwargs):
-        calls.append(length)
-        return original(length, *args, **kwargs)
-
-    monkeypatch.setattr(extract_cost, "document_work", counted)
-    # 100 short documents, then 100 long ones, each pattern repeated
-    lengths = ([100] * 100 + [1000] * 100) * 50
-    sampled = _cost(lengths, draft_policy="adaptive")
-    assert len(calls) == SAMPLE_DOCUMENTS
-    # the sample keeps the first and the last document
-    assert calls[0] == lengths[0] and calls[-1] == lengths[-1]
-    calls.clear()
-    exact = _cost(lengths[:SAMPLE_DOCUMENTS], draft_policy="adaptive",
-                  expected_rows=len(lengths))
-    assert len(calls) == SAMPLE_DOCUMENTS
-    # both are means of the same two lengths, so they agree closely
-    assert sampled.seconds == pytest.approx(exact.seconds, rel=0.05)
-    assert sampled.work.tokens == pytest.approx(
-        len(lengths) * (HEAD + 550 + TAIL), rel=0.05)

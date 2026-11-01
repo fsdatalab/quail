@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
+from quail.execution.deduplicate import deduplicate
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.physical import (
     ExecutionLocation,
@@ -60,6 +61,9 @@ class ExecutionContext:
     functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
     gpus: int = 1
     run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
+    # alias -> the row columns its documents are grouped by beside their
+    # tokens; empty leaves every model operator asking per row
+    deduplicate: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 def _check_ports(node, result) -> None:
     expected = {output.name for output in node.outputs}
@@ -121,8 +125,14 @@ class GenericRunner:
                         for port in member.inputs
                         if port.source.node_id not in inside}
                     for member in pipeline}
+                deduplicated = deduplicate(graph, pipeline, inputs, context)
                 started = time.perf_counter()
-                results = context.run_pipeline(pipeline, inputs, context)
+                results = context.run_pipeline(
+                    pipeline,
+                    inputs if deduplicated is None else deduplicated.inputs,
+                    context)
+                if deduplicated is not None:
+                    results = deduplicated.expanded(results)
                 # a pipeline's wall is charged once, to its first member
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
@@ -150,10 +160,17 @@ class GenericRunner:
                     ]
                     for input_port in node.inputs
                 }
+                deduplicated = deduplicate(
+                    graph, (node,), {node.node_id: inputs}, context)
                 started = time.perf_counter()
                 result = context.runtimes[node.runtime_key].execute(
-                    node, inputs, context
-                )
+                    node,
+                    inputs if deduplicated is None
+                    else deduplicated.inputs[node.node_id],
+                    context)
+                if deduplicated is not None:
+                    result = deduplicated.expanded(
+                        {node.node_id: result})[node.node_id]
                 record(node, result, started)
                 continue
             record(node, result)

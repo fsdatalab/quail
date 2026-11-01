@@ -22,7 +22,6 @@ from quail.physical import (
 )
 from quail.planner.operators.common import (
     bind_inference,
-    emit_calls,
     inference_node,
     node_index,
 )
@@ -475,9 +474,6 @@ def emit_classify(builder, alias, expected_rows, calls, port) -> tuple:
     """
     table = classify_builder(builder.context, alias, "quail")
     labels = builder.operators.labels
-    tests = {}
-    for test in builder.operators.label_filters.get(alias, ()):
-        tests.setdefault(test.call, []).append(test)
 
     def node_of(call, port, expected_rows, _index):
         spec, work = table.prepare(call, labels.names[call], expected_rows)
@@ -485,8 +481,8 @@ def emit_classify(builder, alias, expected_rows, calls, port) -> tuple:
             builder.scoring.work += work
         return table.node(spec, port, node_index(builder, AiClassify))
 
-    return emit_calls(builder, alias, expected_rows, port, calls, node_of,
-                      tests=tests, projected=lambda call: call in labels.projected)
+    return builder.emit_columns(alias, expected_rows, port, calls, node_of,
+                                projected=lambda call: call in labels.projected)
 
 
 def joined_calls(labels: LabelWork) -> list:

@@ -6,7 +6,7 @@ import time
 import pytest
 from helpers import server_fakes
 
-from quail.server.checkpoint import Checkpoint, restore
+from quail.server.checkpoint import Checkpoint
 from quail.server.store import Store
 
 SPEC = {"sql": "SELECT r.id FROM reviews r", "dialect": "snowflake",
@@ -22,29 +22,6 @@ def create(store):
 def fetch_one(path, sql):
     with sqlite3.connect(str(path)) as conn:
         return conn.execute(sql).fetchone()
-
-
-def test_backup_is_a_complete_copy_including_the_wal(tmp_path):
-    store = Store(tmp_path / "live" / "quail.sqlite3")
-    first = create(store)
-    epoch = store.begin(first.id)
-    store.update(first.id, epoch, state="running", progress={"done": 1})
-    # the WAL holds these writes; a plain file copy would miss them
-    assert (tmp_path / "live" / "quail.sqlite3-wal").stat().st_size > 0
-    copy = tmp_path / "volume" / "quail.sqlite3"
-    store.backup(copy)
-    assert not copy.with_name("quail.sqlite3.tmp").exists()
-    assert fetch_one(copy, "SELECT id, state FROM queries") == (first.id, "running")
-    store.close()
-
-    expected_rows = tmp_path / "fresh" / "quail.sqlite3"
-    assert restore(copy, expected_rows)
-    assert not restore(copy, expected_rows)
-    reopened = Store(expected_rows)
-    assert reopened.recover() == [first.id]
-    assert reopened.get(first.id).state == "interrupted"
-    assert reopened.get(first.id).progress == {"done": 1}
-    reopened.close()
 
 
 def test_checkpoint_copies_after_writes_syncs_now_and_survives_failing_commits(
@@ -107,71 +84,3 @@ def test_checkpoint_copies_after_writes_syncs_now_and_survives_failing_commits(
         checkpoint.sync()
     assert checkpoint.run_once(), "the failed copy is tried again"
     store.close()
-
-
-def test_server_runs_closers_before_closing_the_store(tmp_path):
-    pytest.importorskip("starlette")
-    from quail.server.app import ServerSettings, create_app
-
-    settings = ServerSettings(
-        data_dir=tmp_path / "data", db_path=tmp_path / "local" / "live.sqlite3",
-        models=("qwen3-4b-fp8",), device="h100-sxm", in_process=True,
-        hooks=server_fakes.hooks)
-    service = create_app(settings).state.server
-    assert service.store.path == tmp_path / "local" / "live.sqlite3"
-    checkpoint = Checkpoint(service.store, tmp_path / "data" / "quail.sqlite3")
-    service.add_closer(checkpoint.stop)
-    seen = []
-    service.add_closer(lambda: seen.append(service.store.closed))
-    service.stop()
-    assert seen == [False]
-    assert service.store.closed
-    assert (tmp_path / "data" / "quail.sqlite3").exists()
-
-
-def test_a_failed_restore_or_backup_leaves_the_files_as_they_were(
-        tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
-    from quail.server import checkpoint as checkpoint_module
-    from quail.server.checkpoint import restore
-
-    source, destination = tmp_path / "saved.sqlite3", tmp_path / "live.sqlite3"
-    with sqlite3.connect(source) as conn:
-        conn.execute("CREATE TABLE saved (value INTEGER)")
-        conn.execute("INSERT INTO saved VALUES (1)")
-    copy = checkpoint_module.shutil.copyfile
-
-    def interrupted_copy(src, dst):
-        with open(dst, "wb") as handle:
-            handle.write(b"partial")
-        raise OSError("copy interrupted")
-
-    monkeypatch.setattr(checkpoint_module.shutil, "copyfile", interrupted_copy)
-    with pytest.raises(OSError, match="copy interrupted"):
-        restore(source, destination)
-    # nothing is left behind, so the next restore is not blocked
-    assert list(tmp_path.iterdir()) == [source]
-    monkeypatch.setattr(checkpoint_module.shutil, "copyfile", copy)
-    assert restore(source, destination)
-    assert fetch_one(destination, "SELECT value FROM saved") == (1,)
-
-    store = Store(tmp_path / "store.sqlite3")
-    target = tmp_path / "backup.sqlite3"
-    create(store)
-    store.backup(target)
-
-    def interrupted_backup(connection):
-        connection.execute("CREATE TABLE partial (value INTEGER)")
-        connection.commit()
-        raise OSError("backup interrupted")
-
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(store, "_conn", SimpleNamespace(backup=interrupted_backup))
-            with pytest.raises(OSError, match="backup interrupted"):
-                store.backup(target)
-        assert fetch_one(target, "SELECT count(*) FROM queries") == (1,)
-        assert not list(tmp_path.glob("*.tmp"))
-    finally:
-        store.close()

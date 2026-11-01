@@ -1,0 +1,21 @@
+logical:
+  Project: u.id
+    SemanticFilter
+      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the customer message above whether the customer expresses frustration or dissatisfaction with the agent, such as repeating a request, objecting to a refusal, or complaining about the service.\n\nInstruction: answer TRUE if the customer expresses frustration or dissatisfaction with the agent, FALSE otherwise.', u.content) (selectivity=2.21%)
+      Scan support_messages as u [content, id, role] where u.role = 'user'
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                    est. rows   est. pass   est. time
+  Project: u.id                                                        0.0221
+    AiFilter: u                                                        0.0221                 2.18 ms
+      KV rewind=on
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           1       2.21%
+      Scan support_messages as u                                            1
+        tokens=156, mean_document_tokens=26
+        where u.role = 'user'
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

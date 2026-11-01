@@ -59,15 +59,11 @@ class JoinPart(ExecutionPart):
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Bind partner inputs and any pairs produced by preceding operators."""
-        from quail.backends.quail.executor.operators.apply import ApplyGate
-
+        """Bind partner inputs to the documents of the preceding operators."""
         first = parts[0].node if parts else nodes[0]
         prefixes = DocumentPrefixes(
             first.document_head, context.state["documents"][nodes[0].anchor], ids)
-        upstream = {"documents": prefixes, "document_ids": ids, "parts": tuple(parts),
-                 "pairs": {part.node.written_position: part.rows for part in parts
-                           if isinstance(part, ApplyGate) and part.node.ids == "pairs"}}
+        upstream = {"documents": prefixes, "document_ids": ids, "parts": tuple(parts)}
         prepared = context.model_inputs(
             nodes[0], inputs, context, upstream, nodes=nodes)
         return cls(state, nodes, prepared, ids, context=context)
@@ -163,7 +159,7 @@ class JoinPart(ExecutionPart):
                     anchor_ids if j == 0 else id_positions(results[
                         nodes[j - 1].node_id].outputs[f"rows:{node.anchor}"]),
                     dtype=np.int64)
-                survivors = candidates[~np.isin(candidates, matched)]
+                survivors = candidates[member.keeps(np.isin(candidates, matched))]
             answer = {
                 "rows": rows,
                 "anchor_index": anchor_ids,
@@ -272,15 +268,11 @@ def runs_over_pairs(join: dict) -> bool:
     return bool(join.get("pairs_from"))
 
 
-def partner_maps(group, pair_tables, streamed=()) -> dict:
-    """Written position -> anchor row -> partner rows, per pair stage.
-
-    streamed names the written positions whose pairs arrive per batch
-    and need no table here.
-    """
+def partner_maps(group, pair_tables) -> dict:
+    """Written position -> anchor row -> partner rows, per pair stage."""
     maps = {}
     for join in group:
-        if not runs_over_pairs(join) or join["written_position"] in streamed:
+        if not runs_over_pairs(join):
             continue
         table = pair_tables.get(join["written_position"])
         if table is None:
@@ -410,9 +402,7 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
     node = nodes[0]
     group = [join_request(member) for member in nodes]
     stage_suffixes, tuple_indices = join_suffixes(group, documents, indices)
-    streamed_pairs = {} if upstream is None else upstream["pairs"]
-    maps = partner_maps(group, pair_tables, streamed=streamed_pairs)
-    maps.update(streamed_pairs)
+    maps = partner_maps(group, pair_tables)
     lists_for = partner_list_builder(
         group, [tuple_indices[stage.written_position] for stage in nodes], maps)
     anchor_ids = indices[node.anchor] if upstream is None else None

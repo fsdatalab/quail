@@ -144,3 +144,39 @@ def execution_groups(graph: PhysicalGraph, pipelines: dict) -> tuple:
         - {owner} for owner, group in groups.items()}
     ordered = TopologicalSorter(dependencies).static_order()
     return tuple(groups[owner] for owner in ordered)
+
+
+def resident_inputs(graph: PhysicalGraph, pipelines: dict) -> frozenset:
+    """Return the ids of the model nodes whose documents' KV is already resident.
+
+    KV residency is a physical property of a node's output: the
+    documents' KV, up to the document head and what the node wrote
+    after it, stays in the arena for the next operator. A node reads
+    resident KV, and so skips reading the documents again, when:
+
+    - it follows another member of its pipeline, which leaves the KV
+      in place for it; or
+    - it starts a pipeline on a table whose previous pipeline kept its
+      KV (a member with ``keep_kv``) under the same document head.
+
+    Args:
+        graph: The physical graph.
+        pipelines: Node id -> its pipeline's members, from build_pipelines.
+    """
+    resident = set()
+    kept = {}  # alias -> the document head a finished pipeline kept
+    for node in graph.topological_nodes():
+        if node.node_id not in pipelines:
+            continue
+        members = pipelines[node.node_id]
+        if members[0] is not node:
+            resident.add(node.node_id)
+            continue
+        (alias,) = node.document_aliases
+        if kept.get(alias) == node.document_head:
+            resident.add(node.node_id)
+        if any(getattr(member, "keep_kv", False) for member in members):
+            kept[alias] = node.document_head
+        else:
+            kept.pop(alias, None)
+    return frozenset(resident)
