@@ -67,9 +67,11 @@ class PromptLayout:
         choice_label: For a model that classifies by scoring one option
             block per label, the text before an AI.CLASSIFY question;
             None for a model that classifies with Quail's label prompt.
-        join_question_last: Whether a join prompt puts the question
-            after every document, in the tail, instead of in the anchor
-            frame, for a model trained to read its question last.
+        record_label: For a set-attention layout, the label before each
+            document of a join, formatted with its table's name; the
+            question then names each document "the <name> record". The
+            anchor document is the state and each partner tuple one
+            question. None keeps the numbered DOCUMENT blocks.
         label_segment: Whether the separator and question label are
             tokenized on their own, so a set-attention pass can keep
             them with the document and open each later question with
@@ -84,7 +86,7 @@ class PromptLayout:
     question_separator: str | None = None
     answer_rows: tuple[int, ...] = ()
     choice_label: str | None = None
-    join_question_last: bool = False
+    record_label: str | None = None
     label_segment: bool = False
 
     def question_segments(self, question: str, separator: str) -> list[str]:
@@ -134,7 +136,7 @@ PROMPT_LAYOUTS = {layout.name: layout for layout in (
         question_label="QUESTION:\n",
         question_end="\n\nReply with yes or no only.",
         question_separator="\n\n\n",
-        join_question_last=True,
+        record_label="{} record:\n",
         label_segment=True,
     ),
 )}
@@ -160,21 +162,54 @@ def render_join_question(template: str, layout: str = "ai-if") -> str:
 
 def render_join_frame(template: str, placeholder: int,
                       layout: str = "ai-if") -> str:
-    """The complete anchor frame, tokenized as one string.
-
-    A layout that asks the question last keeps only the anchor note.
-    """
-    if PROMPT_LAYOUTS[layout].join_question_last:
-        return join_anchor_note(placeholder)
+    """The complete anchor frame, tokenized as one string."""
     return join_anchor_note(placeholder) + render_join_question(template, layout)
 
 
-def join_tail_segments(template: str, layout: str = "ai-if") -> list[str]:
+def join_tail_segments(layout: str = "ai-if") -> list[str]:
     """The text after a join's last document, one entry per tokenized segment."""
     spec = PROMPT_LAYOUTS[layout]
-    if spec.join_question_last:
-        return spec.question_segments(template, JOIN_QUESTION_SEP)
     return [spec.question_end, *spec.answer_segments]
+
+
+def record_names(args) -> list[str]:
+    """Each join placeholder's record name: its table, or its alias when shared."""
+    tables = [argument.provider or argument.alias for argument in args]
+    return [argument.alias if tables.count(table) > 1 else table
+            for argument, table in zip(args, tables)]
+
+
+def name_records(template: str, names) -> str:
+    """Name each placeholder of a join question as "the <name> record"."""
+    for index, name in enumerate(names):
+        record = f"the {name} record"
+        template = template.replace(f"DOCUMENT {_marker(index)}", record)
+        template = template.replace(_marker(index), record)
+    return template
+
+
+def bind_record_join_prompt(template: str, args: tuple, turn: tuple[str, str],
+                            layout: str) -> Prompt:
+    """Build a join Prompt for a set-attention layout.
+
+    The anchor's label and document, then the question separator and
+    label, are the state; each partner tuple is one question: every
+    partner's label and document, the documents apart by a blank line,
+    then the question. The tail's first segment is that blank line.
+    """
+    spec = PROMPT_LAYOUTS[layout]
+    names = record_names(args)
+    state_tail = spec.question_separator + spec.question_label
+    segments = (JOIN_QUESTION_SEP,
+                name_records(template, names) + spec.question_end + turn[1])
+    return Prompt(template=template, args=tuple(args),
+                  preamble=shared_preamble(turn[0], layout),
+                  tail="".join(segments), frame=state_tail,
+                  frame_text=state_tail, kind="join",
+                  label_texts=tuple(
+                      (argument.alias, spec.record_label.format(name), state_tail)
+                      for argument, name in zip(args, names)),
+                  layout=layout, tail_segments=segments)
 
 
 def render_join_prompt_text(prompt, documents, anchor: int) -> str:
@@ -185,6 +220,12 @@ def render_join_prompt_text(prompt, documents, anchor: int) -> str:
             f"{len(documents)} documents")
     if anchor < 0 or anchor >= len(prompt.args):
         raise ValueError(f"join anchor placeholder {anchor} is out of range")
+    if PROMPT_LAYOUTS[prompt.layout].record_label is not None:
+        labels = [label for _, label, _ in prompt.label_texts]
+        blocks = [labels[i] + document for i, document in enumerate(documents)
+                  if i != anchor]
+        return (prompt.preamble + labels[anchor] + documents[anchor]
+                + prompt.frame + JOIN_QUESTION_SEP.join(blocks) + prompt.tail)
     out = prompt.preamble + documents[anchor]
     out += render_join_frame(prompt.template, anchor, prompt.layout)
     for i, document in enumerate(documents):
@@ -698,9 +739,11 @@ def bind_join_prompt(template: str, args: tuple,
             f"document block per table), got aliases {aliases}; to "
             f"mention a table's document again, use its marker in the "
             f"question text, not a second placeholder")
+    if PROMPT_LAYOUTS[layout].record_label is not None:
+        return bind_record_join_prompt(template, args, turn, layout)
     frame = render_join_frame(template, 0, layout)[len(join_anchor_note(0)):]
     preamble = shared_preamble(turn[0], layout)
-    segments = join_tail_segments(template, layout)
+    segments = join_tail_segments(layout)
     segments[-1] += turn[1]
     segments = tuple(segments)
     tail = "".join(segments)

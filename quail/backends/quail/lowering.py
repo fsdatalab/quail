@@ -65,6 +65,21 @@ def set_question_parts(lowered, model, tokenizer) -> dict:
                 question_header_token_ids=tuple(tokenizer(layout.question_label)))
 
 
+def set_join_parts(lowered, model, tokenizer) -> dict:
+    """A set-attention join's partner separator length and question header.
+
+    Raises:
+        ValueError: The model's layout does not label join records.
+    """
+    layout = PROMPT_LAYOUTS[model.prompt_layout]
+    if layout.record_label is None:
+        raise ValueError(f"{model.name!r}: a set-attention layout labels "
+                         f"each join record with its table")
+    first = lowered.prompt.tail_segments[0]
+    return dict(separator_tokens=len(tokenizer(first)),
+                question_header_token_ids=tuple(tokenizer(layout.question_label)))
+
+
 def bind_runtime_data(plan, region, context):
     """Put tokenized prompts and answer tokens in the physical plan."""
     tokenizer = context.tokenizer
@@ -93,6 +108,9 @@ def bind_runtime_data(plan, region, context):
                 label_token_ids=tuple((alias, runtime_ids[alias][0])
                                       for alias in node.partners),
                 tail_token_ids=tuple(prompt.tail_token_ids))
+            if context.model.attention_mask == "set":
+                node = replace(node, **set_join_parts(
+                    prompt, context.model, tokenizer))
         encoded_nodes.append(node)
 
     true_ids, false_ids = (

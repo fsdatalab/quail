@@ -68,6 +68,11 @@ class AiJoin(PhysicalNode):
     # anchors borrow the KV pages of an anchor that shares their token
     # prefix (the should_share_prefixes rule)
     share_prefixes: bool = False
+    # under set attention: the tokens of the blank line that opens the
+    # tail and parts partner documents, and the tokens that open each
+    # later question of a pass
+    separator_tokens: int = 0
+    question_header_token_ids: tuple[Token, ...] = ()
 
     def keeps(self, matched):
         """Which anchors the join keeps, given whether each matched a partner.

@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass
 
 from quail.cost.budgets import parallel_copies
-from quail.cost.joins import PricedJoin
+from quail.cost.joins import PricedJoin, packed_join_work
 from quail.cost.joins import stage_work as join_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work
@@ -139,10 +139,16 @@ def anchor_documents(spec, anchor, expected_rows) -> float:
     return surviving_documents(expected_rows[anchor], partners, spec.pair_fraction)
 
 
-def stage_work(spec, anchor, expected_rows, lengths, pre, *, resident=False, window=0):
+def stage_work(spec, anchor, expected_rows, lengths, pre, *, resident=False, window=0,
+               set_size=0):
     """Evaluate a prepared join's work at the current survivor counts."""
     if spec.cost is not None:
         return spec.cost.work(expected_rows)
+    if set_size:
+        return packed_join_work(
+            spec, anchor, anchor_documents(spec, anchor, expected_rows),
+            cross_tuples(spec, expected_rows), lengths, pre, window=window,
+            set_size=set_size)
     return join_work(
         spec,
         anchor,
@@ -155,13 +161,16 @@ def stage_work(spec, anchor, expected_rows, lengths, pre, *, resident=False, win
     )
 
 
-def _join_step(spec, anchor, expected_rows, lengths, resident, pre, state, window):
+def _join_step(spec, anchor, expected_rows, lengths, resident, pre, state, model):
     """Price one join and return its work, recorded inputs, and next KV state."""
     same_group = (state.group_open and state.pending_anchor == anchor
                   and spec.semantics == "full")
-    kind = residency(anchor, state, resident, same_group)
+    set_size = model.set_size if model.attention_mask == "set" else 0
+    # a set-attention model keeps no anchor KV between joins
+    kind = "none" if set_size else residency(anchor, state, resident, same_group)
     work = stage_work(spec, anchor, expected_rows, lengths, pre,
-                      resident=kind != "none", window=window)
+                      resident=kind != "none", window=model.sliding_window,
+                      set_size=set_size)
     step = JoinStep(
         written_position=spec.written_position, anchor=anchor, resident=kind,
         resident_documents=lengths[anchor].count if kind != "none" else 0,
@@ -199,7 +208,7 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
             resident,
             pre,
             state,
-            model.sliding_window,
+            model,
         )
         records.append(step)
         total = total + work
@@ -297,7 +306,7 @@ def search_joins(specs, expected_rows: dict, lengths: dict, resident,
                 spec, honor_forced, lengths, pre, chunk_tokens):
             work, step, next_state = _join_step(
                 spec, anchor, expected_rows_now, lengths, resident, pre,
-                state_now, model.sliding_window)
+                state_now, model)
             yield step.copy_work(gpus), next_state, step
 
     search = search_left_deep(

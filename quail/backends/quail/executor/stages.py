@@ -103,9 +103,11 @@ class Stage:
             request, as AI.MAP's answer. Admission reserves headroom for each answer.
         answer_index: Index of this stage's first map in the decoder.
         answer_dependencies: Decoder fields this stage's requests read.
-        questions: Under set attention, the tokens of each question in
-            the sole suffix, in order, after the state that the prefix
-            holds; empty when the whole sequence is one question.
+        questions: Under set attention, per suffix, the tokens of each
+            question in it, in order, after the state that the prefix
+            holds; each document requests one suffix, and each
+            question's last row is read. Empty when the whole sequence
+            is one question.
     """
 
     DROP = DROP
@@ -206,6 +208,13 @@ def _advance_stage(stages, a, j, row):
     if stage.decide is None:
         return bool(any(row) if stage.readout.dtype is None else np.any(row))
     return bool(stage.decide(a, row))
+
+
+def question_ends(questions) -> np.ndarray:
+    """The mask of each question's last row in a suffix of these questions."""
+    mask = np.zeros(int(sum(questions)), dtype=bool)
+    mask[np.cumsum(questions) - 1] = True
+    return mask
 
 
 def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,

@@ -309,16 +309,16 @@ def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
     """Check whether a set-attention model can run the query's AI operators.
 
     Such a model reads one document and its questions in one pass.
-    Quail packs a table's AI filters into passes; a join, which needs
-    both documents in one pass, and a score beside AI filters on one
-    table are refused.
+    Quail packs a table's AI filters into passes, and a join's partner
+    tuples into passes over each anchor; an AI.SCORE over two tables
+    and a score beside AI filters on one table are refused.
     """
     if model.attention_mask != "set":
         return None
-    if operators.joins:
+    if any(is_score(join.predicate) for join in operators.joins):
         return _refusal(
-            f"{model.name!r} runs AI joins with the partner documents in "
-            f"its questions, which Quail does not write yet",
+            f"{model.name!r} answers a join's partners as questions, but "
+            f"Quail does not score them yet, so AI.SCORE reads one table",
             "unsupported_set_attention_query")
     for alias, predicates in operators.filters.items():
         if scored and predicates:

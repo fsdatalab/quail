@@ -158,14 +158,16 @@ class ShouldRetainKv(PhysicalRule):
     The rule needs the logical plan on the context and fires only on a
     plan without a ``retention`` setting, so a later pass keeps the
     first schedule. It puts the schedule, the retention coefficients,
-    and the page cap in the ``retention`` setting.
+    and the page cap in the ``retention`` setting. A set-attention
+    model keeps no KV, so the rule does not fire for it.
     """
 
     name = "should_retain_kv"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None or context.logical_plan is None \
-                or "retention" in context.settings:
+                or "retention" in context.settings \
+                or context.model.attention_mask == "set":
             return None
         logical = context.logical_plan
         statistics = cached_statistics(

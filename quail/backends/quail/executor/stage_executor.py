@@ -19,6 +19,7 @@ from quail.backends.quail.executor.stages import (
     PendingAnswers,
     _advance_stage,
     frame_writes,
+    question_ends,
     state_share_points,
 )
 from quail.progress import Progress, logger
@@ -160,8 +161,10 @@ class StageExecutor:
         k = len(self.stages)
         if not self.paged and (
                 k > 1 or prefix_tree is not None
-                or any(stage.own_suffixes or len(stage.suffixes) != 1
+                or any(stage.own_suffixes
+                       or (len(stage.suffixes) != 1 and not stage.questions)
                        for stage in self.stages)):
+            # a set-attention stage's requests pick each sequence's one suffix
             raise ValueError("the unpaged path runs one stage of one suffix")
         if any(stage.append and not stage.single for stage in self.stages):
             raise ValueError("an append stage sends one request per document")
@@ -609,7 +612,10 @@ class StageExecutor:
                 own["read_mask"] = self.read_masks[j]
                 rows = int(own["read_mask"].sum())
             if self.stages[j].questions:
-                own["questions"] = tuple(self.stages[j].questions)
+                (index,) = indices
+                own["questions"] = tuple(self.stages[j].questions[index])
+                own["read_mask"] = question_ends(own["questions"])
+                rows = len(own["questions"])
             if self.stages[j].canvas is not None:
                 ids = np.asarray(self.stages[j].canvas(a))
                 if ids.ndim == 2:

@@ -58,6 +58,10 @@ ASPECTS = ["the acting", "the plot", "the music", "the ending", "the script",
            "the dialogue", "the stunts", "the soundtrack", "the director",
            "the length", "the jokes", "the price of the ticket"]
 PACKED = [f"Does the review mention {aspect}? {{0}}" for aspect in ASPECTS]
+# a join of reviews and aspects: 18 aspects make two passes per review
+JOIN = ("Does the review in DOCUMENT {0} discuss the movie aspect in "
+        "DOCUMENT {1}?")
+JOIN_ASPECTS = [*ASPECTS, "the sets", "the costumes"]
 # the largest difference between the two sides' yes-against-no logit
 # margins this test accepts, in logits
 MARGIN_TOLERANCE = 0.5
@@ -188,6 +192,7 @@ def _packs():
         StateTails,
         set_pass_stage,
     )
+    from quail.backends.quail.executor.stages import question_ends
     from quail.backends.quail.lowering import set_question_parts
     from quail.catalog.tokens import GigatokenEncoder
     from quail.logical import bind_prompt
@@ -212,10 +217,10 @@ def _packs():
                               tail)
         state = len(prefix)
         groups = [-1] * state + [
-            number for number, length in enumerate(stage.questions, 1)
+            number for number, length in enumerate(stage.questions[0], 1)
             for _ in range(length)]
         slots = [len(prefix) + int(index)
-                 for index in stage.read_mask.nonzero()[0]]
+                 for index in question_ends(stage.questions[0]).nonzero()[0]]
         out.append(dict(review=review, ids=prefix + stage.suffixes[0],
                         state=state, groups=groups, slots=slots,
                         questions=[q.removesuffix(" {0}") for q in PACKED],
@@ -228,8 +233,72 @@ def packs():
     return _packs()
 
 
+def _join_passes():
+    """Per review, its join passes over JOIN_ASPECTS as Quail lays them out.
+
+    Returns the passes' Stage, each pass's state ids, and per pass the
+    entry the reference reads: d1's state and question texts, and the
+    pass's ids, state length, token questions, and slots.
+    """
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.operators.filter import StateTails
+    from quail.backends.quail.executor.operators.join import join_pass_stage
+    from quail.backends.quail.executor.stages import question_ends
+    from quail.backends.quail.lowering import set_join_parts
+    from quail.catalog.tokens import GigatokenEncoder
+    from quail.logical import ColumnRef
+    from quail.logical.prompts import bind_join_prompt
+    from quail.planner.prompt_lowering import lower_prompt
+    from quail.specs.files import resolve_model_path
+
+    spec, ids = _spec(), _tokenizer()
+    prompt = bind_join_prompt(JOIN, (
+        ColumnRef(alias="r", provider="reviews", column="body"),
+        ColumnRef(alias="a", provider="aspects", column="aspect")),
+        turn=spec.turn, layout=spec.prompt_layout)
+    lowered = lower_prompt(prompt, ids)
+    (_, review_label, frame), (_, aspect_label, _) = lowered.label_token_ids
+    node = SimpleNamespace(
+        partners=("a",), label_token_ids=(("a", aspect_label),),
+        frame_token_ids=frame, tail_token_ids=lowered.tail_token_ids,
+        **set_join_parts(lowered, spec, ids))
+    tails = StateTails(GigatokenEncoder(resolve_model_path(spec.hf_name,
+                                                           spec.revision)))
+    prefixes = [list(lowered.preamble_token_ids) + list(review_label) + ids(review)
+                for review in REVIEWS]
+    stage, states, owners = join_pass_stage(
+        node, prefixes, range(len(REVIEWS)), lambda anchor: None,
+        {"a": [ids(aspect) for aspect in JOIN_ASPECTS]}, tails, None,
+        spec.set_size, BUDGET)
+    question = prompt.tail[len("\n\n"):].split("\n\nReply")[0]
+    entries, first = [], 0
+    for index, (state, anchor) in enumerate(zip(states, owners)):
+        shape = stage.questions[index]
+        if index and owners[index - 1] != anchor:
+            first = 0
+        aspects = JOIN_ASPECTS[first:first + len(shape)]
+        first += len(shape)
+        entries.append(dict(
+            review="reviews record:\n" + REVIEWS[anchor],
+            ids=state + stage.suffixes[index], state=len(state),
+            groups=[-1] * len(state) + [number for number, length
+                                        in enumerate(shape, 1)
+                                        for _ in range(length)],
+            slots=[len(state) + int(row)
+                   for row in question_ends(shape).nonzero()[0]],
+            questions=[f"aspects record:\n{aspect}\n\n{question}"
+                       for aspect in aspects]))
+    return stage, states, entries
+
+
 @pytest.fixture(scope="module")
-def reference(prompts, packs, answer_ids, tmp_path_factory):
+def join_passes():
+    return _join_passes()
+
+
+@pytest.fixture(scope="module")
+def reference(prompts, packs, join_passes, answer_ids, tmp_path_factory):
     """Per prompt, question by question, what d1-2B's own code returns."""
     spec = _spec()
     if not os.path.isdir(REFERENCE_PACKAGES):
@@ -246,7 +315,7 @@ def reference(prompts, packs, answer_ids, tmp_path_factory):
                  for review, (_, ids) in zip(REVIEWS, items)],
         packs=[{key: pack[key] for key in
                 ("review", "ids", "state", "groups", "slots", "questions")}
-               for pack in packs[1]])))
+               for pack in [*packs[1], *join_passes[2]]])))
     out = folder / "reference.json"
     environment = dict(os.environ, PYTHONPATH=REFERENCE_PACKAGES)
     subprocess.run([sys.executable, __file__, str(request), str(out)],
@@ -330,6 +399,24 @@ def quail_packs(packs, answer_ids, loaded):
             for index in range(len(items))]
 
 
+@pytest.fixture(scope="module")
+def quail_joins(join_passes, answer_ids, loaded):
+    """Per join pass, Quail's yes-minus-no margin at each question's slot."""
+    import numpy as np
+
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncSlotMargins
+    from quail.backends.quail.executor.stages import run_stages
+
+    model, arena, pipeline = loaded
+    stage, states, _ = join_passes
+    stage.readout = AsyncSlotMargins(torch, AnswerRows(
+        torch, torch.nn.functional, model, answer_ids[0], answer_ids[1]))
+    answers, _, _ = run_stages(torch, arena, pipeline, [stage], states, BUDGET,
+                               paged=False)
+    return [np.asarray(answers[0][index][0], dtype=float).tolist()
+            for index in range(len(states))]
+
+
 def _margin(logits, count):
     """The best yes spelling's logit minus the best no spelling's."""
     return max(logits[:count]) - max(logits[count:])
@@ -367,9 +454,32 @@ def test_quails_p_yes_matches_d1_reading_its_own_tokens(answer_ids,
     assert max(abs(a - b) for a, b in zip(theirs, ours)) < PROBABILITY_TOLERANCE
 
 
-def test_a_packed_pass_is_the_sequence_d1_packs(packs, reference):
-    for pack, theirs in zip(packs[1], reference["packs"]):
+def test_a_packed_pass_is_the_sequence_d1_packs(packs, join_passes, reference):
+    for pack, theirs in zip([*packs[1], *join_passes[2]], reference["packs"]):
         assert pack["ids"] == theirs["d1_ids"]
+
+
+def test_a_join_asks_each_reviews_18_aspects_in_two_passes(join_passes):
+    stage, _, _ = join_passes
+    assert [len(shape) for shape in stage.questions] == [16, 2] * len(REVIEWS)
+
+
+def test_each_join_slot_agrees_with_d1s_own_model(answer_ids, packs, reference,
+                                                  quail_joins):
+    import math
+
+    count = len(answer_ids[0])
+    theirs = reference["packs"][len(packs[1]):]
+    pairs = [(_margin(logits, count), ours, p_yes)
+             for pack, margins in zip(theirs, quail_joins)
+             for logits, ours, p_yes in zip(pack["logits"], margins,
+                                            pack["p_yes"])]
+    print("join yes minus no, d1 code vs Quail (first review):",
+          [(round(a, 2), round(b, 2)) for a, b, _ in pairs[:18]])
+    assert all((a > 0) == (b > 0) for a, b, _ in pairs if abs(a) > 0.1)
+    assert max(abs(a - b) for a, b, _ in pairs) < MARGIN_TOLERANCE
+    assert max(abs(p - 1 / (1 + math.exp(-b)))
+               for _, b, p in pairs) < PROBABILITY_TOLERANCE
 
 
 def test_each_packed_slot_agrees_with_d1s_own_model(answer_ids, reference,

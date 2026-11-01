@@ -60,10 +60,8 @@ def set_pass_stage(nodes, readout, decide=None) -> Stage:
             body = list(node.question_header_token_ids) + body
         suffix += body
         questions.append(len(body))
-    mask = np.zeros(len(suffix), dtype=bool)
-    mask[np.cumsum(questions) - 1] = True
-    return Stage(suffixes=[suffix], readout=readout, read_mask=mask,
-                 questions=tuple(questions), decide=decide,
+    return Stage(suffixes=[suffix], readout=readout,
+                 questions=(tuple(questions),), decide=decide,
                  label=f"filter pass ({len(nodes)} questions)")
 
 

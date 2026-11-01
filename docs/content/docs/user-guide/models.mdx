@@ -30,9 +30,13 @@ d1-2B is Liquid's decision model. Quail asks it in its own yes/no
 format and runs it with the set attention that Liquid trained it
 with: a document is read again in every pass. Quail puts up to 16 AI
 filters on one table into one pass, or splits them into stages when a
-filter is expected to remove most rows. Quail does not yet run joins,
-`AI.CLASSIFY`, `AI.EXTRACT`, or `AI.MAP` on d1-2B, or `AI.SCORE`
-beside AI filters on one table.
+filter is expected to remove most rows. In a join, the table with the
+cheaper plan, usually the one with longer documents, is the state, and
+each row of the other table is one question, up to 16 in a pass. Each
+document is labeled with its table's name, such as "reviews record", and
+the question names the documents the same way. Quail does not yet run
+`AI.CLASSIFY`, `AI.EXTRACT`, or `AI.MAP` on d1-2B, `AI.SCORE` over two
+tables, or `AI.SCORE` beside AI filters on one table.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a

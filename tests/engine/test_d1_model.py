@@ -37,18 +37,18 @@ def test_a_d1_filter_prompt_is_the_text_d1_was_trained_on():
         state=document, question="Does the review praise the acting?")
 
 
-def test_a_d1_join_asks_its_question_after_both_documents():
-    prompt = bind_join_prompt("Is {0} a review of the movie in {1}?",
-                              (REVIEW, MOVIE), turn=D1_2B_BF16.turn,
-                              layout=D1_2B_BF16.prompt_layout)
+def test_a_d1_join_puts_the_anchor_in_the_state_and_its_partner_in_the_question():
+    prompt = bind_join_prompt(
+        "Is the review in DOCUMENT {0} about the movie in {1}?",
+        (REVIEW, MOVIE), turn=D1_2B_BF16.turn, layout=D1_2B_BF16.prompt_layout)
 
     text = render_join_prompt_text(prompt, ["Great film.", "A heist."], 0)
 
-    assert prompt.frame == ""
     assert text == D1_PROMPT.format(
-        state=("Great film.\n\n(The document above is DOCUMENT {0}.)"
-               "\n\nDOCUMENT {1}:\nA heist."),
-        question="Is {0} a review of the movie in {1}?")
+        state="reviews record:\nGreat film.",
+        question=("movies record:\nA heist.\n\nIs the review in the reviews "
+                  "record about the movie in the movies record?"))
+    assert prompt.tail_segments[0] == "\n\n"
 
 
 def test_d1_answers_compare_its_one_token_yes_spellings_with_its_no_spellings():
@@ -129,15 +129,62 @@ def test_a_set_attention_filter_costs_the_same_first_or_later():
     assert first == later > 0
 
 
-def test_set_attention_refuses_joins_and_a_score_beside_filters():
+def test_set_attention_refuses_a_score_beside_filters():
     from quail.planner.validation import set_attention_refusal
 
-    joined = SimpleNamespace(joins=[object()], filters={})
     two = SimpleNamespace(joins=[], filters={"r": [object(), object()]})
 
-    assert "joins" in set_attention_refusal(joined, False, D1_2B_BF16).reasons[0]
     assert "or a score" in set_attention_refusal(two, True, D1_2B_BF16).reasons[0]
     assert set_attention_refusal(two, False, D1_2B_BF16) is None
+
+
+def test_a_set_join_costs_each_anchors_passes_with_packed():
+    from quail.cost.joins import PricedJoin, packed_join_work
+    from quail.cost.work import packed
+    from quail.planner.statistics.tables import AliasStats
+
+    join = PricedJoin(written_position=0, aliases=("r", "a"), anchor="r",
+                      anchor_free=False, semantics="full", selectivity=None,
+                      frame_tokens={"r": 3, "a": 3},
+                      label_tokens={"r": 2, "a": 2}, tail_tokens=20)
+    lengths = {"r": AliasStats(count=10, total=3000, squared=900_000,
+                               maximum=300),
+               "a": AliasStats(count=20, total=200, squared=2000, maximum=10)}
+
+    # 20 partners per anchor: two passes of 10 questions of 32 tokens
+    work = packed_join_work(join, "r", 10, 200, lengths, 5, set_size=16)
+    one = packed(310, (32,) * 10)
+
+    assert work.tokens == pytest.approx(20 * one.tokens)
+    assert work.pairs == pytest.approx(20 * one.pairs)
+    assert work.kv_read == pytest.approx(20 * one.kv_read)
+
+
+def test_a_join_pass_holds_at_most_the_set_size_and_fits_one_chunk():
+    from quail.backends.quail.executor.operators.join import split_passes
+
+    lengths = [10] * 20
+
+    assert split_passes(100, range(20), lengths, 1, 16, 10_000) == [
+        list(range(16)), list(range(16, 20))]
+    # 100 + 10 + 3 * 11 = 143 fits; a fifth question does not
+    assert split_passes(100, range(5), lengths, 1, 16, 150) == [
+        [0, 1, 2, 3], [4]]
+    with pytest.raises(ValueError, match="does not fit"):
+        split_passes(100, [0], lengths, 1, 16, 105)
+
+
+def test_a_join_question_labels_each_partner_and_joins_its_end_to_the_tail():
+    from quail.backends.quail.executor.operators.filter import StateTails
+    from quail.backends.quail.executor.operators.join import set_join_questions
+
+    node = SimpleNamespace(partners=("a",), label_token_ids=(("a", (9,)),),
+                           tail_token_ids=(3, 5), separator_tokens=1)
+
+    questions = set_join_questions(node, {"a": [[1, 2], [2, 1]]},
+                                   StateTails(_Pieces()))
+
+    assert questions == [[9, 1, 4, 5], [9, 2, 1, 3, 5]]
 
 
 def _stages(selectivities, questions=50, state=300.0, longest=300):
@@ -174,8 +221,7 @@ def test_a_pass_suffix_opens_each_later_question_with_its_header():
     stage = set_pass_stage([first, second], readout=None)
 
     assert stage.suffixes == [[1, 2, 8, 3]]
-    assert stage.questions == (2, 2)
-    assert stage.read_mask.tolist() == [False, True, False, True]
+    assert stage.questions == ((2, 2),)
 
 
 class _Pieces:
@@ -240,6 +286,39 @@ def test_two_ai_filters_on_d1_2b_share_one_pass(tmp_path):
     assert [node.stage for node in filters] == [0, 0]
     assert all(node.state_tail_tokens == 1 for node in filters)
     assert all(node.question_header_token_ids == ("QUESTION:",) for node in filters)
+    session.close()
+
+
+def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.physical import AiJoin
+    from quail.planner.plan import EngineConfig
+
+    body = " ".join(["word"] * 300)
+    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
+                   tmp_path / "reviews.parquet")
+    pq.write_table(pa.table({"id": list(range(12)), "aspect": ["acting"] * 12}),
+                   tmp_path / "aspects.parquet")
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=str.split)
+    for name in ("reviews", "aspects"):
+        session.register(name, DocumentProvider.from_parquet(
+            str(tmp_path / f"{name}.parquet"), id_col="id"))
+
+    plan = session.sql(
+        "SELECT r.id, a.id FROM aspects a JOIN reviews r ON AI_FILTER(PROMPT("
+        "'Does {1} discuss {0}?', a.aspect, r.body))").plan()
+
+    (join,) = [node for node in plan.nodes if isinstance(node, AiJoin)]
+    assert join.anchor == "r"
+    assert join.document_head[-2:] == ("reviews", "record:")
+    assert join.label_token_ids == (("a", ("aspects", "record:")),)
+    assert join.question_header_token_ids == ("QUESTION:",)
+    assert not join.keep_kv
     session.close()
 
 
