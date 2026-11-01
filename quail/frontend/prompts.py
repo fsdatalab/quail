@@ -49,7 +49,7 @@ class PromptBinder:
         turn = self.turn if self.model is None else self.model.turn
         layout = self.layout if self.model is None else self.model.prompt_layout
         if kind == "extract":
-            return bind_extract_prompt(args, template, turn)
+            return bind_extract_prompt(args, template, turn, layout)
         if kind == "map":
             return bind_map_prompt(args, template, turn)
         if kind == "features":

@@ -201,6 +201,38 @@ def option_spellings(codes, tokenizer) -> tuple[tuple[int, ...], ...]:
     return tuple(out)
 
 
+def read_slot_offsets(segment: str, names, tokenizer) -> tuple[int, ...]:
+    """Each read slot's row, counted back from the segment's last token.
+
+    The segment ends in one "<name>:" line per slot. A slot is the token
+    that holds its colon, as d1 reads it; tokenizing the whole segment
+    may join that colon with the line break after it.
+
+    Args:
+        segment: The text of the prompt's last tail segment.
+        names: The slot names, in order.
+        tokenizer: Callable text -> token ids, without special tokens.
+
+    Raises:
+        ValueError: A colon's token differs between the segment and the
+            text through it.
+    """
+    marks = "\n".join(f"{name}:" for name in names)
+    if not segment.endswith(marks):
+        raise ValueError("the read segment ends in its slot lines")
+    whole = list(tokenizer(segment))
+    end, offsets = len(segment) - len(marks), []
+    for name in names:
+        end += len(name) + 1
+        through = list(tokenizer(segment[:end]))
+        if whole[:len(through) - 1] != through[:-1]:
+            raise ValueError(f"the {name!r} slot's colon is not one token "
+                             f"apart from the text before it")
+        offsets.append(len(through) - len(whole))
+        end += 1
+    return tuple(offsets)
+
+
 def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
     """Tokenize a prompt's pieces, and letter a classification when possible.
 

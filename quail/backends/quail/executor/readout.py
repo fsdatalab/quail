@@ -397,6 +397,62 @@ class AsyncSlotLogits(_SlotReadout):
         return (*self._copy(logits), rows_per_answer)
 
 
+class AsyncSlotPointers(_SlotReadout):
+    """Each pointer read's span over its document rows, per answer.
+
+    An answer's rows are its document rows, the first being the row
+    that stands for nothing, then each read's start and end slot rows.
+    A slot scores every document row by dot product over the square
+    root of the width. A read is found when its start's probability
+    off the first row is at least one half; its span is then the
+    likeliest start and end at most span_tokens rows apart. Each
+    answer's result is a (reads, 3) array: the span's first and last
+    document row, (0, 0) for nothing, and the raw P(found).
+
+    Args:
+        torch: The torch module.
+        F: torch.nn.functional.
+        reads: The reads in each answer.
+        span_tokens: The longest span, in rows.
+    """
+
+    def __init__(self, torch, F, reads, span_tokens):
+        super().__init__(torch)
+        self.F = F
+        self.reads = reads
+        self.span_tokens = span_tokens
+
+    def _spans(self, rows):
+        torch, F = self.torch, self.F
+        slots = 2 * self.reads
+        state, query = rows[:-slots], rows[-slots:]
+        logits = query @ state.T / math.sqrt(rows.shape[-1])
+        start, end = logits.log_softmax(-1).view(
+            self.reads, 2, -1).unbind(1)
+        found = -torch.expm1(start[:, 0])
+        if state.shape[0] == 1:
+            at = torch.zeros(self.reads, 2, device=rows.device)
+        else:
+            cap = min(self.span_tokens, state.shape[0] - 1)
+            windows, indices = F.max_pool1d(
+                F.pad(end[:, None, 1:], (0, cap - 1), value=-math.inf),
+                cap, stride=1, return_indices=True)
+            index = (start[:, 1:] + windows[:, 0]).argmax(-1)
+            last = indices[:, 0].gather(1, index[:, None])[:, 0] + 1
+            at = torch.stack((index + 1, last), -1).float()
+            at = torch.where((found < 0.5)[:, None], torch.zeros_like(at), at)
+        return torch.cat((at, found[:, None]), -1)
+
+    def submit(self, normed, rows_per_answer=None):
+        rows = normed.float()
+        spans, row = [], 0
+        for count in rows_per_answer:
+            spans.append(self._spans(rows[row:row + int(count)]))
+            row += int(count)
+        return (*self._copy(self.torch.cat(spans)),
+                [self.reads] * len(rows_per_answer))
+
+
 class DecisionHead:
     """The option-scoring head of a Decision 2.0 checkpoint, in fp32.
 

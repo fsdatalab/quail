@@ -616,8 +616,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if n != 1 or len(mask) != total:
                 raise ValueError(
                     f"group {key!r}: read_mask marks one suffix's rows")
-            finals.append(s_row0 + np.flatnonzero(mask))
-            rows_per_answer.append(np.array([int(mask.sum())], dtype=np.int64))
+            reads = s_row0 + np.flatnonzero(mask)
+            state_reads = g.get("state_reads")
+            if state_reads is not None:
+                # a pointer read's document rows, read before its slots
+                reads = np.concatenate(
+                    [row0 + np.asarray(state_reads, dtype=np.int64), reads])
+            finals.append(reads)
+            rows_per_answer.append(np.array([len(reads)], dtype=np.int64))
             multi_row = True
         elif n and g.get("read_rows") is not None:
             # the last read_rows rows of each suffix carry the answers

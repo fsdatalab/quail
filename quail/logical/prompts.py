@@ -80,6 +80,12 @@ class PromptLayout:
             per label, the text after its option list; the question,
             "Options:", and one "<code> <text>" line per label come
             before it. None classifies with Quail's label prompt.
+        read_end: For a model that extracts by pointing at document
+            positions, the text after an AI.EXTRACT question; None
+            extracts by decoding the answer.
+        read_slots: The names of the slots such a model points from,
+            each written as "<name>:" on its own line after its turn
+            text.
     """
 
     name: str
@@ -93,6 +99,8 @@ class PromptLayout:
     record_label: str | None = None
     label_segment: bool = False
     option_end: str | None = None
+    read_end: str | None = None
+    read_slots: tuple[str, ...] = ()
 
     def question_segments(self, question: str, separator: str) -> list[str]:
         """The text after a document: one entry per tokenized segment."""
@@ -144,6 +152,8 @@ PROMPT_LAYOUTS = {layout.name: layout for layout in (
         record_label="{} record:\n",
         label_segment=True,
         option_end="\n\nReply with the option code only.",
+        read_end="\n\nRead the text from the state, or nothing if it is absent.",
+        read_slots=("start", "end"),
     ),
 )}
 
@@ -697,7 +707,8 @@ def render_extract_question(question: str) -> str:
 
 
 def bind_extract_prompt(args: tuple, question: str,
-                        turn: tuple[str, str] = ("", "")) -> Prompt:
+                        turn: tuple[str, str] = ("", ""),
+                        layout: str = "ai-if") -> Prompt:
     """Bind an AI.EXTRACT prompt over one document column.
 
     The prompt is the document label, the document, the question, the
@@ -710,6 +721,10 @@ def bind_extract_prompt(args: tuple, question: str,
         question: The question the answer is copied for.
         turn: Chat text before the prompt and after the answer template.
             Without it, a line break separates the template and the cue.
+        layout: The PROMPT_LAYOUTS name of the model's prompt text. A
+            layout with a read_end asks the question as a read: the
+            question label, the question, the read end, the turn text,
+            then one line per read slot.
 
     Returns:
         A Prompt whose template is ``{0}``, whose tail is the text
@@ -722,6 +737,15 @@ def bind_extract_prompt(args: tuple, question: str,
     if len(args) != 1:
         raise CompileError("AI.EXTRACT reads one document column")
     validate_question(question)
+    spec = PROMPT_LAYOUTS[layout]
+    if spec.read_end is not None:
+        segments = (spec.question_separator + spec.question_label,
+                    question + spec.read_end + turn[1]
+                    + "\n".join(f"{name}:" for name in spec.read_slots))
+        return Prompt(template="{0}", args=tuple(args),
+                      preamble=turn[0] + spec.document_label,
+                      tail="{0}" + "".join(segments), kind="extract",
+                      source=question, layout=layout, tail_segments=segments)
     preamble = turn[0] + SHARED_PRE
     # the cue opens the model's turn; without turn text it opens a line
     after = (render_extract_question(question) + (turn[1] or "\n")

@@ -20,7 +20,7 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | Qwen3.6 35B-A3B | `"qwen3.6-35b-a3b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
 | Qwen3.8 27B | `"qwen3.8-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
 | LFM2 2.6B | `"lfm2-2.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
-| d1-2B | `"d1-2b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| d1-2B | `"d1-2b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | Qwen3.5 2B Base with Qwen-Scope SAE | `"qwen3.5-2b-sae-bf16"` | BF16 | `AI.SAE_FEATURES` |
 
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
@@ -36,9 +36,12 @@ each row of the other table is one question, up to 16 in a pass. Each
 document is labeled with its table's name, such as "reviews record", and
 the question names the documents the same way. `AI.CLASSIFY` lists
 the labels by option code (A, B, and so on), and the classifications
-on one table share passes. Quail does not yet run `AI.EXTRACT` or
-`AI.MAP` on d1-2B, `AI.CLASSIFY` over joined rows, `AI.SCORE` over two
-tables, or `AI.SCORE` beside AI filters on one table.
+on one table share passes. `AI.EXTRACT` returns one span of the
+document, up to 512 tokens, that the model points to, or nothing; the
+extractions on one table share passes too. d1-2B does not write text,
+so it does not run `AI.MAP`. Quail does not yet run `AI.CLASSIFY` over
+joined rows, `AI.SCORE` over two tables, or `AI.SCORE` beside AI
+filters on one table on d1-2B.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a

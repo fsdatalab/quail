@@ -5,7 +5,6 @@ from functools import partial
 
 import numpy as np
 
-from quail.backends.quail.executor.operators.filter import state_tails
 from quail.backends.quail.executor.parts import (
     ExecutionPart,
     execute_parts,
@@ -15,6 +14,7 @@ from quail.backends.quail.executor.parts import (
     stage_spans,
 )
 from quail.backends.quail.executor.readout import AsyncSlotMargins
+from quail.backends.quail.executor.set_passes import split_passes, state_tails
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, join_settlement
@@ -236,35 +236,6 @@ def set_join_questions(node, documents, tails) -> list:
             tokens += blocks[alias][position]
         questions.append(tokens + rest)
     return questions
-
-
-def split_passes(state: int, members, lengths, header: int, set_size: int,
-                 budget: int) -> list[list]:
-    """Split an anchor's members into passes, in order.
-
-    A pass holds at most set_size questions and fits the chunk budget
-    with the state; every question after a pass's first carries the
-    header.
-
-    Raises:
-        ValueError: One question does not fit a chunk with the state.
-    """
-    passes, current, used = [], [], state
-    for member in members:
-        tokens = int(lengths[member])
-        if state + tokens > budget:
-            raise ValueError(
-                f"a join question of {tokens} tokens does not fit one "
-                f"{budget}-token chunk with its {state}-token state")
-        if current and (len(current) == set_size
-                        or used + header + tokens > budget):
-            passes.append(current)
-            current, used = [], state
-        used += tokens + (header if current else 0)
-        current.append(member)
-    if current:
-        passes.append(current)
-    return passes
 
 
 def join_pass_stage(node, prefixes, anchors, members_of, documents, tails,

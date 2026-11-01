@@ -135,6 +135,11 @@ class ModelSpec:
     #                       sent to vLLM drops it because vLLM adds its own
     answer_temperature: float = 1.0    # divides a score's yes-against-no
     #                                    margin before the sigmoid
+    read_found: tuple[tuple[float, float], ...] = ()    # a pointer
+    #                    read's (raw, calibrated) P(found) knots, read
+    #                    linearly between knots and flat past the ends;
+    #                    empty keeps the raw value
+    read_span_tokens: int = 0    # the longest span a pointer read returns
     set_size: int = 0    # the most questions one set-attention pass
     #                      holds: the size the model was trained with
     attention_mask: Literal["causal", "set"] = "causal"

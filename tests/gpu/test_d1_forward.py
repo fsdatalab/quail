@@ -62,6 +62,9 @@ PACKED = [f"Does the review mention {aspect}? {{0}}" for aspect in ASPECTS]
 JOIN = ("Does the review in DOCUMENT {0} discuss the movie aspect in "
         "DOCUMENT {1}?")
 JOIN_ASPECTS = [*ASPECTS, "the sets", "the costumes"]
+# two reads packed in one pass: some reviews hold the answer, some do not
+READS = ["The part of the cast the reviewer singles out",
+         "The number of times the reviewer bought a ticket"]
 # three classifications packed in one pass; the second describes its labels
 CHOICES = [
     ("Judge strictly from the review above which category best describes "
@@ -186,8 +189,13 @@ def reference_main(request_path, out_path):
             choices.append(dict(
                 text=engine.render(item["review"], questions[0]),
                 probabilities=served.probabilities(item["review"], questions)))
+        reads = []
+        for review in request["reads"]:
+            questions = [prompt.Read(question) for question in READS]
+            reads.append(served.probabilities(review, questions))
     with open(out_path, "w") as f:
-        json.dump(dict(prompts=rows, packs=packs, choices=choices), f)
+        json.dump(dict(prompts=rows, packs=packs, choices=choices,
+                       reads=reads), f)
 
 
 @pytest.fixture(scope="module")
@@ -211,10 +219,8 @@ def _packs():
     """
     from types import SimpleNamespace
 
-    from quail.backends.quail.executor.operators.filter import (
-        StateTails,
-        set_pass_stage,
-    )
+    from quail.backends.quail.executor.operators.filter import set_pass_stage
+    from quail.backends.quail.executor.set_passes import StateTails
     from quail.backends.quail.executor.stages import question_ends
     from quail.backends.quail.lowering import set_question_parts
     from quail.catalog.tokens import GigatokenEncoder
@@ -265,8 +271,8 @@ def _join_passes():
     """
     from types import SimpleNamespace
 
-    from quail.backends.quail.executor.operators.filter import StateTails
     from quail.backends.quail.executor.operators.join import join_pass_stage
+    from quail.backends.quail.executor.set_passes import StateTails
     from quail.backends.quail.executor.stages import question_ends
     from quail.backends.quail.lowering import set_join_parts
     from quail.catalog.tokens import GigatokenEncoder
@@ -344,7 +350,8 @@ def reference(prompts, packs, join_passes, answer_ids, tmp_path_factory):
                  criteria={label: (descriptions[index] if descriptions else "")
                            or None for index, label in enumerate(labels)})
             for question, labels, descriptions in CHOICES])
-            for review in REVIEWS])))
+            for review in REVIEWS],
+        reads=REVIEWS)))
     out = folder / "reference.json"
     environment = dict(os.environ, PYTHONPATH=REFERENCE_PACKAGES)
     subprocess.run([sys.executable, __file__, str(request), str(out)],
@@ -477,10 +484,10 @@ def quail_choices(loaded):
     """Per review and classification, Quail's option probabilities, one pass."""
     from types import SimpleNamespace
 
-    from quail.backends.quail.executor.operators.filter import StateTails
     from quail.backends.quail.executor.operators.set_classify import (
         classify_passes,
     )
+    from quail.backends.quail.executor.set_passes import StateTails
     from quail.catalog.tokens import GigatokenEncoder
     from quail.specs.files import resolve_model_path
 
@@ -497,6 +504,47 @@ def quail_choices(loaded):
     every = classify_passes(state, specs, range(len(REVIEWS)),
                             {"r": [ids(review) for review in REVIEWS]})
     return [[labels.probabilities[review].tolist() for labels in every]
+            for review in range(len(REVIEWS))]
+
+
+@pytest.fixture(scope="module")
+def quail_reads(loaded):
+    """Per review and read, Quail's text and calibrated P(found), one pass."""
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.operators.set_extract import read_passes
+    from quail.backends.quail.executor.set_passes import StateTails
+    from quail.catalog.tokens import GigatokenEncoder
+    from quail.logical import ColumnRef
+    from quail.logical.prompts import PROMPT_LAYOUTS, bind_extract_prompt
+    from quail.planner.prompt_lowering import lower_prompt, read_slot_offsets
+    from quail.specs.files import resolve_model_path
+
+    model, arena, pipeline = loaded
+    spec, ids = _spec(), _tokenizer()
+    layout = PROMPT_LAYOUTS[spec.prompt_layout]
+    specs = []
+    for question in READS:
+        lowered = lower_prompt(bind_extract_prompt(
+            (ColumnRef(alias="r", provider="reviews", column="body"),),
+            question, spec.turn, spec.prompt_layout), ids)
+        segments = lowered.prompt.tail_segments
+        specs.append(SimpleNamespace(
+            prompt_token_parts=(tuple(lowered.preamble_token_ids),
+                                tuple(lowered.tail_token_ids)),
+            state_tail_tokens=len(ids(segments[0])),
+            question_header_token_ids=tuple(ids("QUESTION:\n")),
+            read_slots=read_slot_offsets(segments[-1], layout.read_slots, ids)))
+    tails = StateTails(GigatokenEncoder(resolve_model_path(spec.hf_name,
+                                                           spec.revision)))
+    state = SimpleNamespace(
+        torch=torch, chunk_tokens=BUDGET, gpu_timing=False,
+        loaded_model=SimpleNamespace(model=model, arena=arena, pipeline=pipeline,
+                                     model_spec=spec, state_tails=tails,
+                                     input_staging=None))
+    every = read_passes(state, specs, list(range(len(REVIEWS))),
+                        [ids(review) for review in REVIEWS], REVIEWS)
+    return [[(reads.answers[review], reads.found[review]) for reads in every]
             for review in range(len(REVIEWS))]
 
 
@@ -604,6 +652,22 @@ def test_packed_choices_match_d1s_option_probabilities(reference, quail_choices)
           [[round(p, 3) for p in question]
            for question in reference["choices"][0]["probabilities"]])
     assert max(abs(a - b) for a, b in pairs) < PROBABILITY_TOLERANCE
+
+
+def test_packed_reads_match_d1s_text_and_found(reference, quail_reads):
+    from quail.backends.quail.executor.operators.set_extract import calibrated
+
+    knots = _spec().read_found
+    pairs = []
+    for theirs, ours in zip(reference["reads"], quail_reads):
+        for read, (text, found) in zip(theirs, ours):
+            present = calibrated(knots, read["found"])
+            pairs.append(((read["text"] if present >= 0.5 else None, present),
+                          (text, found)))
+    print("reads, d1 code vs Quail:", pairs)
+    # a found near one half may land on either side
+    assert all(a[0] == b[0] for a, b in pairs if abs(a[1] - 0.5) > 0.05)
+    assert max(abs(a[1] - b[1]) for a, b in pairs) < PROBABILITY_TOLERANCE
 
 
 if __name__ == "__main__":

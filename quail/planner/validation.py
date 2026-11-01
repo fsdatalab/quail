@@ -209,8 +209,7 @@ def extraction_refusal(context, function: str = "AI.EXTRACT") -> Refusal | None:
         reason = (f"{function} decodes the model's next tokens, which "
                   f"{model.name!r} does not give")
     elif model.prompt_layout == "d1" and function == "AI.EXTRACT":
-        reason = (f"{model.name!r} extracts by scoring document positions "
-                  f"against the question, which Quail does not read")
+        return None
     elif model.prompt_layout == "d1":
         reason = (f"{function} writes text, and {model.name!r} answers only "
                   f"by scoring options")

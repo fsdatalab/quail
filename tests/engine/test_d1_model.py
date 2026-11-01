@@ -80,16 +80,13 @@ def test_the_vllm_baseline_refuses_d1_2b():
     assert "lfm3" in support.reason
 
 
-def test_d1_2b_refuses_extract_and_map_with_a_reason():
+def test_d1_2b_refuses_map_with_a_reason():
     from quail.planner.validation import extraction_refusal
 
     context = SimpleNamespace(model=D1_2B_BF16, tokenizer=lambda text: [1])
 
-    extract = extraction_refusal(context)
-    mapped = extraction_refusal(context, "AI.MAP")
-
-    assert "document positions" in extract.reasons[0]
-    assert "writes text" in mapped.reasons[0]
+    assert extraction_refusal(context) is None
+    assert "writes text" in extraction_refusal(context, "AI.MAP").reasons[0]
 
 
 def test_a_set_attention_model_keeps_no_arena_or_checkpoints():
@@ -164,7 +161,7 @@ def test_a_set_join_costs_each_anchors_passes_with_packed():
 
 
 def test_a_join_pass_holds_at_most_the_set_size_and_fits_one_chunk():
-    from quail.backends.quail.executor.operators.join import split_passes
+    from quail.backends.quail.executor.set_passes import split_passes
 
     lengths = [10] * 20
 
@@ -178,8 +175,8 @@ def test_a_join_pass_holds_at_most_the_set_size_and_fits_one_chunk():
 
 
 def test_a_join_question_labels_each_partner_and_joins_its_end_to_the_tail():
-    from quail.backends.quail.executor.operators.filter import StateTails
     from quail.backends.quail.executor.operators.join import set_join_questions
+    from quail.backends.quail.executor.set_passes import StateTails
 
     node = SimpleNamespace(partners=("a",), label_token_ids=(("a", (9,)),),
                            tail_token_ids=(3, 5), separator_tokens=1)
@@ -250,7 +247,7 @@ class _Pieces:
 
 
 def test_a_documents_last_mark_joins_the_blank_line_after_it_once_per_ending():
-    from quail.backends.quail.executor.operators.filter import StateTails
+    from quail.backends.quail.executor.set_passes import StateTails
 
     encoder = _Pieces()
     tails = StateTails(encoder)
@@ -395,6 +392,109 @@ def test_two_d1_classifications_plan_option_code_questions(tmp_path):
     assert all(node.spec.label_token_ids == (("A",), ("B",)) for node in nodes)
     assert all(node.spec.state_tail_tokens == 1 for node in nodes)
     assert all(node.spec.estimated_seconds > 0 for node in nodes)
+    session.close()
+
+
+def test_a_d1_extraction_asks_for_a_read_with_start_and_end_slots():
+    from quail.logical.prompts import bind_extract_prompt
+
+    prompt = bind_extract_prompt((REVIEW,), "The film's director",
+                                 D1_2B_BF16.turn, D1_2B_BF16.prompt_layout)
+
+    text = prompt.preamble + "Great film." + prompt.tail[len("{0}"):]
+
+    assert text == (
+        "<|startoftext|><|im_start|>user\nGreat film.\n\n\nQUESTION:\n"
+        "The film's director\n\nRead the text from the state, or nothing if it "
+        "is absent.<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        "start:\nend:")
+
+
+def test_a_read_slot_is_the_token_holding_its_colon():
+    from quail.planner.prompt_lowering import read_slot_offsets
+
+    pieces = ("x", "start", ":\n", ":", "end", "\n")
+
+    def tokenizer(text):
+        ids = []
+        while text:
+            piece = max((p for p in pieces if text.startswith(p)), key=len)
+            ids.append(pieces.index(piece))
+            text = text[len(piece):]
+        return ids
+
+    # the whole segment joins the start colon with the line break
+    assert read_slot_offsets("xstart:\nend:", ("start", "end"),
+                             tokenizer) == (-2, 0)
+
+
+def test_a_found_probability_follows_the_calibration_knots():
+    from quail.backends.quail.executor.operators.set_extract import calibrated
+
+    knots = ((0.1, 0.0), (0.5, 0.4), (0.9, 1.0))
+
+    assert calibrated(knots, 0.05) == 0.0
+    assert calibrated(knots, 0.3) == pytest.approx(0.2)
+    assert calibrated(knots, 0.95) == 1.0
+    assert calibrated((), 0.3) == 0.3
+
+
+def test_a_read_returns_its_tokens_characters_without_edge_spaces():
+    from quail.backends.quail.executor.operators.set_extract import token_span
+
+    text = "Paid to Zoë Ltd. now"
+    vocabulary = {1: b"Paid", 2: b" to", 3: b" Zo\xc3\xab", 4: b" Ltd.", 5: b" now"}
+
+    assert token_span(text, [1, 2, 3, 4, 5], vocabulary, 2, 3) == (
+        "Zoë Ltd.", (8, 16))
+
+
+def test_a_pointer_read_takes_the_likeliest_span_or_nothing():
+    torch = pytest.importorskip("torch")
+    from quail.backends.quail.executor.readout import AsyncSlotPointers
+
+    readout = AsyncSlotPointers(torch, torch.nn.functional, 2, 512)
+    width = 4
+    state = torch.eye(5, width) * 0.0
+    state[2, 0] = state[3, 1] = 1.0   # rows 2 and 3 answer the first read
+    state[0, 2] = 1.0                 # row 0 stands for nothing
+    slots = torch.zeros(4, width)
+    slots[0, 0] = slots[1, 1] = 40.0  # read 1: start at row 2, end at row 3
+    slots[2, 2] = slots[3, 2] = 40.0  # read 2: both slots on row 0
+
+    spans = readout._spans(torch.cat((state, slots)))
+
+    assert spans[0, :2].tolist() == [2.0, 3.0] and spans[0, 2] > 0.99
+    assert spans[1, :2].tolist() == [0.0, 0.0] and spans[1, 2] < 0.01
+
+
+def test_a_d1_extraction_plans_a_read(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.physical import AiExtract
+    from quail.planner.plan import EngineConfig
+
+    body = " ".join(["word"] * 300)
+    pq.write_table(pa.table({"id": [1, 2, 3], "text": [body] * 3}),
+                   tmp_path / "contracts.parquet")
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=str.split)
+    session.register("contracts", DocumentProvider.from_parquet(
+        str(tmp_path / "contracts.parquet"), id_col="id"))
+
+    plan = session.sql(
+        "SELECT c.id, AI.EXTRACT(c.text, {'signed': 'The date of the contract'}) "
+        "AS terms FROM contracts c").plan()
+
+    (node,) = [node for node in plan.nodes if isinstance(node, AiExtract)]
+    # str.split keeps "<think></think>start:" whole, one token before "end:"
+    assert node.spec.read_slots == (-1, 0)
+    assert node.spec.state_tail_tokens == 1
+    assert node.spec.max_answer_tokens == 512
+    assert node.spec.estimated_seconds > 0
     session.close()
 
 

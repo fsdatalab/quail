@@ -106,8 +106,13 @@ class Stage:
         questions: Under set attention, per suffix, the tokens of each
             question in it, in order, after the state that the prefix
             holds; each document requests one suffix, and each
-            question's last row is read. Empty when the whole sequence
-            is one question.
+            question's question_slots rows are read. Empty when the
+            whole sequence is one question.
+        question_slots: The rows read in each question, counted back
+            from its last row.
+        state_reads: Optional callback from document index to the rows
+            of its prefix to read before the questions' rows, as a
+            pointer read scores them.
     """
 
     DROP = DROP
@@ -134,6 +139,8 @@ class Stage:
     answer_index: int = 0
     answer_dependencies: tuple[int, ...] = ()
     questions: tuple = ()
+    question_slots: tuple = (0,)
+    state_reads: Callable | None = None
 
     def __post_init__(self):
         if self.own_suffixes:
@@ -210,10 +217,17 @@ def _advance_stage(stages, a, j, row):
     return bool(stage.decide(a, row))
 
 
-def question_ends(questions) -> np.ndarray:
-    """The mask of each question's last row in a suffix of these questions."""
+def question_ends(questions, slots=(0,)) -> np.ndarray:
+    """The mask of each question's read rows in a suffix of these questions.
+
+    Args:
+        questions: Each question's tokens, in order.
+        slots: Each read row, counted back from its question's last row.
+    """
     mask = np.zeros(int(sum(questions)), dtype=bool)
-    mask[np.cumsum(questions) - 1] = True
+    ends = np.cumsum(questions) - 1
+    for slot in slots:
+        mask[ends + slot] = True
     return mask
 
 
