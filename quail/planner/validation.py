@@ -140,6 +140,9 @@ def classification_refusal(context) -> Refusal | None:
         reason = "AI.CLASSIFY planning needs the model's tokenizer"
     elif model.canvas_tokens and model.answer_canvas is None:
         reason = f"{model.name!r} names no answer canvas to read labels on"
+    elif model.prompt_layout == "d1":
+        reason = (f"{model.name!r} was trained on its own option-code "
+                  f"prompt for choices, which Quail does not write")
     else:
         return None
     return Refusal(reasons=(reason,), constraint="unsupported_classify_query",
@@ -208,6 +211,10 @@ def extraction_refusal(context, function: str = "AI.EXTRACT") -> Refusal | None:
     elif model.role in ("reranker", "decision") or model.canvas_tokens:
         reason = (f"{function} decodes the model's next tokens, which "
                   f"{model.name!r} does not give")
+    elif model.prompt_layout == "d1":
+        reason = (f"{model.name!r} answers by scoring options and document "
+                  f"positions, not by writing text, and Quail does not read "
+                  f"those positions for {function}")
     else:
         return None
     return Refusal(reasons=(reason,), constraint=constraint,

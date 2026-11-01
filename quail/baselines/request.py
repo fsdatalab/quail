@@ -113,6 +113,11 @@ def _warm_boot() -> dict:
     }
 
 
+# Architectures the request backends do not serve. vLLM 0.29 has no
+# LFM3 model; SGLang's support was not checked.
+UNSERVED_ARCHS = frozenset({"lfm3"})
+
+
 @dataclass
 class LoadedRequestEngine:
     """One request engine loaded for a backend configuration.
@@ -178,6 +183,10 @@ class RequestBackend:
             return SupportResult.reject(
                 f"the {label} request backends use one model copy on one GPU"
             )
+        if model.arch in UNSERVED_ARCHS:
+            return SupportResult.reject(
+                f"{label} does not support model {model.name!r}: it has no "
+                f"model for architecture {model.arch!r}")
         if model.canvas_tokens == 1 and not getattr(self.engine, "reads_logprobs",
                                                      False):
             return SupportResult.reject(

@@ -290,15 +290,39 @@ def _answer_token_parts(prompt, model, tokenizer) -> tuple[tuple[int, ...], ...]
             tuple(bound.tail_token_ids))
 
 
-def answer_ids(model, tokenizer) -> tuple[list[int], list[int]]:
-    """The token ids a score compares: yes and no, or TRUE and FALSE.
+def spelling_token_ids(tokenizer, spellings) -> tuple[list[int], list[int]]:
+    """The sorted ids of the spellings that are one token each.
 
     Args:
-        model: The ModelSpec; a reranker answers yes or no.
+        tokenizer: Callable text -> token ids, without special tokens.
+        spellings: (true spellings, false spellings).
+
+    Raises:
+        ValueError: A side has no spelling that is one token.
+    """
+    sides = []
+    for words in spellings:
+        ids = sorted({tokens[0] for tokens in map(tokenizer, words)
+                      if len(tokens) == 1})
+        if not ids:
+            raise ValueError(f"no spelling among {words} is one token")
+        sides.append(ids)
+    return sides[0], sides[1]
+
+
+def answer_ids(model, tokenizer) -> tuple[list[int], list[int]]:
+    """The token ids an answer compares: the model's true and false spellings.
+
+    Args:
+        model: The ModelSpec; a reranker answers yes or no, a model with
+            answer_spellings answers with them, and any other answers
+            TRUE or FALSE.
         tokenizer: Callable text -> token ids.
     """
     if model.role == "reranker":
         return list(tokenizer("yes")), list(tokenizer("no"))
+    if model.answer_spellings:
+        return spelling_token_ids(tokenizer, model.answer_spellings)
     return true_false_token_ids(tokenizer)
 
 

@@ -416,8 +416,66 @@ def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale, *,
     return out[0], final
 
 
+# the widest filter vLLM's causal convolution kernel takes
+VLLM_CONV_MAX_WIDTH = 5
+
+
+def wide_causal_conv(x, weight, phase, history):
+    """Causal depthwise convolution of any width, in fp32, per sequence.
+
+    Lays each sequence's history columns before its rows in one
+    buffer, then sums the taps over shifted gathers of it.
+
+    Args:
+        x: Packed inputs with shape (rows, channels).
+        weight: Convolution weights with shape (channels, width).
+        phase: Sequence lengths; its conv_metadata caches the gather
+            indices.
+        history: Private state with shape (capacity, width - 1, channels),
+            or None to start each sequence from zero.
+
+    Returns:
+        The outputs and each sequence's last width - 1 input columns.
+    """
+    import torch
+
+    keep = weight.shape[1] - 1
+    count = len(phase.lengths)
+    if phase.conv_metadata is None:
+        lengths = np.asarray(phase.lengths, dtype=np.int64)
+        firsts = np.concatenate(([0], np.cumsum(lengths)[:-1]))
+        # each sequence's place in the buffer, after the columns of the
+        # sequences before it
+        starts = firsts + keep * np.arange(count)
+        rows = (np.repeat(starts + keep - firsts, lengths)
+                + np.arange(lengths.sum()))
+        columns = np.arange(keep)
+        phase.conv_metadata = SimpleNamespace(
+            rows=torch.from_numpy(rows).to(x.device),
+            history=torch.from_numpy(
+                (starts[:, None] + columns).reshape(-1)).to(x.device),
+            tails=torch.from_numpy(
+                (starts + lengths)[:, None] + columns).to(x.device))
+    metadata = phase.conv_metadata
+    buffer = x.new_zeros((x.shape[0] + count * keep, x.shape[1]))
+    if history is not None:
+        buffer.index_copy_(0, metadata.history,
+                           history[:count].reshape(count * keep, -1))
+    buffer.index_copy_(0, metadata.rows, x)
+    taps = weight.float()
+    out = buffer.index_select(0, metadata.rows).float() * taps[:, keep]
+    for tap in range(keep):
+        out += (buffer.index_select(0, metadata.rows - (keep - tap)).float()
+                * taps[:, tap])
+    tails = buffer[metadata.tails]
+    return out.to(x.dtype), tails
+
+
 def causal_conv_kernel(x, weight, phase, history, bias=None, activate=True):
     """Run vLLM's convolution and return outputs and updated private history.
+
+    A filter wider than vLLM's kernel takes runs wide_causal_conv,
+    which has no bias or activation.
 
     Args:
         x: Packed inputs with shape (rows, channels).
@@ -431,6 +489,11 @@ def causal_conv_kernel(x, weight, phase, history, bias=None, activate=True):
     Returns:
         The outputs and each sequence's final convolution state.
     """
+    if weight.shape[1] > VLLM_CONV_MAX_WIDTH:
+        if bias is not None or activate:
+            raise ValueError("a convolution wider than vLLM's kernel takes "
+                             "has no bias or activation")
+        return wide_causal_conv(x, weight, phase, history)
     import torch
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
     from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata

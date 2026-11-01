@@ -131,8 +131,8 @@ and
 
 ## Supported models and GPUs
 
-Quail runs Qwen3, Qwen3.5, Qwen3.6, Qwen3.8, LFM2, DiffusionGemma, and
-Decision 2.0 Kai models on NVIDIA H100 SXM, B200, L40S, and RTX PRO 6000
+Quail runs Qwen3, Qwen3.5, Qwen3.6, Qwen3.8, LFM2, d1, DiffusionGemma,
+and Decision 2.0 Kai models on NVIDIA H100 SXM, B200, L40S, and RTX PRO 6000
 Blackwell GPUs, with 1, 2, 4, or 8 GPUs per query. See
 [Supported models and GPUs](https://fsdatalab.github.io/quail/docs/user-guide/models)
 for each model's AI functions and GPU limits.

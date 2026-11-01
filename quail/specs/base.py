@@ -133,6 +133,10 @@ class ModelSpec:
     #                       to every prompt: Quail tokenizes without special
     #                       tokens, so the prefix carries it, and the text
     #                       sent to vLLM drops it because vLLM adds its own
+    answer_spellings: tuple[tuple[str, ...], tuple[str, ...]] = ()
+    #                    (true spellings, false spellings) that a
+    #                    filter, join, or score reads at the answer row;
+    #                    empty reads TRUE against FALSE
     prompt_format: str = "raw-v1"    # names the turn layout in run records
     prompt_layout: str = "ai-if"     # the PROMPT_LAYOUTS entry AI.IF
     #                                  prompts are written in
