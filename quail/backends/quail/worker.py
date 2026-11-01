@@ -335,7 +335,7 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
         gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
         warm_s, warm_tier = gpu.warm()
         boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
-        say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
+        say(f"model ready after {boot['boot_s']} s ({boot['kind']} start)")
         rollback.pop_all()
     return gpu, boot
 

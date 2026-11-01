@@ -146,6 +146,6 @@ class Progress:
         rate = self.done / elapsed if elapsed > 0 else 0.0
         count = f"{self.done:,}"
         if self.total is not None:
-            count += f"/{self.total:,}"
-        return (f"{label}: {count} {self.unit}, {elapsed:.1f} s, "
-                f"{rate:,.0f} {self.unit}/s")
+            count += f" of {self.total:,}"
+        return (f"{label}: {count} {self.unit} in {elapsed:.1f} s "
+                f"({rate:,.0f} per second)")

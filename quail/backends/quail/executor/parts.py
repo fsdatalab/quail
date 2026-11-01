@@ -35,9 +35,9 @@ def shared_prefix_tree(name, prefixes, arena):
     started = time.perf_counter()
     tree = prefix_tree(prefixes, arena.page_tokens)
     logger.info(
-        "prefix sharing on %s: %s documents borrow %s tokens "
-        "(tree built in %.2f s)", name, len(prefixes),
-        tree.shared_tokens, time.perf_counter() - started)
+        "prefix sharing for %s: %s documents reuse %s tokens of earlier "
+        "documents (found in %.2f s)", name, f"{len(prefixes):,}",
+        f"{tree.shared_tokens:,}", time.perf_counter() - started)
     return tree
 
 

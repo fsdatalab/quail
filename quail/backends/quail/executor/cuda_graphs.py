@@ -282,8 +282,8 @@ class PiecewiseGraphs:
             raise
         self.storage = engine.arena.k
         self.capture_s = time.perf_counter() - started
-        logger.info("captured %d piecewise buckets in %.2f s; %.1f MiB "
-                    "storage / %.1f MiB budget",
+        logger.info("CUDA graphs: captured %d batch sizes in %.1f s, using "
+                    "%.0f of %.0f MiB",
                     len(self.graphs), self.capture_s, self.captured_bytes / 2**20,
                     self.memory_bytes / 2**20)
         return True

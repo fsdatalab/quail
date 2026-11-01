@@ -155,7 +155,7 @@ def _label_readout(state: QueryExecutionState, targets, rows: int, normalize: bo
             torch, torch.nn.functional, head, targets, rows=rows,
             normalize=normalize)
         state.loaded_model.label_readout = readout
-        logger.info("label readout: head %s x %s in %s, %s targets, "
+        logger.debug("label readout: head %s x %s in %s, %s targets, "
                     "%s rows per request, %s", *head.shape,
                     str(head.dtype).replace("torch.", ""), len(targets),
                     rows, "normalized" if normalize else "targets' logits")

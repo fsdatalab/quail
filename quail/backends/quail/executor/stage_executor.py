@@ -863,14 +863,16 @@ class StageExecutor:
             need = self.arena.page_cost(sum(self._entry_rows(*e) for e in part))
             if self.arena.evict_retained(need):
                 self._log_memory_event("evict_retry", groups=len(part))
-                logger.info("chunk of %d groups retried after evicting "
-                            "retained KV", len(part))
+                logger.info("%s: a forward pass of %d groups ran out of KV; "
+                            "freed KV kept for later operators and retried",
+                            self.label, len(part))
                 self._run_part(part, decode, replays)
                 return
             if len(part) < 2:
                 raise
             self._log_memory_event("split", groups=len(part), reason=str(error))
-            logger.info("chunk of %d groups split: %s", len(part), error)
+            logger.info("%s: a forward pass of %d groups did not fit (%s); "
+                        "splitting it in two", self.label, len(part), error)
             half = len(part) // 2
             self._run_part(part[:half], decode, replays)
             self._run_part(part[half:])
@@ -1074,22 +1076,23 @@ class StageExecutor:
             between = sum(max(0.0, end.elapsed_time(start))
                           for (*_, end), (*_, start, _)
                           in zip(self.spans, self.spans[1:])) / 1000.0
-            logger.info("%s: %d forward passes, %.3f s of GPU time between them",
-                        self.label, len(self.spans), between)
+            logger.info("%s: %s forward passes, with %.2f s of GPU time between "
+                        "them", self.label, f"{len(self.spans):,}", between)
         if self.pass_rows and self.summary:
             rows = np.asarray(self.pass_rows)
-            line = (f"{self.label}: {len(rows)} passes, median "
+            line = (f"{self.label}: {len(rows):,} passes of a median "
                     f"{int(np.median(rows)):,} rows")
             if self.knee_rows:
                 # a pass below the size where it becomes compute-bound,
                 # while documents wait, is one admission left short
                 short = (rows < self.knee_rows) & np.asarray(self.pass_queued)
-                line += (f"; {int(short.sum())} passes under {self.knee_rows:,} "
-                         f"rows while documents waited")
+                line += (f"; {int(short.sum()):,} passes had under "
+                         f"{self.knee_rows:,} rows while documents waited")
             logger.info(line)
         if self.decoder is not None and self.summary:
-            logger.info("%s: %d answer evictions, %d recomputed tokens", self.label,
-                        self.num_evictions, self.recomputed_tokens)
+            logger.info("%s: evicted %s answers and recomputed %s tokens",
+                        self.label, f"{self.num_evictions:,}",
+                        f"{self.recomputed_tokens:,}")
             curves = getattr(self.answer_admission, "bucket_curves", None)
             directory = os.environ.get(HEADROOM_TRACE_ENV)
             if curves and directory:
@@ -1105,6 +1108,9 @@ class StageExecutor:
                                                 for v in curve[::8]]
                                    for (q, b), curve in curves.items()}}, file)
                 logger.info("%s: headroom trace saved to %s", self.label, path)
-            logger.info("%s: decode rows read KV tokens %s", self.label,
-                        self.decoder.read_tokens)
+            reads = self.decoder.read_tokens
+            logger.info("%s: answers read %s KV tokens, against %s without "
+                        "shared reads", self.label,
+                        f"{reads['alone'] + reads['own'] + reads['shared']:,}",
+                        f"{reads['all']:,}")
         return self.sched.answers, self.spans, self.tokens

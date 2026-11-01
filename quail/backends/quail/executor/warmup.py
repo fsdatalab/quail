@@ -271,7 +271,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         work = [(m, lin) for lin in linears for m in counts]
     progress = Progress("kernels: GEMM warmup", total=len(work),
                         unit="configurations", emit=logger.info)
-    logger.info("kernels: starting %s GEMM warmup configurations", len(work))
+    logger.info("warming up %s matrix multiply shapes", len(work))
     with torch.inference_mode():
         # one buffer per linear, row-sliced per call; the sweep only
         # needs each kernel launched once
@@ -288,7 +288,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         buf = None
         torch.cuda.synchronize()
     progress.finish("kernels: GEMM warmup done")
-    logger.info("kernels: warming filter and join forward passes")
+    logger.info("warming up the forward pass kernels")
     _forward_warm(torch, arena, pipeline, async_ans, budget,
                   join_chunk=True)
 
@@ -357,7 +357,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                logger.info("kernels: waiting for another worker to compile")
+                logger.info("waiting for another worker to compile the kernels")
                 fcntl.flock(lock, fcntl.LOCK_EX)
             wait_s = time.perf_counter() - t0
             on_disk = None
@@ -367,7 +367,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
             except (OSError, ValueError):
                 pass
             if force_compile or on_disk != identity:
-                logger.info("kernels: starting compile pass")
+                logger.info("compiling the kernels")
                 compile_kernels(torch, arena, pipeline, async_ans, budget)
                 torch.cuda.synchronize()
                 tmp = path + ".tmp"
@@ -376,15 +376,15 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                 os.replace(tmp, path)
                 tier = "compile"
         if tier == "touch":
-            logger.info("kernels: warming cached filter and join kernels")
+            logger.info("loading the compiled kernels from the cache")
             touch_kernels(torch, arena, pipeline, async_ans, budget)
         if model is not None:
             warm_label_readout(torch, full_output_head(model))
         torch.cuda.synchronize()
         warm_s = round(time.perf_counter() - t0 - wait_s, 2)
         wait_s = round(wait_s, 2)
-        logger.info("kernels: %s pass done in %s s; waited %s s for compilation",
-                    tier, warm_s, wait_s)
+        logger.info("kernels ready in %s s (%s pass, %s s waiting for compilation)",
+                    warm_s, tier, wait_s)
         return dict(tier=tier, warm_s=warm_s, wait_s=wait_s)
 
 

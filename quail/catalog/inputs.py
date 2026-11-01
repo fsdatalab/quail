@@ -298,10 +298,9 @@ class InputStore:
                         ).cast(pa.int64()).to_pylist())
             finally:
                 reader.close()
-        say(f"estimated {provider_name}.{_column_label(column)}: "
-            f"{len(lengths):,} documents, "
-            f"about {sum(lengths):,} tokens from a {len(sample)} document "
-            f"sample, {time.perf_counter() - started:.1f} s")
+        say(f"{provider_name}.{_column_label(column)}: {len(lengths):,} "
+            f"documents, about {sum(lengths):,} tokens (estimated from "
+            f"{len(sample):,} documents in {time.perf_counter() - started:.1f} s)")
         self._length_estimates[key] = lengths = TokenLengths(lengths)
         return lengths
 
