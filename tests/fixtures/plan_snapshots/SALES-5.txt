@@ -1,0 +1,30 @@
+logical:
+  Limit: 25
+    Sort: commit_score DESC NULLS LAST, c.id ASC NULLS LAST
+      Project: c.id, AI.SCORE('Judge strictly from the sales call above whether the customer commits to buying, such as accepting the terms, agreeing to sign, or asking for the contract or paperwork. Interest, questions, or agreeing to another meeting do not count.\n\n{0}\n\nInstruction: answer TRUE if the customer commits to buying, FALSE otherwise.') AS commit_score
+        Scan sales_calls as c [transcript, id, deal_stage] where c.deal_stage = 'Negotiation'
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                            est. rows   est. time
+  Sort: commit_score DESC NULLS LAST, c.id ASC NULLS LAST
+    fetch=25
+    Project: c.id, commit_score
+      quail.ai_score                                                      2.41 ms
+        backend=quail
+        keep_kv=False
+        model=qwen3-4b-fp8
+        batching=token_based_admission
+        output=commit_score
+        aliases=['c']
+        expected_rows=1.0
+        estimated_seconds=0.0024672108812310474
+        share_prefixes=True
+        Scan sales_calls as c                                       1
+          tokens=144, mean_document_tokens=24
+          where c.deal_stage = 'Negotiation'
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

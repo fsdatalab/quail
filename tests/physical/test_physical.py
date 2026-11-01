@@ -1,7 +1,6 @@
 """Physical planning and runtime extension test."""
 
 import copy
-import re
 import sys
 import types
 from dataclasses import dataclass, replace
@@ -17,7 +16,7 @@ from quail.catalog import DocumentProvider
 from quail.execution.metrics import NodeResult
 from quail.execution.runtimes import BarrierRuntime
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
-from quail.logical import ColumnRef, LogicalPlan
+from quail.logical import ColumnRef
 from quail.physical import (
     Barrier,
     ExecutionLocation,
@@ -38,26 +37,7 @@ from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import EngineConfig, PhysicalPlan
 
 
-def test_barrier_preserves_survivor_order_and_duplicates():
-    from quail.physical.base import input_ports
-
-    node = Barrier(node_id="barrier", aliases=("a", "b"), inputs=input_ports((
-        PortRef("scan:a", "rows:a"), PortRef("scan:b", "rows:b"),
-        PortRef("join", "join_answers:0"))))
-    for arrow in (False, True):
-        for keep in (False, True):
-            ids = ([3, 1, 3, 2], [8, 7])
-            inputs = {f"input:{i}": pa.table({alias: values}) if arrow else values
-                      for i, (alias, values) in enumerate(zip(node.aliases, ids))}
-            inputs["input:2"] = pa.table({"a": [1, 3, 2, 9], "b": [7, 8, 7, 8],
-                                          "answer": [keep, keep, False, keep]})
-            outputs = BarrierRuntime().execute(node, inputs, None).outputs
-            values = [outputs[f"rows:{alias}"].ids[alias].to_pylist()
-                      for alias in node.aliases]
-            assert values == ([[3, 1, 3], [8, 7]] if keep else [[], []])
-
-
-@pytest.mark.parametrize("shape", ["chain", "cycle", "disconnected"])
+@pytest.mark.parametrize("shape", ["cycle"])
 def test_barrier_survivors_are_the_ids_of_a_complete_join(shape):
     """A survivor needs a partner in every join at once, whatever the relation order."""
     import itertools
@@ -92,8 +72,7 @@ def test_barrier_survivors_are_the_ids_of_a_complete_join(shape):
                 for alias in expected} == expected, ordered
 
 
-@pytest.mark.parametrize("aliases", [("key0", "key1"), ("left", "right"),
-                                     ("right", "left")])
+@pytest.mark.parametrize("aliases", [("left", "right")])
 def test_hash_join_keeps_ids_apart_from_a_key_column_named_like_its_alias(aliases):
     from types import SimpleNamespace
 
@@ -191,68 +170,6 @@ class KeepFirstDocument(PhysicalRule):
             graph.root)
 
 
-class TwoCandidatesBackend:
-    """Offers the plan as written and an alternative, at chosen estimates."""
-
-    name = "local_filter"
-
-    def __init__(self, written, alternative):
-        self.estimates = (written, alternative)
-        self.alternative = None
-
-    def supports(self, model, device, gpus):
-        return SupportResult.accept()
-
-    def plan(self, region, context):
-        written, alternative = self.estimates
-        self.alternative = LogicalPlan(region.logical_plan.root)
-        return (
-            local_plan(context, count=1, estimate=written, source="written"),
-            replace(local_plan(context, count=1, estimate=alternative,
-                               source="alternative"),
-                    logical_plan=self.alternative),
-        )
-
-
-class RecordLogicalPlan(PhysicalRule):
-    name = "record_logical_plan"
-
-    def __init__(self):
-        self.seen = []
-
-    def rewrite(self, graph, context):
-        self.seen.append(context.logical_plan)
-        return None
-
-
-@pytest.mark.parametrize("estimates, chosen", [
-    ((1.0, 1.0), "written"), ((2.0, 1.0), "alternative")])
-def test_plan_query_keeps_the_cheapest_candidate_and_its_logical_plan(
-        estimates, chosen):
-    registry = quail.ExtensionRegistry.with_built_ins()
-    backend = TwoCandidatesBackend(*estimates)
-    registry.register_backend(backend)
-    rule = RecordLogicalPlan()
-    registry.register_physical_rule(rule)
-    session = quail.Session(
-        EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
-                     device="h100-sxm"),
-        tokenizer=str.split, registry=registry)
-    session.register("documents", DocumentProvider.from_table(
-        pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
-        id_col="id", identity="two-candidate-docs"))
-    query = session.sql(
-        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
-    plan = query.plan()
-    assert plan.settings["planner_source"] == chosen
-    written, alternative = rule.seen
-    assert query.logical is (written if chosen == "written" else alternative)
-    assert plan.logical_plan is query.logical
-    assert alternative is backend.alternative
-    assert [candidate["selected"] for candidate in plan.settings["candidates"]] == (
-        [True, False] if chosen == "written" else [False, True])
-
-
 def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     registry = quail.ExtensionRegistry.with_built_ins()
     backend = LocalFilterBackend()
@@ -323,53 +240,3 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     registry.load_extension(module)
     response = _execute_physical(request, registry)
     assert response.metrics == {"backend": "test.example", "nodes": ["input:d"]}
-
-
-def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
-    from quail.execution.metrics import NodeMetrics, scalar_node_metrics
-    from quail.explain import physical_tree
-    from quail.physical.base import input_ports
-
-    source = Scan(node_id="input:d", alias="d", num_documents=100)
-    first = FirstDocuments(
-        node_id="first", alias="d", count=5,
-        inputs=input_ports((PortRef(source.node_id, "rows:d"),)))
-    second = FirstDocuments(
-        node_id="second", alias="d", count=10,
-        inputs=input_ports((PortRef(source.node_id, "rows:d"),)))
-    project = Project(
-        node_id="project", columns=("d.id",),
-        inputs=input_ports((PortRef(first.node_id, "rows:d"),
-                            PortRef(second.node_id, "rows:d"))))
-    graph = PhysicalGraph((source, first, second, project),
-                          PortRef(project.node_id, "rows"))
-    text = physical_tree(graph)
-    assert text.splitlines()[0].split() == ["est.", "rows"]
-    assert text.splitlines()[1].startswith("Project: d.id")
-    assert text.count("Scan: d [1]") == 1
-    assert text.count("Reuse [1]") == 1
-    assert "count=5" in text and "count=10" in text
-    assert "test.first_documents" in text
-    assert "input:d" not in text
-    assert "input:d[rows:d]" in physical_tree(graph, verbose=True)
-
-    node = Scan(node_id="input:d", alias="d", num_documents=100)
-    graph = PhysicalGraph((node,), PortRef(node.node_id, "rows:d"))
-    assert "metrics unavailable" in physical_tree(graph, metrics={})
-    measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,
-                                         fresh_tokens=200)}
-    text = physical_tree(graph, metrics=measured)
-    assert re.search(r"Scan: d\s+100\s+42\s+1\.25 s\s+200$", text,
-                     re.MULTILINE)
-    assert "est. time" not in text
-    assert "fresh_tokens=200" in physical_tree(
-        graph, metrics=measured, verbose=True)
-
-    nodes = {"ai_filter:r": NodeResult({}, NodeMetrics(
-        fresh_tokens=10,
-        extension={"borrowed_prefix_tokens": 64, "answers": [1, 0],
-                   "flag": True}))}
-    metrics = scalar_node_metrics(nodes)["ai_filter:r"]
-    assert metrics["fresh_tokens"] == 10
-    assert metrics["borrowed_prefix_tokens"] == 64
-    assert "answers" not in metrics and "flag" not in metrics

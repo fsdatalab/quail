@@ -7,7 +7,7 @@ from quail.logical import (
 )
 from quail.logical.expressions import column_name
 from quail.logical.prompts import prompt_aliases
-from quail.physical import AiJoin, Foreign, PortRef
+from quail.physical import AiJoin, PortRef
 from quail.physical.base import input_ports
 from quail.planner.operators.common import question_tokens
 from quail.planner.operators.score import ScoreJoinCost, score_statistics
@@ -74,7 +74,7 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
 def emit_join(
     builder, spec, step, anchor, join_id, exec_index, port_by_alias
 ) -> tuple:
-    """Append one AI join stage and the functions that supply its pairs.
+    """Append one AI join stage.
 
     Args:
         builder: The graph builder.
@@ -97,18 +97,6 @@ def emit_join(
         pair_inputs.append(
             PortRef(producer.node_id, f"pairs:{spec.written_position}"))
         pairs_from = producer.node_id
-    for apply in builder.join_applies.get(spec.written_position, ()):
-        # the function's pairs reach the join on their own port
-        apply_id = f"apply:{apply.function}"
-        builder.nodes.append(Foreign(
-            node_id=apply_id,
-            inputs=input_ports(tuple(
-                port_by_alias[a] for a in apply.aliases)),
-            function=apply.function, kind=apply.kind, ids="pairs",
-            columns=apply.columns, aliases=tuple(apply.aliases),
-            written_position=spec.written_position))
-        pair_inputs.append(PortRef(apply_id, f"pairs:{spec.written_position}"))
-        pairs_from = apply_id
     builder.nodes.append(AiJoin(
         node_id=join_id,
         inputs=input_ports(tuple(

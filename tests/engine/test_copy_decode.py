@@ -429,7 +429,8 @@ def test_maps_and_extracts_share_branches_without_changing_results(
                 "is not null" if tested == "extract" else "<>",
                 None if tested == "extract" else ""),
         )
-        parts.extend([ConditionGate(condition, producer, producer), after])
+        parts.extend([ConditionGate(condition, {column: producer}, producer, None),
+                      after])
     results = execute_parts(
         state,
         parts,

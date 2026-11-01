@@ -3,7 +3,6 @@
 
 def execution_parts() -> dict:
     """Return the execution implementation for each supported node type."""
-    from quail.backends.quail.executor.operators.apply import ApplyGate
     from quail.backends.quail.executor.operators.classify import ClassifyPart
     from quail.backends.quail.executor.operators.extract import ExtractPart
     from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
@@ -22,7 +21,6 @@ def execution_parts() -> dict:
         AiSaeFeatures,
         AiScore,
         Filter,
-        Foreign,
     )
 
     return {AiFilter.type_name: FilterPart, AiClassify.type_name: ClassifyPart,
@@ -30,4 +28,4 @@ def execution_parts() -> dict:
             AiSaeFeatures.type_name: SaeFeaturesPart,
             AiMap.type_name: MapPart,
             AiScore.type_name: ScoreBatch,
-            Filter.type_name: ConditionGate, Foreign.type_name: ApplyGate}
+            Filter.type_name: ConditionGate}

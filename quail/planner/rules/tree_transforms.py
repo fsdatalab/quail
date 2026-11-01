@@ -7,7 +7,7 @@ from dataclasses import replace
 from quail.logical import (
     Aggregate,
     Alias,
-    Apply,
+    And,
     ColumnRef,
     Equality,
     Filter,
@@ -16,7 +16,9 @@ from quail.logical import (
     LogicalNode,
     LogicalPlan,
     ModelCall,
+    Not,
     Operators,
+    Or,
     Project,
     RegularPredicate,
     Result,
@@ -28,9 +30,10 @@ from quail.logical import (
     SemanticMap,
     SortKey,
     Window,
-    above_unnest,
+    above_projection,
     is_score,
     model_call,
+    reads_projection,
 )
 from quail.logical.expressions import (
     GetField,
@@ -54,6 +57,8 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return _refs_of(model_call(expression).prompt.args)
     if isinstance(expression, RegularPredicate):
         return _column_refs(expression.expression)
+    if isinstance(expression, (Not, And, Or)):
+        return _refs_of(expression.tests())
     if isinstance(expression, Equality):
         return _refs_of((expression.left, expression.right))
     if isinstance(expression, SortKey):
@@ -78,8 +83,8 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
 
     The document column is always tokenized. It is kept as a value too
     only when something reads its text: the root projection or a sort
-    key returns it, a score reads it, a scan predicate tests it, an
-    apply() function or a join condition reads it, or an extraction
+    key returns it, a score reads it, a scan predicate tests it, a
+    join condition reads it, or an extraction
     locates its answers in it.
     """
     plan = LogicalPlan(root)
@@ -100,9 +105,7 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for ref in _column_refs(expression)
     }
     for node in plan.walk():
-        if isinstance(node, Apply):
-            refs = _refs_of(node.columns)
-        elif isinstance(node, Join):
+        if isinstance(node, Join):
             refs = _refs_of(node.on)
         elif isinstance(node, (SemanticExtract, SemanticMap)):
             refs = _refs_of(node.call.prompt.args)
@@ -142,8 +145,7 @@ def _lets_through(node, alias: str) -> bool:
 
     True for a Join, a full SemanticJoin, a classification of joined
     rows, and any node on another table. False for the table's own
-    sequence, a gate (an exists or anti join), an Apply reading the
-    table or returning a join's pairs, and any other node.
+    sequence, a gate (an exists or anti join), and any other node.
     """
     if isinstance(node, Join):
         return True
@@ -153,10 +155,8 @@ def _lets_through(node, alias: str) -> bool:
         return len(node.call.aliases()) == 2 or node.alias != alias
     if isinstance(node, (SemanticExtract, SemanticMap)):
         return node.alias != alias
-    if isinstance(node, Apply):
-        return node.ids != "pairs" and node.aliases[0] != alias
     if isinstance(node, Filter):
-        return node.condition.column.alias != alias
+        return node.alias != alias
     if isinstance(node, SemanticFilter):
         return all(model_call(p.expression).aliases()[0] != alias
                    for p in node.predicates)
@@ -168,7 +168,7 @@ def _place_filter(filter_node, node, alias: str):
 
     Returns:
         The subtree under node with the filter as low as it goes, or
-        None when a gate, an Apply, or the table's own sequence stops
+        None when a gate or the table's own sequence stops
         it before any Join.
     """
     if isinstance(node, Join):
@@ -194,9 +194,7 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
     and the other tables' operators above that table. Each moves to
     the top of its own table's sequence and keeps its order with the
     table's other filters. A filter stays where it is when a gate (an
-    exists or anti join) or an Apply reading its table sits between it
-    and the first Join below. An Apply never moves: its function sees
-    the rows of the relation it was written on.
+    exists or anti join) sits between it and the first Join below.
 
     Returns:
         The rewritten root, or None when no filter moved.
@@ -208,9 +206,9 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
         children = tuple(visit(child) for child in node.children())
         if children != node.children():
             node = node.with_children(children)
-        if not isinstance(node, Filter):
+        if not isinstance(node, Filter) or reads_projection(node.input):
             return node
-        alias = node.condition.column.alias
+        alias = node.alias
         placed = _place_filter(node, node.input, alias)
         if placed is None:
             return node
@@ -241,7 +239,7 @@ def _sequence_alias(node) -> str:
     """Return the table alias a classification, extraction, or label filter reads."""
     if isinstance(node, (SemanticClassify, SemanticExtract, SemanticMap)):
         return node.alias
-    return node.condition.column.alias
+    return node.alias
 
 
 def lift_maps(root: LogicalNode) -> LogicalNode | None:
@@ -253,8 +251,7 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     sequence and
     moves above the topmost join, under the root Project, in scan
     order. A classification or extraction of a table that no join
-    reads stays, as does one below an Apply, whose function sees the
-    rows it was written on, and one of a gate's inner table (an exists
+    reads stays, as does one of a gate's inner table (an exists
     or anti join's partner), whose filters decide which anchors pass.
     The column operators here are SemanticClassify, SemanticExtract, and
     SemanticMap; above the joins each runs on the documents they keep.
@@ -265,8 +262,8 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     """
     # the result rows above the Project, an Unnest chain among them, hold
     # no document operators
-    if (isinstance(root, (Result, Aggregate, Window)) or above_unnest(root)
-            or isinstance(root, Project) and above_unnest(root.input)):
+    if (isinstance(root, (Result, Aggregate, Window)) or above_projection(root)
+            or isinstance(root, Project) and above_projection(root.input)):
         rewritten = lift_maps(root.input)
         return None if rewritten is None else root.with_children((rewritten,))
     nodes = LogicalPlan(root).walk()
@@ -311,7 +308,7 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
 
 def _filtered_alias(operators: Operators) -> str | None:
     """Return the one alias whose AI.IF predicates are the only model calls."""
-    if (operators.joins or operators.classifies or operators.applies
+    if (operators.joins or operators.classifies
             or operators.projections or operators.column_filters
             or len(operators.filters) != 1):
         return None

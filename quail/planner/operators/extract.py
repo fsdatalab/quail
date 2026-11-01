@@ -8,7 +8,6 @@ from quail.cost.retention import coefficients
 from quail.physical import AiExtract, ExtractSpec
 from quail.planner.operators.common import (
     bind_inference,
-    emit_calls,
     inference_node,
     node_index,
 )
@@ -95,4 +94,4 @@ def emit_extract(builder, alias, expected_rows, names, port, resident=False) -> 
             AiExtract, spec, (port,), index=node_index(builder, AiExtract),
             backend="quail", model=builder.model.name)
 
-    return emit_calls(builder, alias, expected_rows, port, names, node_of)
+    return builder.emit_columns(alias, expected_rows, port, names, node_of)

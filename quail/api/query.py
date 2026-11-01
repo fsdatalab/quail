@@ -11,7 +11,7 @@ import pyarrow as pa
 
 from quail.api.execute import execute_query
 from quail.catalog import inputs
-from quail.catalog.pairs import columns_key, estimate_pair_fraction
+from quail.catalog.pairs import FIRST_DOCUMENT, columns_key, estimate_pair_fraction
 from quail.catalog.providers import ScanRequest
 from quail.catalog.selection import selected_rows
 from quail.catalog.tokens import TokenLengths
@@ -294,7 +294,11 @@ class Query:
                 continue
             columns = pa.table(self.inputs.sample_columns(
                 scan.provider,
-                [predicate.column.column for predicate in scan.predicates]))
+                list(dict.fromkeys(reference.column
+                                   for predicate in scan.predicates
+                                   for test in predicate.tests()
+                                   for reference in column_references(
+                                       test.expression)))))
             sampled = columns.num_rows
             kept = len(selected_rows(columns, scan.predicates))
             # a sample that keeps nothing, or everything, says little
@@ -400,7 +404,8 @@ class Query:
         provider = self.catalog.get(scan.provider)
         expressions = (*self.logical.projection.columns,
                        *(key.expression for key in self.logical.result.order),
-                       *(predicate.column for predicate in scan.predicates))
+                       *(test.expression for predicate in scan.predicates
+                         for test in predicate.tests()))
         columns = tuple(dict.fromkeys(
             column for expression in expressions
             for column in source_columns(expression)))
@@ -472,7 +477,9 @@ class Query:
         """One value table per alias whose columns the executor reads.
 
         A scan's regular predicates, a HashJoin, an apply(), and a stop key
-        read values; the tables carry the columns they name.
+        read values; the tables carry the columns they name. A table the
+        plan deduplicates also carries FIRST_DOCUMENT, computed from the
+        tokens and the row columns the deduplicate setting lists for it.
         """
         needed = {}
         operators = self.logical.operators()
@@ -481,21 +488,35 @@ class Query:
                 for ref in column_references(condition.left) + column_references(
                         condition.right):
                     needed.setdefault(ref.alias, {})[ref.column] = None
-        for apply in operators.applies:
-            for expression in apply.columns:
-                for ref in column_references(expression):
-                    needed.setdefault(ref.alias, {})[ref.column] = None
         for scan in operators.scans:
             for predicate in scan.predicates:
-                needed.setdefault(scan.alias, {})[predicate.column.column] = None
+                for test in predicate.tests():
+                    for reference in column_references(test.expression):
+                        needed.setdefault(scan.alias, {})[reference.column] = None
+        # a Filter on labels or answers reads the source columns it tests
+        # by document ID
+        providers = {scan.alias: scan.provider for scan in operators.scans}
+        for alias, filters in operators.column_filters.items():
+            columns = self.catalog.get(providers[alias]).columns
+            for reference in (reference for each in filters
+                              for found in each.condition.tests()
+                              for reference in column_references(found.expression)):
+                if reference.alias == alias and reference.column in columns:
+                    needed.setdefault(alias, {})[reference.column] = None
         for alias, key in filter_stop_keys(self.logical).items():
             for column in key:
                 needed.setdefault(alias, {})[column] = None
+        deduplicated = self.plan().settings.get("deduplicate", {})
+        for alias in deduplicated:
+            needed.setdefault(alias, {})
         tables = {}
         for alias, columns in needed.items():
             store = self._token_inputs[alias]
-            tables[columns_key(alias)] = pa.table(
-                {name: store.column(name) for name in columns})
+            values = {name: store.column(name) for name in columns}
+            if alias in deduplicated:
+                values[FIRST_DOCUMENT] = store.tokens.first_documents_with(
+                    [store.column(column) for column in deduplicated[alias]])
+            tables[columns_key(alias)] = pa.table(values)
         return tables
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:

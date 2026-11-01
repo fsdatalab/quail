@@ -1,0 +1,40 @@
+logical:
+  Project: r.id, a.id, a2.id
+    SemanticJoin (full)
+      PROMPT('Does the review in DOCUMENT {0} express positive sentiment about the movie aspect in DOCUMENT {1}?', r.body, a2.aspect) (selectivity=16.1%)
+      Join
+        cross
+        SemanticJoin (full)
+          PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect) (selectivity=29.5%)
+          Join
+            cross
+            Scan reviews as r [body, id]
+            Scan aspects as a [aspect, id]
+        Scan aspects as a2 [aspect, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                           est. rows   est. pass   est. time
+  Project: r.id, a.id, a2.id
+    Recombine: r, a2, a
+      AiJoin: anchor=r [3]                                                                           66.5 ms
+        KV: anchor=not resident, retain after join=yes
+        join 2 full (r, a2)  PROMPT('Does the review in DOCUMENT {0} …')         144       16.1%
+        Scan reviews as r                                                         12
+          tokens=158, mean_document_tokens=13.2
+        Scan aspects as a2 [2]                                                    12
+          tokens=164, mean_document_tokens=13.7
+      AiJoin: anchor=r                                                                                 52 ms
+        KV: anchor=from an earlier join, retain after join=no
+        join 1 full (r, a)  PROMPT('Does the review in DOCUMENT {0} …')        126.4       29.5%
+        Reuse [3]
+        Scan aspects as a [1]                                                     12
+          tokens=164, mean_document_tokens=13.7
+      Reuse [2]
+      Reuse [1]
+  Pipeline on r: ai_join:r -> ai_join:r:predicate:0 (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

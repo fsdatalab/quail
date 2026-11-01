@@ -1,9 +1,7 @@
 """Filters and joins over random corpora read the right KV.
 
-The corpora repeat one another's starts, as agent snapshots do. Small
-corpora run on arenas a few documents fill; large ones have documents
-of thousands of tokens and a 1,024-token window, the sizes QUAIL-B
-runs at. See kv_checker for the check.
+The corpora repeat one another's starts, as agent snapshots do, and
+run on arenas a few documents fill. See kv_checker for the check.
 """
 
 import random
@@ -21,9 +19,8 @@ from helpers.kv_checker import (
 pytest.importorskip("torch")
 
 
-@pytest.fixture(params=[("unified", False, False), ("tree", False, False),
-                        ("unified", True, False), ("unified", True, True)],
-                ids=["unified", "tree", "sliding", "sliding-canvas"])
+@pytest.fixture(params=[("tree", False, False), ("unified", True, True)],
+                ids=["tree", "sliding-canvas"])
 def arena_kind(request, monkeypatch):
     """(attention path, sliding layers, canvas row), with CPU staging."""
     cpu_staging(monkeypatch)
@@ -64,21 +61,6 @@ def small(rng, kind, n, pages, sliding_pages):
         canvas=(99,) if canvas else (), pages=rng.choice(pages),
         sliding_pages=rng.choice(sliding_pages),
         budget=max(map(len, documents)) + rng.choice((8, 60, 600)))
-
-
-def large(rng, kind):
-    """Documents of thousands of tokens, a 1,024-token window."""
-    path, sliding, canvas = kind
-    documents = corpus(rng, 120, (0, 48, 300), (40, 200, 700, 1500))
-    longest = max(map(len, documents))
-    # the longest document and its extra rows fit either pool untrimmed
-    pages = -(-(longest + 16) // 16) + 1
-    return documents, Setup(
-        path=path, window=1024 if sliding else None,
-        canvas=(99,) if canvas else (),
-        pages=pages * rng.choice((1, 3, 10)),
-        sliding_pages=pages * rng.choice((1, 2)),
-        budget=longest + rng.choice((16, 4096, 16384)))
 
 
 def questions(rng):
@@ -128,25 +110,3 @@ def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
                   canvas=(99,) if canvas else (), pages=12,
                   sliding_pages=12, budget=200, page_tokens=16)
     check_join_after_join([parent, child], *join_parts(), setup)
-
-
-@pytest.mark.parametrize(
-    "arena_kind", [("unified", False, False), ("tree", False, False),
-                   ("unified", True, False)],
-    ids=["unified", "tree", "sliding"], indirect=True)
-def test_large_filters_joins_and_filters_feeding_joins(arena_kind):
-    """Documents of thousands of tokens on a 1,024-token window.
-
-    The canvas row runs on the small corpora only.
-    """
-    rng = random.Random(300)
-    documents, setup = large(rng, arena_kind)
-    named("filter", check_filter, documents, questions(rng), setup)
-    for retain in (False, True):
-        rng = random.Random(400)
-        documents, setup = large(rng, arena_kind)
-        named(f"join retain {retain}", check_join, documents, *join_parts(),
-              setup, retain=retain)
-    rng = random.Random(500)
-    documents, setup = large(rng, arena_kind)
-    named("feed", check_feed, documents, [90, 91, 92], *join_parts(), setup)

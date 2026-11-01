@@ -6,21 +6,20 @@ from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from quail.logical.expressions import (
+    SPAN_SUFFIX,
     Aggregation,
-    ColumnRef,
     CompileError,
     FilterPredicate,
     ModelCall,
     Prompt,
-    RegularPredicate,
     aliased_call,
     column_name,
     column_references,
+    condition_columns,
     model_call,
 )
 from quail.logical.nodes import (
     Aggregate,
-    Apply,
     Filter,
     Join,
     Project,
@@ -35,6 +34,8 @@ from quail.logical.nodes import (
     Unnest,
     Window,
 )
+from quail.logical.nodes.relational import readable_columns
+from quail.logical.placement import result_columns_read, result_row_condition
 from quail.logical.plan import (
     LogicalPlan,
 )
@@ -50,7 +51,6 @@ class JoinSpec:
     selectivity: Optional[float] = None
     anchor: Optional[str] = None
     on: tuple = ()  # tuple[Equality, ...] over the tables
-    applies: tuple = ()  # (function, kind, columns) returning pairs
 
     @property
     def prompt(self) -> Prompt:
@@ -65,7 +65,6 @@ class LogicalPlanBuilder:
         self._tables = []
         self._nodes = {}
         self._root = None
-        self._joins = 0
 
     def add_scan(
         self,
@@ -73,17 +72,15 @@ class LogicalPlanBuilder:
         provider: str,
         column: str,
         predicates: tuple[FilterPredicate, ...] = (),
-        applies: tuple = (),
         labels: tuple = (),
-        label_filters: tuple = (),
         regular_predicates: tuple = (),
         extracts: tuple = (),
-        column_filters: tuple = (),
+        computed_filters: tuple = (),
         sae_features: tuple = (),
         maps: tuple = (),
         schema=None,
     ) -> None:
-        """Add one table with its filters, applies, classifications, and extractions.
+        """Add one table with its filters, classifications, and extractions.
 
         Args:
             alias: The table's alias in the query.
@@ -91,29 +88,29 @@ class LogicalPlanBuilder:
             column: The document column.
             schema: The provider's Arrow schema, for typing the result.
             predicates: The table's AI.IF predicates in written order.
-            regular_predicates: RegularPredicate tests the scan applies
-                before any operator reads a document.
-            applies: (function, kind, ids, columns) per apply, in order.
+            regular_predicates: The conditions the scan applies before
+                any operator reads a document.
             labels: (call, name) per one-table classification. A call
                 that a label filter tests sits below the first Filter
                 testing it; the others sit above the last Filter, in the
                 order given.
-            label_filters: (name, values, selectivity) per Filter on a
-                classification's label column, in written order.
             extracts: (call, name) per extraction, in order. They sit
                 above the classifications and label filters.
-            column_filters: (RegularPredicate, selectivity) per Filter
-                on a computed column, in written order. Each sits right
-                above the operator it tests.
+            computed_filters: (condition, selectivity) per Filter on the
+                columns of column operators, in written order: a
+                classification's label, an extraction's answer and span,
+                or a feature call's or a map's answer. A label filter
+                sits above its classification, in written order; any
+                other filter sits right above the last operator it reads.
             sae_features: (call, name) per AI.SAE_FEATURES call, in
                 order. They sit above the extractions.
             maps: (call, name) per AI.MAP call, in order. They sit
                 above the feature calls.
 
         Raises:
-            CompileError: The alias is taken, a label filter names a
-                column no classification in labels computes, or an
-                extraction filter names a column no extraction computes.
+            CompileError: The alias is taken, a label filter lists a
+                value that is not a label, or a filter names a column no
+                classification or extraction computes.
         """
         if alias in self._nodes:
             raise CompileError(f"duplicate table alias {alias!r}")
@@ -126,59 +123,43 @@ class LogicalPlanBuilder:
         )
         if predicates:
             node = SemanticFilter(node, tuple(predicates))
-        for function, kind, ids, columns in applies:
-            node = Apply(
-                node,
-                function=function,
-                kind=kind,
-                ids=ids,
-                columns=tuple(columns),
-                aliases=(alias,),
-            )
-        tests = list(column_filters)
-
-        def add_column(node, node_type, call, name):
-            column = node_type(node, call, name)
-            node = column
-            for predicate, selectivity in column_filters:
-                if predicate.column.column in column.added_columns:
-                    node = Filter(node, predicate, selectivity)
-                    tests.remove((predicate, selectivity))
-            return node
-
         calls = {name: call for call, name in labels}
+        label_filters = [(condition, selectivity)
+                         for condition, selectivity in computed_filters
+                         if set(condition_columns(condition)) & set(calls)]
         classified = []
-        for name, values, selectivity in label_filters:
-            if name not in calls:
-                raise CompileError(
-                    f"a filter on a label of {alias!r} tests a "
-                    f"classification the query does not name"
-                )
-            unknown = sorted(set(values) - set(calls[name].labels))
-            if unknown:
-                raise CompileError(
-                    f"the filter on {name!r} lists {unknown}, which are not "
-                    f"among its labels {list(calls[name].labels)}")
-            if calls[name] not in classified:
-                node = add_column(node, SemanticClassify, calls[name], name)
-                classified.append(calls[name])
-            node = Filter(
-                node,
-                RegularPredicate(ColumnRef(alias, provider, name), "in", tuple(values)),
-                selectivity,
-            )
+        for condition, selectivity in label_filters:
+            for name in condition_columns(condition):
+                if name in calls and calls[name] not in classified:
+                    node = SemanticClassify(node, calls[name], name)
+                    classified.append(calls[name])
+            _check_labels(condition, calls)
+            node = Filter(node, condition, selectivity)
         for call, name in labels:
             if call not in classified:
-                node = add_column(node, SemanticClassify, call, name)
+                node = SemanticClassify(node, call, name)
                 classified.append(call)
-        for node_type, calls in ((SemanticExtract, extracts),
-                                 (SemanticSaeFeatures, sae_features),
-                                 (SemanticMap, maps)):
-            for call, name in calls:
-                node = add_column(node, node_type, call, name)
+        tests = [test for test in computed_filters if test not in label_filters]
+        answers = {column for calls_of_kind in (extracts, sae_features, maps)
+                   for _, name in calls_of_kind
+                   for column in (name, name + SPAN_SUFFIX)}
+        done = set()
+        for node_type, calls_of_kind in ((SemanticExtract, extracts),
+                                         (SemanticSaeFeatures, sae_features),
+                                         (SemanticMap, maps)):
+            for call, name in calls_of_kind:
+                column = node_type(node, call, name)
+                node = column
+                done.update(column.added_columns)
+                # a test runs after the last column operator it reads
+                for predicate, selectivity in list(tests):
+                    if set(condition_columns(predicate)) & answers <= done:
+                        node = Filter(node, predicate, selectivity)
+                        tests.remove((predicate, selectivity))
         if tests:
             raise CompileError(
-                f"the filter {tests[0][0]} tests a column the query does not return")
+                f"the filter {tests[0][0]} tests a column the query does not "
+                f"return")
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:
@@ -198,7 +179,7 @@ class LogicalPlanBuilder:
                 and set(model_call(node.predicate).aliases()) == aliases
             ):
                 return SemanticClassify(node, call, name)
-            if isinstance(node, (SemanticJoin, SemanticClassify, Apply)):
+            if isinstance(node, (SemanticJoin, SemanticClassify)):
                 return replace(node, input=insert(node.input))
             if isinstance(node, Join):
                 return replace(node, left=insert(node.left))
@@ -235,19 +216,6 @@ class LogicalPlanBuilder:
                 )
         if join.on:
             root = replace(root, on=tuple(join.on))
-        written_position = self._joins
-        self._joins += 1
-        for function, kind, columns in join.applies:
-            aliases = tuple(dict.fromkeys(ref.alias for ref in join.prompt.args))
-            root = Apply(
-                root,
-                function=function,
-                kind=kind,
-                ids="pairs",
-                columns=tuple(columns),
-                aliases=aliases,
-                written_position=written_position,
-            )
         self._root = SemanticJoin(
             input=root,
             predicate=join.predicate,
@@ -274,7 +242,7 @@ class LogicalPlanBuilder:
         windows: tuple = (),
         output: tuple = (),
         unnests: tuple = (),
-        unnest_tests: tuple = (),
+        row_tests: tuple = (),
         unnest_outer: tuple = (),
     ) -> LogicalPlan:
         """Build the plan's result nodes over the projected columns.
@@ -292,9 +260,11 @@ class LogicalPlanBuilder:
                 or unnested lists are present.
             unnests: The list columns of each Unnest, lowest first; the
                 lists of one Unnest are zipped.
-            unnest_tests: RegularPredicates on unnested field columns.
-                Each becomes a Filter above the Unnest that adds its
-                column.
+            row_tests: The conditions on result rows, such as one over
+                two tables or over an unnested field. Each becomes a
+                Filter above the Project, or above the Unnest that adds
+                the last field it reads; the Project also returns the
+                source columns they read, and a later Project drops them.
             unnest_outer: For each Unnest, whether a row with no
                 elements returns one row of nulls; empty means none do.
         """
@@ -317,19 +287,26 @@ class LogicalPlanBuilder:
                            for ref in column_references(column))}
         source = tuple(column for column in columns
                        if column_name(column) not in expanded)
-        if unnests and aggregation is None:
+        written = Project(self._root, source, tuple(structs))
+        returned = written.result_columns()
+        row_tests = tuple(result_row_condition(test, written.packing())
+                          for test in row_tests)
+        if (unnests or row_tests) and aggregation is None:
             source += tuple(key.expression for key in order
                             if column_references(key.expression)
                             and not any(ref.alias in unnested for ref in
                                         column_references(key.expression))
                             and key.expression not in source)
+        source += _row_test_columns(row_tests, unnested, source, returned)
         node = _unnested(Project(self._root, source, tuple(structs)),
-                         unnests, unnest_tests,
+                         unnests, row_tests,
                          unnest_outer or (False,) * len(unnests))
-        if unnests:
-            selected = (tuple(column_name(column) for column in columns
-                              if column_name(column) not in unnested)
-                        if aggregation is not None or windows else tuple(output))
+        if unnests or row_tests:
+            if aggregation is not None or windows:
+                selected = tuple(column_name(column) for column in columns
+                                 if column_name(column) not in unnested)
+            else:
+                selected = tuple(output) if unnests else returned
             node = Project(node, tuple(expanded.get(name, name) for name in selected))
         if aggregation is not None:
             node = Aggregate(
@@ -348,24 +325,72 @@ class LogicalPlanBuilder:
         return plan
 
 
+def _check_labels(condition, calls) -> None:
+    """Refuse a label filter that lists a value its classification cannot return.
+
+    Raises:
+        CompileError: An = or IN test of a label lists a value that is
+            not among the labels.
+    """
+    for test in condition.tests():
+        references = column_references(test.expression)
+        if test.comparison not in ("=", "in") or len(references) != 1:
+            continue
+        name = references[0].column
+        if name not in calls:
+            continue
+        values = test.value if isinstance(test.value, tuple) else (test.value,)
+        unknown = sorted(set(values) - set(calls[name].labels))
+        if unknown:
+            raise CompileError(
+                f"the filter on {name!r} lists {unknown}, which are not "
+                f"among its labels {list(calls[name].labels)}")
+
+
+def _row_test_columns(tests, unnested, source, returned) -> tuple:
+    """Return the source columns result row tests read that the Project lacks."""
+    present = set(returned) | {column_name(column) for column in source}
+    extra = []
+    for test in tests:
+        for reference in (reference for found in test.tests()
+                          for reference in column_references(found.expression)):
+            if (reference.provider and reference.alias not in unnested
+                    and column_name(reference) not in present):
+                extra.append(reference)
+                present.add(column_name(reference))
+    return tuple(extra)
+
+
 def _unnested(node, unnests, tests, outer):
-    """Return the node under its Unnests, each test above its field's Unnest.
+    """Return the node under its Unnests and result row Filters.
+
+    Each test sits above the Project, or above the Unnest that adds the
+    last column it reads.
 
     Raises:
         CompileError: An Unnest names no list column below it, or a test
-            reads no unnested field.
+            reads a column no result row holds.
     """
     tests = list(tests)
+
+    def place(node):
+        available = readable_columns(node)
+        for test in [test for test in tests
+                     if set(result_columns_read(test)) <= available]:
+            node = Filter(node, test)
+            tests.remove(test)
+        return node
+
+    node = place(node)
     for lists, keep_empty in zip(unnests, outer, strict=True):
         node = Unnest(node, tuple(lists), outer=keep_empty)
         node.validate()
-        fields = {name for names in node.fields().values() for name in names}
-        for test in [test for test in tests if column_name(test.column) in fields]:
-            node = Filter(node, test)
-            tests.remove(test)
+        node = place(node)
     if tests:
+        missing = sorted(set(result_columns_read(tests[0]))
+                         - readable_columns(node))
         raise CompileError(
-            f"{tests[0]} tests no field of an unnested list")
+            f"{tests[0]} reads {missing}, which no result row holds")
     return node
 
 

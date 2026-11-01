@@ -1,0 +1,33 @@
+logical:
+  Project: d.id, area, s.id
+    SemanticJoin (full)
+      PROMPT('Is the passage in DOCUMENT {1} cited by the legal excerpt in DOCUMENT {0}?', d.destination_context, s.passage_text) (selectivity=0.231%)
+      Join
+        cross
+        Filter: d.area IN ('constitutional law', 'criminal law') (selectivity=31.8%)
+          SemanticClassify: area
+            PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the excerpt above which area of law it concerns.', d.destination_context) labels=['constitutional law', 'criminal law', 'civil procedure', 'civil rights', 'contracts', 'torts', 'property', 'administrative law', 'employment law', 'intellectual property', 'tax law', 'family law', 'immigration law', 'bankruptcy', 'antitrust']
+            Scan citation_contexts as d [destination_context, id]
+        Scan citation_passages as s [passage_text, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                        est. rows   est. pass   est. time
+  Project: d.id, area, s.id
+    AiJoin: anchor=d                                                                              5.59 ms
+      KV: anchor=from filters, retain after join=no
+      join 1 full (d, s)  PROMPT('Is the passage in DOCUMENT {1} c…')        11.4      0.231%
+      Filter: d.area IN ('constitutional law', 'criminal law')
+        AiClassify: area over d [1]                                                               13.1 ms
+          rule=trie_decode, labels=15, label tokens=183
+          Scan citation_contexts as d                                           6
+            tokens=108, mean_document_tokens=18
+      Scan citation_passages as s                                               6
+        tokens=90, mean_document_tokens=15
+    Reuse [1]
+  Pipeline on d: ai-classify:0 -> filter:d:0 -> ai_join:d (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

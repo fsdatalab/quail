@@ -1,0 +1,20 @@
+logical:
+  Project: r.id
+    SemanticFilter
+      PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the agent run above whether the agent wrote and ran a script or test that reproduces the reported issue before changing the project's code.\n\nInstruction: answer TRUE if the agent reproduced the issue before changing the code, FALSE otherwise.", r.transcript) (selectivity=97.5%)
+      Scan issue_runs as r [transcript, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                    est. rows   est. pass   est. time
+  Project: r.id                                                           5.8
+    AiFilter: r                                                           5.8                 11.1 ms
+      KV rewind=on
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       97.5%
+      Scan issue_runs as r                                                  6
+        tokens=138, mean_document_tokens=23
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

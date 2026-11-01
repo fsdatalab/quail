@@ -45,15 +45,6 @@ def test_a_map_writes_one_answer_per_document(session):
     assert list(tail) == (SUMMARY + turn[1] + "ANSWER:").split()
 
 
-def test_the_builder_and_sql_plan_the_same_map(session):
-    built = (session.docs("reviews").alias("r")
-             .ai_map("r.body", SUMMARY, name="summary", max_answer_tokens=32)
-             .select("r.id", "summary"))
-    written = session.sql(
-        f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 32) AS summary FROM reviews r")
-    assert _maps(built.plan()) == _maps(written.plan())
-
-
 def test_a_map_without_a_limit_writes_up_to_256_tokens(session):
     query = session.sql(
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}') AS summary FROM reviews r")

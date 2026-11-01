@@ -38,6 +38,18 @@ FILTER_PROMPT = (
     "then FLAG_9 has value FALSE.\nInstruction: output only the value "
     "of FLAG_{j} from the [FLAGS] line above.\nFLAG_{j}="
 )
+JOIN_PROMPT = (
+    "Judge strictly from {0} whether it says its dominant color is the "
+    "color named in {1}. Answer TRUE if it does, FALSE otherwise."
+    "\nANSWER="
+)
+JOIN_SQL = f"""
+SELECT r.id, c.id
+FROM reports r
+JOIN cands c
+  ON AI_FILTER(PROMPT('{JOIN_PROMPT}', r.report, c.body),
+               {{'selectivity': {1 / 6}}})
+"""
 FILLER = (
     "The projector hummed while the reel changed and nobody in "
     "the back row noticed the splice. ")
@@ -138,18 +150,7 @@ def smoke(device: str, run_dir: str) -> dict:
             raise RuntimeError(f"{device} {attention} filter refused: "
                                f"{filter_plan}")
         filter_result = filter_query.run()
-        join_query = (
-            session.docs("reports").alias("r")
-            .ai_join(
-                session.docs("cands").alias("c"),
-                quail.prompt(
-                    "Judge strictly from {0} whether it says its "
-                    "dominant color is the color named in {1}. "
-                    "Answer TRUE if it does, FALSE otherwise."
-                    "\nANSWER=",
-                    quail.col("r.report"), quail.col("c.body")),
-                selectivity=1 / 6)
-            .select("r.id", "c.id"))
+        join_query = session.sql(JOIN_SQL)
         join_plan = join_query.plan()
         if isinstance(join_plan, Refusal):
             session.close()

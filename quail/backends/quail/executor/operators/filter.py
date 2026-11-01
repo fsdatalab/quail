@@ -2,6 +2,7 @@
 
 import numpy as np
 import pyarrow as pa
+from pyarrow import compute as pc
 
 from quail.backends.quail.executor.parts import (
     SingleResultPart,
@@ -10,6 +11,7 @@ from quail.backends.quail.executor.parts import (
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
+from quail.catalog.pairs import columns_key
 from quail.catalog.selection import group_ids
 from quail.catalog.tokens import (
     DocumentKeys,
@@ -18,8 +20,9 @@ from quail.catalog.tokens import (
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.result import filter_answer_table
 from quail.execution.rows import Rows
-from quail.execution.runtimes.filter import filter_scores
+from quail.execution.runtimes.filter import filter_scores, tested_table
 from quail.progress import answer_sink
 
 
@@ -98,50 +101,95 @@ class FilterPart(SingleResultPart):
 
 
 class ConditionGate(SingleResultPart):
-    """Pipeline condition that drops documents whose tested value fails.
+    """Pipeline condition that drops documents whose tested values fail.
 
-    The value is a settled column-operator result. The pipeline skips
-    a rejected document's later stages and frees its KV.
+    A value is a settled column-operator result, such as a label, an
+    extracted answer or span, or a map answer, or a source column of
+    the table; the pipeline then skips the document's later stages and
+    frees its KV.
     """
 
     stages = ()
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Bind a condition to the part computing its column."""
+        """Bind a condition to the parts computing its columns and the source table."""
         node = nodes[0]
         source_id = node.inputs[0].source.node_id
-        producer = next(part for part in reversed(parts)
-                        if node.column in part.tested_columns)
+        producers = {}
+        for name in node.tested_columns:
+            part = next((part for part in reversed(parts)
+                         if name in part.tested_columns), None)
+            if part is not None:
+                producers[name] = part
         source = next(part for part in reversed(parts)
                       if any(member.node_id == source_id for member in part.nodes))
-        return cls(node, producer, source)
+        return cls(node, producers, source,
+                   context.sources.get(columns_key(node.aliases[0])))
 
-    def __init__(self, node, producer, source):
+    def __init__(self, node, producers, source, columns):
         self.node = node
-        self.producer = producer
+        self.producers = producers  # column -> the part computing it
         self.source = source  # the part whose rows the Filter reads
-        self.position = {document: index
-                         for index, document in enumerate(producer.ids)}
+        self.columns = columns  # the table's source columns, by document
+        self.positions = {
+            id(part): {document: index for index, document in enumerate(part.ids)}
+            for part in producers.values()}
         self.accepted = {}
+        self.decided = {}  # key -> kept, from decide, until gate asks
 
     @property
     def answer_dependencies(self):
-        if not self.producer.answer_limits:
-            return ()
-        index, _ = self.producer.column_sources[self.node.column]
-        return (self.producer.first + index,)
+        """The decoder answer streams the tested columns wait for."""
+        return tuple(dict.fromkeys(
+            part.first + part.column_sources[name][0]
+            for name, part in self.producers.items() if part.answer_limits))
+
+    def read(self, name: str, documents):
+        """Return a tested column's values for documents, by document id."""
+        part = self.producers.get(name)
+        if part is not None:
+            positions = self.positions[id(part)]
+            return part.tested_values(name, [positions[document]
+                                             for document in documents])
+        if self.columns is None or name not in self.columns.column_names:
+            raise KeyError(f"{self.node.node_id!r} reads {name!r}, which no "
+                           f"operator computes and the scan does not hold")
+        if len(documents) == 1:
+            # one document at a time: a slice copies nothing
+            return self.columns.column(name).slice(documents[0], 1)
+        return pc.take(self.columns.column(name), pa.array(documents))
+
+    def decide(self, keys):
+        """Test the documents of keys together; return the keys kept.
+
+        The pipeline calls this with the documents entering the next
+        stage in one chunk, so the condition runs once per chunk; gate
+        then answers each document from the saved decision.
+        """
+        if not keys:
+            return keys
+        documents = [key[1] for key in keys]
+        values = {column: self.read(column, documents)
+                  for column in self.node.tested_columns}
+        kept = self.node.predicate.accepts(pa.table(values))
+        kept = kept.to_numpy(zero_copy_only=False).tolist()
+        self.decided.update(zip(keys, kept))
+        return [key for key, keep in zip(keys, kept) if keep]
 
     def gate(self, key):
-        # values settle as chunks finish, so each is tested as its
-        # document arrives; a repeated value, such as a label, is
-        # evaluated once
-        values = self.producer.tested_values(self.node.column,
-                                             [self.position[key[1]]])
-        token = values[0]
+        kept = self.decided.pop(key, None)
+        if kept is not None:
+            return None if kept else Stage.DROP
+        # a document decide did not see, such as one asked outside a
+        # chunk report, is tested alone; a repeated value, such as a
+        # label, is evaluated once
+        values = {column: self.read(column, [key[1]])
+                  for column in self.node.tested_columns}
+        token = tuple(_hashable(found[0].as_py()) for found in values.values())
         if token not in self.accepted:
-            self.accepted[token] = bool(self.node.predicate.accepts(
-                pa.table({self.node.column: values}))[0].as_py())
+            self.accepted[token] = bool(
+                self.node.predicate.accepts(pa.table(values))[0].as_py())
         return None if self.accepted[token] else Stage.DROP
 
     def finish(self, every):
@@ -149,8 +197,20 @@ class ConditionGate(SingleResultPart):
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         source = self.node.inputs[0].source
-        return filter_scores(self.node,
-                             self.source.results()[source.node_id].outputs[source.port])
+        rows = self.source.results()[source.node_id].outputs[source.port]
+        if all(name in rows.column_names for name in self.node.tested_columns):
+            return filter_scores(self.node, rows)
+        return filter_scores(self.node, rows, tested_table(
+            self.node, rows, lambda name, ids: self.read(name, ids.to_pylist())))
+
+
+def _hashable(value):
+    """Return a struct as sorted pairs and a list as a tuple, so a gate can cache."""
+    if isinstance(value, dict):
+        return tuple(sorted((key, _hashable(item)) for key, item in value.items()))
+    if isinstance(value, list):
+        return tuple(_hashable(item) for item in value)
+    return value
 
 
 def filter_result(node, answers, tokens, document_ids,
@@ -170,22 +230,30 @@ def filter_result(node, answers, tokens, document_ids,
 
     Returns:
         A NodeResult containing surviving IDs, filter answers, and metrics.
+        The filter answers are a filter_answer_table, one row per answer.
     """
     local = np.fromiter(answers, dtype=np.int64, count=len(answers))
     passed = np.fromiter((len(row) == 1 and all(row) for row in answers.values()),
                          dtype=bool, count=len(answers))
     positions = np.asarray(document_ids, dtype=np.int64)
     survivors = arrow_ids(np.sort(positions[local[passed]]))
-    global_answers = dict(zip(positions[local].tolist(), answers.values()))
+    lengths = np.fromiter((len(row) for row in answers.values()),
+                          dtype=np.int64, count=len(answers))
+    answered = np.repeat(positions[local], lengths)
+    values = (np.concatenate([np.asarray(row, dtype=bool)
+                              for row in answers.values()])
+              if len(answers) else np.zeros(0, dtype=bool))
     return NodeResult(
         outputs={
             f"rows:{node.alias}": Rows({node.alias: survivors}),
-            f"filter_answers:{node.alias}": global_answers,
+            f"filter_answers:{node.alias}": filter_answer_table(
+                node.alias, answered,
+                np.full(len(answered), node.written_position), values),
         },
         metrics=NodeMetrics(
             input_rows=len(document_ids),
             output_rows=len(survivors),
-            evaluated_documents=len(global_answers),
+            evaluated_documents=len(answers),
             fresh_tokens=tokens,
             gpu_s=gpu_s,
             chunks=chunks,

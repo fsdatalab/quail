@@ -1,0 +1,29 @@
+logical:
+  Project: r1.id, r2.id
+    SemanticJoin (full)
+      PROMPT('Do the two conversations in DOCUMENT {0} and DOCUMENT {1}, which start from the same customer request, handle it in different ways? Answer TRUE if the agent takes different actions or the customer ends up with a different outcome, FALSE if the actions and outcome are the same.', r1.transcript, r2.transcript) (selectivity=35%)
+      Join
+        on r1.task_id = r2.task_id
+        Scan support_traces as r1 [transcript, id, task_id]
+        Scan support_traces as r2 [transcript, id, task_id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                                                          est. rows   est. pass   est. time
+  Project: r1.id, r2.id
+    AiJoin: anchor=r1                                                                                                               11.8 ms
+      KV: anchor=not resident, retain after join=no
+      join 1 full (r1, r2) over pairs from hash_join:r1-r2  PROMPT('Do the two conversations in DOCU…')           6         35%
+      Scan support_traces as r1 [1]                                                                               6
+        tokens=162, mean_document_tokens=27
+      Scan support_traces as r2 [2]                                                                               6
+        tokens=162, mean_document_tokens=27
+      HashJoin: r1.task_id = r2.task_id
+        pairs kept: 0.1667 of the cross product
+        Reuse [1]
+        Reuse [2]
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

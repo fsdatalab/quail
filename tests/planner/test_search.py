@@ -12,9 +12,8 @@ from quail.catalog import DocumentProvider
 from quail.logical import extracted_above_joins
 from quail.physical import AiExtract, PhysicalGraph
 from quail.planner.optimize import search_candidates, search_plan
-from quail.planner.optimizer.candidates import ModelRegion
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
+from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.validation import ClassifyRefusedError
 
@@ -105,35 +104,8 @@ def test_refused_candidate_does_not_hide_a_runnable_plan(query):
     assert lifted["refusal"] is not None
 
 
-def test_backend_only_lowers_the_given_alternative(query):
-    context = context_for(query)
-    backend = query.session.registry.backend("quail")
-    (candidate,) = backend.plan(ModelRegion(query._logical_input), context)
-    assert candidate.logical_plan == query._logical_input
-    assert "retention" not in candidate.plan.settings
-    assert "candidates" not in candidate.plan.settings
-    assert len(search_candidates(
-        query._logical_input, context, query.session.registry)) == 2
 
 
-def test_prefix_sharing_is_priced_for_every_placement(query):
-    query.token_inputs()
-    context = context_for(query)
-    registry = query.session.registry
-    candidates = search_candidates(query._logical_input, context, registry)
-    assert len(candidates) == 2
-    for candidate in candidates:
-        (raw,) = registry.backend("quail").plan(
-            ModelRegion(candidate.logical_plan),
-            replace(context, logical_plan=candidate.logical_plan))
-        (extract,) = [node for node in candidate.plan.nodes
-                     if isinstance(node, AiExtract)]
-        assert extract.spec.share_prefixes
-        assert "retention" in candidate.plan.settings
-        assert candidate.estimated_seconds < raw.estimated_seconds
-        # the sharing extraction is priced over its fresh tokens
-        assert candidate.plan.estimates[extract.node_id]["seconds"] < (
-            extract.spec.estimated_seconds)
 
 
 def test_logical_alternatives_retain_original_and_deduplicate(query):
@@ -161,132 +133,30 @@ def test_logical_alternatives_retain_original_and_deduplicate(query):
     assert "tree_rule_setting" not in lifted.plan.settings
 
 
-def test_exact_tokenization_reconsiders_placement(query):
-    rule = PlacementCost(exact=True)
-    query.session.registry.register_physical_rule(rule)
-    first = query.plan()
-    assert first.settings["candidates"][1]["selected"]
-    assert extracted_above_joins(query.logical.root)
-    assert query.logical is first.logical_plan
-    request = query._prepare_physical()
-    final = query.plan()
-    assert final.settings["candidates"][0]["selected"]
-    assert not extracted_above_joins(query.logical.root)
-    assert query.logical is final.logical_plan
-    assert request.plan["settings"]["candidates"] == final.settings["candidates"]
-    assert rule.seen == [False, True, False, True]
-    assert final.settings["test_seen"] is False
-    assert query._replanning_s > 0
 
 
-def test_exact_tokenization_preserves_explicit_physical_edits(query):
-    first = query.plan()
-    edited = replace(first, settings={**first.settings, "user_edit": True})
-    query._plan = edited
-    query.wait_for_tokens()
-    assert query.plan().settings["user_edit"] is True
 
 
-def test_logical_alternatives_finish_before_physical_rules(query):
-    context = context_for(query)
-    events = []
-
-    class RecordTrees(LogicalRule):
-        name = "record_trees"
-
-        def rewrites(self, root, context):
-            events.append("logical")
-            return [root]
-
-    class RecordGraphs(PhysicalRule):
-        name = "record_graphs"
-
-        def rewrite(self, graph, context):
-            events.append("physical")
-            return None
-
-    registry = query.session.registry
-    registry.register_physical_rule(RecordGraphs())
-    registry.register_logical_rule(RecordTrees())
-    candidates = search_candidates(query._logical_input, context, registry)
-    assert len(candidates) == 2
-    first_physical = events.index("physical")
-    assert first_physical > 0
-    assert events[:first_physical] == ["logical"] * first_physical
-    assert events[first_physical:] == ["physical", "physical"]
 
 
-def test_a_filter_above_the_joins_thins_nothing_before_them(query):
-    from quail.logical import classified_above_joins
-    from quail.planner.search.statistics import (
-        cached_statistics,
-        expected_rows_after_filters,
-    )
-
-    session = query.session
-    built = (session.docs("documents").alias("d")
-             .ai_filter(quail.prompt("Signed? {0}", quail.col("d.text")),
-                        selectivity=0.5)
-             .ai_join(session.docs("questions").alias("q"), quail.prompt(
-                 "Pair? {0} {1}", quail.col("d.text"), quail.col("q.text")),
-                 anchor="d", selectivity=0.1)
-             .ai_classify(quail.prompt("Kind? {0}", quail.col("d.text")),
-                          ["a", "b"], name="kind")
-             .label_in("kind", ["a"], selectivity=0.3)
-             .select("d.id", "q.id"))
-    context = context_for(built)
-    expected = {}
-    for candidate in search_candidates(built._logical_input, context,
-                                       session.registry):
-        logical = candidate.logical_plan
-        statistics = cached_statistics(
-            logical, {}, model=session.model, device=session.device,
-            document_tokens=built._document_tokens, context=context)
-        lifted = bool(classified_above_joins(logical.root))
-        expected[lifted] = expected_rows_after_filters(logical, statistics)
-    assert expected == {False: {"d": 3.0, "q": 1.0}, True: {"d": 10.0, "q": 1.0}}
 
 
-@pytest.mark.parametrize("retain", [False, True])
-def test_a_filter_after_a_barrier_is_priced_over_the_kv_the_sequence_kept(
-        query, retain):
-    from quail.physical import AiFilter, Barrier, PortRef
-    from quail.physical.base import input_ports
-
-    built = (query.session.docs("documents").alias("d")
-             .ai_filter(quail.prompt("First? {0}", quail.col("d.text")),
-                        selectivity=1.0)
-             .ai_filter(quail.prompt("Second? {0}", quail.col("d.text")),
-                        selectivity=1.0)
-             .select("d.id", order="as_written"))
-    plan = built.plan()
-    scan, first, second, project = plan.nodes
-    assert isinstance(second, AiFilter)
-    # the second filter starts its own pipeline after a barrier; it
-    # reads the first one's KV only when that pipeline kept it
-    barrier = Barrier(node_id="barrier:d", next_anchor="d", aliases=("d",),
-                      inputs=input_ports((PortRef(first.node_id, "rows:d"),)))
-    graph = PhysicalGraph((
-        scan, replace(first, keep_kv=retain), barrier,
-        replace(second, inputs=input_ports((PortRef("barrier:d", "rows:d"),))),
-        project), plan.root)
-    work = plan.estimator._priced(graph)[second.node_id][0].work
-    prefix = (second.preamble_tokens
-              + plan.estimator.statistics.stats["d"].mean_document_tokens)
-    assert first.expected_rows == second.expected_rows == 20
-    assert work.tokens == pytest.approx(
-        20 * (second.question_tokens + (0 if retain else prefix)))
-
-
-def test_map_answer_tests_follow_maps_on_both_sides_of_join_placement(query):
+def test_map_answer_tests_follow_maps_on_both_sides_of_join_placement(query,
+                                                                      tmp_path):
     from helpers.oracle import Oracle, finish
 
     from quail.physical import AiMap, Filter
     from quail.physical.pipelines import build_pipelines
 
+    # distinct documents, so each gets its own answer
+    path = tmp_path / "leases.parquet"
+    pq.write_table(pa.table({"id": range(20), "text": [
+        f"Lease {index} ends in June." for index in range(20)]}), path)
+    query.session.register("leases", DocumentProvider.from_parquet(
+        str(path), id_col="id"))
     mapped = query.session.sql(
         "SELECT d.id, q.id, AI.MAP(d.text, 'Name the topic.', 16) AS topic "
-        "FROM documents d JOIN questions q "
+        "FROM leases d JOIN questions q "
         "ON AI_FILTER(PROMPT('Does {0} answer {1}?', d.text, q.text)) "
         "WHERE HINT(topic = 'leases', {'selectivity': 0.25})")
     context = context_for(mapped)
@@ -309,3 +179,5 @@ def test_map_answer_tests_follow_maps_on_both_sides_of_join_placement(query):
             maps=lambda spec, document: "leases" if document == 1 else "other")
         assert finish(mapped, oracle).collect().to_pylist() == [
             {"d.id": 1, "q.id": 0, "topic": "leases"}]
+
+

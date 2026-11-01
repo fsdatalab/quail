@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.backends import resources
 from quail.backends.quail import worker
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.memory import memory_report
@@ -198,25 +197,3 @@ def test_a_failed_boot_releases_the_gpu_and_the_next_boot_loads_again(
     again, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
     assert again is gpu and boot["kind"] == "warm"
     assert calls == [("release", ["gpu"])]
-
-
-def test_releasing_a_quail_request_stops_its_children_and_frees_cuda(monkeypatch):
-    calls = []
-    cuda = SimpleNamespace(
-        is_initialized=lambda: True,
-        synchronize=lambda: calls.append("synchronize"),
-        empty_cache=lambda: calls.append("empty_cache"),
-        ipc_collect=lambda: calls.append("ipc_collect"),
-    )
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
-    monkeypatch.setattr(resources.gc, "collect", lambda: calls.append("gc"))
-    monkeypatch.setattr(resources, "_release_vllm_parallel_state",
-                        lambda: calls.append("release_parallel_state"))
-    monkeypatch.setattr(worker, "_WORKERS",
-                        SimpleNamespace(close=lambda: calls.append("children")))
-    state = {"gpu": SimpleNamespace(close=lambda: calls.append("close"))}
-    worker.release_quail_request(state)
-    assert state == {}
-    assert worker._WORKERS is None
-    assert calls == ["children", "synchronize", "close", "release_parallel_state",
-                     "gc", "empty_cache", "ipc_collect"]

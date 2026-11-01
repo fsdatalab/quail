@@ -412,7 +412,6 @@ def _execution_state(gpu, payload, registry) -> dict:
         "documents": decode_payload_documents(payload["documents"]),
         "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
-        "functions": registry.functions,
         "runtimes": registry.runtimes,
         "device": registry.device(payload["physical_plan"]["device"]),
         "chunk_tokens": payload["chunk_tokens"],

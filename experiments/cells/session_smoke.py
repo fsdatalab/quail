@@ -66,6 +66,19 @@ FILTER_Q = ("\n\nExample: if the line said [FLAGS] FLAG_9=FALSE, "
             "then FLAG_9 has value FALSE.\nInstruction: output only the value "
             "of FLAG_{j} from the [FLAGS] line above.\nFLAG_{j}=")
 
+JOIN_PROMPT = (
+    "Judge strictly from {0} whether it says its dominant color is the "
+    "color named in {1}. Answer TRUE if it does, FALSE otherwise."
+    "\nANSWER="
+)
+JOIN_SQL = f"""
+SELECT r.id, c.id
+FROM reports r
+JOIN cands c
+  ON AI_FILTER(PROMPT('{JOIN_PROMPT}', r.report, c.body),
+               {{'selectivity': {1 / 6}}})
+"""
+
 
 def main():
     tmp = tempfile.mkdtemp()
@@ -79,7 +92,7 @@ def main():
         backend="quail",
         device="h100-sxm",
     ))
-    sess.register("documents", quail.DocumentProvider.from_parquet(
+    sess.register("docs", quail.DocumentProvider.from_parquet(
         f"{tmp}/docs.parquet", id_col="id"))
     sess.register("reports", quail.DocumentProvider.from_parquet(
         f"{tmp}/reports.parquet", id_col="id"))
@@ -88,7 +101,7 @@ def main():
 
     summary = {}
 
-    # ---- the filter query, AI SQL entry point
+    # ---- the filter query
     q1_text = FILTER_Q.replace("{j}", "1")
     q2_text = FILTER_Q.replace("{j}", "2")
     fq = sess.sql(f"""
@@ -125,17 +138,8 @@ def main():
                               == sorted(res.to_rows())))
     print(json.dumps(summary["filter_warm"], indent=2), flush=True)
 
-    # ---- the join query, builder entry point
-    jq = (sess.docs("reports").alias("r")
-          .ai_join(sess.docs("cands").alias("c"),
-                   quail.prompt(
-                       "Judge strictly from {0} whether it says its "
-                       "dominant color is the color named in {1}. "
-                       "Answer TRUE if it does, FALSE otherwise."
-                       "\nANSWER=",
-                       quail.col("r.report"), quail.col("c.body")),
-                   selectivity=1 / 6)
-          .select("r.id", "c.id"))
+    # ---- the join query
+    jq = sess.sql(JOIN_SQL)
     print(jq.explain(), flush=True)
     jres = jq.run()
     planted_pairs = {(f"r{i}", f"c{j}") for (i, j), v in truth.items()

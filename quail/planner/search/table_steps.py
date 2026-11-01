@@ -133,14 +133,16 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
                                cost.later, cost.reuse_key,
                                document_head=pricing.document_head(
                                    predicates[position].prompt)))
+    # a test's selectivity counts at the operator it follows
     tests = {}
     for test in operators.column_filters.get(alias, ()):
-        tests.setdefault(test.call, []).append(test.selectivity)
+        tests.setdefault(test.name, []).append(test.selectivity)
     for call, owner in operators.labels.calls:
         if owner != alias or len(call.aliases()) != 1:
             continue
-        first, later = pricing.classify(call, operators.labels.names[call])
-        steps.append(TableStep(CLASSIFY, call, _survival(tests.get(call, ())),
+        name = operators.labels.names[call]
+        first, later = pricing.classify(call, name)
+        steps.append(TableStep(CLASSIFY, call, _survival(tests.get(name, ())),
                                first, later,
                                document_head=pricing.document_head(call.prompt)))
     for kind, nodes in (
@@ -153,7 +155,7 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
                 continue
             first, later = getattr(pricing, kind)(node)
             steps.append(TableStep(
-                kind, node.name, _survival(tests.get(node.call, ())), first, later,
+                kind, node.name, _survival(tests.get(node.name, ())), first, later,
                 document_head=pricing.document_head(node.call.prompt)))
     return steps
 

@@ -1,0 +1,30 @@
+logical:
+  Limit: 50
+    Sort: test_steps DESC NULLS LAST, m.trace_id ASC NULLS LAST
+      Aggregate: group by m.trace_id; test_steps = count(*); having test_steps >= 3
+        Project: m.trace_id
+          SemanticFilter
+            PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the agent step above whether it runs the project's tests or a reproduction script.\n\nInstruction: answer TRUE if the step runs tests or a reproduction script, FALSE otherwise.", m.content) (selectivity=29.5%)
+            Scan issue_messages as m [content, trace_id, role] where m.role = 'assistant'
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                        est. rows   est. pass   est. time
+  Sort: test_steps DESC NULLS LAST, m.trace_id ASC NULLS LAST
+    fetch=50
+    Aggregate: m.trace_id, test_steps
+      group by m.trace_id
+      test_steps = count(*)
+      having test_steps >= 3
+      Project: m.trace_id                                                   0.295
+        AiFilter: m                                                         0.295                 1.54 ms
+          KV rewind=on
+          predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           1       29.5%
+          Scan issue_messages as m                                              1
+            tokens=144, mean_document_tokens=24
+            where m.role = 'assistant'
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

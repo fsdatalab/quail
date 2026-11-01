@@ -17,7 +17,7 @@ from quail.baselines.nodes import (
 from quail.cost import budgets
 from quail.logical import (
     SPAN_SUFFIX,
-    Apply,
+    RegularPredicate,
     classified_above_joins,
     column_name,
     effective_selectivity,
@@ -183,11 +183,6 @@ def plan_request_backend(
 def _refusal(region, context, *, backend_name: str, scores_labels: bool,
              decides: bool) -> Refusal | None:
     """Return why the request backends cannot run the region, or None."""
-    if any(isinstance(node, Apply) for node in region.logical_plan.walk()):
-        return Refusal(
-            reasons=("apply() functions run on the Quail backend only",),
-            constraint="apply_needs_quail_backend",
-            needed=1, available=0, unit="backends")
     root = region.logical_plan.result
     projected = {column_name(column)
                  for column in region.logical_plan.projection.columns}
@@ -199,8 +194,9 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
             constraint="sort_needs_quail_backend",
             needed=1, available=0, unit="backends")
     operators = region.logical_plan.operators()
-    if any(test.call.kind == "label" and (
-            test.condition.comparison != "in" or test.condition.function is not None)
+    if any(test.call.kind == "label" and not (
+            isinstance(test.condition, RegularPredicate)
+            and test.condition.comparison == "in" and test.condition.function is None)
            for tests in operators.column_filters.values() for test in tests):
         return Refusal(
             reasons=("plain label tests other than IN run on the Quail backend only",),

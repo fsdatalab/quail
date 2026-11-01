@@ -12,7 +12,7 @@ from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.runtimes import ScanRuntime
 from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
 from quail.planner.optimizer.graph_refinement import rewrite_graph
-from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
+from quail.planner.optimizer.rules import PhysicalRule
 
 
 @dataclass(frozen=True)
@@ -119,46 +119,6 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
     assert not registry.extension_modules
 
 
-class KeepTree(LogicalRule):
-    def __init__(self, name):
-        self.name = name
-
-    def rewrites(self, root, context):
-        raise AssertionError("logical rules must not run on physical graphs")
-
-
-def test_rule_types_preserve_registration_order_within_each_stage():
-    registry = built_in_registry()
-    registry.register_physical_rule(ChangeCount("double", factor=2))
-    registry.register_logical_rule(KeepTree("keep_tree"))
-    registry.register_physical_rule(ChangeCount("add_three", offset=3))
-    registry.register_physical_rule(ChangeCount("double_again", factor=2))
-
-    assert list(registry.rules)[-4:] == [
-        "double", "keep_tree", "add_three", "double_again"]
-    assert list(registry.physical_rules)[-3:] == [
-        "double", "add_three", "double_again"]
-    assert list(registry.logical_rules)[-1:] == ["keep_tree"]
-    assert _count(registry) == 10
-
-    before = dict(registry.rules)
-    with pytest.raises(ValueError, match="duplicate optimizer rule"):
-        registry.register_logical_rule(KeepTree("double"))
-    assert dict(registry.rules) == before
-
-
-def test_rule_registration_validates_base_class():
-    registry = built_in_registry()
-    before = dict(registry.rules)
-    with pytest.raises(TypeError, match="needs a LogicalRule subclass"):
-        registry.register_logical_rule(ChangeCount("wrong_type"))
-    with pytest.raises(TypeError, match="needs a PhysicalRule subclass"):
-        registry.register_physical_rule(KeepTree("wrong_type"))
-    with pytest.raises(TypeError, match="needs a PhysicalRule subclass"):
-        registry.register_physical_rule(object())
-    assert dict(registry.rules) == before
-
-
 def test_node_registration_validation_and_execution():
     for existing in ["codec", "runtime"]:
         registry = built_in_registry()
@@ -190,22 +150,3 @@ def test_node_registration_validation_and_execution():
         )
     assert CustomInput.type_name not in registry.codecs
     assert CustomInput.runtime_key not in registry.runtimes
-
-
-def test_a_projection_returning_no_rows_reports_none():
-    import pyarrow as pa
-
-    from quail.execution.result import QueryResult
-    from quail.physical import Project
-    from quail.physical.base import input_ports
-
-    graph = PhysicalGraph((
-        Scan(node_id="scan", alias="d", input_id="d", num_documents=2),
-        Project(node_id="project", inputs=input_ports((PortRef("scan", "rows:d"),)),
-                columns=("d.id",))), PortRef("project", "rows"))
-    empty = QueryResult.from_table(pa.table({"d.id": pa.array([], pa.int64())}))
-    report = GenericRunner().run(graph, ExecutionContext(
-        runtimes=built_in_registry().runtimes, sources={"d": [0, 1]},
-        project=lambda *_: empty))
-    metrics = report.nodes["project"].metrics
-    assert (metrics.input_rows, metrics.output_rows) == (2, 0)

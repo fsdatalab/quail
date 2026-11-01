@@ -35,7 +35,7 @@ def test_feature_lists_are_tested_after_settling_and_cached_as_values(pooling):
         part.stages[0].decide(position, packed[position:position + 1])
     condition = Filter(node_id="condition", aliases=("r",), predicate=RegularPredicate(
         ColumnRef("r", "reviews", "features"), "is not null"))
-    gate = ConditionGate(condition, part, part)
+    gate = ConditionGate(condition, {"features": part}, part, None)
     assert part.tested_columns == ("features",)
     assert gate.gate(("r", 1)) is None
     if pooling == "max":
@@ -45,7 +45,8 @@ def test_feature_lists_are_tested_after_settling_and_cached_as_values(pooling):
     assert len(gate.accepted) == 2
     rejected = ConditionGate(Filter(
         node_id="null", aliases=("r",), predicate=RegularPredicate(
-            ColumnRef("r", "reviews", "features"), "is null")), part, part)
+            ColumnRef("r", "reviews", "features"), "is null")),
+        {"features": part}, part, None)
     assert rejected.gate(("r", 1)) is Stage.DROP
     rows = part.result(0, 0, 0, {}).outputs["rows:r"]
     expected = [[{"feature": 3, "strength": 0.5}], [],

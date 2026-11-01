@@ -1,0 +1,30 @@
+logical:
+  Project: t.id, progress, domain, root_cause
+    SemanticClassify: root_cause
+      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above what kind of defect causes the reported issue.', t.trace) labels=['assignment', 'checking', 'algorithm', 'function', 'interface', 'timing or serialization', 'build, package, or merge', 'documentation']
+      SemanticClassify: domain
+        PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above which PyPI topic best describes the project the issue is filed against.', t.trace) labels=['Communications', 'Database', 'Documentation', 'File Formats', 'Internet :: WWW/HTTP', 'Multimedia :: Graphics', 'Multimedia :: Sound/Audio', 'Multimedia :: Video', 'Office/Business :: Financial', 'Scientific/Engineering :: Artificial Intelligence', 'Scientific/Engineering :: Artificial Life', 'Scientific/Engineering :: Bio-Informatics', 'Scientific/Engineering :: GIS', 'Scientific/Engineering :: Mathematics', 'Scientific/Engineering :: Medical Science Apps.', 'Security', 'Software Development :: Build Tools', 'Software Development :: Compilers', 'Software Development :: Embedded Systems', 'Software Development :: Quality Assurance', 'Software Development :: Testing', 'Software Development :: User Interfaces', 'System :: Distributed Computing', 'System :: Networking', 'Text Processing :: Linguistic', 'Text Processing :: Markup', 'Utilities']
+        SemanticClassify: progress
+          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above how far the agent has gotten so far.', t.trace) labels=['has not located the relevant code', 'located the relevant code', 'changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails']
+          Scan agent_traces as t [trace, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                         est. rows   est. time
+  Project: t.id, progress, domain, root_cause
+    AiClassify: root_cause over t                                      22.3 ms
+      rule=trie_decode, labels=8, label tokens=104
+      AiClassify: domain over t [2]                                    32.2 ms
+        rule=trie_decode, labels=27, label tokens=746
+        AiClassify: progress over t [1]                                  23 ms
+          rule=trie_decode, labels=5, label tokens=146
+          Scan agent_traces as t                                 6
+            tokens=78, mean_document_tokens=13
+    Reuse [1]
+    Reuse [2]
+  Pipeline on t: ai-classify:0 -> ai-classify:1 -> ai-classify:2 (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

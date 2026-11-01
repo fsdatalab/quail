@@ -4,8 +4,6 @@ from quail.cost import budgets
 from quail.cost.joins import PricedJoin, longest_join_input
 from quail.logical import (
     Alias,
-    Apply,
-    CompileError,
     SemanticClassify,
     SemanticExtract,
     classified_above_joins,
@@ -105,8 +103,6 @@ def score_refusal(logical, context) -> Refusal | None:
     prompts.extend(item.expression.prompt for item in projected)
     if any(len(prompt_aliases(prompt)) > 2 for prompt in prompts):
         return _refusal("AI.SCORE supports one document or one document pair")
-    if any(isinstance(node, Apply) for node in logical.walk()):
-        return _refusal("AI.SCORE cannot be mixed with apply()")
     if not all(is_score(expression) for expression in predicates):
         return _refusal("AI.SCORE cannot be mixed with generative AI predicates")
     if any(join.semantics != "full" for join in operators.joins):
@@ -301,7 +297,7 @@ def attention_device_refusal(model, device):
 
 def validate_query(plan, operators, context, model, device, gpus):
     """Return a refusal for unsupported inference or hardware requirements."""
-    labels, applies = operators.labels, operators.applies
+    labels = operators.labels
     scored = has_score(plan)
     if operators.sae_features or (
             context is not None and context.model.sae is not None):
@@ -332,16 +328,6 @@ def validate_query(plan, operators, context, model, device, gpus):
         refusal = extraction_refusal(context, function) if nodes else None
         if refusal is not None:
             return refusal
-    join_applies = {}
-    for apply in applies:
-        if apply.ids == "pairs":
-            join_applies.setdefault(apply.written_position, []).append(apply)
-    names = [apply.function for apply in applies]
-    if len(set(names)) != len(names):
-        raise CompileError(
-            f"each apply() needs its own name; {names} repeat one")
-    if any(len(group) > 1 for group in join_applies.values()):
-        raise CompileError("a join takes one apply() returning pairs")
     refusal = attention_device_refusal(model, device)
     if refusal is not None:
         return refusal

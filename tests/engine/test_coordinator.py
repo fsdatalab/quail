@@ -3,11 +3,11 @@
 import pyarrow as pa
 
 from quail.backends.quail.coordinator import (
-    merge_join_answers,
     merge_results,
     shard_input,
 )
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.result import filter_answer_table
 from quail.execution.rows import Rows
 from quail.physical import InputPort, PortRef, ValueType
 from quail.physical.base import input_ports
@@ -34,46 +34,10 @@ def test_merged_rows_follow_the_input_order_and_sum_the_metrics():
                     inputs=input_ports((PortRef("scan:r", "rows:r"),)))
     outputs = [{"results": {node.node_id: NodeResult(
         {"rows:r": Rows({"r": pa.array(kept, pa.int32())}),
-         "filter_answers:r": {document: [True] for document in kept}},
+         "filter_answers:r": filter_answer_table(
+             "r", kept, [0] * len(kept), [True] * len(kept))},
         NodeMetrics(fresh_tokens=len(kept)))}} for kept in ([4, 0], [3])]
     (merged,) = merge_results([node], outputs, "r", [3, 4, 1, 0], 2.0).values()
     assert merged.outputs["rows:r"].ids["r"].to_pylist() == [3, 4, 0]
-    assert merged.outputs["filter_answers:r"] == {4: [True], 0: [True], 3: [True]}
+    assert merged.outputs["filter_answers:r"].column("r").to_pylist() == [3, 4, 0]
     assert (merged.metrics.fresh_tokens, merged.metrics.wall_s) == (3, 2.0)
-
-
-def test_join_merge_and_partner_lists():
-    # the merge keeps stages aligned though stage 2 skips gated anchors
-    outs = [
-        dict(joins=[dict(rows={0: [1, 0], 1: [0, 0]}, anchor_index=[0, 4],
-                         partner_index=[[1], [2]]),
-                    dict(rows={0: [0, 1, 1]}, anchor_index=[0, 4],
-                         partner_index=[[0], [1], [2]])],
-             fresh_tokens=10, wall_s=1.0),
-        dict(joins=[dict(rows={0: [1, 1]}, anchor_index=[3],
-                         partner_index=[[1], [2]]),
-                    dict(rows={0: [1, 0, 0]}, anchor_index=[3],
-                         partner_index=[[0], [1], [2]])],
-             fresh_tokens=10, wall_s=1.0),
-    ]
-    merged = [merge_join_answers([out["joins"][i] for out in outs])
-              for i in range(len(outs[0]["joins"]))]
-    assert len(merged) == 2
-    assert merged[0]["anchor_index"] == [0, 4, 3]
-    assert merged[0]["rows"] == {0: [1, 0], 1: [0, 0], 2: [1, 1]}
-    assert merged[1]["anchor_index"] == [0, 4, 3]
-    assert merged[1]["rows"] == {0: [0, 1, 1], 2: [1, 0, 0]}
-    assert merged[1]["partner_index"] == [[0], [1], [2]]
-
-    outs = [
-        dict(joins=[dict(rows={0: [1], 1: [0, 1]}, anchor_index=[0, 4],
-                         partner_index=[[1], [2], [3]],
-                         anchor_partners={0: [2], 1: [0, 1]})],
-             fresh_tokens=1, wall_s=1.0),
-        dict(joins=[dict(rows={0: [1, 0]}, anchor_index=[3],
-                         partner_index=[[1], [2], [3]],
-                         anchor_partners={0: [1, 2]})],
-             fresh_tokens=1, wall_s=1.0),
-    ]
-    merged = merge_join_answers([out["joins"][0] for out in outs])
-    assert merged["anchor_partners"] == {0: [2], 1: [0, 1], 2: [1, 2]}

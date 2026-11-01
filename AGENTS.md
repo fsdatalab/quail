@@ -162,7 +162,7 @@ how they release and explain changes.
 - **Apache Spark**: the model for Quail as a whole.
   - Catalyst, for logical and physical plans rewritten by rules
     (Quail's planner rules).
-  - The DataFrame and SQL APIs, for Quail's builder and `sql()`.
+  - The SQL API, for Quail's `sql()`.
   - Spark Connect, for a thin client talking to a remote server
     (Quail Server and the remote `Session`).
   - `EXPLAIN` and the Spark UI, for showing a plan and what it cost

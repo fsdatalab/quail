@@ -57,8 +57,6 @@ def test_submit_close_reattach_watch_collect_and_stream_answers(endpoint, tmp_pa
         assert run.id == "demo-1"
         assert query.submit(query_id="demo-1").id == "demo-1"
         assert run.status().session_id == session.session_id
-        with pytest.raises(RuntimeError, match="builder API"):
-            session.docs("reviews")
         assert isinstance(query, QueryLike)
         assert all(hasattr(Query, name) for name in
                    ("run", "submit", "execute_stream", "collect", "explain",

@@ -2,6 +2,7 @@
 
 import re
 from collections import Counter
+from dataclasses import replace
 from enum import StrEnum
 
 import pyarrow as pa
@@ -22,11 +23,7 @@ from quail.frontend.sql_binding.expressions import (
     _conjuncts,
 )
 from quail.frontend.sql_binding.predicates import SQL_FUNCTIONS, column_path
-from quail.frontend.sql_binding.relations import (
-    JoinBinder,
-    bind_where,
-    check_join_coverage,
-)
+from quail.frontend.sql_binding.relations import JoinBinder, bind_where
 from quail.frontend.sql_binding.select import (
     SelectBinder,
     _parse_distinct,
@@ -41,13 +38,13 @@ from quail.logical import (
     ColumnRef,
     CompileError,
     LogicalPlan,
-    LogicalPlanBuilder,
+    Scan,
     WithCTE,
     column_name,
     cte_schema,
-    is_score,
 )
 from quail.logical.expressions import aliased_call
+from quail.logical.naive import Exists, Hint, place_relation, relation_tree
 
 FORBIDDEN = (
     (exp.Qualify, "QUALIFY"),
@@ -104,6 +101,15 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
     return sql
 
 
+def _asks_model(node) -> bool:
+    """Return whether an expression holds an AI call or an EXISTS subquery."""
+    return any(
+        isinstance(inner, (exp.AIClassify, exp.Exists))
+        or (isinstance(inner, exp.Anonymous)
+            and str(inner.this).upper().startswith("AI_"))
+        for inner in node.walk())
+
+
 def _reject_forbidden(tree) -> None:
     for cls, name in FORBIDDEN:
         if list(tree.find_all(cls)):
@@ -112,7 +118,9 @@ def _reject_forbidden(tree) -> None:
                 f"semantic part; do the relational part in the "
                 f"database the ids came from"
             )
-    if list(tree.find_all(exp.Or)):
+    if any(node.find_ancestor(exp.Having) for node in tree.find_all(exp.Or)):
+        raise CompileError("OR in HAVING is not supported; combine tests with AND")
+    if any(_asks_model(node) for node in tree.find_all(exp.Or)):
         raise CompileError(
             "OR between AI predicates is not supported: a disjunction "
             "belongs inside one prompt's text, where the model "
@@ -135,10 +143,9 @@ def _reject_forbidden(tree) -> None:
 
 
 def _validate_query(
-    b: ExpressionBinder, joins: JoinBinder, columns: tuple[ColumnRef | Alias, ...],
-    structs: tuple = (), *, allow_relational: bool = False,
+    b: ExpressionBinder, columns: tuple[ColumnRef | Alias, ...], structs: tuple = (),
 ) -> None:
-    """Validate output names and supported combinations of AI operators."""
+    """Refuse an output name that repeats a table, a column, or a projected call."""
     for struct in structs:
         if struct.name in dict(b.tables):
             raise CompileError(
@@ -157,9 +164,6 @@ def _validate_query(
                 f"pick another AS name")
     projected = tuple(column for column in columns
                       if aliased_call(column) is not None)
-    projected_scores = tuple(
-        column for column in projected if column.expression.kind == "score"
-    )
     names_by_prompt = {}
     for score in projected:
         if score.name in dict(b.tables):
@@ -174,68 +178,64 @@ def _validate_query(
                 f"{names[0]!r} and {score.name!r}; project it once"
             )
         names.append(score.name)
-    for alias, equalities in joins.conditions.items():
-        if any(alias in score.expression.aliases() for score in projected_scores):
-            raise CompileError(
-                f"JOIN {alias} ON {equalities[0]} projects a pair "
-                f"AI.SCORE; a projected pair score runs over CROSS JOIN, "
-                f"and an ON equality is supported when the score is "
-                f"compared in ON"
-            )
-        raise CompileError(
-            f"JOIN {alias} ON {equalities[0]} has no AI predicate over "
-            f"its pairs; a plain join belongs in the database the ids "
-            f"came from"
-        )
-    check_join_coverage(b, joins.aliases, projected_scores)
-
-    filter_predicates = [
-        predicate for predicates in b.filters.values() for predicate in predicates
-    ]
-    score_flags = (
-        [is_score(predicate.expression) for predicate in filter_predicates]
-        + [is_score(join.predicate) for join in b.joins]
-        + [True for _ in projected_scores]
-    )
-    if any(score_flags) and not all(score_flags):
-        raise CompileError(
-            "AI.SCORE cannot be mixed with generative AI predicates in one query"
-        )
-
-    if (not allow_relational and not b.joins and not b.filters
-            and not b.label_tests and not b.tested_calls and not projected):
-        raise CompileError(
-            "the query has no AI predicate; a plain "
-            "scan belongs in the database the ids came "
-            "from"
-        )
 
 
-def _bind_label_names(b: ExpressionBinder, columns: tuple[ColumnRef | Alias, ...]):
-    """Assign names to classifications used in projections and filters."""
-    projected = tuple(column for column in columns
-                      if aliased_call(column) is not None)
-    # a filter on a label tests the projected column of the same call;
-    # a classification only tested is named after its first test's
-    # position among the alias's filters
-    named = {
-        column.expression: column.name
-        for column in projected
-        if column.expression.kind == "label"
-    }
-    labels = {}
-    for alias, tests in b.label_tests.items():
-        asks = len(b.filters.get(alias, ()))
-        for index, (call, _, _) in enumerate(tests):
-            labels.setdefault(alias, {}).setdefault(
-                call, named.get(call, b.tested_calls.get(
-                    call, f"__label_{alias}_{asks + index}"))
-            )
-    for call, name in {**named, **b.tested_calls}.items():
-        if call.kind == "label" and len(call.aliases()) == 1:
-            labels.setdefault(call.aliases()[0], {}).setdefault(call, name)
+def _parse(sql: str, dialect) -> tuple[SQLDialect, exp.Select]:
+    """Parse one SELECT statement and refuse what is outside the language.
 
-    return named, labels
+    Raises:
+        CompileError: The text does not parse, is not one SELECT, or
+            uses SQL outside the language.
+        ValueError: The dialect is not supported.
+    """
+    try:
+        dialect = SQLDialect(dialect)
+    except ValueError as error:
+        raise ValueError(
+            f"unsupported SQL dialect {dialect!r}; expected snowflake or bq"
+        ) from error
+    sql = _normalize_ai_calls(sql, dialect)
+    try:
+        tree = sqlglot.parse_one(sql, dialect=_sqlglot_dialect(dialect))
+    except sqlglot.errors.SqlglotError as e:
+        raise CompileError(f"parse error: {e}") from e
+    if not isinstance(tree, exp.Select):
+        raise CompileError("the query must be a single SELECT")
+    _reject_forbidden(tree)
+    return dialect, tree
+
+
+def bind_relation(sql: str, catalog: Catalog,
+                  dialect: SQLDialect | str = SQLDialect.SNOWFLAKE,
+                  prompts: PromptBinder | None = None):
+    """Bind the FROM, JOIN, and WHERE part of one SELECT, before placement.
+
+    This is the tree compile_sql gives place_relation: a Scan per
+    table, a Join per JOIN with its ON equalities, and a Filter holding
+    every ON and WHERE part as written, model calls included.
+
+    Raises:
+        CompileError: The query is invalid, uses unsupported SQL, or
+            has a WITH clause or a subquery in FROM.
+    """
+    dialect, tree = _parse(sql, dialect)
+    if len(_scopes(tree)) != 1:
+        raise CompileError("bind_relation binds one SELECT without WITH")
+    b, joins = _bind_tables(tree, catalog, prompts or PromptBinder(), dialect, ())
+    SelectBinder(b).bind(tree)
+    return _relation(b, joins)
+
+
+def _bind_tables(tree, catalog, prompts, dialect, unnests):
+    """Bind FROM, JOIN, and WHERE; return the binder and the join binder."""
+    b = ExpressionBinder(catalog, prompts, dialect=dialect.value)
+    joins = JoinBinder(b)
+    joins.bind_tables(tree)
+    for names, _, _ in unnests:
+        for name in names:
+            b.scope.add_relation(name, pa.schema(FEATURE_LIST.value_type))
+    bind_where(b, tree)
+    return b, joins
 
 
 def compile_sql(
@@ -265,20 +265,7 @@ def compile_sql(
         CompileError: The query is invalid or uses unsupported SQL.
         ValueError: The dialect is not supported.
     """
-    try:
-        dialect = SQLDialect(dialect)
-    except ValueError as error:
-        raise ValueError(
-            f"unsupported SQL dialect {dialect!r}; expected snowflake or bq"
-        ) from error
-    sql = _normalize_ai_calls(sql, dialect)
-    try:
-        tree = sqlglot.parse_one(sql, dialect=_sqlglot_dialect(dialect))
-    except sqlglot.errors.SqlglotError as e:
-        raise CompileError(f"parse error: {e}") from e
-    if not isinstance(tree, exp.Select):
-        raise CompileError("the query must be a single SELECT")
-    _reject_forbidden(tree)
+    dialect, tree = _parse(sql, dialect)
     for with_ in tree.find_all(exp.With):
         if with_.recursive:
             raise CompileError(
@@ -483,6 +470,32 @@ def _computed(scope: Scope) -> set:
     return names
 
 
+def _relation(b: ExpressionBinder, joins: JoinBinder):
+    """Return the bound FROM, JOIN, and WHERE part as one relation tree.
+
+    Each table's Scan reads the document column its prompts read; an
+    EXISTS gate's table is in its Exists part, not in the joins.
+    """
+    scans = {alias: Scan(provider=provider, alias=alias,
+                         column=b.document_columns.get(alias, ""),
+                         schema=b.catalog.get(provider).schema())
+             for alias, provider in b.tables}
+    parts = [_with_scan(part, scans) for part in b.parts]
+    gates = {part.condition.relation.alias for part in parts
+             if isinstance(part, Hint) and isinstance(part.condition, Exists)}
+    return relation_tree([scan for alias, scan in scans.items() if alias not in gates],
+                         joins.conditions, parts)
+
+
+def _with_scan(part, scans: dict):
+    """Give an EXISTS part its table's Scan, with the document column read."""
+    if isinstance(part, Hint) and isinstance(part.condition, Exists):
+        gate = part.condition
+        return replace(part, condition=replace(
+            gate, relation=scans[gate.relation.alias]))
+    return part
+
+
 def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
                     dialect: SQLDialect, *,
                     allow_relational: bool = False) -> LogicalPlan:
@@ -492,14 +505,7 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
     offset = _parse_offset(tree)
     distinct = _parse_distinct(tree)
 
-    b = ExpressionBinder(catalog, prompts, dialect=dialect.value)
-
-    joins = JoinBinder(b)
-    joins.bind_tables(tree)
-    for names, _, _ in unnests:
-        for name in names:
-            b.scope.add_relation(name, pa.schema(FEATURE_LIST.value_type))
-    bind_where(b, tree, joins)
+    b, joins = _bind_tables(tree, catalog, prompts, dialect, unnests)
 
     selection = SelectBinder(b).bind(tree)
     columns, aggregation = selection.columns, selection.aggregation
@@ -508,51 +514,11 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
                            for name, call in zip(names, calls)))
     order = bind_order(tree, b, columns, aggregation, selection.structs,
                        selection.windows)
-    _validate_query(b, joins, columns, selection.structs,
-                    allow_relational=allow_relational)
-    named, labels = _bind_label_names(b, columns)
-    # alias -> (call, name) of each extraction, feature call, and map
-    calls = {kind: {} for kind in ("extract", "features", "map")}
-    for column in columns:
-        call = aliased_call(column, *calls)
-        if call is not None:
-            calls[call.kind].setdefault(call.aliases()[0], []).append(
-                (call, column.name))
-
-    for call, name in b.tested_calls.items():
-        if call.kind in calls:
-            entries = calls[call.kind].setdefault(call.aliases()[0], [])
-            if (call, name) not in entries:
-                entries.append((call, name))
-
-    logical = LogicalPlanBuilder()
-    for alias, provider in b.tables:
-        logical.add_scan(
-            alias,
-            provider,
-            b.document_columns.get(alias, ""),
-            tuple(b.filters.get(alias, ())),
-            regular_predicates=tuple(b.regular_predicates.get(alias, ())),
-            labels=tuple(labels.get(alias, {}).items()),
-            label_filters=tuple(
-                (labels[alias][call], accepted, selectivity)
-                for call, accepted, selectivity in b.label_tests.get(alias, ())
-            ),
-            extracts=tuple(calls["extract"].get(alias, ())),
-            column_filters=tuple(b.column_tests.get(alias, ())),
-            sae_features=tuple(calls["features"].get(alias, ())),
-            maps=tuple(calls["map"].get(alias, ())),
-            schema=catalog.get(provider).schema(),
-        )
-    for join in b.joins:
-        logical.add_join(join)
-    for alias in joins.aliases:
-        if alias not in joins.claimed:
-            logical.add_cross_join(alias)
-    for call, name in named.items():
-        if len(call.aliases()) == 2:
-            logical.add_classify(call, name)
-    return logical.project(
+    _validate_query(b, columns, selection.structs)
+    placed = place_relation(_relation(b, joins), columns, catalog,
+                            b.scope.relations, tested=b.tested_calls,
+                            allow_relational=allow_relational)
+    return placed.builder.project(
         tuple(columns),
         limit,
         order=order,
@@ -564,5 +530,5 @@ def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
         output=selection.output,
         unnests=tuple(names for names, _, _ in unnests),
         unnest_outer=tuple(outer for _, _, outer in unnests),
-        unnest_tests=tuple(b.unnest_tests),
+        row_tests=placed.rows,
     )

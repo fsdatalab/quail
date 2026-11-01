@@ -174,7 +174,7 @@ def filtered_before_joins(plan: LogicalPlan) -> set:
     aliases = set()
     for node in filters_before_joins(plan):
         if isinstance(node, Filter):
-            aliases.add(node.condition.column.alias)
+            aliases.add(node.alias)
         else:
             aliases.update(model_call(predicate.expression).aliases()[0]
                            for predicate in node.predicates)
@@ -186,7 +186,7 @@ def expected_rows_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -
     expected_rows = {a: float(st.num_documents) for a, st in statistics.stats.items()}
     for node in filters_before_joins(plan):
         if isinstance(node, Filter):
-            alias = node.condition.column.alias
+            alias = node.alias
             expected_rows[alias] *= effective_selectivity(node.selectivity)
         else:
             for predicate in node.predicates:

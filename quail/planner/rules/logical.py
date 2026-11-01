@@ -6,7 +6,6 @@ from dataclasses import replace
 
 from quail.logical import (
     Aggregate,
-    Apply,
     LogicalPlan,
     Project,
     Result,
@@ -31,8 +30,8 @@ class ShouldEliminateDistinct(LogicalRule):
     taken as a key: nothing checks it, since that would read the
     whole column, and a table that repeats an id gets the repeated
     rows back. The rule reads the id columns from the catalog and
-    leaves a plan alone without one, or when an apply() supplies the
-    rows. A GROUP BY whose output returns every key is unique as well.
+    leaves a plan alone without one. A GROUP BY whose output returns
+    every key is unique as well.
     """
 
     name = "should_eliminate_distinct"
@@ -48,8 +47,6 @@ class ShouldEliminateDistinct(LogicalRule):
         if not isinstance(root.input, Project) or context.catalog is None:
             return [root]
         plan = LogicalPlan(root)
-        if any(isinstance(node, Apply) for node in plan.walk()):
-            return [root]
         returned = {(ref.alias, ref.column)
                     for ref in root.input.output_schema()}
         for scan in plan.operators().scans:
@@ -112,9 +109,8 @@ class ShouldPushDownFilters(LogicalRule):
 
     Like Catalyst's PushDownPredicates, the move is unconditional: a
     Filter on a label column runs no model, so it thins a table before
-    the joins read it. Both front ends already place such filters on
-    their table; the rule rewrites plans built another way. An Apply
-    stays where it was written, since its function sees its input rows.
+    the joins read it. The SQL frontend already places such filters on
+    their table; the rule rewrites plans built another way.
     """
 
     name = "should_push_down_filters"

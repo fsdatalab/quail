@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import pyarrow as pa
 from pyarrow import compute as pc
@@ -15,17 +15,16 @@ from quail.logical.expressions import (
     ColumnRef,
     CompileError,
     ModelCall,
-    RegularPredicate,
     aliased_call,
     column_name,
     column_references,
+    condition_columns,
     evaluate_expression,
     model_call,
 )
 from quail.logical.nodes import (
     FEATURE_LIST,
     Aggregate,
-    Apply,
     Filter,
     Join,
     LogicalNode,
@@ -47,21 +46,26 @@ from quail.logical.nodes.column import SemanticColumn
 
 @dataclass(frozen=True)
 class ColumnTest:
-    """A Filter on a column a SemanticColumn computes.
+    """A Filter on the columns that column operators compute.
+
+    For example, ``kind = 'lease'`` tests the label a classification
+    adds, and ``lease.ends IS NULL OR c.id = 2`` an extraction's answer
+    and a source column.
 
     Attributes:
-        name: The producing SemanticColumn's name.
-        call: The model call that computes the column.
-        condition: The RegularPredicate the Filter applies.
+        name: The column operator the Filter follows, the last one it
+            reads, as its SemanticColumn names it.
+        call: That operator's model call.
+        condition: The condition the Filter applies.
         selectivity: The Filter's selectivity hint, or None.
-        position: Its written position among the table's filters,
-            counted after the table's AI.IF predicates, with the label
-            filters before the answer filters.
+        position: Its position among the table's filters, counted after
+            the table's AI.IF predicates, with the label tests before
+            the answer tests.
     """
 
     name: str
     call: "ModelCall"
-    condition: RegularPredicate
+    condition: Any  # RegularPredicate | Not | And | Or
     selectivity: Optional[float]
     position: int
 
@@ -95,8 +99,8 @@ def _label_work(classifies, columns, column_filters) -> LabelWork:
     names = {node.call: node.name for node in classifies}
     tests = {}
     calls = []
-    for alias, filters in column_filters.items():
-        for test in filters:
+    for alias, filters_of_alias in column_filters.items():
+        for test in filters_of_alias:
             if test.call.kind != "label":
                 continue
             if test.call not in tests:
@@ -193,7 +197,7 @@ class LogicalPlan:
 
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
-        scans, filters, joins, applies, classifies = [], {}, [], [], []
+        scans, filters, joins, classifies = [], {}, [], []
         extracts, feature_calls, map_calls, tested, aliases = [], [], [], {}, []
         # the nodes above the projection read result rows, not documents
         nodes = LogicalPlan(self.projection).walk()
@@ -207,14 +211,12 @@ class LogicalPlan:
                     if alias not in aliases:
                         aliases.append(alias)
             elif isinstance(node, Filter):
-                alias = node.condition.column.alias
+                alias = node.alias
                 tested.setdefault(alias, []).append(node)
                 if alias not in aliases:
                     aliases.append(alias)
             elif isinstance(node, SemanticJoin):
                 joins.append(node)
-            elif isinstance(node, Apply):
-                applies.append(node)
             elif isinstance(node, SemanticClassify):
                 classifies.append(node)
             elif isinstance(node, SemanticExtract):
@@ -223,25 +225,21 @@ class LogicalPlan:
                 feature_calls.append(node)
             elif isinstance(node, SemanticMap):
                 map_calls.append(node)
-        producers = {
-            (node.alias, column): node
-            for node in nodes if isinstance(node, SemanticColumn)
-            for column in node.added_columns
-        }
         column_filters = {}
-        for alias, tests in tested.items():
-            # Label positions precede answer positions, even after a rewrite.
-            tests = sorted(tests, key=lambda node: producers[
-                (alias, node.condition.column.column)].call.kind != "label")
-            column_filters[alias] = tuple(
-                ColumnTest(
-                    name=producers[(alias, node.condition.column.column)].name,
-                    call=producers[(alias, node.condition.column.column)].call,
-                    condition=node.condition,
-                    selectivity=node.selectivity,
-                    position=len(filters.get(alias, ())) + index,
-                )
-                for index, node in enumerate(tests))
+        for alias in aliases:
+            # the label tests come first, then the answer tests
+            ordered = sorted(tested.get(alias, ()),
+                             key=lambda node: _producer(node).call.kind != "label")
+            if ordered:
+                column_filters[alias] = tuple(
+                    ColumnTest(
+                        name=_producer(node).name,
+                        call=_producer(node).call,
+                        condition=node.condition,
+                        selectivity=node.selectivity,
+                        position=len(filters.get(alias, ())) + index,
+                    )
+                    for index, node in enumerate(ordered))
         columns = next(
             (
                 node.columns
@@ -257,7 +255,6 @@ class LogicalPlan:
             },
             column_filters=column_filters,
             joins=tuple(joins),
-            applies=tuple(applies),
             projections=tuple(
                 column for column in columns if aliased_call(column) is not None
             ),
@@ -273,7 +270,7 @@ class LogicalPlan:
 class Operators:
     """The operators of one plan, in the order the plan was written.
 
-    ``walk`` lists children before parents, so scans, joins, applies,
+    ``walk`` lists children before parents, so scans, joins,
     classifications, and extractions follow written order, each
     alias's AI.IF predicates keep their order, and each alias's label
     filters keep theirs.
@@ -282,7 +279,6 @@ class Operators:
     scans: tuple  # tuple[Scan, ...]
     filters: dict  # alias -> tuple[FilterPredicate, ...]
     joins: tuple  # tuple[SemanticJoin, ...]
-    applies: tuple  # tuple[Apply, ...]
     labels: LabelWork
     projections: tuple = ()  # named model calls in SELECT order
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
@@ -290,13 +286,15 @@ class Operators:
     sae_features: tuple = ()  # tuple[SemanticSaeFeatures, ...]
     maps: tuple = ()  # tuple[SemanticMap, ...]
     column_filters: dict = field(default_factory=dict)
-    #                      alias -> tuple[ColumnTest, ...]
+    #   alias -> tuple[ColumnTest, ...], the label tests, then the answer tests
 
     def all_filters(self) -> dict:
         """Return alias -> its AI.IF predicates, then its ColumnTests."""
+        aliases = list(dict.fromkeys((*self.filters, *self.column_filters)))
         return {
-            alias: (*self.filters.get(alias, ()), *self.column_filters.get(alias, ()))
-            for alias in dict.fromkeys((*self.filters, *self.column_filters))
+            alias: (*self.filters.get(alias, ()),
+                    *self.column_filters.get(alias, ()))
+            for alias in aliases
         }
 
     @property
@@ -320,11 +318,24 @@ class Operators:
         )
 
 
+def _producer(test: "Filter") -> SemanticColumn:
+    """Return the last column operator below a Filter whose columns it reads.
+
+    The Filter runs after that operator and reads the other columns by
+    document ID.
+    """
+    read = set(condition_columns(test.condition))
+    node = test.input
+    while not (isinstance(node, SemanticColumn) and read & set(node.added_columns)):
+        node = node.input
+    return node
+
+
 def join_outer_input(join: "SemanticJoin") -> "LogicalNode":
     """The tree the join extends: everything before its new tables."""
     node = join.input
-    while isinstance(node, (Join, Apply)):
-        node = node.left if isinstance(node, Join) else node.input
+    while isinstance(node, Join):
+        node = node.left
     return node
 
 
@@ -333,9 +344,7 @@ def join_conditions(join: "SemanticJoin") -> tuple:
     conditions = []
 
     def visit(node):
-        if isinstance(node, Apply):
-            visit(node.input)
-        elif isinstance(node, Join):
+        if isinstance(node, Join):
             visit(node.left)
             conditions.extend(node.on)
 
@@ -356,16 +365,6 @@ def oriented_join_conditions(join: "SemanticJoin") -> tuple | None:
             left, right = right, left
         oriented.append((left, right))
     return left_alias, right_alias, tuple(oriented)
-
-
-def join_applies(join: "SemanticJoin") -> tuple:
-    """The Apply nodes that return pairs for one SemanticJoin."""
-    applies = []
-    node = join.input
-    while isinstance(node, Apply):
-        applies.append(node)
-        node = node.input
-    return tuple(reversed(applies))
 
 
 SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])

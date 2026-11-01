@@ -162,8 +162,9 @@ def classification_and_condition(ids):
         return pa.array([table["label"][0].as_py() == "keep"])
 
     condition = ConditionGate(SimpleNamespace(
-        column="label", predicate=SimpleNamespace(accepts=accepts)),
-        classification, classification)
+        node_id="condition", tested_columns=("label",),
+        predicate=SimpleNamespace(accepts=accepts)),
+        {"label": classification}, classification, None)
     return classification, condition
 
 

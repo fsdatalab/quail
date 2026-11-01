@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from quail.api.builder import BoundBuilder
 from quail.api.query import Query, QueryLike
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, TableProvider
 from quail.catalog.tokens import GigatokenEncoder
 from quail.extensions import ExtensionRegistry
-from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.planner.plan import EngineConfig, Refusal, RefusalError, resolve_model
@@ -147,15 +145,6 @@ class Session:
                 "session has no saved query records")
         return self._remote.run(query_id)
 
-    def docs(self, name: str) -> "BoundBuilder":
-        if self._remote is not None:
-            raise RuntimeError(
-                "the builder API is not available on a remote Session; "
-                "write the query with sql()")
-        return BoundBuilder(self,
-                            BuilderQuery(self.catalog, name,
-                                         prompts=PromptBinder(model=self.model)))
-
     @property
     def tokenizer(self):
         """Return Gigatoken's encoder, loading it when first used.
@@ -168,15 +157,3 @@ class Session:
             self._tokenizer = GigatokenEncoder(resolve_model_path(
                 self.model.hf_name, self.model.revision, include_weights=False))
         return self._tokenizer
-
-    def register_functions(self, functions: dict) -> None:
-        """Register a query's apply() functions once each, by name."""
-        for name, function in functions.items():
-            known = self.registry.functions.get(name)
-            if known is function:
-                continue
-            if known is not None:
-                raise ValueError(
-                    f"apply name {name!r} is registered for another "
-                    f"function on this session")
-            self.registry.register_function(function, name=name)

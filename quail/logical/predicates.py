@@ -16,8 +16,8 @@ VALUE_COMPARISONS = ("=", "<>", "<", "<=", ">", ">=")
 TEXT_COMPARISONS = ("like", "ilike", "contains", "icontains", "starts with",
                     "ends with", "regex")
 COLUMN_COMPARISONS = (
-    *VALUE_COMPARISONS, "in", "is null", "is not null",
-    *TEXT_COMPARISONS, *(f"not {comparison}" for comparison in TEXT_COMPARISONS))
+    *VALUE_COMPARISONS, "in", "is null", "is not null", "is true",
+    *TEXT_COMPARISONS)
 
 COMPARISON_KERNELS = {
     "=": pc.equal, "<>": pc.not_equal,

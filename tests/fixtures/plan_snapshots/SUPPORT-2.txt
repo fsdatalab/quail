@@ -1,0 +1,30 @@
+logical:
+  Project: a.id, u.id
+    SemanticJoin (full)
+      PROMPT("Does the customer's reply in DOCUMENT {1} disagree with, correct, or push back on what the agent said in DOCUMENT {0}? Answer TRUE if the reply objects to the agent's statement, rejects its proposal, or says the agent got something wrong, FALSE otherwise.", a.content, u.content) (selectivity=5.26%)
+      Join
+        on a.id = u.prev_assistant_id
+        Scan support_messages as a [content, id]
+        Scan support_messages as u [content, id, prev_assistant_id, role] where u.role = 'user'
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                                                      est. rows   est. pass   est. time
+  Project: a.id, u.id
+    AiJoin: anchor=u                                                                                                             1.1 ms
+      KV: anchor=not resident, retain after join=no
+      join 1 full (u, a) over pairs from hash_join:a-u  PROMPT("Does the customer's reply in DOC…")         0.2       5.26%
+      Scan support_messages as u [2]                                                                          1
+        tokens=156, mean_document_tokens=26
+        where u.role = 'user'
+      Scan support_messages as a [1]                                                                          6
+        tokens=156, mean_document_tokens=26
+      HashJoin: a.id = u.prev_assistant_id
+        pairs kept: 0.02778 of the cross product
+        Reuse [1]
+        Reuse [2]
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

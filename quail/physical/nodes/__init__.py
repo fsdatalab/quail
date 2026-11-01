@@ -4,7 +4,7 @@ from .classify import AiClassify, ClassifySpec
 from .extract import AiExtract, ExtractSpec
 from .filter import AiFilter, Filter
 from .inference import AiInference, AiScore, InferenceSpec, ScoreSpec
-from .join import AiJoin, Barrier, Foreign, HashJoin
+from .join import AiJoin, Barrier, HashJoin
 from .map import AiMap, MapSpec
 from .relational import (
     Aggregate,
@@ -35,7 +35,6 @@ __all__ = [
     "Exchange",
     "ExtractSpec",
     "Filter",
-    "Foreign",
     "HashJoin",
     "InferenceSpec",
     "Limit",

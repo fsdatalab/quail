@@ -1,0 +1,33 @@
+logical:
+  Project: c.id, contract.agreement_date, contract.expiration_date, contract.governing_law
+    contract = struct(contract.agreement_date, contract.expiration_date, contract.governing_law)
+    SemanticExtract: contract.governing_law, contract.governing_law_span
+      question="Which state/country's law governs the interpretation of the contract?"
+      SemanticExtract: contract.expiration_date, contract.expiration_date_span
+        question="On what date will the contract's initial term expire?"
+        SemanticExtract: contract.agreement_date, contract.agreement_date_span
+          question='The date of the contract'
+          Scan contracts as c [text, id]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                                                                       est. rows   est. time
+  Project: c.id, contract, contract_span
+    contract = struct(contract.agreement_date, contract.expiration_date, contract.governing_law)
+    contract_span = struct(contract.agreement_date_span, contract.expiration_date_span, contract.governing_law_span)
+    AiExtract: contract.governing_law over c                                                                                         11.1 ms
+      question="Which state/country's law governs the interpretation of the contract?", up to 64 answer tokens
+      AiExtract: contract.expiration_date over c [2]                                                                                 10.6 ms
+        question="On what date will the contract's initial term expire?", up to 64 answer tokens
+        AiExtract: contract.agreement_date over c [1]                                                                                12.7 ms
+          question='The date of the contract', up to 64 answer tokens
+          Scan contracts as c                                                                                                  6
+            tokens=96, mean_document_tokens=16
+    Reuse [1]
+    Reuse [2]
+  Pipeline on c: ai-extract:0 -> ai-extract:1 -> ai-extract:2 (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

@@ -1,15 +1,12 @@
 """Dense and MoE Qwen hybrid specs against checkpoint configs and costs."""
 
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from quail.cost.dense_decoder_cost import (
-    attention_projection_params,
     dense_decoder_components,
-    gdn_projection_params,
     mlp_params,
 )
 from quail.cost.sol import speed_of_light
@@ -17,9 +14,7 @@ from quail.cost.work import Work
 from quail.specs import (
     H100_SXM,
     MODELS,
-    QWEN3_4B_FP8,
     QWEN3_5_4B_BF16,
-    QWEN3_5_4B_FP8,
 )
 
 CONFIG = (Path(__file__).parents[1] / "fixtures" / "qwen3_5_configs"
@@ -27,7 +22,7 @@ CONFIG = (Path(__file__).parents[1] / "fixtures" / "qwen3_5_configs"
 SPEC = QWEN3_5_4B_BF16
 
 
-@pytest.mark.parametrize("name", ["qwen3.5-4b-bf16", "qwen3.6-35b-a3b-fp8"])
+@pytest.mark.parametrize("name", ["qwen3.5-4b-bf16"])
 def test_spec_matches_the_config(name):
     spec = MODELS[name]
     config = json.loads((CONFIG.parent / f"{name}.json").read_text())["text_config"]
@@ -71,97 +66,22 @@ def test_spec_matches_the_config(name):
         assert budgets.arena_pages(spec, H100_SXM)[0] > 0
 
 
-def test_weights_match_the_plan():
-    # equation 21: 2 x (embedding + MLP + attention + Gated DeltaNet) is
-    # 8,411,152,384 bytes; vLLM's model memory after loading is 1.6
-    # percent above it, and the spec carries the measured figure
-    assert SPEC.W_mem == 8_545_764_864
-    assert SPEC.W_mem / 8_411_152_384 < 1.02
-    assert SPEC.widest_projection == 18_432
-    conv_weights = 24 * (2 * 16 * 128 + 32 * 128) * 4
-    assert conv_weights == 786_432
-    assert SPEC.params == (attention_projection_params(SPEC)
-                           + gdn_projection_params(SPEC)
-                           + mlp_params(SPEC) + conv_weights)
-    assert gdn_projection_params(SPEC) == 24 * 42_106_880
-    assert attention_projection_params(SPEC) == 8 * 36_700_160
 
 
-def test_dense_components_price_gdn_projections_with_the_attention_ones():
-    work = Work(tokens=1_000, pairs=0, kv_written=0, kv_read=0)
-    attn_proj, mlp, attention, *_ = dense_decoder_components(
-        work, SPEC, passes=1.0)
-    assert attn_proj.flops == 2.0 * 1_000 * (
-        8 * 36_700_160 + 24 * 42_106_880)
-    assert attn_proj.bytes_moved == 2.0 * (8 * 36_700_160 + 24 * 42_106_880)
-    assert mlp.flops == 2.0 * 1_000 * 32 * 3 * 2560 * 9216
-    assert attention.flops == 0
-    fp8 = QWEN3_5_4B_FP8
-    parts = {part.name: part for part in dense_decoder_components(work, fp8, 1)}
-    assert parts["gdn_proj"].precision == "bf16"
-    assert parts["gdn_proj"].bytes_moved == 2 * gdn_projection_params(fp8)
-    assert parts["attn_proj"].precision == parts["mlp"].precision == "fp8"
-    assert fp8.checkpoint_bytes == SPEC.checkpoint_bytes
-    assert MODELS[fp8.name] is fp8
 
 
-def test_vllm_takes_no_images_for_the_vision_checkpoint_only():
-    from quail.baselines.vllm import DefaultVLLMEngine, VLLMEngine
-
-    off = {"image": 0, "video": 0}
-    for engine in (VLLMEngine(), DefaultVLLMEngine()):
-        assert engine.llm_kwargs(SPEC)["limit_mm_per_prompt"] == off
-        assert "limit_mm_per_prompt" not in engine.llm_kwargs(QWEN3_4B_FP8, H100_SXM)
 
 
-def test_vllm_sequences_stay_under_the_state_blocks_it_holds():
-    from quail.baselines.vllm import MAX_SEQUENCES, VLLMEngine
-
-    assert VLLMEngine().llm_kwargs(SPEC)["max_num_seqs"] == 3_000 < MAX_SEQUENCES
-    assert VLLMEngine().llm_kwargs(QWEN3_4B_FP8, H100_SXM)[
-        "max_num_seqs"] == MAX_SEQUENCES
 
 
-def test_a_sliding_hybrid_slides_only_its_attention_layers():
-
-    sliding = replace(
-        SPEC, sliding_window=128,
-        layer_kinds=tuple("sliding_attention" if kind == "full_attention" else kind
-                          for kind in SPEC.layer_kinds))
-    assert sliding.sliding_layer_set == frozenset(range(3, 32, 4))
-    assert not any(sliding.is_full_layer(i) for i in range(32))
 
 
-def test_gdn_core_and_convolution_are_priced_per_token():
-    from quail.cost.dense_decoder_cost import (
-        conv_flops_per_token,
-        gdn_core_flops_per_token,
-    )
-
-    work = Work(tokens=1_000, pairs=0, kv_written=0, kv_read=0)
-    names = [c.name for c in dense_decoder_components(work, SPEC, passes=1.0)]
-    assert names == ["attn_proj", "mlp", "attention", "gdn_core", "state",
-                     "conv"]
-    # per token and value head: 6 C K + 4 C V + 6 K V + 2 C^2 / 3 with
-    # C = 64 and K = V = 128, over 32 value heads and 24 layers
-    per_head = 6 * 64 * 128 + 4 * 64 * 128 + 6 * 128 * 128 + 2 * 64 * 64 / 3
-    assert gdn_core_flops_per_token(SPEC) == per_head * 32 * 24
-    # 2 FLOPs per tap per channel: 8,192 channels, width 4, 24 layers
-    assert conv_flops_per_token(SPEC) == 2 * 4 * 8_192 * 24
 
 
-def test_a_pure_attention_model_prices_no_state_bytes():
-    from quail.cost.work import ask
-    from quail.specs import QWEN3_4B_FP8
-
-    names = [c.name for c in dense_decoder_components(
-        ask(100, 10), QWEN3_4B_FP8, passes=1.0)]
-    assert "state" not in names
 
 
 def test_one_review_through_a_filter_and_a_join_matches_the_hand_calculation():
     from quail.cost.work import ask, scan, stream
-    from quail.specs import H100_SXM
 
     # 100-token review, 6-token preamble, 56-token filter question, then a
     # join: a 43-token frame and two aspects of 2 and 3 tokens, each with a

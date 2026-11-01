@@ -271,6 +271,8 @@ class StageExecutor:
             stop_groups=stop_groups,
             stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
+            gated=[j for j, stage in enumerate(self.stages)
+                   if stage.prepare is not None],
             reserve=self._reserve if self.paged else None,
             dependencies=dependencies,
         )
@@ -383,6 +385,9 @@ class StageExecutor:
         capacity = prefix_tokens + self.capacity_extra
         return (self.arena.page_cost(capacity)
                 - self.arena.growth_cost(key, capacity))
+
+    def _prepare(self, j, anchors):
+        self.stages[j].prepare([self.keys[a] for a in anchors])
 
     def _requests_of(self, a, key):
         """Return a stage request selector, or None if every request is selected.
@@ -748,6 +753,7 @@ class StageExecutor:
             transitions.extend(self._record(a, j, start, end, rows))
         entry.at += len(groups)
         transitions.extend(self._record_answers())
+        self._decide_waiting()
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)
             if self.counting_answers else self.finished)
@@ -794,8 +800,14 @@ class StageExecutor:
         waiting, self.waiting_reports = self.waiting_reports, []
         for entry in waiting:
             transitions.extend(self._record(*entry))
+        self._decide_waiting()
         if transitions and self.on_chunk is not None:
             self.on_chunk(transitions)
+
+    def _decide_waiting(self):
+        """Run each gated stage's conditions over the documents waiting at it."""
+        for settlement in self.sched.decide_waiting(self._prepare):
+            self._event(settlement)
 
     def _report_next(self, partial=False):
         """Decide the oldest results, splitting append stages when no work is ready."""

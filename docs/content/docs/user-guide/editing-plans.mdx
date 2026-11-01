@@ -12,8 +12,6 @@ execution times of these two plans.
 
 The example below builds and prints both plans on the CPU. To measure
 their execution times, run them on a GPU with `query.run(plan=...)`.
-The guide also shows how to add Python code that selects which document
-pairs reach the model.
 
 The full example is in
 [`demos/plan_walkthrough.py`][demoscript].
@@ -37,32 +35,28 @@ first keeps claims about a person. It then checks whether the evidence
 passages support those claims. A URL equality limits the pairs evaluated
 by the model.
 
-The script creates a session and registers both tables. It then builds
-this query with the [Python builder API](/docs/user-guide/python-api):
+The script creates a session and registers both tables. It then writes
+this query in [SQL](/docs/user-guide/sql):
 
 ```python
-from quail import col, prompt
-
 PERSON = "Is the claim in DOCUMENT {0} about a person?"
 SUPPORT = (
     "Does the passage in DOCUMENT {1} support the claim in "
     "DOCUMENT {0}?"
 )
 
-query = (
-    session.docs("claims").alias("c")
-    .ai_if(prompt(PERSON, col("c.claim")))
-    .join(
-        session.docs("evidence").alias("e"),
-        on=col("c.evidence_wiki_url") == col("e.id"),
-    )
-    .ai_if(prompt(SUPPORT, col("c.claim"), col("e.text")))
-    .select("c.id", "e.id")
-)
+query = session.sql(f"""
+SELECT c.id, e.id
+FROM claims c
+JOIN evidence e
+  ON c.evidence_wiki_url = e.id
+ AND AI.IF(PROMPT('{SUPPORT}', c.claim, e.text))
+WHERE AI.IF(PROMPT('{PERSON}', c.claim))
+""", dialect="bq")
 ```
 
-The `.join(..., on=...)` restricts which combinations of claims and
-evidence the model evaluates.
+The condition `c.evidence_wiki_url = e.id` restricts which combinations
+of claims and evidence the model evaluates.
 
 ## Inspect the plan
 
@@ -131,9 +125,8 @@ We can remove the barrier and get back the original plan:
 assert edited.remove("barrier:c") == plan
 ```
 
-Only `Barrier`, `Foreign`, and `Exchange` nodes can be removed. A
-`Foreign` node holds a Python function, so its removal can change the
-results. The removal of an LLM node raises an error:
+Only `Barrier` and `Exchange` nodes can be removed. The removal of an
+LLM node raises an error:
 
 ```text
 PlanEditError: 'ai_filter:c' is a AiFilter; removing it would change
@@ -141,7 +134,6 @@ what the query means
 ```
 
 ## Plan editing API
-
 
 Start with `query.plan()` to inspect the plan without running inference.
 If planning returns a `Refusal`, resolve the reported constraint before
@@ -157,64 +149,7 @@ editing it.
 Each edit returns a new plan, validates port connections and cycles, and
 re-estimates the graph. An invalid edit raises `PlanEditError`.
 
-Only `Foreign`, `Barrier`, and `Exchange` nodes can be removed. Quail
-rejects removal of a scan, model operator, or filter. Removing a `Foreign`
-node can change results if its Python function filters rows.
-
-## Insert a user function
-
-With `.apply()`, we can run our own Python function between operators.
-The full signature is:
-
-```text
-query.apply(fn, columns=(), *, name=None, ids=None, kind="per_batch")
-```
-
-- `fn` receives a `dict[str, pa.Table]` keyed by alias. Each table
-  has the alias's row indices plus the columns you listed in `columns`.
-- `columns` is a list of `col(...)` references that your function
-  needs to read.
-- After a `.join()`, `fn` returns a table with both alias columns
-  (e.g. `c` and `e`) selecting which combinations the next AI
-  predicate evaluates.
-- Without a preceding `.join()`, `fn` returns the ids to keep.
-- `kind="per_batch"` runs on each batch of rows in a pipeline. Outside
-  a pipeline, it gets all input rows in one call.
-  `kind="barrier"` waits for all survivors, then runs once.
-
-For example, instead of an `ON` clause, we can match claims to
-evidence with an Arrow join inside our function:
-
-```python
-def match_by_url(tables):
-    """Match each claim to the evidence page its URL names."""
-    return tables["c"].join(
-        tables["e"],
-        keys=["evidence_wiki_url"],
-        right_keys=["id"],
-        join_type="inner",
-    ).select(["c", "e"])
-
-query = (
-    session.docs("claims").alias("c")
-    .ai_if(prompt(PERSON, col("c.claim")))
-    .join(session.docs("evidence").alias("e"))
-    .apply(match_by_url, columns=[col("c.evidence_wiki_url"),
-                                  col("e.id")])
-    .ai_if(prompt(SUPPORT, col("c.claim"), col("e.text")))
-    .select("c.id", "e.id")
-)
-```
-
-The function determines which row pairs reach the model predicate.
-Quail uses the returned `c` and `e` index columns to identify those pairs;
-it does not inspect the function's internal logic.
-
-In the physical plan, `match_by_url` appears as a `Foreign` node:
-
-```text
-      Foreign: match_by_url (per_batch, pairs) on c, e
-        columns: c.evidence_wiki_url, e.id
-```
+Only `Barrier` and `Exchange` nodes can be removed. Quail rejects
+removal of a scan, model operator, or filter.
 
 [demoscript]: https://github.com/fsdatalab/quail/blob/main/demos/plan_walkthrough.py
