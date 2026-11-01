@@ -21,8 +21,7 @@ from quail.logical.expressions import (
     packed_columns,
 )
 from quail.logical.nodes.base import LogicalNode
-from quail.logical.nodes.classify import classifications
-from quail.logical.nodes.extract import extractions
+from quail.logical.nodes.column import SemanticColumn, column_nodes
 from quail.logical.nodes.filter import above_projection
 from quail.logical.nodes.sae_features import FEATURE_LIST
 
@@ -60,8 +59,8 @@ class Project:
                      for name in self.result_columns())
 
     def validate(self) -> None:
-        computed = {(node.call, node.name) for node in classifications(self.input)}
-        extracted = {(node.call, node.name) for node in extractions(self.input)}
+        computed = {(node.call, node.name)
+                    for node in column_nodes(self.input, SemanticColumn)}
         for column in self.columns:
             if isinstance(column, str):
                 if column not in self.input.result_columns():
@@ -69,18 +68,11 @@ class Project:
                 continue
             column.validate()
             call = aliased_call(column)
-            if call is not None and call.kind == "label" and (
-                    call, column.name) not in computed:
+            if (call is not None and call.kind != "score"
+                    and (call, column.name) not in computed):
                 raise CompileError(
-                    f"the label column {column.name!r} needs a "
-                    f"SemanticClassify below the Project"
-                )
-            if call is not None and call.kind == "extract" and (
-                    call, column.name) not in extracted:
-                raise CompileError(
-                    f"the answer column {column.name!r} needs a "
-                    f"SemanticExtract below the Project"
-                )
+                    f"the {call.kind} column {column.name!r} needs the "
+                    f"column operator that computes it below the Project")
         names = [column_name(column) for column in self.columns]
         if len(names) != len(set(names)):
             raise CompileError(f"projection names must be unique, got {names}")

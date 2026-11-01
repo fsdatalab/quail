@@ -22,7 +22,7 @@ from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import EngineConfig
 from quail.planner.rules import built_in_rules
 from quail.planner.rules.tree_transforms import (
-    lift_maps,
+    lift_column_operators,
     push_down_filters,
     push_down_projection,
 )
@@ -173,5 +173,5 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
     assert push_down_filters(lifted) == labelled.root
     # the placement rule offers the lifted plan for a full join
     assert [type(node).__name__ for node in LogicalPlan(
-        lift_maps(labelled.root)).walk()][-4:] == [
+        lift_column_operators(labelled.root)).walk()][-4:] == [
         "SemanticJoin", "SemanticClassify", "Filter", "Project"]

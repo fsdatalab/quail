@@ -24,6 +24,9 @@ from quail.planner.validation import ClassifyRefusedError
 
 ASK, CLASSIFY, EXTRACT = "ask", "classify", "extract"
 FEATURES, MAP = "features", "map"
+# the step kind of each column operator, by its model call kind
+COLUMN_STEPS = {"label": CLASSIFY, "extract": EXTRACT, "features": FEATURES,
+                "map": MAP}
 
 
 @dataclass(frozen=True)

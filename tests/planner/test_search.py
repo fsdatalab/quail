@@ -9,7 +9,7 @@ from helpers.fakes import letter_tokens
 
 import quail
 from quail.catalog import DocumentProvider
-from quail.logical import extracted_above_joins
+from quail.logical import columns_above_joins
 from quail.physical import AiExtract, PhysicalGraph
 from quail.planner.optimize import search_candidates, search_plan
 from quail.planner.optimizer.context import PlanningContext
@@ -54,7 +54,7 @@ class PlacementCost(PhysicalRule):
         self.seen = []
 
     def rewrite(self, graph, context):
-        lifted = bool(extracted_above_joins(context.logical_plan.root))
+        lifted = ("d", "extract") in columns_above_joins(context.logical_plan.root)
         assert "retention" in context.settings
         assert "test_seen" not in context.settings
         context.settings["test_seen"] = lifted
@@ -85,10 +85,10 @@ def test_graph_refinement_can_reverse_placement_choice(query):
     original, lifted = chosen.settings["candidates"]
     assert original["selected"] and not lifted["selected"]
     assert original["estimated_seconds"] < lifted["estimated_seconds"]
-    assert "should_lift_maps" in lifted["rewrites"]
+    assert "should_lift_column_operators" in lifted["rewrites"]
     assert "test_seen" not in context.settings
     text = query.explain(verbose=True)
-    assert "should_lift_maps" in text.split("  physical:")[0]
+    assert "should_lift_column_operators" in text.split("  physical:")[0]
     assert "rewrite logical candidates" in text
     assert "lowest estimated cost after graph refinement" in text
 
@@ -109,12 +109,12 @@ def test_refused_candidate_does_not_hide_a_runnable_plan(query):
 
 
 def test_logical_alternatives_retain_original_and_deduplicate(query):
-    from quail.planner.rules.logical import ShouldLiftMaps
+    from quail.planner.rules.logical import ShouldLiftColumnOperators
 
     context = context_for(query)
     registry = query.session.registry
 
-    class CheckCandidateContext(ShouldLiftMaps):
+    class CheckCandidateContext(ShouldLiftColumnOperators):
         def rewrites(self, root, context):
             assert context.logical_plan.root is root
             assert context.settings == {}
@@ -123,11 +123,11 @@ def test_logical_alternatives_retain_original_and_deduplicate(query):
 
     registry.register_logical_rule(CheckCandidateContext(), name="duplicate_lift")
     with pytest.raises(ValueError, match="duplicate"):
-        registry.register_logical_rule(ShouldLiftMaps())
+        registry.register_logical_rule(ShouldLiftColumnOperators())
     original, lifted = search_candidates(query._logical_input, context, registry)
-    assert not extracted_above_joins(original.logical_plan.root)
-    assert "should_lift_maps" not in original.rewrites
-    assert "should_lift_maps" in lifted.rewrites
+    assert not columns_above_joins(original.logical_plan.root)
+    assert "should_lift_column_operators" not in original.rewrites
+    assert "should_lift_column_operators" in lifted.rewrites
     assert context.settings == {}
     assert "tree_rule_setting" not in original.plan.settings
     assert "tree_rule_setting" not in lifted.plan.settings

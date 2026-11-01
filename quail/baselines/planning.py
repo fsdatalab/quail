@@ -18,8 +18,8 @@ from quail.cost import budgets
 from quail.logical import (
     SPAN_SUFFIX,
     RegularPredicate,
-    classified_above_joins,
     column_name,
+    columns_above_joins,
     effective_selectivity,
 )
 from quail.logical import Aggregate as LogicalAggregate
@@ -247,7 +247,8 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
             reasons=(reason,),
             constraint="classify_needs_quail_backend",
             needed=1, available=0, unit="backends")
-    if classified_above_joins(region.logical_plan.root):
+    if any(kind == "label"
+           for _, kind in columns_above_joins(region.logical_plan.root)):
         return Refusal(
             reasons=(f"{backend_name} runs single-document classification "
                      "before joins",),

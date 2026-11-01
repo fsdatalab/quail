@@ -15,7 +15,7 @@ from quail.planner.optimizer.rules import LogicalRule
 from quail.planner.rules.tree_transforms import (
     _filtered_alias,
     _stop_key,
-    lift_maps,
+    lift_column_operators,
     push_down_filters,
     push_down_projection,
 )
@@ -120,11 +120,11 @@ class ShouldPushDownFilters(LogicalRule):
         return [root if rewritten is None else rewritten]
 
 
-class ShouldLiftMaps(LogicalRule):
-    """Offer classification and extraction placement above joins."""
+class ShouldLiftColumnOperators(LogicalRule):
+    """Offer each joined table's column operators above its joins as well."""
 
-    name = "should_lift_maps"
+    name = "should_lift_column_operators"
 
     def rewrites(self, root, context):
-        rewritten = lift_maps(root)
+        rewritten = lift_column_operators(root)
         return [root] if rewritten is None else [root, rewritten]

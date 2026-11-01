@@ -98,7 +98,7 @@ def test_a_malformed_map_is_refused(session, sql, message):
 
 def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
     from quail.logical import LogicalPlan
-    from quail.planner.rules.tree_transforms import lift_maps
+    from quail.planner.rules.tree_transforms import lift_column_operators
 
     session.register("films", DocumentProvider.from_table(
         pa.table({"id": [7, 8], "plot": ["a heist", "a romance"]}), id_col="id"))
@@ -111,9 +111,10 @@ def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
     # placement rule also offers it above the join, like a classification
     written = [type(node).__name__ for node in LogicalPlan(root).walk()]
     assert written.index("SemanticMap") < written.index("SemanticJoin")
-    lifted = [type(node).__name__ for node in LogicalPlan(lift_maps(root)).walk()]
+    moved = LogicalPlan(lift_column_operators(root))
+    lifted = [type(node).__name__ for node in moved.walk()]
     assert lifted.index("SemanticJoin") < lifted.index("SemanticMap")
-    LogicalPlan(lift_maps(root)).validate()
+    moved.validate()
 
 
 @pytest.mark.parametrize("form", ["call", "alias", "cte"])

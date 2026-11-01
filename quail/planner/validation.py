@@ -6,7 +6,7 @@ from quail.logical import (
     Alias,
     SemanticClassify,
     SemanticExtract,
-    classified_above_joins,
+    columns_above_joins,
     has_score,
     is_score,
 )
@@ -112,7 +112,8 @@ def score_refusal(logical, context) -> Refusal | None:
             "AI.CLASSIFY over a document pair needs its AI join pipeline "
             "on one GPU; AI.SCORE plans cannot execute that classification",
             "joined_classify_pipeline")
-    if classified_above_joins(logical.root) and operators.joins:
+    if (any(kind == "label" for _, kind in columns_above_joins(logical.root))
+            and operators.joins):
         return _refusal("classification after a score join is unsupported")
     pairs = [j.prompt for j in operators.joins] + [
         item.expression.prompt for item in projected

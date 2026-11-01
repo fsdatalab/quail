@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from quail.logical.nodes.column import SemanticColumn, column_nodes
-from quail.logical.nodes.join import _above_joins
+from quail.logical.nodes.column import SemanticColumn
 
 
 @dataclass(frozen=True)
@@ -28,13 +27,3 @@ class SemanticMap(SemanticColumn):
     def explain_fields(self) -> dict:
         return {**super().explain_fields(),
                 "max_answer_tokens": self.call.max_answer_tokens}
-
-
-def maps(node) -> tuple:
-    """Return the SemanticMap nodes at or below a node, children first."""
-    return column_nodes(node, SemanticMap)
-
-
-def mapped_above_joins(root) -> frozenset:
-    """Return aliases whose maps run after a join."""
-    return _above_joins(maps(root))

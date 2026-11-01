@@ -2,7 +2,7 @@
 
 from quail.planner.rules.logical import (
     ShouldEliminateDistinct,
-    ShouldLiftMaps,
+    ShouldLiftColumnOperators,
     ShouldPushDownDistinct,
     ShouldPushDownFilters,
     ShouldPushDownProjection,
@@ -29,7 +29,8 @@ def built_in_rules() -> tuple:
     """
     return (
         ShouldEliminateDistinct(), ShouldPushDownDistinct(), ShouldPushDownProjection(),
-        ShouldPushDownFilters(), ShouldLiftMaps(), ShouldEliminateWindowSort(),
+        ShouldPushDownFilters(), ShouldLiftColumnOperators(),
+        ShouldEliminateWindowSort(),
         ShouldPushDownLimitThroughWindow(), ShouldPushDownLimit(),
         ChooseClassifyImplementation(), ShouldRetainKv(), ShouldSharePrefixes(),
         ChooseAttentionPath(), ShouldDeduplicate(),

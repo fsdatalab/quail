@@ -7,14 +7,12 @@ from quail.logical import (
     PROBABILITIES_SUFFIX,
     SPAN_SUFFIX,
     LogicalPlan,
-    classified_above_joins,
     column_name,
+    columns_above_joins,
     condition_columns,
     effective_selectivity,
-    extracted_above_joins,
     has_score,
     is_score,
-    mapped_above_joins,
     oriented_join_conditions,
 )
 from quail.logical.expressions import aliased_call
@@ -58,6 +56,7 @@ from quail.planner.search.statistics import filter_stop_keys
 from quail.planner.search.table_steps import (
     ASK,
     CLASSIFY,
+    COLUMN_STEPS,
     EXTRACT,
     FEATURES,
     MAP,
@@ -167,9 +166,12 @@ class GraphBuilder:
         self.operator_order = operator_order
         self.operators = operator_order.operators
         self.classified = {alias for _, alias in self.operators.labels.calls}
-        self.after_joins = classified_above_joins(plan.root)
-        self.extract_after = extracted_above_joins(plan.root)
-        self.map_after = mapped_above_joins(plan.root)
+        # alias -> the step kinds the planner lifted above the joins
+        self.after_joins = {}
+        for alias, call_kind in columns_above_joins(plan.root):
+            self.after_joins.setdefault(alias, set()).add(COLUMN_STEPS[call_kind])
+        self.classified_after = {alias for alias, kinds in self.after_joins.items()
+                                 if CLASSIFY in kinds}
         self.projected_scores = score_projections(plan)
         self.ask_filters = {
             alias: [self.operators.filters[alias][position] for position in positions]
@@ -264,7 +266,7 @@ class GraphBuilder:
 
         # aliases whose filter sequence runs in one pipeline with the
         # classification or join after it
-        between = self.classified - self.after_joins
+        between = self.classified - self.classified_after
         self.pipelined = self.streamed | {
             alias for alias in self.ask_filters
             if self.gpus == 1 and alias in between}
@@ -276,15 +278,9 @@ class GraphBuilder:
         row_ports = []
         port_by_alias = dict(port_by_alias)
         for s in self.operators.scans:
-            # a classification or extraction the planner lifted
-            # above the joins is emitted after them
-            kinds = {ASK, FEATURES}
-            if s.alias not in self.after_joins:
-                kinds.add(CLASSIFY)
-            if s.alias not in self.extract_after:
-                kinds.add(EXTRACT)
-            if s.alias not in self.map_after:
-                kinds.add(MAP)
+            # a column operator the planner lifted above the joins is
+            # emitted after them
+            kinds = {ASK, *COLUMN_STEPS.values()} - self.after_joins.get(s.alias, set())
             port_by_alias[s.alias], rows = self._emit_steps(
                 s.alias,
                 float(stats[s.alias].num_documents),
@@ -407,16 +403,16 @@ class GraphBuilder:
         return port_by_alias, joins
 
     def _emit_join_answers(self, port_by_alias: dict, joins) -> list:
-        """Create the classifications and extractions that follow the joins.
+        """Create the column operators the planner lifted above the joins.
 
         Returns:
             The rows ports of the labels and answers SELECT returns.
         """
         row_ports = emit_joined_classify(self, joins.node_ids)
-        # classifications after the joins run over the documents the joins
-        # matched: a document with at least one true pair, expected as the
+        # a column operator after the joins runs over the documents the
+        # joins matched: a document with at least one true pair, expected as the
         # join selectivity times the partners it met, at most every document
-        for alias in sorted(self.after_joins | self.extract_after | self.map_after):
+        for alias, kinds in sorted(self.after_joins.items()):
             met = sum(
                 effective_selectivity(join.selectivity)
                 * (self.pair_fractions or {}).get(position, 1.0)
@@ -425,13 +421,6 @@ class GraphBuilder:
                       if argument.alias != alias)
                 for position, join in enumerate(self.operators.joins)
                 if alias in {argument.alias for argument in join.prompt.args})
-            kinds = set()
-            if alias in self.after_joins:
-                kinds.add(CLASSIFY)
-            if alias in self.extract_after:
-                kinds.add(EXTRACT)
-            if alias in self.map_after:
-                kinds.add(MAP)
             port_by_alias[alias], rows = self._emit_steps(
                 alias, self.operator_order.expected_rows[alias] * min(1.0, met), kinds,
                 port_by_alias[alias])
@@ -450,13 +439,13 @@ class GraphBuilder:
 
     def _emit_result(self, port_by_alias, row_ports, joins, score_pairs):
         """Connect result operators to surviving rows and answers."""
-        filtered_after = ((self.extract_after | self.map_after)
-                          & self.operators.column_filters.keys())
+        filtered_after = {alias for alias, kinds in self.after_joins.items()
+                          if kinds - {CLASSIFY}} & self.operators.column_filters.keys()
         if score_pairs is not None:
             sink_inputs = (score_pairs,)
         elif (len(joins.answers) == 1
               and len(self.operator_order.join_sequence) == 1
-              and not (self.after_joins or filtered_after)):
+              and not (self.classified_after or filtered_after)):
             # A later classification or column filter can remove joined rows.
             sink_inputs = (joins.answers[0],)
         elif joins.answers:
@@ -521,7 +510,7 @@ class GraphBuilder:
                         "decision": "decision_head_softmax",
                     }.get(self.model.role, "true_false_softmax"),
                 } if self.scoring is not None else {}),
-                **({"classify_placement": ("after joins" if self.after_joins
+                **({"classify_placement": ("after joins" if self.classified_after
                                            else "before joins")}
                    if self.operators.labels.calls else {}),
                 **({"canvas_draws": self.context.canvas_draws}
