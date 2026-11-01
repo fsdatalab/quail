@@ -48,7 +48,9 @@ def arrow_function(name: str):
         raise CompileError(
             f"unknown function {name!r}; a scalar function of Arrow compute "
             f"is called by its name, such as abs or utf8_reverse") from error
-    if kind != "scalar" or not hasattr(pc, arrow):
+    # cast is a meta function: it converts one row at a time
+    if kind not in ("scalar", "meta") or not hasattr(pc, arrow) or (
+            kind == "meta" and arrow != "cast"):
         raise CompileError(
             f"{name} is an Arrow {kind} function; an expression calls a "
             f"scalar function, which reads one row at a time")
@@ -109,16 +111,23 @@ class GetField:
 
 @dataclass(frozen=True)
 class Literal:
-    """A constant in a value expression, such as the 3 of ``abs(r.stars - 3)``."""
+    """A constant in a value expression, such as the 3 of ``abs(r.stars - 3)``.
+
+    A tuple is a list of constants, passed to Arrow as an array, such as
+    the value set of ``is_in``; None is NULL.
+    """
 
     value: Any
 
     type_name: ClassVar[str] = "quail.literal"
 
     def validate(self) -> None:
-        if not isinstance(self.value, (str, int, float, bool)):
+        values = self.value if isinstance(self.value, tuple) else (self.value,)
+        if not all(value is None or isinstance(value, (str, int, float, bool))
+                   for value in values):
             raise CompileError(
-                f"a literal is a string, number, or boolean, got {self.value!r}")
+                f"a literal is a string, number, boolean, NULL, or a list of "
+                f"them, got {self.value!r}")
 
     def __str__(self) -> str:
         return repr(self.value)
@@ -180,6 +189,8 @@ def evaluate_expression(expression, columns, *, qualified: bool = False):
     if isinstance(expression, Literal):
         # a function takes a constant as a Python value: Arrow's wrappers
         # read one in an option's position, such as round's ndigits
+        if isinstance(expression.value, tuple):
+            return pa.array(expression.value)
         return expression.value
     if isinstance(expression, ColumnRef):
         return columns.column(column_name(expression) if qualified

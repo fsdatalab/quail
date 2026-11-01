@@ -16,8 +16,13 @@ from dataclasses import dataclass
 
 from sqlglot import exp
 
+from quail.frontend.sql_binding.sql_calls import TRANSLATED_NODES
 from quail.logical import And, ColumnRef, CompileError, Not, Or, RegularPredicate
-from quail.logical.expressions import SPAN_SUFFIX, column_expression
+from quail.logical.expressions import (
+    SPAN_SUFFIX,
+    column_expression,
+    column_references,
+)
 
 _PLAIN_COMPARISONS = {
     exp.EQ: "=",
@@ -95,6 +100,9 @@ COLUMN_NODES = (exp.Column, *SQL_FUNCTIONS)
 
 def unwrap_function(node) -> tuple[exp.Expression, str | None]:
     """Return the node under a column function and the function's name."""
+    if isinstance(node, exp.Trim) and (node.expression is not None
+                                       or node.args.get("position")):
+        return node, None
     function = SQL_FUNCTIONS.get(type(node))
     return (node.this, function) if function else (node, None)
 
@@ -116,7 +124,8 @@ def computed_value(node) -> bool:
 
     An AI call, an aggregate, and a window are not computed values.
     """
-    if not isinstance(node, (exp.Func, exp.Paren, exp.Neg, *OPERATORS)) or isinstance(
+    if not isinstance(node, (exp.Func, exp.Paren, exp.Neg, *OPERATORS,
+                             *TRANSLATED_NODES)) or isinstance(
             node, (exp.AggFunc, exp.AIClassify, exp.Window)):
         return False
     return not any(
@@ -259,17 +268,21 @@ def bind_condition(b, term, selected: dict, *, join_keys: bool = False):
 
 
 def _join_condition(b, test: PlainTest) -> bool:
-    """Return whether a test compares a column of one table with another's."""
+    """Return whether a test compares one table's values with another's.
+
+    Each side is a column or an expression of one table's columns, such
+    as ``LOWER(r.lang) = u.lang``.
+    """
     node = test.operand
-    if type(node) not in COMPARISON_FUNCTIONS or not all(
-            isinstance(side, exp.Column) for side in (node.this, node.expression)):
+    if type(node) not in COMPARISON_FUNCTIONS:
         return False
     try:
-        sides = [b.resolve_value(side) for side in (node.this, node.expression)]
+        sides = [b.bind_value(side) for side in (node.this, node.expression)]
     except CompileError:
         return False
-    return len({side.alias for side in sides
-                if isinstance(side, ColumnRef)}) == 2
+    aliases = [{reference.alias for reference in column_references(side)}
+               for side in sides]
+    return all(len(found) == 1 for found in aliases) and aliases[0] != aliases[1]
 
 
 def _bind_operand(b, term, selected: dict):

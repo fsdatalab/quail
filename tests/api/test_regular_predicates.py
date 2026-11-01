@@ -224,3 +224,64 @@ def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     assert result.to_rows() == [
         ("r0", "p0"), ("r0", "p1"), ("r2", "p0"), ("r5", "p0"), ("r5", "p1")]
+
+
+SQL_CALLS = {
+    # sqlglot parses each to a node of its own; Quail calls Arrow with
+    # SQL's meaning. r0, r1, r3, and r4 pass q1
+    "LOG10(r.stars * 20) > 1.7": [True, False, None, True],
+    "SUBSTRING(r.lang, 2, 1)": ["n", "n", "n", "n"],
+    "CONCAT(r.lang, '-', r.lang)": ["en-en", "en-en", "en-en", "en-en"],
+    "CASE WHEN r.stars > 3 THEN 'high' WHEN r.stars > 0 THEN 'low' END": [
+        "high", "low", None, "low"],
+    "CAST(r.stars AS DOUBLE)": [5.0, 2.0, None, 3.0],
+    "r.stars IN (2, 3)": [False, True, None, True],
+    "ROUND(r.stars / 2)": [3.0, 1.0, None, 2.0],
+    "GREATEST(r.stars, 3)": [5, 3, None, 3],
+    "STRPOS(r.lang, 'n')": [2, 2, 2, 2],
+    "r.stars BETWEEN 2 AND 3": [False, True, None, True],
+}
+
+
+@pytest.mark.parametrize("dialect", ["bq", "snowflake"])
+def test_sql_functions_sqlglot_names_call_arrow_with_sqls_meaning(session, dialect):
+    for expression, expected in SQL_CALLS.items():
+        query = session.sql(
+            f"SELECT r.id, {expression} AS v FROM reviews r "
+            f"WHERE AI_FILTER(PROMPT('q1: {{0}}', r.review)) ORDER BY r.id",
+            dialect=dialect)
+        values = _run(query, make_executor(TRUTH)).collect().column("v").to_pylist()
+        assert values == expected, expression
+    with pytest.raises(CompileError, match="remainder"):
+        session.sql("SELECT r.id, MOD(r.stars, 2) AS v FROM reviews r "
+                    "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))", dialect=dialect)
+
+
+def test_order_by_group_by_on_and_prompt_take_expressions(session):
+    # q1 keeps r0, r1, r3, and r4; their stars are 5, 2, None, and 3
+    first = "FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
+    query = session.sql(f"SELECT r.id {first} ORDER BY ABS(r.stars - 3), r.id")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("r4",), ("r1",), ("r0",), ("r3",)]
+    query = session.sql(
+        f"SELECT CASE WHEN r.stars > 2 THEN 'hi' ELSE 'lo' END AS band, "
+        f"COUNT(*) AS n, SUM(r.stars * 2) AS s {first} "
+        f"GROUP BY CASE WHEN r.stars > 2 THEN 'hi' ELSE 'lo' END ORDER BY band")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("hi", 2, 16), ("lo", 2, 4)]
+    query = session.sql(
+        "SELECT r.id FROM reviews r "
+        "WHERE AI_FILTER(PROMPT('q1: {0}', LOWER(TRIM(r.review)))) ORDER BY r.id")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [
+        ("r0",), ("r1",), ("r3",), ("r4",)]
+    session.register("langs", quail.DocumentProvider.from_table(pa.table({
+        "code": ["EN", "FR"], "notes": ["n0", "n1"]}), id_col="code"))
+    query = session.sql("""
+        SELECT r.id, l.code FROM reviews r
+        JOIN langs l ON UPPER(TRIM(r.lang)) = l.code
+            AND AI_FILTER(PROMPT('x {0} {1}', r.review, l.notes))
+        ORDER BY r.id""")
+    assert "on upper(utf8_trim_whitespace(r.lang)) = l.code" in query.explain()
+    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
+    assert result.to_rows() == [("r0", "EN"), ("r1", "EN"), ("r2", "FR"),
+                                ("r3", "EN"), ("r4", "EN")]

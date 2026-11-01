@@ -14,7 +14,6 @@ from quail.frontend.sql_binding.expressions import (
     _label_test,
 )
 from quail.frontend.sql_binding.predicates import (
-    COLUMN_NODES,
     ai_aliases,
     bind_condition,
     unwrap_hint,
@@ -29,14 +28,12 @@ from quail.logical.naive import Exists, Hint
 
 
 def _parse_equality(b, term, joined_alias: str) -> Equality:
-    """Parse one ordinary ON condition: two columns compared with =."""
-    if not isinstance(term, exp.EQ) or not all(
-            isinstance(side, COLUMN_NODES)
-            for side in (term.this, term.expression)):
+    """Parse one ordinary ON condition: two tables' values compared with =."""
+    if not isinstance(term, exp.EQ):
         raise CompileError(
             f"ON supports column = column and AI predicates, got {term.sql()}"
         )
-    equality = Equality(b.resolve_value(term.this), b.resolve_value(term.expression))
+    equality = Equality(b.bind_value(term.this), b.bind_value(term.expression))
     if joined_alias not in equality.aliases() or len(set(equality.aliases())) != 2:
         raise CompileError(
             f"JOIN {joined_alias} ON {term.sql()} must relate "

@@ -15,6 +15,7 @@ from quail.frontend.sql_binding.predicates import (
     sql_literal,
     unwrap_function,
 )
+from quail.frontend.sql_binding.sql_calls import Call, Const, translate
 from quail.logical import (
     Alias,
     CompileError,
@@ -124,8 +125,10 @@ class ExpressionBinder:
         """Bind a value expression: a column, a literal, or a function of them.
 
         A function is any scalar function of Arrow compute, called by its
-        name or by a SQL name such as LENGTH; ``+ - * /`` call add,
-        subtract, multiply, and divide.
+        name, or a SQL function or operator sqlglot parses to a node of
+        its own, which sql_calls.translate turns into the Arrow call with
+        SQL's meaning, such as SUBSTRING, CASE, CAST, or IN; ``+ - * /``
+        call add, subtract, multiply, and divide.
 
         Args:
             node: The expression.
@@ -136,12 +139,24 @@ class ExpressionBinder:
             CompileError: A column does not resolve, or a function is not
                 a scalar function of Arrow compute.
         """
+        if isinstance(node, Const):
+            return Literal(node.value)
+        if isinstance(node, Call):
+            function = ScalarFunction(node.name, tuple(
+                self.bind_value(argument, tables) for argument in node.args))
+            function.validate()
+            return function
         if isinstance(node, exp.Paren):
             return self.bind_value(node.this, tables)
         if isinstance(node, (exp.Column, exp.Dot)):
             return self.resolve_value(node, tables)
+        if isinstance(node, exp.Null):
+            return Literal(None)
         if not computed_value(node) and node.find(exp.Column) is None:
             return Literal(sql_literal(node))
+        call = translate(node, self.dialect)
+        if call is not None:
+            return self.bind_value(call, tables)
         if type(node) in OPERATORS:
             name, arguments = OPERATORS[type(node)], (node.this, node.expression)
         elif isinstance(node, exp.Neg):
@@ -234,10 +249,14 @@ class ExpressionBinder:
         template = str(p_args[0].this)
         refs = []
         for a in p_args[1:]:
+            if computed_value(a) and not isinstance(
+                    unwrap_function(a)[0], (exp.Column, exp.Dot)):
+                refs.append(self.bind_value(a, scope))
+                continue
             if not isinstance(a, COLUMN_NODES):
                 raise CompileError(
-                    f"PROMPT arguments must be column references, got {a.sql()}"
-                )
+                    f"PROMPT arguments are columns or expressions of them, "
+                    f"got {a.sql()}")
             refs.append(self.resolve_value(a, scope))
         aliases = []
         for r in refs:
@@ -368,16 +387,18 @@ class ExpressionBinder:
             raise CompileError(
                 "AI.EXTRACT takes a document column and an object of field "
                 "questions")
-        if not isinstance(args[0], COLUMN_NODES):
+        computed = computed_value(args[0]) and not isinstance(
+            unwrap_function(args[0])[0], (exp.Column, exp.Dot))
+        if not (computed or isinstance(args[0], COLUMN_NODES)):
             raise CompileError(
-                f"AI.EXTRACT's first argument is a document column, "
-                f"got {args[0].sql()}")
+                f"AI.EXTRACT's first argument is a document column or an "
+                f"expression of one, got {args[0].sql()}")
         if not isinstance(args[1], exp.Struct):
             raise CompileError(
                 f"AI.EXTRACT's second argument is an object of field "
                 f"questions such as {{'ends': 'When does the lease end?'}}, "
                 f"got {args[1].sql()}")
-        ref = self.resolve_value(args[0])
+        ref = self.bind_value(args[0]) if computed else self.resolve_value(args[0])
         return ref, args[1]
 
     def _extract_call(self, ref, question: str) -> ModelCall:

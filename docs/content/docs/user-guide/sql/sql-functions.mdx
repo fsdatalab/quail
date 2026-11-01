@@ -153,7 +153,8 @@ WHERE r.year = 2024
 Quail checks the year and rating before evaluating `AI.IF`.
 
 A condition in `ON` filters the table containing the referenced column.
-In `ON`, `column = column` between two tables is a join key. In `WHERE`, a
+In `ON`, `=` between two tables' columns, or expressions of them such as
+`LOWER(r.lang) = l.code`, is a join key. In `WHERE`, a
 comparison of two tables' columns filters the joined rows; the tables still
 need a join key or an AI predicate in `ON`. See
 [Joining](/docs/user-guide/sql/ai-functions#joining).
@@ -225,10 +226,10 @@ ORDER BY body_length;
   `SELECT`, `ORDER BY`, `GROUP BY`, and aggregate arguments.
 - Use `AS` to name a result column. Without `AS`, Quail uses the expression
   text, such as `length(p.details.body)`.
-- In `WHERE` and `SELECT`, functions can nest and take literals, such as
-  `LOWER(TRIM(p.details.body))` or `ABS(r.stars - 3)`. In the other
-  clauses, an expression has one function.
-- `WHERE` and `SELECT` can call any scalar function of Arrow compute; see
+- Functions can nest and take literals in every clause, such as
+  `LOWER(TRIM(p.details.body))` or `ABS(r.stars - 3)`.
+- An expression can call any scalar function of Arrow compute, and the
+  common SQL functions keep their SQL meaning; see
   [Arrow compute functions](#arrow-compute-functions).
 
 For example, the function entries below use a review row where `r.body`
@@ -260,10 +261,20 @@ Removes whitespace at both ends of the text.
 
 ### Arrow compute functions
 
-`WHERE` and `SELECT` can call any scalar function of
+An expression can call any scalar function of
 [Arrow compute](https://arrow.apache.org/docs/python/api/compute.html) by its
-name, such as `UTF8_REVERSE`, `ABS`, `ROUND`, or `UTF8_SLICE_CODEUNITS`.
-`+`, `-`, `*`, and `/` call `add`, `subtract`, `multiply`, and `divide`.
+name, such as `UTF8_REVERSE`, `ABS`, or `UTF8_SLICE_CODEUNITS`.
+`+`, `-`, and `*` call `add`, `subtract`, and `multiply`; `/` divides
+integers exactly, as SQL does.
+
+The common SQL functions keep their SQL meaning in both dialects:
+`SUBSTRING` and `STRPOS` count from 1, `ROUND` rounds half away from zero,
+`GREATEST`, `LEAST`, and `IN` return NULL for a NULL input, and `CASE`,
+`IF`/`IFF`, `CAST`, `CONCAT`/`||`, `COALESCE`, `NULLIF`, `LOG`/`LOG10`,
+`LEFT`, `RIGHT`, `TRIM`/`LTRIM`/`RTRIM`, `LPAD`/`RPAD`, `REPLACE`,
+`EXTRACT`, `DATE_TRUNC`, `LIKE`, `BETWEEN`, `IS NULL`, `AND`, `OR`, and `NOT`
+work as written. `MOD`, `%`, and `TRY_CAST`/`SAFE_CAST` have no Arrow
+function and are refused.
 A literal after the first argument fills the function's option in that
 position, as in Python: `ROUND(r.score, 2)` rounds to two digits.
 `WHERE` takes the same expressions as `SELECT`: a function that returns a
