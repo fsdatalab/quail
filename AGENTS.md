@@ -188,7 +188,7 @@ how they release and explain changes.
 - Do not create Modal app names. Attach GPU cells to
   `quail-milestone1` and the worker to `quail-engine`; caches and warm
   state belong to those apps.
-- To check a change, run these 13 queries at scale factor 0.1, with
+- To check a change, run these 15 queries at scale factor 0.1, with
   Quail alone. Do not run the full suite; it is slow. Together they
   cover each AI operator alone, chained with the others, and followed
   by relational operators:
@@ -205,6 +205,8 @@ how they release and explain changes.
   - `CUAD-15`: a filter, an extract, then sort and limit.
   - `CUAD-11`: classify, then aggregate.
   - `SALES-5`: a relational filter, a score, then top 25.
+  - `IMDB-24`: a filter, then three maps over the same rows.
+  - `CUAD-20`: three extracts and a map.
 
   `bench.quailb_parallel` runs each query family on its own H100, so
   this set uses five H100s: IMDB, FEV, AGENT, CUAD, and SALES. If a
@@ -214,8 +216,9 @@ how they release and explain changes.
 
       queries=IMDB-1,IMDB-2,IMDB-4,FEV-9,IMDB-11,AGENT-5,IMDB-15
       queries=$queries,CUAD-1,CUAD-4,CUAD-10,CUAD-15,CUAD-11,SALES-5
+      queries=$queries,IMDB-24,CUAD-20
       uv run modal run --detach -m bench.quailb_parallel \
-        --model qwen3-4b-fp8 --sf 0.1 --query "$queries" \
+        --model qwen3-4b-fp8 --scale-factor 0.1 --query "$queries" \
         --no-include-baselines --no-include-sglang \
         2>&1 | tee "$run_log"
 
