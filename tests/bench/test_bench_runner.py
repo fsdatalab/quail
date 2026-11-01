@@ -8,8 +8,10 @@ from helpers.oracle import Oracle, oracle_executor
 import quail
 from bench.quailb import (
     build_query,
+    data_directory,
     join_anchors,
     prompt_pieces,
+    register_tables,
     run_output,
 )
 from bench.substrait import sql_string
@@ -21,7 +23,7 @@ from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.result import answer_table
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.physical import decode_graph
-from quail.planner.plan import EngineConfig
+from quail.planner.plan import EngineConfig, Refusal
 from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.minimum import DocumentTokens, token_metrics
 from quail_b.prompts import DISCUSS_ASPECT, F1
@@ -359,3 +361,18 @@ def test_benchmark_results_and_scoring(tmp_path):
     measured = token_metrics(SPEC, output, CORPUS, stores)
     assert measured["minimum_tokens"] > 0
     assert measured["regret_tokens"] == 2000 - measured["minimum_tokens"]
+
+
+def test_sec_queries_read_their_own_directory_as_engines_see_the_filings(tmp_path):
+    assert data_directory(tmp_path, 1.0, ["SEC-9", "SEC-10"]) == tmp_path / "sec"
+    assert data_directory(tmp_path, 0.1, ["CUAD-16"]) == tmp_path / "sf0.1"
+    # a composed accent is one character once the text is NFC
+    pq.write_table(pa.table({
+        "id": ["0001"], "text": ["cafe\u0301 agreement"],
+        "filing_date": ["2024-01-02"], "filing_month": ["2024-01"]}),
+        tmp_path / "sec_filings.parquet")
+    with quail.Session(_config("quail"), tokenizer=str.split) as sess:
+        register_tables(sess, tmp_path)
+        query = sess.sql("SELECT f.id FROM sec_filings f WHERE f.text_chars = 14 "
+                         "AND AI_FILTER(PROMPT('Is {0} a contract?', f.text))")
+        assert not isinstance(query.plan(), Refusal)

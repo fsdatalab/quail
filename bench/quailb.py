@@ -61,11 +61,37 @@ TEXT_VLLM_BACKENDS = frozenset({
 })
 
 
+def labeled(query_ids) -> bool:
+    """Return whether QUAIL-B publishes reference labels for the queries.
+
+    It publishes none for the SEC queries, which run alone at scale
+    factor 1.0 from their own data directory.
+    """
+    return not all(query_id.startswith("SEC-") for query_id in query_ids)
+
+
+def data_directory(root, scale_factor: float, query_ids) -> Path:
+    """Return the directory of the queries' input tables under root."""
+    return Path(root) / (f"sf{scale_factor}" if labeled(query_ids) else "sec")
+
+
 def register_tables(session, data_dir):
-    """Register every Parquet file of a directory as a document table."""
+    """Register every Parquet file of a directory as a document table.
+
+    The SEC filings are registered as engines read them: NFC text and
+    its length (quail_b.sec.sec_engine_table).
+    """
+    import pyarrow.parquet as pq
+
+    from quail_b.sec import SEC_TABLE, sec_engine_table
+
     for path in sorted(Path(data_dir).glob("*.parquet")):
-        session.register(path.stem, quail.DocumentProvider.from_parquet(
-            str(path), id_col="id"))
+        if path.stem == SEC_TABLE:
+            provider = quail.DocumentProvider.from_table(
+                sec_engine_table(pq.read_table(path)), id_col="id")
+        else:
+            provider = quail.DocumentProvider.from_parquet(str(path), id_col="id")
+        session.register(path.stem, provider)
 
 
 def _build(session, info: PlanInfo):
@@ -523,7 +549,7 @@ def run_suite(only=None, *, scale_factor=0.1, config, data_dir=None,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=usd_per_hour,
-            metadata=metadata)
+            metadata=metadata, accuracy=labeled(only))
         record["skipped_queries"] = skipped
         write_json(Path(output_dir) / "run.json", record)
         benchmark.report(output_dir, rescore=False)
@@ -538,7 +564,8 @@ def _empty_record(skipped, *, scale_factor, data_dir, ground_truth_collection, r
 
     suite = benchmark.load_benchmark(
         sorted(skipped)[:1], scale_factor=scale_factor, data_dir=data_dir,
-        collection_id=ground_truth_collection, root=root)
+        collection_id=ground_truth_collection, accuracy=labeled(skipped),
+        root=root)
     started = datetime.now(timezone.utc).isoformat()
     record = {
         "schema_version": RUN_SCHEMA_VERSION, "quail_b_version": __version__,
