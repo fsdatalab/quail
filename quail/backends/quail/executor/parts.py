@@ -173,7 +173,13 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
     to fall short of it, by the parts' selectivities.
     """
     stages = gated_stages(parts)
-    paged = paged or state.loaded_model.pipeline.needs_pages
+    pipeline = state.loaded_model.pipeline
+    if pipeline.whole_sequences:
+        if keep_kv:
+            raise ValueError("a set-attention model keeps no document KV")
+        # each request is one unpaged sequence: no pages, no borrowing
+        paged, prefix_tree = False, None
+    paged = paged or pipeline.needs_pages
     if keep_kv and not paged:
         raise ValueError("retaining document KV requires arena writes")
     if prefix_tree is not None and not prefix_tree.shared_tokens:
@@ -188,7 +194,7 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
         for part in parts:
             resources.enter_context(part.execution_context())
         every, spans, tokens = run_stages(
-            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+            state.torch, state.loaded_model.arena, pipeline,
             stages, prefixes, state.chunk_tokens, anchor_keys=anchor_keys,
             on_settled=settled, prefix_tree=prefix_tree, stats=stats,
             gpu_timing=state.gpu_timing,

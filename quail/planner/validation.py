@@ -297,10 +297,37 @@ def attention_device_refusal(model, device):
     )
 
 
+def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
+    """Check whether a set-attention model can run the query's AI operators.
+
+    Such a model reads one document and its questions in one pass.
+    Quail runs one question per pass, so a table takes one AI operator,
+    and a join, which needs both documents in one pass, is refused.
+    """
+    if model.attention_mask != "set":
+        return None
+    if operators.joins:
+        return _refusal(
+            f"{model.name!r} runs AI joins with the partner documents in "
+            f"its questions, which Quail does not write yet",
+            "unsupported_set_attention_query")
+    for alias, predicates in operators.filters.items():
+        if len(predicates) + (1 if scored and predicates else 0) > 1:
+            return _refusal(
+                f"{model.name!r} reads one question per pass in Quail, so "
+                f"table {alias!r} takes one AI operator, not "
+                f"{len(predicates) + int(scored)}",
+                "unsupported_set_attention_query")
+    return None
+
+
 def validate_query(plan, operators, context, model, device, gpus):
     """Return a refusal for unsupported inference or hardware requirements."""
     labels = operators.labels
     scored = has_score(plan)
+    refusal = set_attention_refusal(operators, scored, model)
+    if refusal is not None:
+        return refusal
     if operators.sae_features or (
             context is not None and context.model.sae is not None):
         refusal = sae_features_refusal(operators, context, scored)

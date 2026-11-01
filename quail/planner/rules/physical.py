@@ -305,12 +305,15 @@ class ShouldSharePrefixes(PhysicalRule):
     A score of
     one table is priced like a filter that writes no pages, since
     without sharing its documents follow one shared prompt head.
+
+    A set-attention model shares nothing: a document's first tokens
+    read its last ones and its questions.
     """
 
     name = "should_share_prefixes"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
-        if context is None:
+        if context is None or context.model.attention_mask == "set":
             return None
         nodes = []
         changed = False

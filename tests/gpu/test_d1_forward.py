@@ -4,17 +4,17 @@ Liquid's code for d1-2B needs transformers 5.19 or later, newer than
 the project pins, so it runs in a child process with that version on
 its path, from a folder the GPU test image installs it into. The child
 renders each review and question with d1's own prompt code, so the
-test checks Quail's prompt text against it, and runs the checkpoint's
-own LFM3 model with causal attention over Quail's token ids,
-recording the logits of the yes and no spellings at the last row.
+test checks Quail's prompt text against it. It then runs the
+checkpoint's own model with d1's set attention over Quail's token ids,
+through d1's own slot readout, and records the logits of the yes and
+no spellings at the answer slot. With one question, set attention
+reads the whole prompt in both directions.
 
-Quail runs the same prompts through its stage executor: each review
-is a document prefix with a shared question frame after it and both
-questions as suffixes, so the suffixes read the document's KV and
-convolution state instead of computing them again. The two sides run
-different attention and convolution kernels in bf16, so the logits
-differ slightly; the test checks that the yes-against-no margins
-agree in sign and closely in value.
+Quail runs the same prompts through its stage executor, one question
+per pass: each review and question is one unpaged sequence, with no KV
+kept. The two sides run different attention and convolution kernels
+in bf16, so the logits differ slightly; the test checks that the
+yes-against-no margins agree in sign and closely in value.
 
 Skipped without a CUDA device; runs through
 `uv run modal run experiments/run_gpu_tests.py --keyword d1`.
@@ -100,9 +100,9 @@ def _prompts():
 def reference_main(request_path, out_path):
     """Run d1-2B's own code over the prompts in request_path.
 
-    Writes, per prompt, d1's rendered text, the logits of every yes
-    and no spelling at the last row of Quail's ids, and d1's P(yes)
-    under causal and under its trained set attention.
+    Writes, per prompt, d1's rendered text and token ids, the logits of
+    every yes and no spelling at the slot of Quail's ids under set
+    attention, and d1's own P(yes) from its own ids.
     """
     from transformers import AutoModel, AutoTokenizer
 
@@ -113,31 +113,29 @@ def reference_main(request_path, out_path):
     package = type(model).__module__.rsplit(".", 1)[0]
     runner = sys.modules[package + ".runner"]
     prompt = sys.modules[package + ".prompt"]
+    slots = sys.modules[package + ".slots"]
     tokenizer = AutoTokenizer.from_pretrained(
         request["hf_name"], revision=request["revision"])
-    engines = {mode: runner.SystemOne(model=model, tokenizer=tokenizer,
-                                      attention=mode)
-               for mode in ("causal", "set")}
-    head = model.get_output_embeddings().weight
-    text_model = runner.text_backbone(model)
+    engine = runner.SystemOne(model=model, tokenizer=tokenizer)
+    if engine.attention != "set":
+        raise ValueError(f"d1-2B serves {engine.attention!r} attention, not set")
     ids = request["answer_ids"]
     rows = []
     with torch.inference_mode():
         for item in request["prompts"]:
             question = prompt.Noul(item["question"])
+            text = engine.render(item["review"], question)
             quail_ids = torch.tensor([item["ids"]], device="cuda")
-            hidden = text_model(input_ids=quail_ids, use_cache=False)
-            last = hidden.last_hidden_state[0, -1]
-            logits = (last.float() @ head.float().T)[ids]
+            n = quail_ids.shape[1]
+            # one question: the state is the whole prompt, read both ways
+            codes = slots.slot_logits(
+                model, quail_ids, torch.ones_like(quail_ids),
+                torch.tensor([n - 1]), torch.tensor([n]), None).codes
             rows.append(dict(
-                text=engines["causal"].render(item["review"], question),
-                ids=tokenizer.encode(
-                    engines["causal"].render(item["review"], question),
-                    add_special_tokens=False),
-                logits=logits.tolist(),
-                **{f"p_yes_{mode}": engine.probabilities(
-                    item["review"], [question])[0][0]
-                   for mode, engine in engines.items()}))
+                text=text,
+                ids=tokenizer.encode(text, add_special_tokens=False),
+                logits=codes[0].float()[ids].tolist(),
+                p_yes=engine.probabilities(item["review"], [question])[0][0]))
     with open(out_path, "w") as f:
         json.dump(rows, f)
 
@@ -193,46 +191,37 @@ def quail(prompts, answer_ids, reference):
     )
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AsyncLabelLogprobs
-    from quail.backends.quail.executor.stages import (
-        Stage,
-        run_stages,
-        shared_preamble_tokens,
-    )
-    from quail.backends.quail.worker import checkpoint_arena_args
+    from quail.backends.quail.executor.stages import Stage, run_stages
+    from quail.cost import budgets
     from quail.specs import H100_SXM
 
     spec, device, budget = _spec(), H100_SXM, 8192
     targets = list(answer_ids[0]) + list(answer_ids[1])
     model = load_model(spec.hf_name, revision=spec.revision,
                        answer_token_ids=targets)
-    pages = 2048
-    arena = KVArena(num_layers=spec.layers, num_pages=pages,
+    full, sliding = budgets.arena_pages(spec, device, budget)
+    arena = KVArena(num_layers=spec.layers, num_pages=full,
                     page_tokens=device.page_tokens,
                     num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,
                     dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
                     sliding_layers=spec.sliding_layer_set,
                     sliding_window=spec.sliding_window,
-                    num_sliding_pages=pages,
-                    **checkpoint_arena_args(spec, device, budget, pages))
+                    num_sliding_pages=sliding)
     pipeline = build_pipeline(spec, model, arena)
     readout = AsyncLabelLogprobs(torch, torch.nn.functional,
                                  full_output_head(model), targets,
                                  normalize=False)
-    # every question shares the preamble and the review; the text after
-    # the review is the stage's frame and its two suffixes
-    preamble = prompts[0][1].preamble_token_ids
-    tails = [list(lowered.tail_token_ids) for _, lowered, _ in prompts]
-    shared = shared_preamble_tokens(tails)
-    stage = Stage(suffixes=[tail[shared:] for tail in tails],
-                  readout=readout, frame=tails[0][:shared])
     ids = _tokenizer()
-    documents = [list(preamble) + ids(review) for review in REVIEWS]
-    answers, _, _ = run_stages(torch, arena, pipeline, [stage], documents,
-                               budget, attention_mode="unified")
     rows = []
-    for question in range(len(QUESTIONS)):
-        for document in range(len(REVIEWS)):
-            rows.append(np.asarray(answers[0][document])[question].tolist())
+    for _, lowered, _ in prompts:
+        # one pass per review: the preamble and review, then the question
+        documents = [list(lowered.preamble_token_ids) + ids(review)
+                     for review in REVIEWS]
+        stage = Stage(suffixes=[list(lowered.tail_token_ids)], readout=readout)
+        answers, _, _ = run_stages(torch, arena, pipeline, [stage], documents,
+                                   budget, paged=False)
+        rows.extend(np.asarray(answers[0][document])[0].tolist()
+                    for document in range(len(REVIEWS)))
     return rows
 
 
@@ -254,11 +243,8 @@ def test_answers_agree_with_d1s_own_model(answer_ids, reference, quail):
     count = len(answer_ids[0])
     margins = [(_margin(row["logits"], count), _margin(ours, count))
                for row, ours in zip(reference, quail)]
-    print("yes minus no logit at the last row, d1 code vs Quail:",
+    print("yes minus no logit at the slot, d1 code vs Quail:",
           [(round(a, 2), round(b, 2)) for a, b in margins])
-    print("d1's P(yes) causal vs set:",
-          [(round(row["p_yes_causal"], 3), round(row["p_yes_set"], 3))
-           for row in reference])
     assert all((a > 0) == (b > 0) for a, b in margins)
     assert max(abs(a - b) for a, b in margins) < MARGIN_TOLERANCE
 
@@ -269,7 +255,7 @@ def test_quails_p_yes_matches_d1_reading_its_own_tokens(answer_ids,
 
     count = len(answer_ids[0])
     ours = [1 / (1 + math.exp(-_margin(logits, count))) for logits in quail]
-    theirs = [row["p_yes_causal"] for row in reference]
+    theirs = [row["p_yes"] for row in reference]
     print("P(yes), d1 on its own tokens vs Quail:",
           [(round(a, 3), round(b, 3)) for a, b in zip(theirs, ours)])
     assert max(abs(a - b) for a, b in zip(theirs, ours)) < PROBABILITY_TOLERANCE

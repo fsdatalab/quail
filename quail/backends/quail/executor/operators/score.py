@@ -51,6 +51,8 @@ class QuailScorer:
         if (len(spec.aliases) == 1 and spec.draws > 1
                 and state.loaded_model.pipeline.canvas_ids):
             return self._drawn(spec, rows, documents, on_answers)
+        if state.loaded_model.pipeline.whole_sequences:
+            return self._whole(spec, rows, documents, on_answers)
         if len(spec.aliases) == 1 and spec.share_prefixes:
             return self._shared(spec, rows, documents, on_answers)
         if len(spec.aliases) == 1:
@@ -110,9 +112,49 @@ class QuailScorer:
         answer_rows = state.answer_rows
         async_scores = state.async_scores
         if async_scores is None or async_scores.rows is not answer_rows:
-            async_scores = AsyncScores(state.torch, answer_rows)
+            async_scores = AsyncScores(
+                state.torch, answer_rows,
+                state.loaded_model.model_spec.answer_temperature)
             state.async_scores = async_scores
         return async_scores
+
+    def _whole(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
+        """Score each document as one sequence: head, document, question.
+
+        Under set attention the prompt head reads the document, so no
+        part of the prompt is shared between documents.
+
+        Args:
+            spec: Single-document score specification.
+            rows: Input row indices with shape (documents, 1).
+            documents: Tokenized documents indexed by table alias and document ID.
+            on_answers: Optional callable(row positions, values) run with each
+                chunk's finished scores.
+
+        Returns:
+            A RerankerBatch of scores and execution metrics.
+
+        Raises:
+            ValueError: The score reads a document pair.
+        """
+        if len(spec.aliases) != 1:
+            raise ValueError("a set-attention model scores one document per row")
+        (alias,) = spec.aliases
+        head, tail = spec.prompt_token_parts
+        document_ids = rows[:, 0]
+        scores = np.full(len(document_ids), np.nan, dtype=np.float32)
+
+        def keep(anchor, row):
+            scores[anchor] = float(row[0])
+            return True
+
+        prefixes = DocumentPrefixes(head, documents[alias], document_ids)
+        stages = [Stage(suffixes=[list(tail)], readout=self._scores(),
+                        decide=keep, label=f"score {spec.name}")]
+        total = sum(len(head) + len(documents[alias][document_id]) + len(tail)
+                    for document_id in document_ids)
+        batch = ScoreBatch(spec.name, stages, scores, lambda: total, on_answers)
+        return self._execute(spec, batch, prefixes)
 
     def _shared(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
         """Score documents that borrow the KV pages of shared prefixes.

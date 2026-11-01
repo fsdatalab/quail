@@ -35,6 +35,9 @@ class ModelPipeline:
     gemm_warmup = True
     warm_row_classes = True    # row-count classes keep one KV row per reader
     warm_joins = True          # join and classification chunks borrow prefixes
+    # every request runs as one unpaged sequence, its document and its
+    # questions together, with no KV kept or borrowed (set attention)
+    whole_sequences = False
     decode_graphs = None
     # For a spec with an SAE, forward_chunk returns the residual stream
     # after the last loaded layer instead of the final-normed rows, and
