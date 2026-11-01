@@ -341,6 +341,36 @@ class AsyncScores(_HostReadout):
         return super().result(handle, copy=False)
 
 
+class AsyncSlotMargins(_HostReadout):
+    """Each read row's best true logit minus its best false logit, per answer.
+
+    For a set-attention pass, whose answer is one row per question: the
+    result is an object array holding each answer's margins in row order.
+
+    Args:
+        torch: The torch module.
+        rows: The AnswerRows of the query's true and false tokens.
+    """
+
+    dtype = np.dtype(object)
+
+    def __init__(self, torch, rows):
+        super().__init__(torch)
+        self.rows = rows
+        self.weights = rows.weights.float()
+
+    def submit(self, normed, rows_per_answer=None):
+        rows = self.rows
+        logits = rows.F.linear(normed.float(), self.weights)
+        margins = (logits.index_select(1, rows.true_cols).amax(dim=1)
+                   - logits.index_select(1, rows.false_cols).amax(dim=1))
+        return (*self._copy(margins), rows_per_answer)
+
+    def result(self, handle):
+        *transfer, rows_per_answer = handle
+        return split_rows(super().result(transfer), rows_per_answer)
+
+
 class DecisionHead:
     """The option-scoring head of a Decision 2.0 checkpoint, in fp32.
 

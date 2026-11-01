@@ -1,5 +1,7 @@
 """Execute LLM filters and conditions on classification results."""
 
+from itertools import groupby
+
 import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
@@ -8,14 +10,18 @@ from quail.backends.quail.executor.parts import (
     SingleResultPart,
     execute_parts,
     execution_prefix_tree,
+    gpu_seconds,
+    input_staging,
 )
-from quail.backends.quail.executor.stages import Stage, filter_stages
+from quail.backends.quail.executor.readout import AsyncSlotMargins
+from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.pairs import columns_key
 from quail.catalog.selection import group_ids
 from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
+    GigatokenEncoder,
 )
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
@@ -24,11 +30,145 @@ from quail.execution.result import filter_answer_table
 from quail.execution.rows import Rows
 from quail.execution.runtimes.filter import filter_scores, tested_table
 from quail.progress import answer_sink
+from quail.specs.files import resolve_model_path
+
+
+def set_pass_stage(nodes, readout, decide=None) -> Stage:
+    """One pass's stage for filters sharing it under set attention.
+
+    The suffix is each filter's question after the state tail, every
+    question after the first opened by its header; each question's
+    last row is read. The prefix holds the document and the state tail
+    (StateTails).
+
+    Args:
+        nodes: The AiFilters of the stage, in order.
+        readout: The readout of each question's row.
+        decide: The stage's decide callback.
+
+    Raises:
+        ValueError: The filters disagree on the state tail.
+    """
+    tail = nodes[0].state_tail_tokens
+    state = list(nodes[0].question_token_ids[:tail])
+    suffix, questions = [], []
+    for index, node in enumerate(nodes):
+        if list(node.question_token_ids[:tail]) != state:
+            raise ValueError("the filters of one pass share their state tail")
+        body = list(node.question_token_ids[tail:])
+        if index:
+            body = list(node.question_header_token_ids) + body
+        suffix += body
+        questions.append(len(body))
+    mask = np.zeros(len(suffix), dtype=bool)
+    mask[np.cumsum(questions) - 1] = True
+    return Stage(suffixes=[suffix], readout=readout, read_mask=mask,
+                 questions=tuple(questions), decide=decide,
+                 label=f"filter pass ({len(nodes)} questions)")
+
+
+class StateTails:
+    """A pass's state: a document, then the state tail, tokenized as d1 does.
+
+    d1 tokenizes a whole prompt, so a document's final mark can join
+    the blank line after it in one token. The join depends on the
+    document's last token alone, so each last token is tokenized with
+    the tail once and reused.
+
+    Args:
+        encoder: The model's tokenizer, with encode (call) and decode.
+    """
+
+    def __init__(self, encoder):
+        self.encoder = encoder
+        self.joins = {}
+
+    def prefix(self, document, state_tail) -> list:
+        """The document's tokens, then the tail, joined at their boundary.
+
+        Args:
+            document: The prompt head and document token ids.
+            state_tail: The token ids the state ends with.
+        """
+        document, tail = [int(t) for t in document], tuple(state_tail)
+        if not document:
+            return list(tail)
+        key = (document[-1], tail)
+        if key not in self.joins:
+            text = self.encoder.decode([document[-1], *tail])
+            joined = self.encoder(text)
+            # a text that does not decode back the same keeps its tokens
+            self.joins[key] = (joined if self.encoder.decode(joined) == text
+                               else [document[-1], *tail])
+        return document[:-1] + list(self.joins[key])
+
+
+def state_tails(state) -> StateTails:
+    """The loaded model's StateTails, its tokenizer loaded once."""
+    loaded = state.loaded_model
+    if loaded.state_tails is None:
+        spec = loaded.model_spec
+        loaded.state_tails = StateTails(GigatokenEncoder(
+            resolve_model_path(spec.hf_name, spec.revision)))
+    return loaded.state_tails
+
+
+def execute_set_filters(state: QueryExecutionState, nodes, inputs) -> dict:
+    """Run a table's filters under set attention, stage by stage.
+
+    The filters of one stage share one pass per document: the document,
+    then each filter's question. Each stage reads the documents that
+    every earlier stage kept. A filter answers only the documents that
+    passed the filters before it, as in a plan of one filter per stage.
+    """
+    documents, ids = inputs["documents"], inputs["document_ids"]
+    readout = AsyncSlotMargins(state.torch, state.answer_rows)
+    tails = state_tails(state)
+    answers = {node.node_id: {} for node in nodes}
+    metrics = {node.node_id: (0, 0.0, 0) for node in nodes}
+    runs = [list(run) for _, run in groupby(nodes, key=lambda node: node.stage)]
+    groups = inputs.get("stop_groups")
+    current = list(range(len(ids)))
+    for index, run in enumerate(runs):
+        if not current:
+            break
+        last = index == len(runs) - 1
+        stage = set_pass_stage(run, readout, decide=lambda _, row: bool(
+            np.all(np.asarray(row[0], dtype=float) > 0)))
+        tail = list(run[0].question_token_ids[:run[0].state_tail_tokens])
+        prefixes = [tails.prefix(documents[i], tail) for i in current]
+        every, spans, tokens = run_stages(
+            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+            [stage], prefixes, state.chunk_tokens,
+            staging=input_staging(state), gpu_timing=state.gpu_timing,
+            paged=False, label=stage.label,
+            limit=inputs.get("limit") if last else None,
+            stop_groups=([groups[i] for i in current]
+                         if last and groups is not None else None))
+        kept = []
+        for position, document in enumerate(current):
+            if position not in every[0]:
+                continue
+            margins = np.asarray(every[0][position][0], dtype=float)
+            for node, margin in zip(run, margins):
+                answers[node.node_id][document] = [int(margin > 0)]
+                if margin <= 0:
+                    break
+            else:
+                kept.append(document)
+        metrics[run[0].node_id] = (tokens, gpu_seconds(spans), len(spans))
+        current = kept
+    return {node.node_id: filter_result(
+        node, answers[node.node_id], metrics[node.node_id][0], ids,
+        gpu_s=metrics[node.node_id][1], chunks=metrics[node.node_id][2])
+        for node in nodes}
 
 
 def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
     """Run filter predicates together while each document retains its KV."""
     state.gpu_timing = bool(inputs.get("gpu_timing", False))
+    if state.loaded_model.pipeline.whole_sequences:
+        return execute_set_filters(state, nodes, inputs)
     node = nodes[0]
     documents, ids = inputs["documents"], inputs["document_ids"]
     parts = [FilterPart(member, ids, state.async_answers,

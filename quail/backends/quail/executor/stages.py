@@ -103,6 +103,9 @@ class Stage:
             request, as AI.MAP's answer. Admission reserves headroom for each answer.
         answer_index: Index of this stage's first map in the decoder.
         answer_dependencies: Decoder fields this stage's requests read.
+        questions: Under set attention, the tokens of each question in
+            the sole suffix, in order, after the state that the prefix
+            holds; empty when the whole sequence is one question.
     """
 
     DROP = DROP
@@ -128,6 +131,7 @@ class Stage:
     answer_tokens: int = 0
     answer_index: int = 0
     answer_dependencies: tuple[int, ...] = ()
+    questions: tuple = ()
 
     def __post_init__(self):
         if self.own_suffixes:

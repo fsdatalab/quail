@@ -211,10 +211,12 @@ def extraction_refusal(context, function: str = "AI.EXTRACT") -> Refusal | None:
     elif model.role in ("reranker", "decision") or model.canvas_tokens:
         reason = (f"{function} decodes the model's next tokens, which "
                   f"{model.name!r} does not give")
+    elif model.prompt_layout == "d1" and function == "AI.EXTRACT":
+        reason = (f"{model.name!r} extracts by scoring document positions "
+                  f"against the question, which Quail does not read")
     elif model.prompt_layout == "d1":
-        reason = (f"{model.name!r} answers by scoring options and document "
-                  f"positions, not by writing text, and Quail does not read "
-                  f"those positions for {function}")
+        reason = (f"{function} writes text, and {model.name!r} answers only "
+                  f"by scoring options")
     else:
         return None
     return Refusal(reasons=(reason,), constraint=constraint,
@@ -307,8 +309,9 @@ def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
     """Check whether a set-attention model can run the query's AI operators.
 
     Such a model reads one document and its questions in one pass.
-    Quail runs one question per pass, so a table takes one AI operator,
-    and a join, which needs both documents in one pass, is refused.
+    Quail packs a table's AI filters into passes; a join, which needs
+    both documents in one pass, and a score beside AI filters on one
+    table are refused.
     """
     if model.attention_mask != "set":
         return None
@@ -318,11 +321,11 @@ def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
             f"its questions, which Quail does not write yet",
             "unsupported_set_attention_query")
     for alias, predicates in operators.filters.items():
-        if len(predicates) + (1 if scored and predicates else 0) > 1:
+        if scored and predicates:
             return _refusal(
-                f"{model.name!r} reads one question per pass in Quail, so "
-                f"table {alias!r} takes one AI operator, not "
-                f"{len(predicates) + int(scored)}",
+                f"{model.name!r} packs AI filters into passes, but not an "
+                f"AI.SCORE beside them, so table {alias!r} takes AI filters "
+                f"or a score",
                 "unsupported_set_attention_query")
     return None
 

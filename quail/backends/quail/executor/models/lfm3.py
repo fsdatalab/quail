@@ -278,11 +278,91 @@ class Lfm3Pipeline(ModelPipeline):
         if layer.kind == "sliding_attention":
             out, _ = self.engine._fa(q, k, v, cu, cu, longest, longest,
                                      causal=True, window=(self.window - 1, 0))
-        else:
+        elif meta.get("set_rows") is None:
             out, _ = self.engine._fa(q, k, v, cu, cu, longest, longest,
                                      causal=False)
+        else:
+            out = self._set_attention(q, k, v, meta)
         out = out.view(rows, H, D) * self.engine.torch.sigmoid(gate)[:, :, None]
         return self._linear(out.view(rows, H * D), layer.o_proj)
+
+    def _set_attention(self, q, k, v, meta):
+        """Full attention under set attention, for passes of several questions.
+
+        The state reads its whole sequence. Each question reads its
+        state and itself; the two reads merge by log-sum-exp.
+        """
+        torch, fa, plan = self.engine.torch, self.engine._fa, meta["set_rows"]
+        out = torch.empty_like(q)
+        state, asked = plan["state"], plan["asked"]
+        state_out, _ = fa(q.index_select(0, state), k, v, plan["cu_state"],
+                          meta["cu_a"], plan["max_state"], meta["max_a"],
+                          causal=False)
+        out.index_copy_(0, state, state_out)
+        q_asked = q.index_select(0, asked)
+        read = plan["read_state"]
+        over_state, lse_state = fa(
+            q_asked, k.index_select(0, read), v.index_select(0, read),
+            plan["cu_asked"], plan["cu_read"], plan["max_asked"],
+            plan["max_read"], causal=False)
+        own, lse_own = fa(
+            q_asked, k.index_select(0, asked), v.index_select(0, asked),
+            plan["cu_own"], plan["cu_own"], plan["max_own"], plan["max_own"],
+            causal=False)
+        a = lse_state.transpose(0, 1)[:, :, None]
+        b = lse_own.transpose(0, 1)[:, :, None]
+        top = torch.maximum(a, b)
+        wa, wb = (a - top).exp(), (b - top).exp()
+        merged = (over_state.float() * wa + own.float() * wb) / (wa + wb)
+        out.index_copy_(0, asked, merged.to(q.dtype))
+        return out
+
+    def _plan_set_rows(self, chunk, meta):
+        """Row indices and bounds of the set attention calls, or None.
+
+        A chunk whose every sequence is one question reads each sequence
+        in both directions with one call; it needs no plan.
+        """
+        import numpy as np
+
+        passes = meta.get("passes", ())
+        if not any(len(p) == 3 and len(p[2]) > 1 for p in passes):
+            return None
+        state, asked, read = [], [], []
+        cu_state, cu_asked, cu_read, cu_own = [0], [0], [0], [0]
+        for entry in passes:
+            if len(entry) == 2:
+                (first, state_end), questions = entry, ()
+            else:
+                first, state_end, questions = entry
+            state.append(np.arange(first, state_end))
+            cu_state.append(cu_state[-1] + state_end - first)
+            if not questions:
+                continue
+            total = int(sum(questions))
+            asked.append(np.arange(state_end, state_end + total))
+            read.append(np.arange(first, state_end))
+            cu_asked.append(cu_asked[-1] + total)
+            cu_read.append(cu_read[-1] + state_end - first)
+            for length in questions:
+                cu_own.append(cu_own[-1] + int(length))
+        torch, device = self.engine.torch, chunk.input_ids.device
+
+        def rows(parts):
+            return torch.from_numpy(np.concatenate(parts).astype(np.int64)).to(device)
+
+        def bounds(values):
+            return torch.tensor(values, dtype=torch.int32, device=device)
+
+        def widest(values):
+            return int(np.diff(values).max())
+
+        return dict(
+            state=rows(state), asked=rows(asked), read_state=rows(read),
+            cu_state=bounds(cu_state), cu_asked=bounds(cu_asked),
+            cu_read=bounds(cu_read), cu_own=bounds(cu_own),
+            max_state=widest(cu_state), max_asked=widest(cu_asked),
+            max_read=widest(cu_read), max_own=widest(cu_own))
 
     def _mlp(self, layer, x):
         gate_up = self._linear(x, layer.w13)
@@ -300,6 +380,7 @@ class Lfm3Pipeline(ModelPipeline):
         if sum(lengths) != chunk.tokens:
             raise ValueError("an LFM3 chunk holds whole sequences only")
         sequences = SimpleNamespace(lengths=lengths, conv_metadata=None)
+        meta["set_rows"] = self._plan_set_rows(chunk, meta)
         hidden = F.embedding(chunk.input_ids, self.embed)
         for layer in self.layers:
             x = self._norm(hidden, layer.operator_norm)

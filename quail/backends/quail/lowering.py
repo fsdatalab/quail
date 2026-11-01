@@ -3,6 +3,7 @@
 from dataclasses import replace
 
 from quail.logical import has_score
+from quail.logical.prompts import PROMPT_LAYOUTS
 from quail.physical import AiFilter, AiJoin
 from quail.planner.graph.builder import build_physical_plan
 from quail.planner.optimizer.candidates import PhysicalCandidate
@@ -45,6 +46,25 @@ def plan_region(region, context) -> tuple[PhysicalCandidate, ...]:
     return (PhysicalCandidate(plan.graph, plan, plan.estimated_seconds, logical),)
 
 
+def set_question_parts(lowered, model, tokenizer) -> dict:
+    """A set-attention filter's state tail length and later-question header.
+
+    The layout tokenizes the separator and question label as the first
+    tail segment; a pass reads them with the document and opens each
+    later question with the label alone.
+
+    Raises:
+        ValueError: The model's layout does not tokenize the label alone.
+    """
+    layout = PROMPT_LAYOUTS[model.prompt_layout]
+    if not layout.label_segment:
+        raise ValueError(f"{model.name!r}: a set-attention layout tokenizes "
+                         f"its question label as its own segment")
+    first = lowered.prompt.tail_segments[0]
+    return dict(state_tail_tokens=len(tokenizer(first)),
+                question_header_token_ids=tuple(tokenizer(layout.question_label)))
+
+
 def bind_runtime_data(plan, region, context):
     """Put tokenized prompts and answer tokens in the physical plan."""
     tokenizer = context.tokenizer
@@ -54,11 +74,14 @@ def bind_runtime_data(plan, region, context):
     for node in plan.nodes:
         if isinstance(node, AiFilter):
             predicates = filters[node.alias]
-            question = tuple(context.lowered(
-                predicates[node.written_position].prompt).tail_token_ids)
+            lowered = context.lowered(predicates[node.written_position].prompt)
+            question = tuple(lowered.tail_token_ids)
             if not question:
                 raise ValueError("filter prompts have no token ids")
             node = replace(node, question_token_ids=question)
+            if context.model.attention_mask == "set":
+                node = replace(node, **set_question_parts(
+                    lowered, context.model, tokenizer))
         elif isinstance(node, AiJoin):
             prompt = context.lowered(joins[node.written_position].prompt)
             runtime_ids = {

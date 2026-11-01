@@ -114,6 +114,14 @@ class AiFilter(PhysicalNode):
     # value columns of the alias; the executor reads one document of
     # each key value at a time and skips the rest once one survives
     stop_key: tuple[str, ...] = ()
+    # under set attention: the filters of a table with the same stage
+    # share one pass per document (the choose_packing step)
+    stage: int = 0
+    # under set attention: the first question tokens, which the pass
+    # reads with the document, and the tokens that open each later
+    # question of a pass
+    state_tail_tokens: int = 0
+    question_header_token_ids: tuple[Token, ...] = ()
 
     type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name

@@ -70,6 +70,10 @@ class PromptLayout:
         join_question_last: Whether a join prompt puts the question
             after every document, in the tail, instead of in the anchor
             frame, for a model trained to read its question last.
+        label_segment: Whether the separator and question label are
+            tokenized on their own, so a set-attention pass can keep
+            them with the document and open each later question with
+            the label alone.
     """
 
     name: str
@@ -81,11 +85,15 @@ class PromptLayout:
     answer_rows: tuple[int, ...] = ()
     choice_label: str | None = None
     join_question_last: bool = False
+    label_segment: bool = False
 
     def question_segments(self, question: str, separator: str) -> list[str]:
         """The text after a document: one entry per tokenized segment."""
         if self.question_separator is not None:
             separator = self.question_separator
+        if self.label_segment:
+            return [separator + self.question_label,
+                    question + self.question_end, *self.answer_segments]
         return [separator + self.question_label + question + self.question_end,
                 *self.answer_segments]
 
@@ -127,6 +135,7 @@ PROMPT_LAYOUTS = {layout.name: layout for layout in (
         question_end="\n\nReply with yes or no only.",
         question_separator="\n\n\n",
         join_question_last=True,
+        label_segment=True,
     ),
 )}
 

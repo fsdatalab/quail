@@ -34,6 +34,7 @@ D1_2B_BF16 = ModelSpec(
     conv_width=7,
     # Liquid trained the model with set attention (d1_attention "set")
     attention_mask="set",
+    set_size=16,           # d1_set_size in the checkpoint's config
     # the model was trained to answer yes or no at the end of its turn
     answer_spellings=(("yes", "Yes", "YES"), ("no", "No", "NO")),
     # calibration.json "default", the temperature Liquid fitted for

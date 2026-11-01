@@ -608,6 +608,8 @@ class StageExecutor:
             if self.read_masks[j] is not None:
                 own["read_mask"] = self.read_masks[j]
                 rows = int(own["read_mask"].sum())
+            if self.stages[j].questions:
+                own["questions"] = tuple(self.stages[j].questions)
             if self.stages[j].canvas is not None:
                 ids = np.asarray(self.stages[j].canvas(a))
                 if ids.ndim == 2:

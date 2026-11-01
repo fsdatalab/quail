@@ -28,9 +28,11 @@ format. All listed models store KV in BF16.
 
 d1-2B is Liquid's decision model. Quail asks it in its own yes/no
 format and runs it with the set attention that Liquid trained it
-with: a document is read again in every pass. Quail runs one AI
-operator per table on d1-2B, and does not yet run joins,
-`AI.CLASSIFY`, or `AI.EXTRACT` on it.
+with: a document is read again in every pass. Quail puts up to 16 AI
+filters on one table into one pass, or splits them into stages when a
+filter is expected to remove most rows. Quail does not yet run joins,
+`AI.CLASSIFY`, `AI.EXTRACT`, or `AI.MAP` on d1-2B, or `AI.SCORE`
+beside AI filters on one table.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a

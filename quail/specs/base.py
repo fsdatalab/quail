@@ -135,6 +135,8 @@ class ModelSpec:
     #                       sent to vLLM drops it because vLLM adds its own
     answer_temperature: float = 1.0    # divides a score's yes-against-no
     #                                    margin before the sigmoid
+    set_size: int = 0    # the most questions one set-attention pass
+    #                      holds: the size the model was trained with
     attention_mask: Literal["causal", "set"] = "causal"
     #                    "set": d1's set attention, under which a
     #                    document reads its questions, so a document's
