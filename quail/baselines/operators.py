@@ -19,7 +19,7 @@ from quail.execution.result import (
     filter_answer_table,
 )
 from quail.execution.rows import Rows
-from quail.execution.spans import locate_span, read_phrase
+from quail.execution.spans import held_prefix, read_phrase
 
 # the order shuffled map submission sends prompts in
 SHUFFLE_SEED = 0
@@ -247,11 +247,8 @@ def classification_rows(spec, columns, labels) -> Rows:
 def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
     """Decode one answer per prompt body and locate it in the document's text.
 
-    Generation stops where the model ends its turn. An answer
-    the document holds is returned as the document's own text at its
-    span; "none" gives nulls;
-    an answer the document does not hold is returned as written, with
-    a null span.
+    Generation stops where the model ends its turn. Each answer is cut
+    as read_extractions describes.
 
     Args:
         client: The engine client.
@@ -431,17 +428,26 @@ def map_documents(client, specs, bodies, body_texts=None, *,
 
 
 def read_extractions(outputs, texts, wall_s: float) -> dict:
-    """Read each output's phrase and locate it in its document's text."""
+    """Read each output's phrase and cut it to what its document holds.
+
+    The answer is the longest prefix of the phrase that the document
+    holds, as the document's own text at its span: copy decoding stops
+    where the next token would leave the document. A phrase the
+    document holds none of gives nulls.
+    """
     answers, spans = [], []
-    unanswered = unaligned = 0
+    unanswered = unaligned = cut = 0
     for output, document in zip(outputs, texts):
         phrase = read_phrase(output.outputs[0].text or "")
-        span = None if phrase is None else locate_span(document, phrase)
+        held = None if phrase is None else held_prefix(document, phrase)
         if phrase is None:
             unanswered += 1
-        elif span is None:
+        elif held is None:
             unaligned += 1
-        answers.append(phrase if span is None else document[span[0]:span[1]])
+        elif held[0] != phrase:
+            cut += 1
+        span = None if held is None else held[1]
+        answers.append(None if span is None else document[span[0]:span[1]])
         spans.append(span)
     return {
         "answers": answers,
@@ -451,6 +457,7 @@ def read_extractions(outputs, texts, wall_s: float) -> dict:
         **_generation_counts(outputs),
         "unanswered": unanswered,
         "unaligned": unaligned,
+        "cut": cut,
     }
 
 

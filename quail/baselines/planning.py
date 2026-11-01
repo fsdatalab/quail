@@ -59,7 +59,7 @@ def plan_request_backend(
     backend_name: str,
     filter_submission: str,
     join_submission: str,
-    map_submission: str = "operator-at-a-time",
+    answer_submission: str = "operator-at-a-time",
     scores_labels: bool = False,
 ) -> tuple[PhysicalCandidate, ...]:
     """Build one physical request plan for a request engine.
@@ -70,7 +70,8 @@ def plan_request_backend(
         backend_name: The backend the plan names.
         filter_submission: How filter stages become requests.
         join_submission: How join tuples become requests.
-        map_submission: How each document's maps become requests.
+        answer_submission: How each document's extraction and map prompts
+            become requests.
         scores_labels: Whether the engine decodes an answer as text,
             which AI.CLASSIFY and AI.EXTRACT need.
     """
@@ -163,7 +164,7 @@ def plan_request_backend(
         settings={
             "filter_submission": filter_submission,
             "join_submission": join_submission,
-            "map_submission": map_submission,
+            "answer_submission": answer_submission,
             "true_ids": true_ids,
             "false_ids": false_ids,
             "order_rule": rule,

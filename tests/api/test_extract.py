@@ -15,7 +15,7 @@ import quail
 from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
 from quail.execution.rows import Rows, extraction_rows
-from quail.execution.spans import locate_span, read_phrase
+from quail.execution.spans import held_prefix, locate_span, read_phrase
 from quail.logical import (
     CompileError,
     ExtractStruct,
@@ -322,6 +322,14 @@ def test_span_helpers_read_locate_and_widen_an_answer():
     assert locate_span("a b a b", "a b") == (0, 3)
     assert locate_span(LEASE, "April") is None
     assert locate_span(LEASE, "   ") is None
+    # a free answer is cut to the whole words its document holds
+    assert held_prefix(LEASE, 'March 3, 2027." and then') == (
+        "March 3, 2027.", (14, 28))
+    assert held_prefix(LEASE, "March 3, 2028") == ("March 3,", (14, 22))
+    assert held_prefix(LEASE, "rent IS $2,000 a month") == (
+        "rent IS $2,000", (29, 43))
+    assert held_prefix(LEASE, "April 1") is None
+    assert held_prefix("the absent one", "a phrase") is None
 
 
 @pytest.mark.parametrize("filtered", [False, True])
@@ -356,7 +364,8 @@ class _PhraseClient(request_tests._Client):
         return ("decode", max_tokens)
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
-        assert sampling_params == ("decode", self.params[-1][0])
+        assert sampling_params == ("decode", self.params[-1][0]) or all(
+            params[0] == "decode" for params in sampling_params)
         outputs = []
         for prompt in prompts:
             ids = prompt["prompt_token_ids"]
@@ -412,15 +421,14 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     answers = result.outputs["extract_answers:ends"].to_pydict()
     assert answers == {
         "c": [0, 1, 2, 3],
-        "ends": ["March 3, 2027", None, "five years",
-                 "a phrase the document lacks"],
+        "ends": ["March 3, 2027", None, "five years", None],
         "ends_span": [{"start": 14, "end": 27}, None, {"start": 6, "end": 16},
                       None]}
     # an extraction keeps every document
     assert result.outputs["rows:c"].ids["c"].to_pylist() == [0, 1, 2, 3]
     step, = result.metrics.extension["steps"]
     assert (step["kind"], step["output"], step["num_in"], step["num_out"]) == (
-        "extract", "ends", 4, 3)
+        "extract", "ends", 4, 2)
     assert (step["requests"], step["unanswered"], step["unaligned"]) == (4, 1, 1)
     assert step["generated_tokens"] == 4 + 1 + 2 + 3
     # the preamble, document, and tail of each prompt, and each
@@ -441,7 +449,7 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     assert texted.prompts == ["DOCUMENT:\n" + text + "\nQ?\nPhrase:"
                               for text in TEXTS]
     assert result.outputs["extract_answers:ends"].to_pydict()["ends"] == [
-        "March 3, 2027", None, "five years", "a phrase the document lacks"]
+        "March 3, 2027", None, "five years", None]
 
 
 
@@ -468,16 +476,15 @@ def test_request_backend_runs_the_fields_of_a_document_together():
                            tail_token_ids=(tail,), max_answer_tokens=limit)
         for output, tail, limit in (("ends", 90, 7), ("term", 91, 9)))
     node = RequestExecution(
-        node_id="request-model", backend_name="stock_vllm", aliases=("c",),
+        node_id="request-model", backend_name="pipelined_vllm", aliases=("c",),
         preamble_token_ids=(3,), extracts=specs)
     client = _FieldsClient()
     result = request_tests._execution(
-        documents, client=client, document_texts={"c": TEXTS}).execute(
-            node, {"input:0": [0, 1, 2, 3]})
+        documents, client=client, document_texts={"c": TEXTS},
+        answer_submission="pipelined").execute(node, {"input:0": [0, 1, 2, 3]})
     # one run decodes both fields, up to the longer answer limit
     assert client.runs == [([[90], [91]], 9)]
-    expected = ["March 3, 2027", None, "five years",
-                "a phrase the document lacks"]
+    expected = ["March 3, 2027", None, "five years", None]
     for output in ("ends", "term"):
         answers = result.outputs[f"extract_answers:{output}"].to_pydict()
         assert answers[output] == expected
@@ -502,7 +509,7 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     assert rows.column_names == ["c.id", "lease", "lease_span"]
     assert rows.column("c.id").to_pylist() == ["a", "b", "c", "d"]
     # the fake client answers from the document, whatever the question
-    answers = ["March 3, 2027", None, "five years", "a phrase the document lacks"]
+    answers = ["March 3, 2027", None, "five years", None]
     assert rows.column("lease").to_pylist() == [
         {"ends": answer, "term": answer} for answer in answers]
     spans = [{"start": 14, "end": 27}, None, {"start": 6, "end": 16}, None]

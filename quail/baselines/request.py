@@ -148,7 +148,7 @@ class RequestBackend:
     engine: Any
     filter_submission: str
     join_submission: str = "anchor-major"
-    map_submission: str = "operator-at-a-time"
+    answer_submission: str = "operator-at-a-time"
     locates_answers_in_text = False
 
     @property
@@ -194,7 +194,7 @@ class RequestBackend:
             backend_name=self.name,
             filter_submission=self.filter_submission,
             join_submission=self.join_submission,
-            map_submission=self.map_submission,
+            answer_submission=self.answer_submission,
             scores_labels=getattr(self.engine, "scores_labels", False),
         )
 

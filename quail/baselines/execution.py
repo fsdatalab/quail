@@ -68,7 +68,7 @@ class RequestModelExecution:
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
-        self.map_submission = settings["map_submission"]
+        self.answer_submission = settings["answer_submission"]
         self.submit_text = bool(getattr(self.client, "accepts_text", False))
 
     def _classify(self, spec, bodies) -> dict:
@@ -122,8 +122,7 @@ class RequestModelExecution:
         self._execute_classifications(node, survivors, outputs, steps)
         self._execute_joins(node, survivors, outputs, steps)
         self._execute_joined_classifications(node, survivors, outputs, steps)
-        if (node.extracts and node.maps
-                and self.map_submission in ("operator-at-a-time", "shuffled")):
+        if self.answer_submission in ("operator-at-a-time", "shuffled"):
             self._execute_answers(node, survivors, outputs, steps)
         else:
             self._execute_extractions(node, survivors, outputs, steps)
@@ -494,33 +493,21 @@ class RequestModelExecution:
         for alias, specs, ids, _, bodies, body_texts in self._answer_groups(
                 node, node.maps, survivors, "AI.MAP"):
             results = map_documents(self.client, specs, bodies, body_texts,
-                                    submission=self.map_submission)
+                                    submission=self.answer_submission)
             for spec, result in zip(specs, results):
                 self._mapped(alias, spec, ids, result, outputs, steps)
 
     def _execute_answers(self, node, survivors, outputs, steps):
-        """Submit each document's extraction and map prompts in one generate call.
-
-        Fields and maps over the same documents and preamble go together;
-        a group with only one kind runs as that kind alone does.
-        """
+        """Submit each document's extraction and map prompts in one generate call."""
         for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
                 node, [*node.extracts, *node.maps], survivors,
                 "AI.EXTRACT and AI.MAP"):
             extracts = [spec for spec in specs
                         if isinstance(spec, RequestExtractSpec)]
             maps = [spec for spec in specs if not isinstance(spec, RequestExtractSpec)]
-            if extracts and maps:
-                extracted, mapped = answer_documents(
-                    self.client, extracts, maps, bodies, texts, body_texts,
-                    shuffled=self.map_submission == "shuffled")
-            else:
-                extracted = (extract_fields(self.client, extracts, bodies, texts,
-                                            body_texts=body_texts)
-                             if extracts else [])
-                mapped = (map_documents(self.client, maps, bodies, body_texts,
-                                        submission=self.map_submission)
-                          if maps else [])
+            extracted, mapped = answer_documents(
+                self.client, extracts, maps, bodies, texts, body_texts,
+                shuffled=self.answer_submission == "shuffled")
             for spec, result in zip(extracts, extracted):
                 self._extracted(alias, spec, ids, result, outputs, steps)
             for spec, result in zip(maps, mapped):
@@ -536,9 +523,10 @@ class RequestModelExecution:
             alias=alias,
             output=spec.output,
             num_in=len(ids),
-            num_out=len(ids) - result["unanswered"],
+            num_out=len(ids) - result["unanswered"] - result["unaligned"],
             unanswered=result["unanswered"],
             unaligned=result["unaligned"],
+            cut=result["cut"],
         ))
 
     def _mapped(self, alias, spec, ids, result, outputs, steps):
@@ -548,6 +536,6 @@ class RequestModelExecution:
             pa.table({spec.output: pa.array(result["answers"], pa.string())}))
         steps.append(request_step(result, kind="map", alias=alias,
                                   output=spec.output,
-                                  submission=self.map_submission,
+                                  submission=self.answer_submission,
                                   num_in=len(ids), num_out=len(ids),
                                   document_cap=result["doc_cap"]))

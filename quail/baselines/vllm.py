@@ -459,7 +459,7 @@ def pipelined_vllm_backend() -> RequestBackend:
         name="pipelined_vllm",
         engine=VLLMEngine(),
         filter_submission="pipelined",
-        map_submission="pipelined",
+        answer_submission="pipelined",
     )
 
 
@@ -469,7 +469,7 @@ def shuffled_vllm_backend() -> RequestBackend:
         name="shuffled_vllm",
         engine=VLLMEngine(),
         filter_submission="operator-at-a-time",
-        map_submission="shuffled",
+        answer_submission="shuffled",
     )
 
 
