@@ -3,7 +3,7 @@ title: AI functions
 ---
 
 Use AI functions to filter and join documents, score answers, assign
-labels, extract text, and read sparse autoencoder features. The examples use BigQuery syntax. See the
+labels, extract text, write text answers, and read sparse autoencoder features. The examples use BigQuery syntax. See the
 [SQL reference](/docs/user-guide/sql) for dialect selection and a first query.
 
 ## Functions
@@ -20,6 +20,7 @@ Square brackets mark optional arguments.
 | [`AI.SCORE(prompt[, options])`](#aiscore) | Returns a score from 0 to 1 for a model question. |
 | [`AI.CLASSIFY(input, categories[, options])`](#aiclassify) | Assigns one of the supplied labels. |
 | [`AI.EXTRACT(input, questions)`](#aiextract) | Copies answers from a document and returns their positions. |
+| [`AI.MAP(input, instruction[, max_tokens])`](#aimap) | Writes a text answer for each document. |
 | [`AI.SAE_FEATURES(prompt, pooling)`](#aisae_features) | Returns the sparse autoencoder features of a prompt. |
 | [`HINT(condition, options)`](#planning-hints) | Sets the estimated pass fraction for a label or answer condition. |
 
@@ -407,6 +408,81 @@ set the expected fraction of documents that pass, or pass
 - `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result of an
   extraction.
 
+## AI.MAP
+
+`AI.MAP` writes a text answer for each row, following your instruction.
+For example, imagine a `reviews` table with review text in `body`.
+Write a one-sentence summary of each review:
+
+```sql
+SELECT r.id,
+       AI.MAP(r.body, 'Summarize the review in one sentence.') AS summary
+FROM reviews r;
+```
+
+The result is a `STRING` column with one answer for each row. The model
+always picks its most likely next token, so the same document and
+instruction give the same answer. An answer ends when the model
+finishes or when it reaches the answer limit.
+
+A map in `SELECT` requires a column alias with `AS`, and the call must
+be a separate item. To change the answer, map in a
+[CTE](/docs/user-guide/sql/sql-functions#with), then change it in the
+outer query:
+
+```sql
+WITH m AS (
+    SELECT r.id,
+           AI.MAP(r.body, 'Summarize the review in one sentence.') AS summary
+    FROM reviews r
+)
+SELECT m.id, UPPER(m.summary) AS loud_summary
+FROM m;
+```
+
+### Arguments
+
+`AI.MAP(input, instruction[, max_tokens])`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `input` | `STRING` column | The document to read. |
+| `instruction` | `STRING` literal | What to write about the document. |
+| `max_tokens` | Positive integer | The most tokens an answer can have. The default is 256. |
+
+### Several maps and other functions
+
+Each map in a query writes its own answer. On the Quail backend, the
+maps about one document read the same document KV. Maps also work with
+`AI.IF`, `AI.CLASSIFY`, and `AI.EXTRACT` on the same table. For
+example, summarize only the negative reviews:
+
+```sql
+SELECT r.id,
+       AI.MAP(r.body, 'Summarize the review in one sentence.') AS summary
+FROM reviews r
+WHERE AI.IF(PROMPT('Is this review negative?\n\n{0}', r.body));
+```
+
+Quail writes answers only for the rows that pass the filter.
+
+### Use answers in the query
+
+You can use a map's answer in `WHERE`, `ORDER BY`, `GROUP BY`, and
+`SELECT DISTINCT`, like any text column. For example, keep reviews
+whose complaints mention the ending:
+
+```sql
+SELECT r.id,
+       AI.MAP(r.body, 'List what the review complains about.') AS complaints
+FROM reviews r
+WHERE complaints ILIKE '%ending%';
+```
+
+Quail writes each answer once and uses it for both the condition and
+the result. Use a [planning hint](#planning-hints) to set the expected
+fraction of rows that pass.
+
 ## AI.SAE_FEATURES
 
 `AI.SAE_FEATURES` returns the sparse autoencoder (SAE) features of a
@@ -517,7 +593,7 @@ For an application, see
 ## Planning hints
 
 Use `HINT(condition, {'selectivity': fraction})` on a classification
-label or extracted answer to estimate the fraction of documents that
+label, extracted answer, or map answer to estimate the fraction of documents that
 pass. Quail uses the estimate to choose the order of AI functions.
 
 For example, in the lease query above, replace the `WHERE` clause with:
