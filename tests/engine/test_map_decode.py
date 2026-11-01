@@ -18,7 +18,6 @@ from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 
 from quail.backends.quail.executor.admission import pages_for
 from quail.backends.quail.executor.answer_admission import HeadroomAdmission
-from quail.backends.quail.executor.answer_survival import answer_survival
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.operators.classify import ClassifyPart
 from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
@@ -26,6 +25,7 @@ from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.catalog.tokens import prefix_tree
+from quail.cost.answers import answer_survival
 from quail.cost.decode import DecodeCost
 from quail.cost.work import Work
 from quail.specs import DEVICES, QWEN3_4B_FP8

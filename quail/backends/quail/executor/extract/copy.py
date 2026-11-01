@@ -7,7 +7,6 @@ from quail.backends.quail.executor.extract.candidates import (
     TextWindows,
 )
 from quail.backends.quail.executor.extract.trace import TRACE_WIDTH, trace_path
-from quail.cost.draft_policy import LIVE_BUCKETS, PRIOR_WEIGHT
 
 
 def verification_blocks(counts, stream_width, num_streams, num_options, num_keys,
@@ -675,31 +674,3 @@ class CopyConstraint:
             values.append(text[start:end])
             spans.append((start, end))
         return values, spans
-
-
-def draft_lengths(spec, lengths, written, num_streams, rho, trials, accepts):
-    """Choose all running answers' adaptive draft lengths with array operations."""
-    cap = spec.draft_tokens
-    if spec.draft_policy != "adaptive":
-        return np.full(len(written), cap, dtype=np.int64)
-    j = np.arange(spec.max_answer_tokens + 1)
-    observed = np.bincount(lengths[lengths > 0], minlength=len(j))
-    q = 1 - 1 / max(1, spec.expected_answer_tokens)
-    curve = PRIOR_WEIGHT * q**j + observed.sum() - np.cumsum(observed)
-    columns = written[:, None] + np.arange(cap + 1)
-    survival = curve[np.minimum(columns, spec.max_answer_tokens)]
-    base = survival[:, :1]
-    survival = np.divide(survival, base, out=np.ones_like(survival), where=base > 0)
-    buckets = np.abs(np.log1p(num_streams[:, None]) - np.log1p(LIVE_BUCKETS)).argmin(1)
-    odds = np.where(
-        num_streams <= 1,
-        1,
-        (PRIOR_WEIGHT / np.array(LIVE_BUCKETS)[buckets] + accepts[buckets])
-        / (PRIOR_WEIGHT + trials[buckets]),
-    )
-    writes = 1 + odds[:, None] * np.cumsum(
-        np.c_[np.zeros(len(written)), survival[:, 1:]], axis=1
-    )
-    costs = (1 + np.arange(cap + 1) + rho[:, None]) / writes
-    costs[columns >= spec.max_answer_tokens] = np.inf
-    return costs.argmin(axis=1)

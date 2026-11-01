@@ -3,40 +3,14 @@
 import numpy as np
 
 from quail.backends.quail.executor.chunk import decode_groups
-from quail.cost.answers import prior_survival
+from quail.cost.answers import prior_survival, survival_rows
 from quail.cost.work import Work
-
-PRIOR_WEIGHT = 20.0
 
 
 def input_bucket(tokens):
     """Return the input-length bucket: one per doubling of the prefix length."""
     return np.floor(np.log2(np.maximum(np.asarray(tokens, dtype=float), 1.0))
                     ).astype(np.int64)
-
-
-def survival_rows(counts, events, prior, limits):
-    """Return Kaplan-Meier curves, one per row, as answer_survival builds one.
-
-    Args:
-        counts: Answers observed last at each token, ended or censored,
-            one row per curve.
-        events: Answers that ended at each token, one row per curve.
-        prior: The prior curve of each row, 0 past the row's limit.
-        limits: Each row's answer token limit.
-
-    Returns:
-        S(t) per row, 0 from each row's limit on.
-    """
-    risk = (np.cumsum(counts[:, ::-1], axis=1)[:, ::-1][:, 1:]
-            + PRIOR_WEIGHT * prior[:, :-1])
-    events = events[:, 1:] + PRIOR_WEIGHT * (prior[:, :-1] - prior[:, 1:])
-    hazard = np.divide(events, risk, out=np.zeros(risk.shape), where=risk > 0)
-    survival = np.empty(counts.shape)
-    survival[:, 0] = 1.0
-    np.cumprod(1.0 - hazard, axis=1, out=survival[:, 1:])
-    survival[np.arange(counts.shape[1]) >= limits[:, None]] = 0.0
-    return survival
 
 
 class HeadroomAdmission:

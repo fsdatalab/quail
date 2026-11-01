@@ -5,10 +5,10 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from quail.backends.quail.executor.answer_survival import (
+from quail.cost.answers import (
+    prior_survival,
     remaining_tokens,
 )
-from quail.cost.answers import prior_survival
 from quail.cost.decode import DecodeCost
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.work import Work
@@ -26,10 +26,11 @@ def test_cold_start_uses_the_map_length_prior():
                                                           survival=prior))
 
 
-def test_censored_answers_leave_the_risk_set_after_their_written_length():
+def test_censored_answers_leave_the_risk_set_after_their_written_length(
+        monkeypatch):
     # The censor at 3 leaves two answers at risk at 4.
-    remaining = remaining_tokens([2, -1, 4, 6], [2, 3, 4, 6], 3, 6,
-                                 prior_weight=0)
+    monkeypatch.setattr("quail.cost.answers.PRIOR_WEIGHT", 0.0)
+    remaining = remaining_tokens([2, -1, 4, 6], [2, 3, 4, 6], 3, 6)
     survival = np.array([1, 1, .75, .75, .375, .375, 0])
     expected = np.r_[np.cumsum(survival[:0:-1])[::-1], 0]
     expected[:-1] /= survival[:-1]

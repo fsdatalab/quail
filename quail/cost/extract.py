@@ -17,6 +17,7 @@ from KV.
 from dataclasses import dataclass, replace
 from itertools import repeat
 
+from quail.cost.answers import prior_survival
 from quail.cost.budgets import parallel_copies
 from quail.cost.draft_policy import DraftPolicy
 from quail.cost.sol import unrounded_seconds
@@ -47,7 +48,7 @@ class ExtractAssumptions:
         """Return the chance an answer has more than tokens tokens after its first."""
         if self.answer_tokens == 0:
             return 0.0
-        return (1 - 1 / self.answer_tokens) ** tokens
+        return float(prior_survival(self.answer_tokens, tokens + 1)[tokens])
 
     def rounds(self, max_answer_tokens: int, draft_tokens: int) -> float:
         """Return the expected rounds an answer takes, limited by the answer limit.

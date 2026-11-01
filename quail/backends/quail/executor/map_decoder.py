@@ -157,7 +157,8 @@ class MapDecoder:
 
     def row_counts(self, running):
         """Return one chosen-token row and each answer's copy draft rows."""
-        from quail.backends.quail.executor.extract.copy import draft_lengths
+        from quail.cost.answers import answer_survival
+        from quail.cost.draft_policy import draft_lengths
 
         counts = np.ones(len(running), dtype=np.int64)
         written = np.zeros(len(running), dtype=np.int64)
@@ -168,9 +169,17 @@ class MapDecoder:
             if not len(slots):
                 continue
             written[mine] = self.written[q][slots]
+            spec = state.spec
+            if spec.draft_policy != "adaptive":
+                sizes[mine] = spec.draft_tokens
+                continue
+            curve = answer_survival(self.lengths[q], self.written[q],
+                                    spec.expected_answer_tokens,
+                                    spec.max_answer_tokens)
             sizes[mine] = draft_lengths(
-                state.spec, self.lengths[q], written[mine], self.num_streams[slots],
-                state.rho[self.copy_document[slots]], state.trials, state.accepts)
+                spec.draft_tokens, spec.max_answer_tokens, curve, written[mine],
+                self.num_streams[slots], state.rho[self.copy_document[slots]],
+                state.trials, state.accepts)
         for group in self.copy_groups:
             mine = np.isin(self.map[running], group.questions)
             slots = running[mine]
@@ -259,7 +268,7 @@ class MapDecoder:
 
     def eviction_order(self, curves=None, recompute_cost=None, page_holds=None):
         """Order running slots by page-hold time saved per recomputation second."""
-        from quail.backends.quail.executor.answer_survival import remaining_tokens
+        from quail.cost.answers import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         scores = np.zeros(len(self.map))
@@ -596,7 +605,7 @@ class MapDecoder:
             self.copy_pending[slots] = ~ready
 
     def _read_copy(self, q, documents, indices, values):
-        from quail.cost.draft_policy import LIVE_BUCKETS
+        from quail.cost.draft_policy import live_buckets
 
         slots, first, inverse = np.unique(
             documents, return_index=True, return_inverse=True)
@@ -614,8 +623,7 @@ class MapDecoder:
             last, 4:4 + state.constraint.mask_words]
         observed = ((self.num_streams[slots] > 1) & (self.drafts[slots] > 0)
                     & (values[first, 0] >= 0) & (indices[first] + 1 < self.limits[q]))
-        buckets = np.abs(np.log1p(self.num_streams[slots, None])
-                         - np.log1p(LIVE_BUCKETS)).argmin(1)
+        buckets = live_buckets(self.num_streams[slots])
         np.add.at(state.trials, buckets[observed], 1)
         np.add.at(state.accepts, buckets[observed], values[first[observed], 3] > 0)
         self.copy_sources[slots] = state.sources[slots] = values[last, 1]
