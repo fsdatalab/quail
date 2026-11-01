@@ -2,11 +2,14 @@
 
 A snapshot is the query's explain() text: the logical plan and the
 physical plan with its estimates. A change that alters a plan shows
-here as a diff. To accept new plans, run the test with
+here as a diff. The chunk and admission budgets are left out of the
+comparison: they follow the model's and device's memory constants, not
+the plan. To accept new plans, run the test with
 QUAIL_UPDATE_SNAPSHOTS=1 and commit the files it writes.
 """
 
 import os
+import re
 from pathlib import Path
 
 from helpers.fakes import letter_tokens
@@ -17,6 +20,12 @@ from bench.quailb import queries, register_tables
 from quail.planner.plan import EngineConfig
 
 SNAPSHOTS = Path(__file__).resolve().parents[1] / "fixtures" / "plan_snapshots"
+BUDGETS = re.compile(r"(chunk|admission) budget=[\d,]+ tokens")
+
+
+def _plan_text(text: str) -> str:
+    """Return explain() text without the token budgets."""
+    return BUDGETS.sub(r"\1 budget=N tokens", text)
 
 
 def test_every_quailb_query_plans_as_its_snapshot(tmp_path):
@@ -39,6 +48,7 @@ def test_every_quailb_query_plans_as_its_snapshot(tmp_path):
             if update:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text)
-            elif not path.exists() or path.read_text() != text:
+            elif (not path.exists()
+                  or _plan_text(path.read_text()) != _plan_text(text)):
                 changed.append(query_id)
     assert not changed, f"plans differ from their snapshots: {changed}"
