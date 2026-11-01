@@ -10,9 +10,10 @@ from typing import Any, Mapping
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
-from quail.baselines.nodes import RequestExecution
+from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.baselines.operators import (
     allowed_members_by_anchor,
+    answer_documents,
     choose_documents,
     classification_rows,
     classify_documents,
@@ -121,8 +122,12 @@ class RequestModelExecution:
         self._execute_classifications(node, survivors, outputs, steps)
         self._execute_joins(node, survivors, outputs, steps)
         self._execute_joined_classifications(node, survivors, outputs, steps)
-        self._execute_extractions(node, survivors, outputs, steps)
-        self._execute_maps(node, survivors, outputs, steps)
+        if (node.extracts and node.maps
+                and self.map_submission in ("operator-at-a-time", "shuffled")):
+            self._execute_answers(node, survivors, outputs, steps)
+        else:
+            self._execute_extractions(node, survivors, outputs, steps)
+            self._execute_maps(node, survivors, outputs, steps)
 
         for alias in node.aliases:
             outputs[f"rows:{alias}"] = Rows({alias: document_ids(survivors[alias])})
@@ -482,18 +487,7 @@ class RequestModelExecution:
             results = extract_fields(self.client, specs, bodies, texts,
                                      body_texts=body_texts)
             for spec, result in zip(specs, results):
-                outputs[f"extract_answers:{spec.output}"] = extraction_rows(
-                    alias, spec.output, spec.span_output, ids,
-                    result["answers"], result["spans"])
-                steps.append(request_step(result,
-                    kind="extract",
-                    alias=alias,
-                    output=spec.output,
-                    num_in=len(ids),
-                    num_out=len(ids) - result["unanswered"],
-                    unanswered=result["unanswered"],
-                    unaligned=result["unaligned"],
-                ))
+                self._extracted(alias, spec, ids, result, outputs, steps)
 
     def _execute_maps(self, node, survivors, outputs, steps):
         """Submit every map's prompts and collect the answers."""
@@ -502,12 +496,58 @@ class RequestModelExecution:
             results = map_documents(self.client, specs, bodies, body_texts,
                                     submission=self.map_submission)
             for spec, result in zip(specs, results):
-                outputs[f"map_answers:{spec.output}"] = Rows(
-                    {alias: document_ids(ids)},
-                    pa.table({spec.output: pa.array(result["answers"],
-                                                    pa.string())}))
-                steps.append(request_step(result, kind="map", alias=alias,
-                                          output=spec.output,
-                                          submission=self.map_submission,
-                                          num_in=len(ids), num_out=len(ids),
-                                          document_cap=result["doc_cap"]))
+                self._mapped(alias, spec, ids, result, outputs, steps)
+
+    def _execute_answers(self, node, survivors, outputs, steps):
+        """Submit each document's extraction and map prompts in one generate call.
+
+        Fields and maps over the same documents and preamble go together;
+        a group with only one kind runs as that kind alone does.
+        """
+        for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
+                node, [*node.extracts, *node.maps], survivors,
+                "AI.EXTRACT and AI.MAP"):
+            extracts = [spec for spec in specs
+                        if isinstance(spec, RequestExtractSpec)]
+            maps = [spec for spec in specs if not isinstance(spec, RequestExtractSpec)]
+            if extracts and maps:
+                extracted, mapped = answer_documents(
+                    self.client, extracts, maps, bodies, texts, body_texts,
+                    shuffled=self.map_submission == "shuffled")
+            else:
+                extracted = (extract_fields(self.client, extracts, bodies, texts,
+                                            body_texts=body_texts)
+                             if extracts else [])
+                mapped = (map_documents(self.client, maps, bodies, body_texts,
+                                        submission=self.map_submission)
+                          if maps else [])
+            for spec, result in zip(extracts, extracted):
+                self._extracted(alias, spec, ids, result, outputs, steps)
+            for spec, result in zip(maps, mapped):
+                self._mapped(alias, spec, ids, result, outputs, steps)
+
+    def _extracted(self, alias, spec, ids, result, outputs, steps):
+        """Record one extraction field's answers and its request step."""
+        outputs[f"extract_answers:{spec.output}"] = extraction_rows(
+            alias, spec.output, spec.span_output, ids,
+            result["answers"], result["spans"])
+        steps.append(request_step(result,
+            kind="extract",
+            alias=alias,
+            output=spec.output,
+            num_in=len(ids),
+            num_out=len(ids) - result["unanswered"],
+            unanswered=result["unanswered"],
+            unaligned=result["unaligned"],
+        ))
+
+    def _mapped(self, alias, spec, ids, result, outputs, steps):
+        """Record one map's answers and its request step."""
+        outputs[f"map_answers:{spec.output}"] = Rows(
+            {alias: document_ids(ids)},
+            pa.table({spec.output: pa.array(result["answers"], pa.string())}))
+        steps.append(request_step(result, kind="map", alias=alias,
+                                  output=spec.output,
+                                  submission=self.map_submission,
+                                  num_in=len(ids), num_out=len(ids),
+                                  document_cap=result["doc_cap"]))

@@ -671,6 +671,37 @@ class _MapClient:
                                   answer_tokens=answer_tokens)
 
 
+@pytest.mark.parametrize("submission", ["operator-at-a-time", "shuffled"])
+def test_extracts_and_maps_of_a_document_go_in_one_generate_call(submission):
+    from quail.baselines.nodes import RequestExtractSpec, RequestMapSpec
+
+    class Client(_MapClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def generate(self, prompts, params, use_tqdm=False):
+            self.calls.append(len(prompts))
+            return super().generate(prompts, params, use_tqdm)
+
+    client = Client()
+    node = RequestExecution(
+        node_id="request-model", backend_name="stock_vllm", aliases=("d",),
+        extracts=(RequestExtractSpec(alias="d", output="kind",
+                                     tail_token_ids=(80,), max_answer_tokens=16),),
+        maps=(RequestMapSpec(alias="d", output="plot", tail_token_ids=(90,),
+                             max_answer_tokens=1024),))
+    result = _execution(
+        {"d": [[10], [11], [12]]}, client=client,
+        document_texts={"d": ["one", "two", "three"]},
+        map_submission=submission).execute(node, {"input:0": [0, 1, 2]})
+    assert client.calls == [6]
+    assert result.outputs["map_answers:plot"].to_pydict()["plot"] == [
+        "10:90/1024", "11:90/1024", "12:90/1024"]
+    kinds = result.outputs["extract_answers:kind"]
+    assert kinds.to_pydict()["kind"] == ["10:80/16", "11:80/16", "12:80/16"]
+
+
 @pytest.mark.parametrize("submission", ["operator-at-a-time", "shuffled", "pipelined"])
 def test_maps_write_each_answer_under_its_own_limit(submission):
     from quail.baselines.nodes import RequestMapSpec

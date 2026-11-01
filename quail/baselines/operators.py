@@ -310,6 +310,71 @@ def extract_fields(client, specs, bodies, texts, body_texts=None) -> list[dict]:
             for outputs in run["outputs"]]
 
 
+def generate_answers(client, specs, bodies, body_texts=None, *, shuffled=False):
+    """Send every spec's prompt over every body in one generate call.
+
+    The prompts go in body order with each body's specs together, so the
+    engine's prefix caching computes a body's KV once for all of them,
+    or, shuffled, in a seeded random order.
+
+    Args:
+        client: The engine client.
+        specs: Answer specs over the bodies, each with its tail and limit.
+        bodies: Token ids for each prompt before the tail, preamble included.
+        body_texts: The text of each prompt before the tail, for an
+            engine that tokenizes the prompt itself; None sends token ids.
+        shuffled: Whether to send the prompts in a random order.
+
+    Returns:
+        Per spec, its outputs in body order.
+    """
+    prompts = [
+        body_texts[index] + spec.tail_text if body_texts is not None
+        else {"prompt_token_ids": body + token_list(spec.tail_token_ids)}
+        for index, body in enumerate(bodies) for spec in specs]
+    params = [client.decode_params(spec.max_answer_tokens) for spec in specs]
+    order = np.arange(len(prompts))
+    if shuffled:
+        order = np.random.default_rng(SHUFFLE_SEED).permutation(len(prompts))
+    sent = (client.generate([prompts[i] for i in order],
+                            [params[i % len(specs)] for i in order],
+                            use_tqdm=False)
+            if prompts else [])
+    outputs = [sent[k] for k in np.argsort(order)]
+    return [outputs[q::len(specs)] for q in range(len(specs))]
+
+
+def answer_documents(client, extracts, maps, bodies, texts, body_texts=None, *,
+                     shuffled=False) -> tuple[list[dict], list[dict]]:
+    """Decode extraction fields and maps over the same bodies in one generate call.
+
+    Args:
+        client: The engine client.
+        extracts: The RequestExtractSpecs over the bodies.
+        maps: The RequestMapSpecs over the bodies.
+        bodies: Token ids for each prompt before the tail, preamble included.
+        texts: The document text of each body, where extractions are located.
+        body_texts: The text of each prompt before the tail, for an
+            engine that tokenizes the prompt itself; None sends token ids.
+        shuffled: Whether to send the prompts in a random order.
+
+    Returns:
+        One read_extractions result per extraction field and one map
+        result per map, each reporting the call's wall seconds.
+    """
+    started = time.perf_counter()
+    per_spec = generate_answers(client, [*extracts, *maps], bodies, body_texts,
+                                shuffled=shuffled)
+    wall_s = time.perf_counter() - started
+    extracted = [read_extractions(own, texts, wall_s)
+                 for own in per_spec[:len(extracts)]]
+    mapped = [{"answers": [output.outputs[0].text for output in own],
+               "wall_s": wall_s, "requests": len(own), "doc_cap": None,
+               **_generation_counts(own)}
+              for own in per_spec[len(extracts):]]
+    return extracted, mapped
+
+
 def map_documents(client, specs, bodies, body_texts=None, *,
                   submission="operator-at-a-time") -> list[dict]:
     """Write every map's answer over the same prompt bodies.
@@ -353,19 +418,8 @@ def map_documents(client, specs, bodies, body_texts=None, *,
             tail_texts=[spec.tail_text for spec in specs])
         per_spec, document_cap = run["outputs"], run["doc_cap"]
     elif submission in ("operator-at-a-time", "shuffled"):
-        prompts = [
-            body_texts[index] + spec.tail_text if body_texts is not None
-            else {"prompt_token_ids": body + token_list(spec.tail_token_ids)}
-            for index, body in enumerate(bodies) for spec in specs]
-        order = np.arange(len(prompts))
-        if submission == "shuffled":
-            order = np.random.default_rng(SHUFFLE_SEED).permutation(len(prompts))
-        sent = (client.generate([prompts[i] for i in order],
-                                [params[i % len(specs)] for i in order],
-                                use_tqdm=False)
-                if prompts else [])
-        outputs = [sent[k] for k in np.argsort(order)]
-        per_spec = [outputs[q::len(specs)] for q in range(len(specs))]
+        per_spec = generate_answers(client, specs, bodies, body_texts,
+                                    shuffled=submission == "shuffled")
         document_cap = None
     else:
         raise ValueError(f"unknown map submission {submission!r}")
