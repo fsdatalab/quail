@@ -20,10 +20,17 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | Qwen3.6 35B-A3B | `"qwen3.6-35b-a3b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | Qwen3.8 27B | `"qwen3.8-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | LFM2 2.6B | `"lfm2-2.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
+| d1-2B | `"d1-2b-bf16"` | BF16 | `AI.IF`, `AI.SCORE` |
 | Qwen3.5 2B Base with Qwen-Scope SAE | `"qwen3.5-2b-sae-bf16"` | BF16 | `AI.SAE_FEATURES` |
 
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
 format. All listed models store KV in BF16.
+
+d1-2B is Liquid's decision model. Quail asks it in its own yes/no
+format and runs it with causal attention, so Quail can reuse a
+document's KV for every question about it. Liquid trained the model
+with attention that lets the document see the question. Quail does not yet run
+`AI.CLASSIFY` or `AI.EXTRACT` on d1-2B.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a
