@@ -3,14 +3,16 @@
 DuckDB reads the traces on this machine. The table goes to the GPU
 function as its input and the answers come back as its output, so no
 rows are written to a Modal volume or printed to the logs. The SQL
-needs DuckDB 2.0 or newer; 1.5.5 fails on its filters.
+needs DuckDB 2.0 or newer; 1.5.5 fails on its filters. Start Modal with
+`python -m modal`: the `modal` command runs the project's interpreter,
+which has the locked DuckDB 1.5.5 and ignores `--with`.
 
 `--table-sql` runs its files in order on one DuckDB connection, and the
 last file's result is the table. Normalize the logs once into a DuckDB
 file, then build each table from it:
 
     db=/tmp/traces.duckdb
-    uv run --with "duckdb>=2" modal run demos/traces/run_query.py \
+    uv run --with "duckdb>=2" python -m modal run demos/traces/run_query.py \
       --database "$db" --traces "$HOME/.claude/projects/*/*.jsonl" \
       --table-sql demos/traces/messages.sql,demos/traces/exchanges.sql \
       --query-sql demos/traces/steering_filter.sql \
