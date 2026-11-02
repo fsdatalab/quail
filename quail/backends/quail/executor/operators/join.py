@@ -1,6 +1,7 @@
 """Prepare join requests, retain matching pairs, and collect predicate results."""
 
 import itertools
+from dataclasses import dataclass
 from functools import partial
 
 import numpy as np
@@ -209,6 +210,31 @@ class JoinPart(ExecutionPart):
         return self._results
 
 
+@dataclass(frozen=True)
+class JoinQuestions:
+    """What a set-attention pass over an anchor asks about its partners.
+
+    An AiJoin has these fields; a classification of a join's pairs
+    builds them from its spec.
+
+    Attributes:
+        partners: The partner aliases, in question order.
+        label_token_ids: Per partner alias, its record label's tokens.
+        tail_token_ids: The tokens after the last partner document.
+        separator_tokens: The tail's first tokens: the blank line after
+            each partner document.
+        frame_token_ids: The state tail after the anchor document.
+        question_header_token_ids: The tokens that open a later question.
+    """
+
+    partners: tuple
+    label_token_ids: tuple
+    tail_token_ids: tuple
+    separator_tokens: int
+    frame_token_ids: tuple
+    question_header_token_ids: tuple
+
+
 def set_join_questions(node, documents, tails) -> list:
     """Each partner tuple's question tokens, in member order.
 
@@ -243,7 +269,7 @@ def join_pass_stage(node, prefixes, anchors, members_of, documents, tails,
     """One join's passes over the anchors, as one unpaged stage.
 
     Args:
-        node: The AiJoin.
+        node: The AiJoin, or the JoinQuestions of a classification.
         prefixes: Per anchor, its head and document token ids.
         anchors: The anchors to ask, by index into prefixes.
         members_of: Callable(anchor) -> the member indices it asks, or

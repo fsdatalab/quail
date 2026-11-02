@@ -122,20 +122,14 @@ def test_a_set_attention_filter_costs_the_same_first_or_later():
     assert first == later > 0
 
 
-def test_set_attention_refuses_a_score_beside_filters_and_a_joined_label():
+def test_set_attention_refuses_a_score_beside_filters():
     from quail.planner.validation import set_attention_refusal
 
-    none = SimpleNamespace(calls=[])
-    pair = SimpleNamespace(aliases=lambda: ("r", "a"))
     two = SimpleNamespace(joins=[], filters={"r": [object(), object()]},
-                          labels=none)
-    joined = SimpleNamespace(joins=[], filters={},
-                             labels=SimpleNamespace(calls=[(pair, "mood")]))
+                          labels=SimpleNamespace(calls=[]))
 
     assert "or a score" in set_attention_refusal(two, True, D1_2B_BF16).reasons[0]
     assert set_attention_refusal(two, False, D1_2B_BF16) is None
-    assert "joined pair" in set_attention_refusal(
-        joined, False, D1_2B_BF16).reasons[0]
 
 
 def test_a_set_join_costs_each_anchors_passes_with_packed():
@@ -529,6 +523,62 @@ def test_a_d1_plan_prices_and_explains_the_passes_its_operators_share(tmp_path):
     assert "seconds" not in plan.estimates[second]
     assert f"Passes on r: [{first}, {second}]" in text
     assert "paged KV" not in text and "admission budget" not in text
+    session.close()
+
+
+def test_a_joined_d1_classification_asks_about_the_partner_record():
+    from quail.logical.prompts import bind_classify_prompt
+
+    aspect = ColumnRef(alias="a", provider="aspects", column="aspect")
+    prompt = bind_classify_prompt(
+        "What does the review in DOCUMENT {0} say about DOCUMENT {1}?",
+        (REVIEW, aspect), ["praise", "complaint"], (),
+        turn=D1_2B_BF16.turn, layout=D1_2B_BF16.prompt_layout)
+
+    text = render_join_prompt_text(prompt, ["Great film.", "the acting"], 0)
+
+    assert text == D1_PROMPT.format(
+        state="reviews record:\nGreat film.",
+        question=("aspects record:\nthe acting\n\nWhat does the review in "
+                  "the reviews record say about the aspects record?\n\n"
+                  "Options:\nA praise\nB complaint"),
+    ).replace("Reply with yes or no only.", "Reply with the option code only.")
+
+
+def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.physical import AiClassify, AiJoin
+    from quail.physical.pipelines import build_pipelines
+    from quail.planner.plan import EngineConfig
+
+    body = " ".join(["word"] * 300)
+    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
+                   tmp_path / "reviews.parquet")
+    pq.write_table(pa.table({"id": list(range(12)), "aspect": ["acting"] * 12}),
+                   tmp_path / "aspects.parquet")
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=str.split)
+    for name in ("reviews", "aspects"):
+        session.register(name, DocumentProvider.from_parquet(
+            str(tmp_path / f"{name}.parquet"), id_col="id"))
+
+    plan = session.sql(
+        "SELECT r.id, a.id, AI.CLASSIFY(PROMPT('What does DOCUMENT {0} say "
+        "about DOCUMENT {1}?', r.body, a.aspect), ARRAY['praise', 'complaint']) "
+        "AS stance FROM reviews r JOIN aspects a ON AI_FILTER(PROMPT("
+        "'Does {0} mention {1}?', r.body, a.aspect))").plan()
+
+    (join,) = [node for node in plan.nodes if isinstance(node, AiJoin)]
+    (label,) = [node for node in plan.nodes if isinstance(node, AiClassify)]
+    spec = label.spec
+    assert spec.scoring == "set_choice" and spec.aliases == ("r", "a")
+    assert spec.join_layout == (("QUESTION:",), ("aspects", "record:"))
+    assert spec.prompt_token_parts[0][-2:] == ("reviews", "record:")
+    assert build_pipelines(plan.graph)[join.node_id] == (join, label)
     session.close()
 
 

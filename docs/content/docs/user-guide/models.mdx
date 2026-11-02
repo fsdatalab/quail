@@ -39,9 +39,8 @@ the labels by option code (A, B, and so on), and the classifications
 on one table share passes. `AI.EXTRACT` returns one span of the
 document, up to 512 tokens, that the model points to, or nothing; the
 extractions on one table share passes too. d1-2B does not write text,
-so it does not run `AI.MAP`. Quail does not yet run `AI.CLASSIFY` over
-joined rows, `AI.SCORE` over two tables, or `AI.SCORE` beside AI
-filters on one table on d1-2B.
+so it does not run `AI.MAP`. Quail does not yet run `AI.SCORE` over
+two tables, or `AI.SCORE` beside AI filters on one table, on d1-2B.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a

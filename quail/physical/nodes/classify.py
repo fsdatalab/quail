@@ -36,6 +36,9 @@ class ClassifySpec(InferenceSpec):
             tokens that a pass reads with the document.
         question_header_token_ids: For the set_choice rule, the tokens
             that open the question when it follows another in a pass.
+        separator_tokens: For the set_choice rule over joined rows, the
+            tokens of the blank line that opens the tail, after the
+            partner document.
     """
 
     pair_fraction: float = 1.0
@@ -49,6 +52,7 @@ class ClassifySpec(InferenceSpec):
     frame_tokens: int = 0
     state_tail_tokens: int = 0
     question_header_token_ids: tuple[Token, ...] = ()
+    separator_tokens: int = 0
 
     @property
     def anchor(self) -> str:

@@ -1,5 +1,6 @@
 """AI.CLASSIFY: its statistics, scoring rule, cost, spec, and plan node."""
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
@@ -342,7 +343,8 @@ class ClassifyBuilder(ClassifyStatistics):
             AiClassify, spec, (input_port, *port), index=index,
             backend=self.backend_name, model=self.model.name)
 
-    def classify_joined(self, call, name, partner, expected_rows, partner_tokens):
+    def classify_joined(self, call, name, partner, expected_rows, partner_tokens,
+                        anchors=None):
         """Build a classification specification for joined document expected_rows.
 
         Pair classification uses letters and reuses the anchor document's KV.
@@ -353,6 +355,9 @@ class ClassifyBuilder(ClassifyStatistics):
             partner: Partner table alias.
             expected_rows: Expected number of joined expected_rows to classify.
             partner_tokens: Mean partner document length in tokens.
+            anchors: Expected anchor documents with a kept pair; a
+                set-attention model asks each anchor's pairs in its
+                passes.
 
         Returns:
             A tuple containing the ClassifySpec and estimated Work.
@@ -365,6 +370,9 @@ class ClassifyBuilder(ClassifyStatistics):
             raise ClassifyRefusedError(
                 f"a classification of joined rows returns its label only; "
                 f"{name!r} asks for the labels' probabilities", 1, 0)
+        if self.model.attention_mask == "set":
+            return self._joined_set_choice_spec(call, name, partner, expected_rows,
+                                                partner_tokens, anchors)
         if self.model.role == "decision":
             return self._joined_choice_spec(call, name, partner, expected_rows,
                                             partner_tokens)
@@ -435,6 +443,45 @@ class ClassifyBuilder(ClassifyStatistics):
                                              self.tokenizer),
             scoring=SET_CHOICE_SCORING, probabilities=call.probabilities,
             state_tail_tokens=state_tail,
+            question_header_token_ids=tuple(self.tokenizer(layout.question_label)),
+        ), work
+
+    def _joined_set_choice_spec(self, call, name, partner, expected_rows,
+                                partner_tokens, anchors):
+        """Build a set_choice specification over the pairs a join kept.
+
+        Each anchor document is the state of its passes; each kept
+        partner is one question: its label and document, then the
+        question and its option list.
+        """
+        prompt = self.lower(call.prompt)
+        parts = {alias: (label, frame)
+                 for alias, label, frame in prompt.label_token_ids}
+        (anchor_label, frame), (partner_label, _) = parts[self.alias], parts[partner]
+        head = tuple(prompt.preamble_token_ids) + tuple(anchor_label)
+        tail = tuple(prompt.tail_token_ids)
+        question = len(partner_label) + round(partner_tokens) + len(tail)
+        if len(head) + self.longest + len(frame) + question > self.chunk:
+            raise ClassifyRefusedError.over_budget(
+                f"a row of {self.alias!r} x {partner!r}",
+                len(head) + self.longest + len(frame) + question, self.chunk)
+        anchors = max(1.0, anchors or 1.0)
+        per_anchor = max(1.0, expected_rows / anchors)
+        passes = math.ceil(per_anchor / self.model.set_size)
+        asked = max(1, round(per_anchor / passes))
+        work = packed(len(head) + self.mean + len(frame), (question,) * asked,
+                      window=self.model.sliding_window) * (passes * anchors)
+        layout = PROMPT_LAYOUTS[self.model.prompt_layout]
+        return bind_inference(
+            ClassifySpec, call.prompt, name=name, aliases=(self.alias, partner),
+            expected_rows=expected_rows,
+            estimated_seconds=unrounded_seconds(work, self.model, self.device,
+                                                self.chunk),
+            prompt_token_parts=(head, tail), labels=tuple(call.labels),
+            label_token_ids=option_spellings(prompt.prompt.letters, self.tokenizer),
+            scoring=SET_CHOICE_SCORING,
+            join_layout=(tuple(frame), tuple(partner_label)),
+            separator_tokens=len(self.tokenizer(prompt.prompt.tail_segments[0])),
             question_header_token_ids=tuple(self.tokenizer(layout.question_label)),
         ), work
 
@@ -581,7 +628,8 @@ def emit_joined_classify(builder, join_ids) -> list:
                  * builder.operator_order.expected_rows[partner])
         spec, _ = table.classify_joined(
             call, builder.operators.labels.names[call], partner, pairs,
-            stats[partner].mean_document_tokens)
+            stats[partner].mean_document_tokens,
+            anchors=builder.operator_order.expected_rows[anchor])
         node = table.node(
             spec, PortRef(join_ids[stage.written_position],
                           f"join_answers:{stage.written_position}"),

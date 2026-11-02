@@ -306,9 +306,9 @@ def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
 
     Such a model reads one document and its questions in one pass.
     Quail packs a table's AI filters and classifications into passes,
-    and a join's partner tuples into passes over each anchor; an
-    AI.SCORE over two tables, AI.CLASSIFY over joined rows, and a score
-    beside AI filters on one table are refused.
+    and a join's partner tuples, and the pairs it keeps for a
+    classification, into passes over each anchor; an AI.SCORE over two
+    tables and a score beside AI filters on one table are refused.
     """
     if model.attention_mask != "set":
         return None
@@ -316,11 +316,6 @@ def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
         return _refusal(
             f"{model.name!r} answers a join's partners as questions, but "
             f"Quail does not score them yet, so AI.SCORE reads one table",
-            "unsupported_set_attention_query")
-    if any(len(call.aliases()) > 1 for call, _ in operators.labels.calls):
-        return _refusal(
-            f"{model.name!r} classifies one document per row; Quail does "
-            f"not yet ask it about a joined pair",
             "unsupported_set_attention_query")
     for alias, predicates in operators.filters.items():
         if scored and predicates:

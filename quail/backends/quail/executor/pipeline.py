@@ -9,9 +9,11 @@ from quail.backends.quail.executor.operators.filter import (
     execute_set_filters,
     filter_inputs,
 )
+from quail.backends.quail.executor.operators.join import JoinPart, execute_set_joins
 from quail.backends.quail.executor.operators.set_classify import (
     classify_passes,
     classify_result,
+    joined_label_passes,
 )
 from quail.backends.quail.executor.operators.set_extract import (
     execute_set_extractions,
@@ -21,7 +23,8 @@ from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import id_positions
 from quail.execution.rows import Rows
-from quail.physical import AiClassify, AiExtract, AiFilter, AiJoin
+from quail.execution.runtimes.filter import FilterRuntime
+from quail.physical import AiClassify, AiExtract, AiFilter, AiJoin, Filter
 from quail.physical.base import ValueType
 
 
@@ -77,49 +80,73 @@ def pipeline_ids(first, inputs) -> np.ndarray:
     return id_positions(source.ids[alias] if isinstance(source, Rows) else source)
 
 
+def _kind(node) -> str:
+    """The kind of step a node is in a set-attention pipeline."""
+    if isinstance(node, AiFilter):
+        return "filter"
+    if isinstance(node, AiClassify):
+        return "label" if node.spec.partner is None else "joined"
+    if isinstance(node, AiExtract):
+        return "extract"
+    if isinstance(node, AiJoin):
+        return "join"
+    if isinstance(node, Filter) and len(node.aliases) == 1:
+        return "condition"
+    raise ValueError(f"a set-attention pipeline does not run {node.type_name!r}")
+
+
+def _node_inputs(node, results, inputs) -> dict:
+    """A node's input values: from the pipeline's results, else from outside it."""
+    return {port.name: (results[port.source.node_id].outputs[port.source.port]
+                        if port.source.node_id in results
+                        else inputs[node.node_id][port.name])
+            for port in node.inputs}
+
+
 def execute_set_pipeline(state, nodes, inputs, context) -> dict:
-    """Run a pipeline of AI filters, classifications, and extractions.
+    """Run a pipeline's operators under set attention, step by step.
 
-    Under set attention, consecutive operators of one kind share their
-    passes; each run reads the rows the run before it kept.
-
-    Raises:
-        ValueError: The pipeline holds another operator.
+    Consecutive operators of one kind share their passes: a table's
+    filters by stage, and classifications or extractions in blocks of
+    the set size. A condition on their columns runs between them. A
+    join's anchors are the rows the steps before it kept, and the
+    classifications of its pairs follow it. Each step reads the rows
+    the step before it kept.
     """
     alias = nodes[0].document_aliases[0]
     ids = pipeline_ids(nodes[0], inputs)
-    runs = []
-    for node in nodes:
-        if not isinstance(node, (AiFilter, AiClassify, AiExtract)):
-            raise ValueError(f"a set-attention pipeline runs AI filters, "
-                             f"classifications, and extractions, not "
-                             f"{node.type_name!r}")
-        if runs and type(runs[-1][-1]) is type(node):
-            runs[-1].append(node)
-        else:
-            runs.append([node])
-    results = {}
-    for index, run in enumerate(runs):
-        if isinstance(run[0], AiFilter):
+    results, join = {}, None
+    for kind, run in groupby(nodes, key=_kind):
+        run = list(run)
+        if kind == "filter":
             run_inputs = filter_inputs(context.state, run[0], ids)
-            if index < len(runs) - 1:
+            if run[-1] is not nodes[-1]:
                 run_inputs["limit"] = None
             results.update(execute_set_filters(state, run, run_inputs))
-            ids = id_positions(results[run[-1].node_id].outputs[
-                f"rows:{alias}"].ids[alias])
-            continue
-        if isinstance(run[0], AiExtract):
+        elif kind == "extract":
             results.update(execute_set_extractions(state, run, {
                 "document_ids": ids, "documents": context.state["documents"],
                 "texts": context.state.get("texts", {})}))
+        elif kind == "label":
+            every = classify_passes(state, [node.spec for node in run], ids,
+                                    context.state["documents"])
+            for node, labels in zip(run, every):
+                priors = [value for port, value in zip(
+                    node.inputs, _node_inputs(node, results, inputs).values())
+                    if port.value_type is ValueType.ROWS]
+                results[node.node_id] = classify_result(node, ids, labels, priors)
+        elif kind == "condition":
+            for node in run:
+                results[node.node_id] = FilterRuntime().execute(
+                    node, _node_inputs(node, results, inputs), context)
+        elif kind == "join":
+            join = JoinPart.prepare(state, run, ids, [], inputs, context)
+            results.update(execute_set_joins(state, join))
+        else:
+            for node in run:
+                results[node.node_id] = joined_label_passes(state, node, join)
             continue
-        every = classify_passes(state, [node.spec for node in run], ids,
-                                context.state["documents"])
-        for node, labels in zip(run, every):
-            priors = [
-                results[port.source.node_id].outputs[port.source.port]
-                if port.source.node_id in results
-                else inputs[node.node_id][port.name]
-                for port in node.inputs if port.value_type is ValueType.ROWS]
-            results[node.node_id] = classify_result(node, ids, labels, priors)
+        last = results[run[-1].node_id].outputs.get(f"rows:{alias}")
+        if last is not None:
+            ids = id_positions(last.ids[alias])
     return results

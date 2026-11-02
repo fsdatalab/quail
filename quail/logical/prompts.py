@@ -490,9 +490,17 @@ def _bind_option_classify_prompt(template, args, labels, descriptions, turn,
     label with its description or else its name, and the option end.
     """
     import re
-    if len(args) != 1:
-        raise CompileError("this model classifies one document per row")
     spec = PROMPT_LAYOUTS[layout]
+    descriptions = descriptions or ("",) * len(labels)
+    lines = "\n".join(
+        f"{code} {description or label.replace('_', ' ')}"
+        for code, label, description in zip(codes, labels, descriptions))
+    if len(args) == 2 and spec.record_label is not None:
+        return _bind_record_option_prompt(template, args, lines, turn,
+                                          task_description, layout, codes, recipe)
+    if len(args) != 1:
+        raise CompileError("this model classifies one document per row, or "
+                           "one joined pair")
     # the text before the placeholder moves after it, into the question
     _, canonical = split_frame(template, spec.document_label)
     _, rest = split_template(canonical)
@@ -502,10 +510,6 @@ def _bind_option_classify_prompt(template, args, labels, descriptions, turn,
     question = m.group(2).strip()
     if task_description:
         question = (question + "\n" if question else "") + task_description
-    descriptions = descriptions or ("",) * len(labels)
-    lines = "\n".join(
-        f"{code} {description or label.replace('_', ' ')}"
-        for code, label, description in zip(codes, labels, descriptions))
     segments = (spec.question_separator + spec.question_label,
                 f"{question}\n\nOptions:\n{lines}{spec.option_end}{turn[1]}")
     return Prompt(template=canonical, args=tuple(args),
@@ -513,6 +517,36 @@ def _bind_option_classify_prompt(template, args, labels, descriptions, turn,
                   tail=m.group(1) + "".join(segments), frame="", frame_text="",
                   kind="label", label_prefix="", layout=layout,
                   tail_segments=segments, **{**recipe, "letters": tuple(codes)})
+
+
+def _bind_record_option_prompt(template, args, lines, turn, task_description,
+                               layout, codes, recipe):
+    """Bind AI.CLASSIFY over a joined pair in a set-attention layout.
+
+    As in a join, the anchor record is the state and the partner record
+    opens the question, then a blank line, the question naming the
+    records, and the option list.
+    """
+    spec = PROMPT_LAYOUTS[layout]
+    if len({argument.alias for argument in args}) != 2:
+        raise CompileError("each placeholder of a classification of joined "
+                           "rows names a distinct table")
+    names = record_names(args)
+    question = name_records(template, names).strip()
+    if task_description:
+        question = (question + "\n" if question else "") + task_description
+    state_tail = spec.question_separator + spec.question_label
+    segments = (JOIN_QUESTION_SEP,
+                f"{question}\n\nOptions:\n{lines}{spec.option_end}{turn[1]}")
+    return Prompt(template=template, args=tuple(args),
+                  preamble=turn[0] + spec.document_label,
+                  tail="".join(segments), frame=state_tail,
+                  frame_text=state_tail, kind="label", label_prefix="",
+                  label_texts=tuple(
+                      (argument.alias, spec.record_label.format(name), state_tail)
+                      for argument, name in zip(args, names)),
+                  layout=layout, tail_segments=segments,
+                  **{**recipe, "letters": tuple(codes)})
 
 
 def _bind_document_classify_prompt(template, args, labels, descriptions,
