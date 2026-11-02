@@ -16,6 +16,7 @@ from quail.logical.expressions import Prompt
 from quail.logical.prompts import (
     LABEL_PREFIX,
     MAX_LETTERS,
+    OPTION_LETTERS,
     PROMPT_LAYOUTS,
     CompileError,
     bind_classify_prompt,
@@ -147,6 +148,91 @@ def choice_letters(count: int, tokenizer=None,
     return tuple(letters)
 
 
+# d1's codes for an option whose own code is not one token, in the order
+# it tries them
+OPTION_FALLBACKS = (
+    OPTION_LETTERS + tuple(f"{index:02d}" for index in range(100))
+    + tuple(chr(code) for code in range(ord("a"), ord("z") + 1))
+    + tuple(f"#{index}" for index in range(200))
+    + tuple(first + second for first in OPTION_LETTERS for second in OPTION_LETTERS))
+
+
+def option_aliases(codes, tokenizer) -> tuple[str, ...]:
+    """Each option's code as d1 writes it.
+
+    An option keeps its own code when that is one unused token, else it
+    takes the first unused one-token fallback.
+
+    Args:
+        codes: The option codes, from option_codes.
+        tokenizer: Callable text -> token ids, without special tokens.
+
+    Raises:
+        CompileError: No one-token code is left for an option.
+    """
+    used, out = set(), []
+
+    def take(code) -> bool:
+        ids = tuple(tokenizer(code))
+        if len(ids) != 1 or ids[0] in used:
+            return False
+        used.add(ids[0])
+        out.append(code)
+        return True
+
+    for code in codes:
+        if not take(code) and not any(take(other) for other in OPTION_FALLBACKS):
+            raise CompileError(f"no one-token option code left for {len(codes)} "
+                               f"options")
+    return tuple(out)
+
+
+def option_spellings(codes, tokenizer) -> tuple[tuple[int, ...], ...]:
+    """Per option, the token ids d1 scores.
+
+    These are its code, then " code" when that is one other token.
+    """
+    out = []
+    for code in codes:
+        (first,) = tokenizer(code)
+        spaced = tuple(tokenizer(" " + code))
+        out.append((first,) + (spaced if len(spaced) == 1 and spaced[0] != first
+                               else ()))
+    return tuple(out)
+
+
+def read_slot_offsets(segment: str, names, tokenizer) -> tuple[int, ...]:
+    """Each read slot's row, counted back from the segment's last token.
+
+    The segment ends in one "<name>:" line per slot. A slot is the token
+    that holds its colon, as d1 reads it; tokenizing the whole segment
+    may join that colon with the line break after it.
+
+    Args:
+        segment: The text of the prompt's last tail segment.
+        names: The slot names, in order.
+        tokenizer: Callable text -> token ids, without special tokens.
+
+    Raises:
+        ValueError: A colon's token differs between the segment and the
+            text through it.
+    """
+    marks = "\n".join(f"{name}:" for name in names)
+    if not segment.endswith(marks):
+        raise ValueError("the read segment ends in its slot lines")
+    whole = list(tokenizer(segment))
+    end, offsets = len(segment) - len(marks), []
+    for name in names:
+        end += len(name) + 1
+        through = list(tokenizer(segment[:end]))
+        if whole[:len(through) - 1] != through[:-1]:
+            raise ValueError(f"the {name!r} slot's colon is not one token "
+                             f"apart from the text before it")
+        offsets.append(len(through) - len(whole))
+        end += 1
+    return tuple(offsets)
+
+
 def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
     """Tokenize a prompt's pieces, and letter a classification when possible.
 
@@ -156,6 +242,15 @@ def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
     """
     if prompt.kind == "score":
         return LoweredPrompt(prompt, (), (), 0)
+    if (prompt.kind == "label" and tokenizer is not None
+            and PROMPT_LAYOUTS[prompt.layout].option_end is not None):
+        codes = option_aliases(prompt.letters, tokenizer)
+        if codes != tuple(prompt.letters):
+            return lower_prompt(bind_classify_prompt(
+                prompt.source, prompt.args, prompt.categories,
+                prompt.descriptions, turn=prompt.turn,
+                task_description=prompt.task_description,
+                layout=prompt.layout, letters=codes), tokenizer)
     lettered = None
     if (prompt.kind == "label" and prompt.categories and not prompt.letters
             and PROMPT_LAYOUTS[prompt.layout].choice_label is None):
@@ -290,15 +385,39 @@ def _answer_token_parts(prompt, model, tokenizer) -> tuple[tuple[int, ...], ...]
             tuple(bound.tail_token_ids))
 
 
-def answer_ids(model, tokenizer) -> tuple[list[int], list[int]]:
-    """The token ids a score compares: yes and no, or TRUE and FALSE.
+def spelling_token_ids(tokenizer, spellings) -> tuple[list[int], list[int]]:
+    """The sorted ids of the spellings that are one token each.
 
     Args:
-        model: The ModelSpec; a reranker answers yes or no.
+        tokenizer: Callable text -> token ids, without special tokens.
+        spellings: (true spellings, false spellings).
+
+    Raises:
+        ValueError: A side has no spelling that is one token.
+    """
+    sides = []
+    for words in spellings:
+        ids = sorted({tokens[0] for tokens in map(tokenizer, words)
+                      if len(tokens) == 1})
+        if not ids:
+            raise ValueError(f"no spelling among {words} is one token")
+        sides.append(ids)
+    return sides[0], sides[1]
+
+
+def answer_ids(model, tokenizer) -> tuple[list[int], list[int]]:
+    """The token ids an answer compares: the model's true and false spellings.
+
+    Args:
+        model: The ModelSpec; a reranker answers yes or no, a model with
+            answer_spellings answers with them, and any other answers
+            TRUE or FALSE.
         tokenizer: Callable text -> token ids.
     """
     if model.role == "reranker":
         return list(tokenizer("yes")), list(tokenizer("no"))
+    if model.answer_spellings:
+        return spelling_token_ids(tokenizer, model.answer_spellings)
     return true_false_token_ids(tokenizer)
 
 

@@ -1,6 +1,7 @@
 """Prepare join requests, retain matching pairs, and collect predicate results."""
 
 import itertools
+from dataclasses import dataclass
 from functools import partial
 
 import numpy as np
@@ -10,9 +11,12 @@ from quail.backends.quail.executor.parts import (
     execute_parts,
     execution_prefix_tree,
     gpu_seconds,
+    input_staging,
     stage_spans,
 )
-from quail.backends.quail.executor.stages import Stage
+from quail.backends.quail.executor.readout import AsyncSlotMargins
+from quail.backends.quail.executor.set_passes import split_passes, state_tails
+from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, join_settlement
 from quail.catalog.pairs import (
@@ -45,6 +49,8 @@ class JoinPart(ExecutionPart):
         """Run prepared join predicates through the shared document scheduler."""
         state.gpu_timing = bool(inputs.get("gpu_timing", False))
         part = cls(state, nodes, inputs, inputs["anchor_ids"])
+        if state.loaded_model.pipeline.whole_sequences:
+            return execute_set_joins(state, part)
         prefixes = inputs["prefixes"]
         return execute_parts(
             state, [part], prefixes, inputs["anchor_keys"],
@@ -202,6 +208,178 @@ class JoinPart(ExecutionPart):
     def results(self) -> dict:
         """Return results for every join predicate in the group."""
         return self._results
+
+
+@dataclass(frozen=True)
+class JoinQuestions:
+    """What a set-attention pass over an anchor asks about its partners.
+
+    An AiJoin has these fields; a classification of a join's pairs
+    builds them from its spec.
+
+    Attributes:
+        partners: The partner aliases, in question order.
+        label_token_ids: Per partner alias, its record label's tokens.
+        tail_token_ids: The tokens after the last partner document.
+        separator_tokens: The tail's first tokens: the blank line after
+            each partner document.
+        frame_token_ids: The state tail after the anchor document.
+        question_header_token_ids: The tokens that open a later question.
+    """
+
+    partners: tuple
+    label_token_ids: tuple
+    tail_token_ids: tuple
+    separator_tokens: int
+    frame_token_ids: tuple
+    question_header_token_ids: tuple
+
+
+def set_join_questions(node, documents, tails) -> list:
+    """Each partner tuple's question tokens, in member order.
+
+    A question is every partner's label and document, each document
+    followed by the blank line that opens the tail and joined to it as
+    the model's tokenizer joins them, then the rest of the tail.
+
+    Args:
+        node: The AiJoin.
+        documents: alias -> the partner documents' token ids, by local
+            position.
+        tails: The model's StateTails.
+    """
+    labels = dict(node.label_token_ids)
+    tail = list(node.tail_token_ids)
+    separator, rest = tail[:node.separator_tokens], tail[node.separator_tokens:]
+    blocks = {alias: [list(labels[alias]) + tails.prefix(document, separator)
+                      for document in documents[alias]]
+              for alias in node.partners}
+    questions = []
+    for positions in itertools.product(
+            *(range(len(blocks[alias])) for alias in node.partners)):
+        tokens = []
+        for alias, position in zip(node.partners, positions):
+            tokens += blocks[alias][position]
+        questions.append(tokens + rest)
+    return questions
+
+
+def join_pass_stage(node, prefixes, anchors, members_of, documents, tails,
+                    readout, set_size: int, budget: int):
+    """One join's passes over the anchors, as one unpaged stage.
+
+    Args:
+        node: The AiJoin, or the JoinQuestions of a classification.
+        prefixes: Per anchor, its head and document token ids.
+        anchors: The anchors to ask, by index into prefixes.
+        members_of: Callable(anchor) -> the member indices it asks, or
+            None for every member.
+        documents: alias -> the partner documents' token ids.
+        tails: The model's StateTails.
+        readout: The readout of each question's last row.
+        set_size: The most questions in one pass.
+        budget: The chunk token budget a pass fits.
+
+    Returns:
+        The Stage, each pass's state tokens, and each pass's anchor;
+        the Stage is None when no anchor asks a member.
+    """
+    questions = set_join_questions(node, documents, tails)
+    lengths = [len(question) for question in questions]
+    header = list(node.question_header_token_ids)
+    frame = list(node.frame_token_ids)
+    states, suffixes, shapes, owners = [], [], [], []
+    for anchor in anchors:
+        members = members_of(anchor)
+        members = range(len(questions)) if members is None else members
+        if not len(members):
+            continue
+        prefix = tails.prefix(prefixes[anchor], frame)
+        for block in split_passes(len(prefix), members, lengths, len(header),
+                                  set_size, budget):
+            suffix, shape = [], []
+            for index, member in enumerate(block):
+                question = (header if index else []) + questions[member]
+                suffix += question
+                shape.append(len(question))
+            states.append(prefix)
+            suffixes.append(suffix)
+            shapes.append(tuple(shape))
+            owners.append(anchor)
+    if not states:
+        return None, states, owners
+    return Stage(suffixes=suffixes, readout=readout, requests=lambda key: [key],
+                 questions=tuple(shapes), decide=lambda _, row: True,
+                 label=f"join ({len(states)} passes)"), states, owners
+
+
+def settled_rows(every, asked) -> dict:
+    """Each anchor's answers at the last join of the group it reached.
+
+    An anchor that reached a join but had no partner to ask there
+    settles with no answers, as unmatched, not with the answers of the
+    join before it.
+
+    Args:
+        every: Per join, anchor -> its answers.
+        asked: Per join, the anchors that reached it.
+    """
+    last = {}
+    for rows, anchors in zip(every, asked):
+        last.update((anchor, rows.get(anchor, [])) for anchor in anchors)
+    return last
+
+
+def execute_set_joins(state, part) -> dict:
+    """Run a group's joins under set attention.
+
+    Each anchor is the state of its passes, and each of its partner
+    tuples is one question; a pass asks up to the model's set size.
+    A later join of the group asks only the anchors with a match in
+    the join before it.
+
+    Args:
+        state: The query's execution state.
+        part: The group's JoinPart, which turns the answers into results.
+    """
+    nodes, inputs = part.nodes, part.inputs
+    tails = state_tails(state)
+    readout = AsyncSlotMargins(state.torch, state.answer_rows)
+    keys = inputs["anchor_keys"]
+    lists_for = inputs.get("anchor_partners")
+    every, own_tokens, all_spans, asked = [], [], [], []
+    reached = range(len(part.ids))
+    for j, node in enumerate(nodes):
+        asked.append(list(reached))
+        stage, states, owners = join_pass_stage(
+            node, inputs["prefixes"], reached,
+            lambda anchor, j=j: (None if lists_for is None
+                                 else lists_for(keys[anchor][1], j)),
+            inputs["partner_documents"], tails, readout,
+            state.loaded_model.model_spec.set_size, state.chunk_tokens)
+        rows, tokens = {}, 0
+        if stage is not None:
+            answers, spans, tokens = run_stages(
+                state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+                [stage], states, state.chunk_tokens, staging=input_staging(state),
+                gpu_timing=state.gpu_timing, paged=False,
+                label=f"join predicate {j}")
+            for position, anchor in enumerate(owners):
+                margins = np.asarray(answers[0][position][0], dtype=float)
+                rows.setdefault(anchor, []).extend((margins > 0).tolist())
+            # one run per join: its stage 0 is the group's stage j
+            all_spans += [({j: by_stage.get(0, 0)}, chunk, start, end)
+                          for by_stage, chunk, start, end in spans]
+        every.append(rows)
+        own_tokens.append(tokens)
+        reached = [anchor for anchor in sorted(rows) if any(rows[anchor])]
+    last = settled_rows(every, asked)
+    for anchor in sorted(last):
+        part.on_settled(anchor, any(last[anchor]), last[anchor])
+    part.finish(every)
+    part.own_tokens = own_tokens
+    part.complete(sum(own_tokens), all_spans, {}, 0)
+    return part.results()
 
 
 def _predicate_tokens(join_stages, answers, lists_for, anchor_keys,
@@ -442,6 +620,7 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
 
     return {
         "prefixes": prefixes,
+        "partner_documents": documents,
         "stage_suffixes": stage_suffixes,
         "stage_frames": [join.get("frame") or [] for join in group],
         "anchor_keys": anchor_keys,

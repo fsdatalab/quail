@@ -27,6 +27,7 @@ from quail.backends.quail.reranker import (
 )
 from quail.catalog.selection import document_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.labels import SET_CHOICE_SCORING
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.progress import answer_sink
 
@@ -85,6 +86,11 @@ class QuailClassifier:
         """
         state = self.state
         rows = np.asarray(rows, dtype=np.int32).reshape(-1)
+        if spec.scoring == SET_CHOICE_SCORING:
+            from quail.backends.quail.executor.operators.set_classify import (
+                set_classify_batch,
+            )
+            return set_classify_batch(state, spec, rows, documents)
         prefixes = document_prefixes(spec, documents, rows)
         keys = [("classify", spec.name, index) for index in range(len(rows))]
         tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)

@@ -89,8 +89,9 @@ def emit_filter(builder, alias, positions, expected_rows, port, followed=False):
             preamble_tokens=lowered.preamble_tokens,
             document_head=tuple(lowered.preamble_token_ids),
             selectivity=p.selectivity, expected_rows=round(surv, 1),
-            arena_writes=(len(orders[alias]) > 1 or followed
-                          or alias in builder.pipelined),
+            arena_writes=(builder.model.reuses_kv
+                          and (len(orders[alias]) > 1 or followed
+                               or alias in builder.pipelined)),
             stop_key=builder.stop_keys.get(alias, ())))
         surv *= effective_selectivity(p.selectivity)
         port = PortRef(ask_id, f"rows:{alias}")

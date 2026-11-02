@@ -110,7 +110,9 @@ class QuailScorer:
         answer_rows = state.answer_rows
         async_scores = state.async_scores
         if async_scores is None or async_scores.rows is not answer_rows:
-            async_scores = AsyncScores(state.torch, answer_rows)
+            async_scores = AsyncScores(
+                state.torch, answer_rows,
+                state.loaded_model.model_spec.answer_temperature)
             state.async_scores = async_scores
         return async_scores
 

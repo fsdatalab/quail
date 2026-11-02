@@ -67,6 +67,25 @@ class PromptLayout:
         choice_label: For a model that classifies by scoring one option
             block per label, the text before an AI.CLASSIFY question;
             None for a model that classifies with Quail's label prompt.
+        record_label: For a set-attention layout, the label before each
+            document of a join, formatted with its table's name; the
+            question then names each document "the <name> record". The
+            anchor document is the state and each partner tuple one
+            question. None keeps the numbered DOCUMENT blocks.
+        label_segment: Whether the separator and question label are
+            tokenized on their own, so a set-attention pass can keep
+            them with the document and open each later question with
+            the label alone.
+        option_end: For a model that classifies by one option code
+            per label, the text after its option list; the question,
+            "Options:", and one "<code> <text>" line per label come
+            before it. None classifies with Quail's label prompt.
+        read_end: For a model that extracts by pointing at document
+            positions, the text after an AI.EXTRACT question; None
+            extracts by decoding the answer.
+        read_slots: The names of the slots such a model points from,
+            each written as "<name>:" on its own line after its turn
+            text.
     """
 
     name: str
@@ -77,11 +96,19 @@ class PromptLayout:
     question_separator: str | None = None
     answer_rows: tuple[int, ...] = ()
     choice_label: str | None = None
+    record_label: str | None = None
+    label_segment: bool = False
+    option_end: str | None = None
+    read_end: str | None = None
+    read_slots: tuple[str, ...] = ()
 
     def question_segments(self, question: str, separator: str) -> list[str]:
         """The text after a document: one entry per tokenized segment."""
         if self.question_separator is not None:
             separator = self.question_separator
+        if self.label_segment:
+            return [separator + self.question_label,
+                    question + self.question_end, *self.answer_segments]
         return [separator + self.question_label + question + self.question_end,
                 *self.answer_segments]
 
@@ -114,6 +141,20 @@ PROMPT_LAYOUTS = {layout.name: layout for layout in (
         answer_rows=(0, 1),
         choice_label="Task type: choice\nQuestion:\n",
     ),
+    # Liquid's d1 decision models: the document, then the question
+    # after "QUESTION:", then the instruction to answer yes or no.
+    PromptLayout(
+        "d1",
+        document_label="",
+        question_label="QUESTION:\n",
+        question_end="\n\nReply with yes or no only.",
+        question_separator="\n\n\n",
+        record_label="{} record:\n",
+        label_segment=True,
+        option_end="\n\nReply with the option code only.",
+        read_end="\n\nRead the text from the state, or nothing if it is absent.",
+        read_slots=("start", "end"),
+    ),
 )}
 
 
@@ -141,6 +182,52 @@ def render_join_frame(template: str, placeholder: int,
     return join_anchor_note(placeholder) + render_join_question(template, layout)
 
 
+def join_tail_segments(layout: str = "ai-if") -> list[str]:
+    """The text after a join's last document, one entry per tokenized segment."""
+    spec = PROMPT_LAYOUTS[layout]
+    return [spec.question_end, *spec.answer_segments]
+
+
+def record_names(args) -> list[str]:
+    """Each join placeholder's record name: its table, or its alias when shared."""
+    tables = [argument.provider or argument.alias for argument in args]
+    return [argument.alias if tables.count(table) > 1 else table
+            for argument, table in zip(args, tables)]
+
+
+def name_records(template: str, names) -> str:
+    """Name each placeholder of a join question as "the <name> record"."""
+    for index, name in enumerate(names):
+        record = f"the {name} record"
+        template = template.replace(f"DOCUMENT {_marker(index)}", record)
+        template = template.replace(_marker(index), record)
+    return template
+
+
+def bind_record_join_prompt(template: str, args: tuple, turn: tuple[str, str],
+                            layout: str) -> Prompt:
+    """Build a join Prompt for a set-attention layout.
+
+    The anchor's label and document, then the question separator and
+    label, are the state; each partner tuple is one question: every
+    partner's label and document, the documents apart by a blank line,
+    then the question. The tail's first segment is that blank line.
+    """
+    spec = PROMPT_LAYOUTS[layout]
+    names = record_names(args)
+    state_tail = spec.question_separator + spec.question_label
+    segments = (JOIN_QUESTION_SEP,
+                name_records(template, names) + spec.question_end + turn[1])
+    return Prompt(template=template, args=tuple(args),
+                  preamble=shared_preamble(turn[0], layout),
+                  tail="".join(segments), frame=state_tail,
+                  frame_text=state_tail, kind="join",
+                  label_texts=tuple(
+                      (argument.alias, spec.record_label.format(name), state_tail)
+                      for argument, name in zip(args, names)),
+                  layout=layout, tail_segments=segments)
+
+
 def render_join_prompt_text(prompt, documents, anchor: int) -> str:
     """The complete canonical text for one join tuple."""
     if len(documents) != len(prompt.args):
@@ -149,6 +236,12 @@ def render_join_prompt_text(prompt, documents, anchor: int) -> str:
             f"{len(documents)} documents")
     if anchor < 0 or anchor >= len(prompt.args):
         raise ValueError(f"join anchor placeholder {anchor} is out of range")
+    if PROMPT_LAYOUTS[prompt.layout].record_label is not None:
+        labels = [label for _, label, _ in prompt.label_texts]
+        blocks = [labels[i] + document for i, document in enumerate(documents)
+                  if i != anchor]
+        return (prompt.preamble + labels[anchor] + documents[anchor]
+                + prompt.frame + JOIN_QUESTION_SEP.join(blocks) + prompt.tail)
     out = prompt.preamble + documents[anchor]
     out += render_join_frame(prompt.template, anchor, prompt.layout)
     for i, document in enumerate(documents):
@@ -351,6 +444,10 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
     recipe = dict(categories=labels, descriptions=descriptions,
                   task_description=task_description, turn=tuple(turn),
                   source=template, letters=tuple(letters))
+    if PROMPT_LAYOUTS[layout].option_end is not None:
+        return _bind_option_classify_prompt(
+            template, args, labels, descriptions, turn, task_description,
+            layout, letters or option_codes(labels), recipe)
     if PROMPT_LAYOUTS[layout].choice_label is not None:
         return _bind_choice_classify_prompt(
             template, args, labels, descriptions, turn,
@@ -365,6 +462,91 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
     return _bind_document_classify_prompt(
         template, args, labels, descriptions, turn,
         task_description, answer_prefix(turn), letters, recipe)
+
+
+OPTION_LETTERS = tuple(chr(ord("A") + index) for index in range(26))
+
+
+def option_codes(labels) -> tuple[str, ...]:
+    """d1's option codes.
+
+    The codes are the labels when each is one letter, else A to Z, then
+    AA, AB, and so on.
+    """
+    labels = [str(label).strip() for label in labels]
+    if labels and all(len(label) == 1 and label.isalpha() for label in labels):
+        return tuple(labels)
+    pairs = [first + second for first in OPTION_LETTERS
+             for second in OPTION_LETTERS]
+    return tuple([*OPTION_LETTERS, *pairs][:len(labels)])
+
+
+def _bind_option_classify_prompt(template, args, labels, descriptions, turn,
+                                 task_description, layout, codes, recipe):
+    """Bind AI.CLASSIFY in a layout that answers with one option code.
+
+    The document, then the question separator and label as the first
+    tail segment, then the question, the option list, one line per
+    label with its description or else its name, and the option end.
+    """
+    import re
+    spec = PROMPT_LAYOUTS[layout]
+    descriptions = descriptions or ("",) * len(labels)
+    lines = "\n".join(
+        f"{code} {description or label.replace('_', ' ')}"
+        for code, label, description in zip(codes, labels, descriptions))
+    if len(args) == 2 and spec.record_label is not None:
+        return _bind_record_option_prompt(template, args, lines, turn,
+                                          task_description, layout, codes, recipe)
+    if len(args) != 1:
+        raise CompileError("this model classifies one document per row, or "
+                           "one joined pair")
+    # the text before the placeholder moves after it, into the question
+    _, canonical = split_frame(template, spec.document_label)
+    _, rest = split_template(canonical)
+    m = re.match(r"(\{\d+\})(.*)", rest, re.DOTALL)
+    if m is None:
+        raise CompileError(f"unexpected AI.CLASSIFY template: {template!r}")
+    question = m.group(2).strip()
+    if task_description:
+        question = (question + "\n" if question else "") + task_description
+    segments = (spec.question_separator + spec.question_label,
+                f"{question}\n\nOptions:\n{lines}{spec.option_end}{turn[1]}")
+    return Prompt(template=canonical, args=tuple(args),
+                  preamble=turn[0] + spec.document_label,
+                  tail=m.group(1) + "".join(segments), frame="", frame_text="",
+                  kind="label", label_prefix="", layout=layout,
+                  tail_segments=segments, **{**recipe, "letters": tuple(codes)})
+
+
+def _bind_record_option_prompt(template, args, lines, turn, task_description,
+                               layout, codes, recipe):
+    """Bind AI.CLASSIFY over a joined pair in a set-attention layout.
+
+    As in a join, the anchor record is the state and the partner record
+    opens the question, then a blank line, the question naming the
+    records, and the option list.
+    """
+    spec = PROMPT_LAYOUTS[layout]
+    if len({argument.alias for argument in args}) != 2:
+        raise CompileError("each placeholder of a classification of joined "
+                           "rows names a distinct table")
+    names = record_names(args)
+    question = name_records(template, names).strip()
+    if task_description:
+        question = (question + "\n" if question else "") + task_description
+    state_tail = spec.question_separator + spec.question_label
+    segments = (JOIN_QUESTION_SEP,
+                f"{question}\n\nOptions:\n{lines}{spec.option_end}{turn[1]}")
+    return Prompt(template=template, args=tuple(args),
+                  preamble=turn[0] + spec.document_label,
+                  tail="".join(segments), frame=state_tail,
+                  frame_text=state_tail, kind="label", label_prefix="",
+                  label_texts=tuple(
+                      (argument.alias, spec.record_label.format(name), state_tail)
+                      for argument, name in zip(args, names)),
+                  layout=layout, tail_segments=segments,
+                  **{**recipe, "letters": tuple(codes)})
 
 
 def _bind_document_classify_prompt(template, args, labels, descriptions,
@@ -559,7 +741,8 @@ def render_extract_question(question: str) -> str:
 
 
 def bind_extract_prompt(args: tuple, question: str,
-                        turn: tuple[str, str] = ("", "")) -> Prompt:
+                        turn: tuple[str, str] = ("", ""),
+                        layout: str = "ai-if") -> Prompt:
     """Bind an AI.EXTRACT prompt over one document column.
 
     The prompt is the document label, the document, the question, the
@@ -572,6 +755,10 @@ def bind_extract_prompt(args: tuple, question: str,
         question: The question the answer is copied for.
         turn: Chat text before the prompt and after the answer template.
             Without it, a line break separates the template and the cue.
+        layout: The PROMPT_LAYOUTS name of the model's prompt text. A
+            layout with a read_end asks the question as a read: the
+            question label, the question, the read end, the turn text,
+            then one line per read slot.
 
     Returns:
         A Prompt whose template is ``{0}``, whose tail is the text
@@ -584,6 +771,15 @@ def bind_extract_prompt(args: tuple, question: str,
     if len(args) != 1:
         raise CompileError("AI.EXTRACT reads one document column")
     validate_question(question)
+    spec = PROMPT_LAYOUTS[layout]
+    if spec.read_end is not None:
+        segments = (spec.question_separator + spec.question_label,
+                    question + spec.read_end + turn[1]
+                    + "\n".join(f"{name}:" for name in spec.read_slots))
+        return Prompt(template="{0}", args=tuple(args),
+                      preamble=turn[0] + spec.document_label,
+                      tail="{0}" + "".join(segments), kind="extract",
+                      source=question, layout=layout, tail_segments=segments)
     preamble = turn[0] + SHARED_PRE
     # the cue opens the model's turn; without turn text it opens a line
     after = (render_extract_question(question) + (turn[1] or "\n")
@@ -662,16 +858,17 @@ def bind_join_prompt(template: str, args: tuple,
             f"document block per table), got aliases {aliases}; to "
             f"mention a table's document again, use its marker in the "
             f"question text, not a second placeholder")
-    spec = PROMPT_LAYOUTS[layout]
-    question = render_join_question(template, layout)
+    if PROMPT_LAYOUTS[layout].record_label is not None:
+        return bind_record_join_prompt(template, args, turn, layout)
+    frame = render_join_frame(template, 0, layout)[len(join_anchor_note(0)):]
     preamble = shared_preamble(turn[0], layout)
-    segments = [spec.question_end, *spec.answer_segments]
+    segments = join_tail_segments(layout)
     segments[-1] += turn[1]
     segments = tuple(segments)
     tail = "".join(segments)
     return Prompt(template=template, args=tuple(args),
                   preamble=preamble, tail=tail,
-                  frame=question, frame_text=question, kind="join",
+                  frame=frame, frame_text=frame, kind="join",
                   label_texts=tuple(
                       (alias, join_label(index),
                        render_join_frame(template, index, layout))

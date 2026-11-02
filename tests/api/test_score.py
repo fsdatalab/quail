@@ -165,3 +165,22 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
     assert finish(query, mixed()).collect().column(
         "topic").to_pylist() == ["refund", "praise", "refund", "praise"]
     session.close()
+
+
+def test_a_set_attention_score_plans_a_document_longer_than_one_page(tmp_path):
+    catalog = Catalog()
+    catalog.register("documents", _provider(
+        tmp_path / "documents.parquet",
+        {"id": [1, 2], "body": [" ".join(["word"] * 2000), "all good"]},
+        id_col="id",
+    ))
+    catalog.register("queries", _provider(
+        tmp_path / "queries.parquet", {"id": [1], "text": ["refund"]},
+        id_col="id",
+    ))
+    session = _session(catalog, model="d1-2b-bf16")
+
+    physical = session.sql(PROJECTION_SQL).plan()
+
+    assert sum(isinstance(node, AiScore) for node in physical.nodes) == 1
+    session.close()

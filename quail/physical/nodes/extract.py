@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
-from ..base import PhysicalNode, validate_integer_setting
+from ..base import PhysicalNode, Token, validate_integer_setting
 from .inference import AiInference, InferenceSpec
 
 
@@ -33,6 +33,13 @@ class ExtractSpec(InferenceSpec):
         top_tokens: Vocabulary candidates returned by each GPU readout.
         first_window_chars: Source characters tokenized in the first window.
         window_chars: Source characters tokenized in later windows.
+        state_tail_tokens: For a set-attention model's read, the prompt
+            tail's tokens that a pass reads with the document.
+        question_header_token_ids: For such a read, the tokens that
+            open the question when it follows another in a pass.
+        read_slots: For such a read, each slot's row counted back from
+            the question's last row, start first; empty decodes the
+            answer instead.
     """
 
     question: str = ""
@@ -44,6 +51,9 @@ class ExtractSpec(InferenceSpec):
     top_tokens: int = 1024
     first_window_chars: int = 64
     window_chars: int = 512
+    state_tail_tokens: int = 0
+    question_header_token_ids: tuple[Token, ...] = ()
+    read_slots: tuple[int, ...] = ()
 
     def __post_init__(self):
         for name in ("max_answer_tokens", "draft_tokens", "expected_answer_tokens",

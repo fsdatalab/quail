@@ -314,24 +314,180 @@ def split_rows(values, rows_per_answer):
 
 
 class AsyncScores(_HostReadout):
-    """Non-blocking yes-against-no sigmoid readout for AI.SCORE."""
+    """Non-blocking yes-against-no sigmoid readout for AI.SCORE.
+
+    Args:
+        torch: The torch module.
+        rows: The AnswerRows of the query's yes and no tokens.
+        temperature: Divides the yes-against-no margin before the sigmoid.
+    """
 
     dtype = np.float32
 
-    def __init__(self, torch, rows):
+    def __init__(self, torch, rows, temperature=1.0):
         super().__init__(torch)
         self.rows = rows
         self.weights = rows.weights.float()
+        self.temperature = temperature
 
     def submit(self, normed):
         torch, rows = self.torch, self.rows
         logits = rows.F.linear(normed.float(), self.weights)
         yes = logits.index_select(1, rows.true_cols).amax(dim=1)
         no = logits.index_select(1, rows.false_cols).amax(dim=1)
-        return self._copy(torch.sigmoid(yes - no))
+        return self._copy(torch.sigmoid((yes - no) / self.temperature))
 
     def result(self, handle):
         return super().result(handle, copy=False)
+
+
+class _SlotReadout(_HostReadout):
+    """A set-attention pass's readout, whose answer is one row per question.
+
+    The result is an object array holding each answer's rows in order.
+    """
+
+    dtype = np.dtype(object)
+
+    def result(self, handle):
+        *transfer, rows_per_answer = handle
+        return split_rows(super().result(transfer), rows_per_answer)
+
+
+class AsyncSlotMargins(_SlotReadout):
+    """Each read row's best true logit minus its best false logit, per answer.
+
+    Args:
+        torch: The torch module.
+        rows: The AnswerRows of the query's true and false tokens.
+    """
+
+    def __init__(self, torch, rows):
+        super().__init__(torch)
+        self.rows = rows
+        self.weights = rows.weights.float()
+
+    def submit(self, normed, rows_per_answer=None):
+        rows = self.rows
+        logits = rows.F.linear(normed.float(), self.weights)
+        margins = (logits.index_select(1, rows.true_cols).amax(dim=1)
+                   - logits.index_select(1, rows.false_cols).amax(dim=1))
+        return (*self._copy(margins), rows_per_answer)
+
+
+def pointer_spans(torch, F, rows, queries, firsts, states, span_tokens):
+    """Every read's span in a chunk, computed together.
+
+    A read has a start and an end slot. Each slot scores its answer's
+    document rows by dot product over the square root of the width; the
+    first document row stands for nothing. A read is found when its
+    start's probability off the first row is at least one half; its span
+    is then the likeliest start and end at most span_tokens rows apart.
+
+    Args:
+        torch: The torch module.
+        F: torch.nn.functional.
+        rows: (read rows, width) float32 rows of the chunk's answers.
+        queries: (reads * 2, width) the slot rows, start then end, read by read.
+        firsts: Per read, its answer's first row in rows.
+        states: Per read, its answer's document rows.
+        span_tokens: The longest span, in rows.
+
+    Returns:
+        (reads, 3): each read's first and last document row, (0, 0) for
+        nothing, and its raw P(found).
+    """
+    widest = int(states.max())
+    device = rows.device
+
+    def tensor(array):
+        return torch.from_numpy(np.ascontiguousarray(array)).to(device)
+
+    # each slot against every row of the chunk: (slots, rows); a slot
+    # then keeps only its own answer's document rows
+    scores = queries @ rows.T / math.sqrt(rows.shape[-1])
+    valid = np.arange(widest)[None, :] < states[:, None]
+    columns = np.where(valid, firsts[:, None] + np.arange(widest), 0)
+    logits = scores.gather(1, tensor(np.repeat(columns, 2, axis=0)))
+    logits = logits.masked_fill(~tensor(np.repeat(valid, 2, axis=0)), -math.inf)
+    start, end = logits.log_softmax(-1).view(-1, 2, widest).unbind(1)
+    found = -torch.expm1(start[:, 0])
+    if widest == 1:
+        return torch.cat((torch.zeros_like(start).repeat(1, 2), found[:, None]), -1)
+    cap = min(span_tokens, widest - 1)
+    windows, indices = F.max_pool1d(
+        F.pad(end[:, None, 1:], (0, cap - 1), value=-math.inf),
+        cap, stride=1, return_indices=True)
+    index = (start[:, 1:] + windows[:, 0]).argmax(-1)
+    last = indices[:, 0].gather(1, index[:, None])[:, 0] + 1
+    at = torch.stack((index + 1, last), -1).float()
+    # nothing when P(found) is under one half, or when the answer has no
+    # document row past the first
+    nothing = (found < 0.5) | tensor(states == 1)
+    at = torch.where(nothing[:, None], torch.zeros_like(at), at)
+    return torch.cat((at, found[:, None]), -1)
+
+
+class AsyncPassReadout(_SlotReadout):
+    """A set-attention pass's answers to questions of any kind, per document.
+
+    An answer's rows are, when the pass holds a read, its document rows,
+    then its slot rows in question order. A code slot (a yes/no or an
+    option-code question's last row) is projected through the output
+    head's rows for the targets. A read's start and end slots point at
+    the document rows (pointer_spans). Each answer's result is one row:
+    the code slots' target logits, then each read's first row, last row,
+    and raw P(found).
+
+    Args:
+        torch: The torch module.
+        F: torch.nn.functional.
+        head: The model's full output head.
+        targets: The token ids the code slots are read for, in column order.
+        slot_kinds: Per slot row of an answer, "code", "start", or "end";
+            None reads every row as a code slot, answers of any number
+            of rows, each answer's result its rows' target logits.
+        span_tokens: The longest span a read returns, in rows.
+    """
+
+    def __init__(self, torch, F, head, targets, slot_kinds, span_tokens=0):
+        super().__init__(torch)
+        self.F = F
+        self.weights = head.index_select(0, torch.tensor(
+            list(targets), device=head.device)).float()
+        self.ragged = slot_kinds is None
+        kinds = np.asarray(() if slot_kinds is None else slot_kinds)
+        self.slots = len(kinds)
+        self.code = np.flatnonzero(kinds == "code")
+        # start then end, read by read
+        self.read = np.flatnonzero((kinds == "start") | (kinds == "end"))
+        self.span_tokens = span_tokens
+
+    def submit(self, normed, rows_per_answer=None):
+        torch = self.torch
+        rows = normed.float()
+        if self.ragged:
+            return (*self._copy(rows @ self.weights.T), rows_per_answer)
+        counts = np.asarray(rows_per_answer, dtype=np.int64)
+        firsts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+        states = counts - self.slots
+        slot_rows = (firsts + states)[:, None] + np.arange(self.slots)
+
+        def take(columns):
+            index = np.ascontiguousarray(slot_rows[:, columns].reshape(-1))
+            return rows.index_select(0, torch.from_numpy(index).to(rows.device))
+
+        answers = len(counts)
+        parts = []
+        if len(self.code):
+            parts.append((take(self.code) @ self.weights.T).view(answers, -1))
+        if len(self.read):
+            reads = len(self.read) // 2
+            spans = pointer_spans(
+                torch, self.F, rows, take(self.read), np.repeat(firsts, reads),
+                np.repeat(states, reads), self.span_tokens)
+            parts.append(spans.view(answers, -1))
+        return (*self._copy(torch.cat(parts, -1)), None)
 
 
 class DecisionHead:

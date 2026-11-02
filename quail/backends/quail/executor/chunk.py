@@ -507,6 +507,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     reader_rows = []
     kv_writes, layout = [], []
     row_spans = []
+    # per group: (first row, end row), or under set attention (first
+    # row, end of the state, each question's rows after it)
+    passes = []
     fresh_keys = []
     read_keys, read_used, cu_q = [], [], [0]
     max_q = 0
@@ -613,8 +616,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if n != 1 or len(mask) != total:
                 raise ValueError(
                     f"group {key!r}: read_mask marks one suffix's rows")
-            finals.append(s_row0 + np.flatnonzero(mask))
-            rows_per_answer.append(np.array([int(mask.sum())], dtype=np.int64))
+            reads = s_row0 + np.flatnonzero(mask)
+            state_reads = g.get("state_reads")
+            if state_reads is not None:
+                # a pointer read's document rows, read before its slots
+                reads = np.concatenate(
+                    [row0 + np.asarray(state_reads, dtype=np.int64), reads])
+            finals.append(reads)
+            rows_per_answer.append(np.array([len(reads)], dtype=np.int64))
             multi_row = True
         elif n and g.get("read_rows") is not None:
             # the last read_rows rows of each suffix carry the answers
@@ -680,6 +689,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         num_s = num_tokens - s_row0
         layout.append((key, n))
         row_spans.append((key, row0, prefix_end, num_tokens))
+        questions = g.get("questions")
+        passes.append((row0, num_tokens) if questions is None else
+                      (row0, prefix_end, questions))
         if stacked:
             # every row of the group reads the parent's pages up to
             # start; siblings packed back to back share that read
@@ -982,7 +994,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
         unified=unified, canvas=canvas_meta, gdn=gdn, shared=shared,
-        cu_a=stage("cu_a", cu_a, torch.int32),
+        cu_a=stage("cu_a", cu_a, torch.int32), passes=tuple(passes),
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
     out = Chunk(
         input_ids=_staged_token_parts(

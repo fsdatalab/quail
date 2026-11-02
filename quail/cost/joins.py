@@ -1,5 +1,6 @@
 """Model work for a join with given row counts and KV residency."""
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -159,3 +160,54 @@ def stage_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
         state_read=count * per_anchor,
     )
     return (start + stream) * frac
+
+
+def packed_join_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
+                     lengths: dict, pre: int, *, window: int = 0,
+                     set_size: int) -> Work:
+    """Expected Work of one join under set attention.
+
+    Each anchor is the state of its own passes, and each partner tuple
+    is one question. An anchor with k expected tuples runs
+    ceil(k / set_size) passes of k / passes questions each. The state
+    is the preamble, the anchor's label and document, and the frame; a
+    question is every partner's label and mean document, then the tail.
+    The sums of the anchor lengths and their squares give packed() of
+    every pass in closed form.
+
+    Args:
+        spec: The join.
+        anchor: The table whose documents are the states.
+        n: Expected anchors with a candidate partner.
+        tuples: Expected partner tuples over those anchors.
+        lengths: alias -> AliasStats of the live documents.
+        pre: Engine preamble tokens.
+        window: The model's sliding window, or 0.
+        set_size: The most questions in one pass.
+    """
+    stats = lengths[anchor]
+    if window != stats.window:
+        raise ValueError("length summaries must use the model attention window")
+    if stats.count == 0 or n <= 0:
+        return Work()
+    partners = [alias for alias in spec.aliases if alias != anchor]
+    question = spec.tail_tokens + sum(
+        spec.label_tokens[p] + lengths[p].mean for p in partners)
+    head = pre + spec.label_tokens[anchor] + spec.frame_tokens[anchor]
+    per_anchor = tuples / n
+    passes = max(1, math.ceil(per_anchor / set_size))
+    asked = per_anchor / passes
+    questions = asked * question
+    count = stats.count
+    state_sum = stats.total + head * count
+    state_squared = (stats.squared + 2 * head * stats.total
+                     + head * head * count)
+    tokens = state_sum + count * questions
+    pass_work = Work(
+        tokens=tokens,
+        pairs=(state_squared + 2 * questions * state_sum
+               + count * asked * question * question),
+        kv_written=tokens,
+        kv_read=tokens if asked <= 1 else 2 * tokens,
+        sliding_pairs=stats.window_pairs(head + questions) if window else 0.0)
+    return pass_work * (passes * n / count)

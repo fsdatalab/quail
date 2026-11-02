@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from quail.cost.budgets import parallel_copies
 from quail.cost.sol import speed_of_light
-from quail.cost.work import Work, triangle
+from quail.cost.work import Work, packed, triangle
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -94,6 +94,17 @@ class ScoreCost:
                 prefix = float(shared)
                 prefix_variance = 0.0
                 groups = min(float(self.gpus), expected_rows)
+        if self.model.attention_mask == "set":
+            # each row is one pass: its prompt head, document, and question
+            question = self.token_lengths[-1]
+            state = self.mean_tokens + fixed_tokens - question
+            work = packed(state, (question,),
+                          window=self.model.sliding_window) * expected_rows
+            work += Work(pairs=sum(s.variance for s in summaries) * expected_rows)
+            return work, speed_of_light(
+                work * (1 / parallel_copies(
+                    self.gpus, min(expected_rows, summaries[0].count))),
+                self.model, self.device, self.chunk_tokens).seconds
         work = score_work(
             expected_rows, self.mean_tokens, fixed_tokens,
             variance=sum(summary.variance for summary in summaries),

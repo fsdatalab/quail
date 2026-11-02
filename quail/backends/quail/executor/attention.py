@@ -281,6 +281,27 @@ class Engine:
             num_warps=8 if head_dim > 256 else 4)
         return q, k, v
 
+    def qk_norm_rope_heads(self, qkv, positions, *, num_q_heads, num_kv_heads,
+                           head_dim, q_weight, k_weight, eps, cos_sin_cache):
+        """The fused per-head q and k RMS norm plus neox rotary, any geometry.
+
+        qkv_norm_rope_heads without the norm of v: q and k are read from
+        the front of each qkv row, whatever columns follow them.
+        Returns contiguous q (rows, num_q_heads * head_dim) and k (rows,
+        num_kv_heads * head_dim).
+        """
+        n = qkv.shape[0]
+        torch = self.torch
+        q = torch.empty((n, num_q_heads * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        k = torch.empty((n, num_kv_heads * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        self._triton_kernels()["qk"][(n,)](
+            qkv, q, k, cos_sin_cache, positions, q_weight, k_weight,
+            qkv.stride(0), q.stride(0), k.stride(0), eps,
+            QH=num_q_heads, KH=num_kv_heads, HD=head_dim, HALF=head_dim // 2)
+        return q, k
+
     def gelu_mul_quant(self, gate_up):
         """gelu_tanh(gate) * up, quantized to fp8 with per-row scales."""
         return self._gelu_mul_quant(gate_up, match_vllm_rounding=False)

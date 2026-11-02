@@ -127,6 +127,29 @@ def stream(prefix: float, suffixes, *, window: int = 0) -> Work:
     )
 
 
+def packed(state, questions, *, window: int = 0) -> Work:
+    """Work of one set-attention pass: a state, then its questions, nothing kept.
+
+    On the full-attention layers the state reads every token and each
+    question reads the state and itself, so a lone question reads the
+    whole sequence. The other layers read causally through the sequence.
+    The state's keys are read once for all questions, then once more
+    for each question's own tokens.
+
+    Args:
+        state: State tokens, or an array of them per document.
+        questions: Each question's tokens, its header included.
+        window: Attention window of the sliding layers, or 0.
+    """
+    questions = tuple(questions)
+    asked = float(sum(questions))
+    n = state + asked
+    pairs = state * n + sum(q * (state + q) for q in questions)
+    read = n if len(questions) == 1 else n + state + asked
+    return Work(tokens=n, pairs=pairs, kv_written=n, kv_read=read,
+                sliding_pairs=triangle(n, window) if window else 0.0)
+
+
 def decode(prefix, rounds, *, window: int = 0) -> Work:
     """Append accepted tokens over sequential rounds, rereading KV each round.
 

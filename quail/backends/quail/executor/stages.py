@@ -103,6 +103,16 @@ class Stage:
             request, as AI.MAP's answer. Admission reserves headroom for each answer.
         answer_index: Index of this stage's first map in the decoder.
         answer_dependencies: Decoder fields this stage's requests read.
+        questions: Under set attention, per suffix, the tokens of each
+            question in it, in order, after the state that the prefix
+            holds; each document requests one suffix, and each
+            question's question_slots rows are read. Empty when the
+            whole sequence is one question.
+        question_slots: The rows read in each question, counted back
+            from its last row; or, per question, its own such rows.
+        state_reads: Optional callback from document index to the rows
+            of its prefix to read before the questions' rows, as a
+            pointer read scores them.
     """
 
     DROP = DROP
@@ -128,6 +138,9 @@ class Stage:
     answer_tokens: int = 0
     answer_index: int = 0
     answer_dependencies: tuple[int, ...] = ()
+    questions: tuple = ()
+    question_slots: tuple = (0,)
+    state_reads: Callable | None = None
 
     def __post_init__(self):
         if self.own_suffixes:
@@ -202,6 +215,25 @@ def _advance_stage(stages, a, j, row):
     if stage.decide is None:
         return bool(any(row) if stage.readout.dtype is None else np.any(row))
     return bool(stage.decide(a, row))
+
+
+def question_ends(questions, slots=(0,)) -> np.ndarray:
+    """The mask of each question's read rows in a suffix of these questions.
+
+    Args:
+        questions: Each question's tokens, in order.
+        slots: Each read row, counted back from its question's last row;
+            or, per question, its own such rows.
+    """
+    mask = np.zeros(int(sum(questions)), dtype=bool)
+    ends = np.cumsum(questions) - 1
+    if slots and isinstance(slots[0], tuple):
+        for end, own in zip(ends, slots):
+            mask[end + np.asarray(own, dtype=np.int64)] = True
+        return mask
+    for slot in slots:
+        mask[ends + slot] = True
+    return mask
 
 
 def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
@@ -290,7 +322,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         torch, arena, pipeline, stages, anchor_prefixes, budget,
         anchor_keys=anchor_keys, on_settled=on_settled, staging=staging,
         attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
-        limit=limit, survival=survival, paged=paged or pipeline.needs_pages,
+        limit=limit, survival=survival,
+        paged=(paged or pipeline.needs_pages) and not pipeline.whole_sequences,
         unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,

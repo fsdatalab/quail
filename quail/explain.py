@@ -456,7 +456,12 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                       "kept": "from an earlier join"}.get(
                           node.anchor_resident, node.anchor_resident)
             keep = "yes" if node.keep_kv else "no"
-            details.append(f"KV: anchor={source}, retain after join={keep}")
+            size = (estimates_by_node.get(node.node_id, {})
+                    .get("pass_questions"))
+            details.append(
+                f"set passes: each anchor document, then up to {size} "
+                f"partner rows as questions" if size else
+                f"KV: anchor={source}, retain after join={keep}")
             label = (f"join {node.written_position + 1} {node.semantics} "
                      f"({node.anchor}, {', '.join(node.partners)})")
             if node.pairs_from:
@@ -516,6 +521,17 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     details.extend(_fields(vars(measured), 0))
             else:
                 title += " (metrics unavailable)"
+        members = estimate.get("pass_members")
+        if members:
+            others = [member for member in members if member != node.node_id]
+            if members[0] == node.node_id:
+                details.append(
+                    f"set pass: {len(members)} question"
+                    f"{'s' if len(members) > 1 else ''} per document pass"
+                    + (f", with {', '.join(others)}" if others else ""))
+            else:
+                details.append(f"set pass: asked in {members[0]}'s pass, "
+                               f"priced there")
         if "release_recompute_tokens" in estimate:
             details.append(
                 "expected recompute at the join if the sequence's KV is "
@@ -541,6 +557,22 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         if node.node_id not in visited:
             visit(node, 0)
     lines = _table(rows)
+    passes = list(dict.fromkeys(
+        estimate["pass_members"] for estimate in estimates_by_node.values()
+        if estimate.get("pass_members")))
+    if passes:
+        aliases = dict.fromkeys(graph.node(members[0]).document_aliases[0]
+                                for members in passes)
+        for alias in aliases:
+            own = [members for members in passes
+                   if graph.node(members[0]).document_aliases[0] == alias]
+            lines.append(f"Passes on {alias}: " + " -> ".join(
+                "[" + ", ".join(members) + "]" for members in own)
+                + " (each pass reads the document again, then its "
+                "questions; nothing is kept between passes)")
+        if used_default:
+            lines.append(DEFAULT_NOTE)
+        return "\n".join(lines)
     seen = set()
     for member_id, pipeline in build_pipelines(graph).items():
         if id(pipeline) in seen or len(pipeline) < 2:
@@ -633,7 +665,10 @@ def architecture_lines(model_name: str) -> list[str]:
         if spec.gdn_weight_precision is not None:
             gemm += f" (recurrent projections {spec.gdn_weight_precision})"
     paths = [f"linear layers: {gemm}"]
-    if "full_attention" in kinds or "sliding_attention" in kinds:
+    if spec.attention_mask == "set":
+        paths.append("attention: FlashAttention, set attention on the full "
+                     "layers as three calls merged by log-sum-exp, no KV kept")
+    elif "full_attention" in kinds or "sliding_attention" in kinds:
         paths.append("attention: FlashAttention over paged KV")
     if "gated_delta_net" in kinds:
         requested = os.environ.get("QUAIL_GDN_PREFILL", "auto")
@@ -644,6 +679,14 @@ def architecture_lines(model_name: str) -> list[str]:
     return [f"architecture={spec.arch} ({layers}), "
             f"weights={spec.weight_precision}",
             "kernels: " + "; ".join(paths)]
+
+
+def _reuses_kv(model_name: str) -> bool:
+    """Whether a registered model keeps documents' KV for later questions."""
+    from quail.specs import MODELS
+
+    spec = MODELS.get(model_name)
+    return spec is None or spec.reuses_kv
 
 
 def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
@@ -679,7 +722,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         budgets = ["KV=bf16"]
         if chunk is not None:
             budgets.append(f"chunk budget={chunk:,} tokens")
-        if admission is not None:
+        if admission is not None and _reuses_kv(physical.model):
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
         for alias, columns in sorted(physical.settings.get("deduplicate", {}).items()):
@@ -694,7 +737,11 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         metrics=None if result is None else result.node_metrics,
         stages=None if result is None else measured_stages(result.report),
     ).splitlines())
-    if physical.estimates and not any(
+    if any("pass_members" in entry for entry in (physical.estimates or {}).values()):
+        lines.append("  est. time is each pass group's work, on its first "
+                     "operator; the other operators in the group are asked "
+                     "in its passes")
+    elif physical.estimates and not any(
             isinstance(node, QueryStage) for node in physical.nodes):
         lines.append("  est. time is each node's work alone; node times do "
                      "not add up to the plan estimate")

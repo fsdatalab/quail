@@ -17,7 +17,8 @@ from quail.cost import budgets
 from quail.cost.extract import estimate as extract_estimate
 from quail.cost.score import score_fixed_tokens
 from quail.cost.sol import speed_of_light
-from quail.cost.work import Work, ask, scan
+from quail.cost.work import Work, ask, packed, scan
+from quail.logical.prompts import PROMPT_LAYOUTS
 from quail.physical import (
     AiClassify,
     AiExtract,
@@ -29,6 +30,12 @@ from quail.physical import (
     PhysicalGraph,
 )
 from quail.physical.pipelines import build_pipelines, resident_inputs
+from quail.planner.graph.passes import (
+    expected_documents,
+    head_tokens,
+    pass_members,
+    question_tokens,
+)
 from quail.planner.operators.classify import classify_scoring
 from quail.planner.operators.map import map_seconds
 from quail.planner.statistics.prefixes import key_documents, page_tree
@@ -76,6 +83,50 @@ class PlanPricer:
         return self._seconds(work) + seconds, entries
 
     def _priced(self, graph) -> dict:
+        out = self._each_priced(graph)
+        if self.context.model.attention_mask == "set":
+            out.update(self._set_passes(graph))
+            for node in graph.nodes:
+                if isinstance(node, AiJoin):
+                    price, entry = out[node.node_id]
+                    entry["pass_questions"] = self.context.model.set_size
+        return out
+
+    def _set_passes(self, graph) -> dict:
+        """Price a set-attention plan's passes: each group of operators sharing them.
+
+        A group's first operator carries the work of its passes, one
+        packed() pass per document over every question in the group; the
+        others carry none. Each entry names the group's operators.
+        """
+        context = self.context
+        model = context.model
+        layout = PROMPT_LAYOUTS[model.prompt_layout]
+        state_tail = len(context.tokenizer(layout.question_separator
+                                           + layout.question_label))
+        header = len(context.tokenizer(layout.question_label))
+        out = {}
+        for members in pass_members(graph):
+            first = members[0]
+            alias = first.document_aliases[0]
+            summary = summarize_alias(context.document_tokens[alias],
+                                      model.sliding_window, memo=context.memo)
+            questions = [question_tokens(node, state_tail) + (header if index else 0)
+                         for index, node in enumerate(members)]
+            rows = expected_documents(first) * self._distinct(alias)
+            work = (packed(head_tokens(first) + summary.mean + state_tail, questions,
+                           window=model.sliding_window)
+                    + Work(pairs=summary.variance)) * rows
+            ids = tuple(node.node_id for node in members)
+            for node in members:
+                price = NodePrice(work=work if node is first else Work())
+                entry = {"pass_members": ids}
+                if node is first:
+                    entry["seconds"] = self._seconds(work)
+                out[node.node_id] = (price, entry)
+        return out
+
+    def _each_priced(self, graph) -> dict:
         pipelines = build_pipelines(graph)
         anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
         last_filters = {node.alias: node.node_id for node in graph.nodes

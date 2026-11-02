@@ -71,6 +71,19 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
     return out
 
 
+def join_document_head(context, prompt, anchor) -> tuple:
+    """The tokens before each anchor document.
+
+    A set-attention layout labels the anchor record before its document.
+    """
+    lowered = context.lowered(prompt)
+    head = tuple(lowered.preamble_token_ids)
+    if context.model.attention_mask == "set":
+        head += next(tuple(label) for alias, label, _ in lowered.label_token_ids
+                     if alias == anchor)
+    return head
+
+
 def emit_join(
     builder, spec, step, anchor, join_id, exec_index, port_by_alias
 ) -> tuple:
@@ -110,8 +123,8 @@ def emit_join(
         anchor_documents=round(step.anchor_documents, 1),
         anchor_frame_tokens=spec.frame_tokens[anchor],
         pair_tail_tokens=spec.tail_tokens,
-        document_head=tuple(builder.context.lowered(
-            builder.operators.joins[spec.written_position].prompt).preamble_token_ids),
+        document_head=join_document_head(builder.context, builder.operators.joins[
+            spec.written_position].prompt, anchor),
         anchor_resident=step.resident,
         tuple_tokens=round(step.tokens, 1),
         pairs_from=pairs_from))

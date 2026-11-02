@@ -5,8 +5,14 @@ from dataclasses import dataclass
 from quail.cost import budgets
 from quail.cost.score import ScoreCost
 from quail.cost.work import Work
-from quail.logical import ColumnRef, RegularPredicate, effective_selectivity
+from quail.logical import (
+    ColumnRef,
+    RegularPredicate,
+    bind_prompt,
+    effective_selectivity,
+)
 from quail.logical.prompts import (
+    PROMPT_LAYOUTS,
     prompt_aliases,
     score_query_template,
 )
@@ -19,7 +25,7 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.planner.operators.common import bind_inference, inference_node
 from quail.planner.plan import Refusal
-from quail.planner.prompt_lowering import score_token_parts
+from quail.planner.prompt_lowering import lower_prompt, score_token_parts
 from quail.planner.statistics.memory import arena_capacity
 from quail.planner.statistics.tables import pair_counts, summarize_alias
 from quail.planner.validation import (
@@ -72,6 +78,23 @@ def score_name(prompt, projected, fallback: str) -> str:
     )
 
 
+def set_score_parts(prompt, model, tokenizer) -> dict:
+    """A set-attention score's state tail length and later-question header.
+
+    A score of one table asks the AI.IF question of a filter; a pass
+    reads the first tail segment with the document. Other scores get
+    no fields.
+    """
+    if model.attention_mask != "set" or len(prompt_aliases(prompt)) != 1:
+        return {}
+    lowered = lower_prompt(bind_prompt(prompt.template, prompt.args, model.turn,
+                                       model.prompt_layout), tokenizer)
+    layout = PROMPT_LAYOUTS[model.prompt_layout]
+    return dict(
+        state_tail_tokens=len(tokenizer(lowered.prompt.tail_segments[0])),
+        question_header_token_ids=tuple(tokenizer(layout.question_label)))
+
+
 def score_spec(prompt, *, name, expected_rows, mean_tokens, context,
                chunk_tokens, pair_fraction=1.0, prefix_groups=None):
     """Build a score specification from prepared prompt tokens and costs."""
@@ -82,7 +105,8 @@ def score_spec(prompt, *, name, expected_rows, mean_tokens, context,
         ScoreSpec, prompt, name=name,
         query_template=score_query_template(prompt),
         expected_rows=expected_rows, estimated_seconds=seconds,
-        pair_fraction=pair_fraction, prompt_token_parts=parts, draws=cost.draws), work
+        pair_fraction=pair_fraction, prompt_token_parts=parts, draws=cost.draws,
+        **set_score_parts(prompt, context.model, context.tokenizer)), work
 
 
 class ScoreLowering:
@@ -109,7 +133,8 @@ class ScoreLowering:
         what = (f"a document in {spec.aliases[0]!r}" if len(spec.aliases) == 1
                 else f"one pair of {spec.aliases[0]!r} and {spec.aliases[1]!r}")
         needed, available, unit = prefix + suffix, self.chunk, "tokens"
-        if needed <= available:
+        # a set-attention pass keeps no KV, so only the chunk bounds it
+        if needed <= available and self.context.model.reuses_kv:
             page_tokens = self.context.device.page_tokens
             needed = (budgets.pages(prefix, page_tokens)
                       + budgets.pages(suffix, page_tokens))

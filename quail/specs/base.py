@@ -133,6 +133,23 @@ class ModelSpec:
     #                       to every prompt: Quail tokenizes without special
     #                       tokens, so the prefix carries it, and the text
     #                       sent to vLLM drops it because vLLM adds its own
+    answer_temperature: float = 1.0    # divides a score's yes-against-no
+    #                                    margin before the sigmoid
+    read_found: tuple[tuple[float, float], ...] = ()    # a pointer
+    #                    read's (raw, calibrated) P(found) knots, read
+    #                    linearly between knots and flat past the ends;
+    #                    empty keeps the raw value
+    read_span_tokens: int = 0    # the longest span a pointer read returns
+    set_size: int = 0    # the most questions one set-attention pass
+    #                      holds: the size the model was trained with
+    attention_mask: Literal["causal", "set"] = "causal"
+    #                    "set": d1's set attention, under which a
+    #                    document reads its questions, so a document's
+    #                    work is redone in every pass and no KV is kept
+    answer_spellings: tuple[tuple[str, ...], tuple[str, ...]] = ()
+    #                    (true spellings, false spellings) that a
+    #                    filter, join, or score reads at the answer row;
+    #                    empty reads TRUE against FALSE
     prompt_format: str = "raw-v1"    # names the turn layout in run records
     prompt_layout: str = "ai-if"     # the PROMPT_LAYOUTS entry AI.IF
     #                                  prompts are written in
@@ -194,6 +211,15 @@ class ModelSpec:
     def keeps_kv(self, layer: int) -> bool:
         """Whether the layer stores KV; Gated DeltaNet and convolution layers do not."""
         return self.layer_kind(layer) in ("full_attention", "sliding_attention")
+
+    @property
+    def reuses_kv(self) -> bool:
+        """Whether a document's KV can be kept and read again by later questions.
+
+        False under set attention, where a document reads its questions,
+        so each pass computes it afresh and no KV is kept or shared.
+        """
+        return self.attention_mask != "set"
 
     @property
     def attention_layers(self) -> tuple[int, ...]:

@@ -234,11 +234,12 @@ def checkpoint_memory_bytes(model: ModelSpec, chunk_tokens: int,
                             page_tokens: int = PAGE_TOKENS) -> float:
     """Return workspace, execution KV, and one retained document's KV and state.
 
-    Models without checkpoints reserve zero bytes. A retained document can
+    Models without checkpoints, and models with set attention, which
+    keep none, reserve zero bytes. A retained document can
     be as long as a chunk; startup reserves at least the default document
     length used by the checkpoint pool.
     """
-    if not model.checkpoint_bytes:
+    if not model.checkpoint_bytes or not model.reuses_kv:
         return 0
     document_tokens = max(chunk_tokens, CHECKPOINT_DEFAULT_DOC_TOKENS)
     reserved_pages = (execution_pages(chunk_tokens, page_tokens)
@@ -306,6 +307,9 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
                 mean_document_tokens: float | None = None) -> tuple[int, int]:
     """Pages of the two KV pools: (every-token pool, sliding-layer pool).
 
+    A model with set attention keeps no KV between chunks and gets one
+    page in each pool.
+
     A model with Gated DeltaNet layers gets the KV pages left beside its
     checkpoints (see hybrid_arena_pages) and 0 sliding pages.
 
@@ -318,6 +322,10 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     mean sizes it as if every document fit in the window, the largest
     fraction.
     """
+    if not model.reuses_kv:
+        # a set-attention model keeps no KV between chunks; the arena
+        # needs one page in each pool to exist
+        return 1, 1 if model.sliding_layer_set else 0
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
     if model.state_layers:

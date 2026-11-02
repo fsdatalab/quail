@@ -11,7 +11,7 @@ from quail.logical import (
     is_score,
 )
 from quail.logical.expressions import aliased_call
-from quail.logical.prompts import prompt_aliases
+from quail.logical.prompts import PROMPT_LAYOUTS, prompt_aliases
 from quail.physical import AiClassify, AiJoin
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import Refusal
@@ -208,6 +208,12 @@ def extraction_refusal(context, function: str = "AI.EXTRACT") -> Refusal | None:
     elif model.role in ("reranker", "decision") or model.canvas_tokens:
         reason = (f"{function} decodes the model's next tokens, which "
                   f"{model.name!r} does not give")
+    elif PROMPT_LAYOUTS[model.prompt_layout].read_end is not None:
+        # the model answers by scoring options and document positions
+        if function == "AI.EXTRACT":
+            return None
+        reason = (f"{function} writes text, and {model.name!r} answers only "
+                  f"by scoring options")
     else:
         return None
     return Refusal(reasons=(reason,), constraint=constraint,
@@ -296,10 +302,32 @@ def attention_device_refusal(model, device):
     )
 
 
+def set_attention_refusal(operators, model) -> Refusal | None:
+    """Check whether a set-attention model can run the query's AI operators.
+
+    Such a model reads one document and its questions in one pass.
+    Quail packs a table's AI filters, classifications, extractions, and
+    scores into passes, and a join's partner tuples, and the pairs it
+    keeps for a classification, into passes over each anchor; an
+    AI.SCORE over two tables is refused.
+    """
+    if model.attention_mask != "set":
+        return None
+    if any(is_score(join.predicate) for join in operators.joins):
+        return _refusal(
+            f"{model.name!r} answers a join's partners as questions, but "
+            f"Quail does not score them yet, so AI.SCORE reads one table",
+            "unsupported_set_attention_query")
+    return None
+
+
 def validate_query(plan, operators, context, model, device, gpus):
     """Return a refusal for unsupported inference or hardware requirements."""
     labels = operators.labels
     scored = has_score(plan)
+    refusal = set_attention_refusal(operators, model)
+    if refusal is not None:
+        return refusal
     if operators.sae_features or (
             context is not None and context.model.sae is not None):
         refusal = sae_features_refusal(operators, context, scored)
