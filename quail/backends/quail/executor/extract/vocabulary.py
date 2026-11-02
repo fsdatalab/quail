@@ -7,6 +7,8 @@ matched against a row's likeliest tokens by word, and it names the
 tokens that close an answer.
 """
 
+from functools import cached_property
+
 import numpy as np
 import pyarrow as pa
 
@@ -25,6 +27,9 @@ def same_word(token) -> str:
 class Vocabulary:
     """One model's tokenizer and the vocabulary index its extractions read.
 
+    The tokenizer and the stop tokens are ready at once; AI.MAP needs only
+    those. The word index that AI.EXTRACT reads is built on first use.
+
     Args:
         tokenizer: A Gigatoken encoder or a tokenizer supplied by the caller.
         turn_suffix: The model's chat-turn text after a prompt; its first
@@ -33,35 +38,9 @@ class Vocabulary:
 
     def __init__(self, tokenizer, turn_suffix: str = ""):
         self.encoder = tokenizer if isinstance(tokenizer, GigatokenEncoder) else None
-        self.offsets = (TokenOffsets(self.encoder.token_bytes())
-                        if self.encoder is not None else None)
         if self.encoder is not None:
             tokenizer = self.encoder.tokenizer.as_hf()
         self.tokenizer = tokenizer
-        self.vocab = tokenizer.convert_ids_to_tokens(list(range(len(tokenizer))))
-        # a document token may be written without its leading space
-        # or in another case after the opening quote: every
-        # vocabulary token with the same text up to those can start it
-        self.variants = {}
-        # every token's key: its word, or the token itself without one
-        self.keys = []
-        key_ids = {}
-        key_of = np.empty(len(self.vocab), dtype=np.int64)
-        for index, token in enumerate(self.vocab):
-            key = same_word(token)
-            if key:
-                self.variants.setdefault(key, []).append(index)
-            else:
-                key = index
-            kid = key_ids.get(key)
-            if kid is None:
-                kid = len(self.keys)
-                self.keys.append(key)
-                key_ids[key] = kid
-            key_of[index] = kid
-        self.key_of = key_of
-        self._options = [None] * len(self.keys)
-        self._fillers = [None] * len(self.vocab)
         # the answer ends where the model ends its turn: the turn close
         # or the end of text, which no document holds
         stops = {self.encode_ids(turn_suffix)[0]} if turn_suffix else set()
@@ -70,8 +49,68 @@ class Vocabulary:
         if not stops:
             raise ValueError("AI.EXTRACT needs a turn close or an end-of-text token")
         self.stop_ids = tuple(sorted(stops))
-        self.is_stop = np.zeros(len(self.vocab), dtype=bool)
+        self.is_stop = np.zeros(len(tokenizer), dtype=bool)
         self.is_stop[list(self.stop_ids)] = True
+
+    @cached_property
+    def offsets(self):
+        """Return the token byte table that maps tokens to source characters."""
+        if self.encoder is None:
+            return None
+        return TokenOffsets(self.encoder.token_bytes())
+
+    @cached_property
+    def vocab(self) -> list:
+        """Return each token id's token text."""
+        return self.tokenizer.convert_ids_to_tokens(list(range(len(self.tokenizer))))
+
+    @cached_property
+    def _word_index(self) -> tuple:
+        """Return the spellings of each word, every key, and each token's key."""
+        # a document token may be written without its leading space
+        # or in another case after the opening quote: every
+        # vocabulary token with the same text up to those can start it
+        variants = {}
+        # every token's key: its word, or the token itself without one
+        keys = []
+        key_ids = {}
+        key_of = np.empty(len(self.vocab), dtype=np.int64)
+        for index, token in enumerate(self.vocab):
+            key = same_word(token)
+            if key:
+                variants.setdefault(key, []).append(index)
+            else:
+                key = index
+            kid = key_ids.get(key)
+            if kid is None:
+                kid = len(keys)
+                keys.append(key)
+                key_ids[key] = kid
+            key_of[index] = kid
+        return variants, keys, key_of
+
+    @property
+    def variants(self) -> dict:
+        """Return the tokens of each word, keyed by the word."""
+        return self._word_index[0]
+
+    @property
+    def keys(self) -> list:
+        """Return every key: a word, or a token id for a token without one."""
+        return self._word_index[1]
+
+    @property
+    def key_of(self) -> np.ndarray:
+        """Return each token id's key index."""
+        return self._word_index[2]
+
+    @cached_property
+    def _options(self) -> list:
+        return [None] * len(self.keys)
+
+    @cached_property
+    def _fillers(self) -> list:
+        return [None] * len(self.vocab)
 
     def options(self, kid: int) -> tuple:
         """Return the tokens that can begin a key's word, and their lengths.
@@ -193,6 +232,6 @@ def load_vocabulary(state) -> Vocabulary:
 
         spec = loaded.model_spec
         path = resolve_model_path(spec.hf_name, spec.revision)
-        say(f"loading the tokenizer of {spec.name} for AI.EXTRACT")
+        say(f"loading the tokenizer of {spec.name} for AI.EXTRACT and AI.MAP")
         loaded.vocabulary = Vocabulary(GigatokenEncoder(path), spec.turn_suffix)
     return loaded.vocabulary

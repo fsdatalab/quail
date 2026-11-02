@@ -181,8 +181,8 @@ class LoadedGpu:
                                     model=self.model)
                 tier = warm["tier"]
                 if self.spec.role not in ("reranker", "decision"):
-                    # AI.EXTRACT and AI.MAP read the tokenizer's vocabulary;
-                    # loading it is startup, not query time
+                    # AI.EXTRACT and AI.MAP read the tokenizer; loading it is
+                    # startup, and the first AI.EXTRACT builds its word index
                     load_vocabulary(self.execution)
             graphs = self.pipeline.piecewise_graphs
             if graphs is not None and graphs.prepare():
