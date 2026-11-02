@@ -204,7 +204,8 @@ def keep_layers(torch, model, num_layers: int):
 
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids=None, max_batched_tokens=None,
-               moe_backend=None, text_only=False, num_layers=None):
+               moe_backend=None, text_only=False, num_layers=None,
+               quantize_fp8=False):
     """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
@@ -214,6 +215,8 @@ def load_model(model_name: str, revision: str | None = None, *,
     takes no image or video input, for a checkpoint with a vision tower.
     num_layers keeps only the first decoder layers after the load, for a
     spec that reads an intermediate layer's residual stream.
+    quantize_fp8 quantizes a bf16 LFM3 checkpoint's linear weights to fp8
+    as they load; vLLM's checkpoints carry their own precision.
     """
     import os
     import tempfile
@@ -231,7 +234,7 @@ def load_model(model_name: str, revision: str | None = None, *,
     model_path = resolve_model_path(model_name, revision)
     if is_lfm3(model_path):
         # vLLM has no LFM3 model; its loader would also refuse the config
-        model = load_lfm3(model_path)
+        model = load_lfm3(model_path, quantize_fp8=quantize_fp8)
     else:
         model = _load_vllm_model(model_path, max_batched_tokens, moe_backend,
                                  text_only)
