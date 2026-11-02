@@ -501,9 +501,22 @@ class DecisionHead:
         torch: The torch module.
         F: torch.nn.functional.
         weights: The tensors of decision_head.safetensors by name.
+
+    Raises:
+        ValueError: The weights are not exactly TENSORS.
     """
 
+    # every tensor of decision_head.safetensors, by name
+    TENSORS = frozenset((
+        "candidate_norm.weight", "candidate_norm.bias", "query_norm.weight",
+        "query_norm.bias", "key.weight", "query.weight", "candidate_mlp.weight",
+        "candidate_mlp.bias", "query_mlp.weight", "scalar.weight"))
+
     def __init__(self, torch, F, weights):
+        if missing := self.TENSORS - weights.keys():
+            raise ValueError(f"the decision head is missing {sorted(missing)}")
+        if unknown := weights.keys() - self.TENSORS:
+            raise ValueError(f"the decision head does not use {sorted(unknown)}")
         self.torch = torch
         self.F = F
         self.w = {name: t.float() for name, t in weights.items()}

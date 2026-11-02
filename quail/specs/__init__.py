@@ -16,7 +16,7 @@ from .base import (
     Role,
     SaeSpec,
 )
-from .d1_2b import D1_2B_BF16
+from .d1_2b import D1_2B_BF16, D1_2B_FP8
 from .decision_2_kai_0_6b import DECISION_2_KAI_0_6B_BF16
 from .diffusion_gemma_26b import DIFFUSION_GEMMA_26B_FP8
 from .h100_sxm import H100_PRICE_SOURCE, H100_SXM, H100_USD_PER_HOUR
@@ -47,7 +47,7 @@ MODELS = {QWEN3_4B_FP8.name: QWEN3_4B_FP8,
          QWEN3_RERANKER_4B_BF16.name: QWEN3_RERANKER_4B_BF16,
          DIFFUSION_GEMMA_26B_FP8.name: DIFFUSION_GEMMA_26B_FP8,
          DECISION_2_KAI_0_6B_BF16.name: DECISION_2_KAI_0_6B_BF16,
-         D1_2B_BF16.name: D1_2B_BF16}
+         D1_2B_BF16.name: D1_2B_BF16, D1_2B_FP8.name: D1_2B_FP8}
 DEVICES = {device.name: device for device in (
     H100_SXM, L40S, B200, RTX_PRO_6000_BLACKWELL_SERVER,
 )}
@@ -84,7 +84,7 @@ __all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "LayerKind",
            "QWEN3_32B_FP8", "QWEN3_6_35B_A3B_FP8",
            "QWEN3_RERANKER_0_6B_BF16",
            "QWEN3_RERANKER_4B_BF16", "DIFFUSION_GEMMA_26B_FP8",
-           "DECISION_2_KAI_0_6B_BF16", "D1_2B_BF16",
+           "DECISION_2_KAI_0_6B_BF16", "D1_2B_BF16", "D1_2B_FP8",
            "H100_SXM", "H100_USD_PER_HOUR", "H100_PRICE_SOURCE",
            "L40S", "B200", "RTX_PRO_6000_BLACKWELL_SERVER",
            "MODAL_GPU_USD_PER_HOUR", "modal_gpu_type",
