@@ -47,12 +47,19 @@ class StateTails:
 
 
 def state_tails(state) -> StateTails:
-    """The loaded model's StateTails, its tokenizer loaded once."""
+    """The loaded model's StateTails, over the tokenizer the worker loaded.
+
+    A state without a loaded tokenizer, as in tests, loads its own once.
+    """
     loaded = state.loaded_model
     if loaded.state_tails is None:
-        spec = loaded.model_spec
-        loaded.state_tails = StateTails(GigatokenEncoder(
-            resolve_model_path(spec.hf_name, spec.revision)))
+        tokenizer = getattr(loaded, "tokenizer", None)
+        encoder = None if tokenizer is None else tokenizer.encoder
+        if encoder is None:
+            spec = loaded.model_spec
+            encoder = GigatokenEncoder(resolve_model_path(spec.hf_name,
+                                                          spec.revision))
+        loaded.state_tails = StateTails(encoder)
     return loaded.state_tails
 
 

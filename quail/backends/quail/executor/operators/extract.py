@@ -3,9 +3,6 @@
 
 import numpy as np
 
-from quail.backends.quail.executor.extract import (
-    load_vocabulary,
-)
 from quail.backends.quail.executor.extract.stages import ExtractionInputs
 from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import (
@@ -153,7 +150,8 @@ class ExtractPart(MapPart):
             raise ValueError(f"AI.EXTRACT needs the text of {alias!r}")
         super().__init__(state, nodes, ids, first)
         self.extraction = ExtractionInputs(
-            state, [node.spec for node in nodes], load_vocabulary(state), self.ids,
+            state, [node.spec for node in nodes], state.loaded_model.vocabulary,
+            self.ids,
             inputs["documents"][alias], texts,
             pipeline_head=inputs.get("pipeline_head", self.node.document_head),
             document_positions=inputs.get("document_positions"))

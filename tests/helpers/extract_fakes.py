@@ -3,6 +3,7 @@
 import re
 
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
+from quail.backends.quail.executor.tokenizer import ModelTokenizer
 from quail.physical import ExtractSpec
 
 NEG = float("-inf")
@@ -93,7 +94,7 @@ def make_vocabulary(*extra):
                                *(squeezed(text)[0] for text in (LEASE, TERM,
                                                                 NOTHING)),
                                *extra])
-    return Vocabulary(tokenizer)
+    return Vocabulary(ModelTokenizer(tokenizer))
 
 
 def make_spec(*extra):
@@ -101,8 +102,8 @@ def make_spec(*extra):
     return ExtractSpec(
         name="ends", aliases=("c",), query_template="{0}",
         arguments=(("c", "text"),), expected_rows=3, estimated_seconds=0.0,
-        prompt_token_parts=(tuple(tables.encode_ids(HEAD)),
-                            tuple(tables.encode_ids(TAIL))),
+        prompt_token_parts=(tuple(tables.tokenizer.encode_ids(HEAD)),
+                            tuple(tables.tokenizer.encode_ids(TAIL))),
         question=QUESTION, draft_tokens=16, draft_policy="fixed"), tables
 
 
