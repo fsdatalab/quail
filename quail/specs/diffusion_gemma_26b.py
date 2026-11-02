@@ -26,6 +26,7 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     expert_intermediate=704,
     w_bytes=1.0,           # fp8 weights, per-channel scales
     hf_name="RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic",
+    revision="3b3dae4697494da5a290e9c0461954449e76c4f5",
     kv_bytes=2.0,
     # Loaded FP8 modules plus BF16 embeddings, router, and auxiliary weights.
     w_mem_bytes=27_682_404_352,
