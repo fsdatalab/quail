@@ -80,7 +80,6 @@ def classify_passes(state, specs, rows, documents) -> list[SetLabels]:
         specs: set_choice ClassifySpecs over one table.
         rows: The document ids to label.
         documents: Tokenized documents by alias and document id.
-
     """
     first = specs[0]
     (alias,) = first.aliases
