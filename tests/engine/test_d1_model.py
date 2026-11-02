@@ -598,9 +598,24 @@ def _varlen_attention(torch):
     return fa
 
 
-def test_set_attention_lets_the_state_read_every_question_and_each_question_itself():
+def merge_reference(out, rows, over_state, lse_state, own, lse_own):
+    """lfm3_kernels.merge_questions in plain torch."""
+    a, b = lse_state.transpose(0, 1)[:, :, None], lse_own.transpose(0, 1)[:, :, None]
+    top = a.maximum(b)
+    wa, wb = (a - top).exp(), (b - top).exp()
+    merged = (over_state.float() * wa + own.float() * wb) / (wa + wb)
+    out.index_copy_(0, rows, merged.to(out.dtype))
+    return out
+
+
+def test_set_attention_lets_the_state_read_every_question_and_each_question_itself(
+        monkeypatch):
     torch = pytest.importorskip("torch")
+    from quail.backends.quail.executor.models import lfm3_kernels
     from quail.backends.quail.executor.models.lfm3 import Lfm3Pipeline
+
+    # the Triton merge needs a GPU; tests/gpu checks it against this one
+    monkeypatch.setattr(lfm3_kernels, "merge_questions", merge_reference)
 
     torch.manual_seed(0)
     # pass 0: rows 0-4 state, questions of 2, 3, and 1 rows; pass 1: 4

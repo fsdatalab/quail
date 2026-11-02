@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from quail.backends.quail.executor.attention import Engine
-from quail.backends.quail.executor.gdn import wide_causal_conv
+from quail.backends.quail.executor.models import lfm3_kernels as kernels
 from quail.backends.quail.executor.models.base import ModelPipeline
 
 TEXT_PREFIX = "model.language_model."
@@ -216,7 +216,6 @@ class Lfm3Pipeline(ModelPipeline):
         self.layers = model.model.layers
         self.embed = model.model.embed_tokens
         self.final_norm = model.model.embedding_norm
-        self.rotary = model.rotary
         self.window = spec.sliding_window
         self.num_heads = spec.num_q_heads
         self.num_kv_heads = spec.num_kv_heads
@@ -224,6 +223,10 @@ class Lfm3Pipeline(ModelPipeline):
         self.engine = engine_class(
             arena, num_q_heads=spec.num_q_heads, num_kv_heads=spec.num_kv_heads,
             head_dim=spec.d_head, rotary=None, fp8=False)
+        # per attention layer kind, its [cos | sin] table, as the fused
+        # q/k norm and rotary kernel reads it
+        self.cos_sin = {kind: self.engine.torch.cat(tables, -1).contiguous()
+                        for kind, tables in model.rotary.items()}
         attention = next(layer for layer in self.layers if layer.kind != "conv")
         conv = next(layer for layer in self.layers if layer.kind == "conv")
         self.attention_layer, self.conv_layer = attention, conv
@@ -247,33 +250,23 @@ class Lfm3Pipeline(ModelPipeline):
     def _norm(self, x, norm):
         return self.engine.norm_rows(x, norm.weight, norm.variance_epsilon)
 
-    def _short_conv(self, layer, x, sequences):
-        b, c, gated = self._linear(x, layer.in_proj).chunk(3, dim=-1)
-        conv, _ = wide_causal_conv(
-            (b * gated).contiguous(), layer.taps, sequences, None)
-        return self._linear(c * conv, layer.out_proj)
-
-    def _rotate(self, x, positions, kind):
-        """Rotate (rows, heads, head_dim) by each row's position, in fp32."""
-        cos, sin = self.rotary[kind]
-        cos = cos.index_select(0, positions)[:, None, :]
-        sin = sin.index_select(0, positions)[:, None, :]
-        x = x.float()
-        first, second = x.chunk(2, dim=-1)
-        return self.engine.torch.cat(
-            (first * cos - second * sin, second * cos + first * sin),
-            dim=-1).to(self.engine.torch.bfloat16)
+    def _short_conv(self, layer, x, starts):
+        conv = kernels.gated_conv(self._linear(x, layer.in_proj), layer.taps,
+                                  starts)
+        return self._linear(conv, layer.out_proj)
 
     def _attention(self, layer, x, positions, meta):
         rows = x.shape[0]
         H, KH, D = self.num_heads, self.num_kv_heads, self.head_dim
         projected = self._linear(x, layer.qkv_gate)
-        q, k, v, gate = projected.split([H * D, KH * D, KH * D, H], dim=-1)
-        q = self._norm(q.reshape(rows * H, D), layer.q_norm).view(rows, H, D)
-        k = self._norm(k.reshape(rows * KH, D), layer.k_norm).view(rows, KH, D)
-        q = self._rotate(q, positions, layer.kind)
-        k = self._rotate(k, positions, layer.kind).contiguous()
-        v = v.contiguous().view(rows, KH, D)
+        q, k = self.engine.qk_norm_rope_heads(
+            projected, positions, num_q_heads=H, num_kv_heads=KH, head_dim=D,
+            q_weight=layer.q_norm.weight, k_weight=layer.k_norm.weight,
+            eps=layer.q_norm.variance_epsilon,
+            cos_sin_cache=self.cos_sin[layer.kind])
+        q, k = q.view(rows, H, D), k.view(rows, KH, D)
+        v = projected[:, (H + KH) * D:(H + 2 * KH) * D].contiguous().view(
+            rows, KH, D)
         cu, longest = meta["cu_a"], meta["max_a"]
         if layer.kind == "sliding_attention":
             out, _ = self.engine._fa(q, k, v, cu, cu, longest, longest,
@@ -283,8 +276,9 @@ class Lfm3Pipeline(ModelPipeline):
                                      causal=False)
         else:
             out = self._set_attention(q, k, v, meta)
-        out = out.view(rows, H, D) * self.engine.torch.sigmoid(gate)[:, :, None]
-        return self._linear(out.view(rows, H * D), layer.o_proj)
+        out = kernels.gate_heads(out.reshape(rows, H * D),
+                                 projected[:, (H + 2 * KH) * D:])
+        return self._linear(out, layer.o_proj)
 
     def _set_attention(self, q, k, v, meta):
         """Full attention under set attention, for passes of several questions.
@@ -309,13 +303,9 @@ class Lfm3Pipeline(ModelPipeline):
             q_asked, k.index_select(0, asked), v.index_select(0, asked),
             plan["cu_own"], plan["cu_own"], plan["max_own"], plan["max_own"],
             causal=False)
-        a = lse_state.transpose(0, 1)[:, :, None]
-        b = lse_own.transpose(0, 1)[:, :, None]
-        top = torch.maximum(a, b)
-        wa, wb = (a - top).exp(), (b - top).exp()
-        merged = (over_state.float() * wa + own.float() * wb) / (wa + wb)
-        out.index_copy_(0, asked, merged.to(q.dtype))
-        return out
+        return kernels.merge_questions(
+            out, asked, over_state, lse_state.contiguous(), own,
+            lse_own.contiguous())
 
     def _plan_set_rows(self, chunk, meta):
         """Row indices and bounds of the set attention calls, or None.
@@ -379,17 +369,23 @@ class Lfm3Pipeline(ModelPipeline):
         lengths = tuple(end - first for _, first, _, end in chunk.row_spans)
         if sum(lengths) != chunk.tokens:
             raise ValueError("an LFM3 chunk holds whole sequences only")
-        sequences = SimpleNamespace(lengths=lengths, conv_metadata=None)
+        starts = kernels.sequence_starts(self.engine.torch, lengths,
+                                         chunk.input_ids.device)
         meta["set_rows"] = self._plan_set_rows(chunk, meta)
         hidden = F.embedding(chunk.input_ids, self.embed)
-        for layer in self.layers:
-            x = self._norm(hidden, layer.operator_norm)
+        x = self._norm(hidden, self.layers[0].operator_norm)
+        for index, layer in enumerate(self.layers):
             if layer.kind == "conv":
-                x = self._short_conv(layer, x, sequences)
+                y = self._short_conv(layer, x, starts)
             else:
-                x = self._attention(layer, x, chunk.positions, meta)
-            hidden = hidden + self._norm(x, layer.post_operator_norm)
-            x = self._mlp(layer, self._norm(hidden, layer.ffn_norm))
-            hidden = hidden + self._norm(x, layer.post_ffn_norm)
+                y = self._attention(layer, x, chunk.positions, meta)
+            x = kernels.post_norm_add_norm(
+                y, hidden, layer.post_operator_norm.weight, layer.ffn_norm.weight,
+                layer.ffn_norm.variance_epsilon)
+            following = (self.layers[index + 1].operator_norm.weight
+                         if index + 1 < len(self.layers) else None)
+            x = kernels.post_norm_add_norm(
+                self._mlp(layer, x), hidden, layer.post_ffn_norm.weight,
+                following, layer.post_ffn_norm.variance_epsilon)
         final = hidden.index_select(0, chunk.final_indices)
         return self._norm(final, self.final_norm)
