@@ -3,6 +3,7 @@
 import time
 
 from quail.backends.quail.executor.model_loading import full_output_head
+from quail.backends.quail.executor.readout import AsyncSlotMargins
 from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 from quail.progress import Progress, logger, quiet
 
@@ -19,7 +20,7 @@ from quail.progress import Progress, logger, quiet
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass.
-WARMUP_VERSION = 11
+WARMUP_VERSION = 12
 
 # Triton compiles one copy of a kernel for each class of its integer
 # arguments: equal to 1, a multiple of 16, or neither. Quail's row
@@ -158,6 +159,17 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
             torch, arena, pipeline,
             [Stage(suffixes=labels, readout=async_ans, frame=question)],
             warm_documents, budget)
+    if pipeline.whole_sequences and async_ans is not None:
+        # a set-attention pass of two questions runs the merge of each
+        # question's two attention reads
+        logger.debug("kernels: warming a set-attention pass of two questions")
+        half = len(question) // 2
+        _warm_run(
+            torch, arena, pipeline,
+            [Stage(suffixes=[question], readout=AsyncSlotMargins(
+                torch, async_ans.rows), questions=((half, len(question) - half),),
+                decide=lambda _, row: True)],
+            warm_documents, budget, paged=False)
     logger.debug("kernels: warming filter without KV writes")
     _warm_run(
         torch, arena, pipeline,

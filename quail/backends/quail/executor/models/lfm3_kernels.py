@@ -24,7 +24,9 @@ def _kernels() -> dict:
     import triton
     import triton.language as tl
 
-    @triton.jit
+    # a row count is not specialized, so each chunk size reuses one
+    # compiled kernel
+    @triton.jit(do_not_specialize=["rows"])
     def gated_conv(proj_ptr, taps_ptr, starts_ptr, out_ptr, rows, stride_proj,
                    stride_out, C: tl.constexpr, WIDTH: tl.constexpr,
                    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
@@ -94,7 +96,7 @@ def _kernels() -> dict:
                  (values.to(tl.bfloat16).to(tl.float32) * scale[:, None])
                  .to(out_ptr.dtype.element_ty))
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["count"])
     def merge_questions(out_ptr, rows_ptr, a_ptr, lse_a_ptr, b_ptr, lse_b_ptr,
                         count, stride_out, stride_a, stride_b, stride_lse_a,
                         stride_lse_b, HEADS: tl.constexpr, D: tl.constexpr):
