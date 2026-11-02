@@ -498,6 +498,40 @@ def test_a_d1_extraction_plans_a_read(tmp_path):
     session.close()
 
 
+def test_a_d1_plan_prices_and_explains_the_passes_its_operators_share(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.physical import AiClassify
+    from quail.planner.plan import EngineConfig
+
+    body = " ".join(["word"] * 300)
+    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
+                   tmp_path / "reviews.parquet")
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=str.split)
+    session.register("reviews", DocumentProvider.from_parquet(
+        str(tmp_path / "reviews.parquet"), id_col="id"))
+    query = session.sql(
+        "SELECT r.id, AI.CLASSIFY(PROMPT('Which mood? {0}', r.body), "
+        "ARRAY['happy', 'sad']) AS mood, AI.CLASSIFY(PROMPT('Which size? {0}', "
+        "r.body), ARRAY['short', 'long']) AS size FROM reviews r")
+
+    plan = query.plan()
+    first, second = [node.node_id for node in plan.nodes
+                     if isinstance(node, AiClassify)]
+    text = query.explain()
+
+    assert plan.estimates[first]["pass_members"] == (first, second)
+    assert plan.estimates[first]["seconds"] > 0
+    assert "seconds" not in plan.estimates[second]
+    assert f"Passes on r: [{first}, {second}]" in text
+    assert "paged KV" not in text and "admission budget" not in text
+    session.close()
+
+
 def _varlen_attention(torch):
     """FlashAttention's varlen call, in plain torch, returning (out, lse)."""
     def fa(q, k, v, cu_q, cu_k, max_q, max_k, causal, window=None):
