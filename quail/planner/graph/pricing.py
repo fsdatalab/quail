@@ -89,7 +89,7 @@ class PlanPricer:
             for node in graph.nodes:
                 if isinstance(node, AiJoin):
                     price, entry = out[node.node_id]
-                    entry["anchor_passes"] = self.context.model.set_size
+                    entry["pass_questions"] = self.context.model.set_size
         return out
 
     def _set_passes(self, graph) -> dict:

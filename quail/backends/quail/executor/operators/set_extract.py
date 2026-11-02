@@ -8,7 +8,7 @@ import numpy as np
 from quail.backends.quail.executor.parts import gpu_seconds, input_staging
 from quail.backends.quail.executor.readout import AsyncSlotPointers
 from quail.backends.quail.executor.set_passes import (
-    pass_blocks,
+    group_passes,
     spec_questions,
     state_tails,
 )
@@ -113,16 +113,16 @@ def read_passes(state, specs, rows, documents, texts) -> list[SetReads]:
     out = [SetReads([None] * len(rows), [None] * len(rows), [0.0] * len(rows))
            for _ in specs]
     torch = state.torch
-    for block, suffix, shape in pass_blocks(
+    for members, suffix, shape in group_passes(
             prefixes, questions, first.question_header_token_ids,
             model_spec.set_size, state.chunk_tokens):
-        readout = AsyncSlotPointers(torch, torch.nn.functional, len(block),
+        readout = AsyncSlotPointers(torch, torch.nn.functional, len(members),
                                     model_spec.read_span_tokens)
         stage = Stage(suffixes=[suffix], readout=readout, questions=(shape,),
                       question_slots=first.read_slots,
                       state_reads=lambda anchor: state_rows[anchor],
                       decide=lambda _, row: True,
-                      label=f"extract pass ({len(block)} questions)")
+                      label=f"extract pass ({len(members)} questions)")
         answers, spans, tokens = run_stages(
             torch, state.loaded_model.arena, state.loaded_model.pipeline, [stage],
             prefixes, state.chunk_tokens, staging=input_staging(state),
@@ -131,10 +131,10 @@ def read_passes(state, specs, rows, documents, texts) -> list[SetReads]:
             reads = np.asarray(answer[0], dtype=float)
             text = texts[rows[position]]
             text = text.as_py() if hasattr(text, "as_py") else str(text)
-            for read, member in zip(reads, block):
+            for read, member in zip(reads, members):
                 start, end, found = int(read[0]), int(read[1]), float(read[2])
                 result = out[member]
-                result.suffix_tokens += shape[block.index(member)]
+                result.suffix_tokens += shape[members.index(member)]
                 found = calibrated(model_spec.read_found, found)
                 result.found[position] = found
                 if start == 0 or found < 0.5:
@@ -142,7 +142,7 @@ def read_passes(state, specs, rows, documents, texts) -> list[SetReads]:
                 # a read row's document token is one before it: row 0 is nothing
                 result.answers[position], result.spans[position] = token_span(
                     text, tokens_of[position], vocabulary, start - 1, end - 1)
-        lead = out[block[0]]
+        lead = out[members[0]]
         lead.tokens += tokens
         lead.gpu_s += gpu_seconds(spans)
         lead.chunks += len(spans)

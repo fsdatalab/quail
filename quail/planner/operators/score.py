@@ -110,7 +110,7 @@ class ScoreLowering:
                 else f"one pair of {spec.aliases[0]!r} and {spec.aliases[1]!r}")
         needed, available, unit = prefix + suffix, self.chunk, "tokens"
         # a set-attention pass keeps no KV, so only the chunk bounds it
-        if needed <= available and self.context.model.attention_mask != "set":
+        if needed <= available and self.context.model.reuses_kv:
             page_tokens = self.context.device.page_tokens
             needed = (budgets.pages(prefix, page_tokens)
                       + budgets.pages(suffix, page_tokens))

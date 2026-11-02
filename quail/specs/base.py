@@ -213,6 +213,15 @@ class ModelSpec:
         return self.layer_kind(layer) in ("full_attention", "sliding_attention")
 
     @property
+    def reuses_kv(self) -> bool:
+        """Whether a document's KV can be kept and read again by later questions.
+
+        False under set attention, where a document reads its questions,
+        so each pass computes it afresh and no KV is kept or shared.
+        """
+        return self.attention_mask != "set"
+
+    @property
     def attention_layers(self) -> tuple[int, ...]:
         """The layers that store KV."""
         return tuple(i for i in range(self.layers) if self.keeps_kv(i))

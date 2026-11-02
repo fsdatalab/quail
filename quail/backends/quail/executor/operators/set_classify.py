@@ -13,7 +13,7 @@ from quail.backends.quail.executor.operators.join import (
 from quail.backends.quail.executor.parts import gpu_seconds, input_staging
 from quail.backends.quail.executor.readout import AsyncSlotLogits
 from quail.backends.quail.executor.set_passes import (
-    pass_blocks,
+    group_passes,
     spec_questions,
     state_tails,
 )
@@ -88,7 +88,7 @@ def classify_passes(state, specs, rows, documents) -> list[SetLabels]:
     prefixes = [tails.prefix(concat_tokens(head, documents[alias][row]), state_tail)
                 for row in rows]
     model_spec = state.loaded_model.model_spec
-    blocks = pass_blocks(prefixes, questions, first.question_header_token_ids,
+    passes = group_passes(prefixes, questions, first.question_header_token_ids,
                          model_spec.set_size, state.chunk_tokens)
     targets = sorted({token for spec in specs for ids in spec.label_token_ids
                       for token in ids})
@@ -99,17 +99,17 @@ def classify_passes(state, specs, rows, documents) -> list[SetLabels]:
     out = [SetLabels(np.full(len(rows), None, dtype=object),
                      np.full((len(rows), len(spec.labels)), np.nan))
            for spec in specs]
-    for block, suffix, shape in blocks:
+    for members, suffix, shape in passes:
         stage = Stage(suffixes=[suffix], readout=readout, questions=(shape,),
                       decide=lambda _, row: True,
-                      label=f"classify pass ({len(block)} questions)")
+                      label=f"classify pass ({len(members)} questions)")
         answers, spans, tokens = run_stages(
             torch, state.loaded_model.arena, state.loaded_model.pipeline, [stage],
             prefixes, state.chunk_tokens, staging=input_staging(state),
             gpu_timing=state.gpu_timing, paged=False, label=stage.label)
         for position, answer in answers[0].items():
             logits = np.asarray(answer[0], dtype=float)
-            for row, member in enumerate(block):
+            for row, member in enumerate(members):
                 spec, labels = specs[member], out[member]
                 labels.probabilities[position] = option_probabilities(
                     logits[row], columns, spec.label_token_ids,
@@ -117,7 +117,7 @@ def classify_passes(state, specs, rows, documents) -> list[SetLabels]:
                 labels.labels[position] = spec.labels[
                     int(np.argmax(labels.probabilities[position]))]
                 labels.suffix_tokens += shape[row]
-        lead = out[block[0]]
+        lead = out[members[0]]
         lead.tokens += tokens
         lead.gpu_s += gpu_seconds(spans)
         lead.chunks += len(spans)

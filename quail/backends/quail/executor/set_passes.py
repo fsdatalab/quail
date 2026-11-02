@@ -85,8 +85,8 @@ def split_passes(state: int, members, lengths, header: int, set_size: int,
     return passes
 
 
-def pass_blocks(prefixes, questions, header, set_size: int, budget: int) -> list:
-    """Split questions asked of every document into passes.
+def group_passes(prefixes, questions, header, set_size: int, budget: int) -> list:
+    """Split a pass group's questions, asked of every document, into passes.
 
     Every document is asked the same questions, so the passes are the
     same for each; the longest document decides what fits a chunk.
@@ -102,17 +102,17 @@ def pass_blocks(prefixes, questions, header, set_size: int, budget: int) -> list
         Per pass: its question indices, its suffix tokens, and each
         question's length in the suffix.
     """
-    blocks = split_passes(max(map(len, prefixes), default=0), range(len(questions)),
+    passes = split_passes(max(map(len, prefixes), default=0), range(len(questions)),
                           [len(question) for question in questions], len(header),
                           set_size, budget)
     out = []
-    for block in blocks:
+    for members in passes:
         suffix, shape = [], []
-        for index, member in enumerate(block):
+        for index, member in enumerate(members):
             question = (list(header) if index else []) + list(questions[member])
             suffix += question
             shape.append(len(question))
-        out.append((block, suffix, tuple(shape)))
+        out.append((members, suffix, tuple(shape)))
     return out
 
 

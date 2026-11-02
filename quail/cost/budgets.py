@@ -239,7 +239,7 @@ def checkpoint_memory_bytes(model: ModelSpec, chunk_tokens: int,
     be as long as a chunk; startup reserves at least the default document
     length used by the checkpoint pool.
     """
-    if not model.checkpoint_bytes or model.attention_mask == "set":
+    if not model.checkpoint_bytes or not model.reuses_kv:
         return 0
     document_tokens = max(chunk_tokens, CHECKPOINT_DEFAULT_DOC_TOKENS)
     reserved_pages = (execution_pages(chunk_tokens, page_tokens)
@@ -322,7 +322,7 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     mean sizes it as if every document fit in the window, the largest
     fraction.
     """
-    if model.attention_mask == "set":
+    if not model.reuses_kv:
         # a set-attention model keeps no KV between chunks; the arena
         # needs one page in each pool to exist
         return 1, 1 if model.sliding_layer_set else 0

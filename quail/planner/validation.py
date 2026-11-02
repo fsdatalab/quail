@@ -11,7 +11,7 @@ from quail.logical import (
     is_score,
 )
 from quail.logical.expressions import aliased_call
-from quail.logical.prompts import prompt_aliases
+from quail.logical.prompts import PROMPT_LAYOUTS, prompt_aliases
 from quail.physical import AiClassify, AiJoin
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import Refusal
@@ -208,9 +208,10 @@ def extraction_refusal(context, function: str = "AI.EXTRACT") -> Refusal | None:
     elif model.role in ("reranker", "decision") or model.canvas_tokens:
         reason = (f"{function} decodes the model's next tokens, which "
                   f"{model.name!r} does not give")
-    elif model.prompt_layout == "d1" and function == "AI.EXTRACT":
-        return None
-    elif model.prompt_layout == "d1":
+    elif PROMPT_LAYOUTS[model.prompt_layout].read_end is not None:
+        # the model answers by scoring options and document positions
+        if function == "AI.EXTRACT":
+            return None
         reason = (f"{function} writes text, and {model.name!r} answers only "
                   f"by scoring options")
     else:

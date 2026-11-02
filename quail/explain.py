@@ -457,7 +457,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                           node.anchor_resident, node.anchor_resident)
             keep = "yes" if node.keep_kv else "no"
             size = (estimates_by_node.get(node.node_id, {})
-                    .get("anchor_passes"))
+                    .get("pass_questions"))
             details.append(
                 f"set passes: each anchor document, then up to {size} "
                 f"partner rows as questions" if size else
@@ -681,12 +681,12 @@ def architecture_lines(model_name: str) -> list[str]:
             "kernels: " + "; ".join(paths)]
 
 
-def _set_attention(model_name: str) -> bool:
-    """Whether a registered model runs set attention."""
+def _reuses_kv(model_name: str) -> bool:
+    """Whether a registered model keeps documents' KV for later questions."""
     from quail.specs import MODELS
 
     spec = MODELS.get(model_name)
-    return spec is not None and spec.attention_mask == "set"
+    return spec is None or spec.reuses_kv
 
 
 def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
@@ -722,7 +722,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         budgets = ["KV=bf16"]
         if chunk is not None:
             budgets.append(f"chunk budget={chunk:,} tokens")
-        if admission is not None and not _set_attention(physical.model):
+        if admission is not None and _reuses_kv(physical.model):
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
         for alias, columns in sorted(physical.settings.get("deduplicate", {}).items()):
@@ -737,7 +737,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         metrics=None if result is None else result.node_metrics,
         stages=None if result is None else measured_stages(result.report),
     ).splitlines())
-    if _set_attention(physical.model):
+    if any("pass_members" in entry for entry in (physical.estimates or {}).values()):
         lines.append("  est. time is each pass group's work, on its first "
                      "operator; the other operators in the group are asked "
                      "in its passes")

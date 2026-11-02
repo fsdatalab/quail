@@ -106,6 +106,7 @@ def test_a_set_attention_model_keeps_no_arena_or_checkpoints():
 
     chunk = budgets.chunk_budget(D1_2B_BF16, H100_SXM)
 
+    assert not D1_2B_BF16.reuses_kv
     assert budgets.arena_pages(D1_2B_BF16, H100_SXM) == (1, 1)
     assert budgets.checkpoint_memory_bytes(D1_2B_BF16, chunk) == 0
     assert chunk > 0

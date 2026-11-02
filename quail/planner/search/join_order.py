@@ -166,8 +166,9 @@ def _join_step(spec, anchor, expected_rows, lengths, resident, pre, state, model
     same_group = (state.group_open and state.pending_anchor == anchor
                   and spec.semantics == "full")
     set_size = model.set_size if model.attention_mask == "set" else 0
-    # a set-attention model keeps no anchor KV between joins
-    kind = "none" if set_size else residency(anchor, state, resident, same_group)
+    # a model that does not reuse KV keeps no anchor KV between joins
+    kind = (residency(anchor, state, resident, same_group) if model.reuses_kv
+            else "none")
     work = stage_work(spec, anchor, expected_rows, lengths, pre,
                       resident=kind != "none", window=model.sliding_window,
                       set_size=set_size)

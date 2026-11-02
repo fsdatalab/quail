@@ -196,7 +196,7 @@ class ShouldRetainKv(PhysicalRule):
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None or context.logical_plan is None \
                 or "retention" in context.settings \
-                or context.model.attention_mask == "set":
+                or not context.model.reuses_kv:
             return None
         logical = context.logical_plan
         statistics = cached_statistics(
@@ -345,7 +345,7 @@ class ShouldSharePrefixes(PhysicalRule):
     name = "should_share_prefixes"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
-        if context is None or context.model.attention_mask == "set":
+        if context is None or not context.model.reuses_kv:
             return None
         nodes = []
         changed = False
