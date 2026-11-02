@@ -114,9 +114,9 @@ class AiFilter(PhysicalNode):
     # value columns of the alias; the executor reads one document of
     # each key value at a time and skips the rest once one survives
     stop_key: tuple[str, ...] = ()
-    # under set attention: the filters of a table with the same stage
-    # share one pass per document (the choose_packing step)
-    stage: int = 0
+    # under set attention, the operators whose questions share each pass
+    # over a document have one pass_group (PackSetPasses); -1 is none
+    pass_group: int = -1
     # under set attention: the first question tokens, which the pass
     # reads with the document, and the tokens that open each later
     # question of a pass

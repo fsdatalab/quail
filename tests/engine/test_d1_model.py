@@ -180,6 +180,17 @@ def test_a_join_pass_holds_at_most_the_set_size_and_fits_one_chunk():
         split_passes(100, [0], lengths, 1, 16, 105)
 
 
+def test_an_anchor_without_partners_at_the_next_join_settles_unmatched():
+    from quail.backends.quail.executor.operators.join import settled_rows
+
+    # anchor 0 matches at join 0, then has no partner to ask at join 1;
+    # anchor 1 matches at both; anchor 2 matches nothing at join 0
+    every = [{0: [True], 1: [True], 2: [False]}, {1: [False, True]}]
+    asked = [[0, 1, 2], [0, 1]]
+
+    assert settled_rows(every, asked) == {0: [], 1: [False, True], 2: [False]}
+
+
 def test_a_join_question_labels_each_partner_and_joins_its_end_to_the_tail():
     from quail.backends.quail.executor.operators.join import set_join_questions
     from quail.backends.quail.executor.set_passes import StateTails
@@ -193,27 +204,34 @@ def test_a_join_question_labels_each_partner_and_joins_its_end_to_the_tail():
     assert questions == [[9, 1, 4, 5], [9, 2, 1, 3, 5]]
 
 
-def _stages(selectivities, questions=50, state=300.0, longest=300):
-    from quail.cost.packing import choose_stages
+def _groups(selectivities, questions=50, state=300.0, longest=300,
+            chunk=8192, header=0):
+    from quail.cost.packing import choose_pass_groups
 
     count = len(selectivities)
-    return choose_stages([questions] * count, selectivities, 5000.0, state,
-                         longest, D1_2B_BF16, H100_SXM, 8192, set_size=16)
+    return choose_pass_groups([questions] * count, selectivities, 5000.0, state,
+                              longest, D1_2B_BF16, H100_SXM, chunk,
+                              set_size=16, header=header)
 
 
-def test_a_filter_that_keeps_few_rows_gets_its_own_stage():
-    assert _stages([0.02, 0.5, 0.5]) == (0, 1, 1)
+def test_a_filter_that_keeps_few_rows_gets_its_own_pass_group():
+    assert _groups([0.02, 0.5, 0.5]) == (0, 1, 1)
 
 
 def test_filters_that_keep_most_rows_share_one_pass():
-    assert _stages([0.8, 0.8, 0.8]) == (0, 0, 0)
+    assert _groups([0.8, 0.8, 0.8]) == (0, 0, 0)
 
 
 def test_a_pass_holds_at_most_the_trained_set_size():
-    stages = _stages([1.0] * 20)
+    groups = _groups([1.0] * 20)
 
-    assert max(stages) >= 1
-    assert all(stages.count(stage) <= 16 for stage in set(stages))
+    assert max(groups) >= 1
+    assert all(groups.count(group) <= 16 for group in set(groups))
+
+
+def test_a_pass_group_fits_one_chunk_with_the_longest_document_and_headers():
+    # 300 + 50 + 3 * (50 + 5) = 515 tokens fit 520; a fifth question does not
+    assert _groups([1.0] * 5, chunk=520, header=5) == (0, 0, 0, 0, 1)
 
 
 def test_a_pass_suffix_opens_each_later_question_with_its_header():
@@ -289,7 +307,7 @@ def test_two_ai_filters_on_d1_2b_share_one_pass(tmp_path):
         "AND AI_FILTER(PROMPT('Is it short? {0}', r.body))").plan()
 
     filters = [node for node in plan.nodes if isinstance(node, AiFilter)]
-    assert [node.stage for node in filters] == [0, 0]
+    assert [node.pass_group for node in filters] == [0, 0]
     assert all(node.state_tail_tokens == 1 for node in filters)
     assert all(node.question_header_token_ids == ("QUESTION:",) for node in filters)
     session.close()
@@ -591,6 +609,44 @@ def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
     assert spec.join_layout == (("QUESTION:",), ("aspects", "record:"))
     assert spec.prompt_token_parts[0][-2:] == ("reviews", "record:")
     assert build_pipelines(plan.graph)[join.node_id] == (join, label)
+    # priced by its own estimate over each anchor's kept pairs, not as a
+    # pass group of one question for each pair
+    assert label.pass_group == -1
+    assert plan.estimates[label.node_id]["seconds"] == pytest.approx(
+        spec.estimated_seconds)
+    session.close()
+
+
+def test_a_condition_between_two_d1_classifications_splits_their_passes(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.physical import AiClassify
+    from quail.planner.plan import EngineConfig
+
+    body = " ".join(["word"] * 300)
+    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
+                   tmp_path / "reviews.parquet")
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=str.split)
+    session.register("reviews", DocumentProvider.from_parquet(
+        str(tmp_path / "reviews.parquet"), id_col="id"))
+
+    plan = session.sql(
+        "SELECT r.id, AI.CLASSIFY(PROMPT('Which size? {0}', r.body), "
+        "ARRAY['short', 'long']) AS size FROM reviews r WHERE "
+        "AI.CLASSIFY(PROMPT('Which mood? {0}', r.body), "
+        "ARRAY['happy', 'sad']) = 'happy'").plan()
+
+    labels = [node for node in plan.nodes if isinstance(node, AiClassify)]
+    groups = {node.pass_group for node in labels}
+    # the condition reads the first label, so the second is asked in a
+    # later pass, as the executor runs them
+    assert len(labels) == 2 and len(groups) == 2 and -1 not in groups
+    assert all(plan.estimates[node.node_id]["pass_members"] == (node.node_id,)
+               for node in labels)
     session.close()
 
 

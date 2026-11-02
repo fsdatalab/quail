@@ -313,6 +313,23 @@ def join_pass_stage(node, prefixes, anchors, members_of, documents, tails,
                  label=f"join ({len(states)} passes)"), states, owners
 
 
+def settled_rows(every, asked) -> dict:
+    """Each anchor's answers at the last join of the group it reached.
+
+    An anchor that reached a join but had no partner to ask there
+    settles with no answers, as unmatched, not with the answers of the
+    join before it.
+
+    Args:
+        every: Per join, anchor -> its answers.
+        asked: Per join, the anchors that reached it.
+    """
+    last = {}
+    for rows, anchors in zip(every, asked):
+        last.update((anchor, rows.get(anchor, [])) for anchor in anchors)
+    return last
+
+
 def execute_set_joins(state, part) -> dict:
     """Run a group's joins under set attention.
 
@@ -330,9 +347,10 @@ def execute_set_joins(state, part) -> dict:
     readout = AsyncSlotMargins(state.torch, state.answer_rows)
     keys = inputs["anchor_keys"]
     lists_for = inputs.get("anchor_partners")
-    every, own_tokens, all_spans = [], [], []
+    every, own_tokens, all_spans, asked = [], [], [], []
     reached = range(len(part.ids))
     for j, node in enumerate(nodes):
+        asked.append(list(reached))
         stage, states, owners = join_pass_stage(
             node, inputs["prefixes"], reached,
             lambda anchor, j=j: (None if lists_for is None
@@ -355,7 +373,7 @@ def execute_set_joins(state, part) -> dict:
         every.append(rows)
         own_tokens.append(tokens)
         reached = [anchor for anchor in sorted(rows) if any(rows[anchor])]
-    last = {anchor: row for rows in every for anchor, row in rows.items()}
+    last = settled_rows(every, asked)
     for anchor in sorted(last):
         part.on_settled(anchor, any(last[anchor]), last[anchor])
     part.finish(every)

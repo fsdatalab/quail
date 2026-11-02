@@ -6,7 +6,6 @@ from operator import mul
 from typing import Callable, Hashable
 
 from quail.cost.filters import filter_cost
-from quail.cost.packing import choose_stages
 from quail.logical import (
     effective_selectivity,
     is_score,
@@ -15,7 +14,6 @@ from quail.physical import AiFilter, PortRef
 from quail.physical.base import input_ports
 from quail.planner.operators.common import question_tokens
 from quail.planner.operators.score import score_statistics
-from quail.planner.statistics.tables import summarize_alias
 
 
 @dataclass(frozen=True)
@@ -62,29 +60,6 @@ def prepare_filter_costs(predicates, *, mean_tokens, model, device,
     return tuple(prepared)
 
 
-def set_stages(builder, alias, positions, expected_rows) -> tuple[int, ...]:
-    """Each filter's stage under set attention (the choose_packing step).
-
-    Args:
-        builder: The graph builder.
-        alias: The table.
-        positions: The written positions of its filters, in run order.
-        expected_rows: The documents the first filter reads.
-    """
-    predicates = builder.operators.filters[alias]
-    lowered = [builder.context.lowered(predicates[i].prompt) for i in positions]
-    summary = summarize_alias(
-        builder.document_tokens[alias], builder.model.sliding_window,
-        memo=builder.context.memo)
-    head = lowered[0].preamble_tokens
-    return choose_stages(
-        [question_tokens(prompt, builder.model.canvas_tokens) for prompt in lowered],
-        [effective_selectivity(predicates[i].selectivity) for i in positions],
-        expected_rows, head + summary.mean, head + summary.maximum,
-        builder.model, builder.device,
-        builder.operator_order.statistics.chunk, set_size=builder.model.set_size)
-
-
 def emit_filter(builder, alias, positions, expected_rows, port, followed=False):
     """Append a run of the alias's AI filters in their chosen order.
 
@@ -101,10 +76,8 @@ def emit_filter(builder, alias, positions, expected_rows, port, followed=False):
         Where the documents stand after the run.
     """
     orders = builder.operator_order.filter_orders
-    stages = (set_stages(builder, alias, positions, expected_rows)
-              if builder.model.attention_mask == "set" else (0,) * len(positions))
     surv = expected_rows
-    for i, stage in zip(positions, stages):
+    for i in positions:
         p = builder.operators.filters[alias][i]
         ask_id = (f"ai_filter:{alias}" if i == orders[alias][0]
                else f"ai_filter:{alias}:{i}")
@@ -119,7 +92,7 @@ def emit_filter(builder, alias, positions, expected_rows, port, followed=False):
             arena_writes=(builder.model.attention_mask != "set"
                           and (len(orders[alias]) > 1 or followed
                                or alias in builder.pipelined)),
-            stop_key=builder.stop_keys.get(alias, ()), stage=stage))
+            stop_key=builder.stop_keys.get(alias, ())))
         surv *= effective_selectivity(p.selectivity)
         port = PortRef(ask_id, f"rows:{alias}")
     return port

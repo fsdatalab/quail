@@ -62,19 +62,20 @@ def set_pass_stage(nodes, readout, decide=None) -> Stage:
 
 
 def execute_set_filters(state: QueryExecutionState, nodes, inputs) -> dict:
-    """Run a table's filters under set attention, stage by stage.
+    """Run a table's filters under set attention, one pass group at a time.
 
-    The filters of one stage share one pass per document: the document,
-    then each filter's question. Each stage reads the documents that
-    every earlier stage kept. A filter answers only the documents that
-    passed the filters before it, as in a plan of one filter per stage.
+    The filters of one pass group (PackSetPasses) share one pass per
+    document: the document, then each filter's question. Each group
+    reads the documents that every earlier group kept. A filter answers
+    only the documents that passed the filters before it, as in a plan
+    of one filter per pass group.
     """
     documents, ids = inputs["documents"], inputs["document_ids"]
     readout = AsyncSlotMargins(state.torch, state.answer_rows)
     tails = state_tails(state)
     answers = {node.node_id: {} for node in nodes}
     metrics = {node.node_id: (0, 0.0, 0) for node in nodes}
-    runs = [list(run) for _, run in groupby(nodes, key=lambda node: node.stage)]
+    runs = [list(run) for _, run in groupby(nodes, key=lambda node: node.pass_group)]
     groups = inputs.get("stop_groups")
     current = list(range(len(ids)))
     for index, run in enumerate(runs):

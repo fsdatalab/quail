@@ -30,7 +30,12 @@ from quail.physical import (
     PhysicalGraph,
 )
 from quail.physical.pipelines import build_pipelines, resident_inputs
-from quail.planner.graph.passes import pass_groups
+from quail.planner.graph.passes import (
+    expected_documents,
+    head_tokens,
+    pass_members,
+    question_tokens,
+)
 from quail.planner.operators.classify import classify_scoring
 from quail.planner.operators.map import map_seconds
 from quail.planner.statistics.prefixes import key_documents, page_tree
@@ -101,36 +106,25 @@ class PlanPricer:
                                            + layout.question_label))
         header = len(context.tokenizer(layout.question_label))
         out = {}
-        for group in pass_groups(graph, model.set_size):
-            first = group.nodes[0]
-            summary = summarize_alias(context.document_tokens[group.alias],
+        for members in pass_members(graph):
+            first = members[0]
+            alias = first.document_aliases[0]
+            summary = summarize_alias(context.document_tokens[alias],
                                       model.sliding_window, memo=context.memo)
-            if isinstance(first, AiFilter):
-                head = first.preamble_tokens
-            else:
-                head = len(first.spec.prompt_token_parts[0])
-            questions = [self._question_tokens(node, state_tail)
-                         + (header if index else 0)
-                         for index, node in enumerate(group.nodes)]
-            rows = group.rows * self._distinct(group.alias)
-            work = (packed(head + summary.mean + state_tail, questions,
+            questions = [question_tokens(node, state_tail) + (header if index else 0)
+                         for index, node in enumerate(members)]
+            rows = expected_documents(first) * self._distinct(alias)
+            work = (packed(head_tokens(first) + summary.mean + state_tail, questions,
                            window=model.sliding_window)
                     + Work(pairs=summary.variance)) * rows
-            members = tuple(node.node_id for node in group.nodes)
-            for node in group.nodes:
+            ids = tuple(node.node_id for node in members)
+            for node in members:
                 price = NodePrice(work=work if node is first else Work())
-                entry = {"pass_members": members}
+                entry = {"pass_members": ids}
                 if node is first:
                     entry["seconds"] = self._seconds(work)
                 out[node.node_id] = (price, entry)
         return out
-
-    @staticmethod
-    def _question_tokens(node, state_tail: int) -> int:
-        """A packed operator's question tokens after the state tail."""
-        if isinstance(node, AiFilter):
-            return max(1, node.question_tokens - state_tail)
-        return len(node.spec.prompt_token_parts[1]) - node.spec.state_tail_tokens
 
     def _each_priced(self, graph) -> dict:
         pipelines = build_pipelines(graph)

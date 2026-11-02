@@ -106,17 +106,17 @@ def _node_inputs(node, results, inputs) -> dict:
 def execute_set_pipeline(state, nodes, inputs, context) -> dict:
     """Run a pipeline's operators under set attention, step by step.
 
-    Consecutive operators of one kind share their passes: a table's
-    filters by stage, and classifications or extractions in blocks of
-    the set size. A condition on their columns runs between them. A
-    join's anchors are the rows the steps before it kept, and the
-    classifications of its pairs follow it. Each step reads the rows
-    the step before it kept.
+    The operators of one pass group (PackSetPasses) share their passes.
+    A condition on their columns runs between them. A join's anchors are
+    the rows the steps before it kept, and the classifications of its
+    pairs follow it. Each step reads the rows the step before it kept.
     """
     alias = nodes[0].document_aliases[0]
     ids = pipeline_ids(nodes[0], inputs)
     results, join = {}, None
-    for kind, run in groupby(nodes, key=_kind):
+    # a run of one kind and one pass group (PackSetPasses) shares passes
+    for (kind, _), run in groupby(
+            nodes, key=lambda node: (_kind(node), getattr(node, "pass_group", -1))):
         run = list(run)
         if kind == "filter":
             run_inputs = filter_inputs(context.state, run[0], ids)

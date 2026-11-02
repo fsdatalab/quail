@@ -27,6 +27,7 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.physical.pipelines import build_pipelines
 from quail.planner.graph import retention
+from quail.planner.graph.passes import packed_kind, set_pass_groups
 from quail.planner.operators.classify import classify_scoring
 from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import plan_kv_retention
@@ -137,6 +138,34 @@ class ShouldPushDownLimitThroughWindow(PhysicalRule):
                 node = replace(node, inputs=input_ports((PortRef("top", "rows"),)))
             nodes.append(node)
         return PhysicalGraph(tuple(nodes), limit.inputs[0].source)
+
+
+class PackSetPasses(PhysicalRule):
+    """Give the operators that share each set-attention pass one pass_group.
+
+    Under set attention a pass reads a document, then up to the model's
+    set size of questions, and keeps nothing. In each pipeline, a run of
+    consecutive AI filters, classifications of one document, or
+    extractions splits into pass groups (choose_pass_groups): a group is
+    asked of every row that reaches its first operator, holds at most
+    the set size of questions, and fits one chunk with the longest
+    document. Pricing, explain(), and the executor read pass_group. The
+    rule fires once, while some packable operator has none.
+    """
+
+    name = "pack_set_passes"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None or context.model.attention_mask != "set":
+            return None
+        if not any(packed_kind(node) and node.pass_group < 0
+                   for node in graph.nodes):
+            return None
+        groups = set_pass_groups(graph, context)
+        return PhysicalGraph(tuple(
+            replace(node, pass_group=groups[node.node_id])
+            if node.node_id in groups else node for node in graph.nodes),
+            graph.root)
 
 
 class ShouldRetainKv(PhysicalRule):

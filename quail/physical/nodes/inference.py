@@ -49,6 +49,9 @@ class AiInference(PhysicalNode):
     model: str = ""
     spec: InferenceSpec | None = None
     keep_kv: bool = False
+    # under set attention, the operators whose questions share each pass
+    # over a document have one pass_group (PackSetPasses); -1 is none
+    pass_group: int = -1
 
     answer_kind: ClassVar[str] = "scores"
     spec_type: ClassVar[type[InferenceSpec]] = InferenceSpec

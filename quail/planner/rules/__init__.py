@@ -10,6 +10,7 @@ from quail.planner.rules.logical import (
 from quail.planner.rules.physical import (
     ChooseAttentionPath,
     ChooseClassifyImplementation,
+    PackSetPasses,
     ShouldDeduplicate,
     ShouldEliminateWindowSort,
     ShouldPushDownLimit,
@@ -23,15 +24,17 @@ def built_in_rules() -> tuple:
     """Return logical rules followed by physical rules in dependency order.
 
     Classification implementation determines pipeline compatibility for
-    KV retention. Prefix sharing prices the writes retention requires.
-    Tree attention uses the selected shared prefixes. Deduplication
-    reads the plan every other rule settled.
+    KV retention and for packing set-attention passes. Prefix sharing
+    prices the writes retention requires. Tree attention uses the
+    selected shared prefixes. Deduplication reads the plan every other
+    rule settled.
     """
     return (
         ShouldEliminateDistinct(), ShouldPushDownDistinct(), ShouldPushDownProjection(),
         ShouldPushDownFilters(), ShouldLiftColumnOperators(),
         ShouldEliminateWindowSort(),
         ShouldPushDownLimitThroughWindow(), ShouldPushDownLimit(),
-        ChooseClassifyImplementation(), ShouldRetainKv(), ShouldSharePrefixes(),
+        ChooseClassifyImplementation(), PackSetPasses(), ShouldRetainKv(),
+        ShouldSharePrefixes(),
         ChooseAttentionPath(), ShouldDeduplicate(),
     )
