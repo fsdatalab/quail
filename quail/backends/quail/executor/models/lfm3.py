@@ -264,10 +264,6 @@ class Lfm3Pipeline(ModelPipeline):
         return (conv.in_proj, conv.out_proj, attention.qkv_gate,
                 attention.o_proj, conv.w13, conv.w2)
 
-    def convolutions(self):
-        """Return the convolution weights and activation used by this model."""
-        return ((self.conv_layer.taps, None, False),)
-
     def _linear(self, x, module):
         if not self.engine.is_fp8:
             return self.engine.gemm(x, None, module)

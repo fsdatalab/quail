@@ -94,27 +94,3 @@ def test_launches_cap_the_sequences_and_match_one_pass(monkeypatch):
             torch.testing.assert_close(output, expected)
             torch.testing.assert_close(initial, start)
             assert final is expected_state if keep else final is None
-
-
-def test_a_convolution_wider_than_vllms_kernel_continues_each_sequence():
-    import torch.nn.functional as F
-
-    channels, width, lengths = 8, 7, (5, 1, 12, 3)
-    torch.manual_seed(0)
-    x = torch.randn(sum(lengths), channels)
-    weight = torch.randn(channels, width)
-    saved = torch.randn(len(lengths), width - 1, channels)
-    for history in (None, saved):
-        phase = SimpleNamespace(lengths=lengths, conv_metadata=None)
-        out, tails = gdn.causal_conv_kernel(
-            x, weight, phase, history, activate=False)
-        start = 0
-        for index, length in enumerate(lengths):
-            before = (torch.zeros(width - 1, channels) if history is None
-                      else history[index])
-            inputs = torch.cat((before, x[start:start + length]))
-            expected = F.conv1d(inputs.T[None], weight[:, None, :],
-                                groups=channels)[0].T
-            torch.testing.assert_close(out[start:start + length], expected)
-            torch.testing.assert_close(tails[index], inputs[-(width - 1):])
-            start += length

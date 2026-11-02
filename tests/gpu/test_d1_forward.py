@@ -625,6 +625,31 @@ def test_each_packed_slot_agrees_with_d1s_own_model(answer_ids, reference,
     assert max(abs(a - b) for a, b in pairs) < MARGIN_TOLERANCE
 
 
+def test_the_fused_kernels_match_a_plain_pytorch_forward(packs, answer_ids,
+                                                         loaded, quail_packs):
+    """Quail's packed passes against tests/gpu/lfm3_reference.py, two reviews."""
+    import sys
+    from pathlib import Path
+
+    from quail.backends.quail.executor.model_loading import full_output_head
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from lfm3_reference import reference_hidden
+
+    model, _, _ = loaded
+    head = full_output_head(model).float()
+    yes, no = list(answer_ids[0]), list(answer_ids[1])
+    pairs = []
+    for item, ours in zip(packs[1][:2], quail_packs[:2]):
+        hidden = reference_hidden(model, _spec(), item["ids"], item["groups"])
+        logits = hidden[item["slots"]].float() @ head.T
+        theirs = (logits[:, yes].amax(-1) - logits[:, no].amax(-1)).tolist()
+        pairs.extend(zip(theirs, ours))
+    print("packed yes minus no, plain PyTorch vs Quail's kernels:",
+          [(round(a, 2), round(b, 2)) for a, b in pairs[:16]])
+    assert max(abs(a - b) for a, b in pairs) < MARGIN_TOLERANCE
+
+
 def test_packed_p_yes_matches_d1_reading_its_own_pass(reference, quail_packs):
     import math
 

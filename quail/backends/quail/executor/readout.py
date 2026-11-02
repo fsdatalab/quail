@@ -422,35 +422,60 @@ class AsyncSlotPointers(_SlotReadout):
         self.reads = reads
         self.span_tokens = span_tokens
 
-    def _spans(self, rows):
+    def spans(self, rows, counts):
+        """Every read's span in a chunk, computed together.
+
+        Args:
+            rows: (read rows, width) float32 rows of the chunk's answers.
+            counts: Each answer's read rows: its document rows, then two
+                slot rows for each read.
+
+        Returns:
+            (answers * reads, 3): each read's first and last document
+            row, and its raw P(found).
+        """
         torch, F = self.torch, self.F
+        counts = np.asarray(counts, dtype=np.int64)
         slots = 2 * self.reads
-        state, query = rows[:-slots], rows[-slots:]
-        logits = query @ state.T / math.sqrt(rows.shape[-1])
-        start, end = logits.log_softmax(-1).view(
-            self.reads, 2, -1).unbind(1)
+        firsts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+        states = counts - slots
+        widest = int(states.max())
+        device = rows.device
+
+        def tensor(array):
+            return torch.from_numpy(np.ascontiguousarray(array)).to(device)
+
+        slot_rows = (firsts + states)[:, None] + np.arange(slots)
+        queries = rows.index_select(0, tensor(slot_rows.reshape(-1)))
+        # each slot against every row of the chunk: (slots in the chunk,
+        # rows); a slot then keeps only its own answer's document rows
+        scores = queries @ rows.T / math.sqrt(rows.shape[-1])
+        valid = np.arange(widest)[None, :] < states[:, None]
+        columns = np.where(valid, firsts[:, None] + np.arange(widest), 0)
+        logits = scores.gather(1, tensor(np.repeat(columns, slots, axis=0)))
+        logits = logits.masked_fill(~tensor(np.repeat(valid, slots, axis=0)),
+                                    -math.inf)
+        start, end = logits.log_softmax(-1).view(-1, 2, widest).unbind(1)
         found = -torch.expm1(start[:, 0])
-        if state.shape[0] == 1:
-            at = torch.zeros(self.reads, 2, device=rows.device)
-        else:
-            cap = min(self.span_tokens, state.shape[0] - 1)
-            windows, indices = F.max_pool1d(
-                F.pad(end[:, None, 1:], (0, cap - 1), value=-math.inf),
-                cap, stride=1, return_indices=True)
-            index = (start[:, 1:] + windows[:, 0]).argmax(-1)
-            last = indices[:, 0].gather(1, index[:, None])[:, 0] + 1
-            at = torch.stack((index + 1, last), -1).float()
-            at = torch.where((found < 0.5)[:, None], torch.zeros_like(at), at)
+        if widest == 1:
+            return torch.cat((torch.zeros_like(start).repeat(1, 2),
+                              found[:, None]), -1)
+        cap = min(self.span_tokens, widest - 1)
+        windows, indices = F.max_pool1d(
+            F.pad(end[:, None, 1:], (0, cap - 1), value=-math.inf),
+            cap, stride=1, return_indices=True)
+        index = (start[:, 1:] + windows[:, 0]).argmax(-1)
+        last = indices[:, 0].gather(1, index[:, None])[:, 0] + 1
+        at = torch.stack((index + 1, last), -1).float()
+        # a read finds nothing when P(found) is under one half, or when
+        # its answer has no document row past the first
+        nothing = (found < 0.5) | tensor(np.repeat(states == 1, self.reads))
+        at = torch.where(nothing[:, None], torch.zeros_like(at), at)
         return torch.cat((at, found[:, None]), -1)
 
     def submit(self, normed, rows_per_answer=None):
-        rows = normed.float()
-        spans, row = [], 0
-        for count in rows_per_answer:
-            spans.append(self._spans(rows[row:row + int(count)]))
-            row += int(count)
-        return (*self._copy(self.torch.cat(spans)),
-                [self.reads] * len(rows_per_answer))
+        values = self.spans(normed.float(), rows_per_answer)
+        return (*self._copy(values), [self.reads] * len(rows_per_answer))
 
 
 class DecisionHead:
