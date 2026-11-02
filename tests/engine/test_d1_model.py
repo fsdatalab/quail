@@ -305,3 +305,18 @@ def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
     assert plan.estimates[label.node_id]["seconds"] == pytest.approx(
         spec.estimated_seconds)
     session.close()
+
+
+def test_an_lfm3_checkpoint_reads_its_text_model_and_refuses_unknown_tensors():
+    from quail.backends.quail.executor.models.lfm3 import text_tensor_names
+
+    vl = ["model.language_model.layers.0.conv.conv.weight",
+          "model.vision_tower.encoder.weight", "model.multi_modal_projector.w"]
+    text = ["model.layers.0.conv.conv.weight", "model.embed_tokens.weight"]
+
+    assert text_tensor_names(vl, "lfm3_vl") == {
+        "layers.0.conv.conv.weight": vl[0]}
+    assert sorted(text_tensor_names(text, "lfm3")) == [
+        "embed_tokens.weight", "layers.0.conv.conv.weight"]
+    with pytest.raises(ValueError, match="outside its language model"):
+        text_tensor_names([*vl, "model.audio_tower.weight"], "lfm3_vl")

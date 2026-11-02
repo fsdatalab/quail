@@ -22,14 +22,49 @@ from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models import lfm3_kernels as kernels
 from quail.backends.quail.executor.models.base import ModelPipeline
 
-TEXT_PREFIX = "model.language_model."
+# per model_type, the prefix of the language model's tensors and the
+# prefixes of the parts the text pass does not read, as transformers
+# names them
+CHECKPOINT_LAYOUTS = {
+    "lfm3": ("model.", ("lm_head.",)),
+    "lfm3_vl": ("model.language_model.",
+                ("model.vision_tower.", "model.multi_modal_projector.",
+                 "lm_head.")),
+}
 
 
 def is_lfm3(path) -> bool:
     """Whether a checkpoint directory holds an LFM3 or LFM3-VL model."""
     config = Path(path) / "config.json"
     return (config.is_file() and json.loads(config.read_text()).get(
-        "model_type") in ("lfm3", "lfm3_vl"))
+        "model_type") in CHECKPOINT_LAYOUTS)
+
+
+def text_tensor_names(names, model_type) -> dict:
+    """The language model's tensors, by their name inside it.
+
+    Args:
+        names: Every tensor name in the checkpoint.
+        model_type: The config's model_type.
+
+    Returns:
+        Checkpoint name by name inside the language model.
+
+    Raises:
+        ValueError: A tensor is in neither the language model nor a part
+            the text pass skips.
+    """
+    prefix, skipped = CHECKPOINT_LAYOUTS[model_type]
+    out, unknown = {}, []
+    for name in names:
+        if name.startswith(prefix):
+            out[name[len(prefix):]] = name
+        elif not name.startswith(skipped):
+            unknown.append(name)
+    if unknown:
+        raise ValueError(f"the {model_type} checkpoint has tensors outside its "
+                         f"language model: {sorted(unknown)[:5]}")
+    return out
 
 
 def text_config(path) -> dict:
@@ -108,6 +143,7 @@ def load_lfm3(path, device="cuda", max_positions=None):
     import torch
     from safetensors import safe_open
 
+    model_type = json.loads((Path(path) / "config.json").read_text())["model_type"]
     config = text_config(path)
     if config.get("conv_bias"):
         raise ValueError("an LFM3 convolution with bias is not supported")
@@ -117,9 +153,8 @@ def load_lfm3(path, device="cuda", max_positions=None):
     tensors = {}
     for file in sorted(Path(path).glob("*.safetensors")):
         with safe_open(str(file), framework="pt", device="cpu") as f:
-            for name in f.keys():
-                if name.startswith(TEXT_PREFIX):
-                    tensors[name[len(TEXT_PREFIX):]] = f.get_tensor(name)
+            for inner, name in text_tensor_names(f.keys(), model_type).items():
+                tensors[inner] = f.get_tensor(name)
 
     def take(name):
         try:
