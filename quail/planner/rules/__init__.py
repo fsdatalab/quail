@@ -10,6 +10,7 @@ from quail.planner.rules.logical import (
 from quail.planner.rules.physical import (
     ChooseAttentionPath,
     ChooseClassifyImplementation,
+    JoinDocumentEnds,
     PackSetPasses,
     ShouldDeduplicate,
     ShouldEliminateWindowSort,
@@ -34,7 +35,8 @@ def built_in_rules() -> tuple:
         ShouldPushDownFilters(), ShouldLiftColumnOperators(),
         ShouldEliminateWindowSort(),
         ShouldPushDownLimitThroughWindow(), ShouldPushDownLimit(),
-        ChooseClassifyImplementation(), PackSetPasses(), ShouldRetainKv(),
+        ChooseClassifyImplementation(), PackSetPasses(), JoinDocumentEnds(),
+        ShouldRetainKv(),
         ShouldSharePrefixes(),
         ChooseAttentionPath(), ShouldDeduplicate(),
     )

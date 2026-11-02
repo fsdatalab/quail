@@ -8,15 +8,16 @@ in one pass per document and decodes the answers for every document
 at once.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.parts import gpu_seconds, input_staging
 from quail.backends.quail.executor.readout import AsyncPassReadout
-from quail.backends.quail.executor.set_passes import group_passes, state_tails
+from quail.backends.quail.executor.set_passes import group_passes
 from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.catalog.document_ends import ends_for, joined_state
 from quail.physical import AiFilter, ClassifySpec, ExtractSpec, ScoreSpec
 
 
@@ -33,6 +34,9 @@ class SetQuestion:
         header: The tokens that open the question after another.
         spellings: For a choice, per option, its token ids.
         slots: The rows read, counted back from the question's last row.
+        ends: The plan's joins of each document's last token with the
+            state tail, as (last token, tokens) pairs (JoinDocumentEnds);
+            empty joins nothing.
     """
 
     kind: str
@@ -42,29 +46,33 @@ class SetQuestion:
     header: tuple
     spellings: tuple = ()
     slots: tuple = (0,)
+    ends: tuple = ()
 
 
 def node_question(node) -> SetQuestion:
     """The question an AiFilter, or a score, classification, or extraction, asks."""
+    spec = node.spec if hasattr(node, "spec") else None
     if isinstance(node, AiFilter):
         cut, ids = node.state_tail_tokens, tuple(node.question_token_ids)
-        return SetQuestion("yes_no", tuple(node.document_head), ids[:cut],
-                           ids[cut:], tuple(node.question_header_token_ids))
-    spec = getattr(node, "spec", node)
-    head, tail = (tuple(part) for part in spec.prompt_token_parts)
-    cut = spec.state_tail_tokens
-    if isinstance(spec, ClassifySpec):
-        return SetQuestion("choice", head, tail[:cut], tail[cut:],
-                           tuple(spec.question_header_token_ids),
-                           spellings=tuple(spec.label_token_ids))
-    if isinstance(spec, ScoreSpec):
-        return SetQuestion("score", head, tail[:cut], tail[cut:],
-                           tuple(spec.question_header_token_ids))
-    if isinstance(spec, ExtractSpec):
-        return SetQuestion("read", head, tail[:cut], tail[cut:],
-                           tuple(spec.question_header_token_ids),
-                           slots=tuple(spec.read_slots))
-    raise TypeError(f"no set-attention question for {type(node).__name__}")
+        alias, head = node.alias, tuple(node.document_head)
+        question = SetQuestion("yes_no", head, ids[:cut], ids[cut:],
+                               tuple(node.question_header_token_ids))
+    else:
+        head, tail = (tuple(part) for part in spec.prompt_token_parts)
+        cut, alias = spec.state_tail_tokens, spec.aliases[0]
+        header = tuple(spec.question_header_token_ids)
+        if isinstance(spec, ClassifySpec):
+            question = SetQuestion("choice", head, tail[:cut], tail[cut:], header,
+                                   spellings=tuple(spec.label_token_ids))
+        elif isinstance(spec, ScoreSpec):
+            question = SetQuestion("score", head, tail[:cut], tail[cut:], header)
+        elif isinstance(spec, ExtractSpec):
+            question = SetQuestion("read", head, tail[:cut], tail[cut:], header,
+                                   slots=tuple(spec.read_slots))
+        else:
+            raise TypeError(f"no set-attention question for {type(node).__name__}")
+    ends = ends_for(node.document_ends, alias, question.state_tail)
+    return question if ends is None else replace(question, ends=tuple(ends.items()))
 
 
 @dataclass
@@ -194,8 +202,8 @@ def run_pass_group(state, questions, prefixes, *, limit=None, stop_groups=None,
            for q in questions):
         raise ValueError("the questions of one pass group share their prompt "
                          "head and state tail")
-    tails = state_tails(state)
-    states = [tails.prefix(prefix, first.state_tail) for prefix in prefixes]
+    ends = dict(first.ends) if first.ends else None
+    states = [joined_state(prefix, first.state_tail, ends) for prefix in prefixes]
     head = len(first.head)
     reads_any = any(q.kind == "read" for q in questions)
     # a read's document rows: the first row, which stands for nothing,

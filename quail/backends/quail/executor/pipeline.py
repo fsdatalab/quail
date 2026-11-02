@@ -24,7 +24,6 @@ from quail.backends.quail.executor.operators.set_extract import (
 )
 from quail.backends.quail.executor.parts import execute_parts, execution_prefix_tree
 from quail.backends.quail.executor.pass_groups import node_question, run_pass_group
-from quail.backends.quail.executor.set_passes import state_tails
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import id_positions
@@ -37,6 +36,10 @@ from quail.physical.base import ValueType
 def execute_pipeline(state: QueryExecutionState, nodes, inputs, context) -> dict:
     """Prepare compatible operators, run their stages, and return node results."""
     state.gpu_timing = bool(context.state.get("gpu_timing", False))
+    # a set-attention model runs every pipeline as passes over whole
+    # sequences; this is the one place that choice is made
+    if state.loaded_model.pipeline.whole_sequences:
+        return execute_set_pipeline(state, nodes, inputs, context)
     first = nodes[0]
     implementations = execution_parts()
     implementation = implementations[first.type_name]
@@ -44,8 +47,6 @@ def execute_pipeline(state: QueryExecutionState, nodes, inputs, context) -> dict
             and all(node.type_name == first.type_name for node in nodes)):
         prepared = context.model_inputs(first, inputs, context, nodes=nodes)
         return implementation.execute_group(state, nodes, prepared)
-    if state.loaded_model.pipeline.whole_sequences:
-        return execute_set_pipeline(state, nodes, inputs, context)
 
     alias = first.document_aliases[0]
     ids = pipeline_ids(first, inputs)
@@ -210,7 +211,7 @@ def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
                     values, keep, [prefixes[int(p)] for p in asked],
                     [texts[int(ids[p])] for p in asked],
                     len(node.spec.prompt_token_parts[0]),
-                    state_tails(state).encoder.token_bytes())
+                    state.loaded_model.tokenizer.encoder.token_bytes())
                 results[node.node_id] = read_result(node, ids[asked], SetReads(
                     answers, characters, list(found), suffix_tokens=suffix_tokens,
                     **cost))

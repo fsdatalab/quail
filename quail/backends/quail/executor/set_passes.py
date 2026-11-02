@@ -2,65 +2,9 @@
 
 Under set attention a pass is a state, a document and the text after
 it, then up to the model's set size of questions. Each operator builds
-its questions; these helpers build the state and split questions into
-passes.
+its questions; these helpers split questions into passes. The state
+ends each document as the plan joined it (JoinDocumentEnds).
 """
-
-from quail.catalog.tokens import GigatokenEncoder
-from quail.specs.files import resolve_model_path
-
-
-class StateTails:
-    """A pass's state: a document, then the state tail, tokenized as d1 does.
-
-    d1 tokenizes a whole prompt, so a document's final mark can join
-    the blank line after it in one token. The join depends on the
-    document's last token alone, so each last token is tokenized with
-    the tail once and reused.
-
-    Args:
-        encoder: The model's tokenizer, with encode (call) and decode.
-    """
-
-    def __init__(self, encoder):
-        self.encoder = encoder
-        self.joins = {}
-
-    def prefix(self, document, state_tail) -> list:
-        """The document's tokens, then the tail, joined at their boundary.
-
-        Args:
-            document: The prompt head and document token ids.
-            state_tail: The token ids the state ends with.
-        """
-        document, tail = [int(t) for t in document], tuple(state_tail)
-        if not document:
-            return list(tail)
-        key = (document[-1], tail)
-        if key not in self.joins:
-            text = self.encoder.decode([document[-1], *tail])
-            joined = self.encoder(text)
-            # a text that does not decode back the same keeps its tokens
-            self.joins[key] = (joined if self.encoder.decode(joined) == text
-                               else [document[-1], *tail])
-        return document[:-1] + list(self.joins[key])
-
-
-def state_tails(state) -> StateTails:
-    """The loaded model's StateTails, over the tokenizer the worker loaded.
-
-    A state without a loaded tokenizer, as in tests, loads its own once.
-    """
-    loaded = state.loaded_model
-    if loaded.state_tails is None:
-        tokenizer = getattr(loaded, "tokenizer", None)
-        encoder = None if tokenizer is None else tokenizer.encoder
-        if encoder is None:
-            spec = loaded.model_spec
-            encoder = GigatokenEncoder(resolve_model_path(spec.hf_name,
-                                                          spec.revision))
-        loaded.state_tails = StateTails(encoder)
-    return loaded.state_tails
 
 
 def split_passes(state: int, members, lengths, header: int, set_size: int,
