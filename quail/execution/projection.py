@@ -13,6 +13,7 @@ from quail.execution.result import (
     true_answer_rows,
 )
 from quail.logical import (
+    PROBABILITIES_SUFFIX,
     CompileError,
 )
 from quail.logical.expressions import (
@@ -38,6 +39,12 @@ def projection_for(logical, token_inputs, documents):
                    for node in (*operators.classifies, *operators.extracts,
                                 *operators.sae_features, *operators.maps)}
     model_calls.update({node.span_name: node.call for node in operators.extracts})
+    # a classification's probability map belongs to the same documents
+    # as its label, but holds a map, not a label
+    probability_columns = {node.name + PROBABILITIES_SUFFIX
+                           for node in operators.classifies}
+    model_calls.update({node.name + PROBABILITIES_SUFFIX: node.call
+                        for node in operators.classifies})
     model_calls.update({column.name: call for column in logical.projection.columns
                         if (call := aliased_call(column, "label", "extract",
                                                  "score", "features", "map"))
@@ -119,7 +126,8 @@ def projection_for(logical, token_inputs, documents):
                 widened = pc.take(
                     pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
                     pa.array(slots))
-                if call is not None and call.kind == "label":
+                if (call is not None and call.kind == "label"
+                        and name not in probability_columns):
                     order = pa.array(call.labels, pa.string())
                     values = pa.DictionaryArray.from_arrays(
                         pc.index_in(widened, order).cast(pa.int32()),
