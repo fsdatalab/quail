@@ -8,9 +8,11 @@ Both cells run on one H100 SXM over the 4,995 IMDB-11 reviews at scale
 factor 0.1 and its question. The Liquid cell times
 ``model.system_one_batch`` after ``model.compile()``, at its default
 token budget and at Quail's chunk budget. The Quail cell times
-``classify_passes``, the code IMDB-11's classification runs, then
-profiles one more run with the torch profiler and prints the CUDA time
-by kernel and by kind. Both print one JSON line starting with
+``set_classify_batch``, the code IMDB-11's classification runs, and one
+mixed pass group (a yes/no, a choice, and a read in each review's
+pass), then profiles one more run of each with the torch profiler. It
+prints the CUDA time by kernel and by kind, and the host share: the
+part of wall time no kernel ran. Both print one JSON line starting with
 ``RESULT``; the profiler trace is saved on the results volume.
 """
 
@@ -112,7 +114,7 @@ def liquid_runtime() -> dict:
 
 
 def _quail_state():
-    """Quail's d1-2B model and the execution state classify_passes reads."""
+    """Quail's d1-2B model and the execution state its set passes read."""
     from types import SimpleNamespace
 
     import torch
@@ -120,6 +122,7 @@ def _quail_state():
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.readout import AnswerRows
     from quail.backends.quail.executor.set_passes import StateTails
     from quail.catalog.tokens import GigatokenEncoder
     from quail.cost import budgets
@@ -143,6 +146,8 @@ def _quail_state():
                     num_sliding_pages=sliding)
     state = SimpleNamespace(
         torch=torch, chunk_tokens=chunk, gpu_timing=False,
+        answer_rows=AnswerRows(torch, torch.nn.functional, model, true_ids,
+                               false_ids),
         loaded_model=SimpleNamespace(
             model=model, arena=arena, pipeline=build_pipeline(spec, model, arena),
             model_spec=spec, state_tails=StateTails(encoder), input_staging=None))
@@ -150,11 +155,10 @@ def _quail_state():
 
 
 def _classify_spec(encoder):
-    """IMDB-11's classification as a set_choice spec over the reviews."""
-    from types import SimpleNamespace
-
+    """IMDB-11's classification as a ClassifySpec over the reviews."""
     from quail.logical import ColumnRef
     from quail.logical.prompts import bind_classify_prompt
+    from quail.physical import ClassifySpec
     from quail.planner.prompt_lowering import lower_prompt, option_spellings
     from quail.specs import D1_2B_BF16
 
@@ -164,13 +168,45 @@ def _classify_spec(encoder):
                                          column="body"),),
         LABELS, (), turn=spec.turn, layout=spec.prompt_layout)
     lowered = lower_prompt(prompt, encoder)
-    return SimpleNamespace(
-        aliases=("r",), labels=tuple(LABELS), probabilities=False,
+    return ClassifySpec(
+        name="label", aliases=("r",), query_template=QUESTION, arguments=(),
+        expected_rows=0.0, estimated_seconds=0.0,
+        labels=tuple(LABELS), probabilities=False,
         prompt_token_parts=(tuple(lowered.preamble_token_ids),
                             tuple(lowered.tail_token_ids)),
         state_tail_tokens=len(encoder(lowered.prompt.tail_segments[0])),
         question_header_token_ids=tuple(encoder("QUESTION:\n")),
         label_token_ids=option_spellings(lowered.prompt.letters, encoder))
+
+
+def _mixed_questions(encoder, choice):
+    """A yes/no, IMDB-11's choice, and a read, as one pass group's SetQuestions."""
+    from quail.backends.quail.executor.pass_groups import SetQuestion, node_question
+    from quail.backends.quail.lowering import set_question_parts
+    from quail.logical import ColumnRef, bind_prompt
+    from quail.logical.prompts import PROMPT_LAYOUTS, bind_extract_prompt
+    from quail.planner.prompt_lowering import lower_prompt, read_slot_offsets
+    from quail.specs import D1_2B_BF16
+
+    spec = D1_2B_BF16
+    lowered = lower_prompt(bind_prompt(
+        "Does the review praise the acting? {0}", ("body",), turn=spec.turn,
+        layout=spec.prompt_layout), encoder)
+    parts = set_question_parts(lowered, spec, encoder)
+    tail, cut = tuple(lowered.tail_token_ids), parts["state_tail_tokens"]
+    yes_no = SetQuestion("yes_no", tuple(lowered.preamble_token_ids), tail[:cut],
+                         tail[cut:], parts["question_header_token_ids"])
+    lowered = lower_prompt(bind_extract_prompt(
+        (ColumnRef(alias="r", provider="reviews", column="body"),),
+        "The actor the reviewer singles out", spec.turn, spec.prompt_layout),
+        encoder)
+    segments = lowered.prompt.tail_segments
+    tail, cut = tuple(lowered.tail_token_ids), len(encoder(segments[0]))
+    read = SetQuestion(
+        "read", tuple(lowered.preamble_token_ids), tail[:cut], tail[cut:],
+        tuple(encoder("QUESTION:\n")), slots=read_slot_offsets(
+            segments[-1], PROMPT_LAYOUTS[spec.prompt_layout].read_slots, encoder))
+    return [yes_no, node_question(choice), read]
 
 
 KINDS = (  # first match wins: substrings of kernel names, lower case
@@ -190,41 +226,30 @@ def _kind(name: str) -> str:
                 "other")
 
 
-@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
-              volumes=volumes)
-def quail_profile() -> dict:
-    """Quail's IMDB-11 classification passes: timed, then profiled once."""
+def _profile(name, run, documents, tokens_of):
+    """Time run() twice after a warm run, then profile it once."""
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    from quail.backends.quail.executor.operators.set_classify import (
-        classify_passes,
-    )
-
-    state, encoder = _quail_state()
-    spec = _classify_spec(encoder)
-    documents = {"r": [encoder(review) for review in _reviews()]}
-    rows = list(range(len(documents["r"])))
-    classify_passes(state, [spec], rows, documents)    # warm
+    run()
     times = []
     for _ in range(2):
         torch.cuda.synchronize()
         begin = time.perf_counter()
-        (labels,) = classify_passes(state, [spec], rows, documents)
+        out = run()
         torch.cuda.synchronize()
         times.append(time.perf_counter() - begin)
-    tokens = labels.tokens
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        classify_passes(state, [spec], rows, documents)
+        run()
         torch.cuda.synchronize()
     os.makedirs(TRACE_DIR, exist_ok=True)
-    trace = f"{TRACE_DIR}/quail_classify_passes.json.gz"
+    trace = f"{TRACE_DIR}/quail_{name}.json.gz"
     prof.export_chrome_trace(trace)
-    kernels = [event for event in prof.key_averages()
-               if event.device_type.name == "CUDA" or event.self_device_time_total]
     by_kind, by_name = {}, {}
-    for event in kernels:
-        microseconds = event.self_device_time_total
+    for event in prof.key_averages():
+        # a CPU op's device time repeats its kernels' time
+        microseconds = (event.self_device_time_total
+                        if event.device_type.name == "CUDA" else 0)
         if not microseconds:
             continue
         by_name[event.key] = by_name.get(event.key, 0) + microseconds
@@ -232,15 +257,46 @@ def quail_profile() -> dict:
         by_kind[kind] = by_kind.get(kind, 0) + microseconds
     total = sum(by_kind.values())
     best = min(times)
-    result = dict(
-        reviews=len(rows), seconds=best, runs=times,
-        decisions_per_second=len(rows) / best, fresh_tokens=tokens,
+    tokens = tokens_of(out)
+    return dict(
+        reviews=documents, seconds=best, runs=times,
+        decisions_per_second=documents / best, fresh_tokens=tokens,
         tokens_per_second=tokens / best, cuda_seconds=total / 1e6,
+        host_share=max(0.0, 1 - total / 1e6 / best),
         by_kind={kind: round(us / total, 4) for kind, us in
                  sorted(by_kind.items(), key=lambda item: -item[1])},
         top_kernels=[(name[:120], round(us / 1e6, 3)) for name, us in
-                     sorted(by_name.items(), key=lambda item: -item[1])[:30]],
+                     sorted(by_name.items(), key=lambda item: -item[1])[:20]],
         trace=trace)
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
+def quail_profile() -> dict:
+    """IMDB-11's classification, then one mixed pass group: timed and profiled.
+
+    The host share is 1 minus CUDA kernel seconds over wall seconds: the
+    part of the run no kernel ran, an upper bound on host overhead.
+    """
+    from quail.backends.quail.executor.operators.set_classify import (
+        set_classify_batch,
+    )
+    from quail.backends.quail.executor.pass_groups import run_pass_group
+    from quail.catalog.tokens import DocumentPrefixes
+
+    state, encoder = _quail_state()
+    spec = _classify_spec(encoder)
+    documents = {"r": [encoder(review) for review in _reviews()]}
+    rows = list(range(len(documents["r"])))
+    questions = _mixed_questions(encoder, spec)
+    prefixes = DocumentPrefixes(questions[0].head, documents["r"], rows)
+    result = dict(
+        classify=_profile(
+            "classify", lambda: set_classify_batch(state, spec, rows, documents),
+            len(rows), lambda batch: batch.fresh_tokens),
+        mixed=_profile(
+            "mixed", lambda: run_pass_group(state, questions, prefixes),
+            len(rows), lambda group: group.tokens))
     modal.Volume.from_name("quail-results").commit()
     print("RESULT quail " + json.dumps(result), flush=True)
     return result

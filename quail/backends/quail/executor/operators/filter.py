@@ -1,6 +1,5 @@
 """Execute LLM filters and conditions on classification results."""
 
-from itertools import groupby
 
 import numpy as np
 import pyarrow as pa
@@ -10,12 +9,8 @@ from quail.backends.quail.executor.parts import (
     SingleResultPart,
     execute_parts,
     execution_prefix_tree,
-    gpu_seconds,
-    input_staging,
 )
-from quail.backends.quail.executor.readout import AsyncSlotMargins
-from quail.backends.quail.executor.set_passes import state_tails
-from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
+from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.pairs import columns_key
 from quail.catalog.selection import group_ids
@@ -29,88 +24,17 @@ from quail.execution.runtimes.filter import filter_scores, tested_table
 from quail.progress import answer_sink
 
 
-def set_pass_stage(nodes, readout, decide=None) -> Stage:
-    """One pass's stage for filters sharing it under set attention.
-
-    The suffix is each filter's question after the state tail, every
-    question after the first opened by its header; each question's
-    last row is read. The prefix holds the document and the state tail
-    (StateTails).
-
-    Args:
-        nodes: The AiFilters of the stage, in order.
-        readout: The readout of each question's row.
-        decide: The stage's decide callback.
-
-    Raises:
-        ValueError: The filters disagree on the state tail.
-    """
-    tail = nodes[0].state_tail_tokens
-    state = list(nodes[0].question_token_ids[:tail])
-    suffix, questions = [], []
-    for index, node in enumerate(nodes):
-        if list(node.question_token_ids[:tail]) != state:
-            raise ValueError("the filters of one pass share their state tail")
-        body = list(node.question_token_ids[tail:])
-        if index:
-            body = list(node.question_header_token_ids) + body
-        suffix += body
-        questions.append(len(body))
-    return Stage(suffixes=[suffix], readout=readout,
-                 questions=(tuple(questions),), decide=decide,
-                 label=f"filter pass ({len(nodes)} questions)")
-
-
 def execute_set_filters(state: QueryExecutionState, nodes, inputs) -> dict:
-    """Run a table's filters under set attention, one pass group at a time.
+    """Run a table's filters under set attention, by pass group.
 
-    The filters of one pass group (PackSetPasses) share one pass per
-    document: the document, then each filter's question. Each group
-    reads the documents that every earlier group kept. A filter answers
-    only the documents that passed the filters before it, as in a plan
-    of one filter per pass group.
+    A filter answers only the documents that passed the filters before
+    it, as in a plan of one filter per pass group (execute_set_steps).
     """
-    documents, ids = inputs["documents"], inputs["document_ids"]
-    readout = AsyncSlotMargins(state.torch, state.answer_rows)
-    tails = state_tails(state)
-    answers = {node.node_id: {} for node in nodes}
-    metrics = {node.node_id: (0, 0.0, 0) for node in nodes}
-    runs = [list(run) for _, run in groupby(nodes, key=lambda node: node.pass_group)]
-    groups = inputs.get("stop_groups")
-    current = list(range(len(ids)))
-    for index, run in enumerate(runs):
-        if not current:
-            break
-        last = index == len(runs) - 1
-        stage = set_pass_stage(run, readout, decide=lambda _, row: bool(
-            np.all(np.asarray(row[0], dtype=float) > 0)))
-        tail = list(run[0].question_token_ids[:run[0].state_tail_tokens])
-        prefixes = [tails.prefix(documents[i], tail) for i in current]
-        every, spans, tokens = run_stages(
-            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-            [stage], prefixes, state.chunk_tokens,
-            staging=input_staging(state), gpu_timing=state.gpu_timing,
-            paged=False, label=stage.label,
-            limit=inputs.get("limit") if last else None,
-            stop_groups=([groups[i] for i in current]
-                         if last and groups is not None else None))
-        kept = []
-        for position, document in enumerate(current):
-            if position not in every[0]:
-                continue
-            margins = np.asarray(every[0][position][0], dtype=float)
-            for node, margin in zip(run, margins):
-                answers[node.node_id][document] = [int(margin > 0)]
-                if margin <= 0:
-                    break
-            else:
-                kept.append(document)
-        metrics[run[0].node_id] = (tokens, gpu_seconds(spans), len(spans))
-        current = kept
-    return {node.node_id: filter_result(
-        node, answers[node.node_id], metrics[node.node_id][0], ids,
-        gpu_s=metrics[node.node_id][1], chunks=metrics[node.node_id][2])
-        for node in nodes}
+    from quail.backends.quail.executor.pipeline import execute_set_steps
+
+    return execute_set_steps(
+        state, nodes, inputs["document_ids"], inputs["documents"],
+        limit=inputs.get("limit"), stop_groups=inputs.get("stop_groups"))
 
 
 def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:

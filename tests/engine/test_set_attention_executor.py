@@ -3,7 +3,10 @@
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+
+from quail.specs import D1_2B_BF16
 
 
 def test_a_join_pass_holds_at_most_the_set_size_and_fits_one_chunk():
@@ -44,18 +47,15 @@ def test_a_join_question_labels_each_partner_and_joins_its_end_to_the_tail():
     assert questions == [[9, 1, 4, 5], [9, 2, 1, 3, 5]]
 
 
-def test_a_pass_suffix_opens_each_later_question_with_its_header():
-    from quail.backends.quail.executor.operators.filter import set_pass_stage
+def test_a_pass_opens_each_later_question_with_its_header():
+    from quail.backends.quail.executor.set_passes import group_passes
 
-    first = SimpleNamespace(state_tail_tokens=2, question_token_ids=(7, 8, 1, 2),
-                            question_header_token_ids=(8,))
-    second = SimpleNamespace(state_tail_tokens=2, question_token_ids=(7, 8, 3),
-                             question_header_token_ids=(8,))
+    (members, suffix, shape), = group_passes([[0] * 10], [(1, 2), (3,)], (8,),
+                                             16, 1000)
 
-    stage = set_pass_stage([first, second], readout=None)
-
-    assert stage.suffixes == [[1, 2, 8, 3]]
-    assert stage.questions == ((2, 2),)
+    assert members == [0, 1]
+    assert suffix == [1, 2, 8, 3]
+    assert shape == (2, 2)
 
 
 class _Pieces:
@@ -95,16 +95,44 @@ def test_a_documents_last_mark_joins_the_blank_line_after_it_once_per_ending():
 
 
 def test_an_option_scores_its_best_spelling_over_the_temperature():
-    from quail.backends.quail.executor.operators.set_classify import (
+    from quail.backends.quail.executor.pass_groups import (
+        option_columns,
         option_probabilities,
     )
 
-    logits = [2.0, 4.0, 1.0]  # A, " A", B
-    probabilities = option_probabilities(logits, {7: 0, 8: 1, 9: 2},
-                                         ((7, 8), (9,)), 2.0)
+    targets = [7, 8, 9]                    # A, " A", B
+    logits = np.array([[2.0, 4.0, 1.0], [0.0, 0.0, 3.0]])
+    probabilities = option_probabilities(
+        logits, option_columns(((7, 8), (9,)), targets), 2.0)
 
     expected = math.exp(4.0 / 2) / (math.exp(4.0 / 2) + math.exp(1.0 / 2))
-    assert probabilities[0] == pytest.approx(expected)
+    assert probabilities[0, 0] == pytest.approx(expected)
+    assert probabilities[1].argmax() == 1
+
+
+def test_one_mixed_pass_decodes_a_yes_no_a_choice_and_a_read():
+    from quail.backends.quail.executor.pass_groups import (
+        SetQuestion,
+        _decode,
+        _layout,
+    )
+
+    yes_no = SetQuestion("yes_no", (), (), (1,), ())
+    choice = SetQuestion("choice", (), (), (2,), (), spellings=((5,), (6,)))
+    read = SetQuestion("read", (), (), (3,), (), slots=(-2, 0))
+    targets = [5, 6, 20, 30]               # options A and B, then yes and no
+    kinds, places, width, reads = _layout([yes_no, choice, read], [0, 1, 2],
+                                          [20], [30], targets)
+    # two documents: code logits of the two code slots, then the read
+    values = np.array([[0, 0, 3, 1,   9, 1, 0, 0,   4, 6, 0.9],
+                       [0, 0, 1, 3,   1, 9, 0, 0,   0, 0, 0.1]], dtype=float)
+
+    margins, probabilities, spans = _decode(values, places, width, 4, 1.0)
+
+    assert kinds == ["code", "code", "start", "end"] and reads == 1
+    assert margins.tolist() == [2.0, -2.0]
+    assert probabilities.argmax(-1).tolist() == [0, 1]
+    assert spans.tolist() == [[4, 6, 0.9], [0, 0, 0.1]]
 
 
 def test_a_found_probability_follows_the_calibration_knots():
@@ -130,22 +158,23 @@ def test_a_read_returns_its_tokens_characters_without_edge_spaces():
 
 def test_a_pointer_read_takes_the_likeliest_span_or_nothing():
     torch = pytest.importorskip("torch")
-    from quail.backends.quail.executor.readout import AsyncSlotPointers
+    from quail.backends.quail.executor.readout import pointer_spans
 
-    readout = AsyncSlotPointers(torch, torch.nn.functional, 2, 512)
     width = 4
-    state = torch.eye(5, width) * 0.0
+    state = torch.zeros(5, width)
     state[2, 0] = state[3, 1] = 1.0   # rows 2 and 3 answer the first read
     state[0, 2] = 1.0                 # row 0 stands for nothing
     slots = torch.zeros(4, width)
     slots[0, 0] = slots[1, 1] = 40.0  # read 1: start at row 2, end at row 3
     slots[2, 2] = slots[3, 2] = 40.0  # read 2: both slots on row 0
+    # one chunk: the same answer twice, then one of four document rows
+    rows = torch.cat((state, slots, state, slots, state[:4], slots))
+    firsts, states = np.array([0, 9, 18]), np.array([5, 5, 4])
+    slot_rows = (firsts + states)[:, None] + np.arange(4)
 
-    rows = torch.cat((state, slots))
-    # the same answer twice, and a second answer of four document rows,
-    # in one chunk
-    short = torch.cat((state[:4], slots))
-    spans = readout.spans(torch.cat((rows, rows, short)), [9, 9, 8])
+    spans = pointer_spans(torch, torch.nn.functional, rows,
+                          rows[torch.from_numpy(slot_rows.reshape(-1))],
+                          np.repeat(firsts, 2), np.repeat(states, 2), 512)
 
     assert spans[0, :2].tolist() == [2.0, 3.0] and spans[0, 2] > 0.99
     assert spans[1, :2].tolist() == [0.0, 0.0] and spans[1, 2] < 0.01
@@ -212,3 +241,40 @@ def test_set_attention_lets_the_state_read_every_question_and_each_question_itse
     weights = scores.masked_fill(~sees, float("-inf")).softmax(-1)
     expected = torch.einsum("hts,shd->thd", weights, v.repeat_interleave(2, 1))
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_a_label_packed_with_a_filter_answers_only_the_rows_the_filter_keeps(
+        monkeypatch):
+    from quail.backends.quail.executor import pipeline
+    from quail.backends.quail.executor.pass_groups import GroupAnswers
+    from quail.physical import AiClassify, AiFilter, ClassifySpec
+
+    spec = ClassifySpec(query_template="", arguments=(), expected_rows=4,
+                        estimated_seconds=0.0, name="mood", aliases=("r",),
+                        labels=("happy", "sad"), prompt_token_parts=((), ()),
+                        scoring="set_choice", label_token_ids=((5,), (6,)))
+    nodes = (AiFilter(node_id="f", alias="r", pass_group=0),
+             AiClassify(node_id="c", spec=spec, pass_group=0))
+    asked = []
+
+    def one_pass(state, questions, prefixes, **_):
+        asked.append(len(prefixes))
+        # the filter passes rows 0 and 2; the label is answered for all four
+        return GroupAnswers(np.arange(4), [
+            np.array([1.0, -1.0, 2.0, -3.0]),
+            np.array([[0.9, 0.1], [0.2, 0.8], [0.3, 0.7], [0.6, 0.4]])],
+            [4, 4], tokens=100)
+
+    monkeypatch.setattr(pipeline, "run_pass_group", one_pass)
+    state = SimpleNamespace(loaded_model=SimpleNamespace(model_spec=D1_2B_BF16))
+
+    results = pipeline.execute_set_steps(state, nodes, [10, 11, 12, 13],
+                                         [[0]] * 4)
+
+    labels = results["c"].outputs["rows:r"]
+    assert asked == [4]
+    assert results["f"].outputs["rows:r"].ids["r"].to_pylist() == [10, 12]
+    assert labels.ids["r"].to_pylist() == [10, 12]
+    assert labels.column("mood").to_pylist() == ["happy", "sad"]
+    assert (results["f"].metrics.fresh_tokens, results["c"].metrics.fresh_tokens) \
+        == (100, 0)

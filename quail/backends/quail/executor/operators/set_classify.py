@@ -11,13 +11,15 @@ from quail.backends.quail.executor.operators.join import (
     join_pass_stage,
 )
 from quail.backends.quail.executor.parts import gpu_seconds, input_staging
-from quail.backends.quail.executor.readout import AsyncSlotLogits
-from quail.backends.quail.executor.set_passes import (
-    group_passes,
-    spec_questions,
-    state_tails,
+from quail.backends.quail.executor.pass_groups import (
+    node_question,
+    option_columns,
+    option_probabilities,
+    run_pass_group,
 )
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.readout import AsyncPassReadout
+from quail.backends.quail.executor.set_passes import state_tails
+from quail.backends.quail.executor.stages import run_stages
 from quail.backends.quail.reranker import (
     RerankerBatch,
     classify_outputs,
@@ -25,7 +27,7 @@ from quail.backends.quail.reranker import (
     score_rows,
     scored_batch,
 )
-from quail.catalog.tokens import concat_tokens
+from quail.catalog.tokens import DocumentPrefixes
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.progress import answer_sink
@@ -53,85 +55,24 @@ class SetLabels:
     suffix_tokens: int = 0
 
 
-def option_probabilities(logits, columns, spellings, temperature) -> np.ndarray:
-    """Each option's probability: its best spelling's logit, over the temperature.
-
-    Args:
-        logits: One question row's logits of the readout's targets.
-        columns: Token id -> its column in logits.
-        spellings: Per option, its token ids.
-        temperature: The model's calibrated answer temperature.
-    """
-    scores = np.array([max(logits[columns[token]] for token in ids)
-                       for ids in spellings]) / temperature
-    scores = np.exp(scores - scores.max())
-    return scores / scores.sum()
-
-
-def classify_passes(state, specs, rows, documents) -> list[SetLabels]:
-    """Label rows for every classification, their questions packed in passes.
-
-    Each pass reads a document and the state tail, then up to the
-    model's set size of the classifications' questions; each question
-    is read at its last row.
-
-    Args:
-        state: The query's execution state.
-        specs: set_choice ClassifySpecs over one table.
-        rows: The document ids to label.
-        documents: Tokenized documents by alias and document id.
-    """
-    first = specs[0]
-    (alias,) = first.aliases
-    head, state_tail, questions = spec_questions(specs)
-    tails = state_tails(state)
-    prefixes = [tails.prefix(concat_tokens(head, documents[alias][row]), state_tail)
-                for row in rows]
-    model_spec = state.loaded_model.model_spec
-    passes = group_passes(prefixes, questions, first.question_header_token_ids,
-                         model_spec.set_size, state.chunk_tokens)
-    targets = sorted({token for spec in specs for ids in spec.label_token_ids
-                      for token in ids})
-    columns = {token: column for column, token in enumerate(targets)}
-    torch = state.torch
-    readout = AsyncSlotLogits(torch, torch.nn.functional,
-                              full_output_head(state.loaded_model.model), targets)
-    out = [SetLabels(np.full(len(rows), None, dtype=object),
-                     np.full((len(rows), len(spec.labels)), np.nan))
-           for spec in specs]
-    for members, suffix, shape in passes:
-        stage = Stage(suffixes=[suffix], readout=readout, questions=(shape,),
-                      decide=lambda _, row: True,
-                      label=f"classify pass ({len(members)} questions)")
-        answers, spans, tokens = run_stages(
-            torch, state.loaded_model.arena, state.loaded_model.pipeline, [stage],
-            prefixes, state.chunk_tokens, staging=input_staging(state),
-            gpu_timing=state.gpu_timing, paged=False, label=stage.label)
-        for position, answer in answers[0].items():
-            logits = np.asarray(answer[0], dtype=float)
-            for row, member in enumerate(members):
-                spec, labels = specs[member], out[member]
-                labels.probabilities[position] = option_probabilities(
-                    logits[row], columns, spec.label_token_ids,
-                    model_spec.answer_temperature)
-                labels.labels[position] = spec.labels[
-                    int(np.argmax(labels.probabilities[position]))]
-                labels.suffix_tokens += shape[row]
-        lead = out[members[0]]
-        lead.tokens += tokens
-        lead.gpu_s += gpu_seconds(spans)
-        lead.chunks += len(spans)
-    return out
-
-
 def set_classify_batch(state, spec, rows, documents) -> RerankerBatch:
-    """One classification's RerankerBatch under set attention."""
-    (labels,) = classify_passes(state, [spec], rows, documents)
+    """One classification's RerankerBatch under set attention, one pass a row."""
+    question = node_question(spec)
+    (alias,) = spec.aliases
+    group = run_pass_group(
+        state, [question], DocumentPrefixes(question.head, documents[alias], rows),
+        label=f"classify {spec.name}")
+    labels = np.full(len(rows), None, dtype=object)
+    probabilities = np.full((len(rows), len(spec.labels)), np.nan)
+    (answer,) = group.answers
+    probabilities[group.positions] = answer
+    labels[group.positions] = np.asarray(spec.labels, dtype=object)[
+        answer.argmax(-1)]
     return RerankerBatch(
-        labels.labels, fresh_tokens=labels.tokens, cached_tokens=0,
-        suffix_tokens=labels.suffix_tokens, gpu_s=labels.gpu_s,
-        chunks=labels.chunks,
-        probabilities=labels.probabilities if spec.probabilities else None)
+        labels, fresh_tokens=group.tokens, cached_tokens=0,
+        suffix_tokens=group.suffix_tokens[0], gpu_s=group.gpu_s,
+        chunks=group.chunks,
+        probabilities=probabilities if spec.probabilities else None)
 
 
 def classify_result(node, ids, labels: SetLabels, priors) -> NodeResult:
@@ -200,38 +141,42 @@ def joined_label_passes(state, node, join) -> NodeResult:
         frame_token_ids=spec.join_layout[0],
         question_header_token_ids=spec.question_header_token_ids)
     targets = sorted({token for ids in spec.label_token_ids for token in ids})
-    columns = {token: column for column, token in enumerate(targets)}
     torch = state.torch
     model_spec = state.loaded_model.model_spec
     stage, states, owners = join_pass_stage(
         questions, join.inputs["prefixes"], sorted(kept), kept.get,
         join.inputs["partner_documents"], state_tails(state),
-        AsyncSlotLogits(torch, torch.nn.functional,
-                        full_output_head(state.loaded_model.model), targets),
+        AsyncPassReadout(torch, torch.nn.functional,
+                         full_output_head(state.loaded_model.model), targets, None),
         model_spec.set_size, state.chunk_tokens)
-    labels, tokens, spans = {}, 0, []
+    tokens, spans = 0, []
+    rows = np.zeros((0, 2), dtype=np.int32)
+    values = np.zeros(0, dtype=object)
     if stage is not None:
         answers, spans, tokens = run_stages(
             torch, state.loaded_model.arena, state.loaded_model.pipeline, [stage],
             states, state.chunk_tokens, staging=input_staging(state),
             gpu_timing=state.gpu_timing, paged=False, label=f"classify {spec.name}")
-        for index, anchor in enumerate(owners):
-            for logits in np.asarray(answers[0][index][0], dtype=float):
-                probabilities = option_probabilities(
-                    logits, columns, spec.label_token_ids,
-                    model_spec.answer_temperature)
-                labels.setdefault(anchor, []).append(
-                    spec.labels[int(np.argmax(probabilities))])
-    tuples = answer["partner_index"]
-    pairs = [(int(join.ids[anchor]), int(tuples[member][0]), label)
-             for anchor in sorted(labels)
-             for member, label in zip(kept[anchor], labels[anchor])]
-    rows = np.asarray([pair[:2] for pair in pairs], dtype=np.int32).reshape(-1, 2)
-    values = [pair[2] for pair in pairs]
-    scored = score_rows(rows, spec.aliases, spec.name, values, pa.string())
+        # every pass's question rows, in pass order, and their pairs: an
+        # anchor's passes cover its kept partners in order
+        logits = np.concatenate([np.asarray(answers[0][index][0], dtype=np.float64)
+                                 for index in range(len(owners))])
+        chosen = option_probabilities(
+            logits, option_columns(spec.label_token_ids, targets),
+            model_spec.answer_temperature).argmax(-1)
+        anchors = sorted(kept)
+        counts = np.array([len(kept[anchor]) for anchor in anchors])
+        tuples = answer["partner_index"]
+        partners = np.array([int(tuples[member][0]) for anchor in anchors
+                             for member in kept[anchor]], dtype=np.int64)
+        rows = np.stack((np.repeat(np.asarray(join.ids, dtype=np.int64)[anchors],
+                                   counts), partners), -1).astype(np.int32)
+        values = np.asarray(spec.labels, dtype=object)[chosen]
+    pairs = rows
+    scored = score_rows(rows, spec.aliases, spec.name, list(values), pa.string())
     sink = answer_sink()
     if sink is not None and len(rows):
-        sink(scored_batch(node, rows, values))
+        sink(scored_batch(node, rows, list(values)))
     return NodeResult(classify_outputs(node, scored), NodeMetrics(
         input_rows=len(pairs), output_rows=len(pairs),
         evaluated_document_pairs=len(pairs), fresh_tokens=tokens,

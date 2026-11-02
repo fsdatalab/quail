@@ -109,7 +109,7 @@ class Stage:
             question's question_slots rows are read. Empty when the
             whole sequence is one question.
         question_slots: The rows read in each question, counted back
-            from its last row.
+            from its last row; or, per question, its own such rows.
         state_reads: Optional callback from document index to the rows
             of its prefix to read before the questions' rows, as a
             pointer read scores them.
@@ -222,10 +222,15 @@ def question_ends(questions, slots=(0,)) -> np.ndarray:
 
     Args:
         questions: Each question's tokens, in order.
-        slots: Each read row, counted back from its question's last row.
+        slots: Each read row, counted back from its question's last row;
+            or, per question, its own such rows.
     """
     mask = np.zeros(int(sum(questions)), dtype=bool)
     ends = np.cumsum(questions) - 1
+    if slots and isinstance(slots[0], tuple):
+        for end, own in zip(ends, slots):
+            mask[end + np.asarray(own, dtype=np.int64)] = True
+        return mask
     for slot in slots:
         mask[ends + slot] = True
     return mask

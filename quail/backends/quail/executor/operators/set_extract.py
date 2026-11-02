@@ -1,18 +1,10 @@
 """AI.EXTRACT under set attention: pointer reads packed in passes."""
 
-from bisect import bisect_left
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from quail.backends.quail.executor.parts import gpu_seconds, input_staging
-from quail.backends.quail.executor.readout import AsyncSlotPointers
-from quail.backends.quail.executor.set_passes import (
-    group_passes,
-    spec_questions,
-    state_tails,
-)
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.catalog.tokens import DocumentPrefixes
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import extraction_rows
 
@@ -41,20 +33,16 @@ class SetReads:
     suffix_tokens: int = 0
 
 
-def calibrated(knots, value: float) -> float:
-    """A value through increasing (raw, calibrated) knots.
+def calibrated(knots, value):
+    """A value, or an array of them, through increasing (raw, calibrated) knots.
 
     Linear between knots and flat past the ends; no knots keep the value.
     """
     if not knots:
         return value
-    index = bisect_left([raw for raw, _ in knots], value)
-    if index == 0:
-        return knots[0][1]
-    if index == len(knots):
-        return knots[-1][1]
-    (a, low), (b, high) = knots[index - 1], knots[index]
-    return low + (value - a) * (high - low) / (b - a)
+    raw, out = zip(*knots)
+    result = np.interp(value, raw, out)
+    return float(result) if np.ndim(result) == 0 else result
 
 
 def token_span(text: str, tokens, vocabulary, first: int, last: int):
@@ -84,69 +72,39 @@ def token_span(text: str, tokens, vocabulary, first: int, last: int):
     return text[start:stop], (start, stop)
 
 
-def read_passes(state, specs, rows, documents, texts) -> list[SetReads]:
-    """Read each extraction's span from every row, its questions packed in passes.
-
-    Each pass reads a document and the state tail, then up to the
-    model's set size of read questions. Each question's start and end
-    slots point at the document's rows; the first row of the pass
-    stands for nothing.
+def found_reads(spans, knots):
+    """Each read's calibrated P(found), and whether its span is returned.
 
     Args:
-        state: The query's execution state.
-        specs: Read ExtractSpecs over one table.
-        rows: The document ids to read.
-        documents: The table's tokenized documents, by document id.
-        texts: The table's texts, by document id.
+        spans: (reads, 3) first row, last row, and raw P(found).
+        knots: The model's (raw, calibrated) P(found) knots.
     """
-    first = specs[0]
-    head, state_tail, questions = spec_questions(specs)
-    tails = state_tails(state)
-    tokens_of = [[int(token) for token in documents[row]] for row in rows]
-    prefixes = [tails.prefix(head + tokens, state_tail) for tokens in tokens_of]
-    # the first row, then each document row the prefix kept
-    state_rows = [np.array([0, *range(len(head), min(len(head) + len(tokens),
-                                                     len(prefix)))])
-                  for tokens, prefix in zip(tokens_of, prefixes)]
-    model_spec = state.loaded_model.model_spec
-    vocabulary = tails.encoder.token_bytes()
-    out = [SetReads([None] * len(rows), [None] * len(rows), [0.0] * len(rows))
-           for _ in specs]
-    torch = state.torch
-    for members, suffix, shape in group_passes(
-            prefixes, questions, first.question_header_token_ids,
-            model_spec.set_size, state.chunk_tokens):
-        readout = AsyncSlotPointers(torch, torch.nn.functional, len(members),
-                                    model_spec.read_span_tokens)
-        stage = Stage(suffixes=[suffix], readout=readout, questions=(shape,),
-                      question_slots=first.read_slots,
-                      state_reads=lambda anchor: state_rows[anchor],
-                      decide=lambda _, row: True,
-                      label=f"extract pass ({len(members)} questions)")
-        answers, spans, tokens = run_stages(
-            torch, state.loaded_model.arena, state.loaded_model.pipeline, [stage],
-            prefixes, state.chunk_tokens, staging=input_staging(state),
-            gpu_timing=state.gpu_timing, paged=False, label=stage.label)
-        for position, answer in answers[0].items():
-            reads = np.asarray(answer[0], dtype=float)
-            text = texts[rows[position]]
-            text = text.as_py() if hasattr(text, "as_py") else str(text)
-            for read, member in zip(reads, members):
-                start, end, found = int(read[0]), int(read[1]), float(read[2])
-                result = out[member]
-                result.suffix_tokens += shape[members.index(member)]
-                found = calibrated(model_spec.read_found, found)
-                result.found[position] = found
-                if start == 0 or found < 0.5:
-                    continue
-                # a read row's document token is one before it: row 0 is nothing
-                result.answers[position], result.spans[position] = token_span(
-                    text, tokens_of[position], vocabulary, start - 1, end - 1)
-        lead = out[members[0]]
-        lead.tokens += tokens
-        lead.gpu_s += gpu_seconds(spans)
-        lead.chunks += len(spans)
-    return out
+    found = calibrated(knots, spans[:, 2])
+    return found, (spans[:, 0] > 0) & (found >= 0.5)
+
+
+def read_texts(spans, keep, documents, texts, head, vocabulary):
+    """The text and character span of each kept read, None elsewhere.
+
+    Args:
+        spans: (reads, 3) first row, last row, and raw P(found), a row
+            counted as the document's token plus one.
+        keep: (reads,) whether each read returns its span.
+        documents: Per read, its prompt head and document tokens.
+        texts: Per read, its document text.
+        head: The prompt head's tokens.
+        vocabulary: Token id -> its bytes.
+    """
+    answers, characters = [None] * len(spans), [None] * len(spans)
+    for index in np.flatnonzero(keep):
+        text = texts[index]
+        text = text.as_py() if hasattr(text, "as_py") else str(text)
+        tokens = [int(token) for token in documents[index]][head:]
+        # a read row's document token is one before it: row 0 is nothing
+        answers[index], characters[index] = token_span(
+            text, tokens, vocabulary, int(spans[index, 0]) - 1,
+            int(spans[index, 1]) - 1)
+    return answers, characters
 
 
 def read_result(node, ids, reads: SetReads) -> NodeResult:
@@ -162,7 +120,7 @@ def read_result(node, ids, reads: SetReads) -> NodeResult:
 
 
 def execute_set_extractions(state, nodes, inputs) -> dict:
-    """Run a pipeline's extractions under set attention.
+    """Run a pipeline's extractions under set attention, by pass group.
 
     Args:
         state: The query's execution state.
@@ -173,13 +131,14 @@ def execute_set_extractions(state, nodes, inputs) -> dict:
     Raises:
         ValueError: The table's text was not loaded.
     """
+    from quail.backends.quail.executor.pipeline import execute_set_steps
+
     alias = nodes[0].spec.alias
     texts = inputs.get("texts", {}).get(alias)
     if texts is None:
         raise ValueError(f"AI.EXTRACT reads the text of {alias!r}, which "
                          f"was not loaded")
     ids = np.asarray(inputs["document_ids"], dtype=np.int64)
-    every = read_passes(state, [node.spec for node in nodes], ids,
-                        inputs["documents"][alias], texts)
-    return {node.node_id: read_result(node, ids, reads)
-            for node, reads in zip(nodes, every)}
+    head = nodes[0].spec.prompt_token_parts[0]
+    return execute_set_steps(state, nodes, ids, DocumentPrefixes(
+        head, inputs["documents"][alias], ids), texts=texts)

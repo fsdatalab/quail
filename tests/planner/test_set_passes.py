@@ -67,7 +67,8 @@ def test_a_d1_plan_prices_and_explains_the_passes_its_operators_share(tmp_path):
     session.close()
 
 
-def test_a_condition_between_two_d1_classifications_splits_their_passes(tmp_path):
+def test_two_d1_classifications_share_a_pass_across_a_condition_between_them(
+        tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -92,9 +93,45 @@ def test_a_condition_between_two_d1_classifications_splits_their_passes(tmp_path
 
     labels = [node for node in plan.nodes if isinstance(node, AiClassify)]
     groups = {node.pass_group for node in labels}
-    # the condition reads the first label, so the second is asked in a
-    # later pass, as the executor runs them
-    assert len(labels) == 2 and len(groups) == 2 and -1 not in groups
-    assert all(plan.estimates[node.node_id]["pass_members"] == (node.node_id,)
-               for node in labels)
+    # the condition asks the model nothing, so both labels share a pass;
+    # the executor applies the condition after it, and the second label
+    # keeps only the rows the condition accepts
+    assert len(labels) == 2 and len(groups) == 1 and -1 not in groups
+    assert plan.estimates[labels[0].node_id]["pass_members"] == tuple(
+        node.node_id for node in labels)
+    session.close()
+
+
+def test_a_d1_filter_and_classification_on_one_table_share_a_pass(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.physical import AiClassify, AiFilter
+    from quail.planner.plan import EngineConfig
+
+    body = " ".join(["word"] * 300)
+    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
+                   tmp_path / "reviews.parquet")
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=str.split)
+    session.register("reviews", DocumentProvider.from_parquet(
+        str(tmp_path / "reviews.parquet"), id_col="id"))
+    query = session.sql(
+        "SELECT r.id, AI.CLASSIFY(PROMPT('Which mood? {0}', r.body), "
+        "ARRAY['happy', 'sad']) AS mood FROM reviews r "
+        "WHERE AI_FILTER(PROMPT('Is it kind? {0}', r.body))")
+
+    plan = query.plan()
+    (kind,) = [node for node in plan.nodes if isinstance(node, AiFilter)]
+    (label,) = [node for node in plan.nodes if isinstance(node, AiClassify)]
+
+    # the filter keeps 20% of the 300-token reviews; asking the 4-token
+    # mood question of every review costs less than reading the kept
+    # reviews again
+    assert kind.pass_group == label.pass_group >= 0
+    assert plan.estimates[kind.node_id]["pass_members"] == (kind.node_id,
+                                                           label.node_id)
+    assert f"Passes on r: [{kind.node_id}, {label.node_id}]" in query.explain()
     session.close()

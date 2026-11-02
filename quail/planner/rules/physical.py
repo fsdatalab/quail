@@ -145,11 +145,12 @@ class PackSetPasses(PhysicalRule):
 
     Under set attention a pass reads a document, then up to the model's
     set size of questions, and keeps nothing. In each pipeline, a run of
-    consecutive AI filters, classifications of one document, or
-    extractions splits into pass groups (choose_pass_groups): a group is
-    asked of every row that reaches its first operator, holds at most
-    the set size of questions, and fits one chunk with the longest
-    document. Pricing, explain(), and the executor read pass_group. The
+    AI filters, classifications of one document, and extractions, with
+    any conditions on their outputs between them, splits into pass
+    groups (choose_pass_groups): a group is asked of every row that
+    reaches its first operator, holds at most the set size of questions,
+    and fits one chunk with the longest document. A group can hold
+    questions of every kind. Pricing, explain(), and the executor read pass_group. The
     rule fires once, while some packable operator has none.
     """
 

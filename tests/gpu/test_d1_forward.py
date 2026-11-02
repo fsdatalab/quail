@@ -193,9 +193,23 @@ def reference_main(request_path, out_path):
         for review in request["reads"]:
             questions = [prompt.Read(question) for question in READS]
             reads.append(served.probabilities(review, questions))
+        mixed = []
+        for review in request["reads"]:
+            question, labels, descriptions = CHOICES[0]
+            questions = [
+                prompt.Noul(QUESTIONS[0].removesuffix(" {0}")),
+                prompt.Choice(question.split("\n\n{0}")[0], {
+                    label: (descriptions[index] if descriptions else "") or None
+                    for index, label in enumerate(labels)}),
+                prompt.Read(READS[0])]
+            # yes/no from the uncalibrated runner, as the packed tests;
+            # the choice and the read from the served one
+            p_yes = engine.probabilities(review, questions)[0][0]
+            _, choice, read = served.probabilities(review, questions)
+            mixed.append(dict(p_yes=p_yes, choice=choice, read=read))
     with open(out_path, "w") as f:
         json.dump(dict(prompts=rows, packs=packs, choices=choices,
-                       reads=reads), f)
+                       reads=reads, mixed=mixed), f)
 
 
 @pytest.fixture(scope="module")
@@ -211,50 +225,64 @@ def answer_ids():
     return true_ids, false_ids
 
 
+def _state_tails():
+    from quail.backends.quail.executor.set_passes import StateTails
+    from quail.catalog.tokens import GigatokenEncoder
+    from quail.specs.files import resolve_model_path
+
+    spec = _spec()
+    return StateTails(GigatokenEncoder(resolve_model_path(spec.hf_name,
+                                                          spec.revision)))
+
+
+def _yes_no_questions(templates):
+    """AI filter templates as the SetQuestions of one pass group."""
+    from quail.backends.quail.executor.pass_groups import SetQuestion
+    from quail.backends.quail.lowering import set_question_parts
+    from quail.logical import bind_prompt
+    from quail.planner.prompt_lowering import lower_prompt
+
+    spec, ids = _spec(), _tokenizer()
+    questions = []
+    for template in templates:
+        lowered = lower_prompt(bind_prompt(template, ("body",), turn=spec.turn,
+                                           layout=spec.prompt_layout), ids)
+        parts = set_question_parts(lowered, spec, ids)
+        tail, cut = tuple(lowered.tail_token_ids), parts["state_tail_tokens"]
+        questions.append(SetQuestion(
+            "yes_no", tuple(lowered.preamble_token_ids), tail[:cut], tail[cut:],
+            parts["question_header_token_ids"]))
+    return questions
+
+
 def _packs():
     """Per review, one pass of the 16 PACKED questions as Quail lays it out.
 
-    Returns the pass's token ids, its state length, each token's
-    question (-1 in the state, then 1 to 16), and each question's slot.
+    Returns the questions, and per review the pass's token ids, its state
+    length, each token's question (-1 in the state, then 1 to 16), and
+    each question's slot.
     """
-    from types import SimpleNamespace
-
-    from quail.backends.quail.executor.operators.filter import set_pass_stage
-    from quail.backends.quail.executor.set_passes import StateTails
+    from quail.backends.quail.executor.set_passes import group_passes
     from quail.backends.quail.executor.stages import question_ends
-    from quail.backends.quail.lowering import set_question_parts
-    from quail.catalog.tokens import GigatokenEncoder
-    from quail.logical import bind_prompt
-    from quail.planner.prompt_lowering import lower_prompt
-    from quail.specs.files import resolve_model_path
 
-    spec, ids = _spec(), _tokenizer()
-    nodes = []
-    for question in PACKED:
-        lowered = lower_prompt(bind_prompt(question, ("body",), turn=spec.turn,
-                                           layout=spec.prompt_layout), ids)
-        nodes.append(SimpleNamespace(
-            question_token_ids=tuple(lowered.tail_token_ids),
-            **set_question_parts(lowered, spec, ids)))
-    stage = set_pass_stage(nodes, readout=None, decide=lambda _, row: True)
-    tails = StateTails(GigatokenEncoder(resolve_model_path(spec.hf_name,
-                                                           spec.revision)))
-    tail = list(nodes[0].question_token_ids[:nodes[0].state_tail_tokens])
+    ids = _tokenizer()
+    questions = _yes_no_questions(PACKED)
+    first = questions[0]
+    tails = _state_tails()
     out = []
     for review in REVIEWS:
-        prefix = tails.prefix(list(lowered.preamble_token_ids) + ids(review),
-                              tail)
+        prefix = tails.prefix(list(first.head) + ids(review), first.state_tail)
+        ((_, suffix, shape),) = group_passes(
+            [prefix], [q.tokens for q in questions], first.header, 16, BUDGET)
         state = len(prefix)
-        groups = [-1] * state + [
-            number for number, length in enumerate(stage.questions[0], 1)
-            for _ in range(length)]
-        slots = [len(prefix) + int(index)
-                 for index in question_ends(stage.questions[0]).nonzero()[0]]
-        out.append(dict(review=review, ids=prefix + stage.suffixes[0],
-                        state=state, groups=groups, slots=slots,
+        groups = [-1] * state + [number for number, length in enumerate(shape, 1)
+                                 for _ in range(length)]
+        slots = [state + int(index) for index in question_ends(shape).nonzero()[0]]
+        out.append(dict(review=review, ids=prefix + suffix, state=state,
+                        groups=groups, slots=slots,
                         questions=[q.removesuffix(" {0}") for q in PACKED],
                         prefix=prefix))
-    return stage, out
+    return questions, out
 
 
 @pytest.fixture(scope="module")
@@ -416,23 +444,40 @@ def quail(prompts, answer_ids, loaded):
     return rows
 
 
+def _execution_state(loaded, answer_ids):
+    """The execution state run_pass_group reads, over the loaded model."""
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.readout import AnswerRows
+
+    model, arena, pipeline = loaded
+    return SimpleNamespace(
+        torch=torch, chunk_tokens=BUDGET, gpu_timing=False,
+        answer_rows=AnswerRows(torch, torch.nn.functional, model, answer_ids[0],
+                               answer_ids[1]),
+        loaded_model=SimpleNamespace(model=model, arena=arena, pipeline=pipeline,
+                                     model_spec=_spec(), state_tails=_state_tails(),
+                                     input_staging=None))
+
+
+def _ask(loaded, answer_ids, questions):
+    """Each question's answers for each review, all in one pass a review."""
+    from quail.backends.quail.executor.pass_groups import run_pass_group
+
+    ids = _tokenizer()
+    group = run_pass_group(
+        _execution_state(loaded, answer_ids), questions,
+        [list(questions[0].head) + ids(review) for review in REVIEWS])
+    assert group.positions.tolist() == list(range(len(REVIEWS)))
+    return group.answers
+
+
 @pytest.fixture(scope="module")
 def quail_packs(packs, answer_ids, loaded):
     """Per review, Quail's yes-minus-no margin at each of the 16 slots."""
     import numpy as np
 
-    from quail.backends.quail.executor.readout import AnswerRows, AsyncSlotMargins
-    from quail.backends.quail.executor.stages import run_stages
-
-    model, arena, pipeline = loaded
-    stage, items = packs
-    stage.readout = AsyncSlotMargins(torch, AnswerRows(
-        torch, torch.nn.functional, model, answer_ids[0], answer_ids[1]))
-    answers, _, _ = run_stages(torch, arena, pipeline, [stage],
-                               [item["prefix"] for item in items], BUDGET,
-                               paged=False)
-    return [np.asarray(answers[0][index][0], dtype=float).tolist()
-            for index in range(len(items))]
+    return np.stack(_ask(loaded, answer_ids, packs[0]), -1).tolist()
 
 
 @pytest.fixture(scope="module")
@@ -453,99 +498,90 @@ def quail_joins(join_passes, answer_ids, loaded):
             for index in range(len(states))]
 
 
-def _choice_specs():
-    """The CHOICES as set_choice ClassifySpecs, and each one's lone prompt text."""
-    from types import SimpleNamespace
-
+def _choice_questions():
+    """The CHOICES as SetQuestions, and each one's lone prompt."""
+    from quail.backends.quail.executor.pass_groups import SetQuestion
     from quail.logical import ColumnRef
     from quail.logical.prompts import bind_classify_prompt
     from quail.planner.prompt_lowering import lower_prompt, option_spellings
 
     spec, ids = _spec(), _tokenizer()
-    specs, texts = [], []
+    questions, prompts = [], []
     for question, labels, descriptions in CHOICES:
-        prompt = bind_classify_prompt(
+        lowered = lower_prompt(bind_classify_prompt(
             question, (ColumnRef(alias="r", provider="reviews", column="body"),),
-            labels, descriptions, turn=spec.turn, layout=spec.prompt_layout)
-        lowered = lower_prompt(prompt, ids)
-        specs.append(SimpleNamespace(
-            aliases=("r",), labels=tuple(labels), probabilities=True,
-            prompt_token_parts=(tuple(lowered.preamble_token_ids),
-                                tuple(lowered.tail_token_ids)),
-            state_tail_tokens=len(ids(lowered.prompt.tail_segments[0])),
-            question_header_token_ids=tuple(ids("QUESTION:\n")),
-            label_token_ids=option_spellings(lowered.prompt.letters, ids)))
-        texts.append(lowered.prompt)
-    return specs, texts
+            labels, descriptions, turn=spec.turn, layout=spec.prompt_layout), ids)
+        tail = tuple(lowered.tail_token_ids)
+        cut = len(ids(lowered.prompt.tail_segments[0]))
+        questions.append(SetQuestion(
+            "choice", tuple(lowered.preamble_token_ids), tail[:cut], tail[cut:],
+            tuple(ids("QUESTION:\n")),
+            spellings=option_spellings(lowered.prompt.letters, ids)))
+        prompts.append(lowered.prompt)
+    return questions, prompts
 
 
-@pytest.fixture(scope="module")
-def quail_choices(loaded):
-    """Per review and classification, Quail's option probabilities, one pass."""
-    from types import SimpleNamespace
-
-    from quail.backends.quail.executor.operators.set_classify import (
-        classify_passes,
-    )
-    from quail.backends.quail.executor.set_passes import StateTails
-    from quail.catalog.tokens import GigatokenEncoder
-    from quail.specs.files import resolve_model_path
-
-    model, arena, pipeline = loaded
-    spec, ids = _spec(), _tokenizer()
-    specs, _ = _choice_specs()
-    tails = StateTails(GigatokenEncoder(resolve_model_path(spec.hf_name,
-                                                           spec.revision)))
-    state = SimpleNamespace(
-        torch=torch, chunk_tokens=BUDGET, gpu_timing=False,
-        loaded_model=SimpleNamespace(model=model, arena=arena, pipeline=pipeline,
-                                     model_spec=spec, state_tails=tails,
-                                     input_staging=None))
-    every = classify_passes(state, specs, range(len(REVIEWS)),
-                            {"r": [ids(review) for review in REVIEWS]})
-    return [[labels.probabilities[review].tolist() for labels in every]
-            for review in range(len(REVIEWS))]
-
-
-@pytest.fixture(scope="module")
-def quail_reads(loaded):
-    """Per review and read, Quail's text and calibrated P(found), one pass."""
-    from types import SimpleNamespace
-
-    from quail.backends.quail.executor.operators.set_extract import read_passes
-    from quail.backends.quail.executor.set_passes import StateTails
-    from quail.catalog.tokens import GigatokenEncoder
+def _read_questions():
+    """The READS as SetQuestions."""
+    from quail.backends.quail.executor.pass_groups import SetQuestion
     from quail.logical import ColumnRef
     from quail.logical.prompts import PROMPT_LAYOUTS, bind_extract_prompt
     from quail.planner.prompt_lowering import lower_prompt, read_slot_offsets
-    from quail.specs.files import resolve_model_path
 
-    model, arena, pipeline = loaded
     spec, ids = _spec(), _tokenizer()
     layout = PROMPT_LAYOUTS[spec.prompt_layout]
-    specs = []
+    questions = []
     for question in READS:
         lowered = lower_prompt(bind_extract_prompt(
             (ColumnRef(alias="r", provider="reviews", column="body"),),
             question, spec.turn, spec.prompt_layout), ids)
         segments = lowered.prompt.tail_segments
-        specs.append(SimpleNamespace(
-            prompt_token_parts=(tuple(lowered.preamble_token_ids),
-                                tuple(lowered.tail_token_ids)),
-            state_tail_tokens=len(ids(segments[0])),
-            question_header_token_ids=tuple(ids("QUESTION:\n")),
-            read_slots=read_slot_offsets(segments[-1], layout.read_slots, ids)))
-    tails = StateTails(GigatokenEncoder(resolve_model_path(spec.hf_name,
-                                                           spec.revision)))
-    state = SimpleNamespace(
-        torch=torch, chunk_tokens=BUDGET, gpu_timing=False,
-        loaded_model=SimpleNamespace(model=model, arena=arena, pipeline=pipeline,
-                                     model_spec=spec, state_tails=tails,
-                                     input_staging=None))
-    every = read_passes(state, specs, list(range(len(REVIEWS))),
-                        [ids(review) for review in REVIEWS], REVIEWS)
-    return [[(reads.answers[review], reads.found[review]) for reads in every]
+        tail, cut = tuple(lowered.tail_token_ids), len(ids(segments[0]))
+        questions.append(SetQuestion(
+            "read", tuple(lowered.preamble_token_ids), tail[:cut], tail[cut:],
+            tuple(ids("QUESTION:\n")),
+            slots=read_slot_offsets(segments[-1], layout.read_slots, ids)))
+    return questions
+
+
+def _read_answers(spans):
+    """Per review, a read's text and calibrated P(found) from its spans."""
+    from quail.backends.quail.executor.operators.set_extract import (
+        found_reads,
+        read_texts,
+    )
+
+    spec, ids = _spec(), _tokenizer()
+    found, keep = found_reads(spans, spec.read_found)
+    head = len(_read_questions()[0].head)
+    texts, _ = read_texts(spans, keep, [[0] * head + ids(review) for review in REVIEWS],
+                          REVIEWS, head, _state_tails().encoder.token_bytes())
+    return list(zip(texts, found.tolist()))
+
+
+@pytest.fixture(scope="module")
+def quail_choices(loaded, answer_ids):
+    """Per review and classification, Quail's option probabilities, one pass."""
+    answers = _ask(loaded, answer_ids, _choice_questions()[0])
+    return [[answer[review].tolist() for answer in answers]
             for review in range(len(REVIEWS))]
+
+
+@pytest.fixture(scope="module")
+def quail_reads(loaded, answer_ids):
+    """Per review and read, Quail's text and calibrated P(found), one pass."""
+    every = [_read_answers(spans)
+             for spans in _ask(loaded, answer_ids, _read_questions())]
+    return [[reads[review] for reads in every] for review in range(len(REVIEWS))]
+
+
+@pytest.fixture(scope="module")
+def quail_mixed(loaded, answer_ids):
+    """Per review, one pass of a yes/no, a choice, and a read, as Quail asks it."""
+    margins, probabilities, spans = _ask(loaded, answer_ids, [
+        _yes_no_questions([QUESTIONS[0]])[0], _choice_questions()[0][0],
+        _read_questions()[0]])
+    return list(zip(margins.tolist(), probabilities.tolist(), _read_answers(spans)))
 
 
 def _margin(logits, count):
@@ -662,7 +698,7 @@ def test_packed_p_yes_matches_d1_reading_its_own_pass(reference, quail_packs):
 
 
 def test_quail_writes_the_choice_prompt_d1_renders(reference):
-    _, prompts = _choice_specs()
+    _, prompts = _choice_questions()
     first = prompts[0]
     for review, theirs in zip(REVIEWS, reference["choices"]):
         assert first.preamble + review + first.tail[len("{0}"):] == theirs["text"]
@@ -693,6 +729,27 @@ def test_packed_reads_match_d1s_text_and_found(reference, quail_reads):
     # a found near one half may land on either side
     assert all(a[0] == b[0] for a, b in pairs if abs(a[1] - 0.5) > 0.05)
     assert max(abs(a[1] - b[1]) for a, b in pairs) < PROBABILITY_TOLERANCE
+
+
+def test_one_mixed_pass_matches_d1_asking_the_same_three_questions(reference,
+                                                                   quail_mixed):
+    import math
+
+    from quail.backends.quail.executor.operators.set_extract import calibrated
+
+    knots = _spec().read_found
+    for theirs, (margin, choice, (text, found)) in zip(reference["mixed"],
+                                                      quail_mixed):
+        print("mixed pass, d1 code vs Quail:", theirs,
+              (1 / (1 + math.exp(-margin)), choice, text, found))
+        assert abs(theirs["p_yes"] - 1 / (1 + math.exp(-margin))) \
+            < PROBABILITY_TOLERANCE
+        assert max(abs(a - b) for a, b in zip(theirs["choice"], choice)) \
+            < PROBABILITY_TOLERANCE
+        present = calibrated(knots, theirs["read"]["found"])
+        assert abs(present - found) < PROBABILITY_TOLERANCE
+        if abs(present - 0.5) > 0.05:
+            assert (theirs["read"]["text"] if present >= 0.5 else None) == text
 
 
 if __name__ == "__main__":

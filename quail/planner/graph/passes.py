@@ -2,22 +2,19 @@
 
 Under set attention, a pass reads a document and then up to the
 model's set size of questions; nothing is kept between passes. In each
-pipeline, a run of consecutive AI filters, of classifications of one
-document, or of extractions can share passes. set_pass_groups splits
-each run into pass groups with choose_pass_groups; the PackSetPasses
-rule writes them on the plan, and pricing, explain(), and the executor
-read them back with pass_members.
+pipeline, a run of AI filters, classifications of one document, and
+extractions, with any conditions on their outputs between them, can
+share passes. set_pass_groups splits each run into pass groups with
+choose_pass_groups; the PackSetPasses rule writes them on the plan,
+and pricing, explain(), and the executor read them back.
 """
 
 from __future__ import annotations
 
-from itertools import groupby
-
 from quail.cost import budgets
 from quail.cost.packing import choose_pass_groups
-from quail.logical import effective_selectivity
 from quail.logical.prompts import PROMPT_LAYOUTS
-from quail.physical import AiClassify, AiExtract, AiFilter, PhysicalGraph
+from quail.physical import AiClassify, AiExtract, AiFilter, Filter, PhysicalGraph
 from quail.physical.pipelines import build_pipelines
 from quail.planner.statistics.tables import summarize_alias
 
@@ -75,25 +72,43 @@ def set_pass_groups(graph: PhysicalGraph, context) -> dict[str, int]:
         if pipeline is None or id(pipeline) in seen:
             continue
         seen.add(id(pipeline))
-        for kind, run in groupby(pipeline, key=packed_kind):
-            if kind is None:
-                continue
-            run = list(run)
+        for chain in chains(pipeline):
             summary = summarize_alias(
-                context.document_tokens[run[0].document_aliases[0]],
+                context.document_tokens[chain[0].document_aliases[0]],
                 model.sliding_window, memo=context.memo)
-            state = head_tokens(run[0]) + state_tail
+            state = head_tokens(chain[0]) + state_tail
+            rows = [expected_documents(member) for member in chain]
+            # the share of rows that reach the next operator: a filter's
+            # selectivity, and a condition's between them
+            kept = [later / earlier if earlier else 1.0
+                    for earlier, later in zip(rows, rows[1:])] + [1.0]
             chosen = choose_pass_groups(
-                [question_tokens(member, state_tail) for member in run],
-                [effective_selectivity(member.selectivity) if kind == "filter"
-                 else 1.0 for member in run],
-                expected_documents(run[0]), state + summary.mean,
-                state + summary.maximum, model, context.device, chunk,
-                set_size=model.set_size, header=header)
+                [question_tokens(member, state_tail) for member in chain], kept,
+                rows[0], state + summary.mean, state + summary.maximum, model,
+                context.device, chunk, set_size=model.set_size, header=header)
             groups.update((member.node_id, first + group)
-                          for member, group in zip(run, chosen))
+                          for member, group in zip(chain, chosen))
             first += max(chosen) + 1
     return groups
+
+
+def chains(pipeline) -> list[list]:
+    """The pipeline's runs of packable operators, in order.
+
+    A condition on their outputs stays inside a run, since it asks the
+    model nothing; any other operator, such as a join, ends it.
+    """
+    out, current = [], []
+    for node in pipeline:
+        if packed_kind(node):
+            current.append(node)
+        elif not (isinstance(node, Filter) and len(node.aliases) == 1):
+            if current:
+                out.append(current)
+            current = []
+    if current:
+        out.append(current)
+    return out
 
 
 def pass_members(graph: PhysicalGraph) -> list[tuple]:

@@ -6,19 +6,24 @@ import numpy as np
 
 from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.executor.operators.filter import (
-    execute_set_filters,
     filter_inputs,
+    filter_result,
 )
 from quail.backends.quail.executor.operators.join import JoinPart, execute_set_joins
 from quail.backends.quail.executor.operators.set_classify import (
-    classify_passes,
+    SetLabels,
     classify_result,
     joined_label_passes,
 )
 from quail.backends.quail.executor.operators.set_extract import (
-    execute_set_extractions,
+    SetReads,
+    found_reads,
+    read_result,
+    read_texts,
 )
 from quail.backends.quail.executor.parts import execute_parts, execution_prefix_tree
+from quail.backends.quail.executor.pass_groups import node_question, run_pass_group
+from quail.backends.quail.executor.set_passes import state_tails
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import id_positions
@@ -103,50 +108,141 @@ def _node_inputs(node, results, inputs) -> dict:
             for port in node.inputs}
 
 
-def execute_set_pipeline(state, nodes, inputs, context) -> dict:
-    """Run a pipeline's operators under set attention, step by step.
+PACKED = ("filter", "label", "extract")
 
-    The operators of one pass group (PackSetPasses) share their passes.
-    A condition on their columns runs between them. A join's anchors are
-    the rows the steps before it kept, and the classifications of its
-    pairs follow it. Each step reads the rows the step before it kept.
+
+def _positions(ids, chosen) -> np.ndarray:
+    """The positions in ids of the chosen document ids."""
+    order = np.argsort(ids, kind="stable")
+    return np.sort(order[np.searchsorted(ids[order], chosen)])
+
+
+def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
+                      context=None, limit=None, stop_groups=None) -> dict:
+    """Run a pipeline's steps under set attention, in order.
+
+    The operators of one pass group (PackSetPasses) are asked in one
+    pass per document when the pipeline reaches the group's first
+    operator. Each step then reads its answers for the rows still kept:
+    a filter keeps the rows it passes, a condition the rows it accepts,
+    and a classification or an extraction answers every kept row. A
+    question asked of a row that a filter of the same group removes is
+    answered and then dropped, so packing decides which rows each step
+    reads the same way as running the steps apart. The answers can
+    differ: d1 lets the state read a lone question but not the questions
+    of a packed pass. A join's anchors are the rows kept so far, and the
+    classifications of its pairs follow it.
+
+    Args:
+        state: The query's execution state.
+        nodes: The pipeline's nodes, in order.
+        ids: The document ids the pipeline reads.
+        prefixes: Per position in ids, the prompt head and document tokens.
+        texts: The table's texts by document id, for extractions.
+        inputs: Per node id, its input values from outside the pipeline.
+        context: The execution context, for conditions and joins.
+        limit: When the last pass group ends the pipeline, stop once this
+            many rows passed its filters.
+        stop_groups: Per position in ids, its stop key group, with the limit.
     """
+    ids = np.asarray(ids, dtype=np.int64)
     alias = nodes[0].document_aliases[0]
-    ids = pipeline_ids(nodes[0], inputs)
-    results, join = {}, None
-    # a run of one kind and one pass group (PackSetPasses) shares passes
-    for (kind, _), run in groupby(
-            nodes, key=lambda node: (_kind(node), getattr(node, "pass_group", -1))):
-        run = list(run)
-        if kind == "filter":
-            run_inputs = filter_inputs(context.state, run[0], ids)
-            if run[-1] is not nodes[-1]:
-                run_inputs["limit"] = None
-            results.update(execute_set_filters(state, run, run_inputs))
-        elif kind == "extract":
-            results.update(execute_set_extractions(state, run, {
-                "document_ids": ids, "documents": context.state["documents"],
-                "texts": context.state.get("texts", {})}))
-        elif kind == "label":
-            every = classify_passes(state, [node.spec for node in run], ids,
-                                    context.state["documents"])
-            for node, labels in zip(run, every):
+    kept = np.arange(len(ids))
+    results, groups, join, inputs = {}, {}, None, inputs or {}
+    model_spec = state.loaded_model.model_spec
+    for index, node in enumerate(nodes):
+        kind = _kind(node)
+        if kind in PACKED:
+            if node.pass_group not in groups:
+                members = [member for member in nodes if _kind(member) in PACKED
+                           and member.pass_group == node.pass_group]
+                ends = members[-1] is nodes[-1]
+                group = run_pass_group(
+                    state, [node_question(member) for member in members],
+                    [prefixes[int(position)] for position in kept],
+                    limit=limit if ends else None,
+                    stop_groups=(None if stop_groups is None or not ends
+                                 else [stop_groups[int(p)] for p in kept]),
+                    label=f"pass group ({len(members)} questions)")
+                groups[node.pass_group] = (members, group, kept[group.positions])
+            members, group, answered = groups[node.pass_group]
+            # the kept rows the group answered, and their answers
+            at = np.searchsorted(answered, kept)
+            hit = at < len(answered)
+            hit[hit] = answered[at[hit]] == kept[hit]
+            asked, values = kept[hit], group.answers[members.index(node)][at[hit]]
+            lead = node is members[0]
+            cost = dict(tokens=group.tokens if lead else 0,
+                        gpu_s=group.gpu_s if lead else 0.0,
+                        chunks=group.chunks if lead else 0)
+            if kind == "filter":
+                passed = values > 0
+                results[node.node_id] = filter_result(
+                    node, dict(enumerate([int(bit)] for bit in passed)),
+                    cost["tokens"], ids[asked], gpu_s=cost["gpu_s"],
+                    chunks=cost["chunks"])
+                kept = asked[passed]
+                continue
+            if kind == "label":
+                labels = SetLabels(
+                    np.asarray(node.spec.labels, dtype=object)[values.argmax(-1)],
+                    values, suffix_tokens=group.suffix_tokens[
+                        members.index(node)], **cost)
                 priors = [value for port, value in zip(
                     node.inputs, _node_inputs(node, results, inputs).values())
                     if port.value_type is ValueType.ROWS]
-                results[node.node_id] = classify_result(node, ids, labels, priors)
-        elif kind == "condition":
-            for node in run:
-                results[node.node_id] = FilterRuntime().execute(
-                    node, _node_inputs(node, results, inputs), context)
-        elif kind == "join":
-            join = JoinPart.prepare(state, run, ids, [], inputs, context)
-            results.update(execute_set_joins(state, join))
-        else:
-            for node in run:
-                results[node.node_id] = joined_label_passes(state, node, join)
+                results[node.node_id] = classify_result(node, ids[asked], labels,
+                                                        priors)
+            else:
+                if texts is None:
+                    raise ValueError(f"AI.EXTRACT reads the text of {alias!r}, "
+                                     f"which was not loaded")
+                found, keep = found_reads(values, model_spec.read_found)
+                answers, characters = read_texts(
+                    values, keep, [prefixes[int(p)] for p in asked],
+                    [texts[int(ids[p])] for p in asked],
+                    len(node.spec.prompt_token_parts[0]),
+                    state_tails(state).encoder.token_bytes())
+                results[node.node_id] = read_result(node, ids[asked], SetReads(
+                    answers, characters, list(found), suffix_tokens=group.suffix_tokens[
+                        members.index(node)], **cost))
+            kept = asked
             continue
-        last = results[run[-1].node_id].outputs.get(f"rows:{alias}")
-        if last is not None:
-            ids = id_positions(last.ids[alias])
+        if kind == "condition":
+            results[node.node_id] = FilterRuntime().execute(
+                node, _node_inputs(node, results, inputs), context)
+        elif kind == "join":
+            if index and _kind(nodes[index - 1]) == "join":
+                continue
+            run = [node]
+            for later in nodes[index + 1:]:
+                if _kind(later) != "join":
+                    break
+                run.append(later)
+            join = JoinPart.prepare(state, run, ids[kept], [], inputs, context)
+            results.update(execute_set_joins(state, join))
+            node = run[-1]
+        else:
+            results[node.node_id] = joined_label_passes(state, node, join)
+            continue
+        rows = results[node.node_id].outputs.get(f"rows:{alias}")
+        if rows is not None:
+            kept = _positions(ids, id_positions(rows.ids[alias]))
     return results
+
+
+def execute_set_pipeline(state, nodes, inputs, context) -> dict:
+    """Run a pipeline under set attention (execute_set_steps)."""
+    alias = nodes[0].document_aliases[0]
+    ids = pipeline_ids(nodes[0], inputs)
+    head = next((node.document_head for node in nodes
+                 if _kind(node) in PACKED), ())
+    first_filter = next((node for node in nodes if isinstance(node, AiFilter)), None)
+    stops = (None if first_filter is None else filter_inputs(
+        context.state, first_filter, ids)["stop_groups"])
+    return execute_set_steps(
+        state, nodes, ids, DocumentPrefixes(head, context.state["documents"][alias],
+                                            ids),
+        texts=context.state.get("texts", {}).get(alias), inputs=inputs,
+        context=context, limit=context.state.get("filter_limit"),
+        stop_groups=stops)
