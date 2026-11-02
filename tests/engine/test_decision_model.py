@@ -111,3 +111,20 @@ def session(tmp_path):
         value.register(name, catalog.get(name))
     yield value
     value.close()
+
+
+def test_a_decision_head_needs_exactly_its_tensors():
+    import torch
+
+    from quail.backends.quail.executor.readout import DecisionHead
+
+    weights = {name: torch.zeros(4) for name in DecisionHead.TENSORS}
+    weights["key.weight"] = torch.zeros(2, 4)
+
+    assert DecisionHead(torch, torch.nn.functional, weights).head_dim == 2
+    with pytest.raises(ValueError, match="missing"):
+        DecisionHead(torch, torch.nn.functional,
+                     {k: v for k, v in weights.items() if k != "scalar.weight"})
+    with pytest.raises(ValueError, match="does not use"):
+        DecisionHead(torch, torch.nn.functional,
+                     {**weights, "key.bias": torch.zeros(2)})
