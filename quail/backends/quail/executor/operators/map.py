@@ -11,7 +11,6 @@ from itertools import groupby
 import numpy as np
 import pyarrow as pa
 
-from quail.backends.quail.executor.extract import load_vocabulary
 from quail.backends.quail.executor.parts import (
     ColumnPart,
     ExecutionPart,
@@ -202,9 +201,8 @@ class MapPart(ColumnPart, ExecutionPart):
 
     def column_values(self, index, positions) -> tuple:
         tokens = self.decoder.answers(self.first + index, self._slots(index, positions))
-        tokenizer = load_vocabulary(self.state).tokenizer
-        return (pa.array(tokenizer.batch_decode(tokens, skip_special_tokens=True),
-                         pa.string()),)
+        tokenizer = self.state.loaded_model.tokenizer
+        return (pa.array(tokenizer.decode_batch(tokens), pa.string()),)
 
     def complete(self, fresh, spans, stats, offset):
         """Build each map's answer table and attribute its GPU work."""

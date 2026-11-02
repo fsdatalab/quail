@@ -17,10 +17,11 @@ from quail.backends.quail.executor.extract.candidates import (
 def test_first_tokens_follow_the_models_spelling():
     tables = make_vocabulary()
     text = RANKED
-    ids, offsets = tables.encode(text)
+    ids, offsets = tables.tokenizer.encode(text)
     scan = DocumentTokens.from_tokens(tables, ids, offsets, 1)
-    the, march = tables.encode_ids("The")[0], tables.encode_ids("March")[0]
-    space_march = tables.encode_ids(" March")[0]
+    the = tables.tokenizer.encode_ids("The")[0]
+    march = tables.tokenizer.encode_ids("March")[0]
+    space_march = tables.tokenizer.encode_ids(" March")[0]
     lp = {the: -0.5, march: -1.0, space_march: -3.0}
     starts = first_tokens(tables, _scores(tables, lp), scan)
     by_char = {scan.starts[i - 1]: value for i, value in starts.items(tables)}
@@ -37,7 +38,7 @@ def test_first_tokens_follow_the_models_spelling():
     # a stream holds its first token until the writing reaches it
     assert streams[1].stream == [the]
     streams[1].extend(tables)
-    assert streams[1].stream[:3] == tables.encode_ids("The rent is")
+    assert streams[1].stream[:3] == tables.tokenizer.encode_ids("The rent is")
     # a start's offset includes its token's leading space
     assert text[streams[1].char:streams[1].ends[2]] == " The rent is"
     (march_stream,) = make_streams(tables, text, starts, march)
@@ -53,19 +54,19 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(
     tables = make_vocabulary(*texts)
     streams = []
     expected = []
-    word = tables.encode_ids("word")[0]
+    word = tables.tokenizer.encode_ids("word")[0]
     for text in texts:
-        ids, offsets = tables.encode(text)
+        ids, offsets = tables.tokenizer.encode(text)
         scan = DocumentTokens.from_tokens(tables, ids, offsets)
         starts = first_tokens(tables, _scores(tables, {word: -0.5}), scan)
         streams.append(make_streams(tables, text, starts, word,
                                     first_window_chars=first_window,
                                     window_chars=window)[0])
         rest, ends = squeezed(text)
-        ids, offsets = tables.encode(rest)
+        ids, offsets = tables.tokenizer.encode(rest)
         expected.append((ids, [ends[b - 1] for _, b in offsets]))
     batches = []
-    encode_batch = tables.encode_batch
+    encode_batch = tables.tokenizer.encode_batch
 
     def recorded(texts):
         batches.append(tuple(texts))
@@ -74,8 +75,8 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(
     def scalar(text):
         raise AssertionError("stream windows must be tokenized together")
 
-    monkeypatch.setattr(tables, "encode_batch", recorded)
-    monkeypatch.setattr(tables, "encode", scalar)
+    monkeypatch.setattr(tables.tokenizer, "encode_batch", recorded)
+    monkeypatch.setattr(tables.tokenizer, "encode", scalar)
     ensure_tokens(streams, 80, tables)
     assert len(batches[0]) == 2
     largest_window = max(len(text) for batch in batches for text in batch)

@@ -368,8 +368,7 @@ def map_state(setup, arena, forward_chunk):
             arena=arena, pipeline=pipeline, input_staging=None,
             model_spec=QWEN3_4B_FP8,
             model=SimpleNamespace(quail_full_head=torch.eye(VOCABULARY)),
-            vocabulary=SimpleNamespace(stop_ids=[STOP], tokenizer=SimpleNamespace(
-                batch_decode=batch_decode))))
+            tokenizer=SimpleNamespace(stop_ids=[STOP], decode_batch=batch_decode)))
 
 
 # every setting appears in some case
