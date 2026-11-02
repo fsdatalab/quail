@@ -22,14 +22,18 @@ from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models import lfm3_kernels as kernels
 from quail.backends.quail.executor.models.base import ModelPipeline
 
-# per model_type, the prefix of the language model's tensors and the
-# prefixes of the parts the text pass does not read, as transformers
-# names them
-CHECKPOINT_LAYOUTS = {
-    "lfm3": ("model.", ("lm_head.",)),
-    "lfm3_vl": ("model.language_model.",
-                ("model.vision_tower.", "model.multi_modal_projector.",
-                 "lm_head.")),
+# where transformers puts the language model in each checkpoint type
+LANGUAGE_MODEL = {"lfm3": "model", "lfm3_vl": "model.language_model"}
+# the parts of a checkpoint the text pass does not read
+SKIPPED_PARTS = ("model.vision_tower.", "model.multi_modal_projector.")
+# each layer's tensors, by layer kind, under layers.<index>.
+LAYER_TENSORS = {
+    "conv": ("conv.in_proj", "conv.out_proj", "conv.conv"),
+    "attention": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                  "self_attn.gate_proj", "self_attn.o_proj", "self_attn.q_norm",
+                  "self_attn.k_norm"),
+    "every": ("operator_norm", "post_operator_norm", "ffn_norm", "post_ffn_norm",
+              "feed_forward.w1", "feed_forward.w2", "feed_forward.w3"),
 }
 
 
@@ -37,34 +41,38 @@ def is_lfm3(path) -> bool:
     """Whether a checkpoint directory holds an LFM3 or LFM3-VL model."""
     config = Path(path) / "config.json"
     return (config.is_file() and json.loads(config.read_text()).get(
-        "model_type") in CHECKPOINT_LAYOUTS)
+        "model_type") in LANGUAGE_MODEL)
 
 
-def text_tensor_names(names, model_type) -> dict:
-    """The language model's tensors, by their name inside it.
+def text_tensors(layer_types, language_model) -> list[str]:
+    """Every tensor the text pass reads, by its name in the checkpoint.
 
     Args:
-        names: Every tensor name in the checkpoint.
-        model_type: The config's model_type.
+        layer_types: The text config's layer_types.
+        language_model: The language model's module path, LANGUAGE_MODEL's.
+    """
+    names = ["embed_tokens", "embedding_norm"]
+    for index, kind in enumerate(layer_types):
+        mixer = LAYER_TENSORS["conv" if kind == "conv" else "attention"]
+        names += [f"layers.{index}.{name}" for name in
+                  (*LAYER_TENSORS["every"], *mixer)]
+    return [f"{language_model}.{name}.weight" for name in names]
 
-    Returns:
-        Checkpoint name by name inside the language model.
+
+def check_tensors(found, expected) -> None:
+    """Check that a checkpoint holds the text tensors and nothing unknown.
 
     Raises:
-        ValueError: A tensor is in neither the language model nor a part
-            the text pass skips.
+        ValueError: A text tensor is missing, or a tensor is neither a
+            text tensor nor in SKIPPED_PARTS.
     """
-    prefix, skipped = CHECKPOINT_LAYOUTS[model_type]
-    out, unknown = {}, []
-    for name in names:
-        if name.startswith(prefix):
-            out[name[len(prefix):]] = name
-        elif not name.startswith(skipped):
-            unknown.append(name)
-    if unknown:
-        raise ValueError(f"the {model_type} checkpoint has tensors outside its "
-                         f"language model: {sorted(unknown)[:5]}")
-    return out
+    found, expected = set(found), set(expected)
+    if missing := expected - found:
+        raise ValueError(f"the checkpoint is missing {sorted(missing)[:5]}")
+    unexpected = [name for name in found - expected
+                  if not name.startswith(SKIPPED_PARTS)]
+    if unexpected:
+        raise ValueError(f"the LFM3 pass does not use {sorted(unexpected)[:5]}")
 
 
 def text_config(path) -> dict:
@@ -157,18 +165,23 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
     if not config.get("use_sandwich_norm", False):
         raise ValueError("an LFM3 model without sandwich norms is not "
                          "supported")
-    tensors = {}
+    root = LANGUAGE_MODEL[model_type]
+    expected = text_tensors(config["layer_types"], root)
+    files = {}
     for file in sorted(Path(path).glob("*.safetensors")):
         with safe_open(str(file), framework="pt", device="cpu") as f:
-            for inner, name in text_tensor_names(f.keys(), model_type).items():
-                tensors[inner] = f.get_tensor(name)
+            files.update(dict.fromkeys(f.keys(), file))
+    check_tensors(files, expected)
+    tensors = {}
+    for file in sorted(set(files[name] for name in expected)):
+        with safe_open(str(file), framework="pt", device="cpu") as f:
+            for name in expected:
+                if files[name] == file:
+                    tensors[name] = f.get_tensor(name)
 
     def take(name):
-        try:
-            tensor = tensors.pop(name)
-        except KeyError:
-            raise ValueError(f"the checkpoint has no {name}") from None
-        return tensor.to(device=device, dtype=torch.bfloat16)
+        return tensors.pop(f"{root}.{name}.weight").to(device=device,
+                                                       dtype=torch.bfloat16)
 
     eps = config["norm_eps"]
 
@@ -196,34 +209,34 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
         return SimpleNamespace(weight=quantized, weight_scale_inv=scale,
                                out_features=rows)
 
+    # the execution layout: q, k, v, and the gate fused, and w1 with w3
     layers = []
     for index, kind in enumerate(config["layer_types"]):
-        p = f"layers.{index}."
+        def own(name, index=index):
+            return f"layers.{index}.{name}"
+
         layer = SimpleNamespace(
             kind=kind,
-            operator_norm=norm(p + "operator_norm.weight"),
-            post_operator_norm=norm(p + "post_operator_norm.weight"),
-            ffn_norm=norm(p + "ffn_norm.weight"),
-            post_ffn_norm=norm(p + "post_ffn_norm.weight"),
-            w13=linear(p + "feed_forward.w1.weight", p + "feed_forward.w3.weight"),
-            w2=linear(p + "feed_forward.w2.weight"))
+            operator_norm=norm(own("operator_norm")),
+            post_operator_norm=norm(own("post_operator_norm")),
+            ffn_norm=norm(own("ffn_norm")),
+            post_ffn_norm=norm(own("post_ffn_norm")),
+            w13=linear(own("feed_forward.w1"), own("feed_forward.w3")),
+            w2=linear(own("feed_forward.w2")))
         if kind == "conv":
-            taps = take(p + "conv.conv.weight")
-            layer.in_proj = linear(p + "conv.in_proj.weight")
-            layer.out_proj = linear(p + "conv.out_proj.weight")
+            taps = take(own("conv.conv"))
+            layer.in_proj = linear(own("conv.in_proj"))
+            layer.out_proj = linear(own("conv.out_proj"))
             layer.taps = taps.view(taps.shape[0], taps.shape[2]).contiguous()
         else:
-            a = p + "self_attn."
-            layer.qkv_gate = linear(a + "q_proj.weight", a + "k_proj.weight",
-                                    a + "v_proj.weight", a + "gate_proj.weight")
-            layer.o_proj = linear(a + "o_proj.weight")
-            layer.q_norm = norm(a + "q_norm.weight")
-            layer.k_norm = norm(a + "k_norm.weight")
+            layer.qkv_gate = linear(*(own(f"self_attn.{part}_proj")
+                                      for part in ("q", "k", "v", "gate")))
+            layer.o_proj = linear(own("self_attn.o_proj"))
+            layer.q_norm = norm(own("self_attn.q_norm"))
+            layer.k_norm = norm(own("self_attn.k_norm"))
         layers.append(layer)
-    embed = take("embed_tokens.weight")
-    final_norm = norm("embedding_norm.weight")
-    if tensors:
-        raise ValueError(f"the LFM3 pass does not use {sorted(tensors)[:5]}")
+    embed = take("embed_tokens")
+    final_norm = norm("embedding_norm")
     positions = max_positions or config["max_position_embeddings"]
     rotary = {kind: rotary_tables(torch, config, kind, positions, device)
               for kind in set(config["layer_types"]) - {"conv"}}

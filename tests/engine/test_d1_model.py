@@ -319,16 +319,18 @@ def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
     session.close()
 
 
-def test_an_lfm3_checkpoint_reads_its_text_model_and_refuses_unknown_tensors():
-    from quail.backends.quail.executor.models.lfm3 import text_tensor_names
+def test_an_lfm3_checkpoint_needs_its_text_tensors_and_nothing_unknown():
+    from quail.backends.quail.executor.models.lfm3 import (
+        check_tensors,
+        text_tensors,
+    )
 
-    vl = ["model.language_model.layers.0.conv.conv.weight",
-          "model.vision_tower.encoder.weight", "model.multi_modal_projector.w"]
-    text = ["model.layers.0.conv.conv.weight", "model.embed_tokens.weight"]
+    expected = text_tensors(["conv", "full_attention"], "model.language_model")
+    vision = ["model.vision_tower.encoder.weight", "model.multi_modal_projector.w"]
 
-    assert text_tensor_names(vl, "lfm3_vl") == {
-        "layers.0.conv.conv.weight": vl[0]}
-    assert sorted(text_tensor_names(text, "lfm3")) == [
-        "embed_tokens.weight", "layers.0.conv.conv.weight"]
-    with pytest.raises(ValueError, match="outside its language model"):
-        text_tensor_names([*vl, "model.audio_tower.weight"], "lfm3_vl")
+    assert "model.language_model.layers.1.self_attn.gate_proj.weight" in expected
+    check_tensors([*expected, *vision], expected)
+    with pytest.raises(ValueError, match="missing"):
+        check_tensors(expected[1:], expected)
+    with pytest.raises(ValueError, match="does not use"):
+        check_tensors([*expected, "model.audio_tower.weight"], expected)
