@@ -24,6 +24,7 @@ from quail.backends.quail.executor.readout import (
     AsyncDecisionScores,
     DecisionHead,
 )
+from quail.backends.quail.executor.set_passes import state_tails
 from quail.backends.quail.executor.state import GpuRuntime
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
@@ -184,6 +185,10 @@ class LoadedGpu:
                     # AI.EXTRACT and AI.MAP read the tokenizer; loading it is
                     # startup, and the first AI.EXTRACT builds its word index
                     load_vocabulary(self.execution)
+                if self.spec.attention_mask == "set":
+                    # a set-attention pass joins each document's end with the
+                    # state tail through the tokenizer; loading it is startup
+                    state_tails(self.execution)
             graphs = self.pipeline.piecewise_graphs
             if graphs is not None and graphs.prepare():
                 tier = tier or "graphs"
