@@ -589,76 +589,66 @@ def _margin(logits, count):
     return max(logits[:count]) - max(logits[count:])
 
 
-def test_quail_writes_the_prompt_d1_renders(prompts, reference):
+def test_quail_writes_the_prompts_d1_renders(prompts, reference):
     texts = [text for _, _, items in prompts for text, _ in items]
     assert texts == [row["text"] for row in reference["prompts"]]
-    ids = [quail_ids for _, _, items in prompts for _, quail_ids in items]
-    differ = sum(ours != row["ids"]
-                 for ours, row in zip(ids, reference["prompts"]))
-    print(f"prompts whose segment-wise ids differ from d1's whole-text "
-          f"ids: {differ} of {len(ids)}")
+    first = _choice_questions()[1][0]
+    for review, theirs in zip(REVIEWS, reference["choices"]):
+        assert first.preamble + review + first.tail[len("{0}"):] == theirs["text"]
 
 
-def test_answers_agree_with_d1s_own_model(answer_ids, reference, quail):
-    count = len(answer_ids[0])
-    margins = [(_margin(row["logits"], count), _margin(ours, count))
-               for row, ours in zip(reference["prompts"], quail)]
-    print("yes minus no logit at the slot, d1 code vs Quail:",
-          [(round(a, 2), round(b, 2)) for a, b in margins])
-    assert all((a > 0) == (b > 0) for a, b in margins)
-    assert max(abs(a - b) for a, b in margins) < MARGIN_TOLERANCE
-
-
-def test_quails_p_yes_matches_d1_reading_its_own_tokens(answer_ids,
-                                                        reference, quail):
+def test_one_question_answers_as_d1s_own_model(answer_ids, reference, quail):
     import math
 
     count = len(answer_ids[0])
-    ours = [1 / (1 + math.exp(-_margin(logits, count))) for logits in quail]
-    theirs = [row["p_yes"] for row in reference["prompts"]]
-    print("P(yes), d1 on its own tokens vs Quail:",
-          [(round(a, 3), round(b, 3)) for a, b in zip(theirs, ours)])
-    assert max(abs(a - b) for a, b in zip(theirs, ours)) < PROBABILITY_TOLERANCE
+    rows = [(_margin(row["logits"], count), _margin(ours, count), row["p_yes"])
+            for row, ours in zip(reference["prompts"], quail)]
+    print("yes minus no, d1 code vs Quail:",
+          [(round(a, 2), round(b, 2)) for a, b, _ in rows])
+    assert all((a > 0) == (b > 0) for a, b, _ in rows)
+    assert max(abs(a - b) for a, b, _ in rows) < MARGIN_TOLERANCE
+    assert max(abs(p - 1 / (1 + math.exp(-b)))
+               for _, b, p in rows) < PROBABILITY_TOLERANCE
 
 
-def test_a_packed_pass_is_the_sequence_d1_packs(packs, join_passes, reference):
-    for pack, theirs in zip([*packs[1], *join_passes[2]], reference["packs"]):
-        assert pack["ids"] == theirs["d1_ids"]
+def test_a_packed_pass_answers_as_d1_packing_the_same_questions(
+        answer_ids, packs, reference, quail_packs):
+    import math
+
+    count = len(answer_ids[0])
+    theirs = reference["packs"][:len(packs[1])]
+    assert [pack["ids"] for pack in packs[1]] == [t["d1_ids"] for t in theirs]
+    rows = [(_margin(logits, count), ours, p_yes)
+            for pack, margins in zip(theirs, quail_packs)
+            for logits, ours, p_yes in zip(pack["logits"], margins,
+                                           pack["p_yes"])]
+    print("packed yes minus no, d1 code vs Quail (first pass):",
+          [(round(a, 2), round(b, 2)) for a, b, _ in rows[:16]])
+    assert all((a > 0) == (b > 0) for a, b, _ in rows)
+    assert max(abs(a - b) for a, b, _ in rows) < MARGIN_TOLERANCE
+    assert max(abs(p - 1 / (1 + math.exp(-b)))
+               for _, b, p in rows) < PROBABILITY_TOLERANCE
 
 
-def test_a_join_asks_each_reviews_18_aspects_in_two_passes(join_passes):
-    stage, _, _ = join_passes
+def test_a_join_answers_as_d1_packing_each_reviews_partners(
+        answer_ids, packs, join_passes, reference, quail_joins):
+    import math
+
+    stage, _, items = join_passes
     assert [len(shape) for shape in stage.questions] == [16, 2] * len(REVIEWS)
-
-
-def test_each_join_slot_agrees_with_d1s_own_model(answer_ids, packs, reference,
-                                                  quail_joins):
-    import math
-
     count = len(answer_ids[0])
     theirs = reference["packs"][len(packs[1]):]
-    pairs = [(_margin(logits, count), ours, p_yes)
-             for pack, margins in zip(theirs, quail_joins)
-             for logits, ours, p_yes in zip(pack["logits"], margins,
-                                            pack["p_yes"])]
+    assert [item["ids"] for item in items] == [t["d1_ids"] for t in theirs]
+    rows = [(_margin(logits, count), ours, p_yes)
+            for pack, margins in zip(theirs, quail_joins)
+            for logits, ours, p_yes in zip(pack["logits"], margins,
+                                           pack["p_yes"])]
     print("join yes minus no, d1 code vs Quail (first review):",
-          [(round(a, 2), round(b, 2)) for a, b, _ in pairs[:18]])
-    assert all((a > 0) == (b > 0) for a, b, _ in pairs if abs(a) > 0.1)
-    assert max(abs(a - b) for a, b, _ in pairs) < MARGIN_TOLERANCE
+          [(round(a, 2), round(b, 2)) for a, b, _ in rows[:18]])
+    assert all((a > 0) == (b > 0) for a, b, _ in rows if abs(a) > 0.1)
+    assert max(abs(a - b) for a, b, _ in rows) < MARGIN_TOLERANCE
     assert max(abs(p - 1 / (1 + math.exp(-b)))
-               for _, b, p in pairs) < PROBABILITY_TOLERANCE
-
-
-def test_each_packed_slot_agrees_with_d1s_own_model(answer_ids, reference,
-                                                    quail_packs):
-    count = len(answer_ids[0])
-    pairs = [(_margin(logits, count), ours)
-             for pack, margins in zip(reference["packs"], quail_packs)
-             for logits, ours in zip(pack["logits"], margins)]
-    print("packed yes minus no, d1 code vs Quail (first pass):",
-          [(round(a, 2), round(b, 2)) for a, b in pairs[:16]])
-    assert all((a > 0) == (b > 0) for a, b in pairs)
-    assert max(abs(a - b) for a, b in pairs) < MARGIN_TOLERANCE
+               for _, b, p in rows) < PROBABILITY_TOLERANCE
 
 
 def test_the_fused_kernels_match_a_plain_pytorch_forward(packs, answer_ids,
@@ -684,24 +674,6 @@ def test_the_fused_kernels_match_a_plain_pytorch_forward(packs, answer_ids,
     print("packed yes minus no, plain PyTorch vs Quail's kernels:",
           [(round(a, 2), round(b, 2)) for a, b in pairs[:16]])
     assert max(abs(a - b) for a, b in pairs) < MARGIN_TOLERANCE
-
-
-def test_packed_p_yes_matches_d1_reading_its_own_pass(reference, quail_packs):
-    import math
-
-    pairs = [(theirs, 1 / (1 + math.exp(-ours)))
-             for pack, margins in zip(reference["packs"], quail_packs)
-             for theirs, ours in zip(pack["p_yes"], margins)]
-    print("packed P(yes), d1 own pass vs Quail (first pass):",
-          [(round(a, 3), round(b, 3)) for a, b in pairs[:16]])
-    assert max(abs(a - b) for a, b in pairs) < PROBABILITY_TOLERANCE
-
-
-def test_quail_writes_the_choice_prompt_d1_renders(reference):
-    _, prompts = _choice_questions()
-    first = prompts[0]
-    for review, theirs in zip(REVIEWS, reference["choices"]):
-        assert first.preamble + review + first.tail[len("{0}"):] == theirs["text"]
 
 
 def test_packed_choices_match_d1s_option_probabilities(reference, quail_choices):

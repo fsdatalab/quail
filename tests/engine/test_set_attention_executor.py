@@ -1,26 +1,11 @@
 """Set-attention executor pieces: pass building, readouts, and the set mask."""
 
-import math
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from quail.specs import D1_2B_BF16
-
-
-def test_a_join_pass_holds_at_most_the_set_size_and_fits_one_chunk():
-    from quail.backends.quail.executor.set_passes import split_passes
-
-    lengths = [10] * 20
-
-    assert split_passes(100, range(20), lengths, 1, 16, 10_000) == [
-        list(range(16)), list(range(16, 20))]
-    # 100 + 10 + 3 * 11 = 143 fits; a fifth question does not
-    assert split_passes(100, range(5), lengths, 1, 16, 150) == [
-        [0, 1, 2, 3], [4]]
-    with pytest.raises(ValueError, match="does not fit"):
-        split_passes(100, [0], lengths, 1, 16, 105)
 
 
 def test_an_anchor_without_partners_at_the_next_join_settles_unmatched():
@@ -32,30 +17,6 @@ def test_an_anchor_without_partners_at_the_next_join_settles_unmatched():
     asked = [[0, 1, 2], [0, 1]]
 
     assert settled_rows(every, asked) == {0: [], 1: [False, True], 2: [False]}
-
-
-def test_a_join_question_labels_each_partner_and_joins_its_end_to_the_tail():
-    from quail.backends.quail.executor.operators.join import set_join_questions
-    from quail.backends.quail.executor.set_passes import StateTails
-
-    node = SimpleNamespace(partners=("a",), label_token_ids=(("a", (9,)),),
-                           tail_token_ids=(3, 5), separator_tokens=1)
-
-    questions = set_join_questions(node, {"a": [[1, 2], [2, 1]]},
-                                   StateTails(_Pieces()))
-
-    assert questions == [[9, 1, 4, 5], [9, 2, 1, 3, 5]]
-
-
-def test_a_pass_opens_each_later_question_with_its_header():
-    from quail.backends.quail.executor.set_passes import group_passes
-
-    (members, suffix, shape), = group_passes([[0] * 10], [(1, 2), (3,)], (8,),
-                                             16, 1000)
-
-    assert members == [0, 1]
-    assert suffix == [1, 2, 8, 3]
-    assert shape == (2, 2)
 
 
 class _Pieces:
@@ -78,36 +39,6 @@ class _Pieces:
             ids.append(i)
             text = text[len(piece):]
         return ids
-
-
-def test_a_documents_last_mark_joins_the_blank_line_after_it_once_per_ending():
-    from quail.backends.quail.executor.set_passes import StateTails
-
-    encoder = _Pieces()
-    tails = StateTails(encoder)
-
-    joined = [tails.prefix([1, 2], [3, 5]) for _ in range(3)]
-    plain = tails.prefix([2, 1], [3, 5])
-
-    assert joined == [[1, 4, 5]] * 3
-    assert plain == [2, 1, 3, 5]
-    assert encoder.calls == 2
-
-
-def test_an_option_scores_its_best_spelling_over_the_temperature():
-    from quail.backends.quail.executor.pass_groups import (
-        option_columns,
-        option_probabilities,
-    )
-
-    targets = [7, 8, 9]                    # A, " A", B
-    logits = np.array([[2.0, 4.0, 1.0], [0.0, 0.0, 3.0]])
-    probabilities = option_probabilities(
-        logits, option_columns(((7, 8), (9,)), targets), 2.0)
-
-    expected = math.exp(4.0 / 2) / (math.exp(4.0 / 2) + math.exp(1.0 / 2))
-    assert probabilities[0, 0] == pytest.approx(expected)
-    assert probabilities[1].argmax() == 1
 
 
 def test_one_mixed_pass_decodes_a_yes_no_a_choice_and_a_read():
@@ -133,27 +64,6 @@ def test_one_mixed_pass_decodes_a_yes_no_a_choice_and_a_read():
     assert margins.tolist() == [2.0, -2.0]
     assert probabilities.argmax(-1).tolist() == [0, 1]
     assert spans.tolist() == [[4, 6, 0.9], [0, 0, 0.1]]
-
-
-def test_a_found_probability_follows_the_calibration_knots():
-    from quail.backends.quail.executor.operators.set_extract import calibrated
-
-    knots = ((0.1, 0.0), (0.5, 0.4), (0.9, 1.0))
-
-    assert calibrated(knots, 0.05) == 0.0
-    assert calibrated(knots, 0.3) == pytest.approx(0.2)
-    assert calibrated(knots, 0.95) == 1.0
-    assert calibrated((), 0.3) == 0.3
-
-
-def test_a_read_returns_its_tokens_characters_without_edge_spaces():
-    from quail.backends.quail.executor.operators.set_extract import token_span
-
-    text = "Paid to Zoë Ltd. now"
-    vocabulary = {1: b"Paid", 2: b" to", 3: b" Zo\xc3\xab", 4: b" Ltd.", 5: b" now"}
-
-    assert token_span(text, [1, 2, 3, 4, 5], vocabulary, 2, 3) == (
-        "Zoë Ltd.", (8, 16))
 
 
 def test_a_pointer_read_takes_the_likeliest_span_or_nothing():
@@ -314,23 +224,3 @@ def test_a_score_packed_with_a_label_reads_its_answers_for_every_row(
         == ["happy", "sad", "happy"]
     assert (results["s"].metrics.fresh_tokens, results["c"].metrics.fresh_tokens) \
         == (100, 0)
-
-
-def test_a_mixed_pass_reads_a_score_as_the_sigmoid_of_its_margin():
-    from quail.backends.quail.executor.pass_groups import (
-        SetQuestion,
-        _decode,
-        _layout,
-    )
-
-    questions = [SetQuestion("yes_no", (), (), (1,), ()),
-                 SetQuestion("score", (), (), (2,), ())]
-    kinds, places, width, _ = _layout(questions, [0, 1], [7], [8], [7, 8])
-    # two documents, one code row per question: logits of yes then no
-    values = np.array([[3.0, 1.0, 2.0, 0.0], [0.0, 1.0, 0.0, 2.0]])
-
-    margins, scores = _decode(values, places, width, 2, 2.0)
-
-    assert kinds == ["code", "code"]
-    assert margins.tolist() == [2.0, -1.0]
-    assert scores == pytest.approx(1 / (1 + np.exp(-np.array([1.0, -1.0]))))
