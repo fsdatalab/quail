@@ -24,24 +24,9 @@ from quail.execution.runtimes.filter import filter_scores, tested_table
 from quail.progress import answer_sink
 
 
-def execute_set_filters(state: QueryExecutionState, nodes, inputs) -> dict:
-    """Run a table's filters under set attention, by pass group.
-
-    A filter answers only the documents that passed the filters before
-    it, as in a plan of one filter per pass group (execute_set_steps).
-    """
-    from quail.backends.quail.executor.pipeline import execute_set_steps
-
-    return execute_set_steps(
-        state, nodes, inputs["document_ids"], inputs["documents"],
-        limit=inputs.get("limit"), stop_groups=inputs.get("stop_groups"))
-
-
 def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
     """Run filter predicates together while each document retains its KV."""
     state.gpu_timing = bool(inputs.get("gpu_timing", False))
-    if state.loaded_model.pipeline.whole_sequences:
-        return execute_set_filters(state, nodes, inputs)
     node = nodes[0]
     documents, ids = inputs["documents"], inputs["document_ids"]
     parts = [FilterPart(member, ids, state.async_answers,

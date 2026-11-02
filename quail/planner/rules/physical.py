@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from quail.catalog.document_ends import document_ends, last_tokens
 from quail.cost.budgets import cheaper_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
 from quail.physical import (
@@ -27,7 +28,7 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.physical.pipelines import build_pipelines
 from quail.planner.graph import retention
-from quail.planner.graph.passes import packed_kind, set_pass_groups
+from quail.planner.graph.passes import document_tails, packed_kind, set_pass_groups
 from quail.planner.operators.classify import classify_scoring
 from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import plan_kv_retention
@@ -167,6 +168,54 @@ class PackSetPasses(PhysicalRule):
             replace(node, pass_group=groups[node.node_id])
             if node.node_id in groups else node for node in graph.nodes),
             graph.root)
+
+
+class JoinDocumentEnds(PhysicalRule):
+    """Join each document's last token with the tokens after it, as the model does.
+
+    A set-attention model tokenizes a whole prompt at once, so a
+    document's last token can merge with the text after it. For each
+    table and tail a set-attention node reads (document_tails), the rule
+    finds the table's distinct last tokens, and the prompt head's for an
+    empty document, and joins each with the tail through the tokenizer
+    once (document_ends); the executor ends each document with that join.
+    The rule leaves plans without a decoding tokenizer or the table's
+    tokens, and fires once, while some node it would annotate has none.
+    """
+
+    name = "join_document_ends"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None or context.model.attention_mask != "set":
+            return None
+        tokenizer = context.tokenizer
+        if not hasattr(tokenizer, "decode"):
+            return None
+        joins, nodes, changed = {}, [], False
+        for node in graph.nodes:
+            tails = document_tails(node)
+            if not tails or node.document_ends:
+                nodes.append(node)
+                continue
+            entries = []
+            for alias, head, tail in tails:
+                if (alias, head, tail) not in joins:
+                    lengths = context.document_tokens.get(alias)
+                    store = None if lengths is None else lengths.store
+                    last = (None if store is None else
+                            last_tokens(store.arrow_array).tolist() + list(head[-1:]))
+                    joins[alias, head, tail] = (
+                        None if last is None
+                        else document_ends(sorted(set(last)), tail, tokenizer))
+                if joins[alias, head, tail] is not None:
+                    entries.append((alias, tail, joins[alias, head, tail]))
+            if entries:
+                node = replace(node, document_ends=tuple(entries))
+                changed = True
+            nodes.append(node)
+        if not changed:
+            return None
+        return PhysicalGraph(tuple(nodes), graph.root)
 
 
 class ShouldRetainKv(PhysicalRule):

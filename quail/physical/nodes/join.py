@@ -73,6 +73,10 @@ class AiJoin(PhysicalNode):
     # later question of a pass
     separator_tokens: int = 0
     question_header_token_ids: tuple[Token, ...] = ()
+    # under set attention: per table and the tokens after its documents,
+    # each last token joined with them as the tokenizer reads them
+    # (JoinDocumentEnds), as (alias, tail, ((last, tokens), ...))
+    document_ends: tuple = ()
 
     def keeps(self, matched):
         """Which anchors the join keeps, given whether each matched a partner.

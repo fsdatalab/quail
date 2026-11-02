@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from quail.catalog.tokens import DocumentPrefixes
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import extraction_rows
 
@@ -119,26 +118,3 @@ def read_result(node, ids, reads: SetReads) -> NodeResult:
                    "input_rows": len(ids), "suffix_tokens": reads.suffix_tokens}))
 
 
-def execute_set_extractions(state, nodes, inputs) -> dict:
-    """Run a pipeline's extractions under set attention, by pass group.
-
-    Args:
-        state: The query's execution state.
-        nodes: The AiExtract nodes, over one table.
-        inputs: The documents' ids, and the tokenized documents and texts
-            by alias.
-
-    Raises:
-        ValueError: The table's text was not loaded.
-    """
-    from quail.backends.quail.executor.pipeline import execute_set_steps
-
-    alias = nodes[0].spec.alias
-    texts = inputs.get("texts", {}).get(alias)
-    if texts is None:
-        raise ValueError(f"AI.EXTRACT reads the text of {alias!r}, which "
-                         f"was not loaded")
-    ids = np.asarray(inputs["document_ids"], dtype=np.int64)
-    head = nodes[0].spec.prompt_token_parts[0]
-    return execute_set_steps(state, nodes, ids, DocumentPrefixes(
-        head, inputs["documents"][alias], ids), texts=texts)

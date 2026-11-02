@@ -168,3 +168,58 @@ def test_a_d1_score_and_a_classification_of_one_table_share_a_pass(tmp_path):
     assert score.pass_group == label.pass_group >= 0
     assert sorted(members) == sorted((score.node_id, label.node_id))
     session.close()
+
+
+class _MergingWords:
+    """Tokens of words and marks; a period merges with a blank line after it."""
+
+    def __init__(self):
+        self.texts = []
+
+    def __call__(self, text):
+        import re
+
+        out = []
+        for piece in re.findall(r"\.\n\n|\.| ?\w+|\n\n|\s|.", text):
+            if piece not in self.texts:
+                self.texts.append(piece)
+            out.append(self.texts.index(piece))
+        return out
+
+    def decode(self, tokens):
+        return "".join(self.texts[token] for token in tokens)
+
+
+def test_a_d1_plan_joins_each_documents_last_mark_with_the_blank_line_after_it(
+        tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.catalog.document_ends import ends_for, joined_state
+    from quail.physical import AiFilter
+    from quail.planner.plan import EngineConfig
+
+    words = _MergingWords()
+    pq.write_table(pa.table({"id": [1, 2], "body": ["It was kind.", "It was"]}),
+                   tmp_path / "reviews.parquet")
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=words)
+    session.register("reviews", DocumentProvider.from_parquet(
+        str(tmp_path / "reviews.parquet"), id_col="id"))
+
+    query = session.sql("SELECT r.id FROM reviews r "
+                        "WHERE AI_FILTER(PROMPT('Is it kind? {0}', r.body))")
+    query.plan()
+    # the plan is searched again once the documents' exact tokens are in
+    query.wait_for_tokens()
+    plan = query.plan()
+
+    (node,) = [node for node in plan.nodes if isinstance(node, AiFilter)]
+    tail = node.question_token_ids[:node.state_tail_tokens]
+    ends = ends_for(node.document_ends, "r", tail)
+    state = joined_state(words("It was kind."), tail, ends)
+    assert words.decode(list(state)) == "It was kind." + words.decode(list(tail))
+    assert words(".\n\n")[0] in list(state)
+    session.close()
