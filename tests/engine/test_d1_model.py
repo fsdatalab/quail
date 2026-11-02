@@ -100,14 +100,6 @@ def test_d1_2b_refuses_map_with_a_reason():
     assert "writes text" in extraction_refusal(context, "AI.MAP").reasons[0]
 
 
-def test_set_attention_refuses_a_score_beside_filters():
-    from quail.planner.validation import set_attention_refusal
-
-    two = SimpleNamespace(joins=[], filters={"r": [object(), object()]},
-                          labels=SimpleNamespace(calls=[]))
-
-    assert "or a score" in set_attention_refusal(two, True, D1_2B_BF16).reasons[0]
-    assert set_attention_refusal(two, False, D1_2B_BF16) is None
 
 
 def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):

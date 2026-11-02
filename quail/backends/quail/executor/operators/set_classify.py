@@ -108,6 +108,32 @@ def classify_result(node, ids, labels: SetLabels, priors) -> NodeResult:
                    "input_rows": len(ids), "suffix_tokens": labels.suffix_tokens}))
 
 
+def score_result(node, ids, scores, priors, cost, suffix_tokens) -> NodeResult:
+    """A score's NodeResult: the scored rows joined with its inputs.
+
+    Args:
+        node: The AiScore.
+        ids: The document ids it scored.
+        scores: Their scores, in order.
+        priors: The Rows of each of its rows inputs.
+        cost: The fresh tokens, GPU seconds, and forward passes it led.
+        suffix_tokens: Its question's tokens, summed over the rows.
+    """
+    spec = node.spec
+    rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
+    scored = score_rows(rows, spec.aliases, spec.name, np.asarray(scores))
+    for prior in priors:
+        scored = scored.joined(prior, spec.aliases[0])
+    sink = answer_sink()
+    if sink is not None and len(rows):
+        sink(scored_batch(node, rows, scores))
+    return NodeResult(classify_outputs(node, scored), NodeMetrics(
+        input_rows=len(ids), output_rows=len(ids), evaluated_documents=len(ids),
+        fresh_tokens=cost["tokens"], gpu_s=cost["gpu_s"], chunks=cost["chunks"],
+        extension={"output": spec.name, "aliases": list(spec.aliases),
+                   "input_rows": len(ids), "suffix_tokens": suffix_tokens}))
+
+
 def joined_label_passes(state, node, join) -> NodeResult:
     """Classify the pairs a join kept, as option-code questions in each anchor's passes.
 

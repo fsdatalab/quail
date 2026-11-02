@@ -2,11 +2,12 @@
 
 Under set attention, a pass reads a document and then up to the
 model's set size of questions; nothing is kept between passes. In each
-pipeline, a run of AI filters, classifications of one document, and
-extractions, with any conditions on their outputs between them, can
-share passes. set_pass_groups splits each run into pass groups with
-choose_pass_groups; the PackSetPasses rule writes them on the plan,
-and pricing, explain(), and the executor read them back.
+pipeline, a run of AI filters, classifications of one document,
+extractions, and scores of one document, with any conditions on their
+outputs between them, can share passes. set_pass_groups splits each
+run into pass groups with choose_pass_groups; the PackSetPasses rule
+writes them on the plan, and pricing, explain(), and the executor read
+them back.
 """
 
 from __future__ import annotations
@@ -14,7 +15,14 @@ from __future__ import annotations
 from quail.cost import budgets
 from quail.cost.packing import choose_pass_groups
 from quail.logical.prompts import PROMPT_LAYOUTS
-from quail.physical import AiClassify, AiExtract, AiFilter, Filter, PhysicalGraph
+from quail.physical import (
+    AiClassify,
+    AiExtract,
+    AiFilter,
+    AiScore,
+    Filter,
+    PhysicalGraph,
+)
 from quail.physical.pipelines import build_pipelines
 from quail.planner.statistics.tables import summarize_alias
 
@@ -27,6 +35,8 @@ def packed_kind(node) -> str | None:
         return "label"
     if isinstance(node, AiExtract):
         return "extract"
+    if isinstance(node, AiScore) and node.document_aliases:
+        return "score"
     return None
 
 

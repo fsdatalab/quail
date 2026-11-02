@@ -135,3 +135,36 @@ def test_a_d1_filter_and_classification_on_one_table_share_a_pass(tmp_path):
                                                            label.node_id)
     assert f"Passes on r: [{kind.node_id}, {label.node_id}]" in query.explain()
     session.close()
+
+
+def test_a_d1_score_and_a_classification_of_one_table_share_a_pass(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.physical import AiClassify, AiScore
+    from quail.planner.plan import EngineConfig
+
+    body = " ".join(["word"] * 300)
+    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
+                   tmp_path / "reviews.parquet")
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=str.split)
+    session.register("reviews", DocumentProvider.from_parquet(
+        str(tmp_path / "reviews.parquet"), id_col="id"))
+    query = session.sql(
+        "SELECT r.id, AI.SCORE(PROMPT('Is it funny? {0}', r.body)) AS fun, "
+        "AI.CLASSIFY(PROMPT('Which mood? {0}', r.body), ARRAY['happy', 'sad']) "
+        "AS mood FROM reviews r ORDER BY fun DESC LIMIT 5")
+
+    plan = query.plan()
+    (score,) = [node for node in plan.nodes if isinstance(node, AiScore)]
+    (label,) = [node for node in plan.nodes if isinstance(node, AiClassify)]
+    members = plan.estimates[score.node_id].get("pass_members") or \
+        plan.estimates[label.node_id]["pass_members"]
+
+    assert score.spec.state_tail_tokens == label.spec.state_tail_tokens > 0
+    assert score.pass_group == label.pass_group >= 0
+    assert sorted(members) == sorted((score.node_id, label.node_id))
+    session.close()

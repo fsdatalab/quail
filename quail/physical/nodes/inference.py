@@ -36,10 +36,20 @@ class InferenceSpec:
 
 @dataclass(frozen=True)
 class ScoreSpec(InferenceSpec):
-    """Settings for scoring documents or pairs, including diffusion draws."""
+    """Settings for scoring documents or pairs, including diffusion draws.
+
+    Attributes:
+        state_tail_tokens: For a set-attention model's score of one
+            table, the prompt tail's tokens a pass reads with the
+            document; 0 for every other score.
+        question_header_token_ids: For such a score, the tokens that open
+            its question after another in one pass.
+    """
 
     pair_fraction: float = 1.0
     draws: int = 1
+    state_tail_tokens: int = 0
+    question_header_token_ids: tuple[Token, ...] = ()
 
 @dataclass(frozen=True)
 class AiInference(PhysicalNode):
@@ -113,3 +123,10 @@ class AiScore(AiInference):
     spec_type: ClassVar[type[InferenceSpec]] = ScoreSpec
     type_name: ClassVar[str] = "quail.ai_score"
     runtime_key: ClassVar[str] = type_name
+
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        # only a set-attention question joins a pipeline of its table
+        if self.spec is None or not self.spec.state_tail_tokens:
+            return ()
+        return (self.spec.aliases[0],)

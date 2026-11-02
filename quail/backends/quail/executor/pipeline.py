@@ -14,6 +14,7 @@ from quail.backends.quail.executor.operators.set_classify import (
     SetLabels,
     classify_result,
     joined_label_passes,
+    score_result,
 )
 from quail.backends.quail.executor.operators.set_extract import (
     SetReads,
@@ -29,7 +30,7 @@ from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import id_positions
 from quail.execution.rows import Rows
 from quail.execution.runtimes.filter import FilterRuntime
-from quail.physical import AiClassify, AiExtract, AiFilter, AiJoin, Filter
+from quail.physical import AiClassify, AiExtract, AiFilter, AiJoin, AiScore, Filter
 from quail.physical.base import ValueType
 
 
@@ -93,6 +94,8 @@ def _kind(node) -> str:
         return "label" if node.spec.partner is None else "joined"
     if isinstance(node, AiExtract):
         return "extract"
+    if isinstance(node, AiScore):
+        return "score"
     if isinstance(node, AiJoin):
         return "join"
     if isinstance(node, Filter) and len(node.aliases) == 1:
@@ -108,7 +111,7 @@ def _node_inputs(node, results, inputs) -> dict:
             for port in node.inputs}
 
 
-PACKED = ("filter", "label", "extract")
+PACKED = ("filter", "score", "label", "extract")
 
 
 def _positions(ids, chosen) -> np.ndarray:
@@ -125,7 +128,8 @@ def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
     pass per document when the pipeline reaches the group's first
     operator. Each step then reads its answers for the rows still kept:
     a filter keeps the rows it passes, a condition the rows it accepts,
-    and a classification or an extraction answers every kept row. A
+    and a score, a classification, or an extraction answers every kept
+    row. A
     question asked of a row that a filter of the same group removes is
     answered and then dropped, so packing decides which rows each step
     reads the same way as running the steps apart. The answers can
@@ -183,14 +187,18 @@ def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
                     chunks=cost["chunks"])
                 kept = asked[passed]
                 continue
-            if kind == "label":
+            suffix_tokens = group.suffix_tokens[members.index(node)]
+            priors = [] if kind == "extract" else [
+                value for port, value in zip(
+                    node.inputs, _node_inputs(node, results, inputs).values())
+                if port.value_type is ValueType.ROWS]
+            if kind == "score":
+                results[node.node_id] = score_result(node, ids[asked], values,
+                                                     priors, cost, suffix_tokens)
+            elif kind == "label":
                 labels = SetLabels(
                     np.asarray(node.spec.labels, dtype=object)[values.argmax(-1)],
-                    values, suffix_tokens=group.suffix_tokens[
-                        members.index(node)], **cost)
-                priors = [value for port, value in zip(
-                    node.inputs, _node_inputs(node, results, inputs).values())
-                    if port.value_type is ValueType.ROWS]
+                    values, suffix_tokens=suffix_tokens, **cost)
                 results[node.node_id] = classify_result(node, ids[asked], labels,
                                                         priors)
             else:
@@ -204,8 +212,8 @@ def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
                     len(node.spec.prompt_token_parts[0]),
                     state_tails(state).encoder.token_bytes())
                 results[node.node_id] = read_result(node, ids[asked], SetReads(
-                    answers, characters, list(found), suffix_tokens=group.suffix_tokens[
-                        members.index(node)], **cost))
+                    answers, characters, list(found), suffix_tokens=suffix_tokens,
+                    **cost))
             kept = asked
             continue
         if kind == "condition":

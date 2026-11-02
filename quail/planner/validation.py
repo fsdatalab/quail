@@ -302,14 +302,14 @@ def attention_device_refusal(model, device):
     )
 
 
-def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
+def set_attention_refusal(operators, model) -> Refusal | None:
     """Check whether a set-attention model can run the query's AI operators.
 
     Such a model reads one document and its questions in one pass.
-    Quail packs a table's AI filters and classifications into passes,
-    and a join's partner tuples, and the pairs it keeps for a
-    classification, into passes over each anchor; an AI.SCORE over two
-    tables and a score beside AI filters on one table are refused.
+    Quail packs a table's AI filters, classifications, extractions, and
+    scores into passes, and a join's partner tuples, and the pairs it
+    keeps for a classification, into passes over each anchor; an
+    AI.SCORE over two tables is refused.
     """
     if model.attention_mask != "set":
         return None
@@ -318,13 +318,6 @@ def set_attention_refusal(operators, scored: bool, model) -> Refusal | None:
             f"{model.name!r} answers a join's partners as questions, but "
             f"Quail does not score them yet, so AI.SCORE reads one table",
             "unsupported_set_attention_query")
-    for alias, predicates in operators.filters.items():
-        if scored and predicates:
-            return _refusal(
-                f"{model.name!r} packs AI filters into passes, but not an "
-                f"AI.SCORE beside them, so table {alias!r} takes AI filters "
-                f"or a score",
-                "unsupported_set_attention_query")
     return None
 
 
@@ -332,7 +325,7 @@ def validate_query(plan, operators, context, model, device, gpus):
     """Return a refusal for unsupported inference or hardware requirements."""
     labels = operators.labels
     scored = has_score(plan)
-    refusal = set_attention_refusal(operators, scored, model)
+    refusal = set_attention_refusal(operators, model)
     if refusal is not None:
         return refusal
     if operators.sae_features or (

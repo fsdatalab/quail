@@ -278,3 +278,59 @@ def test_a_label_packed_with_a_filter_answers_only_the_rows_the_filter_keeps(
     assert labels.column("mood").to_pylist() == ["happy", "sad"]
     assert (results["f"].metrics.fresh_tokens, results["c"].metrics.fresh_tokens) \
         == (100, 0)
+
+
+def test_a_score_packed_with_a_label_reads_its_answers_for_every_row(
+        monkeypatch):
+    from quail.backends.quail.executor import pipeline
+    from quail.backends.quail.executor.pass_groups import GroupAnswers
+    from quail.physical import AiClassify, AiScore, ClassifySpec, ScoreSpec
+
+    score = ScoreSpec(query_template="", arguments=(), expected_rows=3,
+                      estimated_seconds=0.0, name="fun", aliases=("r",),
+                      prompt_token_parts=((), ()), state_tail_tokens=1)
+    label = ClassifySpec(query_template="", arguments=(), expected_rows=3,
+                         estimated_seconds=0.0, name="mood", aliases=("r",),
+                         labels=("happy", "sad"), prompt_token_parts=((), ()),
+                         scoring="set_choice", label_token_ids=((5,), (6,)))
+    nodes = (AiScore(node_id="s", spec=score, pass_group=0),
+             AiClassify(node_id="c", spec=label, pass_group=0))
+
+    def one_pass(state, questions, prefixes, **_):
+        assert [question.kind for question in questions] == ["score", "choice"]
+        return GroupAnswers(np.arange(3), [
+            np.array([0.9, 0.2, 0.3]),
+            np.array([[0.9, 0.1], [0.2, 0.8], [0.6, 0.4]])], [3, 3], tokens=100)
+
+    monkeypatch.setattr(pipeline, "run_pass_group", one_pass)
+    state = SimpleNamespace(loaded_model=SimpleNamespace(model_spec=D1_2B_BF16))
+
+    results = pipeline.execute_set_steps(state, nodes, [10, 11, 12], [[0]] * 3)
+
+    scored = results["s"].outputs["rows:r"]
+    assert scored.ids["r"].to_pylist() == [10, 11, 12]
+    assert scored.column("fun").to_pylist() == pytest.approx([0.9, 0.2, 0.3])
+    assert results["c"].outputs["rows:r"].column("mood").to_pylist() \
+        == ["happy", "sad", "happy"]
+    assert (results["s"].metrics.fresh_tokens, results["c"].metrics.fresh_tokens) \
+        == (100, 0)
+
+
+def test_a_mixed_pass_reads_a_score_as_the_sigmoid_of_its_margin():
+    from quail.backends.quail.executor.pass_groups import (
+        SetQuestion,
+        _decode,
+        _layout,
+    )
+
+    questions = [SetQuestion("yes_no", (), (), (1,), ()),
+                 SetQuestion("score", (), (), (2,), ())]
+    kinds, places, width, _ = _layout(questions, [0, 1], [7], [8], [7, 8])
+    # two documents, one code row per question: logits of yes then no
+    values = np.array([[3.0, 1.0, 2.0, 0.0], [0.0, 1.0, 0.0, 2.0]])
+
+    margins, scores = _decode(values, places, width, 2, 2.0)
+
+    assert kinds == ["code", "code"]
+    assert margins.tolist() == [2.0, -1.0]
+    assert scores == pytest.approx(1 / (1 + np.exp(-np.array([1.0, -1.0]))))

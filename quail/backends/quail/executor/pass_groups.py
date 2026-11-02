@@ -1,8 +1,9 @@
 """One set-attention pass group: questions of any kind asked of each document.
 
 A pass group (PackSetPasses) is the operators whose questions share a
-pass over each document: AI filters (yes/no), classifications (option
-codes), and extractions (pointer reads). run_pass_group asks them all
+pass over each document: AI filters (yes/no), scores (yes/no, read as
+a probability), classifications (option codes), and extractions
+(pointer reads). run_pass_group asks them all
 in one pass per document and decodes the answers for every document
 at once.
 """
@@ -16,7 +17,7 @@ from quail.backends.quail.executor.parts import gpu_seconds, input_staging
 from quail.backends.quail.executor.readout import AsyncPassReadout
 from quail.backends.quail.executor.set_passes import group_passes, state_tails
 from quail.backends.quail.executor.stages import Stage, run_stages
-from quail.physical import AiFilter, ClassifySpec, ExtractSpec
+from quail.physical import AiFilter, ClassifySpec, ExtractSpec, ScoreSpec
 
 
 @dataclass(frozen=True)
@@ -24,8 +25,8 @@ class SetQuestion:
     """One operator's question in a pass group.
 
     Attributes:
-        kind: "yes_no" for an AI filter, "choice" for a classification,
-            or "read" for an extraction.
+        kind: "yes_no" for an AI filter, "score" for a score, "choice"
+            for a classification, or "read" for an extraction.
         head: The prompt tokens before each document.
         state_tail: The tokens a pass reads after the document.
         tokens: The question's tokens after the state tail.
@@ -44,7 +45,7 @@ class SetQuestion:
 
 
 def node_question(node) -> SetQuestion:
-    """The question an AiFilter, or the spec of a classification or extraction, asks."""
+    """The question an AiFilter, or a score, classification, or extraction, asks."""
     if isinstance(node, AiFilter):
         cut, ids = node.state_tail_tokens, tuple(node.question_token_ids)
         return SetQuestion("yes_no", tuple(node.document_head), ids[:cut],
@@ -56,6 +57,9 @@ def node_question(node) -> SetQuestion:
         return SetQuestion("choice", head, tail[:cut], tail[cut:],
                            tuple(spec.question_header_token_ids),
                            spellings=tuple(spec.label_token_ids))
+    if isinstance(spec, ScoreSpec):
+        return SetQuestion("score", head, tail[:cut], tail[cut:],
+                           tuple(spec.question_header_token_ids))
     if isinstance(spec, ExtractSpec):
         return SetQuestion("read", head, tail[:cut], tail[cut:],
                            tuple(spec.question_header_token_ids),
@@ -71,10 +75,11 @@ class GroupAnswers:
         positions: The answered documents, as positions in the documents
             asked, in order.
         answers: Per question: a yes/no question's yes-minus-no margins
-            (documents,); a choice's option probabilities (documents,
-            options); a read's first row, last row, and raw P(found)
-            (documents, 3), its rows counted from the document's first
-            token plus one, 0 for nothing.
+            (documents,); a score's probabilities (documents,); a
+            choice's option probabilities (documents, options); a read's
+            first row, last row, and raw P(found) (documents, 3), its rows
+            counted from the document's first token plus one, 0 for
+            nothing.
         suffix_tokens: Per question, its tokens summed over the answered
             documents.
         tokens: The fresh tokens of the group's passes.
@@ -132,8 +137,8 @@ def _layout(questions, members, yes, no, targets):
             read += 1
             continue
         kinds.append("code")
-        if question.kind == "yes_no":
-            places.append(("yes_no", code, [column[t] for t in yes],
+        if question.kind in ("yes_no", "score"):
+            places.append((question.kind, code, [column[t] for t in yes],
                            [column[t] for t in no]))
         else:
             places.append(("choice", code,
@@ -151,9 +156,12 @@ def _decode(values, places, code_width, width, temperature):
     for place in places:
         if place[0] == "read":
             out.append(spans[:, place[1]])
-        elif place[0] == "yes_no":
-            _, slot, yes, no = place
-            out.append(code[:, slot, yes].max(-1) - code[:, slot, no].max(-1))
+        elif place[0] in ("yes_no", "score"):
+            kind, slot, yes, no = place
+            margin = code[:, slot, yes].max(-1) - code[:, slot, no].max(-1)
+            # AsyncScores' probability: the margin over the temperature
+            out.append(margin if kind == "yes_no"
+                       else 1 / (1 + np.exp(-margin / temperature)))
         else:
             _, slot, matrix = place
             out.append(option_probabilities(code[:, slot], matrix, temperature))
@@ -198,7 +206,7 @@ def run_pass_group(state, questions, prefixes, *, limit=None, stop_groups=None,
     yes = [rows.allowed[i] for i in rows.true_cols.tolist()]
     no = [rows.allowed[i] for i in rows.false_cols.tolist()]
     targets = sorted({token for q in questions if q.kind != "read"
-                      for token in (yes + no if q.kind == "yes_no"
+                      for token in (yes + no if q.kind in ("yes_no", "score")
                                     else [t for ids in q.spellings for t in ids])})
     model_spec = state.loaded_model.model_spec
     torch = state.torch
