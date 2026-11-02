@@ -21,6 +21,7 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | Qwen3.8 27B | `"qwen3.8-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
 | LFM2 2.6B | `"lfm2-2.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
 | d1-2B | `"d1-2b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
+| d1-2B, FP8 weights | `"d1-2b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | Qwen3.5 2B Base with Qwen-Scope SAE | `"qwen3.5-2b-sae-bf16"` | BF16 | `AI.SAE_FEATURES` |
 
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
@@ -32,6 +33,7 @@ Caveats for d1-2B:
 - `AI.SCORE` over one table only.
 - Joins cost more tokens than on Qwen3.
 - Answers can shift when questions share a pass.
+- `"d1-2b-fp8"` is quantized by Quail at load, not by Liquid; check its answers.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a
