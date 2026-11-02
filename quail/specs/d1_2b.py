@@ -1,5 +1,3 @@
-from dataclasses import replace
-
 from .base import ModelSpec
 
 # Every other layer is a short convolution; the attention layers
@@ -69,17 +67,4 @@ D1_2B_BF16 = ModelSpec(
     turn_suffix="<|im_end|>\n<|im_start|>assistant\n<think></think>",
     prompt_layout="d1",
     prompt_format="d1-v1",
-)
-
-# d1-2B with its linear weights quantized to fp8 as they load, in 128 x
-# 128 blocks; activations are quantized per row in groups of 128. Not a
-# checkpoint Liquid trained or published.
-D1_2B_FP8 = replace(
-    D1_2B_BF16,
-    name="d1-2b-fp8",
-    w_bytes=1.0,
-    weight_precision="fp8",
-    w_mem_bytes=1_993_000_000,    # the linear weights in fp8 and their
-    #                               scales, the embedding, norms, and
-    #                               convolution taps in bf16
 )

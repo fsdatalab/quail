@@ -79,9 +79,7 @@ class LoadedGpu:
                                 moe_backend=spec.moe_backend,
                                 text_only=spec.vision_tower,
                                 num_layers=(spec.layers if spec.checkpoint_layers
-                                            else None),
-                                quantize_fp8=(spec.arch == "lfm3"
-                                              and spec.weight_precision == "fp8"))
+                                            else None))
         self.load_model_s = time.perf_counter() - t0
         self.weights_bytes = int(torch.cuda.memory_allocated())
 

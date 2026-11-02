@@ -68,18 +68,6 @@ def test_the_d1_2b_spec_has_the_checkpoints_layer_kinds():
     assert D1_2B_BF16.sliding_layer_set == {4, 8, 12, 16, 20}
 
 
-def test_d1_2b_fp8_is_d1_2b_with_fp8_weights():
-    from dataclasses import fields
-
-    from quail.specs import D1_2B_FP8
-
-    differ = {field.name for field in fields(D1_2B_BF16)
-              if getattr(D1_2B_BF16, field.name) != getattr(D1_2B_FP8, field.name)}
-
-    assert differ == {"name", "w_bytes", "weight_precision", "w_mem_bytes"}
-    assert D1_2B_FP8.weight_precision == "fp8"
-
-
 def test_the_vllm_baseline_refuses_d1_2b():
     engine = SimpleNamespace(label="stock vLLM", kind="vllm")
     backend = RequestBackend(name="stock", engine=engine,

@@ -63,10 +63,6 @@ def rotary_tables(torch, config, layer_type, max_positions, device):
                  for t in (angles.cos(), angles.sin()))
 
 
-# the block of the fp8 weights and activations, as Quail's fp8 GEMM reads them
-FP8_BLOCK = 128
-
-
 class Lfm3Model:
     """The loaded text model: embedding, layers, final norm, and tied head.
 
@@ -92,7 +88,7 @@ class Lfm3Model:
         setattr(self, name, tensor)
 
 
-def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
+def load_lfm3(path, device="cuda", max_positions=None):
     """Load an LFM3 checkpoint's language model onto the GPU in bf16.
 
     The vision tower and projector of an LFM3-VL checkpoint are not
@@ -104,9 +100,6 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
         device: Where the weights go.
         max_positions: Rotary table length; the config's
             max_position_embeddings when None.
-        quantize_fp8: Quantize the linear weights to fp8 in 128 x 128 blocks with
-            float32 scales; the embedding, norms, and convolution taps
-            stay bf16.
 
     Raises:
         ValueError: The checkpoint has a tensor the model does not use,
@@ -142,24 +135,8 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
 
     def linear(*names):
         weights = [take(name) for name in names]
-        weight = weights[0] if len(weights) == 1 else torch.cat(weights)
-        rows = weight.shape[0]
-        if not quantize_fp8:
-            return SimpleNamespace(weight=weight, out_features=rows)
-        from vllm.utils.deep_gemm import (
-            is_deep_gemm_e8m0_used,
-            per_block_cast_to_fp8,
-        )
-        # whole 128-row blocks, so the fp8 GEMM's output columns align;
-        # the padding rows are zero and their columns are dropped
-        padded = -(-rows // FP8_BLOCK) * FP8_BLOCK
-        if padded != rows:
-            weight = torch.cat((weight, weight.new_zeros(padded - rows,
-                                                         weight.shape[1])))
-        quantized, scale = per_block_cast_to_fp8(
-            weight, [FP8_BLOCK, FP8_BLOCK], use_ue8m0=is_deep_gemm_e8m0_used())
-        return SimpleNamespace(weight=quantized, weight_scale_inv=scale,
-                               out_features=rows)
+        return SimpleNamespace(
+            weight=weights[0] if len(weights) == 1 else torch.cat(weights))
 
     layers = []
     for index, kind in enumerate(config["layer_types"]):
@@ -245,8 +222,7 @@ class Lfm3Pipeline(ModelPipeline):
         self.head_dim = spec.d_head
         self.engine = engine_class(
             arena, num_q_heads=spec.num_q_heads, num_kv_heads=spec.num_kv_heads,
-            head_dim=spec.d_head, rotary=None,
-            fp8=spec.weight_precision == "fp8")
+            head_dim=spec.d_head, rotary=None, fp8=False)
         # per attention layer kind, its [cos | sin] table, as the fused
         # q/k norm and rotary kernel reads it
         self.cos_sin = {kind: self.engine.torch.cat(tables, -1).contiguous()
@@ -265,11 +241,7 @@ class Lfm3Pipeline(ModelPipeline):
                 attention.o_proj, conv.w13, conv.w2)
 
     def _linear(self, x, module):
-        if not self.engine.is_fp8:
-            return self.engine.gemm(x, None, module)
-        q, scale = self.engine.quant(x)
-        out = self.engine.gemm(q, scale, module)
-        return out[:, :module.out_features]
+        return self.engine.gemm(x, None, module)
 
     def _norm(self, x, norm):
         return self.engine.norm_rows(x, norm.weight, norm.variance_epsilon)

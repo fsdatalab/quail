@@ -21,15 +21,12 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | Qwen3.8 27B | `"qwen3.8-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
 | LFM2 2.6B | `"lfm2-2.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
 | d1-2B | `"d1-2b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
-| d1-2B, FP8 weights | `"d1-2b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | Qwen3.5 2B Base with Qwen-Scope SAE | `"qwen3.5-2b-sae-bf16"` | BF16 | `AI.SAE_FEATURES` |
 
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
 format. All listed models store KV in BF16.
 
-d1-2B is Liquid's decision model. `"d1-2b-fp8"` is the same checkpoint
-with its linear weights quantized to FP8 as Quail loads it; Liquid did
-not train or publish it in FP8, so check its answers on your data. Quail asks it in its own yes/no
+d1-2B is Liquid's decision model. Quail asks it in its own yes/no
 format and runs it with the set attention that Liquid trained it
 with: a document is read again in every pass. Quail puts up to 16 AI
 filters on one table into one pass, or splits them into stages when a
