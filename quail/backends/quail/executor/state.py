@@ -40,9 +40,6 @@ class LoadedModelState:
     vocabulary: Vocabulary | None = None
     # the SAE encoder AI.SAE_FEATURES reads, loaded on first use
     sae: Any = None
-    # a set-attention model's document ends joined with the state tail,
-    # its tokenizer loaded on first use
-    state_tails: Any = None
 
 
 @dataclass

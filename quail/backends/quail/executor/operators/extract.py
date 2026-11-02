@@ -39,11 +39,6 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
         TypeError: A node is not an extraction.
         ValueError: The table's text was not loaded.
     """
-    if state.loaded_model.pipeline.whole_sequences:
-        from quail.backends.quail.executor.operators.set_extract import (
-            execute_set_extractions,
-        )
-        return execute_set_extractions(state, nodes, inputs)
 
     def build():
         part = ExtractPart(state, nodes, inputs["document_ids"], inputs)

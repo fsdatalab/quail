@@ -122,6 +122,10 @@ class AiFilter(PhysicalNode):
     # question of a pass
     state_tail_tokens: int = 0
     question_header_token_ids: tuple[Token, ...] = ()
+    # under set attention: per table and the tokens after its documents,
+    # each last token joined with them as the tokenizer reads them
+    # (JoinDocumentEnds), as (alias, tail, ((last, tokens), ...))
+    document_ends: tuple = ()
 
     type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name

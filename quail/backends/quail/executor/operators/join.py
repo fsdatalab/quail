@@ -15,10 +15,11 @@ from quail.backends.quail.executor.parts import (
     stage_spans,
 )
 from quail.backends.quail.executor.readout import AsyncSlotMargins
-from quail.backends.quail.executor.set_passes import split_passes, state_tails
+from quail.backends.quail.executor.set_passes import split_passes
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, join_settlement
+from quail.catalog.document_ends import ends_for, joined_state
 from quail.catalog.pairs import (
     RowGroups,
     allowed_members,
@@ -49,8 +50,6 @@ class JoinPart(ExecutionPart):
         """Run prepared join predicates through the shared document scheduler."""
         state.gpu_timing = bool(inputs.get("gpu_timing", False))
         part = cls(state, nodes, inputs, inputs["anchor_ids"])
-        if state.loaded_model.pipeline.whole_sequences:
-            return execute_set_joins(state, part)
         prefixes = inputs["prefixes"]
         return execute_parts(
             state, [part], prefixes, inputs["anchor_keys"],
@@ -225,6 +224,9 @@ class JoinQuestions:
             each partner document.
         frame_token_ids: The state tail after the anchor document.
         question_header_token_ids: The tokens that open a later question.
+        anchor: The anchor alias.
+        document_ends: The plan's document ends (JoinDocumentEnds) for
+            the anchor's frame and each partner's separator.
     """
 
     partners: tuple
@@ -233,9 +235,11 @@ class JoinQuestions:
     separator_tokens: int
     frame_token_ids: tuple
     question_header_token_ids: tuple
+    anchor: str = ""
+    document_ends: tuple = ()
 
 
-def set_join_questions(node, documents, tails) -> list:
+def set_join_questions(node, documents) -> list:
     """Each partner tuple's question tokens, in member order.
 
     A question is every partner's label and document, each document
@@ -246,14 +250,16 @@ def set_join_questions(node, documents, tails) -> list:
         node: The AiJoin.
         documents: alias -> the partner documents' token ids, by local
             position.
-        tails: The model's StateTails.
     """
     labels = dict(node.label_token_ids)
     tail = list(node.tail_token_ids)
     separator, rest = tail[:node.separator_tokens], tail[node.separator_tokens:]
-    blocks = {alias: [list(labels[alias]) + tails.prefix(document, separator)
-                      for document in documents[alias]]
-              for alias in node.partners}
+    blocks = {}
+    for alias in node.partners:
+        ends = ends_for(node.document_ends, alias, separator)
+        blocks[alias] = [list(labels[alias])
+                         + list(joined_state(document, separator, ends))
+                         for document in documents[alias]]
     questions = []
     for positions in itertools.product(
             *(range(len(blocks[alias])) for alias in node.partners)):
@@ -264,8 +270,8 @@ def set_join_questions(node, documents, tails) -> list:
     return questions
 
 
-def join_pass_stage(node, prefixes, anchors, members_of, documents, tails,
-                    readout, set_size: int, budget: int):
+def join_pass_stage(node, prefixes, anchors, members_of, documents, readout,
+                    set_size: int, budget: int):
     """One join's passes over the anchors, as one unpaged stage.
 
     Args:
@@ -275,7 +281,6 @@ def join_pass_stage(node, prefixes, anchors, members_of, documents, tails,
         members_of: Callable(anchor) -> the member indices it asks, or
             None for every member.
         documents: alias -> the partner documents' token ids.
-        tails: The model's StateTails.
         readout: The readout of each question's last row.
         set_size: The most questions in one pass.
         budget: The chunk token budget a pass fits.
@@ -284,17 +289,18 @@ def join_pass_stage(node, prefixes, anchors, members_of, documents, tails,
         The Stage, each pass's state tokens, and each pass's anchor;
         the Stage is None when no anchor asks a member.
     """
-    questions = set_join_questions(node, documents, tails)
+    questions = set_join_questions(node, documents)
     lengths = [len(question) for question in questions]
     header = list(node.question_header_token_ids)
     frame = list(node.frame_token_ids)
+    ends = ends_for(node.document_ends, node.anchor, frame)
     states, suffixes, shapes, owners = [], [], [], []
     for anchor in anchors:
         members = members_of(anchor)
         members = range(len(questions)) if members is None else members
         if not len(members):
             continue
-        prefix = tails.prefix(prefixes[anchor], frame)
+        prefix = joined_state(prefixes[anchor], frame, ends)
         for block in split_passes(len(prefix), members, lengths, len(header),
                                   set_size, budget):
             suffix, shape = [], []
@@ -343,7 +349,6 @@ def execute_set_joins(state, part) -> dict:
         part: The group's JoinPart, which turns the answers into results.
     """
     nodes, inputs = part.nodes, part.inputs
-    tails = state_tails(state)
     readout = AsyncSlotMargins(state.torch, state.answer_rows)
     keys = inputs["anchor_keys"]
     lists_for = inputs.get("anchor_partners")
@@ -355,7 +360,7 @@ def execute_set_joins(state, part) -> dict:
             node, inputs["prefixes"], reached,
             lambda anchor, j=j: (None if lists_for is None
                                  else lists_for(keys[anchor][1], j)),
-            inputs["partner_documents"], tails, readout,
+            inputs["partner_documents"], readout,
             state.loaded_model.model_spec.set_size, state.chunk_tokens)
         rows, tokens = {}, 0
         if stage is not None:

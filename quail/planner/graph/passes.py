@@ -19,6 +19,7 @@ from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
+    AiJoin,
     AiScore,
     Filter,
     PhysicalGraph,
@@ -38,6 +39,35 @@ def packed_kind(node) -> str | None:
     if isinstance(node, AiScore) and node.document_aliases:
         return "score"
     return None
+
+
+def document_tails(node) -> tuple:
+    """The tables a set-attention node reads and the tokens after their documents.
+
+    Returns:
+        Per table and tail, (alias, the prompt head before each document,
+        the tail): a pass's state tail for a packable operator, the frame
+        after each anchor and the separator after each partner for a join
+        or a classification of its pairs; empty for any other node.
+    """
+    if isinstance(node, AiFilter):
+        return ((node.alias, tuple(node.document_head),
+                 tuple(node.question_token_ids[:node.state_tail_tokens])),)
+    if isinstance(node, AiJoin):
+        separator = tuple(node.tail_token_ids[:node.separator_tokens])
+        return ((node.anchor, tuple(node.document_head),
+                 tuple(node.frame_token_ids)),
+                *((partner, (), separator) for partner in node.partners))
+    if isinstance(node, AiClassify) and node.spec.partner is not None:
+        spec = node.spec
+        head, tail = spec.prompt_token_parts
+        return ((spec.anchor, tuple(head), tuple(spec.join_layout[0])),
+                (spec.partner, (), tuple(tail[:spec.separator_tokens])))
+    if packed_kind(node):
+        head, tail = node.spec.prompt_token_parts
+        return ((node.spec.aliases[0], tuple(head),
+                 tuple(tail[:node.spec.state_tail_tokens])),)
+    return ()
 
 
 def expected_documents(node) -> float:

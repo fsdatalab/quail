@@ -8,7 +8,7 @@ Both cells run on one H100 SXM over the 4,995 IMDB-11 reviews at scale
 factor 0.1 and its question. The Liquid cell times
 ``model.system_one_batch`` after ``model.compile()``, at its default
 token budget and at Quail's chunk budget. The Quail cell times
-``set_classify_batch``, the code IMDB-11's classification runs, and one
+``run_pass_group`` for IMDB-11's classification alone, and one
 mixed pass group (a yes/no, a choice, and a read in each review's
 pass), then profiles one more run of each with the torch profiler. It
 prints the CUDA time by kernel and by kind, and the host share: the
@@ -123,7 +123,6 @@ def _quail_state():
     from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows
-    from quail.backends.quail.executor.set_passes import StateTails
     from quail.catalog.tokens import GigatokenEncoder
     from quail.cost import budgets
     from quail.planner.prompt_lowering import answer_ids
@@ -150,7 +149,7 @@ def _quail_state():
                                false_ids),
         loaded_model=SimpleNamespace(
             model=model, arena=arena, pipeline=build_pipeline(spec, model, arena),
-            model_spec=spec, state_tails=StateTails(encoder), input_staging=None))
+            model_spec=spec, input_staging=None))
     return state, encoder
 
 
@@ -185,6 +184,7 @@ def _mixed_questions(encoder, choice):
     from quail.backends.quail.lowering import set_question_parts
     from quail.logical import ColumnRef, bind_prompt
     from quail.logical.prompts import PROMPT_LAYOUTS, bind_extract_prompt
+    from quail.physical import AiClassify
     from quail.planner.prompt_lowering import lower_prompt, read_slot_offsets
     from quail.specs import D1_2B_BF16
 
@@ -206,7 +206,7 @@ def _mixed_questions(encoder, choice):
         "read", tuple(lowered.preamble_token_ids), tail[:cut], tail[cut:],
         tuple(encoder("QUESTION:\n")), slots=read_slot_offsets(
             segments[-1], PROMPT_LAYOUTS[spec.prompt_layout].read_slots, encoder))
-    return [yes_no, node_question(choice), read]
+    return [yes_no, node_question(AiClassify(node_id="label", spec=choice)), read]
 
 
 KINDS = (  # first match wins: substrings of kernel names, lower case
@@ -278,22 +278,27 @@ def quail_profile() -> dict:
     The host share is 1 minus CUDA kernel seconds over wall seconds: the
     part of the run no kernel ran, an upper bound on host overhead.
     """
-    from quail.backends.quail.executor.operators.set_classify import (
-        set_classify_batch,
-    )
+    from dataclasses import replace
+
     from quail.backends.quail.executor.pass_groups import run_pass_group
+    from quail.catalog.document_ends import document_ends
     from quail.catalog.tokens import DocumentPrefixes
 
     state, encoder = _quail_state()
     spec = _classify_spec(encoder)
     documents = {"r": [encoder(review) for review in _reviews()]}
     rows = list(range(len(documents["r"])))
-    questions = _mixed_questions(encoder, spec)
-    prefixes = DocumentPrefixes(questions[0].head, documents["r"], rows)
+    # the plan's joins of the reviews' endings with the state tail
+    first = _mixed_questions(encoder, spec)[0]
+    ends = document_ends(sorted({document[-1] for document in documents["r"]}
+                                | set(first.head[-1:])), first.state_tail, encoder)
+    questions = [replace(question, ends=ends)
+                 for question in _mixed_questions(encoder, spec)]
+    prefixes = DocumentPrefixes(first.head, documents["r"], rows)
     result = dict(
         classify=_profile(
-            "classify", lambda: set_classify_batch(state, spec, rows, documents),
-            len(rows), lambda batch: batch.fresh_tokens),
+            "classify", lambda: run_pass_group(state, questions[1:2], prefixes),
+            len(rows), lambda group: group.tokens),
         mixed=_profile(
             "mixed", lambda: run_pass_group(state, questions, prefixes),
             len(rows), lambda group: group.tokens))

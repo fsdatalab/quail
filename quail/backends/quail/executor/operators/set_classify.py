@@ -12,22 +12,17 @@ from quail.backends.quail.executor.operators.join import (
 )
 from quail.backends.quail.executor.parts import gpu_seconds, input_staging
 from quail.backends.quail.executor.pass_groups import (
-    node_question,
     option_columns,
     option_probabilities,
-    run_pass_group,
 )
 from quail.backends.quail.executor.readout import AsyncPassReadout
-from quail.backends.quail.executor.set_passes import state_tails
 from quail.backends.quail.executor.stages import run_stages
 from quail.backends.quail.reranker import (
-    RerankerBatch,
     classify_outputs,
     probability_column,
     score_rows,
     scored_batch,
 )
-from quail.catalog.tokens import DocumentPrefixes
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.progress import answer_sink
@@ -53,26 +48,6 @@ class SetLabels:
     gpu_s: float = 0.0
     chunks: int = 0
     suffix_tokens: int = 0
-
-
-def set_classify_batch(state, spec, rows, documents) -> RerankerBatch:
-    """One classification's RerankerBatch under set attention, one pass a row."""
-    question = node_question(spec)
-    (alias,) = spec.aliases
-    group = run_pass_group(
-        state, [question], DocumentPrefixes(question.head, documents[alias], rows),
-        label=f"classify {spec.name}")
-    labels = np.full(len(rows), None, dtype=object)
-    probabilities = np.full((len(rows), len(spec.labels)), np.nan)
-    (answer,) = group.answers
-    probabilities[group.positions] = answer
-    labels[group.positions] = np.asarray(spec.labels, dtype=object)[
-        answer.argmax(-1)]
-    return RerankerBatch(
-        labels, fresh_tokens=group.tokens, cached_tokens=0,
-        suffix_tokens=group.suffix_tokens[0], gpu_s=group.gpu_s,
-        chunks=group.chunks,
-        probabilities=probabilities if spec.probabilities else None)
 
 
 def classify_result(node, ids, labels: SetLabels, priors) -> NodeResult:
@@ -165,13 +140,14 @@ def joined_label_passes(state, node, join) -> NodeResult:
         label_token_ids=((spec.partner, spec.join_layout[1]),),
         tail_token_ids=tuple(tail), separator_tokens=spec.separator_tokens,
         frame_token_ids=spec.join_layout[0],
-        question_header_token_ids=spec.question_header_token_ids)
+        question_header_token_ids=spec.question_header_token_ids,
+        anchor=spec.anchor, document_ends=node.document_ends)
     targets = sorted({token for ids in spec.label_token_ids for token in ids})
     torch = state.torch
     model_spec = state.loaded_model.model_spec
     stage, states, owners = join_pass_stage(
         questions, join.inputs["prefixes"], sorted(kept), kept.get,
-        join.inputs["partner_documents"], state_tails(state),
+        join.inputs["partner_documents"],
         AsyncPassReadout(torch, torch.nn.functional,
                          full_output_head(state.loaded_model.model), targets, None),
         model_spec.set_size, state.chunk_tokens)
