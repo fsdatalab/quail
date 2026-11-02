@@ -178,7 +178,7 @@ def extend_streams(streams: list, vocabulary: Vocabulary) -> None:
         window = stream.window()
         if window[0]:
             pending.append((stream, window))
-    encoded = vocabulary.encode_batch([window[0] for _, window in pending])
+    encoded = vocabulary.tokenizer.encode_batch([window[0] for _, window in pending])
     for (stream, window), tokens in zip(pending, encoded):
         stream.append_window(window, tokens)
 

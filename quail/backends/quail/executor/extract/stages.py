@@ -71,7 +71,7 @@ class ExtractionInputs:
                  for text in (texts[position] for position in positions)]
         stored = [None if documents is None else documents[document_id]
                   for document_id in positions]
-        encoded = vocabulary.document_batch(shown, stored)
+        encoded = vocabulary.tokenizer.document_batch(shown, stored)
         self.documents = [self._prepare(index, document_id, text, tokens, prior)
                      for index, (document_id, text, tokens, prior) in enumerate(
                          zip(document_ids, shown, encoded, stored))]

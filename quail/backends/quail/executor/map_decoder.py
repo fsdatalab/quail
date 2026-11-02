@@ -121,7 +121,7 @@ class MapDecoder:
         from quail.backends.quail.executor.readout import AsyncTopLogprobs
         from quail.cost.draft_policy import LIVE_BUCKETS
 
-        key = specs[0].top_tokens, tuple(documents.vocabulary.stop_ids)
+        key = specs[0].top_tokens, tuple(documents.vocabulary.tokenizer.stop_ids)
         if key not in self.copy_readouts:
             self.copy_readouts[key] = (AsyncTopLogprobs(
                 self.torch, self.torch.nn.functional, self.head, key[0], [key[1]]), [])
@@ -640,13 +640,12 @@ class MapDecoder:
 
 def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapDecoder:
     """Return a decoder for a pipeline's maps on the loaded model."""
-    from quail.backends.quail.executor.extract import load_vocabulary
     from quail.backends.quail.executor.model_loading import full_output_head
     from quail.cost.budgets import copy_verification_workspace_bytes
 
     return MapDecoder(
         state.torch, full_output_head(state.loaded_model.model), num_documents,
-        limits, load_vocabulary(state).stop_ids,
+        limits, state.loaded_model.tokenizer.stop_ids,
         state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens,
         workspace_bytes=copy_verification_workspace_bytes(
             state.loaded_model.model_spec, state.chunk_tokens))

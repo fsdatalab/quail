@@ -37,13 +37,25 @@ class QuailModelExecution:
         return self._query
 
     def bind_loaded_model(self, *, model, arena, pipeline,
-                          decision_head=None) -> None:
-        """Attach the loaded model and discard the previous model's caches."""
+                          decision_head=None, tokenizer=None) -> None:
+        """Attach the loaded model and discard the previous model's caches.
+
+        Args:
+            model: The loaded model.
+            arena: Its KV arena.
+            pipeline: Its forward pass pipeline.
+            decision_head: A decision model's option-scoring head.
+            tokenizer: The model's ModelTokenizer, for a model that runs
+                AI.MAP and AI.EXTRACT; the word index is built from it here.
+        """
+        from quail.backends.quail.executor.extract import Vocabulary
+
         self.close()
         self.loaded_model = LoadedModelState(
             model=model, arena=arena, pipeline=pipeline,
             model_spec=self.context.model,
-            decision_head=decision_head)
+            decision_head=decision_head, tokenizer=tokenizer,
+            vocabulary=None if tokenizer is None else Vocabulary(tokenizer))
 
     def close(self) -> None:
         """Drop every reference to the loaded model so its memory can go."""

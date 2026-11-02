@@ -39,9 +39,9 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
         first_window_chars=1,
         window_chars=8,
     )
-    extra_stop = vocabulary.encode_ids("none")[0]
-    vocabulary.stop_ids = (*vocabulary.stop_ids, extra_stop)
-    vocabulary.is_stop[extra_stop] = True
+    extra_stop = vocabulary.tokenizer.encode_ids("none")[0]
+    vocabulary.tokenizer.stop_ids = (*vocabulary.tokenizer.stop_ids, extra_stop)
+    vocabulary.tokenizer.is_stop[extra_stop] = True
     state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
     documents = ExtractionInputs(
         state, [spec] * num_questions, vocabulary, [0], None, [text]
@@ -49,16 +49,17 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
     size = len(vocabulary.vocab)
     head = torch.eye(size, dtype=dtype)
     logits = torch.full((num_questions, 20, size), -10.0, dtype=dtype)
-    first = vocabulary.encode_ids("five")[0]
-    alternate = vocabulary.encode_ids(" five")[0]
-    continuations = [vocabulary.encode_ids(word)[0] for word in (" years", " days")]
+    first = vocabulary.tokenizer.encode_ids("five")[0]
+    alternate = vocabulary.tokenizer.encode_ids(" five")[0]
+    continuations = [vocabulary.tokenizer.encode_ids(word)[0]
+                     for word in (" years", " days")]
     logits[:, 0, [first, alternate]] = 2
     for q in range(num_questions):
         logits[q, 1, continuations[q % 2]] = 2 + q / 64
-    logits[:, 2:, vocabulary.stop_ids[0]] = 1
+    logits[:, 2:, vocabulary.tokenizer.stop_ids[0]] = 1
     logits[:, 2:, extra_stop] = 0
     readout = AsyncTopLogprobs(
-        torch, torch.nn.functional, head, 4, [vocabulary.stop_ids]
+        torch, torch.nn.functional, head, 4, [vocabulary.tokenizer.stop_ids]
     )
     old_path, new_path = tmp_path / "old.jsonl", tmp_path / "new.jsonl"
     monkeypatch.setenv("QUAIL_EXTRACT_TRACE", str(old_path))
@@ -75,7 +76,7 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
     monkeypatch.setenv("QUAIL_EXTRACT_TRACE", str(new_path))
     decoder = MapDecoder(
         events_torch(0), head, num_questions, [12] * num_questions,
-        vocabulary.stop_ids, 16,
+        vocabulary.tokenizer.stop_ids, 16,
         workspace_bytes=64 * 2**20,
     )
     slots = np.arange(num_questions)
@@ -128,7 +129,7 @@ def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
     documents = inputs(spec, vocabulary, [text])
     size = len(vocabulary.vocab)
     decoder = MapDecoder(
-        events_torch(3), torch.eye(size), 1, [8], vocabulary.stop_ids, 16,
+        events_torch(3), torch.eye(size), 1, [8], vocabulary.tokenizer.stop_ids, 16,
         workspace_bytes=64 * 2**20,
     )
     decoder.configure_copy(0, np.array([[0]]), documents, [spec])
@@ -139,7 +140,7 @@ def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
         return values
 
     first, years, longer = [
-        vocabulary.encode_ids(word)[0] for word in ("five", " years", " long")
+        vocabulary.tokenizer.encode_ids(word)[0] for word in ("five", " years", " long")
     ]
     decoder.start(0, 0, 0, [0, 1])
     decoder.submit(logits(first), [0], [0], None)
@@ -168,7 +169,7 @@ def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
             input_ids=torch.empty(len(rows), dtype=torch.int64),
         )
     )
-    decoder.submit(logits(vocabulary.stop_ids[0], len(rows)), [], [], rows)
+    decoder.submit(logits(vocabulary.tokenizer.stop_ids[0], len(rows)), [], [], rows)
     decoder.harvest(wait=True)
     assert decoder.answers(0, [0])[0].tolist() == [first, years, longer]
     start = text.index("five years")
