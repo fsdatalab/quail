@@ -14,7 +14,6 @@ from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
-from quail.backends.quail.executor.extract import load_vocabulary
 from quail.backends.quail.executor.model_loading import load_model
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import (
@@ -25,6 +24,7 @@ from quail.backends.quail.executor.readout import (
     DecisionHead,
 )
 from quail.backends.quail.executor.state import GpuRuntime
+from quail.backends.quail.executor.tokenizer import ModelTokenizer
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
     execute_single_graph,
@@ -120,10 +120,14 @@ class LoadedGpu:
             self.pipeline, spec, device)
         self.pipeline_s = time.perf_counter() - t0
 
+        tokenizer = None
+        if spec.role not in ("reranker", "decision"):
+            say(f"loading the tokenizer of {spec.name} for AI.MAP and AI.EXTRACT")
+            tokenizer = ModelTokenizer.load(spec, model_path)
         self.execution = backend.start(context)
         self.execution.bind_loaded_model(
             model=self.model, arena=self.arena, pipeline=self.pipeline,
-            decision_head=self.decision_head)
+            decision_head=self.decision_head, tokenizer=tokenizer)
 
         self.async_ans = None
         self.chunk_tokens = None
@@ -180,10 +184,6 @@ class LoadedGpu:
                                     model_name=self.spec.hf_name,
                                     model=self.model)
                 tier = warm["tier"]
-                if self.spec.role not in ("reranker", "decision"):
-                    # AI.EXTRACT and AI.MAP read the tokenizer; loading it is
-                    # startup, and the first AI.EXTRACT builds its word index
-                    load_vocabulary(self.execution)
             graphs = self.pipeline.piecewise_graphs
             if graphs is not None and graphs.prepare():
                 tier = tier or "graphs"

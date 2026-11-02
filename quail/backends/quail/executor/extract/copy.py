@@ -166,8 +166,8 @@ class CopyConstraint:
         self.changed = np.zeros(len(self.characters), dtype=bool)
         self.position_rows_device = self.tensor(self.position_rows.copy())
         self.characters_device = self.tensor(self.characters)
-        self.is_stop = self.tensor(vocabulary.is_stop)
-        self.stop_ids = self.tensor(vocabulary.stop_ids)
+        self.is_stop = self.tensor(vocabulary.tokenizer.is_stop)
+        self.stop_ids = self.tensor(vocabulary.tokenizer.stop_ids)
 
     def _prepare_fillers(self, documents, tokens):
         width = len(self.vocabulary.vocab)
@@ -369,7 +369,7 @@ class CopyConstraint:
             documents, self.window_ends[positions], sizes)
         self.window_started[positions] = True
         self.window_ends[positions] = cuts
-        tokens, offsets, boundaries = self.vocabulary.encode_packed(text)
+        tokens, offsets, boundaries = self.vocabulary.tokenizer.encode_packed(text)
         counts = np.diff(boundaries)
         owner = np.repeat(np.arange(len(positions)), counts)
         columns = (np.arange(len(tokens)) - np.repeat(boundaries[:-1], counts)
