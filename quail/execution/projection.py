@@ -13,7 +13,6 @@ from quail.execution.result import (
     true_answer_rows,
 )
 from quail.logical import (
-    PROBABILITIES_SUFFIX,
     CompileError,
 )
 from quail.logical.expressions import (
@@ -35,20 +34,17 @@ def projection_for(logical, token_inputs, documents):
         for column in (*logical.projection.columns,
                        *(key.expression for key in logical.result.order))
         if column_references(column)}
-    model_calls = {node.name: node.call
-                   for node in (*operators.classifies, *operators.extracts,
-                                *operators.sae_features, *operators.maps)}
-    model_calls.update({node.span_name: node.call for node in operators.extracts})
-    # a classification's probability map belongs to the same documents
-    # as its label, but holds a map, not a label
-    probability_columns = {node.name + PROBABILITIES_SUFFIX
-                           for node in operators.classifies}
-    model_calls.update({node.name + PROBABILITIES_SUFFIX: node.call
-                        for node in operators.classifies})
-    model_calls.update({column.name: call for column in logical.projection.columns
-                        if (call := aliased_call(column, "label", "extract",
-                                                 "score", "features", "map"))
-                        is not None})
+    # each column a model call adds, with whether it is the call's answer:
+    # a label beside its probability map, an extracted answer beside its span
+    model_columns = {column: (node.call, column == node.name)
+                     for node in (*operators.classifies, *operators.extracts,
+                                  *operators.sae_features, *operators.maps)
+                     for column in node.added_columns}
+    model_columns.update({column.name: (call, True)
+                          for column in logical.projection.columns
+                          if (call := aliased_call(column, "label", "extract",
+                                                   "score", "features", "map"))
+                          is not None})
 
     def project(node, value, labels=None):
         if not isinstance(node, Project):
@@ -75,7 +71,7 @@ def projection_for(logical, token_inputs, documents):
                 continue
             table = next((table for table in (labels or {}).values()
                           if name in table.column_names), None)
-            call = model_calls.get(name)
+            call, is_answer = model_columns.get(name, (None, False))
             aliases = () if call is None else call.aliases()
             if table is not None and len(aliases) == 2:
                 # a label of joined rows: each result row looks its
@@ -126,8 +122,7 @@ def projection_for(logical, token_inputs, documents):
                 widened = pc.take(
                     pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
                     pa.array(slots))
-                if (call is not None and call.kind == "label"
-                        and name not in probability_columns):
+                if call is not None and call.kind == "label" and is_answer:
                     order = pa.array(call.labels, pa.string())
                     values = pa.DictionaryArray.from_arrays(
                         pc.index_in(widened, order).cast(pa.int32()),
