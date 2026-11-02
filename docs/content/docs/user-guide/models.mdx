@@ -27,23 +27,19 @@ Set `model` to the model you want to run and `device` to your GPU type.
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
 format. All listed models store KV in BF16.
 
-d1-2B is Liquid's decision model. `"d1-2b-fp8"` is the same checkpoint
-with its linear weights quantized to FP8 as Quail loads it; Liquid did
-not train or publish it in FP8, so check its answers on your data. Quail asks it in its own yes/no
-format and runs it with the set attention that Liquid trained it
-with: a document is read again in every pass. Quail puts up to 16 AI
-filters on one table into one pass, or splits them into stages when a
-filter is expected to remove most rows. In a join, the table with the
-cheaper plan, usually the one with longer documents, is the state, and
-each row of the other table is one question, up to 16 in a pass. Each
-document is labeled with its table's name, such as "reviews record", and
-the question names the documents the same way. `AI.CLASSIFY` lists
-the labels by option code (A, B, and so on), and the classifications
-on one table share passes. `AI.EXTRACT` returns one span of the
-document, up to 512 tokens, that the model points to, or nothing; the
-extractions on one table share passes too. d1-2B does not write text,
-so it does not run `AI.MAP`. Quail does not yet run `AI.SCORE` over
-two tables, or `AI.SCORE` beside AI filters on one table, on d1-2B.
+d1-2B is Liquid's decision model. It reads each document again for
+every pass of up to 16 questions, and keeps no KV between passes.
+
+- d1-2B does not write text, so it does not run `AI.MAP`.
+- `AI.SCORE` reads one table on d1-2B; a score over two tables is
+  refused.
+- An AI join reads each anchor document again for every 16 partners,
+  so joins cost more tokens on d1-2B than on Qwen3.
+- An answer can differ depending on whether its question is asked
+  alone or in a pass with other questions.
+- `"d1-2b-fp8"` is the same checkpoint with its linear weights
+  quantized to FP8 as Quail loads it. Liquid did not train or publish
+  it in FP8, so check its answers on your data.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a
