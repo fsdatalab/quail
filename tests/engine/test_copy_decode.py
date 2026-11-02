@@ -53,13 +53,13 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
     num_tokens = len(vocabulary.vocab)
     logits = rng.normal(-8, 1, (num_questions, num_documents, 16, num_tokens))
     # Force repeated starts, alternate continuations, stops, and absent words.
-    pool = vocabulary.encode_ids(pool_text)
+    pool = vocabulary.tokenizer.encode_ids(pool_text)
     for q in range(num_questions):
         for document in range(num_documents):
             for at in range(16):
                 token = int(rng.choice(pool))
                 if at > rng.integers(1, 7):
-                    token = vocabulary.stop_ids[0]
+                    token = vocabulary.tokenizer.stop_ids[0]
                 logits[q, document, at, token] = 3
                 if spellings:
                     logits[q, document, at, int(rng.choice(pool))] = 3
@@ -76,7 +76,8 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
                 top, ids = lp.topk(4, dim=1)
                 rows = torch.cat(
                     (
-                        torch.logsumexp(lp[:, vocabulary.stop_ids], dim=1)[:, None],
+                        torch.logsumexp(
+                            lp[:, vocabulary.tokenizer.stop_ids], dim=1)[:, None],
                         ids.float(),
                         top,
                     ),
@@ -91,7 +92,7 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
         torch.eye(num_tokens),
         slots.size,
         [answer_limit] * num_questions,
-        vocabulary.stop_ids,
+        vocabulary.tokenizer.stop_ids,
         16,
         workspace_bytes=64 * 2**20,
     )
@@ -181,13 +182,15 @@ def test_copy_branches_match_reference_after_filters_and_limits(
     torch_ = events_torch(lag)
     model = TokenModel(arena)
     state = SimpleNamespace(
-        loaded_model=SimpleNamespace(arena=arena, vocabulary=vocabulary)
+        loaded_model=SimpleNamespace(arena=arena, vocabulary=vocabulary,
+                                     tokenizer=vocabulary.tokenizer)
     )
     ids = list(range(len(texts)))
     inputs = {
         "documents": {
             "c": (
-                None if lag else vocabulary.document_batch(texts, [None] * len(texts))
+                None if lag else vocabulary.tokenizer.document_batch(
+                    texts, [None] * len(texts))
             )
         },
         "texts": {"c": texts},
@@ -207,7 +210,8 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         setup.page_tokens,
         len(stages) - 1,
     )
-    pool = [*vocabulary.encode_ids("five years days lease"), *vocabulary.stop_ids]
+    pool = [*vocabulary.tokenizer.encode_ids("five years days lease"),
+            *vocabulary.tokenizer.stop_ids]
     head = torch.zeros(len(vocabulary.vocab), 1024)
     head[rng.choice(pool, 1024), np.arange(1024)] = 1
     decoder = MapDecoder(
@@ -215,7 +219,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         head,
         len(prefixes),
         part.answer_limits,
-        vocabulary.stop_ids,
+        vocabulary.tokenizer.stop_ids,
         setup.page_tokens,
         workspace_bytes=64 * 2**20,
     )
@@ -281,7 +285,8 @@ def test_copy_branches_match_reference_after_filters_and_limits(
                 top, tokens = lp.topk(4)
                 row = torch.cat(
                     (
-                        torch.logsumexp(lp[list(vocabulary.stop_ids)], dim=0)[None],
+                        torch.logsumexp(
+                            lp[list(vocabulary.tokenizer.stop_ids)], dim=0)[None],
                         tokens.float(),
                         top,
                     )
@@ -366,7 +371,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     )
     texts = ["five days or five years", "five years", "lease for five days"]
     spec, vocabulary = make_spec(*texts, "five days years lease", "or", "for")
-    vocabulary.tokenizer.batch_decode = batch_decode
+    vocabulary.tokenizer.hf.batch_decode = batch_decode
     spec = replace(spec, max_answer_tokens=6, draft_tokens=3, top_tokens=4)
     setup = Setup(path="unified", pages=pages, page_tokens=4, budget=128)
     arena = make_arena(setup)
@@ -374,12 +379,14 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     state = map_state(setup, arena, model.forward_chunk)
     state.gpu_timing = False
     state.loaded_model.vocabulary = vocabulary
+    state.loaded_model.tokenizer = vocabulary.tokenizer
     head = torch.zeros(len(vocabulary.vocab), 1024)
-    pool = [*vocabulary.encode_ids("five days years lease"), *vocabulary.stop_ids]
+    pool = [*vocabulary.tokenizer.encode_ids("five days years lease"),
+            *vocabulary.tokenizer.stop_ids]
     head[np.array(pool)[np.arange(1024) % len(pool)], np.arange(1024)] = 1
     state.loaded_model.model.quail_full_head = head
     ids = np.arange(len(texts))
-    tokens = vocabulary.document_batch(texts, [None] * len(texts))
+    tokens = vocabulary.tokenizer.document_batch(texts, [None] * len(texts))
     extracts = ExtractPart(
         state,
         [
@@ -437,7 +444,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
             token = int(
                 head[:, next_token(chain(prefix + [10, 11] + expected))].argmax()
             )
-            if token in vocabulary.stop_ids:
+            if token in vocabulary.tokenizer.stop_ids:
                 break
             expected.append(token)
         assert (
@@ -453,7 +460,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
                 top, selected = lp.topk(4)
                 row = torch.cat(
                     (
-                        lp[list(vocabulary.stop_ids)].logsumexp(dim=0)[None],
+                        lp[list(vocabulary.tokenizer.stop_ids)].logsumexp(dim=0)[None],
                         selected.float(),
                         top,
                     )

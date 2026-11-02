@@ -135,6 +135,30 @@ def test_classify_plans_filters_and_returns_labels(session):
         [("refund", 0.1), ("shipping", 0.8), ("praise", 0.1)]]
 
 
+def test_classify_probabilities_beside_an_extract(session):
+    # an extract in the same query projects the label through the label
+    # tables; the probability map must come back as a map there too
+    alone = session.sql(
+        f"SELECT d.id, {TOPIC}, {{'probabilities': true}}) AS topic "
+        "FROM documents d")
+    query = session.sql(
+        f"SELECT d.id, {TOPIC}, {{'probabilities': true}}) AS topic, "
+        "AI.EXTRACT(d.body, {'item': 'What is asked for?'}) AS asked "
+        "FROM documents d")
+    oracle = Oracle(labels=["praise", "shipping"], probabilities=True,
+                    answers=lambda spec, document: (
+                        "refund" if document == 0 else None))
+    rows = finish(query, oracle).collect()
+    expected = finish(alone, _labels(["praise", "shipping"])).collect()
+    assert rows.column("topic").to_pylist() == ["praise", "shipping"]
+    assert (rows.schema.field("topic_probabilities").type
+            == expected.schema.field("topic_probabilities").type)
+    assert (rows.column("topic_probabilities").to_pylist()
+            == expected.column("topic_probabilities").to_pylist())
+    assert rows.column("asked").to_pylist() == [{"item": "refund"},
+                                                {"item": None}]
+
+
 def _classify_then_filter(session, *, filters=1, later_filters=()):
     tests = [("topic", ("refund", "shipping"))]
     if filters > 1:

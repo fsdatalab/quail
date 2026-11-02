@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.chunk import InputStaging
+    from quail.backends.quail.executor.extract import Vocabulary
     from quail.backends.quail.executor.models.base import ModelPipeline
     from quail.backends.quail.executor.readout import (
         AnswerRows,
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
         AsyncLabelLogprobs,
         AsyncScores,
     )
+    from quail.backends.quail.executor.tokenizer import ModelTokenizer
     from quail.cost.decode import DecodeCost
     from quail.specs.base import ModelSpec
 
@@ -32,8 +34,10 @@ class LoadedModelState:
     label_readout: AsyncLabelLogprobs | None = None
     # a decision model's option-scoring head; None for other models
     decision_head: Any = None
-    # the tokenizer and vocabulary index AI.EXTRACT reads, loaded on first use
-    vocabulary: Any = None
+    # the tokenizer AI.MAP and AI.EXTRACT read, and the word index of
+    # AI.EXTRACT; None for a model that runs neither
+    tokenizer: ModelTokenizer | None = None
+    vocabulary: Vocabulary | None = None
     # the SAE encoder AI.SAE_FEATURES reads, loaded on first use
     sae: Any = None
     # a set-attention model's document ends joined with the state tail,
