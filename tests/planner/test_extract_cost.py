@@ -37,33 +37,36 @@ def _document(length, **kwargs):
     return document_work(length, HEAD, TAIL, **options)
 
 
-def _rounds_work(context, round_tokens, rounds):
-    """The decode work of a fractional number of equal rounds."""
-    whole = int(rounds)
-    work = decode(context, [round_tokens] * whole)
-    if rounds > whole:
-        work += (decode(context + whole * round_tokens, [round_tokens])
-                 * (rounds - whole))
+def _assert_same_work(work, expected):
+    for field in fields(Work):
+        assert getattr(work, field.name) == pytest.approx(
+            getattr(expected, field.name), rel=1e-12), field.name
+
+
+def _rounds_work(context, round_tokens, limit, assumptions):
+    """The decode work of every round, each weighted by its chance to run."""
+    work = Work()
+    for index in range(-(-(limit - 1) // round_tokens)):
+        step = decode(context + index * round_tokens, [round_tokens])
+        work += step * assumptions.survival(index * round_tokens)
     return work
 
 
 def _priced_round_by_round(length, shared, *, window, recurrent, cap, rho,
                            limit, assumptions):
-    """One document's work, adding each round's ask in turn."""
+    """One document's work, adding each round's ask weighted by its chance."""
     prefix = HEAD + length
     context = prefix + TAIL
     policy = DraftPolicy(cap, limit, assumptions.answer_tokens)
     round_tokens = 1 + policy.draft_length(rho * context, 1, num_streams=1)
-    rounds = assumptions.rounds(limit, round_tokens - 1)
     if shared:
         work = ask(HEAD + shared, context - HEAD - shared, window=window)
     else:
         work = scan(prefix, TAIL, window=window)
     if recurrent:
         work = replace(work, state_read=1 + bool(shared), state_written=2)
-    whole = int(rounds)
-    for index in range(whole + (rounds > whole)):
-        probability = min(1.0, rounds - index)
+    for index in range(-(-(limit - 1) // round_tokens)):
+        probability = assumptions.survival(index * round_tokens)
         if recurrent:
             replay = round_tokens if index else 0
             step = ask(context + max(0, index - 1) * round_tokens,
@@ -93,9 +96,7 @@ def test_a_table_costs_the_sum_of_its_documents_priced_round_by_round(
         lengths, HEAD, TAIL, window=window, resident=False, shared=shared,
         max_answer_tokens=1024, draft_tokens=16, draft_policy="adaptive",
         round_cost_per_token=0.02, assumptions=assumptions, recurrent=recurrent)
-    for field in fields(Work):
-        assert getattr(work, field.name) == pytest.approx(
-            getattr(expected, field.name), rel=1e-12), field.name
+    _assert_same_work(work, expected)
 
 
 def test_expected_rounds_follow_the_answer_length_curve():
@@ -121,17 +122,18 @@ def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     context = HEAD + 100 + TAIL
     round_tokens = 1 + 16
     rounds = ExtractAssumptions().rounds(ExtractSpec.max_answer_tokens, 16)
-    answer = _rounds_work(context, round_tokens, rounds)
-    assert work == scan(HEAD + 100, TAIL) + answer
+    answer = _rounds_work(context, round_tokens, ExtractSpec.max_answer_tokens,
+                          ExtractAssumptions())
+    _assert_same_work(work, scan(HEAD + 100, TAIL) + answer)
     assert fed == pytest.approx(TAIL + rounds * round_tokens)
     assert rows == pytest.approx(1 + rounds * round_tokens)
     # resident KV turns the scan into a question over it
     resident, _, _ = _document(100, resident=True)
-    assert resident == ask(HEAD + 100, TAIL) + answer
+    _assert_same_work(resident, ask(HEAD + 100, TAIL) + answer)
     assert resident.tokens < work.tokens
     # a borrowed prefix includes the prompt head
     shared, _, _ = _document(100, shared=80)
-    assert shared == ask(HEAD + 80, 100 + TAIL - 80) + answer
+    _assert_same_work(shared, ask(HEAD + 80, 100 + TAIL - 80) + answer)
     assert shared.tokens == pytest.approx(work.tokens - 80 - HEAD)
     assert _document(100, resident=True, shared=80)[0] == resident
 

@@ -7,7 +7,7 @@ executor (quail/backends/quail/executor/extract/): the prompt with
 the document, then the answer, one chosen token and a draft of the
 document per round, every row read. The answer length is a cost
 assumption: answers are taken as geometric with the assumed mean, and
-a document's rounds are the expected number under that curve. Drafts
+each round's work counts with the chance the answer needs it. Drafts
 are taken as accepted while the answer continues. The second and later
 extractions of a pipeline reuse the document's KV. Each answer round
 reads the document, question, and previously accepted answer tokens
@@ -159,57 +159,114 @@ def document_work(length, head_tokens: int, tail_tokens: int, *,
         work = replace(work, state_read=1.0 + (borrowed > 0),
                        state_written=np.full(shape, 1.0 + (not resident)))
     # each round appends the chosen token and the draft, and reads
-    # every row; the last row read decides the closing quote
+    # every row; the last row read decides the closing quote. A round's
+    # work counts with the chance the answer runs long enough to need it.
     round_tokens = 1 + np.broadcast_to(draft_tokens, shape)
-    rounds = np.broadcast_to(assumptions.rounds(max_answer_tokens, draft_tokens),
-                             shape)
-    whole = np.floor(rounds)
-    part = rounds - whole
+    chances = _RoundChances(assumptions, max_answer_tokens, round_tokens)
+    rounds = assumptions.rounds(max_answer_tokens, round_tokens - 1)
     fed = tail_tokens + rounds * round_tokens
     if recurrent:
         # round 0 asks for one round's tokens; each later round replays
         # the previous round's tokens with its own to advance the state
         first = ask(context, round_tokens, window=window)
-        work += replace(first, state_read=1.0, state_written=0.0) * np.minimum(
-            1.0, rounds)
-        later = np.maximum(whole - 1, 0)
-        replays = _series(context, round_tokens, 2, later, window)
-        work += replace(replays, state_read=2 * later, state_written=later)
-        last = ask(context + later * round_tokens, 2 * round_tokens, window=window)
-        partial = part * (whole >= 1)
-        work += replace(last, state_read=2.0, state_written=1.0) * partial
-        fed = fed + round_tokens * (later + partial)
+        work += replace(first, state_read=1.0, state_written=0.0) * chances.first()
+        replays = chances.asks(context, 2, 1, window)
+        work += replace(replays, state_read=2 * replays.state_read,
+                        state_written=replays.state_read)
+        fed = fed + round_tokens * replays.state_read
     else:
-        steps = _series(context, round_tokens, 1, whole, window)
+        steps = chances.asks(context, 1, 0, window)
         work += replace(steps, state_written=steps.state_read)
-        last = ask(context + whole * round_tokens, round_tokens, window=window)
-        work += replace(last, state_written=last.state_read) * part
     rows = 1.0 + rounds * round_tokens
     return work, fed, rows
 
 
-def _series(context, step, multiple: int, count, window: int) -> Work:
-    """Return the sum of ask(context + j step, multiple step) over j < count.
+class _RoundChances:
+    """Each document's chance to run each answer round, and sums over rounds.
 
-    Each document has its own context, step, and count of asks.
+    Round r runs when the answer has more than r round_tokens tokens
+    after its first, up to the answer limit. Documents with the same
+    round length share one row of chances.
     """
-    suffix = multiple * step
-    kv_read = count * context + step * count * (count - 1) / 2
-    sliding_pairs = sliding_kv_read = 0.0
-    if window:
-        # the per-ask window gains telescope: the sum keeps the last
-        # multiple windows and drops the first multiple
-        sliding_pairs = sum(
-            triangle(context + (count + i) * step, window)
-            - triangle(context + i * step, window) for i in range(multiple))
-        # asks before the context reaches window - 1 read their whole context
-        below = np.clip(np.ceil((window - 1 - context) / step), 0, count)
-        sliding_kv_read = (below * context + step * below * (below - 1) / 2
-                           + (count - below) * (window - 1))
-    return Work(tokens=count * suffix, pairs=suffix * kv_read
-                + count * triangle(suffix), kv_written=count * suffix,
-                kv_read=kv_read, sliding_pairs=sliding_pairs,
-                sliding_kv_read=sliding_kv_read, state_read=count)
+
+    def __init__(self, assumptions: ExtractAssumptions, max_answer_tokens: int,
+                 round_tokens):
+        lengths, self.group = np.unique(round_tokens, return_inverse=True)
+        self.group = self.group.reshape(np.shape(round_tokens))
+        self.step = np.asarray(round_tokens, dtype=np.float64)
+        most = np.maximum(0, -(-(max_answer_tokens - 1) // lengths))
+        if assumptions.answer_tokens == 0:
+            most = np.zeros_like(most)
+        self.num_rounds = int(most.max(initial=0))
+        # one zero column past the last round keeps every lookup in range
+        r = np.arange(self.num_rounds + 1)
+        keep = 1.0 - 1.0 / max(1.0, float(assumptions.answer_tokens))
+        self.chance = np.where(r < most[:, None],
+                               keep ** (lengths[:, None] * r), 0.0)
+        zeros = np.zeros((len(lengths), 1))
+        self.sum_chance = np.hstack([zeros, np.cumsum(self.chance, axis=1)])
+        self.sum_chance_round = np.hstack(
+            [zeros, np.cumsum(self.chance * r, axis=1)])
+
+    def first(self) -> np.ndarray:
+        """Return each document's chance to run round 0."""
+        return self.chance[self.group, 0]
+
+    def _sums(self, offset: int, count):
+        """Return sums of chance and of chance times j over rounds offset + j.
+
+        Args:
+            offset: The round that j = 0 stands for.
+            count: How many values of j to sum, per document.
+        """
+        stop = offset + np.asarray(count, dtype=np.int64)
+        chance = (self.sum_chance[self.group, stop]
+                  - self.sum_chance[self.group, offset])
+        chance_round = (self.sum_chance_round[self.group, stop]
+                        - self.sum_chance_round[self.group, offset])
+        return chance, chance_round - offset * chance
+
+    def asks(self, context, multiple: int, offset: int, window: int) -> Work:
+        """Return the expected sum of ask(context + j step, multiple step).
+
+        The ask for j counts with the chance of round offset + j.
+        """
+        step = self.step
+        suffix = multiple * step
+        count = max(self.num_rounds - offset, 0)
+        chance, chance_round = self._sums(offset, count)
+        kv_read = context * chance + step * chance_round
+        sliding_pairs = sliding_kv_read = 0.0
+        if window:
+            # asks that end within the window add their full triangle,
+            # asks that start past it add window keys per token, and at
+            # most multiple asks cross the window's edge
+            below = np.clip(np.floor((window - context - suffix) / step) + 1,
+                            0, count).astype(np.int64)
+            above = np.clip(np.ceil((window - context) / step),
+                            0, count).astype(np.int64)
+            below_chance, below_round = self._sums(offset, below)
+            above_chance, _ = self._sums(offset, above)
+            sliding_pairs = (suffix * (context * below_chance + step * below_round)
+                             + triangle(suffix) * below_chance
+                             + window * suffix * (chance - above_chance))
+            for i in range(multiple):
+                j = below + i
+                start = context + j * step
+                crossing = np.where(j < above, self.chance[
+                    self.group, np.minimum(offset + j, self.num_rounds)], 0.0)
+                sliding_pairs = sliding_pairs + crossing * (
+                    triangle(start + suffix, window) - triangle(start, window))
+            # asks before the context reaches window - 1 read their whole context
+            reach = np.clip(np.ceil((window - 1 - context) / step),
+                            0, count).astype(np.int64)
+            reach_chance, reach_round = self._sums(offset, reach)
+            sliding_kv_read = (context * reach_chance + step * reach_round
+                               + (window - 1) * (chance - reach_chance))
+        return Work(tokens=suffix * chance, pairs=suffix * kv_read
+                    + triangle(suffix) * chance, kv_written=suffix * chance,
+                    kv_read=kv_read, sliding_pairs=sliding_pairs,
+                    sliding_kv_read=sliding_kv_read, state_read=chance)
 
 
 def _per_document(work: Work, shape) -> Work:
