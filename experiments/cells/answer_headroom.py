@@ -123,35 +123,43 @@ def answer_columns(query) -> list[str]:
     return [node.name for node in query.logical.operators().maps]
 
 
-def step_totals(steps: Path, first: int) -> tuple[int, int, int]:
-    """Return the step trace's lines, and its evictions and recomputed tokens.
+def step_totals(steps: Path, first: int) -> tuple[int, int, int, int]:
+    """Return the step trace's lines, evictions, recomputed tokens, and repeats.
 
-    The evictions and recomputed tokens count from line `first` on.
+    The counts start at line `first`. A repeat is an eviction of a
+    request that was evicted before.
     """
     lines = steps.read_text().splitlines() if steps.exists() else []
     records = [json.loads(line) for line in lines[first:]]
     return (len(lines), sum(r["preempted"] for r in records),
-            sum(r["recomputed"] for r in records))
+            sum(r["recomputed"] for r in records),
+            sum(r.get("preempted_again", 0) for r in records))
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=4 * 3600,
               volumes=VOLUMES)
 def run_mode(mode: str, query_ids: list[str], scale_factor: float,
              num_documents: int, repeats: int, run_dir: str,
-             num_contracts: int = 0) -> str:
+             num_contracts: int = 0, kv_pool_tokens: int = 0) -> str:
     """Run the queries under one admission mode and save their measurements.
 
     A query id names one of QUERIES, run on the first num_documents
-    reviews, or a QUAIL-B query, run on its whole tables.
+    reviews, or a QUAIL-B query, run on its whole tables. A positive
+    kv_pool_tokens caps both engines' KV pool at that many tokens, and
+    the run's files carry it in their names.
 
     Returns:
         The measurements as JSON.
     """
     from quail.baselines.vllm_trace import STEP_TRACE_ENV
+    from quail.cost.budgets import KV_POOL_TOKENS_ENV
 
     # the engine's workers start with the Session and read these variables
+    tag = f"{mode}-kv{kv_pool_tokens}" if kv_pool_tokens else mode
+    if kv_pool_tokens:
+        os.environ[KV_POOL_TOKENS_ENV] = str(kv_pool_tokens)
     directory = Path(run_dir)
-    traces = directory / f"{mode}-traces"
+    traces = directory / f"{tag}-traces"
     traces.mkdir(parents=True, exist_ok=True)
     steps = traces / "steps.jsonl"
     if mode in VLLM_MODES:
@@ -170,7 +178,8 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
         gpus=1, model="qwen3-4b-fp8",
         backend=mode if mode in VLLM_MODES else "quail", device="h100-sxm")
     report = {"mode": mode, "num_documents": num_documents,
-              "num_contracts": num_contracts, "queries": {}}
+              "num_contracts": num_contracts, "kv_pool_tokens": kv_pool_tokens,
+              "queries": {}}
     with quail.Session(config) as session:
         # warm up on copies whose first tokens differ from every review, so
         # no KV the warm-up writes serves a timed query
@@ -188,7 +197,7 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
         for name in query_ids:
             runs = []
             for _ in range(repeats):
-                first, _, _ = step_totals(steps, 0)
+                first, *_ = step_totals(steps, 0)
                 query = build(session, name)
                 result = query.run()
                 rows = result.collect()
@@ -215,15 +224,16 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
                     "answers_sha256": digest.hexdigest(),
                 })
                 if mode in VLLM_MODES:
-                    _, evictions, recomputed = step_totals(steps, first)
+                    _, evictions, recomputed, repeated = step_totals(steps, first)
                     runs[-1].update(answer_evictions=evictions,
-                                    recomputed_tokens=recomputed)
+                                    recomputed_tokens=recomputed,
+                                    repeat_evictions=repeated)
                 print(mode, name, runs[-1], flush=True)
-            path = answers_path(run_dir, mode, name)
+            path = answers_path(run_dir, tag, name)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(rows.to_pydict()))
             report["queries"][name] = runs
-    report_path(run_dir, mode, query_ids).write_text(json.dumps(report, indent=1))
+    report_path(run_dir, tag, query_ids).write_text(json.dumps(report, indent=1))
     results_vol.commit()
     return json.dumps(report, indent=1)
 
@@ -231,7 +241,7 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
 @app.local_entrypoint()
 def compare(modes: str = "headroom=0,headroom", queries: str = ",".join(QUERIES),
             scale_factor: float = 0.1, num_documents: int = 1000, repeats: int = 2,
-            num_contracts: int = 0):
+            num_contracts: int = 0, kv_pool_tokens: str = "0"):
     query_ids = [name for name in queries.split(",") if name]
     # IMDB-20 brings the reviews and CUAD-21 the contracts
     ensure_data.remote(scale_factor, list(dict.fromkeys(["IMDB-20", "CUAD-21"] + [
@@ -242,8 +252,11 @@ def compare(modes: str = "headroom=0,headroom", queries: str = ",".join(QUERIES)
     print(f"run directory: {run_dir}", flush=True)
     # each query on its own GPU, so no KV or prefix cache carries over
     calls = [run_mode.spawn(mode, [query], scale_factor, num_documents, repeats,
-                            run_dir, num_contracts)
+                            run_dir, num_contracts, int(pool))
+             for pool in filter(None, kv_pool_tokens.split(","))
              for mode in filter(None, modes.split(",")) for query in query_ids]
+    for call in calls:
+        print(f"function call id: {call.object_id}", flush=True)
     for call in calls:
         print(call.get(), flush=True)
 

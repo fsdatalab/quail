@@ -16,8 +16,9 @@ def install_step_trace() -> None:
     does nothing unless ``QUAIL_VLLM_STEP_TRACE`` names the file. Each
     line holds the step's wall-clock time ``t``, the tokens it
     schedules, the tokens of those it recomputes because their request
-    was preempted, the requests preempted since the previous step, the
-    requests running and waiting, and the fraction of KV blocks in use.
+    was preempted, the requests preempted since the previous step and
+    those of them preempted before, the requests running and waiting,
+    and the fraction of KV blocks in use.
     """
     path = os.environ.get(STEP_TRACE_ENV)
     if not path:
@@ -30,9 +31,14 @@ def install_step_trace() -> None:
     preempt = Scheduler._preempt_request
     # request id -> KV positions it had computed when last preempted
     computed_at_preemption = {}
-    counts = {"preempted": 0}
+    counts = {"preempted": 0, "preempted_again": 0}
+    # request id -> times preempted
+    preemptions = {}
 
     def traced_preempt(self, request, *args, **kwargs):
+        times = preemptions.get(request.request_id, 0)
+        preemptions[request.request_id] = times + 1
+        counts["preempted_again"] += int(times > 0)
         computed_at_preemption[request.request_id] = max(
             computed_at_preemption.get(request.request_id, 0),
             request.num_computed_tokens)
@@ -57,11 +63,13 @@ def install_step_trace() -> None:
                 "scheduled": output.total_num_scheduled_tokens,
                 "recomputed": recomputed,
                 "preempted": counts["preempted"],
+                "preempted_again": counts["preempted_again"],
                 "running": len(self.running),
                 "waiting": len(self.waiting),
                 "kv_usage": round(self.kv_cache_manager.usage, 4),
             }) + "\n")
         counts["preempted"] = 0
+        counts["preempted_again"] = 0
         return output
 
     Scheduler.schedule = traced_schedule

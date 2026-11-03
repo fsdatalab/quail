@@ -3,6 +3,7 @@
 Chunk budget, admission budget, and roofline arithmetic.
 """
 
+import os
 from math import ceil
 
 from quail.specs import DeviceSpec, ModelSpec
@@ -195,6 +196,8 @@ INTERMEDIATE_BLOCK_TOKENS = 64
 # Rows past a document that its pages also cover: the shared question
 # preamble and a stage tail, taken as a round number for the split.
 SPLIT_EXTRA_TOKENS = 64
+# an experiment's cap on the every-token KV pool, in tokens, for both engines
+KV_POOL_TOKENS_ENV = "QUAIL_KV_POOL_TOKENS"
 
 
 def transient_sliding_pages(chunk_tokens: int, window: int,
@@ -349,6 +352,12 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     if full <= 0:
         raise ValueError("the KV arena cannot hold one chunk's sliding KV")
     return full, sliding
+
+
+def kv_pool_cap_tokens() -> int | None:
+    """Return the KV pool cap QUAIL_KV_POOL_TOKENS sets, in tokens, or None."""
+    value = os.environ.get(KV_POOL_TOKENS_ENV)
+    return int(value) if value else None
 
 
 def arena_tokens(model: ModelSpec, device: DeviceSpec,

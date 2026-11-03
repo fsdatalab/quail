@@ -95,6 +95,9 @@ class LoadedGpu:
 
         t0 = time.perf_counter()
         full_pages, sliding_pages = budgets.arena_pages(spec, device, budget)
+        cap = budgets.kv_pool_cap_tokens()
+        if cap:
+            full_pages = min(full_pages, cap // device.page_tokens)
         self.device = device
         self.arena = KVArena(num_layers=spec.layers,
                              num_pages=full_pages,
