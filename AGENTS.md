@@ -130,7 +130,8 @@ one. `tools/check_names.py` enforces the chosen words:
   2.6B bf16, and d1-2B bf16, on one GPU per model copy (H100 SXM,
   L40S, or B200).
   No tensor-parallel weight sharding.
-- `AI.MAP` is on the roadmap.
+- `AI.MAP` writes a text answer for each row, with an optional limit
+  on answer tokens.
   Open-ended generation, speculation, and forking are not supported.
 
 # What Quail builds on and learns from
