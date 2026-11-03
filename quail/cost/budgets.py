@@ -308,6 +308,22 @@ def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
 def arena_pages(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int | None = None,
                 mean_document_tokens: float | None = None) -> tuple[int, int]:
+    """Pages of the two KV pools, the every-token pool capped by QUAIL_KV_POOL_TOKENS.
+
+    See device_arena_pages for the pools memory allows.
+    """
+    full, sliding = device_arena_pages(model, device, chunk_tokens,
+                                       mean_document_tokens)
+    cap = kv_pool_cap_tokens()
+    if cap:
+        full = min(full, cap // device.page_tokens)
+    return full, sliding
+
+
+def device_arena_pages(model: ModelSpec, device: DeviceSpec,
+                       chunk_tokens: int | None = None,
+                       mean_document_tokens: float | None = None
+                       ) -> tuple[int, int]:
     """Pages of the two KV pools: (every-token pool, sliding-layer pool).
 
     A model with set attention keeps no KV between chunks and gets one
