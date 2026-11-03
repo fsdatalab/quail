@@ -1,13 +1,18 @@
 """Extraction costs: the executor's rounds priced like a classification."""
 
+from dataclasses import fields, replace
+
+import numpy as np
 import pytest
 
+from quail.cost.draft_policy import DraftPolicy
 from quail.cost.extract import (
     ExtractAssumptions,
     document_work,
     estimate,
+    table_work,
 )
-from quail.cost.work import ask, decode, scan
+from quail.cost.work import Work, ask, decode, scan
 from quail.physical import ExtractSpec
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -40,6 +45,57 @@ def _rounds_work(context, round_tokens, rounds):
         work += (decode(context + whole * round_tokens, [round_tokens])
                  * (rounds - whole))
     return work
+
+
+def _priced_round_by_round(length, shared, *, window, recurrent, cap, rho,
+                           limit, assumptions):
+    """One document's work, adding each round's ask in turn."""
+    prefix = HEAD + length
+    context = prefix + TAIL
+    policy = DraftPolicy(cap, limit, assumptions.answer_tokens)
+    round_tokens = 1 + policy.draft_length(rho * context, 1, num_streams=1)
+    rounds = assumptions.rounds(limit, round_tokens - 1)
+    if shared:
+        work = ask(HEAD + shared, context - HEAD - shared, window=window)
+    else:
+        work = scan(prefix, TAIL, window=window)
+    if recurrent:
+        work = replace(work, state_read=1 + bool(shared), state_written=2)
+    whole = int(rounds)
+    for index in range(whole + (rounds > whole)):
+        probability = min(1.0, rounds - index)
+        if recurrent:
+            replay = round_tokens if index else 0
+            step = ask(context + max(0, index - 1) * round_tokens,
+                       replay + round_tokens, window=window)
+            step = replace(step, state_read=1 + bool(replay),
+                           state_written=float(bool(replay)))
+        else:
+            step = ask(context + index * round_tokens, round_tokens, window=window)
+            step = replace(step, state_written=step.state_read)
+        work += step * probability
+    return work
+
+
+@pytest.mark.parametrize("window", [0, 512])
+@pytest.mark.parametrize("recurrent", [False, True])
+def test_a_table_costs_the_sum_of_its_documents_priced_round_by_round(
+        window, recurrent):
+    lengths = np.array([3, 40, 300, 480, 505, 900, 2500])
+    shared = np.array([0, 20, 0, 400, 0, 600, 1000])
+    assumptions = ExtractAssumptions(answer_tokens=64)
+    options = dict(window=window, recurrent=recurrent, cap=16, rho=0.02,
+                   limit=1024, assumptions=assumptions)
+    expected = Work()
+    for length, borrowed in zip(lengths, shared):
+        expected += _priced_round_by_round(int(length), int(borrowed), **options)
+    work, _, _ = table_work(
+        lengths, HEAD, TAIL, window=window, resident=False, shared=shared,
+        max_answer_tokens=1024, draft_tokens=16, draft_policy="adaptive",
+        round_cost_per_token=0.02, assumptions=assumptions, recurrent=recurrent)
+    for field in fields(Work):
+        assert getattr(work, field.name) == pytest.approx(
+            getattr(expected, field.name), rel=1e-12), field.name
 
 
 def test_expected_rounds_follow_the_answer_length_curve():

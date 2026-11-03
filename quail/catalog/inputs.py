@@ -6,6 +6,7 @@ file, so later queries read only what they project. It also samples a
 column for the planner's estimates.
 """
 
+import importlib
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -196,13 +197,18 @@ class InputStore:
         return self._background
 
     def warm_tokenizer(self) -> Future:
-        """Load the background thread's encoder before any column needs it.
+        """Load the background thread's encoder and awkward before first use.
 
-        The encoder keeps one instance per thread, and loading one takes
-        a few hundred milliseconds that would otherwise land in the first
-        query's input preparation.
+        The encoder keeps one instance per thread. Loading one, and
+        importing awkward for batch encoding, each take a few hundred
+        milliseconds that would otherwise land in the first query's
+        input preparation.
         """
-        return self._background_executor().submit(self.tokenizer, "")
+        def warm():
+            self.tokenizer("")
+            importlib.import_module("awkward")
+
+        return self._background_executor().submit(warm)
 
     def tokenize_async(self, provider_name: str, column,
                        projected_columns=(), *, with_offsets=False) -> Future:
