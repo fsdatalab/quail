@@ -15,23 +15,28 @@
 //!     .await?;
 //! ```
 
+mod aliases;
 mod claim;
 mod exec;
 mod functions;
 mod region;
+mod unparse;
 
 use std::sync::Arc;
 
 use datafusion::common::Result;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::execution::context::{SessionContext, SessionState};
+use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::optimizer::{Optimizer, OptimizerRule};
+use datafusion::sql::parser::Statement;
 
+pub use aliases::{inline_select_aliases, restore_select_aliases};
 pub use claim::ClaimModelRegions;
 pub use exec::{ModelRegionExec, ModelRegionPlanner, RegionRunner};
 pub use functions::{AI_FUNCTION_NAMES, is_ai_call, normalize_ai_calls, quail_functions};
 pub use region::ModelRegion;
+pub use unparse::region_sql;
 
 /// The optimizer rule after which `ClaimModelRegions` runs.
 ///
@@ -66,8 +71,13 @@ pub fn optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
 }
 
 /// Build a DataFusion session state with Quail registered.
+///
+/// SQL is read in the Snowflake dialect, as Quail's `Session.sql`
+/// reads it; `SET datafusion.sql_parser.dialect` changes it.
 pub fn session_state(runner: Arc<dyn RegionRunner>) -> SessionState {
+    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Snowflake");
     SessionStateBuilder::new()
+        .with_config(config)
         .with_default_features()
         .with_optimizer_rules(optimizer_rules())
         .with_query_planner(Arc::new(exec::QuailQueryPlanner::new(runner)))
@@ -84,6 +94,17 @@ pub fn session_context(runner: Arc<dyn RegionRunner>) -> SessionContext {
 }
 
 /// Plan a SQL query that may call AI functions as `AI.<name>(...)`.
+///
+/// The query is parsed in the session's SQL dialect, and `SELECT`
+/// aliases named in `WHERE` are replaced by their expressions (see
+/// [`inline_select_aliases`]) before DataFusion binds it.
 pub async fn sql(context: &SessionContext, query: &str) -> Result<DataFrame> {
-    context.sql(&normalize_ai_calls(query)).await
+    let state = context.state();
+    let dialect = state.config().options().sql_parser.dialect;
+    let mut statement = state.sql_to_statement(&normalize_ai_calls(query), &dialect)?;
+    if let Statement::Statement(inner) = &mut statement {
+        inline_select_aliases(inner);
+    }
+    let plan = state.statement_to_plan(statement).await?;
+    Ok(DataFrame::new(state, plan))
 }

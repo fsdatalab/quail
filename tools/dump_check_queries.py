@@ -48,16 +48,15 @@ def read_tables(node, tables: dict) -> None:
             read_tables(value, tables)
 
 
-def main() -> None:
-    """Write the check queries to the file named on the command line."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("path", help="JSON file to write")
-    parser.add_argument("--query", default=",".join(CHECK_QUERIES),
-                        help="comma-separated query ids")
-    arguments = parser.parse_args()
+def check_query_entries(query_ids=CHECK_QUERIES) -> list[dict]:
+    """Return each query's id, SQL, and the schemas of the tables it reads.
+
+    Args:
+        query_ids: The quail-b query ids to return.
+    """
     specs = queries(include_draft=True)
     entries = []
-    for query_id in arguments.query.split(","):
+    for query_id in query_ids:
         spec = specs[query_id]
         plan = plan_pb2.Plan()
         plan.ParseFromString(spec.plan_bytes)
@@ -65,6 +64,17 @@ def main() -> None:
         read_tables(MessageToDict(plan), tables)
         entries.append(
             {"id": query_id, "sql": query_sql(spec.info), "tables": tables})
+    return entries
+
+
+def main() -> None:
+    """Write the check queries to the file named on the command line."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("path", help="JSON file to write")
+    parser.add_argument("--query", default=",".join(CHECK_QUERIES),
+                        help="comma-separated query ids")
+    arguments = parser.parse_args()
+    entries = check_query_entries(arguments.query.split(","))
     with open(arguments.path, "w") as file:
         json.dump(entries, file, indent=1)
 

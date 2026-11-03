@@ -10,6 +10,7 @@ async-trait = "0.1"
 datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
 datafusion-common-runtime = "55.2.0"
 futures = "0.3"
+sqlparser = { version = "0.62.0", features = ["visitor"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

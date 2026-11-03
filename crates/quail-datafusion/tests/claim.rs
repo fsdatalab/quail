@@ -2,19 +2,20 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::Result;
+use datafusion::common::{Result, exec_err};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use quail_datafusion::{ModelRegion, RegionRunner, session_context, sql};
 
-/// Answers every region with the rows it holds, in the region's schema.
+/// A runner for planning tests, which never run a region. Execution is
+/// covered end to end in `tests/api/test_session_context.py`.
 #[derive(Debug)]
-struct FixedRows(Vec<RecordBatch>);
+struct NotRun;
 
-impl RegionRunner for FixedRows {
+impl RegionRunner for NotRun {
     fn run(&self, _region: &ModelRegion) -> Result<Vec<RecordBatch>> {
-        Ok(self.0.clone())
+        exec_err!("planning tests do not run model regions")
     }
 }
 
@@ -36,8 +37,8 @@ fn text_table(columns: &[&str], rows: &[&[&str]]) -> Result<MemTable> {
     MemTable::try_new(schema, vec![vec![batch]])
 }
 
-fn context(runner: FixedRows) -> Result<SessionContext> {
-    let context = session_context(Arc::new(runner));
+fn context() -> Result<SessionContext> {
+    let context = session_context(Arc::new(NotRun));
     context.register_table(
         "reviews",
         Arc::new(text_table(
@@ -77,7 +78,7 @@ const FILTER_QUERY: &str = "SELECT r.id FROM reviews r \
 
 #[tokio::test]
 async fn a_filter_query_becomes_one_model_region() -> Result<()> {
-    let context = context(FixedRows(vec![]))?;
+    let context = context()?;
     let plan = optimized(&context, FILTER_QUERY).await?;
     assert!(
         matches!(plan, LogicalPlan::Extension(_)),
@@ -90,7 +91,7 @@ async fn a_filter_query_becomes_one_model_region() -> Result<()> {
 
 #[tokio::test]
 async fn a_query_without_ai_calls_has_no_model_region() -> Result<()> {
-    let context = context(FixedRows(vec![]))?;
+    let context = context()?;
     let plan = optimized(&context, "SELECT id FROM reviews WHERE id = 'r1'").await?;
     assert!(regions(&plan).is_empty());
     Ok(())
@@ -98,7 +99,7 @@ async fn a_query_without_ai_calls_has_no_model_region() -> Result<()> {
 
 #[tokio::test]
 async fn an_aggregate_over_ai_answers_stays_in_the_region() -> Result<()> {
-    let context = context(FixedRows(vec![]))?;
+    let context = context()?;
     let query = "SELECT AI.CLASSIFY(r.body, ['good', 'bad']) AS label, COUNT(*) AS n \
         FROM reviews r GROUP BY label";
     let plan = optimized(&context, query).await?;
@@ -112,7 +113,7 @@ async fn an_aggregate_over_ai_answers_stays_in_the_region() -> Result<()> {
 
 #[tokio::test]
 async fn an_ai_join_and_its_distinct_stay_in_one_region() -> Result<()> {
-    let context = context(FixedRows(vec![]))?;
+    let context = context()?;
     let query = "SELECT DISTINCT r.id FROM reviews r JOIN aspects a \
         ON AI.IF(PROMPT('Does the review discuss {1}?\n\n{0}', r.body, a.aspect))";
     let plan = optimized(&context, query).await?;
@@ -126,7 +127,7 @@ async fn an_ai_join_and_its_distinct_stay_in_one_region() -> Result<()> {
 
 #[tokio::test]
 async fn a_union_keeps_one_region_per_branch() -> Result<()> {
-    let context = context(FixedRows(vec![]))?;
+    let context = context()?;
     let query = format!("{FILTER_QUERY} UNION ALL SELECT id FROM reviews WHERE id = 'r2'");
     let plan = optimized(&context, &query).await?;
     assert!(
@@ -140,7 +141,7 @@ async fn a_union_keeps_one_region_per_branch() -> Result<()> {
 
 #[tokio::test]
 async fn an_exists_subquery_becomes_a_join_inside_the_region() -> Result<()> {
-    let context = context(FixedRows(vec![]))?;
+    let context = context()?;
     let query = "SELECT r.id FROM reviews r WHERE EXISTS (SELECT 1 FROM aspects a \
         WHERE AI.IF(PROMPT('Does the review discuss {1}?\n\n{0}', r.body, a.aspect)))";
     let plan = optimized(&context, query).await?;
@@ -153,18 +154,5 @@ async fn an_exists_subquery_becomes_a_join_inside_the_region() -> Result<()> {
             .to_string()
             .contains("LeftSemi")
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_region_returns_its_runners_rows() -> Result<()> {
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-    let answer = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(StringArray::from(vec!["r1"]))],
-    )?;
-    let context = context(FixedRows(vec![answer.clone()]))?;
-    let batches = sql(&context, FILTER_QUERY).await?.collect().await?;
-    assert_eq!(batches, vec![answer]);
     Ok(())
 }
