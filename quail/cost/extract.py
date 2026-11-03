@@ -14,17 +14,17 @@ reads the document, question, and previously accepted answer tokens
 from KV.
 """
 
-from dataclasses import dataclass, replace
-from itertools import repeat
+from dataclasses import dataclass, fields, replace
 
-from quail.cost.answers import prior_survival
+import numpy as np
+
 from quail.cost.budgets import parallel_copies
-from quail.cost.draft_policy import DraftPolicy
+from quail.cost.draft_policy import DraftPolicy, draft_lengths
 from quail.cost.sol import unrounded_seconds
-from quail.cost.work import Work, ask, decode, scan
+from quail.cost.work import Work, ask, scan, triangle
 
-# a larger table is priced from this many evenly spaced documents: the
-# estimate is a mean, and each document runs the draft policy in Python
+# a larger table is priced from this many evenly spaced documents, so
+# planning time stays flat as the table grows
 SAMPLE_DOCUMENTS = 1024
 
 
@@ -48,19 +48,37 @@ class ExtractAssumptions:
         """Return the chance an answer has more than tokens tokens after its first."""
         if self.answer_tokens == 0:
             return 0.0
-        return float(prior_survival(self.answer_tokens, tokens + 1)[tokens])
+        return float(self._keep() ** tokens)
 
-    def rounds(self, max_answer_tokens: int, draft_tokens: int) -> float:
+    def rounds(self, max_answer_tokens: int, draft_tokens) -> float | np.ndarray:
         """Return the expected rounds an answer takes, limited by the answer limit.
 
         The cue chooses the first token. Round r, counting from zero,
         runs when the answer has more than r (1 + draft_tokens) tokens
         after it; at the limit no stop is read, so the limit minus one
-        token bounds the rounds.
+        token bounds the rounds. The sum over rounds is geometric.
+
+        Args:
+            max_answer_tokens: The answer limit.
+            draft_tokens: Draft tokens per round, or an array of them.
+
+        Returns:
+            The expected rounds, an array when draft_tokens is one.
         """
-        per_round = 1 + draft_tokens
-        most = -(-(max_answer_tokens - 1) // per_round)
-        return float(sum(self.survival(r * per_round) for r in range(most)))
+        per_round = 1 + np.asarray(draft_tokens)
+        most = np.maximum(0, -(-(max_answer_tokens - 1) // per_round))
+        keep = self._keep()
+        if self.answer_tokens == 0:
+            rounds = np.zeros(np.shape(per_round))
+        elif keep == 0.0:
+            rounds = (most > 0).astype(float)
+        else:
+            log_q = per_round * np.log(keep)
+            rounds = np.expm1(most * log_q) / np.expm1(log_q)
+        return float(rounds) if np.ndim(rounds) == 0 else rounds
+
+    def _keep(self) -> float:
+        return 1.0 - 1.0 / max(1.0, float(self.answer_tokens))
 
 
 @dataclass(frozen=True)
@@ -82,23 +100,28 @@ class ExtractCost:
     rows: float
 
 
-def document_work(length: int, head_tokens: int, tail_tokens: int, *,
+def document_work(length, head_tokens: int, tail_tokens: int, *,
                   window: int = 0, resident: bool = False,
-                  shared: int = 0, max_answer_tokens: int, draft_tokens: int,
+                  shared=0, max_answer_tokens: int, draft_tokens: int,
                   draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
                   assumptions: ExtractAssumptions | None = None,
                   recurrent: bool = False,
-                  ) -> tuple[Work, float, float]:
-    """Return one document's work, its fed tokens, and its readout rows.
+                  ) -> tuple[Work, np.ndarray, np.ndarray]:
+    """Return each document's work, its fed tokens, and its readout rows.
+
+    Every count is an array with one entry per document. The expected
+    rounds and their decode work are closed-form sums, so the cost does
+    not grow with the answer limit.
 
     Args:
-        length: The document's tokens.
+        length: The document's tokens, or an array of document lengths.
         head_tokens: Prompt tokens before the document.
         tail_tokens: Prompt tokens after the document, through the cue.
         window: The model's sliding window, 0 for none.
         resident: Whether the document's KV is already available, as
             it is for the second and later extractions of a pipeline.
-        shared: Prefix tokens borrowed from an earlier document.
+        shared: Prefix tokens borrowed from an earlier document, one per
+            document; 0 borrows nothing.
         max_answer_tokens: Answer limit from the extraction plan.
         draft_tokens: Source tokens proposed per round from the extraction
             plan; the cap under the adaptive policy.
@@ -109,48 +132,99 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
         recurrent: Whether rounds replay accepted inputs to advance a checkpoint.
     """
     assumptions = ExtractAssumptions() if assumptions is None else assumptions
+    length = np.asarray(length, dtype=np.float64)
+    shape = length.shape
     prefix = head_tokens + length
-    if draft_policy == "adaptive":
-        # the policy's first-round choice for this document, with one stream
-        policy = DraftPolicy(draft_tokens, max_answer_tokens, assumptions.answer_tokens)
-        draft_tokens = policy.draft_length(
-            round_cost_per_token * (prefix + tail_tokens), 1, num_streams=1)
-    if resident:
-        work = ask(prefix, tail_tokens, window=window)
-    elif shared:
-        # a borrowed prefix includes the prompt head the documents share
-        borrowed = shared + head_tokens
-        work = ask(borrowed, prefix + tail_tokens - borrowed, window=window)
-    else:
-        work = scan(prefix, tail_tokens, window=window)
     context = prefix + tail_tokens
+    if draft_policy == "adaptive":
+        # the policy's first-round choice for each document, with one stream
+        policy = DraftPolicy(draft_tokens, max_answer_tokens, assumptions.answer_tokens)
+        ones = np.ones(context.size, dtype=np.int64)
+        draft_tokens = draft_lengths(
+            policy.cap, policy.max_answer_tokens, policy.curve(), ones, ones,
+            round_cost_per_token * context.reshape(-1), policy.trials,
+            policy.accepts).reshape(shape)
+    borrowed = np.zeros(shape) if resident else np.broadcast_to(
+        np.asarray(shared, dtype=np.float64), shape)
+    if resident:
+        work = _per_document(ask(prefix, tail_tokens, window=window), shape)
+    else:
+        # a borrowed prefix includes the prompt head the documents share
+        work = _where(
+            borrowed > 0,
+            ask(borrowed + head_tokens, context - borrowed - head_tokens,
+                window=window),
+            scan(prefix, tail_tokens, window=window), shape)
     if recurrent:
-        work = replace(work, state_read=1 + bool(shared and not resident),
-                       state_written=1 + (not resident))
-    fed = float(tail_tokens)
-    rows = 1.0
+        work = replace(work, state_read=1.0 + (borrowed > 0),
+                       state_written=np.full(shape, 1.0 + (not resident)))
     # each round appends the chosen token and the draft, and reads
     # every row; the last row read decides the closing quote
-    round_tokens = 1 + draft_tokens
-    rounds = assumptions.rounds(max_answer_tokens, draft_tokens)
-    whole = int(rounds)
+    round_tokens = 1 + np.broadcast_to(draft_tokens, shape)
+    rounds = np.broadcast_to(assumptions.rounds(max_answer_tokens, draft_tokens),
+                             shape)
+    whole = np.floor(rounds)
+    part = rounds - whole
+    fed = tail_tokens + rounds * round_tokens
     if recurrent:
-        for index in range(whole + (rounds > whole)):
-            probability = min(1.0, rounds - index)
-            replay = round_tokens if index else 0
-            step = ask(context + max(0, index - 1) * round_tokens,
-                       replay + round_tokens, window=window)
-            work += replace(step, state_read=1 + bool(replay),
-                            state_written=float(bool(replay))) * probability
-            fed += replay * probability
+        # round 0 asks for one round's tokens; each later round replays
+        # the previous round's tokens with its own to advance the state
+        first = ask(context, round_tokens, window=window)
+        work += replace(first, state_read=1.0, state_written=0.0) * np.minimum(
+            1.0, rounds)
+        later = np.maximum(whole - 1, 0)
+        replays = _series(context, round_tokens, 2, later, window)
+        work += replace(replays, state_read=2 * later, state_written=later)
+        last = ask(context + later * round_tokens, 2 * round_tokens, window=window)
+        partial = part * (whole >= 1)
+        work += replace(last, state_read=2.0, state_written=1.0) * partial
+        fed = fed + round_tokens * (later + partial)
     else:
-        work += decode(context, repeat(round_tokens, whole), window=window)
-        if rounds > whole:
-            step = ask(context + whole * round_tokens, round_tokens, window=window)
-            work += replace(step, state_written=step.state_read) * (rounds - whole)
-    fed += rounds * round_tokens
-    rows += rounds * round_tokens
+        steps = _series(context, round_tokens, 1, whole, window)
+        work += replace(steps, state_written=steps.state_read)
+        last = ask(context + whole * round_tokens, round_tokens, window=window)
+        work += replace(last, state_written=last.state_read) * part
+    rows = 1.0 + rounds * round_tokens
     return work, fed, rows
+
+
+def _series(context, step, multiple: int, count, window: int) -> Work:
+    """Return the sum of ask(context + j step, multiple step) over j < count.
+
+    Each document has its own context, step, and count of asks.
+    """
+    suffix = multiple * step
+    kv_read = count * context + step * count * (count - 1) / 2
+    sliding_pairs = sliding_kv_read = 0.0
+    if window:
+        # the per-ask window gains telescope: the sum keeps the last
+        # multiple windows and drops the first multiple
+        sliding_pairs = sum(
+            triangle(context + (count + i) * step, window)
+            - triangle(context + i * step, window) for i in range(multiple))
+        # asks before the context reaches window - 1 read their whole context
+        below = np.clip(np.ceil((window - 1 - context) / step), 0, count)
+        sliding_kv_read = (below * context + step * below * (below - 1) / 2
+                           + (count - below) * (window - 1))
+    return Work(tokens=count * suffix, pairs=suffix * kv_read
+                + count * triangle(suffix), kv_written=count * suffix,
+                kv_read=kv_read, sliding_pairs=sliding_pairs,
+                sliding_kv_read=sliding_kv_read, state_read=count)
+
+
+def _per_document(work: Work, shape) -> Work:
+    """Return work with every count broadcast to one entry per document."""
+    return Work(**{field.name: np.broadcast_to(
+        np.asarray(getattr(work, field.name), dtype=np.float64), shape)
+        for field in fields(Work)})
+
+
+def _where(mask, chosen: Work, other: Work, shape) -> Work:
+    """Return chosen's counts where mask holds and other's elsewhere."""
+    chosen, other = _per_document(chosen, shape), _per_document(other, shape)
+    return Work(**{field.name: np.where(mask, getattr(chosen, field.name),
+                                        getattr(other, field.name))
+                   for field in fields(Work)})
 
 
 def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
@@ -160,34 +234,30 @@ def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
                recurrent: bool = False, memo=None) -> tuple[Work, float, float]:
     """Return the work, fed tokens, and readout rows of every document.
 
-    The sum runs the draft policy once per document, so a planner
-    passes its memo to compute it once per table and prompt; the key
-    holds the length and shared columns by identity, and the memo
-    keeps them alive so another column cannot reuse an identity. A
-    table of more than SAMPLE_DOCUMENTS documents sums evenly spaced
-    documents and scales the sum to the table.
+    A planner passes its memo to compute the sum once per table and
+    prompt; the key holds the length and shared columns by identity,
+    and the memo keeps them alive so another column cannot reuse an
+    identity. A table of more than SAMPLE_DOCUMENTS documents sums
+    evenly spaced documents and scales the sum to the table.
     """
     key = ("extract_work", id(lengths), id(shared), head_tokens, tail_tokens,
            window, resident, max_answer_tokens, draft_tokens, draft_policy,
            round_cost_per_token, assumptions, recurrent)
     if memo is not None and key in memo:
         return memo[key][2]
-    work = Work()
-    fed = rows = 0.0
     n = len(lengths)
-    indices = (range(n) if n <= SAMPLE_DOCUMENTS else
-               [i * (n - 1) // (SAMPLE_DOCUMENTS - 1)
-                for i in range(SAMPLE_DOCUMENTS)])
-    for index in indices:
-        own, own_fed, own_rows = document_work(
-            int(lengths[index]), head_tokens, tail_tokens, window=window,
-            resident=resident, shared=0 if shared is None else int(shared[index]),
-            max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
-            draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
-            assumptions=assumptions, recurrent=recurrent)
-        work += own
-        fed += own_fed
-        rows += own_rows
+    indices = (np.arange(n) if n <= SAMPLE_DOCUMENTS else
+               np.arange(SAMPLE_DOCUMENTS) * (n - 1) // (SAMPLE_DOCUMENTS - 1))
+    own, own_fed, own_rows = document_work(
+        np.asarray(lengths)[indices], head_tokens, tail_tokens, window=window,
+        resident=resident,
+        shared=0 if shared is None else np.asarray(shared)[indices],
+        max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
+        draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
+        assumptions=assumptions, recurrent=recurrent)
+    shape = np.shape(indices)
+    work = _per_document(own, shape).total()
+    fed, rows = float(np.sum(own_fed)), float(np.sum(own_rows))
     if n > SAMPLE_DOCUMENTS:
         scale = n / SAMPLE_DOCUMENTS
         work, fed, rows = work * scale, fed * scale, rows * scale
