@@ -17,11 +17,14 @@ use datafusion::logical_expr::{
 ///
 /// `AI.IF` reaches DataFusion as `ai_filter`, and every other
 /// `AI.<name>` as `ai_<name>`; see [`normalize_ai_calls`].
-pub const AI_FUNCTION_NAMES: [&str; 6] = [
+/// `ai_extract_span` is the answer positions of an `ai_extract`; see
+/// [`crate::add_extract_spans`].
+pub const AI_FUNCTION_NAMES: [&str; 7] = [
     "ai_filter",
     "ai_score",
     "ai_classify",
     "ai_extract",
+    "ai_extract_span",
     "ai_map",
     "ai_sae_features",
 ];
@@ -33,6 +36,7 @@ enum FunctionKind {
     Score,
     Classify,
     Extract,
+    ExtractSpan,
     Map,
     SaeFeatures,
     Prompt,
@@ -72,15 +76,16 @@ impl ScalarUDFImpl for QuailFunction {
             FunctionKind::Score => Ok(DataType::Float64),
             FunctionKind::Classify | FunctionKind::Map | FunctionKind::Prompt => Ok(DataType::Utf8),
             FunctionKind::SaeFeatures => Ok(sae_features_type()),
-            FunctionKind::Extract => {
-                plan_err!("ai_extract's type depends on its questions argument")
+            FunctionKind::Extract | FunctionKind::ExtractSpan => {
+                plan_err!("{}'s type depends on its questions argument", self.name)
             }
         }
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
         let data_type = match self.kind {
-            FunctionKind::Extract => extract_type(args.arg_fields)?,
+            FunctionKind::Extract => extract_type(args.arg_fields, DataType::Utf8)?,
+            FunctionKind::ExtractSpan => extract_type(args.arg_fields, span_type())?,
             _ => self.return_type(&[])?,
         };
         Ok(Arc::new(Field::new(self.name, data_type, true)))
@@ -107,20 +112,29 @@ fn sae_features_type() -> DataType {
     )))
 }
 
-/// The type of `AI.EXTRACT`: one nullable string field per question.
+/// The type of `AI.EXTRACT`, or of its answer positions: one nullable
+/// field of type `answer` per question.
 ///
 /// The questions argument is a struct literal such as
 /// `{'end_date': 'When does the lease end?'}`, so the field names are
 /// in its type when the query is bound.
-fn extract_type(arg_fields: &[FieldRef]) -> Result<DataType> {
+fn extract_type(arg_fields: &[FieldRef], answer: DataType) -> Result<DataType> {
     let Some(DataType::Struct(questions)) = arg_fields.get(1).map(|field| field.data_type()) else {
         return plan_err!("ai_extract takes a document column and a struct of questions");
     };
     let answers: Vec<Field> = questions
         .iter()
-        .map(|question| Field::new(question.name(), DataType::Utf8, true))
+        .map(|question| Field::new(question.name(), answer.clone(), true))
         .collect();
     Ok(DataType::Struct(Fields::from(answers)))
+}
+
+/// The position of one answer: its first and past-the-end characters.
+fn span_type() -> DataType {
+    DataType::Struct(Fields::from(vec![
+        Field::new("start", DataType::Int32, false),
+        Field::new("end", DataType::Int32, false),
+    ]))
 }
 
 /// Return every Quail function as a DataFusion UDF.
@@ -130,6 +144,7 @@ pub fn quail_functions() -> Vec<Arc<ScalarUDF>> {
         ("ai_score", FunctionKind::Score),
         ("ai_classify", FunctionKind::Classify),
         ("ai_extract", FunctionKind::Extract),
+        ("ai_extract_span", FunctionKind::ExtractSpan),
         ("ai_map", FunctionKind::Map),
         ("ai_sae_features", FunctionKind::SaeFeatures),
         ("prompt", FunctionKind::Prompt),

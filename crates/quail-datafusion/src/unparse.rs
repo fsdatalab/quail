@@ -12,15 +12,20 @@ use sqlparser::ast::visit_expressions_mut;
 use sqlparser::dialect::SnowflakeDialect;
 use sqlparser::parser::Parser;
 
-use crate::aliases::restore_select_aliases;
+use crate::aliases::{remove_select_calls, restore_select_aliases};
 use crate::region::ModelRegion;
 
+/// How an extraction's answer positions print before `region_sql`
+/// removes them; Quail's front end adds the column itself.
+const EXTRACT_SPAN: &str = "AI_EXTRACT_SPAN";
+
 /// Quail's name for each function, by its DataFusion name.
-const QUAIL_NAMES: [(&str, &str); 8] = [
+const QUAIL_NAMES: [(&str, &str); 9] = [
     ("ai_filter", "AI_FILTER"),
     ("ai_score", "AI.SCORE"),
     ("ai_classify", "AI.CLASSIFY"),
     ("ai_extract", "AI.EXTRACT"),
+    ("ai_extract_span", EXTRACT_SPAN),
     ("ai_map", "AI.MAP"),
     ("ai_sae_features", "AI.SAE_FEATURES"),
     ("prompt", "PROMPT"),
@@ -46,6 +51,9 @@ impl Dialect for QuailDialect {
         func_name: &str,
         args: &[Expr],
     ) -> Result<Option<ast::Expr>> {
+        if func_name == "get_field" {
+            return field_access_sql(unparser, args);
+        }
         let Some((_, quail_name)) = QUAIL_NAMES.iter().find(|(name, _)| *name == func_name) else {
             return Ok(None);
         };
@@ -55,6 +63,28 @@ impl Dialect for QuailDialect {
             .collect::<Result<Vec<_>>>()?;
         parse_expr(&format!("{quail_name}({})", arguments.join(", "))).map(Some)
     }
+}
+
+/// Print `get_field(root, 'a', 'b')` as `root['a']['b']` when the root
+/// is a Quail function, so its answer prints as Quail's front end
+/// reads it; any other root prints as DataFusion prints it.
+fn field_access_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    let Some((Expr::ScalarFunction(root), fields)) = args.split_first() else {
+        return Ok(None);
+    };
+    if !QUAIL_NAMES.iter().any(|(name, _)| *name == root.name()) {
+        return Ok(None);
+    }
+    let mut access_chain = Vec::with_capacity(fields.len());
+    for field in fields {
+        access_chain.push(ast::AccessExpr::Subscript(ast::Subscript::Index {
+            index: parse_expr(&argument_sql(unparser, field)?)?,
+        }));
+    }
+    Ok(Some(ast::Expr::CompoundFieldAccess {
+        root: Box::new(parse_expr(&argument_sql(unparser, &args[0])?)?),
+        access_chain,
+    }))
 }
 
 /// Print one argument of a Quail function.
@@ -157,6 +187,7 @@ pub fn region_sql(region: &ModelRegion) -> Result<String> {
     let dialect = QuailDialect;
     let mut statement = Unparser::new(&dialect).plan_to_sql(&region.plan)?;
     restore_select_aliases(&mut statement);
+    remove_select_calls(&mut statement, EXTRACT_SPAN);
     let count_all = parse_expr("COUNT(*)")?;
     let _ = visit_expressions_mut(&mut statement, |expr| {
         if is_count_one(expr) {

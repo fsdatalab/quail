@@ -4,6 +4,8 @@
 //! stream bytes, so the module does not depend on pyarrow's version.
 
 use std::io::Cursor;
+
+use async_trait::async_trait;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, RecordBatch};
@@ -11,16 +13,21 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{
     DataFusionError, Result, tree_node::TreeNode, tree_node::TreeNodeRecursion,
 };
-use datafusion::datasource::MemTable;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::datasource::TableType;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use quail_datafusion::{ModelRegion, RegionRunner, region_sql, session_context, sql};
+use quail_datafusion::{
+    ModelRegion, RegionRunner, quail_column_names, quail_schema, region_sql, session_context, sql,
+};
 use tokio::runtime::Runtime;
 
 /// Runs each model region by calling a Python function with the
@@ -39,36 +46,80 @@ impl RegionRunner for PythonRunner {
                 .and_then(|answer| answer.extract::<Vec<u8>>(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let schema = Arc::clone(region.plan.schema().inner());
+        let schema = region.plan.schema();
+        let names = quail_column_names(schema);
         read_ipc(&bytes)?
             .into_iter()
-            .map(|batch| conform(batch, &schema))
+            .map(|batch| conform(batch, &names, schema.inner()))
             .collect()
     }
 }
 
-/// Give a batch the region's schema: its columns by position, cast to
-/// the region's types.
-fn conform(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
-    if batch.num_columns() != schema.fields().len() {
-        let got: Vec<_> = batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        let want: Vec<_> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        return Err(DataFusionError::Execution(format!(
-            "Quail returned columns {got:?} for a region with columns {want:?}"
-        )));
-    }
-    let columns = batch
-        .columns()
+/// Give a batch of Quail's rows the region's schema: each region
+/// column is the Quail column of the same name, cast to its type.
+fn conform(batch: RecordBatch, names: &[String], schema: &SchemaRef) -> Result<RecordBatch> {
+    let columns = names
         .iter()
         .zip(schema.fields())
-        .map(|(column, field)| Ok(cast(column, field.data_type())?))
+        .map(|(name, field)| {
+            let column = batch.column_by_name(name).ok_or_else(|| {
+                let returned: Vec<_> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                DataFusionError::Execution(format!(
+                    "Quail returned columns {returned:?}, without the region's column {name}"
+                ))
+            })?;
+            Ok(cast(column, field.data_type())?)
+        })
         .collect::<Result<Vec<ArrayRef>>>()?;
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+}
+
+/// A table whose rows a Python function returns on each scan.
+///
+/// Model regions read their tables through Quail, so DataFusion scans
+/// a table only for operators outside every region.
+#[derive(Debug)]
+struct PythonTable {
+    schema: SchemaRef,
+    scan: Py<PyAny>,
+}
+
+#[async_trait]
+impl TableProvider for PythonTable {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = match projection {
+            Some(indices) => Arc::new(self.schema.project(indices)?),
+            None => Arc::clone(&self.schema),
+        };
+        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let bytes: Vec<u8> = Python::attach(|py| {
+            self.scan
+                .call1(py, (columns,))
+                .and_then(|answer| answer.extract::<Vec<u8>>(py))
+        })
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let batches = read_ipc(&bytes)?;
+        Ok(MemorySourceConfig::try_new_exec(&[batches], schema, None)?)
+    }
 }
 
 fn read_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
@@ -108,14 +159,18 @@ impl NativeContext {
         Ok(Self { context, runtime })
     }
 
-    /// Register a table given as IPC stream bytes.
-    fn register(&self, name: &str, table: &[u8]) -> PyResult<()> {
-        let batches = read_ipc(table).map_err(python_error)?;
-        let reader = StreamReader::try_new(Cursor::new(table), None)
+    /// Register a table by its schema, given as the IPC stream bytes of
+    /// an empty table, and a function `scan(columns)` that returns
+    /// those columns' rows as IPC stream bytes.
+    fn register(&self, name: &str, schema: &[u8], scan: Py<PyAny>) -> PyResult<()> {
+        let reader = StreamReader::try_new(Cursor::new(schema), None)
             .map_err(|error| python_error(error.into()))?;
-        let memory = MemTable::try_new(reader.schema(), vec![batches]).map_err(python_error)?;
+        let table = PythonTable {
+            schema: reader.schema(),
+            scan,
+        };
         self.context
-            .register_table(name, Arc::new(memory))
+            .register_table(name, Arc::new(table))
             .map_err(python_error)?;
         Ok(())
     }
@@ -126,8 +181,15 @@ impl NativeContext {
             .detach(|| {
                 self.runtime.block_on(async {
                     let frame = sql(&self.context, query).await?;
-                    let schema = Arc::new(frame.schema().as_arrow().clone());
-                    let batches = frame.collect().await?;
+                    let schema = quail_schema(frame.schema());
+                    let batches = frame
+                        .collect()
+                        .await?
+                        .into_iter()
+                        .map(|batch| {
+                            RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
                     write_ipc(&schema, &batches)
                 })
             })

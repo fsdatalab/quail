@@ -24,14 +24,18 @@ mod unparse;
 
 use std::sync::Arc;
 
-use datafusion::common::Result;
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::common::{DFSchema, Result};
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::sql::parser::Statement;
 
-pub use aliases::{inline_select_aliases, restore_select_aliases};
+pub use aliases::{
+    SPAN_SUFFIX, add_extract_spans, inline_select_aliases, remove_select_calls,
+    restore_select_aliases,
+};
 pub use claim::ClaimModelRegions;
 pub use exec::{ModelRegionExec, ModelRegionPlanner, RegionRunner};
 pub use functions::{AI_FUNCTION_NAMES, is_ai_call, normalize_ai_calls, quail_functions};
@@ -95,16 +99,41 @@ pub fn session_context(runner: Arc<dyn RegionRunner>) -> SessionContext {
 
 /// Plan a SQL query that may call AI functions as `AI.<name>(...)`.
 ///
-/// The query is parsed in the session's SQL dialect, and `SELECT`
-/// aliases named in `WHERE` are replaced by their expressions (see
-/// [`inline_select_aliases`]) before DataFusion binds it.
+/// The query is parsed in the session's SQL dialect. Before DataFusion
+/// binds it, each extraction gets its answer positions column (see
+/// [`add_extract_spans`]), and `SELECT` aliases named in `WHERE` are
+/// replaced by their expressions (see [`inline_select_aliases`]).
 pub async fn sql(context: &SessionContext, query: &str) -> Result<DataFrame> {
     let state = context.state();
     let dialect = state.config().options().sql_parser.dialect;
     let mut statement = state.sql_to_statement(&normalize_ai_calls(query), &dialect)?;
     if let Statement::Statement(inner) = &mut statement {
+        add_extract_spans(inner);
         inline_select_aliases(inner);
     }
     let plan = state.statement_to_plan(statement).await?;
     Ok(DataFrame::new(state, plan))
+}
+
+/// Quail's name for each column of a schema: `alias.column` for a
+/// table's column, as in `r.id`, and the bare name otherwise.
+pub fn quail_column_names(schema: &DFSchema) -> Vec<String> {
+    schema
+        .iter()
+        .map(|(qualifier, field)| match qualifier {
+            Some(qualifier) => format!("{qualifier}.{}", field.name()),
+            None => field.name().clone(),
+        })
+        .collect()
+}
+
+/// An Arrow schema with Quail's column names and the schema's types.
+pub fn quail_schema(schema: &DFSchema) -> SchemaRef {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .zip(quail_column_names(schema))
+        .map(|(field, name)| field.as_ref().clone().with_name(name))
+        .collect();
+    Arc::new(Schema::new(fields))
 }

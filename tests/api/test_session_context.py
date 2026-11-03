@@ -6,7 +6,6 @@ from helpers.oracle import Oracle, finish, oracle_executor
 from helpers.sessions import CONFIG, fake_tok
 
 import quail
-from quail.api.context import without_spans
 from quail.physical import encode_graph
 
 pytest.importorskip("_quail_datafusion")
@@ -97,15 +96,30 @@ def test_a_region_plans_and_answers_as_the_written_query(context, name):
     codecs = session.registry.codecs
     assert (encode_graph(session.sql(region).plan().graph, codecs)
             == encode_graph(session.sql(text).plan().graph, codecs)), region
-    expected = without_spans(finish(session.sql(text), ORACLE).collect())
-    assert _rows(context.sql(text)) == _rows(expected)
+    expected = finish(session.sql(text), ORACLE).collect()
+    table = context.sql(text)
+    assert table.column_names == expected.column_names
+    assert _rows(table) == _rows(expected)
 
 
 def test_operators_outside_a_region_run_in_datafusion(context):
     text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
             "UNION ALL SELECT a.id FROM aspects a ORDER BY id")
     assert len(context.region_sql(text)) == 1
-    assert _rows(context.sql(text)) == [("a0",), ("a1",), ("r0",), ("r2",), ("r3",)]
+    table = context.sql(text)
+    # a union's column belongs to no one table
+    assert table.column_names == ["id"]
+    assert _rows(table) == [("a0",), ("a1",), ("r0",), ("r2",), ("r3",)]
+
+
+def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
+    text = ("SELECT c.id, AI.EXTRACT(c.text, {'end': 'q6: When does it end?'}) "
+            "AS lease FROM contracts c WHERE lease_span.end.start < 15")
+    expected = finish(context.session.sql(text), ORACLE).collect()
+    table = context.sql(text)
+    assert table.column_names == ["c.id", "lease", "lease_span"]
+    assert _rows(table) == _rows(expected)
+    assert len(_rows(table)) == 2
 
 
 def _check_table(columns) -> pa.Table:

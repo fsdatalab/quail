@@ -1941,6 +1941,7 @@ dependencies = [
 name = "quail-datafusion-python"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "datafusion",
  "pyo3",
  "quail-datafusion",

@@ -30,7 +30,6 @@ import pyarrow as pa
 
 from quail.api.execute import execute_query
 from quail.catalog import ScanRequest, TableProvider
-from quail.logical import SPAN_SUFFIX
 
 
 def ipc_bytes(table: pa.Table) -> bytes:
@@ -68,10 +67,18 @@ class SessionContext:
         self._native = NativeContext(self._run_region)
 
     def register(self, name: str, provider: TableProvider) -> None:
-        """Register a table with the session and with DataFusion."""
+        """Register a table with the session and with DataFusion.
+
+        DataFusion keeps the table's schema only. It scans the provider
+        when an operator outside every model region reads the table.
+        """
         self.session.register(name, provider)
-        table = provider.scan(ScanRequest(columns=provider.columns)).read_all()
-        self._native.register(name, ipc_bytes(table))
+
+        def scan(columns: list[str]) -> bytes:
+            reader = provider.scan(ScanRequest(columns=tuple(columns)))
+            return ipc_bytes(reader.read_all())
+
+        self._native.register(name, ipc_bytes(provider.schema().empty_table()), scan)
 
     def sql(self, text: str) -> pa.Table:
         """Run a query and return its rows."""
@@ -88,16 +95,4 @@ class SessionContext:
     def _run_region(self, text: str) -> bytes:
         query = self.session.sql(text)
         result = execute_query(query, physical_executor=self._physical_executor)
-        return ipc_bytes(without_spans(result.collect()))
-
-
-def without_spans(table: pa.Table) -> pa.Table:
-    """Drop the answer position column Quail adds beside each extraction.
-
-    An ``AI.EXTRACT(...) AS lease`` returns ``lease`` and ``lease_span``;
-    DataFusion's plan has only ``lease``.
-    """
-    names = set(table.column_names)
-    return table.drop_columns([
-        name for name in table.column_names
-        if name.endswith(SPAN_SUFFIX) and name[:-len(SPAN_SUFFIX)] in names])
+        return ipc_bytes(result.collect())

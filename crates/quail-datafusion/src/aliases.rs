@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AccessExpr, Expr, GroupByExpr, Ident, OrderByExpr, OrderByKind, Query, Select, SelectItem,
-    SetExpr, Statement, Subscript, TableFactor, Value, visit_expressions_mut,
+    AccessExpr, Expr, GroupByExpr, Ident, ObjectName, OrderByExpr, OrderByKind, Query, Select,
+    SelectItem, SetExpr, Statement, Subscript, TableFactor, Value, visit_expressions_mut,
 };
 
 /// Replace each `SELECT` alias named in a `WHERE` clause with the
@@ -20,6 +20,64 @@ use sqlparser::ast::{
 /// in `FROM` is left alone.
 pub fn inline_select_aliases(statement: &mut Statement) {
     for_each_select(statement, &mut |select, _| inline_in_select(select));
+}
+
+/// The suffix of the column that holds an extraction's answer
+/// positions, as in Quail's `SPAN_SUFFIX`.
+pub const SPAN_SUFFIX: &str = "_span";
+
+/// After each `ai_extract(...) AS name` in `SELECT`, add
+/// `ai_extract_span(...) AS name_span`, unless `SELECT` names it.
+///
+/// Quail returns each extraction's answer positions beside its
+/// answers, so a query may select or test `lease_span` without
+/// writing it.
+pub fn add_extract_spans(statement: &mut Statement) {
+    for_each_select(statement, &mut |select, _| {
+        let named: HashSet<String> = select
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::ExprWithAlias { alias, .. } => Some(key(alias)),
+                _ => None,
+            })
+            .collect();
+        let mut projection = Vec::with_capacity(select.projection.len());
+        for item in select.projection.drain(..) {
+            let span = match &item {
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Function(call),
+                    alias,
+                } if call.name.to_string().eq_ignore_ascii_case("ai_extract")
+                    && !named.contains(&format!("{}{SPAN_SUFFIX}", key(alias))) =>
+                {
+                    let mut span_call = call.clone();
+                    span_call.name = ObjectName::from(vec![Ident::new("ai_extract_span")]);
+                    Some(SelectItem::ExprWithAlias {
+                        expr: Expr::Function(span_call),
+                        alias: Ident::new(format!("{}{SPAN_SUFFIX}", alias.value)),
+                    })
+                }
+                _ => None,
+            };
+            projection.push(item);
+            projection.extend(span);
+        }
+        select.projection = projection;
+    });
+}
+
+/// Remove each `SELECT` item that calls `function`.
+pub fn remove_select_calls(statement: &mut Statement, function: &str) {
+    for_each_select(statement, &mut |select, _| {
+        select.projection.retain(|item| {
+            let expr = match item {
+                SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => expr,
+                _ => return true,
+            };
+            !matches!(expr, Expr::Function(call) if call.name.to_string() == function)
+        });
+    });
 }
 
 /// Replace each `WHERE`, `GROUP BY`, `HAVING`, or `ORDER BY`
@@ -260,6 +318,21 @@ mod tests {
             inlined(sql).ends_with("WHERE r.id = 'x'"),
             "{}",
             inlined(sql)
+        );
+    }
+
+    #[test]
+    fn an_extraction_gets_its_answer_positions_column() {
+        let mut statements = Parser::parse_sql(
+            &SnowflakeDialect {},
+            "SELECT ai_extract(c.text, {'end': 'When?'}) AS lease FROM contracts c",
+        )
+        .unwrap();
+        add_extract_spans(&mut statements[0]);
+        assert_eq!(
+            statements[0].to_string(),
+            "SELECT ai_extract(c.text, {'end': 'When?'}) AS lease, \
+             ai_extract_span(c.text, {'end': 'When?'}) AS lease_span FROM contracts c"
         );
     }
 }
