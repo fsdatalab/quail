@@ -8,6 +8,7 @@
 /// another tag, a missing field, and an unknown field, as the Python
 /// codec does. Further literals after the tag are older tags that are
 /// also accepted.
+#[macro_export]
 macro_rules! tagged_struct {
     (
         $(#[$doc:meta])*
@@ -21,31 +22,31 @@ macro_rules! tagged_struct {
             $($(#[$field_doc])* pub $field: $field_type,)*
         }
 
-        #[derive(Serialize, Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct $body {
             $($field: $field_type,)*
         }
 
-        #[derive(Serialize, Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         #[serde(tag = "type")]
         enum $wrapper {
             #[serde(rename = $tag $(, alias = $old)*)]
             Value($body),
         }
 
-        impl Serialize for $name {
+        impl serde::Serialize for $name {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                $wrapper::Value($body {
+                serde::Serialize::serialize(&$wrapper::Value($body {
                     $($field: self.$field.clone(),)*
-                })
-                .serialize(serializer)
+                }), serializer)
+
             }
         }
 
-        impl<'de> Deserialize<'de> for $name {
+        impl<'de> serde::Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let $wrapper::Value(body) = $wrapper::deserialize(deserializer)?;
+                let $wrapper::Value(body) = <$wrapper as serde::Deserialize>::deserialize(deserializer)?;
                 Ok($name {
                     $($field: body.$field,)*
                 })
@@ -53,5 +54,3 @@ macro_rules! tagged_struct {
         }
     };
 }
-
-pub(crate) use tagged_struct;

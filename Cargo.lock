@@ -1955,6 +1955,7 @@ dependencies = [
  "quail-cost",
  "quail-datafusion",
  "quail-physical",
+ "quail-planner",
  "tokio",
 ]
 
@@ -1962,6 +1963,16 @@ dependencies = [
 name = "quail-physical"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "quail-planner"
+version = "0.1.0"
+dependencies = [
+ "quail-cost",
+ "quail-physical",
  "serde",
  "serde_json",
 ]

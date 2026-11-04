@@ -1,10 +1,9 @@
 //! The specs an AI node carries: its prompt as token ids, and its plan
 //! estimates.
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::tagged::tagged_struct;
+use crate::tagged_struct;
 
 /// Token ids, as the tokenizer returns them.
 pub type TokenIds = Vec<i64>;

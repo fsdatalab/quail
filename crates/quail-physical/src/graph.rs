@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::nodes::{NestedNode, PhysicalNode};
-use crate::tagged::tagged_struct;
+use crate::tagged_struct;
 
 /// What a port carries between two nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

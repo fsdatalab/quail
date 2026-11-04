@@ -10,6 +10,7 @@ expression tree, decodes to the class that was encoded.
 
 from __future__ import annotations
 
+import base64
 import types
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
@@ -17,6 +18,7 @@ from importlib import import_module
 from typing import Any, Mapping, Union, get_args, get_origin, get_type_hints
 
 import numpy as np
+import pyarrow as pa
 
 from .base import PhysicalGraph, PhysicalNode, PortRef
 from .nodes import (
@@ -43,6 +45,8 @@ from .nodes import (
 )
 
 TYPE_KEY = "type"
+# the tag of an Arrow schema, which is written as IPC bytes in base64
+SCHEMA_TAG = "pyarrow.Schema"
 # Old module -> new module, for tags in plans saved before a class moved.
 MOVED_MODULES = {"quail.logical.expressions": "quail.common.expressions"}
 _SCALARS = (str, int, float, bool)
@@ -60,6 +64,9 @@ def encode_value(value):
         return {key: encode_value(item) for key, item in value.items()}
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, pa.Schema):
+        return {TYPE_KEY: SCHEMA_TAG,
+                "ipc": base64.b64encode(value.serialize().to_pybytes()).decode()}
     if value is None or isinstance(value, _SCALARS):
         return value
     raise TypeError(f"cannot encode a {type(value).__name__} value")
@@ -80,6 +87,9 @@ def decode_value(annotation, value):
     """
     origin = get_origin(annotation)
     if annotation is Any or annotation is object:
+        return _decode_untyped(value)
+    if getattr(annotation, "_is_protocol", False):
+        # a protocol, such as LogicalNode: the tag names the class
         return _decode_untyped(value)
     if origin in (Union, types.UnionType):
         return _decode_union(get_args(annotation), value)
@@ -184,7 +194,20 @@ def _decode_union(members, value):
 def _decode_untyped(value):
     if isinstance(value, list):
         return tuple(_decode_untyped(item) for item in value)
+    if isinstance(value, Mapping) and value.get(TYPE_KEY) == SCHEMA_TAG:
+        return pa.ipc.read_schema(pa.py_buffer(base64.b64decode(value["ipc"])))
+    if isinstance(value, Mapping) and (kind := _dataclass_tag(value.get(TYPE_KEY))):
+        return decode_fields(kind, value)
     return value
+
+
+def _dataclass_tag(tag) -> type | None:
+    """The dataclass a module-qualified tag names, or None for other values."""
+    module, _, name = str(tag).rpartition(".")
+    if not isinstance(tag, str) or not module.startswith("quail."):
+        return None
+    kind = _tagged_type(tag, object)
+    return kind if is_dataclass(kind) else None
 
 
 @dataclass(frozen=True)

@@ -11,8 +11,10 @@ mod specs;
 mod tagged;
 
 pub use expressions::{
-    Alias, ColumnRef, Condition, Connective, GetField, Literal, ModelCall, Not, Projected,
-    RegularPredicate, ScalarFunction, ValueExpression, WindowCall,
+    AggregateCall, Alias, Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct,
+    FilterPredicate, GetField, HavingTest, Literal, ModelCall, Not, Projected, Prompt,
+    RegularPredicate, ScalarFunction, SortExpression, SortKey, TaggedModelCall, ValueExpression,
+    WindowCall,
 };
 pub use graph::{InputPort, NestedGraph, PhysicalGraph, PlanEnvelope, PortRef, ValueType};
 pub use nodes::*;

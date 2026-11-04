@@ -5,6 +5,7 @@ members = [
     "crates/quail-datafusion",
     "crates/quail-native",
     "crates/quail-physical",
+    "crates/quail-planner",
 ]
 
 # Full debug info for DataFusion's dependency tree takes many gigabytes.

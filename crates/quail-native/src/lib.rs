@@ -243,9 +243,22 @@ fn read_and_write_plan(text: &str) -> PyResult<String> {
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
 }
 
+/// Read a logical plan written by the Python codec into the Rust types
+/// and write it back.
+///
+/// Raises a ValueError when the plan does not fit the Rust types.
+#[pyfunction]
+fn read_and_write_logical_plan(text: &str) -> PyResult<String> {
+    let plan = quail_planner::read_logical_plan(text)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    quail_planner::write_logical_plan(&plan)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContext>()?;
     module.add_class::<cost::CostModel>()?;
+    module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }

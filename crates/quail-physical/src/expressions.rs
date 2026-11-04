@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::tagged::tagged_struct;
+use crate::tagged_struct;
 
 /// A value computed from one row's columns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,12 +84,36 @@ pub struct Alias {
     pub name: String,
 }
 
+tagged_struct! {
+    /// The text of one model call, laid out for a model's prompt format.
+    Prompt(PromptFields, PromptTagged) = "quail.common.expressions.Prompt" | "quail.logical.expressions.Prompt" {
+        template: String,
+        /// Column references in placeholder order.
+        args: Vec<ValueExpression>,
+        preamble: String,
+        tail: String,
+        frame: String,
+        frame_text: String,
+        kind: String,
+        layout: String,
+        tail_segments: Vec<String>,
+        /// Per placeholder: alias, its label text, its frame text.
+        label_texts: Vec<(String, String, String)>,
+        label_prefix: String,
+        categories: Vec<String>,
+        descriptions: Vec<String>,
+        task_description: String,
+        turn: (String, String),
+        source: String,
+        letters: Vec<String>,
+    }
+}
+
 /// One prompt asked of every row; the model answers with a value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCall {
-    /// The `Prompt`, kept as written: its argument tuples are untyped.
-    pub prompt: Value,
+    pub prompt: Box<Prompt>,
     pub kind: String,
     pub labels: Value,
     pub descriptions: Value,
@@ -166,4 +190,92 @@ tagged_struct! {
 pub enum Projected {
     Name(String),
     Expression(ValueExpression),
+}
+
+/// A model call, written with its class tag where a field holds one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TaggedModelCall {
+    #[serde(
+        rename = "quail.common.expressions.ModelCall",
+        alias = "quail.logical.expressions.ModelCall"
+    )]
+    Call(ModelCall),
+}
+
+/// What a semantic filter or join asks: a yes-or-no model call, or a
+/// comparison of an `AI.SCORE` call with a constant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Asked {
+    #[serde(
+        rename = "quail.common.expressions.ModelCall",
+        alias = "quail.logical.expressions.ModelCall"
+    )]
+    Call(ModelCall),
+    #[serde(
+        rename = "quail.common.expressions.RegularPredicate",
+        alias = "quail.logical.expressions.RegularPredicate"
+    )]
+    Compare(RegularPredicate),
+}
+
+tagged_struct! {
+    /// One `AI.IF` predicate of a semantic filter.
+    FilterPredicate(FilterPredicateFields, FilterPredicateTagged) = "quail.common.expressions.FilterPredicate" | "quail.logical.expressions.FilterPredicate" {
+        expression: Asked,
+        /// The fraction of documents that pass, if the query gives one.
+        selectivity: Option<f64>,
+    }
+}
+
+tagged_struct! {
+    /// An equality between a value of one table and a value of another.
+    Equality(EqualityFields, EqualityTagged) = "quail.common.expressions.Equality" | "quail.logical.expressions.Equality" {
+        left: ValueExpression,
+        right: ValueExpression,
+    }
+}
+
+tagged_struct! {
+    /// One aggregate function call.
+    AggregateCall(AggregateCallFields, AggregateCallTagged) = "quail.common.expressions.AggregateCall" | "quail.logical.expressions.AggregateCall" {
+        function: String,
+        argument: Option<String>,
+        name: String,
+    }
+}
+
+tagged_struct! {
+    /// One `HAVING` comparison of an aggregate with a constant.
+    HavingTest(HavingTestFields, HavingTestTagged) = "quail.common.expressions.HavingTest" | "quail.logical.expressions.HavingTest" {
+        aggregate: AggregateCall,
+        comparison: String,
+        value: Value,
+    }
+}
+
+/// What a sort key orders by.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SortExpression {
+    Value(ValueExpression),
+    Aggregate(AggregateCall),
+}
+
+tagged_struct! {
+    /// One `ORDER BY` key.
+    SortKey(SortKeyFields, SortKeyTagged) = "quail.common.expressions.SortKey" | "quail.logical.expressions.SortKey" {
+        expression: SortExpression,
+        descending: bool,
+        nulls_first: bool,
+    }
+}
+
+tagged_struct! {
+    /// The struct column of an `AI.EXTRACT` call and its fields.
+    ExtractStruct(ExtractStructFields, ExtractStructTagged) = "quail.common.expressions.ExtractStruct" | "quail.logical.expressions.ExtractStruct" {
+        name: String,
+        fields: Vec<String>,
+    }
 }
