@@ -241,12 +241,13 @@ def checked_compile_sql(native, original, path=None):
             message = str(error)
             raise
         finally:
-            if str(dialect).lower().endswith("snowflake") and not (
-                    plan is not None and isinstance(plan.root, WithCTE)):
+            if str(dialect).lower().endswith("snowflake"):
                 outcome = binder_outcome(native, sql, catalog, binder, plan, message)
                 if path:
+                    staged = plan is not None and isinstance(plan.root, WithCTE)
                     with open(path, "a") as log:
-                        log.write(json.dumps({"sql": sql, "outcome": outcome}) + "\n")
+                        log.write(json.dumps({"sql": sql, "outcome": outcome,
+                                              "staged": staged}) + "\n")
                 check_outcome(outcome, accepted=message is None)
         return plan
 

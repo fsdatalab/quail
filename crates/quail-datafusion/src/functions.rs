@@ -160,8 +160,8 @@ fn extract_type(arg_fields: &[FieldRef], answer: DataType) -> Result<DataType> {
 /// The position of one answer: its first and past-the-end characters.
 fn span_type() -> DataType {
     DataType::Struct(Fields::from(vec![
-        Field::new("start", DataType::Int32, false),
-        Field::new("end", DataType::Int32, false),
+        Field::new("start", DataType::Int32, true),
+        Field::new("end", DataType::Int32, true),
     ]))
 }
 

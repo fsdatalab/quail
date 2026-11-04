@@ -53,8 +53,17 @@ pub fn bind_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
-    let (place, project) = bind_select(plan, turn, layout)?;
-    build_select(place, &project)
+    let (place, project, stages) = bind_with_stages(plan, turn, layout)?;
+    let built = build_select(place, &project)?;
+    if stages.is_empty() {
+        return Ok(built);
+    }
+    Ok(quail_planner::LogicalPlan {
+        root: LogicalNode::WithCte(quail_planner::logical::WithCte {
+            input: Box::new(built.root),
+            ctes: stages,
+        }),
+    })
 }
 
 /// Bind a region's plan into the logical plan builder's arguments.
@@ -67,6 +76,21 @@ pub fn bind_select(
     turn: &Turn,
     layout: &str,
 ) -> Result<(PlaceRelationArguments, ProjectArguments), CompileError> {
+    let (place, project, stages) = bind_with_stages(plan, turn, layout)?;
+    if !stages.is_empty() {
+        return unsupported("a CTE that runs as its own stage");
+    }
+    Ok((place, project))
+}
+
+/// A CTE or FROM subquery that runs as its own stage: its name and plan.
+type Stage = (String, LogicalNode);
+
+fn bind_with_stages(
+    plan: &LogicalPlan,
+    turn: &Turn,
+    layout: &str,
+) -> Result<(PlaceRelationArguments, ProjectArguments, Vec<Stage>), CompileError> {
     let mut select = Select::read(plan)?;
     let unnests = select.take_unnests();
     let mut binder = Binder {
@@ -80,6 +104,7 @@ pub fn bind_select(
         conditions: Vec::new(),
         selected: Vec::new(),
         outputs: select.outputs.clone(),
+        stages: Vec::new(),
     };
     binder.selected = select
         .projection
@@ -144,7 +169,7 @@ pub fn bind_select(
             .collect(),
         unnest_outer: unnests.iter().map(|unnest| unnest.outer).collect(),
     };
-    Ok((place, project))
+    Ok((place, project, binder.stages))
 }
 
 // ---------------------------------------------------------------- the SELECT
@@ -764,6 +789,8 @@ struct Binder {
     selected: Vec<(String, Expr)>,
     /// Output column name -> the group, aggregate, or window expression.
     outputs: Vec<(String, Expr)>,
+    /// The stages FROM reads, in dependency order.
+    stages: Vec<Stage>,
 }
 
 /// A join's ON parts before they join the query's parts.
@@ -815,6 +842,50 @@ impl Binder {
         }
     }
 
+    /// Read a table reference, or bind a FROM subquery as its own stage
+    /// and read the stage's result as a table named by the CTE name or
+    /// the subquery alias, as the front end's `_compile_stage` does.
+    fn table_or_stage(
+        &mut self,
+        plan: &LogicalPlan,
+    ) -> Result<Option<(String, String, SchemaRef)>, CompileError> {
+        if let Some(table) = Self::table_of(plan) {
+            return Ok(Some(table));
+        }
+        let LogicalPlan::SubqueryAlias(alias) = plan else {
+            return Ok(None);
+        };
+        let reference = alias.alias.table().to_string();
+        // `FROM clauses x` reads the CTE `clauses` under the alias `x`
+        let (name, body) = match alias.input.as_ref() {
+            LogicalPlan::SubqueryAlias(cte) => (cte.alias.table().to_string(), cte.input.as_ref()),
+            body => (reference.clone(), body),
+        };
+        // a CTE two queries read runs once
+        if self.stages.iter().any(|(found, _)| *found == name)
+            && let Some(schema) = self.schemas.get(&name)
+        {
+            return Ok(Some((reference, name, schema.clone())));
+        }
+        if self.provider_named(&name) {
+            return compile_error(format!(
+                "{} names a registered table or another CTE; pick another name",
+                repr_str(&name)
+            ));
+        }
+        let (place, project, inner) = bind_with_stages(body, &self.turn, &self.layout)?;
+        let built = build_select(place, &project)?;
+        let schema = stage_schema(body)?;
+        self.stages.extend(inner);
+        self.stages.push((name.clone(), built.root));
+        Ok(Some((reference, name, schema)))
+    }
+
+    fn provider_named(&self, name: &str) -> bool {
+        self.stages.iter().any(|(found, _)| found == name)
+            || self.tables.iter().any(|(_, provider)| provider == name)
+    }
+
     /// Bind FROM and JOIN in table order; return each table's Scan.
     fn bind_tables(&mut self, relation: &LogicalPlan) -> Result<Vec<String>, CompileError> {
         let mut joins: Vec<JoinOn> = Vec::new();
@@ -836,7 +907,7 @@ impl Binder {
                             "only plain JOIN is supported, got {join_type} JOIN"
                         ));
                     }
-                    let Some(table) = Self::table_of(right) else {
+                    let Some(table) = self.table_or_stage(right)? else {
                         return compile_error("JOIN must name one registered provider");
                     };
                     joins.push(JoinOn {
@@ -848,10 +919,7 @@ impl Binder {
                     node = left;
                 }
                 other => {
-                    let Some(table) = Self::table_of(other) else {
-                        if let LogicalPlan::SubqueryAlias(_) = other {
-                            return unsupported("a subquery in FROM");
-                        }
+                    let Some(table) = self.table_or_stage(other)? else {
                         return compile_error("FROM must name one registered provider");
                     };
                     tables.push(table);
@@ -3200,4 +3268,52 @@ fn feature_schema() -> SchemaRef {
         datafusion::arrow::datatypes::Field::new("feature", DataType::Int32, true),
         datafusion::arrow::datatypes::Field::new("strength", DataType::Float32, true),
     ]))
+}
+
+/// The schema of a stage's result, named as a CTE's columns, as
+/// `cte_schema`: a projected column by its column alone, an unnested
+/// field by its field alone, every other column by its AS name.
+fn stage_schema(body: &LogicalPlan) -> Result<SchemaRef, CompileError> {
+    let mut node = body;
+    let exprs = loop {
+        match node {
+            LogicalPlan::Projection(projection) => break projection.expr.clone(),
+            LogicalPlan::Limit(found) => node = &found.input,
+            LogicalPlan::Sort(found) => node = &found.input,
+            LogicalPlan::Distinct(Distinct::All(input)) => node = input,
+            _ => return unsupported("a CTE without a SELECT list"),
+        }
+    };
+    let mut fields = Vec::new();
+    for (expr, field) in exprs.iter().zip(body.schema().fields()) {
+        let name = match expr {
+            Expr::Column(column) => column.name.clone(),
+            Expr::Alias(alias) => alias.name.clone(),
+            Expr::ScalarFunction(call) if call.name() == crate::UNNEST_FIELD => {
+                string_literal(&call.args[2]).unwrap_or_default()
+            }
+            other => {
+                return compile_error(format!(
+                    "{other} in a CTE needs an AS name; a later query reads the column by that name"
+                ));
+            }
+        };
+        fields.push(field.as_ref().clone().with_name(name));
+    }
+    let names: Vec<&String> = fields.iter().map(|field| field.name()).collect();
+    if names
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != names.len()
+    {
+        let listed: Vec<String> = names.iter().map(|name| repr_str(name)).collect();
+        return compile_error(format!(
+            "the CTE returns a column name twice: [{}]; give one an AS name",
+            listed.join(", ")
+        ));
+    }
+    Ok(std::sync::Arc::new(
+        datafusion::arrow::datatypes::Schema::new(fields),
+    ))
 }
