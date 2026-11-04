@@ -109,7 +109,7 @@ pub fn arena_capacity(context: &PlanningContext, chunk: i64) -> Result<i64, Comp
             longest = Some(mean);
         }
     }
-    let (full, _) =
-        arena_pages(&context.model, &context.device, Some(chunk), longest).map_err(CompileError)?;
+    let (full, _) = arena_pages(&context.model, &context.device, Some(chunk), longest)
+        .map_err(CompileError::new)?;
     Ok(full * context.device.page_tokens)
 }

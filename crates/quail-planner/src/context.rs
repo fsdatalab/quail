@@ -31,6 +31,12 @@ pub struct PlanningContext<'a> {
     pub order: Option<String>,
     /// The logical plan being planned, if any.
     pub logical_plan: Option<LogicalPlan>,
+    /// alias -> whether each document is the first of its text, for a
+    /// table with copies.
+    pub first_documents: BTreeMap<String, Vec<bool>>,
+    /// alias -> per document, the prefix tokens in whole KV pages an
+    /// earlier document also has.
+    pub page_shared: BTreeMap<String, Vec<i64>>,
 }
 
 impl PlanningContext<'_> {
@@ -56,6 +62,18 @@ impl PlanningContext<'_> {
         lower_prompt(prompt, self.tokenizer)
     }
 
+    /// Which of an alias's documents the model is asked about, as
+    /// `key_documents`; None when it is asked about every one.
+    pub fn key_documents(&self, alias: &str) -> Option<&[bool]> {
+        if self.model.canvas_tokens != 0 {
+            return None;
+        }
+        self.first_documents
+            .get(alias)
+            .map(Vec::as_slice)
+            .filter(|keys| !keys.iter().all(|key| *key))
+    }
+
     /// Each document's token count for one table alias.
     ///
     /// # Errors
@@ -65,6 +83,6 @@ impl PlanningContext<'_> {
         self.document_tokens
             .get(alias)
             .map(Vec::as_slice)
-            .ok_or_else(|| CompileError(format!("no document token counts for {alias:?}")))
+            .ok_or_else(|| CompileError::new(format!("no document token counts for {alias:?}")))
     }
 }

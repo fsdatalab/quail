@@ -13,7 +13,9 @@ use quail_physical::{ExtractSpec, MapSpec, ModelCall, Prompt, SaeFeaturesSpec};
 use serde::Serialize;
 
 use crate::context::PlanningContext;
-use crate::expressions::{CompileError, argument_alias, column_name, compile_error, repr_str};
+use crate::expressions::{
+    CompileError, Refusal, argument_alias, column_name, compile_error, repr_str,
+};
 use crate::logical::{LogicalNode, SemanticColumn};
 use crate::lowering::read_slot_offsets;
 use crate::nodes::{column_alias, column_call};
@@ -185,7 +187,7 @@ fn extract_spec(
         device,
         context.gpus,
     )
-    .map_err(CompileError)?;
+    .map_err(CompileError::new)?;
     spec.estimated_seconds = cost.seconds;
     Ok(spec)
 }
@@ -230,7 +232,7 @@ pub fn map_seconds(
         &context.device,
         context.gpus,
     )
-    .map_err(CompileError)?
+    .map_err(CompileError::new)?
     .seconds)
 }
 
@@ -267,10 +269,16 @@ fn sae_features_spec(
 ) -> Result<SaeFeaturesSpec, CompileError> {
     let model = &context.model;
     if model.sae.is_none() {
-        return compile_error(format!(
-            "AI.SAE_FEATURES needs a model loaded with an SAE; {} has none",
-            repr_str(&model.name)
-        ));
+        return Err(CompileError::refused(Refusal::new(
+            format!(
+                "AI.SAE_FEATURES needs a model loaded with an SAE; {} has none",
+                repr_str(&model.name)
+            ),
+            "unsupported_sae_features_query",
+            1.0,
+            0.0,
+            "queries",
+        )));
     }
     let call = column_call(column);
     let alias = column_alias(column);

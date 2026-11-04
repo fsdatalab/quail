@@ -106,7 +106,7 @@ fn rewrites(
             None => vec![root.clone()],
         },
         other => {
-            return Err(CompileError(format!("unknown logical rule {other:?}")));
+            return Err(CompileError::new(format!("unknown logical rule {other:?}")));
         }
     })
 }

@@ -14,9 +14,51 @@ use serde_json::Value;
 
 use crate::arrow_functions::ARROW_FUNCTIONS;
 
-/// A query that is malformed or outside the language.
+/// A query that is malformed or outside the language, or a plan the
+/// configuration cannot run, with its refusal.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CompileError(pub String);
+pub struct CompileError(pub String, pub Option<Box<Refusal>>);
+
+impl CompileError {
+    /// An error with the message and no refusal.
+    pub fn new(message: impl Into<String>) -> Self {
+        CompileError(message.into(), None)
+    }
+
+    /// An error carrying a refusal; its message is the first reason.
+    pub fn refused(refusal: Refusal) -> Self {
+        CompileError(refusal.reasons[0].clone(), Some(Box::new(refusal)))
+    }
+}
+
+/// A plan the configuration cannot run within its limits, as `Refusal`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refusal {
+    pub reasons: Vec<String>,
+    pub constraint: String,
+    pub needed: f64,
+    pub available: f64,
+    pub unit: String,
+}
+
+impl Refusal {
+    /// A refusal with one reason.
+    pub fn new(
+        reason: impl Into<String>,
+        constraint: &str,
+        needed: f64,
+        available: f64,
+        unit: &str,
+    ) -> Self {
+        Refusal {
+            reasons: vec![reason.into()],
+            constraint: constraint.to_string(),
+            needed,
+            available,
+            unit: unit.to_string(),
+        }
+    }
+}
 
 impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -28,7 +70,7 @@ impl std::error::Error for CompileError {}
 
 /// Return a `CompileError` with the message.
 pub fn compile_error<T>(message: impl Into<String>) -> Result<T, CompileError> {
-    Err(CompileError(message.into()))
+    Err(CompileError::new(message))
 }
 
 pub const SPAN_SUFFIX: &str = "_span";

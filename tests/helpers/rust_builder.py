@@ -834,3 +834,111 @@ def shadow_operator_order(native, original):
         return found
 
     return choose_operator_order
+
+
+# node attribute and spec fields that hold token ids
+_TOKEN_FIELDS = ("question_token_ids", "document_head", "question_header_token_ids",
+                 "frame_token_ids", "tail_token_ids", "prompt_token_parts",
+                 "join_layout")
+
+
+def _interned_tokens(value, intern):
+    """A node's or spec's fields with their token ids interned."""
+    if isinstance(value, list):
+        return [_interned_tokens(item, intern) for item in value]
+    if not isinstance(value, dict):
+        return value
+    out = {}
+    for key, item in value.items():
+        if key in _TOKEN_FIELDS and item is not None:
+            out[key] = _interned(item, intern)
+        elif key == "label_token_ids" and item:
+            # a spec's are id lists; an AiJoin's are (alias, ids) pairs
+            out[key] = (_interned(item, intern) if "type" in value
+                        else [[alias, _interned(ids, intern)] for alias, ids in item])
+        else:
+            out[key] = _interned_tokens(item, intern)
+    return out
+
+
+def _first_documents(context) -> dict:
+    """Map each alias with copies to whether each document is its text's first."""
+    import numpy as np
+
+    found = {}
+    for alias, lengths in context.document_tokens.items():
+        store = getattr(lengths, "store", None)
+        if store is None:
+            continue
+        first = store.first_documents.to_numpy()
+        keys = first == np.arange(len(first))
+        if not keys.all():
+            found[alias] = keys.tolist()
+    return found
+
+
+def _candidate_fields(candidate, intern) -> dict:
+    """A plan_region candidate as the Rust binding writes it."""
+    from quail.physical.codec import built_in_codecs
+    from quail.planner.plan import Refusal
+
+    plan = candidate.plan
+    if isinstance(plan, Refusal):
+        return {"refusal": {"reasons": list(plan.reasons),
+                            "constraint": plan.constraint,
+                            "needed": float(plan.needed),
+                            "available": float(plan.available), "unit": plan.unit}}
+    codecs = {codec.type_name: codec for codec in built_in_codecs()}
+    envelope = json.loads(json.dumps(plan.to_envelope(codecs)))
+    envelope["graph"] = _interned_tokens(envelope["graph"], intern)
+    for key in ("true_ids", "false_ids"):
+        if key in envelope["settings"]:
+            envelope["settings"][key] = _interned(envelope["settings"][key], intern)
+    return {"envelope": envelope, "estimated_seconds": float(plan.estimated_seconds),
+            "estimates": json.loads(json.dumps(dict(plan.estimates)))}
+
+
+def shadow_plan_region(native, original):
+    """Return plan_region, also building the plan in Rust."""
+    import numpy as np
+
+    def plan_region(region, context):
+        if context.tokenizer is None or context.backend != "quail":
+            return original(region, context)
+        fields = json.loads(_context_json(context))
+        fields.update(
+            order=context.order,
+            pair_fractions={str(key): float(value)
+                            for key, value in (context.pair_fractions or {}).items()},
+            scan_fractions={alias: float(value)
+                            for alias, value in (context.scan_fractions or {}).items()},
+            document_tokens={alias: np.asarray(values).astype(int).tolist()
+                             for alias, values in context.document_tokens.items()},
+            first_documents=_first_documents(context))
+        intern, tokens, decode = _interning(context.tokenizer)
+        rust, message = native.plan_operator(
+            "plan_region", json.dumps(fields),
+            json.dumps({"plan": encode_value(region.logical_plan)}), tokens, decode)
+        try:
+            found = original(region, context)
+        except Exception:
+            assert message is not None, "Rust planned a region Python could not"
+            raise
+        assert message is None, f"Rust refused the region: {message}"
+        built, expected = json.loads(rust), _candidate_fields(found[0], intern)
+        # the answer ids are a set, sorted by word in Python and by id in Rust
+        for plan in (built, expected):
+            for key in ("true_ids", "false_ids"):
+                if key in plan.get("envelope", {}).get("settings", {}):
+                    plan["envelope"]["settings"][key].sort()
+        difference = same_values(built, expected)
+        if os.environ.get("QUAIL_RUST_OPERATOR_LOG"):
+            with open(os.environ["QUAIL_RUST_OPERATOR_LOG"], "a") as log:
+                log.write(f"plan_region {type(found[0].plan).__name__} "
+                          f"{'same' if difference is None else 'differs'} "
+                          f"{context.model.attention_mask} gpus={context.gpus} "
+                          f"copies={bool(fields['first_documents'])}\n")
+        assert difference is None, f"Rust built another plan: {difference}"
+        return found
+
+    return plan_region

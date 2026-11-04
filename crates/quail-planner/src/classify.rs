@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::context::PlanningContext;
-use crate::expressions::{CompileError, argument_alias, column_name, compile_error, repr_str};
+use crate::expressions::{CompileError, Refusal, argument_alias, column_name, repr_str};
 use crate::lowering::{
     Decoder, LoweredPrompt, Tokenizer, choice_token_parts, classify_prompt_tokens, lower_prompt,
     option_spellings,
@@ -71,15 +71,34 @@ pub fn word_starts(
     Ok(flags)
 }
 
+/// A classification no scoring rule can run, as `ClassifyRefusedError`.
+fn refused_with<T>(
+    reason: impl Into<String>,
+    needed: i64,
+    available: i64,
+) -> Result<T, CompileError> {
+    Err(CompileError::refused(Refusal::new(
+        reason,
+        "suffix_over_chunk",
+        needed as f64,
+        available as f64,
+        "tokens",
+    )))
+}
+
 fn refused<T>(reason: impl Into<String>) -> Result<T, CompileError> {
-    compile_error(reason)
+    refused_with(reason, 1, 0)
 }
 
 fn over_budget<T>(what: &str, need: i64, budget: i64) -> Result<T, CompileError> {
-    refused(format!(
-        "{what} needs {need} tokens with its classification prompt, but the forward pass \
-         budget is {budget} tokens"
-    ))
+    refused_with(
+        format!(
+            "{what} needs {need} tokens with its classification prompt, but the forward pass \
+             budget is {budget} tokens"
+        ),
+        need,
+        budget,
+    )
 }
 
 /// One table's lengths, model, and budgets for its classifications, as
@@ -243,7 +262,7 @@ impl ClassifyTable {
             self.draws,
             starts,
         )
-        .map_err(CompileError)
+        .map_err(CompileError::new)
     }
 
     /// The cost of a spec's chosen scoring rule on this table.
@@ -511,7 +530,7 @@ impl ClassifyTable {
         let partner_label = label_parts(&prompt, partner).0;
         let block = round_half_even(partner_tokens) as i64 + tail.len() as i64 - 1;
         let suffixes: Vec<i64> = suffix_lengths(LETTERS_SCORING, &labels, 0, 1, &[])
-            .map_err(CompileError)?
+            .map_err(CompileError::new)?
             .into_iter()
             .map(|length| block + length)
             .collect();

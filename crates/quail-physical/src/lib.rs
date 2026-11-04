@@ -9,6 +9,7 @@ mod graph;
 mod nodes;
 mod specs;
 mod tagged;
+mod topology;
 
 pub use expressions::{
     AggregateCall, Alias, Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct,
@@ -19,6 +20,10 @@ pub use expressions::{
 pub use graph::{InputPort, NestedGraph, PhysicalGraph, PlanEnvelope, PortRef, ValueType};
 pub use nodes::*;
 pub use specs::{ClassifySpec, ExtractSpec, MapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds};
+pub use topology::{
+    Pipelines, build_pipelines, groups_acyclic, input_ports, port, resident_inputs,
+    topological_nodes, value_type_for_port,
+};
 
 /// Read a plan envelope from JSON.
 pub fn read_plan(text: &str) -> serde_json::Result<PlanEnvelope> {

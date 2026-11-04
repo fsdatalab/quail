@@ -459,7 +459,7 @@ fn python_tokenizer<'py>(
         tokenizer
             .call1((text,))
             .and_then(|ids| ids.extract::<Vec<i64>>())
-            .map_err(|error| quail_planner::CompileError(error.value(py).to_string()))
+            .map_err(|error| quail_planner::CompileError::new(error.value(py).to_string()))
     }
 }
 
@@ -548,6 +548,10 @@ struct ContextFields {
     scan_fractions: std::collections::BTreeMap<String, f64>,
     #[serde(default)]
     order: Option<String>,
+    #[serde(default)]
+    first_documents: std::collections::BTreeMap<String, Vec<bool>>,
+    #[serde(default)]
+    page_shared: std::collections::BTreeMap<String, Vec<i64>>,
 }
 
 /// Run one operator planning function of `quail/planner/operators` in Rust.
@@ -572,7 +576,7 @@ fn plan_operator<'py>(
             decode
                 .call1((token,))
                 .and_then(|text| text.extract::<String>())
-                .map_err(|error| quail_planner::CompileError(error.value(py).to_string()))
+                .map_err(|error| quail_planner::CompileError::new(error.value(py).to_string()))
         }
     });
     let decoder_ref: Option<&quail_planner::lowering::Decoder> = decoder
@@ -596,6 +600,8 @@ fn plan_operator<'py>(
         scan_fractions: fields.scan_fractions,
         order: fields.order,
         logical_plan: fields.plan.map(json_value).transpose()?,
+        first_documents: fields.first_documents,
+        page_shared: fields.page_shared,
     };
     let arguments: serde_json::Value = from_json(arguments)?;
     let get = |key: &str| arguments[key].clone();
@@ -743,6 +749,19 @@ fn plan_operator<'py>(
                     .map(|found| operator_order_fields(&found)),
             )
         }
+        "plan_region" => {
+            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
+            lowering_result(
+                quail_planner::graph::plan_region(&plan, &context).map(|found| match found {
+                    Ok(physical) => serde_json::json!({
+                        "envelope": physical.envelope(),
+                        "estimated_seconds": physical.estimated_seconds,
+                        "estimates": physical.estimates,
+                    }),
+                    Err(refusal) => refusal_fields(&refusal),
+                }),
+            )
+        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "no operator planning function {other}"
         ))),
@@ -754,18 +773,21 @@ fn json_value<T: serde::de::DeserializeOwned>(found: serde_json::Value) -> PyRes
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
 }
 
+/// A refusal, as the test helpers compare it.
+fn refusal_fields(refusal: &quail_planner::search::Refusal) -> serde_json::Value {
+    serde_json::json!({"refusal": {
+        "reasons": refusal.reasons, "constraint": refusal.constraint,
+        "needed": refusal.needed, "available": refusal.available, "unit": refusal.unit,
+    }})
+}
+
 /// An operator order, or its refusal, as the test helpers compare it.
 fn operator_order_fields(
     found: &Result<quail_planner::search::OperatorOrder, quail_planner::search::Refusal>,
 ) -> serde_json::Value {
     use quail_planner::search::StepKey;
     let order = match found {
-        Err(refusal) => {
-            return serde_json::json!({"refusal": {
-                "reasons": refusal.reasons, "constraint": refusal.constraint,
-                "needed": refusal.needed, "available": refusal.available, "unit": refusal.unit,
-            }});
-        }
+        Err(refusal) => return refusal_fields(refusal),
         Ok(order) => order,
     };
     let statistics = &order.statistics;

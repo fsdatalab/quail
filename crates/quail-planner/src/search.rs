@@ -103,7 +103,7 @@ pub fn resident_after(previous: &TableStep, step: &TableStep) -> bool {
     previous.document_head == step.document_head
 }
 
-fn column_step_kind(kind: &str) -> &'static str {
+pub fn column_step_kind(kind: &str) -> &'static str {
     match kind {
         "label" => "classify",
         "extract" => "extract",
@@ -224,7 +224,7 @@ pub fn table_steps(
 }
 
 /// The classification calls a filter tests or SELECT returns, as `LabelWork.calls`.
-fn label_calls(found: &Operators) -> Vec<(quail_physical::ModelCall, String)> {
+pub fn label_calls(found: &Operators) -> Vec<(quail_physical::ModelCall, String)> {
     let mut calls: Vec<(quail_physical::ModelCall, String)> = Vec::new();
     for (alias, tests) in &found.column_filters {
         for test in tests {
@@ -499,12 +499,12 @@ pub fn stage_work(
         return packed_join_work(
             spec, anchor, documents, tuples, lengths, pre, window, set_size,
         )
-        .map_err(CompileError);
+        .map_err(CompileError::new);
     }
     join_work(
         spec, anchor, documents, tuples, lengths, pre, resident, window,
     )
-    .map_err(CompileError)
+    .map_err(CompileError::new)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -892,15 +892,7 @@ pub struct OperatorOrder {
     pub order_source: String,
 }
 
-/// A plan the planner cannot run within the configuration's limits.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Refusal {
-    pub reasons: Vec<String>,
-    pub constraint: String,
-    pub needed: f64,
-    pub available: f64,
-    pub unit: String,
-}
+pub use crate::expressions::Refusal;
 
 /// The default stage order rule, as `default_order_rule`: (rule, source).
 pub fn default_order_rule(found: &Operators) -> (String, String) {

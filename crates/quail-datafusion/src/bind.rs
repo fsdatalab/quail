@@ -2573,7 +2573,7 @@ fn computed_value(expr: &Expr) -> bool {
 
 fn sql_literal(expr: &Expr) -> Result<Value, CompileError> {
     literal_value(expr).ok_or_else(|| {
-        CompileError(format!(
+        CompileError::new(format!(
             "a column is compared with a number, string, or boolean literal, got {expr}"
         ))
     })
@@ -2843,7 +2843,7 @@ fn translated(name: &str) -> bool {
 fn integer_argument(expr: &Expr, what: &str) -> Result<i64, CompileError> {
     literal_value(expr)
         .and_then(|value| value.as_i64())
-        .ok_or_else(|| CompileError(format!("{what} is an integer literal, got {expr}")))
+        .ok_or_else(|| CompileError::new(format!("{what} is an integer literal, got {expr}")))
 }
 
 /// The Arrow call a SQL function makes, as `sql_calls.translate`.

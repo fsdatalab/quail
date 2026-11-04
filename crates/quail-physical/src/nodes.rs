@@ -61,6 +61,36 @@ macro_rules! physical_nodes {
         pub enum NestedNode {
             $(#[serde(rename = $class)] $variant($flat),)*
         }
+
+        impl PhysicalNode {
+            /// The node's id.
+            pub fn id(&self) -> &str {
+                match self {
+                    $(PhysicalNode::$variant(node) => &node.id,)*
+                }
+            }
+
+            /// The node's input ports.
+            pub fn inputs(&self) -> &[InputPort] {
+                match self {
+                    $(PhysicalNode::$variant(node) => &node.inputs,)*
+                }
+            }
+
+            /// The node's input ports, to rewire.
+            pub fn inputs_mut(&mut self) -> &mut Vec<InputPort> {
+                match self {
+                    $(PhysicalNode::$variant(node) => &mut node.inputs,)*
+                }
+            }
+
+            /// The node's registered type name.
+            pub fn type_name(&self) -> &'static str {
+                match self {
+                    $(PhysicalNode::$variant(_) => $type_name,)*
+                }
+            }
+        }
     };
 }
 

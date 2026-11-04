@@ -95,6 +95,16 @@ def _rust_builder(monkeypatch):
                        if key.startswith("quail.") and module is not None]:
             if getattr(module, name, None) is original:
                 monkeypatch.setattr(module, name, shadow)
+    from helpers.rust_builder import shadow_plan_region
+
+    import quail.planner.lowering as region_module
+
+    original = region_module.plan_region
+    shadow = shadow_plan_region(_quail_native, original)
+    for module in [module for key, module in list(sys.modules.items())
+                   if key.startswith("quail.") and module is not None]:
+        if getattr(module, "plan_region", None) is original:
+            monkeypatch.setattr(module, "plan_region", shadow)
     for module in (query_module, optimize_module):
         monkeypatch.setattr(module, "logical_alternatives", shadow_logical_alternatives(
             _quail_native, module.logical_alternatives))
