@@ -109,6 +109,15 @@ def _rust_builder(monkeypatch):
 
     monkeypatch.setattr(optimize_module, "search_plan", shadow_search_plan(
         _quail_native, optimize_module.search_plan))
+    from helpers.rust_builder import shadow_speed_of_light
+
+    import quail
+    import quail.planner.sol.estimate as estimate_module
+
+    shadow = shadow_speed_of_light(
+        _quail_native, estimate_module.speed_of_light_estimate)
+    for module in (quail, estimate_module):
+        monkeypatch.setattr(module, "speed_of_light_estimate", shadow)
     for module in (query_module, optimize_module):
         monkeypatch.setattr(module, "logical_alternatives", shadow_logical_alternatives(
             _quail_native, module.logical_alternatives))

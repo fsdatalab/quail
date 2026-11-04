@@ -117,11 +117,19 @@ pub fn column_step_kind(kind: &str) -> &'static str {
 /// # Errors
 ///
 /// The tokenizer fails, or the arena does not fit the device.
+/// How a table's steps are priced: by the planner's operator planners,
+/// or, for the speed of light estimate, each as one question over the
+/// live documents under no prompt head.
+pub enum StepPricing<'a> {
+    Plan(&'a PlanStatistics),
+    Estimate { mean_tokens: f64, chunk: i64 },
+}
+
 pub fn table_steps(
     found: &Operators,
     alias: &str,
     asks: &[usize],
-    statistics: &PlanStatistics,
+    pricing: &StepPricing,
     context: &PlanningContext,
 ) -> Result<Vec<TableStep>, CompileError> {
     let mut steps = Vec::new();
@@ -131,17 +139,26 @@ pub fn table_steps(
         .find(|(owner, _)| owner == alias)
         .map(|(_, predicates)| predicates.clone())
         .unwrap_or_default();
-    let stats = statistics.stats[alias];
+    let (mean_tokens, chunk) = match pricing {
+        StepPricing::Plan(statistics) => (
+            statistics.pre as f64 + statistics.stats[alias].mean_document_tokens(),
+            statistics.chunk,
+        ),
+        StepPricing::Estimate { mean_tokens, chunk } => (*mean_tokens, *chunk),
+    };
+    let estimate = matches!(pricing, StepPricing::Estimate { .. });
+    let head = |prompt: &Prompt| -> Result<Vec<i64>, CompileError> {
+        if estimate {
+            Ok(Vec::new())
+        } else {
+            Ok(context.lowered(prompt)?.preamble_token_ids)
+        }
+    };
     let chosen: Vec<_> = asks
         .iter()
         .map(|position| predicates[*position].clone())
         .collect();
-    let costs = prepare_filter_costs(
-        &chosen,
-        statistics.pre as f64 + stats.mean_document_tokens(),
-        statistics.chunk,
-        context,
-    )?;
+    let costs = prepare_filter_costs(&chosen, mean_tokens, chunk, context)?;
     for (position, cost) in asks.iter().zip(costs) {
         let prompt = &asked_call(&predicates[*position].expression).prompt;
         steps.push(TableStep {
@@ -151,7 +168,7 @@ pub fn table_steps(
             first: StepCost::Curve(cost.first),
             later: StepCost::Curve(cost.later),
             reuse_key: cost.reuse_key,
-            document_head: context.lowered(prompt)?.preamble_token_ids,
+            document_head: head(prompt)?,
         });
     }
     let mut tests: Vec<(String, Vec<f64>)> = Vec::new();
@@ -204,20 +221,39 @@ pub fn table_steps(
             .find(|(name, _)| *name == column.name)
             .map(|(_, found)| found.iter().product::<f64>())
             .unwrap_or(1.0);
+        let (first, later) = if estimate {
+            let tail = context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
+            let cost = |fresh: bool| {
+                StepCost::Curve(CostCurve::Linear(quail_cost::filters::filter_cost(
+                    tail,
+                    mean_tokens,
+                    &context.model,
+                    &context.device,
+                    chunk,
+                    fresh,
+                )))
+            };
+            (cost(true), cost(false))
+        } else {
+            (
+                StepCost::Column {
+                    node: Box::new(node.clone()),
+                    resident: false,
+                },
+                StepCost::Column {
+                    node: Box::new(node.clone()),
+                    resident: true,
+                },
+            )
+        };
         steps.push(TableStep {
             kind: column_step_kind(&call.kind),
             key: StepKey::Name(column.name.clone()),
             selectivity: survival,
-            first: StepCost::Column {
-                node: Box::new(node.clone()),
-                resident: false,
-            },
-            later: StepCost::Column {
-                node: Box::new(node.clone()),
-                resident: true,
-            },
+            first,
+            later,
             reuse_key: None,
-            document_head: context.lowered(&call.prompt)?.preamble_token_ids,
+            document_head: head(&call.prompt)?,
         });
     }
     Ok(steps)
@@ -991,7 +1027,13 @@ pub fn choose_operator_order(
             .map(|(_, p)| p.len())
             .unwrap_or(0);
         let positions: Vec<usize> = (0..count).collect();
-        let steps = table_steps(&found, &table.alias, &positions, &statistics, context)?;
+        let steps = table_steps(
+            &found,
+            &table.alias,
+            &positions,
+            &StepPricing::Plan(&statistics),
+            context,
+        )?;
         if steps.is_empty() {
             continue;
         }

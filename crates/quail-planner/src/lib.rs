@@ -42,6 +42,7 @@ pub mod retention;
 pub mod rules;
 pub mod scores;
 pub mod search;
+pub mod sol;
 pub mod statistics;
 pub mod validation;
 

@@ -263,3 +263,41 @@ def test_map_answers_decode_one_pass_per_token_and_share_their_document(tmp_path
         assert full.work.kv_read - base.work.kv_read == expected[shared]
 
 
+
+
+def _stand_in_answer(prompt, assignment):
+    """A fixed answer per prompt and rows: a bool, a label, or a span of text."""
+    import zlib
+
+    seed = zlib.crc32(f"{prompt.template}|{sorted(assignment.items())}".encode())
+    if prompt.kind == "label":
+        return prompt.categories[seed % len(prompt.categories)]
+    if prompt.kind in ("extract", "map"):
+        missing = prompt.kind == "extract" and seed % 4 == 0
+        return None if missing else f"span {seed % 7}"
+    return seed % 3 != 0
+
+
+def test_every_quail_b_query_gets_an_estimate_or_names_what_it_cannot_price():
+    from helpers.sessions import check_table
+
+    from quail_b.queries import queries
+    from tools.dump_check_queries import check_query_entries
+
+    config = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+    estimated, refused = 0, set()
+    for entry in check_query_entries(list(queries(include_draft=True))):
+        with quail.Session(config, tokenizer=str.split) as session:
+            for name, columns in entry["tables"].items():
+                session.register(name, DocumentProvider.from_table(
+                    check_table(columns), id_col="id"))
+            query = session.sql(entry["sql"])
+            try:
+                estimate = quail.speed_of_light_estimate(
+                    query, _stand_in_answer, label=_stand_in_answer)
+            except NotImplementedError as error:
+                refused.add(str(error).split(";")[0])
+                continue
+            assert estimate.seconds > 0
+            estimated += 1
+    assert estimated >= 40, (estimated, sorted(refused))

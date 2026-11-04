@@ -570,7 +570,7 @@ fn quail_backend() -> String {
 /// the function's other arguments. Returns (the result as JSON, None),
 /// or (None, the refusal's message).
 #[pyfunction]
-#[pyo3(signature = (name, context, arguments, tokenizer, decode=None))]
+#[pyo3(signature = (name, context, arguments, tokenizer, decode=None, callbacks=None))]
 fn plan_operator<'py>(
     py: Python<'py>,
     name: &str,
@@ -578,6 +578,7 @@ fn plan_operator<'py>(
     arguments: &str,
     tokenizer: Bound<'py, PyAny>,
     decode: Option<Bound<'py, PyAny>>,
+    callbacks: Option<Bound<'py, PyAny>>,
 ) -> PyResult<(Option<String>, Option<String>)> {
     use quail_planner::{classify, columns, costs, scores};
     let tokens = python_tokenizer(py, &tokenizer);
@@ -762,6 +763,65 @@ fn plan_operator<'py>(
                     .map(|found| operator_order_fields(&found)),
             )
         }
+        "speed_of_light" => {
+            let Some(callbacks) = callbacks else {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "the speed of light estimate needs its oracles",
+                ));
+            };
+            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
+            let inputs: quail_planner::sol::EstimateInputs = json_value(get("inputs"))?;
+            let failed =
+                |error: PyErr| quail_planner::CompileError::new(error.value(py).to_string());
+            let text = |method: &str, arguments: (String, String)| {
+                callbacks
+                    .call_method1(method, arguments)
+                    .and_then(|found| found.extract::<String>())
+                    .map_err(failed)
+            };
+            let parse = |text: String| {
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .map_err(|error| quail_planner::CompileError::new(error.to_string()))
+            };
+            let encode = |value: &dyn erased_json::Json| value.json();
+            let answer = |prompt: &quail_physical::Prompt,
+                          assignment: &quail_planner::sol::Assignment| {
+                parse(text(
+                    "answer",
+                    (encode(prompt), encode(&assignment.to_vec())),
+                )?)
+            };
+            let label = |prompt: &quail_physical::Prompt,
+                         assignment: &quail_planner::sol::Assignment| {
+                text("label", (encode(prompt), encode(&assignment.to_vec())))
+            };
+            let accepts = |condition: &quail_physical::Condition, values: &[serde_json::Value]| {
+                let found = parse(text(
+                    "accepts",
+                    (encode(condition), encode(&values.to_vec())),
+                )?)?;
+                serde_json::from_value::<Vec<bool>>(found)
+                    .map_err(|error| quail_planner::CompileError::new(error.to_string()))
+            };
+            let subset_shared = |alias: &str, rows: &[i64]| {
+                let found = parse(text(
+                    "subset_shared",
+                    (alias.to_string(), encode(&rows.to_vec())),
+                )?)?;
+                serde_json::from_value::<Vec<i64>>(found)
+                    .map_err(|error| quail_planner::CompileError::new(error.to_string()))
+            };
+            let has_label = callbacks.getattr("has_label")?.extract::<bool>()?;
+            let oracles = quail_planner::sol::Oracles {
+                answer: &answer,
+                label: if has_label { Some(&label) } else { None },
+                accepts: &accepts,
+                subset_shared: &subset_shared,
+            };
+            lowering_result(quail_planner::sol::speed_of_light_estimate(
+                &plan, &context, inputs, &oracles,
+            ))
+        }
         "search_plan" => {
             let alternatives: Vec<(quail_planner::LogicalPlan, Vec<String>)> =
                 json_value(get("alternatives"))?;
@@ -885,4 +945,18 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
+}
+
+/// Values the speed of light callbacks pass to Python as JSON text.
+mod erased_json {
+    /// A value written as JSON text.
+    pub trait Json {
+        fn json(&self) -> String;
+    }
+
+    impl<T: serde::Serialize> Json for T {
+        fn json(&self) -> String {
+            serde_json::to_string(self).expect("a JSON value")
+        }
+    }
 }

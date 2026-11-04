@@ -1088,3 +1088,138 @@ def _fired(plan) -> str:
     settings = plan.get("envelope", {}).get("settings", {})
     marks.update(key for key in ("deduplicate", "filter_limit") if key in settings)
     return ",".join(sorted(marks)) or "-"
+
+
+class _Oracles:
+    """The speed of light estimate's oracles, as the native module calls them."""
+
+    def __init__(self, answer, label, words, stores):
+        from quail.common.expressions import Prompt
+
+        self.has_label = label is not None
+        self._answer, self._label = answer, label
+        self._words, self._stores = words, stores
+        self._prompts = {}
+        self._prompt_type = Prompt
+
+    def _prompt(self, text):
+        from quail.physical.codec import decode_value
+
+        if text not in self._prompts:
+            self._prompts[text] = decode_value(self._prompt_type, json.loads(text))
+        return self._prompts[text]
+
+    @staticmethod
+    def _plain(value):
+        import numpy as np
+
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (list, tuple)):
+            return [_Oracles._plain(item) for item in value]
+        return value
+
+    def answer(self, prompt, assignment):
+        found = self._answer(self._prompt(prompt), dict(json.loads(assignment)))
+        return json.dumps(self._plain(found))
+
+    def label(self, prompt, assignment):
+        return str(self._label(self._prompt(prompt), dict(json.loads(assignment))))
+
+    def accepts(self, condition, values):
+        import pyarrow as pa
+
+        from quail.logical import condition_columns
+        from quail.physical.codec import decode_value
+
+        condition = decode_value(object, json.loads(condition))
+        (column,) = condition_columns(condition)
+        kept = condition.accepts(pa.table({column: pa.array(json.loads(values),
+                                                            pa.string())}))
+        return json.dumps(kept.to_pylist())
+
+    def subset_shared(self, alias, rows):
+        from quail.planner.statistics.prefixes import subset_shared_tokens
+
+        found = subset_shared_tokens(self._stores[alias].tokens, json.loads(rows))
+        return json.dumps([int(value) for value in found])
+
+
+def _estimate_inputs(query, answer, label, model, device, chunk, credit) -> dict:
+    """What the estimate reads from the query's tables, as Search gathers it."""
+    from quail.planner.sol.search import Search
+
+    search = Search(query, answer, label, model, device, chunk, credit)
+    return {
+        "aliases": [{"alias": alias, "column": data.column,
+                     "tokens": [int(token) for token in data.tokens],
+                     "shared": [int(token) for token in data.shared]}
+                    for alias, data in search.aliases.items()],
+        "stop_groups": {alias: [_Oracles._plain(list(key)) for key in keys]
+                        for alias, keys in search.stop_groups.items()},
+        "allowed_pairs": {
+            str(position): {
+                alias: [[int(key), [int(row) for row in groups.rows[
+                    groups.offsets[index]:groups.offsets[index + 1]]]]
+                        for index, key in enumerate(groups.keys)]
+                for alias, groups in by_alias.items()}
+            for position, by_alias in search.allowed_pairs.items()},
+        "order": query.order, "credit_shared": credit, "chunk_tokens": chunk,
+    }, search.stores
+
+
+def shadow_speed_of_light(native, original):
+    """Return speed_of_light_estimate, also estimating in Rust."""
+    from quail.common import budgets
+
+    def speed_of_light_estimate(query, answer, *, label=None, model=None,
+                                device=None, chunk_tokens=None,
+                                credit_shared_prefixes=True):
+        session = query.session
+        model = model or session.model
+        device = device or session.device
+        chunk = (budgets.chunk_budget(model, device) if chunk_tokens is None
+                 else chunk_tokens)
+        try:
+            found = original(query, answer, label=label, model=model, device=device,
+                             chunk_tokens=chunk_tokens,
+                             credit_shared_prefixes=credit_shared_prefixes)
+            error = None
+        except (NotImplementedError, ValueError) as raised:
+            found, error = None, raised
+        try:
+            inputs, stores = _estimate_inputs(query, answer, label, model, device,
+                                              chunk, credit_shared_prefixes)
+        except (NotImplementedError, ValueError):
+            inputs, stores = {"aliases": [], "stop_groups": {}, "allowed_pairs": {},
+                              "order": query.order,
+                              "credit_shared": credit_shared_prefixes,
+                              "chunk_tokens": chunk}, {}
+        intern, tokens, decode = _interning(session.tokenizer)
+        fields = {
+            "model": _untagged(encode_value(model)),
+            "device": _untagged(encode_value(device)),
+            "gpus": 1, "canvas_draws": 4,
+            "document_tokens": {data["alias"]: data["tokens"]
+                                for data in inputs["aliases"]},
+            "plan": None, "attention": None}
+        rust, message = native.plan_operator(
+            "speed_of_light", json.dumps(fields),
+            json.dumps({"plan": encode_value(query.logical), "inputs": inputs}),
+            tokens, decode, _Oracles(answer, label, intern, stores))
+        if error is not None:
+            assert message == f"{type(error).__name__}: {error}", (
+                f"Rust refused with {message!r}, Python with {error!r}")
+            raise error
+        assert message is None, f"Rust refused the estimate: {message}"
+        built = json.loads(rust)
+        expected = json.loads(json.dumps(found.as_dict(), default=_Oracles._plain))
+        difference = same_values(built, {key: expected[key] for key in built})
+        assert difference is None, f"Rust estimated otherwise: {difference}"
+        if os.environ.get("QUAIL_RUST_OPERATOR_LOG"):
+            with open(os.environ["QUAIL_RUST_OPERATOR_LOG"], "a") as log:
+                log.write(f"speed_of_light same joins={len(built['join_stages'])} "
+                          f"stages={len(built['filter_stages'])}\n")
+        return found
+
+    return speed_of_light_estimate
