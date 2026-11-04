@@ -157,3 +157,13 @@ def test_http_lifecycle_events_files_and_durable_submissions(make_client):
     assert_error(refused, 500, "volume commit failed")
     assert client.get("/v1/queries/e").status_code == 404, "no record was kept"
     assert client.get("/v1/queries/d").status_code == 200
+
+
+def test_a_query_needing_sql_around_its_model_region_is_refused_at_submission(
+        make_client):
+    client = make_client()
+    content_id = upload(client)
+    text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) "
+            "UNION ALL SELECT r.id FROM reviews r")
+    response = client.post("/v1/queries", json=submission(content_id, sql=text))
+    assert_error(response, 400, "needs SQL around its regions")
