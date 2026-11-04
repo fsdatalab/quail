@@ -4,13 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import pyarrow as pa
-
 from quail.logical.nodes.column import SemanticColumn, column_nodes
-
-# the Arrow type of one feature list
-FEATURE_LIST = pa.list_(
-    pa.struct([("feature", pa.int32()), ("strength", pa.float32())]))
 
 
 @dataclass(frozen=True)

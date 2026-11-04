@@ -373,6 +373,9 @@ PROBABILITIES_SUFFIX = "_probabilities"
 # an "extract" call's second result column: the answer's character
 # span in the document
 SPAN_SUFFIX = "_span"
+# the Arrow type of one feature list
+FEATURE_LIST = pa.list_(
+    pa.struct([("feature", pa.int32()), ("strength", pa.float32())]))
 
 
 @dataclass(frozen=True)

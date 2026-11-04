@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from quail.logical.expressions import Prompt
+from quail.common.expressions import Prompt
 from quail.logical.prompts import (
     LABEL_PREFIX,
     MAX_LETTERS,

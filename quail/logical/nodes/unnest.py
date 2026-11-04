@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
-from quail.logical.expressions import ColumnRef, CompileError, column_name
+from quail.common.expressions import ColumnRef, CompileError, column_name
 from quail.logical.nodes.base import LogicalNode
 
 

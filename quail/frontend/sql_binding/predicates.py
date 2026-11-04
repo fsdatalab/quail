@@ -16,13 +16,13 @@ from dataclasses import dataclass
 
 from sqlglot import exp
 
-from quail.frontend.sql_binding.sql_calls import TRANSLATED_NODES
-from quail.logical import And, ColumnRef, CompileError, Not, Or, RegularPredicate
-from quail.logical.expressions import (
+from quail.common.expressions import (
     SPAN_SUFFIX,
     column_expression,
     column_references,
 )
+from quail.frontend.sql_binding.sql_calls import TRANSLATED_NODES
+from quail.logical import And, ColumnRef, CompileError, Not, Or, RegularPredicate
 
 _PLAIN_COMPARISONS = {
     exp.EQ: "=",

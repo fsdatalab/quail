@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from quail.logical.expressions import column_name
+from quail.common.expressions import column_name
 from quail.logical.prompts import prompt_aliases
 from quail.physical.base import input_ports
 from quail.planner.prompt_lowering import LoweredPrompt

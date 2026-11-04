@@ -27,8 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from quail.logical.builder import JoinSpec, LogicalPlanBuilder
-from quail.logical.expressions import (
+from quail.common.expressions import (
     SPAN_SUFFIX,
     And,
     ColumnRef,
@@ -39,6 +38,7 @@ from quail.logical.expressions import (
     aliased_call,
     is_score,
 )
+from quail.logical.builder import JoinSpec, LogicalPlanBuilder
 from quail.logical.nodes import Filter, Join, Scan
 from quail.logical.placement import place_conditions
 

@@ -5,6 +5,10 @@ from __future__ import annotations
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from quail.common.expressions import (
+    column_references,
+    evaluate_expression,
+)
 from quail.common.pairs import columns_key, pair_table
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
@@ -15,10 +19,6 @@ from quail.execution.result import (
     true_answer_rows,
 )
 from quail.execution.rows import Rows, as_table
-from quail.logical.expressions import (
-    column_references,
-    evaluate_expression,
-)
 from quail.physical import (
     Barrier,
     Exchange,

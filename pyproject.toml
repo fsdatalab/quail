@@ -103,19 +103,10 @@ ignore_imports = [
     "quail.backends.quail.coordinator -> quail.planner",
     "quail.backends.quail.distributed -> quail.planner",
     "quail.backends.quail.executor.model_loading -> quail.planner.prompt_lowering",
-    "quail.backends.quail.executor.operators.classify -> quail.logical",
-    "quail.backends.quail.executor.operators.sae_features -> quail.logical",
-    "quail.backends.quail.executor.operators.set_classify -> quail.logical",
-    "quail.backends.quail.executor.parts -> quail.logical",
     "quail.backends.quail.executor.readout -> quail.planner.prompt_lowering",
     "quail.backends.quail.executor.runtime -> quail.cost.decode",
-    "quail.backends.quail.reranker -> quail.logical",
     "quail.backends.quail.retention -> quail.cost.retention",
     "quail.backends.quail.worker -> quail.planner.prompt_lowering",
-    "quail.execution.projection -> quail.logical",
-    "quail.execution.projection -> quail.logical.expressions",
-    "quail.execution.runtimes.dataflow -> quail.logical.expressions",
-    "quail.execution.runtimes.relational -> quail.logical.expressions",
 ]
 
 [tool.ruff]

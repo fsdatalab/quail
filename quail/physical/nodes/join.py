@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.logical.expressions import Expression
+from quail.common.expressions import Expression
 
 from ..base import (
     ExecutionLocation,

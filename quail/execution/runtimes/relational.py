@@ -8,6 +8,7 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail.common.expressions import evaluate_expression
 from quail.common.pairs import columns_key
 from quail.common.predicates import compare_literal
 from quail.common.selection import equality_keys
@@ -16,7 +17,6 @@ from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.rows import Rows, as_table
-from quail.logical.expressions import evaluate_expression
 from quail.physical import Aggregate, Limit, Project, Scan, Sort, Window
 
 

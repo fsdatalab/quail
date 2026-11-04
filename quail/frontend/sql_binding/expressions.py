@@ -3,6 +3,7 @@
 from sqlglot import exp
 
 from quail.catalog import Catalog
+from quail.common.expressions import validate_task_description
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
@@ -26,7 +27,6 @@ from quail.logical import (
     RegularPredicate,
     ScalarFunction,
 )
-from quail.logical.expressions import validate_task_description
 
 JOIN_OPTION_KEYS = {"selectivity", "anchor"}
 

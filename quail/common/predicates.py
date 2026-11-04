@@ -1,6 +1,6 @@
 """The Arrow kernels that compare a column with literals, one per comparison.
 
-RegularPredicate, in quail.logical.expressions, evaluates itself with
+RegularPredicate, in quail.common.expressions, evaluates itself with
 them.
 """
 

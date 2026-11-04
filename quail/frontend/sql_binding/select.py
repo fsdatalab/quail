@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from sqlglot import exp
 
+from quail.common.expressions import aliased_call
 from quail.frontend.sql_binding.expressions import (
     ExpressionBinder,
     _conjuncts,
@@ -28,7 +29,6 @@ from quail.logical import (
     WindowCall,
     column_name,
 )
-from quail.logical.expressions import aliased_call
 
 
 def _parse_limit(tree) -> int | None:

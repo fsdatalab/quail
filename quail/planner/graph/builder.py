@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field, replace
 from itertools import groupby
 
+from quail.common.expressions import aliased_call
 from quail.logical import (
     PROBABILITIES_SUFFIX,
     SPAN_SUFFIX,
@@ -15,7 +16,6 @@ from quail.logical import (
     is_score,
     oriented_join_conditions,
 )
-from quail.logical.expressions import aliased_call
 from quail.physical import (
     AiScore,
     Barrier,

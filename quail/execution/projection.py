@@ -5,21 +5,19 @@ import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
 
+from quail.common.expressions import (
+    CompileError,
+    aliased_call,
+    column_name,
+    column_references,
+    evaluate_expression,
+)
 from quail.common.pairs import pair_keys
 from quail.execution.result import (
     IndexRelation,
     QueryResult,
     StructEntry,
     true_answer_rows,
-)
-from quail.logical import (
-    CompileError,
-)
-from quail.logical.expressions import (
-    aliased_call,
-    column_name,
-    column_references,
-    evaluate_expression,
 )
 from quail.physical import Project, ValueType
 

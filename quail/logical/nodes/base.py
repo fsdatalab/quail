@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Protocol
 
-from quail.logical.expressions import ColumnRef
+from quail.common.expressions import ColumnRef
 
 
 class LogicalNode(Protocol):

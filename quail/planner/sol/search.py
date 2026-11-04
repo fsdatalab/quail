@@ -11,6 +11,7 @@ from typing import Callable, Mapping
 
 import pyarrow as pa
 
+from quail.common.expressions import column_name, evaluate_expression
 from quail.common.pairs import RowGroups, pair_table, partner_map
 from quail.common.work import Work, ask, scan
 from quail.cost.decode import DecodeCost
@@ -23,7 +24,6 @@ from quail.logical import (
     condition_columns,
     oriented_join_conditions,
 )
-from quail.logical.expressions import column_name, evaluate_expression
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed

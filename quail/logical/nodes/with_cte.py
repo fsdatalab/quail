@@ -3,7 +3,7 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
-from quail.logical.expressions import CompileError
+from quail.common.expressions import CompileError
 from quail.logical.nodes.base import LogicalNode
 
 

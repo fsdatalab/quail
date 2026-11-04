@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from quail.logical.expressions import (
+from quail.common.expressions import (
     PROBABILITIES_SUFFIX,
     CompileError,
     model_call,

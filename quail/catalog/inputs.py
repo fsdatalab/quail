@@ -21,18 +21,18 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.catalog.providers import Catalog, ScanRequest
+from quail.common.expressions import (
+    Alias,
+    column_name,
+    evaluate_expression,
+    source_columns,
+)
 from quail.common.tokens import (
     ColumnStoreWriter,
     ScanInput,
     TokenLengths,
     TokenOffsets,
     TokenStoreWriter,
-)
-from quail.logical.expressions import (
-    Alias,
-    column_name,
-    evaluate_expression,
-    source_columns,
 )
 from quail.progress import Progress, say
 

@@ -8,7 +8,7 @@ from typing import Any, Optional
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.logical.expressions import (
+from quail.common.expressions import (
     PROBABILITIES_SUFFIX,
     SPAN_SUFFIX,
     Alias,

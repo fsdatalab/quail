@@ -6,6 +6,7 @@ from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
+from quail.common.expressions import normalize
 from quail.common.selection import selected_rows
 from quail.logical import (
     And,
@@ -17,7 +18,6 @@ from quail.logical import (
     Scan,
 )
 from quail.logical import Filter as LogicalFilter
-from quail.logical.expressions import normalize
 
 REF = ColumnRef("r", "reviews", "stars")
 

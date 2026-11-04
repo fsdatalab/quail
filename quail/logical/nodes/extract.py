@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from quail.logical.expressions import SPAN_SUFFIX, CompileError
+from quail.common.expressions import SPAN_SUFFIX, CompileError
 from quail.logical.nodes.column import SemanticColumn
 
 

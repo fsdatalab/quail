@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar
 
-from quail.logical.expressions import (
+from quail.common.expressions import (
     CONDITION_TYPES,
     ColumnRef,
     CompileError,

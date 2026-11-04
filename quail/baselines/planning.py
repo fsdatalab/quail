@@ -15,6 +15,7 @@ from quail.baselines.nodes import (
     RequestMapSpec,
 )
 from quail.common import budgets
+from quail.common.expressions import aliased_call, packed_columns
 from quail.logical import (
     SPAN_SUFFIX,
     RegularPredicate,
@@ -24,7 +25,6 @@ from quail.logical import (
 )
 from quail.logical import Aggregate as LogicalAggregate
 from quail.logical import Window as LogicalWindow
-from quail.logical.expressions import aliased_call, packed_columns
 from quail.physical import (
     Limit,
     PortRef,

@@ -12,6 +12,11 @@ import pyarrow as pa
 from quail.api.execute import execute_query
 from quail.catalog import inputs
 from quail.catalog.providers import ScanRequest
+from quail.common.expressions import (
+    column_references,
+    evaluate_expression,
+    source_columns,
+)
 from quail.common.pairs import FIRST_DOCUMENT, columns_key, estimate_pair_fraction
 from quail.common.selection import selected_rows
 from quail.common.tokens import TokenLengths
@@ -27,11 +32,6 @@ from quail.logical import (
     WithCTE,
     join_conditions,
     oriented_join_conditions,
-)
-from quail.logical.expressions import (
-    column_references,
-    evaluate_expression,
-    source_columns,
 )
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan

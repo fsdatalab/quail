@@ -1,5 +1,6 @@
 """Logical query operators and their validation."""
 
+from quail.common.expressions import FEATURE_LIST
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import (
     SemanticClassify,
@@ -19,7 +20,6 @@ from quail.logical.nodes.relational import (
     reads_projection,
 )
 from quail.logical.nodes.sae_features import (
-    FEATURE_LIST,
     SemanticSaeFeatures,
     feature_calls,
 )

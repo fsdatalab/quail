@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Mapping
 
-from quail.logical.expressions import (
+from quail.common.expressions import (
     Alias,
     ColumnRef,
     CompileError,

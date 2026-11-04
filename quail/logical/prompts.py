@@ -3,7 +3,7 @@
 import json
 from dataclasses import dataclass
 
-from quail.logical.expressions import (
+from quail.common.expressions import (
     LABEL_PREFIX,
     CompileError,
     Prompt,

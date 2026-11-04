@@ -17,6 +17,7 @@ from sqlglot.optimizer.scope import Scope, ScopeType, traverse_scope
 from sqlglot.schema import MappingSchema
 
 from quail.catalog import Catalog, MemoryTableProvider
+from quail.common.expressions import aliased_call
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql_binding.expressions import (
     ExpressionBinder,
@@ -43,7 +44,6 @@ from quail.logical import (
     column_name,
     cte_schema,
 )
-from quail.logical.expressions import aliased_call
 from quail.logical.naive import Exists, Hint, place_relation, relation_tree
 
 FORBIDDEN = (

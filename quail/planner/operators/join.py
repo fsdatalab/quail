@@ -1,11 +1,11 @@
 """AI.IF over two tables: the joins as the cost model prices them."""
 
+from quail.common.expressions import column_name
 from quail.cost.joins import PricedJoin
 from quail.logical import (
     is_score,
     join_conditions,
 )
-from quail.logical.expressions import column_name
 from quail.logical.prompts import prompt_aliases
 from quail.physical import AiJoin, PortRef
 from quail.physical.base import input_ports

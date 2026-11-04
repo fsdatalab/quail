@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
-from quail.logical.expressions import (
+from quail.common.expressions import (
+    FEATURE_LIST,
     AggregateCall,
     Aggregation,
     Alias,
@@ -23,7 +24,6 @@ from quail.logical.expressions import (
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.column import SemanticColumn, column_nodes
 from quail.logical.nodes.filter import above_projection
-from quail.logical.nodes.sae_features import FEATURE_LIST
 
 
 def _named_schema(input: LogicalNode, output: tuple[str, ...]) -> tuple:

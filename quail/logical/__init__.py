@@ -1,10 +1,6 @@
 """Logical expressions, operators, prompts, and plan construction."""
 
-from quail.logical.builder import (
-    JoinSpec,
-    LogicalPlanBuilder,
-)
-from quail.logical.expressions import (
+from quail.common.expressions import (
     COLUMN_COMPARISONS,
     DEFAULT_MAP_ANSWER_TOKENS,
     DEFAULT_SELECTIVITY,
@@ -40,6 +36,10 @@ from quail.logical.expressions import (
     negate,
     normalize,
     packed_columns,
+)
+from quail.logical.builder import (
+    JoinSpec,
+    LogicalPlanBuilder,
 )
 from quail.logical.nodes import (
     FEATURE_LIST,

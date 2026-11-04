@@ -4,6 +4,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from quail.common.expressions import (
+    GetField,
+    ScalarFunction,
+    aliased_call,
+    column_references,
+    source_columns,
+)
 from quail.logical import (
     Aggregate,
     Alias,
@@ -34,13 +41,6 @@ from quail.logical import (
     is_score,
     model_call,
     reads_projection,
-)
-from quail.logical.expressions import (
-    GetField,
-    ScalarFunction,
-    aliased_call,
-    column_references,
-    source_columns,
 )
 from quail.logical.nodes.column import SemanticColumn
 

@@ -9,14 +9,14 @@ CompileError from either.
 import pyarrow as pa
 
 from quail.catalog import Catalog
-from quail.logical import ColumnRef, CompileError
-from quail.logical.expressions import (
+from quail.common.expressions import (
     column_expression,
     column_name,
     column_references,
     evaluate_expression,
     table_alias,
 )
+from quail.logical import ColumnRef, CompileError
 
 
 class Scope:
