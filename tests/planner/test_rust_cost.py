@@ -184,13 +184,16 @@ def test_the_memory_budgets_are_the_same(rust):
                         budgets.copy_verification_workspace_bytes(model, chunk),
                     "checkpoint_pass_bytes": budgets.checkpoint_pass_bytes(
                         model, questions, chunk),
-                    "hybrid_pool_pages": budgets.hybrid_pool_pages(model, device, chunk),
+                    "hybrid_pool_pages": budgets.hybrid_pool_pages(
+                        model, device, chunk),
                     "checkpoint_pages": budgets.checkpoint_pages(model, page_tokens),
                 }, (pair, chunk)
                 for mean in (None, 1.0, 300.5, 5_000.0):
-                    assert _outcome(rust.arena_pages, model_name, device_name, chunk,
-                                    mean) == _outcome(budgets.arena_pages, model,
-                                                      device, chunk, mean), (pair, chunk, mean)
+                    rust_pages = _outcome(
+                        rust.arena_pages, model_name, device_name, chunk, mean)
+                    python_pages = _outcome(
+                        budgets.arena_pages, model, device, chunk, mean)
+                    assert rust_pages == python_pages, (pair, chunk, mean)
                 for kv_pages in (0, 1_000, 50_000):
                     assert rust.checkpoint_slots(
                         model_name, device_name, chunk, kv_pages
