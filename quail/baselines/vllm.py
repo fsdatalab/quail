@@ -13,7 +13,7 @@ from quail.baselines.request_scheduling import (
     run_extract_fields,
     run_filter_sequence,
 )
-from quail.cost.budgets import GRAPH_TOKEN_BUCKETS
+from quail.cost.budgets import GRAPH_TOKEN_BUCKETS, kv_pool_cap_tokens
 from quail.specs.base import DeviceSpec, ModelSpec
 from quail.specs.files import resolve_model_path
 
@@ -345,6 +345,9 @@ class VLLMEngine:
         kwargs.update(diffusion_kwargs(spec))
         if device is not None:
             kwargs["block_size"] = device.page_tokens
+        cap = kv_pool_cap_tokens()
+        if cap:
+            kwargs["num_gpu_blocks_override"] = cap // kwargs.get("block_size", 16)
         kwargs.update(text_only_kwargs(spec))
         return kwargs
 

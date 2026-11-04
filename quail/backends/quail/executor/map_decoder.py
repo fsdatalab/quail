@@ -70,6 +70,8 @@ class MapDecoder:
         self.map = np.full(n, -1, dtype=np.int64)      # its map, -1 for none
         self.origin = np.zeros(n, dtype=np.int64)      # its first decode position
         self.fed = np.zeros(n, dtype=np.int64)         # decode rows packed
+        # when a list, each settle appends the slots whose answers ended
+        self.ended_log = None
         self.stopped = np.zeros(n, dtype=bool)         # read a stop token
         self.kv = FullAttentionGroup(n, page_tokens)
         self.device = head.device
@@ -266,19 +268,34 @@ class MapDecoder:
         self.paused[document] = False
         self.drafts[document] = 0
 
-    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None):
-        """Order running slots by page-hold time saved per recomputation second."""
+    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None,
+                       remaining=None):
+        """Order running slots by page-hold time saved per recomputation second.
+
+        Args:
+            curves: Per map, the survival curve to estimate remaining
+                tokens from; each map's own answers by default.
+            recompute_cost: Prices rebuilding a slot's KV; without it,
+                slots are ordered by remaining tokens alone.
+            page_holds: How many slots hold each page; a page another
+                slot also holds is not freed.
+            remaining: Per slot, its expected remaining tokens; replaces
+                the estimate from curves.
+        """
         from quail.cost.answers import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         scores = np.zeros(len(self.map))
         written = np.zeros(len(self.map), dtype=np.int64)
         for q in np.unique(self.map[running]):
+            mine = running[self.map[running] == q]
+            written[mine] = self.written[q][mine]
+            if remaining is not None:
+                scores[mine] = remaining[mine]
+                continue
             curve = remaining_tokens(
                 self.lengths[q], self.written[q], self.expected_tokens[q],
                 int(self.limits[q]), survival=None if curves is None else curves.get(q))
-            mine = running[self.map[running] == q]
-            written[mine] = self.written[q][mine]
             scores[mine] = curve[written[mine]]
         if recompute_cost is not None and len(running):
             num_pages = self.kv.num_pages[running]
@@ -293,9 +310,15 @@ class MapDecoder:
                                          out=np.zeros(len(running)), where=seconds > 0)
         return running[np.lexsort((running, written[running], -scores[running]))]
 
-    def running(self):
-        """Slots whose next decode row can choose another token."""
-        running = np.flatnonzero((self.map >= 0) & ~self.paused)
+    def running(self, writing=None):
+        """Slots whose next decode row can choose another token.
+
+        Args:
+            writing: Slots holding an answer (map >= 0), or None to find them.
+        """
+        if writing is None:
+            writing = np.flatnonzero(self.map >= 0)
+        running = writing[~self.paused[writing]]
         ready = (~self.constrained[self.map[running]]
                  | (self.inflight[running] == 0))
         return running[ready & ~self.stopped[running] & ~self.copy_pending[running]
@@ -585,6 +608,8 @@ class MapDecoder:
                 self._read_copy(q, documents[mine], indices[mine], values[mine])
         self.stopped[documents[stop]] = True
         self.map[documents[ended]] = -1
+        if self.ended_log is not None:
+            self.ended_log.append(documents[ended])
         self.copy_pending[documents[ended]] = False
         self.finished.extend(zip(documents[ended].tolist(), maps[ended].tolist()))
         for group in self.copy_groups:

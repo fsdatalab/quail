@@ -74,8 +74,12 @@ def answer_survival(lengths, written, expected_tokens, limit, *, prior=None):
 
 
 def remaining_tokens(lengths, written, expected_tokens, limit, *, survival=None):
-    """Return the expected tokens left after t tokens, t = 0..limit."""
+    """Return E[L - t | L > t], the expected tokens left after t, t = 0..limit.
+
+    With S(u) = P(L > u) and S(limit) = 0, this is the sum of S(u) / S(t)
+    over u = t..limit - 1.
+    """
     if survival is None:
         survival = answer_survival(lengths, written, expected_tokens, limit)
-    tail = np.r_[np.cumsum(survival[:0:-1])[::-1], 0.0]
+    tail = np.cumsum(survival[::-1])[::-1]
     return np.divide(tail, survival, out=np.zeros(limit + 1), where=survival > 0)
