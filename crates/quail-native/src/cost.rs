@@ -800,6 +800,58 @@ impl CostModel {
         ))
     }
 
+    /// `quail.cost.classify.estimate_suffixes`: seconds, passes, the
+    /// work's fields, suffix tokens, and rounds.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (head_tokens, frame_tokens, suffixes, expected_rows, lengths, shared, chunk, model, device, resident, canvas_rows, runs, answer_rows, head_rows, gpus))]
+    fn classify_estimate_suffixes<'py>(
+        &self,
+        py: Python<'py>,
+        head_tokens: i64,
+        frame_tokens: i64,
+        suffixes: Vec<i64>,
+        expected_rows: f64,
+        lengths: Vec<f64>,
+        shared: Vec<f64>,
+        chunk: i64,
+        model: &str,
+        device: &str,
+        resident: bool,
+        canvas_rows: i64,
+        runs: Option<Vec<Vec<i64>>>,
+        answer_rows: Option<f64>,
+        head_rows: i64,
+        gpus: i64,
+    ) -> PyResult<(f64, f64, Bound<'py, PyDict>, f64, usize)> {
+        let inputs = ClassifyInputs {
+            head_tokens,
+            frame_tokens,
+            expected_rows,
+            lengths: &lengths,
+            shared: &shared,
+            chunk,
+            model: self.model(model)?,
+            device: self.device(device)?,
+            resident,
+            gpus,
+        };
+        let cost = classify::estimate_suffixes(
+            &inputs,
+            &suffixes,
+            canvas_rows,
+            runs.as_deref(),
+            answer_rows,
+            head_rows,
+        );
+        Ok((
+            cost.seconds,
+            cost.passes,
+            work_to(py, &cost.work)?,
+            cost.suffix_tokens,
+            cost.rounds,
+        ))
+    }
+
     /// `quail.cost.extract.estimate`: seconds, passes, the work's
     /// fields, suffix tokens, and rows.
     #[allow(clippy::too_many_arguments)]
