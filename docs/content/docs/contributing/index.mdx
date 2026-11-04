@@ -17,8 +17,9 @@ Include:
 
 ## Prepare the repository
 
-Quail requires Python 3.12. Clone the repository and install the development
-dependencies:
+Quail requires Python 3.12 and a Rust toolchain ([rustup](https://rustup.rs)):
+the planner is a Rust module, `_quail_native`, that `uv sync` builds with
+maturin. Clone the repository and install the development dependencies:
 
 ```bash
 git clone https://github.com/fsdatalab/quail.git

@@ -22,24 +22,19 @@ jobs:
           git config --global
           url."https://x-access-token:${{ secrets.QUAILB_TOKEN }}@github.com/".insteadOf
           "https://github.com/"
-      - run: uv sync --frozen
+      # uv sync builds the project's Rust module, _quail_native
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - run: uv sync --frozen
+      - run: uv run --frozen python -c "import _quail_native"
       - name: Rust format
         run: cargo fmt --check
       - name: Rust lint (clippy)
         run: cargo clippy --all-targets -- -D warnings
       - name: Rust tests
         run: cargo test
-      # tests/api/test_session_context.py imports this module
-      - name: Build the native Python module (maturin)
-        run: |
-          uv run --frozen --with "maturin>=1.9,<2" maturin build \
-            -m crates/quail-native/Cargo.toml -o target/wheels
-          uv pip install target/wheels/quail_native-*.whl
-          uv run --frozen python -c "import _quail_native"
       - name: Lint (ruff)
         run: uv run --frozen ruff check quail bench calibrate tests experiments tools
       - name: Long string literals

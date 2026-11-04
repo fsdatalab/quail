@@ -58,28 +58,32 @@ dev = [
 [tool.uv.sources]
 quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "e8826ce" }
 
+# One wheel holds the quail package and _quail_native, the planner's
+# Rust module, built from the crates/ workspace
 [build-system]
-requires = ["hatchling==1.32.0"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
-[tool.hatch.build.targets.wheel]
-packages = ["quail"]
-
-[tool.hatch.build.targets.sdist]
-include = [
-    "LICENSE",
-    "README.md",
-    "pyproject.toml",
-    "quail",
-]
-exclude = [
-    "demos",
-    "docs",
-]
+[tool.maturin]
+manifest-path = "crates/quail-native/Cargo.toml"
+module-name = "_quail_native"
+python-packages = ["quail"]
+include = ["LICENSE", "README.md"]
+exclude = ["demos/**", "docs/**"]
+# the planner runs in the module, so even a development install is optimized
+profile = "release"
 
 [tool.uv]
 # uv's Python builds include the C headers Triton needs at startup
 python-preference = "only-managed"
+# uv rebuilds the project, and its Rust module, when any of these change
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "crates/**/*.rs" },
+    { file = "crates/**/Cargo.toml" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -19,9 +19,8 @@ For example, imagine a ``reviews`` table with review text in ``body``:
         "r.body))")
 
 The DataFusion side lives in the ``quail-datafusion`` crate. Its Python
-module, ``_quail_native``, is a wheel that maturin builds from
-``crates/quail-native``; install the wheel into Quail's
-environment.
+module, ``_quail_native``, is part of the quail-engine wheel, built by
+maturin from ``crates/quail-native``.
 """
 
 from __future__ import annotations
