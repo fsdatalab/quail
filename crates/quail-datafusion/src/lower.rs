@@ -392,30 +392,68 @@ fn raise_chain(node: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     )?)))
 }
 
+/// Whether a chain of filters and `SemanticColumn` nodes holds a
+/// `SemanticColumn`.
+fn reaches_column(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Filter(filter) => reaches_column(&filter.input),
+        other => as_node::<SemanticColumn>(other).is_some(),
+    }
+}
+
 fn raise_projection(projection: &Projection) -> Result<Transformed<LogicalPlan>> {
+    // a filter DataFusion pushed between the SELECT list and the
+    // columns may test them
     let mut input = projection.input.as_ref();
+    let mut filters: Vec<Expr> = Vec::new();
     let mut calls: Vec<(String, Expr)> = Vec::new();
-    while let Some(column) = as_node::<SemanticColumn>(input) {
-        calls.push((column.name.clone(), column.call.clone()));
-        input = column.input.as_ref();
+    loop {
+        if let Some(column) = as_node::<SemanticColumn>(input) {
+            calls.push((column.name.clone(), column.call.clone()));
+            input = column.input.as_ref();
+        } else if let LogicalPlan::Filter(filter) = input
+            && reaches_column(&filter.input)
+        {
+            filters.push(filter.predicate.clone());
+            input = filter.input.as_ref();
+        } else {
+            break;
+        }
     }
     if calls.is_empty() {
         return Ok(Transformed::no(LogicalPlan::Projection(projection.clone())));
     }
+    let call_of = |column: &Column| {
+        calls
+            .iter()
+            .find(|(name, _)| column.relation.is_none() && *name == column.name)
+            .map(|(_, call)| call.clone())
+    };
     let exprs = projection
         .expr
         .iter()
         .map(|expr| match expr {
-            Expr::Column(column) if column.relation.is_none() => calls
-                .iter()
-                .find(|(name, _)| *name == column.name)
-                .map(|(name, call)| call.clone().alias(name.clone()))
+            Expr::Column(column) => call_of(column)
+                .map(|call| call.alias(column.name.clone()))
                 .unwrap_or_else(|| expr.clone()),
             _ => expr.clone(),
         })
         .collect();
+    let mut below = input.clone();
+    for predicate in filters.into_iter().rev() {
+        let predicate = predicate
+            .transform_up(|expr| match &expr {
+                Expr::Column(column) => match call_of(column) {
+                    Some(call) => Ok(Transformed::yes(call)),
+                    None => Ok(Transformed::no(expr)),
+                },
+                _ => Ok(Transformed::no(expr)),
+            })?
+            .data;
+        below = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(below))?);
+    }
     Ok(Transformed::yes(LogicalPlan::Projection(
-        Projection::try_new(exprs, Arc::new(input.clone()))?,
+        Projection::try_new(exprs, Arc::new(below))?,
     )))
 }
 

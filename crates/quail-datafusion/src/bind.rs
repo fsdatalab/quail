@@ -39,15 +39,38 @@ use serde_json::Value;
 /// The answer limit of an AI.MAP call written without one.
 const DEFAULT_MAP_ANSWER_TOKENS: i64 = 256;
 
-/// Bind a region's plan into Quail's logical plan.
+/// Bind a model region into Quail's logical plan.
 ///
-/// `turn` and `layout` are the session model's chat-turn text and
-/// prompt layout.
+/// The region's bound plan decides whether the query is refused; the
+/// plan comes from the region after DataFusion's rules when the binder
+/// reads it, and from the bound plan otherwise. `turn` and `layout` are
+/// the session model's chat-turn text and prompt layout.
 ///
 /// # Errors
 ///
 /// The region uses SQL outside Quail's language, or the logical plan
 /// builder refuses it.
+pub fn bind_model_region(
+    region: &crate::ModelRegion,
+    turn: &Turn,
+    layout: &str,
+) -> Result<quail_planner::LogicalPlan, CompileError> {
+    let bound = bind_region(&region.plan, turn, layout)?;
+    let Some(optimized) = &region.optimized else {
+        return Ok(bound);
+    };
+    match crate::as_bound(optimized) {
+        Ok(read) => Ok(bind_region(&read, turn, layout).unwrap_or(bound)),
+        Err(_) => Ok(bound),
+    }
+}
+
+/// Bind a model region's plan, as DataFusion's SQL planner bound it,
+/// into Quail's logical plan.
+///
+/// # Errors
+///
+/// The region uses SQL outside Quail's language.
 pub fn bind_region(
     plan: &LogicalPlan,
     turn: &Turn,

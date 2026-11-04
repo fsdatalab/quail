@@ -51,7 +51,7 @@ impl PythonRunner {
         let Some((turn, layout)) = &self.prompting else {
             return Ok(("sql", region_sql(region)?));
         };
-        match bind::bind_region(&region.plan, turn, layout) {
+        match bind::bind_model_region(region, turn, layout) {
             Ok(plan) => Ok((
                 "plan",
                 quail_planner::write_logical_plan(&plan)
@@ -286,7 +286,7 @@ impl NativeContext {
                         && let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>()
                     {
                         bound.push(
-                            match quail_datafusion::bind::bind_region(&region.plan, &turn, layout) {
+                            match quail_datafusion::bind::bind_model_region(region, &turn, layout) {
                                 Ok(found) => (
                                     Some(quail_planner::write_logical_plan(&found).map_err(
                                         |error| {

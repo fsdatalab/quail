@@ -22,6 +22,7 @@ mod exec;
 mod functions;
 mod joins;
 mod lower;
+mod read;
 mod region;
 pub mod semantic;
 mod unnest;
@@ -48,6 +49,7 @@ pub use functions::{
     quail_functions,
 };
 pub use lower::{LowerAiCalls, lower_ai_calls, raise_ai_calls};
+pub use read::{OptimizeModelRegions, as_bound, optimize_region};
 pub use region::ModelRegion;
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 pub use unparse::region_sql;
@@ -76,6 +78,7 @@ pub fn session_state(runner: Arc<dyn RegionRunner>) -> SessionState {
         .with_config(config)
         .with_default_features()
         .with_analyzer_rules(analyzer_rules())
+        .with_optimizer_rule(Arc::new(OptimizeModelRegions))
         .with_query_planner(Arc::new(exec::QuailQueryPlanner::new(runner)))
         .build()
 }

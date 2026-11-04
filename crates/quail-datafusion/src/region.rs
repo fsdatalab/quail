@@ -14,12 +14,18 @@ use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 pub struct ModelRegion {
     /// The claimed operators, from the region's root down to its scans.
     pub plan: LogicalPlan,
+    /// `plan` after DataFusion's rules inside the region, once
+    /// [`crate::OptimizeModelRegions`] has run.
+    pub optimized: Option<LogicalPlan>,
 }
 
 impl ModelRegion {
     /// Create a model region over the given operators.
     pub fn new(plan: LogicalPlan) -> Self {
-        Self { plan }
+        Self {
+            plan,
+            optimized: None,
+        }
     }
 }
 

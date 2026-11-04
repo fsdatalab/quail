@@ -233,3 +233,31 @@ async fn a_classification_is_a_column_the_projection_reads() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_region_reads_back_after_datafusion_pushes_its_filters_into_the_scan() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT r.id FROM reviews r \
+        WHERE AI.IF(PROMPT('Kind? {0}', r.body)) AND r.id <> 'r9'";
+    let [region] =
+        <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
+    let optimized = lines(region.optimized.as_ref().expect("an optimized region"));
+    // DataFusion moved the plain test below the alias
+    assert!(
+        !optimized
+            .iter()
+            .any(|line| line.starts_with("Filter: r.id")),
+        "{optimized:?}"
+    );
+    let read = lines(&quail_datafusion::as_bound(
+        region.optimized.as_ref().unwrap(),
+    )?);
+    assert_eq!(read[0], "Projection: r.id");
+    assert!(read[1].starts_with("Filter: "), "{read:?}");
+    assert!(
+        read[1].contains("Kind?") && read[1].contains("r.id != Utf8(\"r9\")"),
+        "{read:?}"
+    );
+    assert_eq!(read[2], "SubqueryAlias: r");
+    Ok(())
+}
