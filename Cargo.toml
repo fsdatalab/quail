@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/quail-datafusion", "crates/quail-datafusion-python", "crates/quail-physical"]
+members = [
+    "crates/quail-cost",
+    "crates/quail-datafusion",
+    "crates/quail-datafusion-python",
+    "crates/quail-physical",
+]
 
 # Full debug info for DataFusion's dependency tree takes many gigabytes.
 [profile.dev]

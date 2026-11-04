@@ -3,6 +3,8 @@
 //! Tables and results cross between Python and Rust as Arrow IPC
 //! stream bytes, so the module does not depend on pyarrow's version.
 
+mod cost;
+
 use std::io::Cursor;
 
 use async_trait::async_trait;
@@ -244,5 +246,6 @@ fn read_and_write_plan(text: &str) -> PyResult<String> {
 #[pymodule]
 fn _quail_datafusion(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContext>()?;
+    module.add_class::<cost::CostModel>()?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }
