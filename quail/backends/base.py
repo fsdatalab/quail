@@ -9,8 +9,8 @@ from quail.physical import PhysicalNode
 from quail.specs import DeviceSpec, ModelSpec, SupportResult
 
 if TYPE_CHECKING:
-    from quail.planner.optimizer.candidates import ModelRegion, PhysicalCandidate
-    from quail.planner.optimizer.context import PlanningContext
+    from quail.planner.candidates import ModelRegion, PhysicalCandidate
+    from quail.planner.context import PlanningContext
 
 
 @dataclass(frozen=True)

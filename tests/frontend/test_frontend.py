@@ -20,7 +20,7 @@ from quail.logical import (
     join_outer_input,
 )
 from quail.planner import native
-from quail.planner.optimizer.context import PlanningContext
+from quail.planner.context import PlanningContext
 
 
 @pytest.fixture()

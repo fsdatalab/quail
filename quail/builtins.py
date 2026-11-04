@@ -4,10 +4,9 @@ from quail.backends import QuailBackend
 from quail.backends.quail import quail_runtimes
 from quail.baselines import register_baselines
 from quail.execution.runtimes import built_in_runtimes
-from quail.extensions import ExtensionRegistry
+from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
 from quail.physical import built_in_codecs
 from quail.planner.native import LOGICAL_RULES, PHYSICAL_RULES
-from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 from quail.specs import DEVICES, MODELS
 
 

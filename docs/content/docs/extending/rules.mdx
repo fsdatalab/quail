@@ -29,7 +29,7 @@ then a rule `should_skip_empty_tables` added to `physical_rules.rs`:
 
 ```python
 import quail
-from quail.planner.optimizer.rules import PhysicalRule
+from quail.extensions import PhysicalRule
 
 registry = quail.ExtensionRegistry.with_built_ins()
 registry.register_physical_rule(PhysicalRule("should_skip_empty_tables"))

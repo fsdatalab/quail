@@ -2,7 +2,7 @@
 
 from quail.logical import cte_schema
 from quail.physical import InputPort, PortRef, QueryStage, ValueType
-from quail.planner.plan import PhysicalPlan
+from quail.physical.plan import PhysicalPlan
 
 
 def stage_plan(logical, plans, assumptions=None) -> PhysicalPlan:

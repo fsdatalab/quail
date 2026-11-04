@@ -8,8 +8,8 @@ import pyarrow.parquet as pq
 import pytest
 
 import quail
+from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.planner.plan import EngineConfig
 from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_USD_PER_HOUR
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."

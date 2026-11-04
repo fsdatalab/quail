@@ -8,9 +8,9 @@ import pytest
 from helpers.sessions import CONFIG, check_table
 
 import quail
+from quail.api.config import EngineConfig
 from quail.logical import LogicalPlan
 from quail.physical.codec import decode_value, encode_value
-from quail.planner.plan import EngineConfig
 
 native = pytest.importorskip("_quail_native")
 

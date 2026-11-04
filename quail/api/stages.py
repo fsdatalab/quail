@@ -13,7 +13,7 @@ from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.explain import estimated_rows
 from quail.logical import cte_schema
 from quail.physical import QueryStage, encode_graph
-from quail.planner.plan import Refusal, RefusalError
+from quail.physical.plan import Refusal, RefusalError
 from quail.planner.stages import stage_plan
 
 ASSUMED_ANSWER_TOKENS = 32

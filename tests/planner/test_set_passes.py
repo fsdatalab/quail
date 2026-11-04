@@ -9,9 +9,9 @@ def test_two_ai_filters_on_d1_2b_share_one_pass(tmp_path):
     import pyarrow.parquet as pq
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
     from quail.physical import AiFilter
-    from quail.planner.plan import EngineConfig
 
     # documents much longer than a question, so one pass costs less
     body = " ".join(["word"] * 300)
@@ -38,9 +38,9 @@ def test_a_d1_plan_prices_and_explains_the_passes_its_operators_share(tmp_path):
     import pyarrow.parquet as pq
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
     from quail.physical import AiClassify
-    from quail.planner.plan import EngineConfig
 
     body = " ".join(["word"] * 300)
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
@@ -73,9 +73,9 @@ def test_two_d1_classifications_share_a_pass_across_a_condition_between_them(
     import pyarrow.parquet as pq
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
     from quail.physical import AiClassify
-    from quail.planner.plan import EngineConfig
 
     body = " ".join(["word"] * 300)
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
@@ -107,9 +107,9 @@ def test_a_d1_filter_and_classification_on_one_table_share_a_pass(tmp_path):
     import pyarrow.parquet as pq
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
     from quail.physical import AiClassify, AiFilter
-    from quail.planner.plan import EngineConfig
 
     body = " ".join(["word"] * 300)
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
@@ -142,9 +142,9 @@ def test_a_d1_score_and_a_classification_of_one_table_share_a_pass(tmp_path):
     import pyarrow.parquet as pq
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
     from quail.physical import AiClassify, AiScore
-    from quail.planner.plan import EngineConfig
 
     body = " ".join(["word"] * 300)
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
@@ -194,9 +194,9 @@ def test_a_d1_filter_ends_each_document_joined_with_its_question(tmp_path):
     import pyarrow.parquet as pq
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
     from quail.physical import AiFilter
-    from quail.planner.plan import EngineConfig
 
     pq.write_table(pa.table({"id": [1, 2], "body": ["a kind note", "a short one"]}),
                    tmp_path / "reviews.parquet")

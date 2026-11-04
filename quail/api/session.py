@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from quail.api.compile import SQLDialect, compile_with_datafusion
+from quail.api.config import EngineConfig, resolve_model
 from quail.api.query import Query, QueryLike
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, TableProvider
 from quail.common.tokens import GigatokenEncoder
 from quail.extensions import ExtensionRegistry
-from quail.planner.plan import EngineConfig, Refusal, RefusalError, resolve_model
+from quail.physical.plan import Refusal, RefusalError
 from quail.specs.files import resolve_model_path
 
 

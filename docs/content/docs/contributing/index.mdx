@@ -66,8 +66,11 @@ around it:
 | `optimize.py` | `plan_query` and `refine_plan`. |
 | `sol.py` | The speed-of-light estimate, searched in Rust over the caller's oracles. |
 | `stages.py` | The plan of a statement whose CTEs run as their own stages. |
-| `optimizer/` | `context.py` holds planning inputs, `candidates.py` the candidate plans, and `rules.py` the rule names a registry lists. |
-| `plan.py` | `PhysicalPlan`, `Refusal`, and `EngineConfig`. |
+| `context.py`, `candidates.py` | The planning inputs, and the candidate plans a backend returns. |
+
+`PhysicalPlan` and `Refusal` are in `quail/physical/plan.py`,
+`EngineConfig` in `quail/api/config.py`, and the rule names a registry
+lists in `quail/extensions.py`.
 
 To add an AI operator, add its planning to `crates/quail-planner` and
 its node to `quail/physical`.

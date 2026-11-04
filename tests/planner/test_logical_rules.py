@@ -14,7 +14,7 @@ from helpers.sessions import CONFIG, fake_tok
 import quail
 from quail.logical import Filter, LogicalPlan, Project, SemanticJoin
 from quail.planner import native
-from quail.planner.optimizer.context import PlanningContext
+from quail.planner.context import PlanningContext
 
 REVIEWS = pa.table({"id": ["r0", "r1"], "stars": [5, 2], "body": ["good", "slow"]})
 ASPECTS = pa.table({"id": ["a0", "a1"], "aspect": ["ending", "pacing"]})

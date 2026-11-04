@@ -4,16 +4,40 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType, ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from quail.physical import NodeCodec, PhysicalNode
-from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 
 if TYPE_CHECKING:
     from quail.backends.base import ModelBackend
     from quail.execution.runner import ExecutionObserver, NodeRuntime
     from quail.specs import DeviceSpec, ModelSpec
+
+
+@dataclass(frozen=True)
+class LogicalRule:
+    """A logical rule of the Rust planner, which rewrites a logical plan.
+
+    The Rust planner implements every rule, the logical ones in
+    ``crates/quail-planner/src/rules.rs``; a registry lists the rules a
+    session applies, by name, in the order they apply.
+    """
+
+    name: str
+    kind: ClassVar[str] = "logical"
+
+
+@dataclass(frozen=True)
+class PhysicalRule:
+    """A physical rule of the Rust planner, which rewrites a physical graph.
+
+    The rules are in ``crates/quail-planner/src/physical_rules.rs``.
+    """
+
+    name: str
+    kind: ClassVar[str] = "physical"
 
 
 _KINDS = {

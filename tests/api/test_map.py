@@ -5,11 +5,11 @@ import pytest
 from helpers.oracle import Oracle, finish
 
 import quail
+from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
 from quail.logical import CompileError
 from quail.physical import AiMap
 from quail.physical.pipelines import build_pipelines
-from quail.planner.plan import EngineConfig
 
 REVIEWS = pa.table({"id": [1, 2, 3],
                     "body": ["good film", "bad film", "long dull film"]})

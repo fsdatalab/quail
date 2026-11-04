@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import quail  # noqa: E402
-from quail.planner.plan import EngineConfig  # noqa: E402
+from quail.api.config import EngineConfig  # noqa: E402
 
 SEED = 20260818
 FILLER = ("The projector hummed while the reel changed and nobody in "

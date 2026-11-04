@@ -8,7 +8,8 @@ import pytest
 from helpers.sessions import CONFIG, check_table
 
 import quail
-from quail.planner.plan import EngineConfig, Refusal
+from quail.api.config import EngineConfig
+from quail.physical.plan import Refusal
 
 native = pytest.importorskip("_quail_native")
 

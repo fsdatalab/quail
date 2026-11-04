@@ -10,8 +10,8 @@ import pytest
 from quail.builtins import built_in_registry
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.runtimes import ScanRuntime
+from quail.extensions import PhysicalRule
 from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
-from quail.planner.optimizer.rules import PhysicalRule
 
 
 @dataclass(frozen=True)

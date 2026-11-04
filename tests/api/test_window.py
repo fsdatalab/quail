@@ -6,8 +6,9 @@ from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, _run, fake_tok
 
 import quail
+from quail.api.config import EngineConfig
 from quail.physical import Window
-from quail.planner.plan import EngineConfig, Refusal
+from quail.physical.plan import Refusal
 
 STEPS = pa.table({
     "id": ["s0", "s1", "s2", "s3", "s4"],

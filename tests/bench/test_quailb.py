@@ -10,8 +10,9 @@ from bench.quailb import (
     queries,
     register_tables,
 )
+from quail.api.config import EngineConfig
 from quail.logical import Aggregate
-from quail.planner.plan import EngineConfig, Refusal
+from quail.physical.plan import Refusal
 from quail_b.queries import QUERY_ORDER
 
 

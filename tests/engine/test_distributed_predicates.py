@@ -5,6 +5,7 @@ import pytest
 from helpers.fakes import letter_tokens
 
 import quail
+from quail.api.config import EngineConfig
 from quail.api.execute import execute_query
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.operators.filter import stop_groups
@@ -15,7 +16,6 @@ from quail.execution.result import filter_answer_table
 from quail.execution.rows import Rows, extraction_rows
 from quail.execution.types import PhysicalResponse
 from quail.physical import AiExtract, AiFilter, decode_graph
-from quail.planner.plan import EngineConfig
 
 TEXTS = ["No date", "June", "No date", "August"]
 

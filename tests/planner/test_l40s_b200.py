@@ -6,7 +6,8 @@ from helpers.fakes import letter_tokens
 
 import quail
 from bench.quailb import queries, register_tables
-from quail.planner.plan import EngineConfig, Refusal
+from quail.api.config import EngineConfig
+from quail.physical.plan import Refusal
 
 
 def _standin_filter_and_join(tmp_path):

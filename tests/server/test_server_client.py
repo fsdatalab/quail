@@ -7,7 +7,7 @@ from helpers import server_fakes
 
 import quail
 from quail.api import Query, QueryLike
-from quail.planner.plan import EngineConfig
+from quail.api.config import EngineConfig
 from quail.remote.records import QueryFailedError, ServerError
 
 pytest.importorskip("starlette")

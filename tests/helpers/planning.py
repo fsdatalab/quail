@@ -5,10 +5,10 @@ from types import SimpleNamespace
 from quail.api.compile import compile_with_datafusion
 from quail.builtins import built_in_registry
 from quail.common.tokens import TokenLengths
+from quail.extensions import LogicalRule
 from quail.planner import native
+from quail.planner.context import PlanningContext
 from quail.planner.optimize import plan_query
-from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.rules import LogicalRule
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 

@@ -3,10 +3,10 @@
 from dataclasses import replace
 
 from quail.logical import LogicalPlan
+from quail.physical.plan import Refusal
 from quail.planner import native
-from quail.planner.optimizer.candidates import ModelRegion
-from quail.planner.optimizer.context import PlanningContext
-from quail.planner.plan import Refusal
+from quail.planner.candidates import ModelRegion
+from quail.planner.context import PlanningContext
 from quail.specs import DeviceSpec, ModelSpec
 
 

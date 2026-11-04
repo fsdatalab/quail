@@ -36,9 +36,9 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.physical.lowering import answer_ids
+from quail.physical.plan import PhysicalPlan, Refusal
+from quail.planner.candidates import PhysicalCandidate
 from quail.planner.native import request_order
-from quail.planner.optimizer.candidates import PhysicalCandidate
-from quail.planner.plan import PhysicalPlan, Refusal
 
 
 def plan_request_backend(

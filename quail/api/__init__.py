@@ -4,7 +4,7 @@ from quail.api.context import SessionContext
 from quail.api.execute import execute_query
 from quail.api.query import Query, QueryLike
 from quail.api.session import Session
-from quail.planner.plan import RefusalError
+from quail.physical.plan import RefusalError
 
 __all__ = [
     "Query",

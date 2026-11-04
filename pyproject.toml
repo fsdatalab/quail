@@ -163,8 +163,8 @@ layers = [
     "quail.planner.optimize",
     "quail.planner.stages",
     "quail.planner.native",
-    "quail.planner.optimizer",
-    "quail.planner.plan",
+    "quail.planner.candidates",
+    "quail.planner.context",
 ]
 
 [tool.vulture]

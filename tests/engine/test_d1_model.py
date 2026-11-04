@@ -39,8 +39,9 @@ def test_d1_2b_extracts_but_refuses_map_with_a_reason(tmp_path):
     import pyarrow as pa
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
-    from quail.planner.plan import EngineConfig, Refusal
+    from quail.physical.plan import Refusal
 
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
                             tokenizer=str.split)
@@ -64,9 +65,9 @@ def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
     import pyarrow.parquet as pq
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
     from quail.physical import AiJoin
-    from quail.planner.plan import EngineConfig
 
     body = " ".join(["word"] * 300)
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
@@ -127,10 +128,10 @@ def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
     import pyarrow.parquet as pq
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
     from quail.physical import AiClassify, AiJoin
     from quail.physical.pipelines import build_pipelines
-    from quail.planner.plan import EngineConfig
 
     body = " ".join(["word"] * 300)
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),

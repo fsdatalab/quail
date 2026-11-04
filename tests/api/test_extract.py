@@ -11,6 +11,7 @@ from helpers.fakes import letter_tokens
 from helpers.oracle import Oracle, finish, oracle_executor
 
 import quail
+from quail.api.config import EngineConfig
 from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
 from quail.logical import (
@@ -23,7 +24,7 @@ from quail.physical import (
     encode_graph,
 )
 from quail.physical.pipelines import build_pipelines, resident_inputs
-from quail.planner.plan import EngineConfig, Refusal
+from quail.physical.plan import Refusal
 
 QUESTION = "When does the lease end?"
 LEASE = "Lease ends on March 3, 2027.\nRent is $2,000."

@@ -5,11 +5,11 @@ import pytest
 from helpers.oracle import Oracle, finish
 
 import quail
+from quail.api.config import EngineConfig
 from quail.backends.quail.executor.operators.sae_features import FEATURE_LIST
 from quail.catalog import DocumentProvider
 from quail.logical import CompileError
 from quail.physical import decode_graph, encode_graph
-from quail.planner.plan import EngineConfig
 
 REVIEWS = ["great sound", "meh", "broken zipper"]
 

@@ -31,7 +31,7 @@ from quail.physical import (
     Window,
 )
 from quail.physical.pipelines import build_pipelines
-from quail.planner.plan import Refusal
+from quail.physical.plan import Refusal
 
 
 def _number(value):

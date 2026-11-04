@@ -37,11 +37,11 @@ from starlette.responses import (
 from starlette.routing import Route
 
 from quail.api import RefusalError, Session
+from quail.api.config import EngineConfig
 from quail.builtins import built_in_registry
 from quail.execution.result import iter_rows
 from quail.logical import CompileError
 from quail.physical.codec import encode_fields
-from quail.planner.plan import EngineConfig
 from quail.remote.artifacts import (
     ANSWERS_FILE,
     RESULT_FILE,

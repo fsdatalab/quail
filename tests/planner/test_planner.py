@@ -11,6 +11,7 @@ from quail.catalog import Catalog, DocumentProvider
 from quail.common.sol import speed_of_light
 from quail.common.work import ask, scan, stream
 from quail.explain import explain
+from quail.extensions import LogicalRule, PhysicalRule
 from quail.logical import SemanticJoin
 from quail.physical import (
     AiFilter,
@@ -20,8 +21,7 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.codec import encode_fields
-from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
-from quail.planner.plan import Refusal
+from quail.physical.plan import Refusal
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 

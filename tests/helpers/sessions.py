@@ -3,7 +3,7 @@
 import pyarrow as pa
 
 from helpers.oracle import Oracle, oracle_executor
-from quail.planner.plan import EngineConfig
+from quail.api.config import EngineConfig
 
 CONFIG = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 

@@ -6,12 +6,12 @@ import pytest
 from helpers.fakes import letter_tokens
 
 import quail
+from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
 from quail.logical import columns_above_joins
 from quail.planner import native
+from quail.planner.context import PlanningContext
 from quail.planner.optimize import search_plan
-from quail.planner.optimizer.context import PlanningContext
-from quail.planner.plan import EngineConfig
 
 
 @pytest.fixture()

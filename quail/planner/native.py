@@ -28,8 +28,8 @@ from quail.physical.codec import (
     encode_value,
 )
 from quail.physical.lowering import Vocabulary
-from quail.planner.optimizer.candidates import LogicalAlternative
-from quail.planner.plan import PhysicalPlan, Refusal
+from quail.physical.plan import PhysicalPlan, Refusal
+from quail.planner.candidates import LogicalAlternative
 
 # the built-in logical rules, in the order they apply
 LOGICAL_RULES = (

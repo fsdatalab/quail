@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import quail
+from quail.api.config import EngineConfig
 from quail.api.execute import _execute_physical
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
@@ -32,8 +33,8 @@ from quail.physical import (
     encode_graph,
     plan_envelope,
 )
-from quail.planner.optimizer.candidates import PhysicalCandidate
-from quail.planner.plan import EngineConfig, PhysicalPlan
+from quail.physical.plan import PhysicalPlan
+from quail.planner.candidates import PhysicalCandidate
 from quail.specs import SupportResult
 
 

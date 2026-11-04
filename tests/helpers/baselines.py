@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import pyarrow as pa
 
 import quail
+from quail.api.config import EngineConfig
 from quail.backends.base import BackendExecutionContext, GpuContext
 from quail.baselines.execution import RequestModelExecution
-from quail.planner.plan import EngineConfig
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 CAPACITY = {"kv_cache_size_tokens": 1_000, "block_size": 1, "max_num_seqs": 16}

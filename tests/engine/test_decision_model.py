@@ -9,6 +9,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import quail
+from quail.api.config import EngineConfig
 from quail.catalog import Catalog, DocumentProvider
 from quail.common.prompts import answer_row_offsets
 from quail.logical import (
@@ -16,7 +17,6 @@ from quail.logical import (
     bind_prompt,
 )
 from quail.physical.lowering import lower_prompt, render_filter_prompt_ids
-from quail.planner.plan import EngineConfig
 from quail.specs import DECISION_2_KAI_0_6B_BF16
 
 LAYOUT = "decision2-noul"

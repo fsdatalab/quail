@@ -12,13 +12,13 @@ from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
 from quail.api import execute as execution
+from quail.api.config import EngineConfig
 from quail.execution.result import (
     QueryResult,
     build_result_declaration,
     count_rows,
     document_index_table,
 )
-from quail.planner.plan import EngineConfig
 
 
 @pytest.fixture()

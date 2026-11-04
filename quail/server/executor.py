@@ -84,8 +84,9 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
     result manifest or ``failed`` with the error. Never raises.
     """
     from quail.api import RefusalError, Session
+    from quail.api.config import EngineConfig
     from quail.api.execute import execute_query
-    from quail.planner.plan import EngineConfig, Refusal
+    from quail.physical.plan import Refusal
     from quail.progress import set_answer_sink, set_progress_sink
     from quail.remote.artifacts import write_result
 

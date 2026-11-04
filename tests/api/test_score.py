@@ -9,6 +9,7 @@ from helpers.oracle import Oracle, finish
 from helpers.planning import compile_sql
 
 import quail
+from quail.api.config import EngineConfig
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import ColumnRef, RegularPredicate, SemanticJoin
 from quail.physical import (
@@ -18,7 +19,6 @@ from quail.physical import (
     decode_graph,
     encode_graph,
 )
-from quail.planner.plan import EngineConfig
 
 PROJECTION_SQL = (
     "SELECT d.id, "

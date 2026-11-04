@@ -6,6 +6,7 @@ from helpers.oracle import Oracle
 
 import quail
 from bench import quailb
+from quail.api.config import EngineConfig
 from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
 from quail.execution.metrics import NodeMetrics
@@ -20,7 +21,6 @@ from quail.physical import (
     encode_graph,
 )
 from quail.physical.pipelines import build_pipelines
-from quail.planner.plan import EngineConfig
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 

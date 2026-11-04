@@ -17,7 +17,7 @@ from helpers.quailb_data import standin_sets
 
 import quail
 from bench.quailb import queries, register_tables
-from quail.planner.plan import EngineConfig
+from quail.api.config import EngineConfig
 
 SNAPSHOTS = Path(__file__).resolve().parents[1] / "fixtures" / "plan_snapshots"
 BUDGETS = re.compile(r"(chunk|admission) budget=[\d,]+ tokens")

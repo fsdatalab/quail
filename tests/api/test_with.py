@@ -7,10 +7,11 @@ from helpers.oracle import Oracle, oracle_executor
 
 import quail
 from quail.api import execute as execution
+from quail.api.config import EngineConfig
 from quail.api.query import Query
 from quail.catalog import DocumentProvider
 from quail.physical import QueryStage, decode_graph, encode_graph
-from quail.planner.plan import EngineConfig, PhysicalPlan
+from quail.physical.plan import PhysicalPlan
 
 CONTRACTS = pa.table({
     "id": [1, 2, 3],

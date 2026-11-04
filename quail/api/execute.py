@@ -13,7 +13,7 @@ from quail.physical import (
     check_plan_envelope,
     decode_graph,
 )
-from quail.planner.plan import Refusal, RefusalError
+from quail.physical.plan import Refusal, RefusalError
 
 
 class _BackendState:

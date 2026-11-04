@@ -35,9 +35,9 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import Scan, encode_graph
+from quail.physical.plan import Refusal, RefusalError
 from quail.planner import native, plan_query, refine_plan
-from quail.planner.optimizer.context import PlanningContext
-from quail.planner.plan import Refusal, RefusalError
+from quail.planner.context import PlanningContext
 
 if TYPE_CHECKING:
     from quail.api.session import Session

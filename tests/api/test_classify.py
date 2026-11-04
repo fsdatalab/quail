@@ -10,6 +10,9 @@ from helpers.fakes import (
 from helpers.oracle import Oracle, finish
 
 import quail
+
+# one token per word: refund=1, request=2, status=3, shipping=4
+from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
 from quail.common.prompts import join_anchor_note
 from quail.logical import (
@@ -26,9 +29,7 @@ from quail.physical import (
     encode_graph,
 )
 from quail.physical.pipelines import build_pipelines
-from quail.planner.plan import EngineConfig, Refusal
-
-# one token per word: refund=1, request=2, status=3, shipping=4
+from quail.physical.plan import Refusal
 
 
 def _bytes(text):

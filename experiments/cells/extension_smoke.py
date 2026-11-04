@@ -21,7 +21,7 @@ import modal
 import quail
 from experiments.cells.row_trace import RowTrace
 from experiments.cells.session_smoke import FILTER_Q, make_filter_parquet
-from quail.planner.plan import EngineConfig
+from quail.api.config import EngineConfig
 from quail_ext_examples import cost_ledger
 
 app = modal.App("quail-milestone1")

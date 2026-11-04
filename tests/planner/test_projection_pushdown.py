@@ -8,6 +8,7 @@ from helpers.planning import rewrite
 from helpers.sessions import _run, fake_tok, make_executor
 
 import quail
+from quail.api.config import EngineConfig
 from quail.logical import (
     Filter,
     LogicalPlan,
@@ -17,8 +18,7 @@ from quail.logical import (
 )
 from quail.physical import Recombine
 from quail.planner import native
-from quail.planner.optimizer.context import PlanningContext
-from quail.planner.plan import EngineConfig
+from quail.planner.context import PlanningContext
 
 
 def _scans(plan):
