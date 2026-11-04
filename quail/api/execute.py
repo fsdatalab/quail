@@ -115,6 +115,9 @@ def execute_query(query, physical_executor=None, plan=None,
         on_execution_ready: Optional callback after backend preparation and
             immediately before query execution.
     """
+    if not hasattr(query, "logical"):
+        # a query DataFusion runs plans each model region as it runs
+        return query.run(plan, physical_executor=physical_executor)
     if isinstance(query.logical.root, WithCTE):
         from quail.api.stages import execute_stages
 

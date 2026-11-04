@@ -119,8 +119,10 @@ class Session:
         """Compile SQL locally or prepare it for remote submission.
 
         Returns:
-            A local ``Query`` when the session has no endpoint. A remote
-            session returns ``RemoteQuery`` and the server compiles the SQL.
+            A local ``Query`` when the session has no endpoint, or a
+            ``DataFusionQuery`` when DataFusion runs SQL around the
+            query's model regions. A remote session returns
+            ``RemoteQuery`` and the server compiles the SQL.
         """
         if self._remote is not None:
             from quail.remote.client import RemoteQuery
@@ -130,6 +132,10 @@ class Session:
         logical = compile_with_datafusion(
             text, self.catalog, self.model,
             dialect=SQLDialect(dialect).value)
+        if logical is None:
+            from quail.api.context import DataFusionQuery
+
+            return DataFusionQuery(self, text, SQLDialect(dialect).value, order=order)
         return Query(self, logical, order=order)
 
     def get_run(self, query_id: str):

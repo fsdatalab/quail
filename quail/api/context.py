@@ -30,6 +30,7 @@ from collections.abc import Callable
 
 import pyarrow as pa
 
+from quail.api.compile import DATAFUSION_DIALECTS
 from quail.api.execute import execute_query
 from quail.api.query import Query
 from quail.catalog import ScanRequest, TableProvider
@@ -64,14 +65,18 @@ class SessionContext:
         ImportError: The ``_quail_native`` module is not built.
     """
 
-    def __init__(self, session, physical_executor: Callable | None = None):
+    def __init__(self, session, physical_executor: Callable | None = None, *,
+                 order: str | None = None):
         from _quail_native import NativeContext
 
         self.session = session
         self._physical_executor = physical_executor
+        self._order = order
         model = session.model
         self._native = NativeContext(self._run_region, tuple(model.turn),
                                      model.prompt_layout)
+        for name, provider in session.catalog.providers.items():
+            self._register_table(name, provider)
 
     def register(self, name: str, provider: TableProvider) -> None:
         """Register a table with the session and with DataFusion.
@@ -80,16 +85,18 @@ class SessionContext:
         when an operator outside every model region reads the table.
         """
         self.session.register(name, provider)
+        self._register_table(name, provider)
 
+    def _register_table(self, name: str, provider: TableProvider) -> None:
         def scan(columns: list[str]) -> bytes:
             reader = provider.scan(ScanRequest(columns=tuple(columns)))
             return ipc_bytes(reader.read_all())
 
         self._native.register(name, ipc_bytes(provider.schema().empty_table()), scan)
 
-    def sql(self, text: str) -> pa.Table:
+    def sql(self, text: str, dialect: str = "snowflake") -> pa.Table:
         """Run a query and return its rows."""
-        return ipc_table(self._native.sql(text))
+        return ipc_table(self._native.sql(text, DATAFUSION_DIALECTS[dialect]))
 
     def region_sql(self, text: str) -> list[str]:
         """Return the SQL each model region of a query sends to Quail."""
@@ -113,12 +120,94 @@ class SessionContext:
             plans.append(decode_value(LogicalPlan, json.loads(plan)))
         return plans
 
-    def explain(self, text: str) -> str:
+    def explain(self, text: str, dialect: str = "snowflake") -> str:
         """Return DataFusion's optimized logical plan for a query."""
-        return self._native.explain(text)
+        return self._native.explain(text, DATAFUSION_DIALECTS[dialect])
 
     def _run_region(self, kind: str, payload: str) -> bytes:
-        query = (Query(self.session, decode_value(LogicalPlan, json.loads(payload)))
-                 if kind == "plan" else self.session.sql(payload))
+        query = (Query(self.session, decode_value(LogicalPlan, json.loads(payload)),
+                       order=self._order)
+                 if kind == "plan" else self.session.sql(payload, order=self._order))
         result = execute_query(query, physical_executor=self._physical_executor)
         return ipc_bytes(result.collect())
+
+
+class DataFusionQuery:
+    """A query DataFusion runs, with Quail planning and running each model region.
+
+    ``Session.sql`` returns one when the query needs SQL around its
+    model regions, such as a UNION of two AI filters or a window over
+    an AI join's rows. It offers ``Query``'s methods.
+
+    Args:
+        session: The session whose tables and model the query uses.
+        text: The SQL statement.
+        dialect: "snowflake" or "bq".
+        order: The stage order rule each region is planned with.
+    """
+
+    def __init__(self, session, text: str, dialect: str = "snowflake",
+                 order: str | None = None):
+        self.session = session
+        self.text = text
+        self.dialect = dialect
+        self.order = order
+
+    def _context(self, physical_executor=None) -> SessionContext:
+        return SessionContext(self.session, physical_executor, order=self.order)
+
+    def _regions(self) -> list[Query]:
+        model = self.session.model
+        bound, _ = self._context()._native.logical_plans(
+            self.text, tuple(model.turn), model.prompt_layout,
+            DATAFUSION_DIALECTS[self.dialect])
+        return [Query(self.session, decode_value(LogicalPlan, json.loads(plan)),
+                      order=self.order)
+                for plan, message in bound if message is None]
+
+    def plan(self) -> tuple:
+        """Return the physical plan, or Refusal, of each model region Rust binds."""
+        return tuple(query.plan() for query in self._regions())
+
+    def explain(self, **options) -> str:
+        """Return DataFusion's plan, then each model region's plan."""
+        parts = [self._context().explain(self.text, self.dialect)]
+        parts.extend(f"model region {index + 1}:\n{query.explain(**options)}"
+                     for index, query in enumerate(self._regions()))
+        return "\n\n".join(parts)
+
+    def run(self, plan=None, *, physical_executor: Callable | None = None):
+        """Run the query in the current process.
+
+        Args:
+            plan: Must be None: an edited plan is per model region.
+            physical_executor: Optional callable(PhysicalRequest) that
+                returns the PhysicalResponse, for tests without a GPU.
+
+        Raises:
+            TypeError: A plan was given.
+        """
+        from quail.execution.result import QueryResult
+
+        if plan is not None:
+            raise TypeError("a query DataFusion runs takes no edited plan")
+        table = self._context(physical_executor).sql(self.text, self.dialect)
+        return QueryResult.from_table(table)
+
+    def submit(self, **_options):
+        """Submitting needs Quail Server; local queries use run()."""
+        raise RuntimeError(
+            "submit() needs a Session with an endpoint; this session runs "
+            "queries in the current process, so call run() or collect()")
+
+    def collect(self, limit: int | None = None, batch_rows: int = 65_536) -> pa.Table:
+        """Run the query and collect its rows."""
+        table = self.run().collect()
+        return table if limit is None else table.slice(0, limit)
+
+    def execute_stream(self, batch_rows: int = 65_536,
+                       limit: int | None = None) -> pa.RecordBatchReader:
+        """Run the query and stream its rows."""
+        table = self.collect(limit=limit)
+        return pa.RecordBatchReader.from_batches(
+            table.schema, table.to_batches(max_chunksize=batch_rows))

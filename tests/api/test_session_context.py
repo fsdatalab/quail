@@ -120,6 +120,18 @@ def test_operators_outside_a_region_run_in_datafusion(context):
     assert _rows(table) == [("a0",), ("a1",), ("r0",), ("r2",), ("r3",)]
 
 
+def test_session_sql_runs_a_query_that_needs_sql_around_its_model_region(context):
+    text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
+            "UNION ALL SELECT a.id FROM aspects a ORDER BY id")
+    query = context.session.sql(text)
+    assert isinstance(query, quail.api.context.DataFusionQuery)
+    (plan,) = query.plan()
+    assert plan.graph.nodes
+    assert "model region 1:" in query.explain()
+    table = finish(query, ORACLE).collect()
+    assert _rows(table) == [("a0",), ("a1",), ("r0",), ("r2",), ("r3",)]
+
+
 def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
     text = ("SELECT c.id, AI.EXTRACT(c.text, {'end': 'q6: When does it end?'}) "
             "AS lease FROM contracts c WHERE lease_span.end.start < 15")

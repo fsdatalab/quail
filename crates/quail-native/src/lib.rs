@@ -216,12 +216,21 @@ impl NativeContext {
         Ok(())
     }
 
-    /// Run a query and return its rows as IPC stream bytes.
-    fn sql<'py>(&self, py: Python<'py>, query: &str) -> PyResult<Bound<'py, PyBytes>> {
+    /// Run a query, read in `dialect` ("Snowflake" by default), and
+    /// return its rows as IPC stream bytes.
+    #[pyo3(signature = (query, dialect=None))]
+    fn sql<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        dialect: Option<String>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = py
             .detach(|| {
                 self.runtime.block_on(async {
-                    let frame = sql(&self.context, query).await?;
+                    let frame =
+                        quail_datafusion::sql_in_dialect(&self.context, query, dialect.as_deref())
+                            .await?;
                     let schema = quail_schema(frame.schema());
                     let batches = frame
                         .collect()
@@ -310,11 +319,16 @@ impl NativeContext {
         .map_err(python_error)
     }
 
-    /// Return DataFusion's optimized logical plan for a query.
-    fn explain(&self, py: Python<'_>, query: &str) -> PyResult<String> {
+    /// Return DataFusion's optimized logical plan for a query read in
+    /// `dialect` ("Snowflake" by default).
+    #[pyo3(signature = (query, dialect=None))]
+    fn explain(&self, py: Python<'_>, query: &str, dialect: Option<String>) -> PyResult<String> {
         py.detach(|| {
             self.runtime.block_on(async {
-                let plan = sql(&self.context, query).await?.into_optimized_plan()?;
+                let plan =
+                    quail_datafusion::sql_in_dialect(&self.context, query, dialect.as_deref())
+                        .await?
+                        .into_optimized_plan()?;
                 Ok(plan.display_indent().to_string())
             })
         })

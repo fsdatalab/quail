@@ -26,6 +26,10 @@ class SQLDialect(StrEnum):
     BQ = "bq"
 
 
+# the end of a refusal of a region shape the binder does not read; such
+# a region reaches Quail as SQL text
+READ_AS_SQL = "is outside what Quail binds from DataFusion"
+
 # a dialect -> DataFusion's name for it
 DATAFUSION_DIALECTS = {"snowflake": "Snowflake", "bq": "BigQuery"}
 
@@ -82,7 +86,7 @@ def _message(error: Exception, sql: str) -> str:
 
 
 def compile_with_datafusion(sql: str, catalog, model,
-                            dialect: str = "snowflake"):
+                            dialect: str = "snowflake") -> LogicalPlan | None:
     """Compile AI SQL text into one logical plan.
 
     Args:
@@ -91,6 +95,10 @@ def compile_with_datafusion(sql: str, catalog, model,
         model: The model whose chat turn and prompt layout the prompts
             are bound in.
         dialect: "snowflake" or "bq".
+
+    Returns:
+        The query's logical plan, or None when DataFusion runs SQL
+        around the query's model regions (see ``DataFusionQuery``).
 
     Raises:
         CompileError: The query is invalid or uses unsupported SQL.
@@ -115,9 +123,11 @@ def compile_with_datafusion(sql: str, catalog, model,
     if not regions:
         raise CompileError("the query has no AI predicate")
     if len(regions) != 1 or not whole:
-        raise CompileError(
-            "Quail plans a query that is one model region; this one also needs "
-            "SQL outside it, which quail.SessionContext runs")
+        for _, message in regions:
+            # a region the binder does not read runs as SQL of its own
+            if message is not None and READ_AS_SQL not in message:
+                raise CompileError(message)
+        return None
     plan, message = regions[0]
     if message is not None:
         raise CompileError(message)
