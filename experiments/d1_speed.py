@@ -123,8 +123,8 @@ def _quail_state():
     from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows
-    from quail.catalog.tokens import GigatokenEncoder
     from quail.common import budgets
+    from quail.common.tokens import GigatokenEncoder
     from quail.planner.prompt_lowering import answer_ids
     from quail.specs import D1_2B_BF16, H100_SXM
     from quail.specs.files import resolve_model_path
@@ -281,8 +281,8 @@ def quail_profile() -> dict:
     from dataclasses import replace
 
     from quail.backends.quail.executor.pass_groups import run_pass_group
-    from quail.catalog.document_ends import document_ends
-    from quail.catalog.tokens import DocumentPrefixes
+    from quail.common.document_ends import document_ends
+    from quail.common.tokens import DocumentPrefixes
 
     state, encoder = _quail_state()
     spec = _classify_spec(encoder)

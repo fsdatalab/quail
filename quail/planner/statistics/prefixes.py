@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from quail.catalog.tokens import PrefixTree, prefix_tree
+from quail.common.tokens import PrefixTree, prefix_tree
 
 
 def key_documents(context, alias: str):

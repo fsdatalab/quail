@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import bisect
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from threading import local
@@ -13,7 +13,6 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.common.selection import group_ids
-from quail.logical.expressions import evaluate_expression
 
 
 class TokenView(Sequence):
@@ -324,11 +323,23 @@ class TokenOffsets:
 
 
 class TokenStoreWriter(_StoreWriter):
-    """Tokenize source batches into a token store file."""
+    """Tokenize source batches into a token store file.
 
-    def __init__(self, path: str, *, document_column, tokenizer,
+    Args:
+        path: The token store file to write.
+        document_texts: Callable(record batch) -> the batch's document
+            texts, one string or null per row.
+        tokenizer: Callable text -> token ids.
+        token_type: The Arrow type of one token id.
+        offsets_encoder: Optional callable that also returns each
+            token's character offsets.
+        existing_tokens: Token lists already computed for the rows,
+            read instead of tokenizing.
+    """
+
+    def __init__(self, path: str, *, document_texts: Callable, tokenizer,
                  token_type: pa.DataType, offsets_encoder=None, existing_tokens=None):
-        self._document_column = document_column
+        self._document_texts = document_texts
         self._tokenizer = tokenizer
         self._token_list_type = pa.large_list(token_type)
         self._offsets_encoder = offsets_encoder
@@ -351,7 +362,7 @@ class TokenStoreWriter(_StoreWriter):
 
     def write_batch(self, batch: pa.RecordBatch) -> None:
         """Tokenize the document column of one source batch; a null is empty."""
-        texts = pc.fill_null(evaluate_expression(self._document_column, batch), "")
+        texts = pc.fill_null(self._document_texts(batch), "")
         offsets = None
         batch_arrow = getattr(self._tokenizer, "batch_arrow", None)
         if self._existing_tokens is not None:
@@ -505,7 +516,7 @@ class TokenStore(Sequence):
         """Tokenize bounded input batches into one Arrow IPC file."""
         writer = TokenStoreWriter(
             path,
-            document_column=document_column,
+            document_texts=lambda batch: batch.column(document_column),
             tokenizer=tokenizer,
             token_type=token_type,
             offsets_encoder=offsets_encoder,

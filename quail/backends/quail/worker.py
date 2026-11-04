@@ -32,10 +32,10 @@ from quail.backends.quail.graph import (
     execution_measurements,
 )
 from quail.backends.resources import release_models
-from quail.catalog.tokens import (
+from quail.common import budgets
+from quail.common.tokens import (
     decode_payload_documents,
 )
-from quail.common import budgets
 from quail.execution.runner import ExecutionContext
 from quail.execution.types import PhysicalResponse
 from quail.physical import (

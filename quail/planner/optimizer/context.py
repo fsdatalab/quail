@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from quail.catalog.tokens import TokenLengths
+from quail.common.tokens import TokenLengths
 from quail.planner.prompt_lowering import LoweredPrompt, lower_prompt
 from quail.specs import DeviceSpec, ModelSpec
 

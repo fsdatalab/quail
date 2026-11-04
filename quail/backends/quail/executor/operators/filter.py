@@ -12,9 +12,9 @@ from quail.backends.quail.executor.parts import (
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
 from quail.common.pairs import columns_key
 from quail.common.selection import group_ids
+from quail.common.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult

@@ -7,7 +7,7 @@ import numpy as np
 
 from quail.backends.quail.executor.extract.candidates import DocumentTokens
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.catalog.tokens import concat_tokens
+from quail.common.tokens import concat_tokens
 
 
 @dataclass

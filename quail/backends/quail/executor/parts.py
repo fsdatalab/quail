@@ -14,7 +14,7 @@ from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.map_decoder import map_decoder
 from quail.backends.quail.executor.stages import Stage, frame_writes, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.catalog.tokens import prefix_tree
+from quail.common.tokens import prefix_tree
 from quail.execution.rows import Rows
 from quail.logical import effective_selectivity
 from quail.physical import AiFilter, AiJoin, Filter, ValueType

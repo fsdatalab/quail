@@ -11,6 +11,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, closing
+from functools import partial
 from itertools import chain, count
 from numbers import Integral
 from pathlib import Path
@@ -20,7 +21,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.catalog.providers import Catalog, ScanRequest
-from quail.catalog.tokens import (
+from quail.common.tokens import (
     ColumnStoreWriter,
     ScanInput,
     TokenLengths,
@@ -401,7 +402,7 @@ class InputStore:
                             f"{self.tokenizer_name} with character offsets")
                     token_writer = TokenStoreWriter(
                         self._store_path(),
-                        document_column=column,
+                        document_texts=partial(evaluate_expression, column),
                         tokenizer=tokenizer,
                         token_type=token_type,
                         offsets_encoder=offsets_encoder,

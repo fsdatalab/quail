@@ -17,7 +17,7 @@ from quail.backends.quail.executor.parts import gpu_seconds, input_staging
 from quail.backends.quail.executor.readout import AsyncPassReadout
 from quail.backends.quail.executor.set_passes import group_passes
 from quail.backends.quail.executor.stages import Stage, run_stages
-from quail.catalog.document_ends import ends_for, joined_state
+from quail.common.document_ends import ends_for, joined_state
 from quail.physical import AiFilter, ClassifySpec, ExtractSpec, ScoreSpec
 
 

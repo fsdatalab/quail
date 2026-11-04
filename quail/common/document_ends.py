@@ -12,7 +12,7 @@ then ends the document with that join (joined_state).
 import numpy as np
 import pyarrow as pa
 
-from quail.catalog.tokens import concat_tokens
+from quail.common.tokens import concat_tokens
 
 
 def last_tokens(documents) -> np.ndarray:

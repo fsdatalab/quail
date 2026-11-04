@@ -3,7 +3,7 @@
 import numpy as np
 import pyarrow as pa
 
-from quail.catalog.tokens import GigatokenEncoder, TokenOffsets, TokenView
+from quail.common.tokens import GigatokenEncoder, TokenOffsets, TokenView
 
 
 class ModelTokenizer:

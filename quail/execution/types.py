@@ -10,8 +10,8 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.catalog.tokens import decode_token_documents
 from quail.common.pairs import COLUMNS_PREFIX
+from quail.common.tokens import decode_token_documents
 from quail.execution.result import answer_table
 from quail.execution.rows import Rows, rows_of
 from quail.physical import (

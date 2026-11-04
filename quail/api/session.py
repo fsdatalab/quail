@@ -5,7 +5,7 @@ from __future__ import annotations
 from quail.api.query import Query, QueryLike
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, TableProvider
-from quail.catalog.tokens import GigatokenEncoder
+from quail.common.tokens import GigatokenEncoder
 from quail.extensions import ExtensionRegistry
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql

@@ -24,8 +24,8 @@ from quail.backends.quail.executor.operators.filter import ConditionGate, Filter
 from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import Stage, run_stages
-from quail.catalog.tokens import prefix_tree
 from quail.common.answers import answer_survival
+from quail.common.tokens import prefix_tree
 from quail.cost.decode import DecodeCost
 from quail.specs import DEVICES, QWEN3_4B_FP8
 

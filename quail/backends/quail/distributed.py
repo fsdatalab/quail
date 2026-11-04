@@ -16,8 +16,8 @@ from quail.backends.quail.coordinator import keyed_shards, merge_results, shard_
 from quail.backends.quail.executor.memory import merge_memory_reports
 from quail.backends.quail.executor.operators.filter import stop_groups
 from quail.backends.quail.graph import graph_report
-from quail.catalog.tokens import select_documents
 from quail.common.pairs import columns_key
+from quail.common.tokens import select_documents
 from quail.execution.ids import id_positions
 from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph

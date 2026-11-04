@@ -20,7 +20,7 @@ from quail.backends.quail.executor.readout import (
 )
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.catalog.tokens import concat_tokens
+from quail.common.tokens import concat_tokens
 from quail.execution.labels import (
     GreedyDecoder,
     best_label,

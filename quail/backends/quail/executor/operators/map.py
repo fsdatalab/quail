@@ -24,7 +24,7 @@ from quail.backends.quail.executor.parts import (
     stage_spans,
 )
 from quail.backends.quail.executor.stages import Stage, StageRequests
-from quail.catalog.tokens import DocumentKeys, DocumentPrefixes, PrefixTree
+from quail.common.tokens import DocumentKeys, DocumentPrefixes, PrefixTree
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
 

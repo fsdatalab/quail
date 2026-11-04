@@ -25,7 +25,7 @@ from quail.backends.quail.executor.operators.set_extract import (
 from quail.backends.quail.executor.parts import execute_parts, execution_prefix_tree
 from quail.backends.quail.executor.pass_groups import node_question, run_pass_group
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
+from quail.common.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import id_positions
 from quail.execution.rows import Rows
 from quail.execution.runtimes.filter import FilterRuntime

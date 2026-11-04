@@ -7,7 +7,7 @@ import pyarrow as pa
 
 from quail.api.execute import execute_query
 from quail.catalog import Catalog, MemoryTableProvider
-from quail.catalog.tokens import TokenLengths
+from quail.common.tokens import TokenLengths
 from quail.execution.metrics import scalar_node_metrics
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.explain import estimated_rows

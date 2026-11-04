@@ -1,7 +1,7 @@
 """Plan as a session would: the tree rewrites, then the physical planner."""
 
 from quail.builtins import built_in_registry
-from quail.catalog.tokens import TokenLengths
+from quail.common.tokens import TokenLengths
 from quail.planner.optimize import plan_query
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import logical_alternatives

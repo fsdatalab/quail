@@ -21,7 +21,7 @@ from quail.backends.quail.executor.sae import (
 )
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.reranker import classify_outputs
-from quail.catalog.tokens import DocumentKeys
+from quail.common.tokens import DocumentKeys
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
 from quail.logical import FEATURE_LIST

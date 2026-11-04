@@ -5,7 +5,7 @@ from helpers.fakes import cpu_staging
 from helpers.kv_checker import Run, Setup, chain, passthrough
 
 from quail.backends.quail.executor.stages import Stage, StageRequests, run_stages
-from quail.catalog.tokens import prefix_tree
+from quail.common.tokens import prefix_tree
 
 
 @pytest.mark.parametrize("path", ["tree"])

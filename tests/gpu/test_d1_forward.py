@@ -226,7 +226,7 @@ def answer_ids():
 
 
 def _encoder():
-    from quail.catalog.tokens import GigatokenEncoder
+    from quail.common.tokens import GigatokenEncoder
     from quail.specs.files import resolve_model_path
 
     spec = _spec()
@@ -235,7 +235,7 @@ def _encoder():
 
 def _ends(head, tail, documents):
     """The plan's joins of these documents' endings with a tail."""
-    from quail.catalog.document_ends import document_ends
+    from quail.common.document_ends import document_ends
 
     last = {int(document[-1]) for document in documents} | set(head[-1:])
     return document_ends(sorted(last), tail, _encoder())
@@ -273,7 +273,7 @@ def _packs():
 
     ids = _tokenizer()
     questions = _yes_no_questions(PACKED)
-    from quail.catalog.document_ends import joined_state
+    from quail.common.document_ends import joined_state
 
     first = questions[0]
     ends = dict(_ends(first.head, first.state_tail, [ids(r) for r in REVIEWS]))
