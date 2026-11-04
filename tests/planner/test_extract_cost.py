@@ -5,14 +5,14 @@ from dataclasses import fields, replace
 import numpy as np
 import pytest
 
-from quail.cost.draft_policy import DraftPolicy
+from quail.common.draft_policy import DraftPolicy
+from quail.common.work import Work, ask, decode, scan
 from quail.cost.extract import (
     ExtractAssumptions,
     document_work,
     estimate,
     table_work,
 )
-from quail.cost.work import Work, ask, decode, scan
 from quail.physical import ExtractSpec
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 

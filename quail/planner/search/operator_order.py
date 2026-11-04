@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from quail.cost.work import Work, ask, scan
+from quail.common.work import Work, ask, scan
 from quail.logical import (
     LogicalPlan,
 )

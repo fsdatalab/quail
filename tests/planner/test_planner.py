@@ -10,10 +10,10 @@ from helpers.planning import _optimize, _plan, node_kinds
 
 from quail.catalog import Catalog, DocumentProvider
 from quail.catalog.tokens import TokenLengths
+from quail.common.work import ask, scan, stream
 from quail.cost.filters import filter_cost
 from quail.cost.joins import PricedJoin
 from quail.cost.sol import speed_of_light
-from quail.cost.work import ask, scan, stream
 from quail.explain import explain
 from quail.frontend.sql import compile_sql
 from quail.logical import ModelCall, SemanticJoin

@@ -119,7 +119,7 @@ class MapDecoder:
     def _configure_copy(self, first, slots, documents, specs):
         from quail.backends.quail.executor.extract.copy import CopyConstraint
         from quail.backends.quail.executor.readout import AsyncTopLogprobs
-        from quail.cost.draft_policy import LIVE_BUCKETS
+        from quail.common.draft_policy import LIVE_BUCKETS
 
         key = specs[0].top_tokens, tuple(documents.vocabulary.tokenizer.stop_ids)
         if key not in self.copy_readouts:
@@ -157,8 +157,8 @@ class MapDecoder:
 
     def row_counts(self, running):
         """Return one chosen-token row and each answer's copy draft rows."""
-        from quail.cost.answers import answer_survival
-        from quail.cost.draft_policy import draft_lengths
+        from quail.common.answers import answer_survival
+        from quail.common.draft_policy import draft_lengths
 
         counts = np.ones(len(running), dtype=np.int64)
         written = np.zeros(len(running), dtype=np.int64)
@@ -268,7 +268,7 @@ class MapDecoder:
 
     def eviction_order(self, curves=None, recompute_cost=None, page_holds=None):
         """Order running slots by page-hold time saved per recomputation second."""
-        from quail.cost.answers import remaining_tokens
+        from quail.common.answers import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         scores = np.zeros(len(self.map))
@@ -605,7 +605,7 @@ class MapDecoder:
             self.copy_pending[slots] = ~ready
 
     def _read_copy(self, q, documents, indices, values):
-        from quail.cost.draft_policy import live_buckets
+        from quail.common.draft_policy import live_buckets
 
         slots, first, inverse = np.unique(
             documents, return_index=True, return_inverse=True)
@@ -641,7 +641,7 @@ class MapDecoder:
 def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapDecoder:
     """Return a decoder for a pipeline's maps on the loaded model."""
     from quail.backends.quail.executor.model_loading import full_output_head
-    from quail.cost.budgets import copy_verification_workspace_bytes
+    from quail.common.budgets import copy_verification_workspace_bytes
 
     return MapDecoder(
         state.torch, full_output_head(state.loaded_model.model), num_documents,

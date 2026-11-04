@@ -4,9 +4,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from quail.common.work import Work, triangle
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.retention import RetentionPolicy, coefficients
-from quail.cost.work import Work, triangle
 
 
 @dataclass(frozen=True)

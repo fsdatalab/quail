@@ -2,9 +2,9 @@
 
 from dataclasses import dataclass
 
-from quail.cost import budgets
+from quail.common import budgets
+from quail.common.work import Work
 from quail.cost.score import ScoreCost
-from quail.cost.work import Work
 from quail.logical import (
     ColumnRef,
     RegularPredicate,

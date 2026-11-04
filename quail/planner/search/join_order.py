@@ -10,11 +10,11 @@ import itertools
 import math
 from dataclasses import dataclass
 
-from quail.cost.budgets import parallel_copies
+from quail.common.budgets import parallel_copies
+from quail.common.work import Work
 from quail.cost.joins import PricedJoin, packed_join_work
 from quail.cost.joins import stage_work as join_work
 from quail.cost.sol import speed_of_light
-from quail.cost.work import Work
 from quail.planner.search.leftdeep import search_left_deep
 from quail.planner.statistics.tables import (
     AliasStats,

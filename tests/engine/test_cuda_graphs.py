@@ -11,7 +11,7 @@ from quail.backends.quail.executor.cuda_graphs import (
     PiecewiseGraphs,
 )
 from quail.backends.quail.executor.models.qwen3 import Qwen3Pipeline
-from quail.cost.budgets import graph_memory_bytes, graph_token_buckets
+from quail.common.budgets import graph_memory_bytes, graph_token_buckets
 from quail.specs import (
     H100_SXM,
     LFM2_2_6B_BF16,

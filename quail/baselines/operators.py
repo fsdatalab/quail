@@ -7,7 +7,7 @@ import time
 import numpy as np
 import pyarrow as pa
 
-from quail.catalog.pairs import (
+from quail.common.pairs import (
     allowed_members,
     members_by_partner,
     pair_partner,

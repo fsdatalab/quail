@@ -12,7 +12,7 @@ import numpy as np
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.moe import FP8Experts, init_moe_workspace
-from quail.cost import budgets
+from quail.common import budgets
 from quail.specs.base import CANVAS_SEED
 
 

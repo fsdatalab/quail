@@ -6,7 +6,7 @@ from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
-from quail.catalog.selection import selected_rows
+from quail.common.selection import selected_rows
 from quail.logical import (
     And,
     ColumnRef,

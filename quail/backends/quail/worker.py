@@ -35,7 +35,7 @@ from quail.backends.resources import release_models
 from quail.catalog.tokens import (
     decode_payload_documents,
 )
-from quail.cost import budgets
+from quail.common import budgets
 from quail.execution.runner import ExecutionContext
 from quail.execution.types import PhysicalResponse
 from quail.physical import (

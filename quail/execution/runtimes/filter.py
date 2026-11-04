@@ -6,7 +6,7 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.catalog.pairs import columns_key
+from quail.common.pairs import columns_key
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult, answer_table, filter_answer_table
 from quail.execution.rows import Rows

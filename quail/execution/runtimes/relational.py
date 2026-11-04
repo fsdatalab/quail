@@ -8,15 +8,15 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.catalog.pairs import columns_key
-from quail.catalog.selection import equality_keys
+from quail.common.pairs import columns_key
+from quail.common.predicates import compare_literal
+from quail.common.selection import equality_keys
 from quail.execution.aggregates import prepare_aggregate
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.rows import Rows, as_table
 from quail.logical.expressions import evaluate_expression
-from quail.logical.predicates import compare_literal
 from quail.physical import Aggregate, Limit, Project, Scan, Sort, Window
 
 
@@ -39,7 +39,7 @@ class ScanRuntime:
 
 def _tested_documents(node, context) -> pa.Array:
     """Return the positions of the documents that pass a scan's regular predicates."""
-    from quail.catalog.selection import selected_rows
+    from quail.common.selection import selected_rows
 
     columns = context.sources.get(columns_key(node.alias))
     if columns is None:

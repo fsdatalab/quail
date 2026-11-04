@@ -25,7 +25,7 @@ NotImplementedError.
 
 docs/content/docs/architecture/optimizer.mdx describes the model. The
 work counting and component pricing are the planner's own
-(quail.cost.work, quail.cost.sol); the search does not call or
+(quail.common.work, quail.cost.sol); the search does not call or
 simulate the production planner.
 """
 
@@ -33,9 +33,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from quail.cost import budgets
+from quail.common import budgets
+from quail.common.work import Work
 from quail.cost.sol import SpeedOfLight
-from quail.cost.work import Work
 from quail.logical import (
     SPAN_SUFFIX,
     Aggregate,

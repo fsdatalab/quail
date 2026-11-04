@@ -12,7 +12,7 @@ import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
 
-from quail.catalog.pairs import pair_keys
+from quail.common.pairs import pair_keys
 
 DEFAULT_BATCH_ROWS = 65_536
 

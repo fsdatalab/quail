@@ -5,19 +5,19 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from quail.cost.answers import (
+from quail.common.answers import (
     remaining_tokens,
 )
+from quail.common.work import Work
 from quail.cost.decode import DecodeCost
 from quail.cost.dense_decoder_cost import dense_decoder_components
-from quail.cost.work import Work
 from quail.specs import DEVICES, MODELS
 
 
 def test_censored_answers_leave_the_risk_set_after_their_written_length(
         monkeypatch):
     # The censor at 3 leaves two answers at risk at 4.
-    monkeypatch.setattr("quail.cost.answers.PRIOR_WEIGHT", 0.0)
+    monkeypatch.setattr("quail.common.answers.PRIOR_WEIGHT", 0.0)
     remaining = remaining_tokens([2, -1, 4, 6], [2, 3, 4, 6], 3, 6)
     survival = np.array([1, 1, .75, .75, .375, .375, 0])
     expected = np.r_[np.cumsum(survival[:0:-1])[::-1], 0]

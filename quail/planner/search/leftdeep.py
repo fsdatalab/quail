@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Generic, Hashable, Iterable, Sequence, TypeVar
 
-from quail.cost.work import Work
+from quail.common.work import Work
 
 StateProperty = TypeVar("StateProperty", bound=Hashable)
 Step = TypeVar("Step")

@@ -1,6 +1,6 @@
 """AI.SAE_FEATURES: its spec, cost, and plan nodes."""
 
-from quail.cost import budgets
+from quail.common import budgets
 from quail.cost.sae_features import SaeFeaturesCost
 from quail.physical import AiSaeFeatures, SaeFeaturesSpec
 from quail.planner.operators.common import ColumnPlanner, bind_inference

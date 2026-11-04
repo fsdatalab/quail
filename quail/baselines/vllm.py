@@ -13,7 +13,7 @@ from quail.baselines.request_scheduling import (
     run_extract_fields,
     run_filter_sequence,
 )
-from quail.cost.budgets import GRAPH_TOKEN_BUCKETS
+from quail.common.budgets import GRAPH_TOKEN_BUCKETS
 from quail.specs.base import DeviceSpec, ModelSpec
 from quail.specs.files import resolve_model_path
 

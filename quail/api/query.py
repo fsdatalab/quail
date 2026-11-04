@@ -11,10 +11,10 @@ import pyarrow as pa
 
 from quail.api.execute import execute_query
 from quail.catalog import inputs
-from quail.catalog.pairs import FIRST_DOCUMENT, columns_key, estimate_pair_fraction
 from quail.catalog.providers import ScanRequest
-from quail.catalog.selection import selected_rows
 from quail.catalog.tokens import TokenLengths
+from quail.common.pairs import FIRST_DOCUMENT, columns_key, estimate_pair_fraction
+from quail.common.selection import selected_rows
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
 from quail.execution.projection import projection_for
 from quail.execution.reporting import collect_answers, execution_report

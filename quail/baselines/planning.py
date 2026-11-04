@@ -14,7 +14,7 @@ from quail.baselines.nodes import (
     RequestExtractSpec,
     RequestMapSpec,
 )
-from quail.cost import budgets
+from quail.common import budgets
 from quail.logical import (
     SPAN_SUFFIX,
     RegularPredicate,

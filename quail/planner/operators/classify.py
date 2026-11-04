@@ -4,10 +4,10 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
-from quail.cost import budgets
+from quail.common import budgets
+from quail.common.work import Work, packed
 from quail.cost import classify as classify_cost
 from quail.cost.sol import unrounded_seconds
-from quail.cost.work import Work, packed
 from quail.labels import (
     DECISION_SCORING,
     DECODE_SCORING,

@@ -1,6 +1,6 @@
 """How a query splits the GPU memory left after the weights."""
 
-from quail.cost import budgets
+from quail.common import budgets
 from quail.planner.statistics.tables import summarize_alias
 from quail.specs import DeviceSpec, ModelSpec
 

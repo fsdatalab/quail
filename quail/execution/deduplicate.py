@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pyarrow as pa
 
-from quail.catalog.pairs import (
+from quail.common.pairs import (
     FIRST_DOCUMENT,
     columns_key,
     pair_ids_table,

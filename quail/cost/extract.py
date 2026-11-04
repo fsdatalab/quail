@@ -18,10 +18,10 @@ from dataclasses import dataclass, fields, replace
 
 import numpy as np
 
-from quail.cost.budgets import parallel_copies
-from quail.cost.draft_policy import DraftPolicy, draft_lengths
+from quail.common.budgets import parallel_copies
+from quail.common.draft_policy import DraftPolicy, draft_lengths
+from quail.common.work import Work, ask, scan, triangle
 from quail.cost.sol import unrounded_seconds
-from quail.cost.work import Work, ask, scan, triangle
 
 # a larger table is priced from this many evenly spaced documents, so
 # planning time stays flat as the table grows

@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from quail.cost.work import Work, triangle
+from quail.common.work import Work, triangle
 
 
 @dataclass(frozen=True)

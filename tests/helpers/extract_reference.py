@@ -26,7 +26,7 @@ from quail.backends.quail.executor.extract.trace import (
     write_choices,
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.cost.draft_policy import DraftPolicy
+from quail.common.draft_policy import DraftPolicy
 from quail.physical import ExtractSpec
 
 

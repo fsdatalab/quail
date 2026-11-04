@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.catalog.selection import group_ids
+from quail.common.selection import group_ids
 from quail.logical.expressions import evaluate_expression
 
 

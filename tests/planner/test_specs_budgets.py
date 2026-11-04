@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from quail.cost import budgets
+from quail.common import budgets
 from quail.specs import (
     B200,
     DIFFUSION_GEMMA_26B_FP8,

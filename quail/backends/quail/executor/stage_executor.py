@@ -904,7 +904,7 @@ class StageExecutor:
         earlier token and reads the KV before start. Prefill spans start
         after a borrowed prefix or a document already resident.
         """
-        from quail.cost.work import Work, triangle
+        from quail.common.work import Work, triangle
 
         decode_rows = replay_tokens = pairs = kv_read = 0.0
         if decode is not None:

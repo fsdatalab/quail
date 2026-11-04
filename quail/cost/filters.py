@@ -1,7 +1,7 @@
 """Costs of boolean filters over prepared prompt token counts."""
 
+from quail.common.work import ask, packed, scan
 from quail.cost.sol import unrounded_seconds
-from quail.cost.work import ask, packed, scan
 from quail.specs import DeviceSpec, ModelSpec
 
 

@@ -124,7 +124,7 @@ def _quail_state():
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows
     from quail.catalog.tokens import GigatokenEncoder
-    from quail.cost import budgets
+    from quail.common import budgets
     from quail.planner.prompt_lowering import answer_ids
     from quail.specs import D1_2B_BF16, H100_SXM
     from quail.specs.files import resolve_model_path

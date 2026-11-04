@@ -2,11 +2,11 @@
 
 from dataclasses import replace
 
-from quail.cost import budgets
+from quail.common import budgets
+from quail.common.work import packed
 from quail.cost import extract as extract_cost
 from quail.cost.retention import coefficients
 from quail.cost.sol import unrounded_seconds
-from quail.cost.work import packed
 from quail.logical.prompts import PROMPT_LAYOUTS
 from quail.physical import AiExtract, ExtractSpec
 from quail.planner.operators.common import ColumnPlanner, bind_inference

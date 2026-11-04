@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 import pyarrow.compute as pc
 
+from quail.common.work import triangle
 from quail.cost.joins import PricedJoin
-from quail.cost.work import triangle
 from quail.logical import (
     effective_selectivity,
 )

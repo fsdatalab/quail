@@ -11,7 +11,7 @@ from quail.backends.quail.executor.operators.score import QuailScorer
 from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.reranker import RerankerModelExecution
-from quail.cost.budgets import compute_knee
+from quail.common.budgets import compute_knee
 from quail.cost.decode import DecodeCost
 from quail.physical import AiClassify, AiScore, PhysicalNode
 

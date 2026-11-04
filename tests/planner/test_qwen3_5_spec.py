@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
+from quail.common.work import Work
 from quail.cost.dense_decoder_cost import (
     dense_decoder_components,
     mlp_params,
 )
 from quail.cost.sol import speed_of_light
-from quail.cost.work import Work
 from quail.specs import (
     H100_SXM,
     MODELS,
@@ -50,7 +50,7 @@ def test_spec_matches_the_config(name):
         assert spec.experts == config["num_experts"]
         assert spec.experts_active == config["num_experts_per_tok"]
         assert spec.expert_intermediate == config["moe_intermediate_size"]
-        from quail.cost import budgets
+        from quail.common import budgets
         from quail.cost.dense_decoder_cost import mlp_weight_params
         from quail.specs import H100_SXM
 
@@ -81,7 +81,7 @@ def test_spec_matches_the_config(name):
 
 
 def test_one_review_through_a_filter_and_a_join_matches_the_hand_calculation():
-    from quail.cost.work import ask, scan, stream
+    from quail.common.work import ask, scan, stream
 
     # 100-token review, 6-token preamble, 56-token filter question, then a
     # join: a 43-token frame and two aspects of 2 and 3 tokens, each with a

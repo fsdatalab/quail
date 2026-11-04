@@ -1,6 +1,6 @@
 """Execution constraints checked during planning and graph construction."""
 
-from quail.cost import budgets
+from quail.common import budgets
 from quail.cost.joins import PricedJoin, longest_join_input
 from quail.logical import (
     Alias,

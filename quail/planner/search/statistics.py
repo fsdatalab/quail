@@ -9,7 +9,7 @@ on the plan's nodes: each table's filter order and the join sequence.
 
 from dataclasses import dataclass
 
-from quail.cost import budgets
+from quail.common import budgets
 from quail.cost.retention import retention_pages
 from quail.logical import (
     Filter,

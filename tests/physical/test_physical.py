@@ -77,7 +77,7 @@ def test_barrier_survivors_are_the_ids_of_a_complete_join(shape):
 def test_hash_join_keeps_ids_apart_from_a_key_column_named_like_its_alias(aliases):
     from types import SimpleNamespace
 
-    from quail.catalog.pairs import columns_key
+    from quail.common.pairs import columns_key
     from quail.execution.runtimes.dataflow import HashJoinRuntime
     from quail.physical import HashJoin
     from quail.physical.base import input_ports

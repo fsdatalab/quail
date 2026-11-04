@@ -13,11 +13,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from quail.cost import budgets
+from quail.common import budgets
+from quail.common.work import Work, ask, packed, scan
 from quail.cost.extract import estimate as extract_estimate
 from quail.cost.score import score_fixed_tokens
 from quail.cost.sol import speed_of_light
-from quail.cost.work import Work, ask, packed, scan
 from quail.logical.prompts import PROMPT_LAYOUTS
 from quail.physical import (
     AiClassify,

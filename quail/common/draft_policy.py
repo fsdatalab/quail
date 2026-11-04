@@ -5,7 +5,7 @@ tokens along one of the positions the answer so far fits, and pays one
 read of the document's KV however long the draft is. A draft token is
 written when the answer still has a token to go and the position
 followed is the answer's source. The first is the field's answer
-survival curve (quail.cost.answers); the second is certain with one
+survival curve (quail.common.answers); the second is certain with one
 live position and is learned per count of live positions from the
 rounds that drafted. The policy picks the draft length that costs the
 least per written token.
@@ -13,7 +13,7 @@ least per written token.
 
 import numpy as np
 
-from quail.cost.answers import prior_survival, survival_rows
+from quail.common.answers import prior_survival, survival_rows
 
 # drafted rounds the seed of the source odds counts as
 SOURCE_PRIOR_WEIGHT = 8

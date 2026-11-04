@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.catalog.document_ends import document_ends, last_tokens
-from quail.cost.budgets import cheaper_attention_path, tree_attention_allowed
+from quail.common.budgets import cheaper_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
 from quail.physical import (
     Aggregate as PhysicalAggregate,

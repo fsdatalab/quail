@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from functools import partial
 
-from quail.cost.budgets import graph_memory_bytes, graph_token_buckets
+from quail.common.budgets import graph_memory_bytes, graph_token_buckets
 from quail.progress import logger
 
 

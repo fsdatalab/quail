@@ -137,7 +137,7 @@ def quail() -> dict:
     from quail.backends.quail.executor.sae import SaeEncoder, SaeFeaturesReadout
     from quail.backends.quail.executor.stages import Stage, run_stages
     from quail.backends.quail.worker import checkpoint_arena_args
-    from quail.cost import budgets
+    from quail.common import budgets
     from quail.specs import H100_SXM, MODELS
 
     spec = MODELS[MODEL]

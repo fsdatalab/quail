@@ -401,7 +401,7 @@ def _load(answer_ids):
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
-    from quail.cost import budgets
+    from quail.common import budgets
     from quail.specs import H100_SXM
 
     spec, device = _spec(), H100_SXM

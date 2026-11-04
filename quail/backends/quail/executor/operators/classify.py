@@ -25,7 +25,7 @@ from quail.backends.quail.reranker import (
     score_rows,
     scored_batch,
 )
-from quail.catalog.selection import document_positions
+from quail.common.selection import document_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.progress import answer_sink

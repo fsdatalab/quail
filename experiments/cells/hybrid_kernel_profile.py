@@ -176,7 +176,7 @@ def quail(model: str, backend: str = "flashinfer",
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.executor.stages import filter_stages, run_stages
     from quail.backends.quail.worker import checkpoint_arena_args
-    from quail.cost import budgets
+    from quail.common import budgets
     from quail.planner.prompt_lowering import true_false_ids
     from quail.specs import H100_SXM, MODELS
 

@@ -15,8 +15,8 @@ ModelSpec.checkpoint_bytes for every write and every read in Work.
 
 from __future__ import annotations
 
+from quail.common.work import Work
 from quail.cost.roofline import CostComponent
-from quail.cost.work import Work
 from quail.specs import ModelSpec
 
 # vLLM's FLA_CHUNK_SIZE: tokens per chunk of the chunked gated delta rule

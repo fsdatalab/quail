@@ -5,9 +5,9 @@ from dataclasses import asdict, replace
 
 import pytest
 
+from quail.common.work import Work, scan, stream
 from quail.cost.classify import estimate
 from quail.cost.sol import unrounded_seconds
-from quail.cost.work import Work, scan, stream
 from quail.labels import decode_round_tokens, label_trie
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 

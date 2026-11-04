@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from quail.cost import budgets
+from quail.common import budgets
 from quail.cost import extract as extract_cost
 from quail.physical import AiMap, MapSpec
 from quail.planner.operators.common import ColumnPlanner, bind_inference

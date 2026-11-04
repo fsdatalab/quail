@@ -1,6 +1,6 @@
 """Classification costs: expected work priced like a filter's work.
 
-The estimate sums each document's work (quail/cost/work.py) over every
+The estimate sums each document's work (quail/common/work.py) over every
 document, weights each label's greedy decode rounds by its share of
 the labels, and prices the total with the component roofline at ideal
 packing: forward passes are tokens divided by the chunk, as in
@@ -13,9 +13,9 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from quail.cost.budgets import parallel_copies
+from quail.common.budgets import parallel_copies
+from quail.common.work import Work, ask, decode, stream
 from quail.cost.sol import unrounded_seconds
-from quail.cost.work import Work, ask, decode, stream
 from quail.labels import (
     DECODE_SCORING,
     LETTERS_SCORING,

@@ -3,8 +3,8 @@
 import numpy as np
 
 from quail.backends.quail.executor.chunk import decode_groups
-from quail.cost.answers import prior_survival, survival_rows
-from quail.cost.work import Work
+from quail.common.answers import prior_survival, survival_rows
+from quail.common.work import Work
 
 
 def input_bucket(tokens):

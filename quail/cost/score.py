@@ -2,9 +2,9 @@
 
 from dataclasses import dataclass
 
-from quail.cost.budgets import parallel_copies
+from quail.common.budgets import parallel_copies
+from quail.common.work import Work, packed, triangle
 from quail.cost.sol import speed_of_light
-from quail.cost.work import Work, packed, triangle
 from quail.specs import DeviceSpec, ModelSpec
 
 
