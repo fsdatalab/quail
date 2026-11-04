@@ -60,6 +60,26 @@ def _rust_builder(monkeypatch):
     for planner in (ExtractPlanner, MapPlanner, SaeFeaturesPlanner):
         monkeypatch.setattr(planner, "spec", shadow_column_spec(
             _quail_native, planner.spec))
+    from helpers.rust_builder import (
+        shadow_filter_costs,
+        shadow_join_specs,
+        shadow_score_spec,
+    )
+
+    import quail.planner.operators.filter as filter_module
+    import quail.planner.operators.join as join_module
+    import quail.planner.operators.score as score_module
+
+    for owner, name, make in ((score_module, "score_spec", shadow_score_spec),
+                              (filter_module, "prepare_filter_costs",
+                               shadow_filter_costs),
+                              (join_module, "join_specs", shadow_join_specs)):
+        original = getattr(owner, name)
+        shadow = make(_quail_native, original)
+        for module in [module for key, module in list(sys.modules.items())
+                       if key.startswith("quail.") and module is not None]:
+            if getattr(module, name, None) is original:
+                monkeypatch.setattr(module, name, shadow)
     for module in (query_module, optimize_module):
         monkeypatch.setattr(module, "logical_alternatives", shadow_logical_alternatives(
             _quail_native, module.logical_alternatives))

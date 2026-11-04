@@ -531,43 +531,148 @@ fn prompt_lowering<'py>(
     }
 }
 
-/// Build one column operator's spec, as its Python column planner's
-/// `spec` does.
-///
-/// `model` and `device` are the specs' fields as JSON;
-/// `document_tokens` maps each alias to its documents' token counts.
-/// Returns (the spec as JSON, None), or (None, the refusal's message).
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-#[pyo3(signature = (model, device, gpus, document_tokens, plan, node, expected_rows, resident, tokenizer))]
-fn column_spec<'py>(
-    py: Python<'py>,
-    model: &str,
-    device: &str,
+/// The planning context's fields, as `tests/helpers/rust_builder.py`
+/// writes them.
+#[derive(serde::Deserialize)]
+struct ContextFields {
+    model: serde_json::Value,
+    device: serde_json::Value,
     gpus: i64,
+    canvas_draws: i64,
     document_tokens: std::collections::BTreeMap<String, Vec<i64>>,
-    plan: Option<&str>,
-    node: &str,
-    expected_rows: f64,
-    resident: bool,
+    plan: Option<serde_json::Value>,
+}
+
+/// Run one operator planning function of `quail/planner/operators` in Rust.
+///
+/// `context` is the planning context's fields as JSON, and `arguments`
+/// the function's other arguments. Returns (the result as JSON, None),
+/// or (None, the refusal's message).
+#[pyfunction]
+fn plan_operator<'py>(
+    py: Python<'py>,
+    name: &str,
+    context: &str,
+    arguments: &str,
     tokenizer: Bound<'py, PyAny>,
 ) -> PyResult<(Option<String>, Option<String>)> {
+    use quail_planner::{columns, costs, scores};
     let tokens = python_tokenizer(py, &tokenizer);
+    let fields: ContextFields = from_json(context)?;
     let context = quail_planner::context::PlanningContext {
-        model: from_json(model)?,
-        device: from_json(device)?,
-        gpus,
-        document_tokens,
+        model: json_value(fields.model)?,
+        device: json_value(fields.device)?,
+        gpus: fields.gpus,
+        canvas_draws: fields.canvas_draws,
+        document_tokens: fields.document_tokens,
         tokenizer: &tokens,
-        logical_plan: plan.map(from_json).transpose()?,
+        logical_plan: fields.plan.map(json_value).transpose()?,
     };
-    let node: quail_planner::LogicalNode = from_json(node)?;
-    lowering_result(quail_planner::columns::column_spec(
-        &context,
-        &node,
-        expected_rows,
-        resident,
-    ))
+    let arguments: serde_json::Value = from_json(arguments)?;
+    let get = |key: &str| arguments[key].clone();
+    match name {
+        "column_spec" => lowering_result(columns::column_spec(
+            &context,
+            &json_value(get("node"))?,
+            get("expected_rows").as_f64().unwrap_or_default(),
+            get("resident").as_bool().unwrap_or_default(),
+        )),
+        "score_spec" => lowering_result(
+            scores::score_spec(
+                &json_value(get("prompt"))?,
+                get("name").as_str().unwrap_or_default(),
+                get("expected_rows").as_f64().unwrap_or_default(),
+                get("mean_tokens").as_f64(),
+                &context,
+                get("chunk").as_i64().unwrap_or_default(),
+                get("pair_fraction").as_f64().unwrap_or(1.0),
+                get("prefix_groups").as_f64(),
+            )
+            .map(|(spec, work)| (spec, work_fields(&work))),
+        ),
+        "filter_costs" => {
+            let rows: Vec<f64> = json_value(get("rows"))?;
+            lowering_result(costs::prepare_filter_costs(
+                &json_value::<Vec<quail_physical::FilterPredicate>>(get("predicates"))?,
+                get("mean_tokens").as_f64().unwrap_or_default(),
+                get("chunk").as_i64().unwrap_or_default(),
+                &context,
+            ).map(|prepared| {
+                prepared
+                    .iter()
+                    .map(|cost| {
+                        serde_json::json!({
+                            "selectivity": cost.selectivity,
+                            "reuse_key": cost.reuse_key,
+                            "first": rows.iter().map(|count| cost.first.seconds(*count)).collect::<Vec<_>>(),
+                            "later": rows.iter().map(|count| cost.later.seconds(*count)).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            }))
+        }
+        "join_specs" => {
+            let fractions: std::collections::BTreeMap<String, f64> =
+                json_value(get("pair_fractions"))?;
+            let fractions = fractions
+                .into_iter()
+                .map(|(key, fraction)| (key.parse().unwrap_or(usize::MAX), fraction))
+                .collect();
+            let counts: std::collections::BTreeMap<String, f64> = json_value(get("counts"))?;
+            lowering_result(costs::join_specs(
+                &json_value::<Vec<quail_planner::logical::SemanticJoin>>(get("joins"))?,
+                &fractions,
+                get("canvas").as_i64().unwrap_or_default(),
+                &context,
+                get("chunk").as_i64().unwrap_or_default(),
+            ).map(|specs| {
+                specs
+                    .iter()
+                    .map(|spec| {
+                        serde_json::json!({
+                            "written_position": spec.written_position,
+                            "aliases": spec.aliases,
+                            "anchor": spec.anchor,
+                            "anchor_free": spec.anchor_free,
+                            "semantics": spec.semantics,
+                            "selectivity": spec.selectivity,
+                            "frame_tokens": spec.frame_tokens,
+                            "label_tokens": spec.label_tokens,
+                            "tail_tokens": spec.tail_tokens,
+                            "on": spec.on,
+                            "pair_fraction": spec.pair_fraction,
+                            "work": spec.score.as_ref().map(|cost| work_fields(
+                                &scores::score_join_work(cost, &spec.aliases, spec.pair_fraction, &counts),
+                            )),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            }))
+        }
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "no operator planning function {other}"
+        ))),
+    }
+}
+
+fn json_value<T: serde::de::DeserializeOwned>(found: serde_json::Value) -> PyResult<T> {
+    serde_json::from_value(found)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+/// A Work record's fields, as a dict of floats.
+fn work_fields(work: &quail_cost::work::Work) -> std::collections::BTreeMap<&'static str, f64> {
+    std::collections::BTreeMap::from([
+        ("tokens", work.tokens.total()),
+        ("pairs", work.pairs.total()),
+        ("kv_written", work.kv_written.total()),
+        ("kv_read", work.kv_read.total()),
+        ("sliding_pairs", work.sliding_pairs.total()),
+        ("sliding_kv_read", work.sliding_kv_read.total()),
+        ("state_written", work.state_written.total()),
+        ("state_read", work.state_read.total()),
+        ("sae_encoded", work.sae_encoded.total()),
+    ])
 }
 
 #[pymodule]
@@ -580,6 +685,6 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;
     module.add_function(wrap_pyfunction!(logical_alternatives, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
-    module.add_function(wrap_pyfunction!(column_spec, module)?)?;
+    module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }

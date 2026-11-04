@@ -949,6 +949,14 @@ impl CostModel {
         set_size: Option<i64>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let spec = PricedJoin {
+            written_position: 0,
+            anchor: None,
+            anchor_free: true,
+            semantics: "full".to_string(),
+            selectivity: None,
+            on: Vec::new(),
+            pair_fraction: 1.0,
+            score: None,
             aliases,
             frame_tokens,
             label_tokens,

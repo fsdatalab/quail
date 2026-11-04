@@ -10,8 +10,25 @@ use crate::work::{Work, triangle};
 /// One join with the token counts the cost model prices it by.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PricedJoin {
+    /// The join's position among the query's joins.
+    pub written_position: usize,
     /// The join's tables in placeholder order.
     pub aliases: Vec<String>,
+    /// The table whose document KV the join reuses, or None when the
+    /// search chooses it.
+    pub anchor: Option<String>,
+    /// Whether the search may choose the anchor.
+    pub anchor_free: bool,
+    /// "full" for a join returning pairs, else the gate's kind.
+    pub semantics: String,
+    /// The fraction of pairs expected to pass, or None.
+    pub selectivity: Option<f64>,
+    /// Equality conditions: (left alias, left column, right alias, right column).
+    pub on: Vec<(String, String, String, String)>,
+    /// The fraction of the cross product the equality conditions keep.
+    pub pair_fraction: f64,
+    /// A score join's own pricing; None for a join the model answers.
+    pub score: Option<crate::score::ScoreCost>,
     /// alias -> tokens of the frame after that alias's document when it
     /// anchors.
     pub frame_tokens: BTreeMap<String, i64>,

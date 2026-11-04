@@ -336,7 +336,12 @@ fn without_document(template: &str, marker: &str) -> String {
     text.replace(marker, "this document")
 }
 
-fn score_query_template(prompt: &Prompt) -> Result<String, CompileError> {
+/// The query text a reranker reads, as `score_query_template`.
+///
+/// # Errors
+///
+/// The prompt reads more than a pair.
+pub fn score_query_template(prompt: &Prompt) -> Result<String, CompileError> {
     let aliases = prompt_aliases(prompt);
     if aliases.len() == 1 {
         return Ok(without_document(&prompt.template, "{0}"));

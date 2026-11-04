@@ -475,25 +475,48 @@ def _token_fields(spec: dict, intern) -> dict:
     return out
 
 
-def shadow_column_spec(native, original):
-    """Return a column planner's spec method, also building the spec in Rust."""
+def _context_json(context) -> str:
+    """The planning context's fields, as the native module reads them."""
     import numpy as np
 
+    return json.dumps({
+        "model": _untagged(encode_value(context.model)),
+        "device": _untagged(encode_value(context.device)),
+        "gpus": context.gpus, "canvas_draws": context.canvas_draws,
+        "document_tokens": {alias: np.asarray(values).astype(int).tolist()
+                            for alias, values in context.document_tokens.items()},
+        "plan": (None if context.logical_plan is None
+                 else encode_value(context.logical_plan)),
+    })
+
+
+def _plan_operator(native, name, context, arguments):
+    """(intern, the Rust result or None, its refusal or None)."""
+    intern, tokens = _interning(context.tokenizer)
+    if os.environ.get("QUAIL_RUST_OPERATOR_LOG"):
+        with open(os.environ["QUAIL_RUST_OPERATOR_LOG"], "a") as log:
+            log.write(f"{name} {context.model.attention_mask}\n")
+    rust, message = native.plan_operator(
+        name, _context_json(context), json.dumps(arguments), tokens)
+    return intern, (None if rust is None else json.loads(rust)), message
+
+
+def _work_fields(work) -> dict:
+    from dataclasses import asdict
+
+    return {key: float(value) for key, value in asdict(work).items()}
+
+
+def shadow_column_spec(native, original):
+    """Return a column planner's spec method, also building the spec in Rust."""
     from quail.planner.validation import SaeFeaturesRefusedError
 
     def spec(self, context, node, expected_rows, resident=False):
         if context.tokenizer is None:
             return original(self, context, node, expected_rows, resident)
-        intern, tokens = _interning(context.tokenizer)
-        lengths = {alias: np.asarray(values).astype(int).tolist()
-                   for alias, values in context.document_tokens.items()}
-        plan = (None if context.logical_plan is None
-                else json.dumps(encode_value(context.logical_plan)))
-        rust, message = native.column_spec(
-            json.dumps(_untagged(encode_value(context.model))),
-            json.dumps(_untagged(encode_value(context.device))), context.gpus,
-            lengths, plan, json.dumps(encode_value(node)), float(expected_rows),
-            resident, tokens)
+        intern, rust, message = _plan_operator(native, "column_spec", context, {
+            "node": encode_value(node), "expected_rows": float(expected_rows),
+            "resident": resident})
         try:
             found = original(self, context, node, expected_rows, resident)
         except SaeFeaturesRefusedError:
@@ -501,8 +524,108 @@ def shadow_column_spec(native, original):
             raise
         assert message is None, f"Rust refused the spec: {message}"
         expected = _token_fields(json.loads(json.dumps(encode_value(found))), intern)
-        difference = same_values(json.loads(rust), expected)
+        difference = same_values(rust, expected)
         assert difference is None, f"Rust built another spec: {difference}"
         return found
 
     return spec
+
+
+def shadow_score_spec(native, original):
+    """Return score_spec, also building the spec and its work in Rust."""
+
+    def score_spec(prompt, *, name, expected_rows, mean_tokens, context,
+                   chunk_tokens, pair_fraction=1.0, prefix_groups=None):
+        found = original(prompt, name=name, expected_rows=expected_rows,
+                         mean_tokens=mean_tokens, context=context,
+                         chunk_tokens=chunk_tokens, pair_fraction=pair_fraction,
+                         prefix_groups=prefix_groups)
+        if context.tokenizer is None:
+            return found
+        intern, rust, message = _plan_operator(native, "score_spec", context, {
+            "prompt": encode_value(prompt), "name": name,
+            "expected_rows": float(expected_rows),
+            "mean_tokens": None if mean_tokens is None else float(mean_tokens),
+            "chunk": chunk_tokens, "pair_fraction": float(pair_fraction),
+            "prefix_groups": None if prefix_groups is None else float(prefix_groups)})
+        assert message is None, f"Rust refused the score: {message}"
+        spec, work = found
+        expected = [_token_fields(json.loads(json.dumps(encode_value(spec))), intern),
+                    _work_fields(work)]
+        difference = same_values(rust, expected)
+        assert difference is None, f"Rust built another score: {difference}"
+        return found
+
+    return score_spec
+
+
+# the document counts filter and score costs are compared at
+SAMPLE_ROWS = (0.0, 1.0, 37.5, 4000.0)
+
+
+def shadow_filter_costs(native, original):
+    """Return prepare_filter_costs, also pricing the predicates in Rust."""
+
+    def prepare_filter_costs(predicates, *, mean_tokens, model, device,
+                             chunk_tokens, context=None, lower=None):
+        found = original(predicates, mean_tokens=mean_tokens, model=model,
+                         device=device, chunk_tokens=chunk_tokens,
+                         context=context, lower=lower)
+        if (context is None or lower is not None or context.tokenizer is None
+                or model is not context.model or device is not context.device):
+            return found
+        _, rust, message = _plan_operator(native, "filter_costs", context, {
+            "predicates": encode_value(tuple(predicates)),
+            "mean_tokens": float(mean_tokens), "chunk": chunk_tokens,
+            "rows": list(SAMPLE_ROWS)})
+        assert message is None, f"Rust refused the filter costs: {message}"
+        expected = [{
+            "selectivity": cost.selectivity,
+            "reuse_key": (None if cost.reuse_key is None
+                          else json.loads(json.dumps(encode_value(cost.reuse_key)))),
+            "first": [float(cost.first(rows)) for rows in SAMPLE_ROWS],
+            "later": [float(cost.later(rows)) for rows in SAMPLE_ROWS],
+        } for cost in found]
+        difference = same_values(rust, expected)
+        assert difference is None, f"Rust priced the filters otherwise: {difference}"
+        return found
+
+    return prepare_filter_costs
+
+
+def shadow_join_specs(native, original):
+    """Return join_specs, also pricing the joins in Rust."""
+    import numpy as np
+
+    def join_specs(joins, pair_fractions=None, canvas=0, *, context=None, chunk=0):
+        found = original(joins, pair_fractions, canvas, context=context, chunk=chunk)
+        if context is None or context.tokenizer is None:
+            return found
+        # a score join's work, compared at half of every table's documents
+        counts = {alias: len(np.asarray(values)) / 2
+                  for alias, values in context.document_tokens.items()}
+        _, rust, message = _plan_operator(native, "join_specs", context, {
+            "joins": [_untagged_top(encode_value(join)) for join in joins],
+            "pair_fractions": {str(key): float(value)
+                               for key, value in (pair_fractions or {}).items()},
+            "canvas": canvas, "chunk": chunk, "counts": counts})
+        assert message is None, f"Rust refused the join specs: {message}"
+        expected = [{
+            "written_position": spec.written_position, "aliases": list(spec.aliases),
+            "anchor": spec.anchor, "anchor_free": spec.anchor_free,
+            "semantics": spec.semantics, "selectivity": spec.selectivity,
+            "frame_tokens": dict(spec.frame_tokens),
+            "label_tokens": dict(spec.label_tokens), "tail_tokens": spec.tail_tokens,
+            "on": [list(key) for key in spec.on], "pair_fraction": spec.pair_fraction,
+            "work": None if spec.cost is None else _work_fields(spec.cost.work(counts)),
+        } for spec in found]
+        difference = same_values(rust, expected)
+        assert difference is None, f"Rust priced the joins otherwise: {difference}"
+        return found
+
+    return join_specs
+
+
+def _untagged_top(value: dict) -> dict:
+    """An encoded dataclass without its own class tag."""
+    return {key: item for key, item in value.items() if key != "type"}

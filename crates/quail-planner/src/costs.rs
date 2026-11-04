@@ -1,0 +1,211 @@
+//! What filter ordering and join search price: each AI.IF predicate's
+//! cost and each join's token counts, as `quail/planner/operators/filter.py`
+//! and `join.py` prepare them.
+
+use std::collections::BTreeMap;
+
+use quail_cost::filters::filter_cost;
+use quail_cost::joins::PricedJoin;
+use quail_cost::score::ScoreCost;
+use quail_physical::{Equality, FilterPredicate, Prompt};
+
+use crate::context::PlanningContext;
+use crate::expressions::{CompileError, argument_alias, column_name, compile_error};
+use crate::logical::{LogicalNode, SemanticJoin};
+use crate::lowering::LoweredPrompt;
+use crate::nodes::asked_call;
+use crate::scores::{prompt_aliases, score_statistics};
+use crate::statistics::effective_selectivity;
+
+/// A predicate's seconds as a function of the documents it reads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CostCurve {
+    /// Seconds per document.
+    Linear(f64),
+    /// A score's own estimate at each count.
+    Score(Box<ScoreCost>),
+}
+
+impl CostCurve {
+    /// The seconds over `rows` documents.
+    pub fn seconds(&self, rows: f64) -> f64 {
+        match self {
+            CostCurve::Linear(per_document) => rows * per_document,
+            CostCurve::Score(cost) => cost.estimate(rows, None).1,
+        }
+    }
+}
+
+/// One predicate's costs, and the score result a later predicate may reuse.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PredicateCost {
+    pub selectivity: f64,
+    /// Seconds when the predicate reads its documents first.
+    pub first: CostCurve,
+    /// Seconds when an earlier predicate already read them.
+    pub later: CostCurve,
+    /// The score prompt whose result the predicate reuses, or None.
+    pub reuse_key: Option<Prompt>,
+}
+
+/// Token count of a prompt's per-evaluation tail, as `question_tokens`.
+///
+/// # Errors
+///
+/// The prompt is a score's, which has no question tail.
+pub fn question_tokens(lowered: &LoweredPrompt, canvas: i64) -> Result<i64, CompileError> {
+    if lowered.prompt.kind == "score" {
+        return compile_error("a score prompt has no question tail");
+    }
+    Ok(lowered.tail_token_ids.len() as i64 + canvas)
+}
+
+/// Each predicate's costs for ordering one table's filters.
+///
+/// # Errors
+///
+/// The tokenizer fails, or the arena does not fit the device.
+pub fn prepare_filter_costs(
+    predicates: &[FilterPredicate],
+    mean_tokens: f64,
+    chunk_tokens: i64,
+    context: &PlanningContext,
+) -> Result<Vec<PredicateCost>, CompileError> {
+    let (model, device) = (&context.model, &context.device);
+    let mut prepared = Vec::new();
+    for predicate in predicates {
+        let call = asked_call(&predicate.expression);
+        let (first, later, reuse_key) = if call.kind == "score" {
+            let (_, cost) =
+                score_statistics(&call.prompt, context, chunk_tokens, Some(mean_tokens))?;
+            let curve = CostCurve::Score(Box::new(cost));
+            (curve.clone(), curve, Some((*call.prompt).clone()))
+        } else {
+            let question = question_tokens(&context.lowered(&call.prompt)?, model.canvas_tokens)?;
+            (
+                CostCurve::Linear(filter_cost(
+                    question,
+                    mean_tokens,
+                    model,
+                    device,
+                    chunk_tokens,
+                    true,
+                )),
+                CostCurve::Linear(filter_cost(
+                    question,
+                    mean_tokens,
+                    model,
+                    device,
+                    chunk_tokens,
+                    false,
+                )),
+                None,
+            )
+        };
+        prepared.push(PredicateCost {
+            selectivity: effective_selectivity(predicate.selectivity),
+            first,
+            later,
+            reuse_key,
+        });
+    }
+    Ok(prepared)
+}
+
+/// The Equality conditions under one SemanticJoin, in written order.
+pub fn join_conditions(join: &SemanticJoin) -> Vec<Equality> {
+    fn visit(node: &LogicalNode, found: &mut Vec<Equality>) {
+        if let LogicalNode::Join(join) = node {
+            visit(&join.left, found);
+            found.extend(join.on.iter().cloned());
+        }
+    }
+    let mut found = Vec::new();
+    visit(&join.input, &mut found);
+    found
+}
+
+fn priced_key(condition: &Equality) -> (String, String, String, String) {
+    (
+        argument_alias(&condition.left),
+        column_name(&condition.left, false),
+        argument_alias(&condition.right),
+        column_name(&condition.right, false),
+    )
+}
+
+/// The joins as the cost model prices them, in written order.
+///
+/// `pair_fractions` maps a written position to the fraction of the
+/// cross product its equality conditions keep; `canvas` is the rows a
+/// diffusion model appends to every pair.
+///
+/// # Errors
+///
+/// The tokenizer fails, or the arena does not fit the device.
+pub fn join_specs(
+    joins: &[SemanticJoin],
+    pair_fractions: &BTreeMap<usize, f64>,
+    canvas: i64,
+    context: &PlanningContext,
+    chunk: i64,
+) -> Result<Vec<PricedJoin>, CompileError> {
+    let mut out = Vec::new();
+    for (position, join) in joins.iter().enumerate() {
+        let conditions = join_conditions(join);
+        let fraction = if conditions.is_empty() {
+            1.0
+        } else {
+            pair_fractions.get(&position).copied().unwrap_or(1.0)
+        };
+        let on: Vec<_> = conditions.iter().map(priced_key).collect();
+        let call = asked_call(&join.predicate);
+        if call.kind == "score" {
+            let (parts, cost) = score_statistics(&call.prompt, context, chunk, None)?;
+            let aliases = prompt_aliases(&call.prompt);
+            let (left, right) = (aliases[0].clone(), aliases[1].clone());
+            let (head, middle, tail) = (
+                parts[0].len() as i64,
+                parts[1].len() as i64,
+                parts[2].len() as i64,
+            );
+            out.push(PricedJoin {
+                written_position: position,
+                aliases: vec![left.clone(), right.clone()],
+                anchor: Some(left.clone()),
+                anchor_free: false,
+                semantics: join.semantics.clone(),
+                selectivity: join.selectivity,
+                frame_tokens: BTreeMap::from([(left.clone(), head + middle), (right.clone(), 0)]),
+                label_tokens: BTreeMap::from([(left, 0), (right, 0)]),
+                tail_tokens: tail + canvas,
+                on,
+                pair_fraction: fraction,
+                score: Some(cost),
+            });
+            continue;
+        }
+        let lowered = context.lowered(&call.prompt)?;
+        let mut frame_tokens = BTreeMap::new();
+        let mut label_tokens = BTreeMap::new();
+        for (alias, label, frame) in &lowered.label_token_ids {
+            frame_tokens.insert(alias.clone(), frame.len() as i64);
+            label_tokens.insert(alias.clone(), label.len() as i64);
+        }
+        out.push(PricedJoin {
+            written_position: position,
+            aliases: call.prompt.args.iter().map(argument_alias).collect(),
+            anchor: join.anchor.clone(),
+            anchor_free: join.anchor.is_none() && join.semantics == "full",
+            semantics: join.semantics.clone(),
+            selectivity: join.selectivity,
+            frame_tokens,
+            label_tokens,
+            tail_tokens: question_tokens(&lowered, canvas)?,
+            on,
+            pair_fraction: fraction,
+            score: None,
+        });
+    }
+    Ok(out)
+}

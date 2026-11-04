@@ -78,7 +78,7 @@ pub fn score_work(
 }
 
 /// Prepared inputs for one score's cost at any survivor count.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScoreCost {
     pub token_lengths: Vec<i64>,
     pub summaries: Vec<AliasStats>,

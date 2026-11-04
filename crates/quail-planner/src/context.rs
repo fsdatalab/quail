@@ -13,6 +13,8 @@ pub struct PlanningContext<'a> {
     pub model: ModelSpec,
     pub device: DeviceSpec,
     pub gpus: i64,
+    /// The most diffusion draws per individual-document classification or score.
+    pub canvas_draws: i64,
     /// alias -> each document's token count.
     pub document_tokens: BTreeMap<String, Vec<i64>>,
     pub tokenizer: &'a Tokenizer<'a>,
