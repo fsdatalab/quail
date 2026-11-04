@@ -80,8 +80,10 @@ compute rates. Quail represents it with `DeviceSpec`.
 | `bf16_flops` | Peak dense BF16 operations per second. |
 
 All values describe one GPU. Use compute rates without structured
-sparsity. The
-[H100 specification](https://github.com/fsdatalab/quail/blob/main/quail/specs/h100_sxm.py)
+sparsity. Each built-in specification is a TOML file in
+[`quail/specs/data`](https://github.com/fsdatalab/quail/tree/main/quail/specs/data);
+the
+[H100 specification](https://github.com/fsdatalab/quail/blob/main/quail/specs/data/devices/h100-sxm.toml)
 is a complete example.
 
 Register a new specification with `registry.register_device(spec)`.

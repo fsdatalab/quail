@@ -73,4 +73,4 @@ def test_the_spec_uses_the_highest_mamf_per_precision(tmp_path):
         directory.mkdir()
         (directory / "summary.json").write_text(json.dumps(summary))
     assert spec_text(load([tmp_path])) == (
-        "mamf_fp8_flops=1.629e+15,\nmamf_bf16_flops=8.5e+14,")
+        "mamf_fp8_flops = 1.629e+15\nmamf_bf16_flops = 8.5e+14")
