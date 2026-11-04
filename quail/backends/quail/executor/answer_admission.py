@@ -68,6 +68,9 @@ class HeadroomAdmission:
         np.maximum.at(self.lead, self.parent, self.borrowed)
         self.page_cost = page_cost
         self.capacity_extra = capacity_extra
+        # the prefix each document can borrow; the scheduler zeroes an entry
+        # when its parent leaves, so this is its list, not a copy
+        self.tree_shared = shared
         self.choose_headroom = choose_headroom and decode_cost is not None
         self.chunk_tokens = chunk_tokens
         self.bucket_answers = bucket_answers
@@ -136,6 +139,7 @@ class HeadroomAdmission:
         self.replay_pages = int(replay_pages)
         self._refreshes += 1
         running = self._running()
+        self._update_curves()
         if self.choose_headroom:
             self._refresh_curves(stages, replays)
             self._choose_running(stages, running)
@@ -146,8 +150,8 @@ class HeadroomAdmission:
         roots = self.committed[self.parent]
         self.headroom_pages += int(self.pending_pages[roots].sum())
 
-    def _refresh_curves(self, stages, replays):
-        """Rebuild the curves of maps whose answers moved, and the work."""
+    def _update_curves(self):
+        """Rebuild the curves of maps whose answers moved since the last update."""
         if self.slots is None:
             self._bind()
         decoder = self.decoder
@@ -161,6 +165,12 @@ class HeadroomAdmission:
         self._observed = observed
         if changed.any():
             self._rebuild_curves(maps, lengths, observed, changed)
+
+    def _refresh_curves(self, stages, replays):
+        """Recompute the expected answer tokens and the work from the curves."""
+        decoder = self.decoder
+        slots, maps = self.slots, self.slot_map[self.slots]
+        lengths = decoder.lengths[maps, slots]
         expected = self.whole.sum(axis=1)
         ready = ~decoder.paused
         if replays:
@@ -205,11 +215,34 @@ class HeadroomAdmission:
                                           self.whole[rows // self.num_buckets],
                                           self.row_limit[rows])
 
-    def eviction_order(self, curves=None):
-        """Rank running answers for eviction, the first evicted first."""
+    def eviction_order(self):
+        """Rank running answers for eviction, the first evicted first.
+
+        Each answer's remaining tokens come from the curve of its map and
+        input-length bucket, the curve its headroom is chosen from.
+        """
         policy = None if self.decode_cost is None else self.decode_cost.recompute_cost
         holds = None if self.page_holds is None else self.page_holds()
-        return self.decoder.eviction_order(curves, policy, holds)
+        self._update_curves()
+        return self.decoder.eviction_order(None, policy, holds,
+                                           remaining=self._remaining_tokens())
+
+    def _remaining_tokens(self):
+        """Per slot, E[L - t | L > t] from its bucket curve, t its written tokens."""
+        decoder = self.decoder
+        remaining = np.zeros(len(self.prefix))
+        running = self._running()
+        if not len(running):
+            return remaining
+        curves = self.curves[self.slot_row[running]]
+        tails = np.cumsum(curves[:, ::-1], axis=1)[:, ::-1]
+        written = decoder.written[decoder.map[running], running]
+        index = np.minimum(written, self.width - 1)
+        rows = np.arange(len(running))
+        survived = curves[rows, index]
+        remaining[running] = np.divide(tails[rows, index], survived,
+                                       out=np.zeros(len(running)), where=survived > 0)
+        return remaining
 
     def _refresh_work(self, slots, contexts, replays):
         cost = self.decode_cost
@@ -304,7 +337,7 @@ class HeadroomAdmission:
         # with nothing running, price joining a pass that holds one such answer
         base = self.work if self.work.tokens else added
         gain = self.decode_cost.gain(base, added, self.expected_tokens[anchor])
-        prompt_pages = self.page_cost(int(self.prefix[anchor]) + self.capacity_extra)
+        prompt_pages = self._new_prompt_pages(anchor)
         value, headroom = gain / max(1, prompt_pages), None
         while True:
             pages = int(self._argmin(risk, value).sum())
@@ -312,6 +345,13 @@ class HeadroomAdmission:
                 return value
             headroom = pages
             value = gain / max(1, prompt_pages + headroom)
+
+    def _new_prompt_pages(self, anchor):
+        """Pages a waiting document's prompts add, past any prefix they borrow."""
+        shared = int(self.tree_shared[anchor]) if anchor < len(self.tree_shared) else 0
+        own = self.page_cost(int(self.prefix[anchor]) + self.capacity_extra - shared)
+        branches = (self.parent == anchor) & (np.arange(len(self.prefix)) != anchor)
+        return own + int(self.prompt_pages[branches].sum())
 
     @staticmethod
     def _argmin(risk, page_value):

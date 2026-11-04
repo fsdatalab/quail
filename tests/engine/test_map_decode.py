@@ -614,6 +614,37 @@ def test_headroom_of_running_answers_is_counted_against_new_documents():
     assert not admission.allows(1, held + need - 1, 4)
 
 
+def test_eviction_takes_remaining_tokens_from_each_answers_length_bucket():
+    # short prompts end after 3 tokens, long ones run to the limit; two
+    # answers that wrote 2 tokens each differ only in their prompt length
+    num_documents = 20
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), num_documents,
+                         [24], [STOP], 4, expected_tokens=[12])
+    decoder.answer_slots = {0: np.arange(num_documents)}
+    prefixes = [8] * 10 + [2000] * 10
+    for a in [*range(2, 10), *range(12, 20)]:
+        decoder.lengths[0][a] = decoder.written[0][a] = 3 if a < 10 else 24
+    admission = HeadroomAdmission(decoder, prefixes, 6, {}, [0] * num_documents,
+                                  lambda tokens: pages_for(tokens, 4),
+                                  choose_headroom=False, bucket_answers=1)
+    decoder.start(0, 0, 14, [0, 1, 2, 3])
+    decoder.start(10, 0, 2006, [4, 5, 6, 7])
+    decoder.written[0][[0, 10]] = 2
+    assert decoder.eviction_order()[0] == 0
+    assert admission.eviction_order()[0] == 10
+
+
+def test_the_page_price_counts_only_the_pages_a_waiting_document_adds():
+    decoder, admission = headroom_admission(ended=[(2, 30)], prefix_tokens=8000)
+    decoder.start(0, 0, 8006, list(range(2003)))
+    admission.refresh(np.array([0, -1, -2]))
+    alone = admission.page_value
+    admission.tree_shared[1] = 7000
+    admission.refresh(np.array([0, -1, -2]))
+    assert admission._new_prompt_pages(1) == pages_for(8006 - 7000, 4)
+    assert admission.page_value > alone
+
+
 def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():
     from quail.backends.quail.executor.stage_executor import StageExecutor
 

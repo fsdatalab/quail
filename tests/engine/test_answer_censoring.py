@@ -20,10 +20,17 @@ def test_censored_answers_leave_the_risk_set_after_their_written_length(
     monkeypatch.setattr("quail.cost.answers.PRIOR_WEIGHT", 0.0)
     remaining = remaining_tokens([2, -1, 4, 6], [2, 3, 4, 6], 3, 6)
     survival = np.array([1, 1, .75, .75, .375, .375, 0])
-    expected = np.r_[np.cumsum(survival[:0:-1])[::-1], 0]
+    expected = np.cumsum(survival[::-1])[::-1]
     expected[:-1] /= survival[:-1]
     np.testing.assert_allclose(remaining, expected)
     assert remaining[2] > remaining[4] > remaining[5]
+
+
+def test_an_answer_of_known_length_has_that_length_minus_written_tokens_left(
+        monkeypatch):
+    monkeypatch.setattr("quail.cost.answers.PRIOR_WEIGHT", 0.0)
+    remaining = remaining_tokens([4, 4, 4], [4, 4, 4], 3, 6)
+    np.testing.assert_allclose(remaining[:5], [4, 3, 2, 1, 0])
 
 
 @pytest.mark.parametrize("model_name,device_name", [

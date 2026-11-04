@@ -266,19 +266,34 @@ class MapDecoder:
         self.paused[document] = False
         self.drafts[document] = 0
 
-    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None):
-        """Order running slots by page-hold time saved per recomputation second."""
+    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None,
+                       remaining=None):
+        """Order running slots by page-hold time saved per recomputation second.
+
+        Args:
+            curves: Per map, the survival curve to estimate remaining
+                tokens from; each map's own answers by default.
+            recompute_cost: Prices rebuilding a slot's KV; without it,
+                slots are ordered by remaining tokens alone.
+            page_holds: How many slots hold each page; a page another
+                slot also holds is not freed.
+            remaining: Per slot, its expected remaining tokens; replaces
+                the estimate from curves.
+        """
         from quail.cost.answers import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         scores = np.zeros(len(self.map))
         written = np.zeros(len(self.map), dtype=np.int64)
         for q in np.unique(self.map[running]):
+            mine = running[self.map[running] == q]
+            written[mine] = self.written[q][mine]
+            if remaining is not None:
+                scores[mine] = remaining[mine]
+                continue
             curve = remaining_tokens(
                 self.lengths[q], self.written[q], self.expected_tokens[q],
                 int(self.limits[q]), survival=None if curves is None else curves.get(q))
-            mine = running[self.map[running] == q]
-            written[mine] = self.written[q][mine]
             scores[mine] = curve[written[mine]]
         if recompute_cost is not None and len(running):
             num_pages = self.kv.num_pages[running]
