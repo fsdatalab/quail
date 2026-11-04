@@ -10,3 +10,6 @@ quail-cost = { path = "../quail-cost" }
 quail-physical = { path = "../quail-physical" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+arrow-ipc = "59.3"
+arrow-schema = "59.3"
+base64 = "0.23"

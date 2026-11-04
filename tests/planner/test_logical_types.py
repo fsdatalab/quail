@@ -95,3 +95,20 @@ def test_a_logical_plan_with_an_unknown_field_is_refused():
     written["root"]["surprise"] = 1
     with pytest.raises(ValueError, match="surprise"):
         native.read_and_write_logical_plan(json.dumps(written))
+
+
+def test_every_quail_b_logical_plan_is_valid_in_rust():
+    from quail_b.queries import queries
+    from tools.dump_check_queries import check_query_entries
+
+    refused = {}
+    for entry in check_query_entries(list(queries(include_draft=True))):
+        with quail.Session(CONFIG, tokenizer=token_ids) as session:
+            for name, columns in entry["tables"].items():
+                session.register(name, quail.DocumentProvider.from_table(
+                    check_table(columns), id_col="id"))
+            plan = session.sql(entry["sql"]).logical
+        message = native.validate_logical_plan(json.dumps(encode_value(plan)))
+        if message is not None:
+            refused[entry["id"]] = message
+    assert refused == {}

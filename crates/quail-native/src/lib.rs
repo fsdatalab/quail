@@ -255,10 +255,54 @@ fn read_and_write_logical_plan(text: &str) -> PyResult<String> {
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
 }
 
+/// Check a logical plan as `LogicalPlan.validate` does: None, or the
+/// message of the CompileError it raises.
+#[pyfunction]
+fn validate_logical_plan(text: &str) -> PyResult<Option<String>> {
+    let plan = quail_planner::read_logical_plan(text)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    Ok(quail_planner::nodes::validate_plan(&plan)
+        .err()
+        .map(|error| error.0))
+}
+
+/// Place a bound SELECT and build its logical plan, as the front end's
+/// `place_relation` and `LogicalPlanBuilder.project` do.
+///
+/// Returns (the plan as JSON, None), or (None, the CompileError's
+/// message). Without project arguments it places the relation only and
+/// returns (None, None) when that succeeds.
+#[pyfunction]
+#[pyo3(signature = (place, project=None))]
+fn build_select(place: &str, project: Option<&str>) -> PyResult<(Option<String>, Option<String>)> {
+    let invalid =
+        |error: serde_json::Error| pyo3::exceptions::PyValueError::new_err(error.to_string());
+    let place: quail_planner::builder::PlaceRelationArguments =
+        serde_json::from_str(place).map_err(invalid)?;
+    let placed = match quail_planner::builder::place_relation(place) {
+        Ok(placed) => placed,
+        Err(error) => return Ok((None, Some(error.0))),
+    };
+    let Some(project) = project else {
+        return Ok((None, None));
+    };
+    let project: quail_planner::builder::ProjectArguments =
+        serde_json::from_str(project).map_err(invalid)?;
+    match placed.builder.project(&project, &placed.rows) {
+        Ok(plan) => Ok((
+            Some(quail_planner::write_logical_plan(&plan).map_err(invalid)?),
+            None,
+        )),
+        Err(error) => Ok((None, Some(error.0))),
+    }
+}
+
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContext>()?;
     module.add_class::<cost::CostModel>()?;
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
+    module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;
+    module.add_function(wrap_pyfunction!(build_select, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }

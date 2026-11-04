@@ -200,3 +200,24 @@ pub fn read_logical_plan(text: &str) -> serde_json::Result<LogicalPlan> {
 pub fn write_logical_plan(plan: &LogicalPlan) -> serde_json::Result<String> {
     serde_json::to_string(plan)
 }
+
+impl Schema {
+    /// The schema's column names.
+    ///
+    /// # Panics
+    ///
+    /// The IPC bytes do not hold a schema.
+    pub fn names(&self) -> Vec<String> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.ipc)
+            .expect("base64 schema bytes");
+        let schema =
+            arrow_ipc::convert::try_schema_from_ipc_buffer(&bytes).expect("an IPC schema message");
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+}
