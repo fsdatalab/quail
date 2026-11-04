@@ -984,79 +984,61 @@ def _document_ends_sorted(value):
 
 
 def shadow_search_plan(native, original):
-    """Return search_plan, also selecting the plan in Rust.
+    """Return search_plan, also selecting the plan with the Python planner.
 
-    The shadow runs only for the Quail backend with the built-in rules
-    and no other physical planner, which is every plan the suite makes
-    unless a test registers its own.
+    search_plan selects in Rust whenever it can (quail.planner.native);
+    the shadow then plans the same alternatives in Python and fails
+    where the two plans, their settings, seconds, or estimates differ.
     """
-    import numpy as np
-
+    import quail.planner.optimize as optimize
+    from quail.planner.native import NativePricer
     from quail.planner.optimizer.tree_rewrites import logical_alternatives
-    from quail.planner.rules import built_in_rules
-
-    built_in = [rule.name for rule in built_in_rules()]
-    # a test that patches a rule's rewrite plans with a rule Rust lacks
-    methods = {rule.name: (getattr(type(rule), "rewrite", None),
-                           getattr(type(rule), "rewrites", None))
-               for rule in built_in_rules()}
 
     def search_plan(logical, context, registry, *, logical_candidates=None):
-        found = original(logical, context, registry,
-                         logical_candidates=logical_candidates)
-        logical_rules = [rule.name for rule in registry.logical_rules.values()]
-        rules = [rule.name for rule in registry.physical_rules.values()]
-        if (context.tokenizer is None or context.backend != "quail"
-                or registry.physical_planners or logical_rules + rules != built_in
-                or any((getattr(type(rule), "rewrite", None),
-                        getattr(type(rule), "rewrites", None)) != methods[rule.name]
-                       for rule in (*registry.logical_rules.values(),
-                                    *registry.physical_rules.values()))):
-            return found
         alternatives = (logical_candidates if logical_candidates is not None
                         else logical_alternatives(
                             logical, tuple(registry.logical_rules.values()), context))
-        fields = json.loads(_context_json(context))
-        fields.update(
-            order=context.order,
-            pair_fractions={str(key): float(value)
-                            for key, value in (context.pair_fractions or {}).items()},
-            scan_fractions={alias: float(value)
-                            for alias, value in (context.scan_fractions or {}).items()},
-            document_tokens={alias: np.asarray(values).astype(int).tolist()
-                             for alias, values in context.document_tokens.items()},
-            first_documents=_first_documents(context), **_sharing_fields(context))
-        intern, tokens, decode = _interning(context.tokenizer)
-        rust, message = native.plan_operator(
-            "search_plan", json.dumps(fields),
-            json.dumps({"alternatives": [[encode_value(alternative.plan),
-                                          list(alternative.rules)]
-                                         for alternative in alternatives],
-                        "rules": rules}), tokens, decode)
-        assert message is None, f"Rust refused the search: {message}"
-        built = json.loads(rust)
-        expected = _candidate_fields(_Selected(found), intern)
-        built.pop("alternative", None)
-        for plan in (built, expected):
+        found = original(logical, context, registry, logical_candidates=alternatives)
+        planned_in_rust = isinstance(getattr(found, "estimator", None), NativePricer)
+        if not planned_in_rust and not _refused_in_rust(context, registry):
+            return found
+        expected = optimize.search_plan_in_python(
+            logical, context, registry, logical_candidates=alternatives)
+        intern = _interning(context.tokenizer)[0]
+        built, wanted = (_candidate_fields(_Selected(plan), intern)
+                         for plan in (found, expected))
+        for plan in (built, wanted):
             for key in ("true_ids", "false_ids"):
                 if key in plan.get("envelope", {}).get("settings", {}):
                     plan["envelope"]["settings"][key].sort()
         difference = same_values(_document_ends_sorted(built),
-                                 _document_ends_sorted(expected))
+                                 _document_ends_sorted(wanted))
         if os.environ.get("QUAIL_RUST_OPERATOR_LOG"):
-            settings = expected.get("envelope", {}).get("settings", {})
+            settings = wanted.get("envelope", {}).get("settings", {})
             with open(os.environ["QUAIL_RUST_OPERATOR_LOG"], "a") as log:
-                log.write(f"search_plan {type(found).__name__} "
+                log.write(f"search_plan {type(expected).__name__} "
                           f"{'same' if difference is None else 'differs'} "
                           f"{context.model.attention_mask} "
-                          f"sharing={bool(fields['page_shared'])} "
                           f"retention={'retention' in settings} "
                           f"candidates={len(alternatives)} "
-                          f"fired={_fired(expected)}\n")
+                          f"fired={_fired(wanted)}\n")
         assert difference is None, f"Rust selected another plan: {difference}"
+        if planned_in_rust:
+            assert found.logical_plan == expected.logical_plan
         return found
 
     return search_plan
+
+
+def _refused_in_rust(context, registry) -> bool:
+    """Whether a refusal came from the Rust planner rather than Python's."""
+    from quail.planner.native import BUILT_IN_RULES, _module
+
+    rules = tuple(rule.name for rule in (*registry.logical_rules.values(),
+                                         *registry.physical_rules.values()))
+    return (_module() is not None and context.tokenizer is not None
+            and context.backend == "quail" and not registry.physical_planners
+            and rules == BUILT_IN_RULES)
 
 
 class _Selected:

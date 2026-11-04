@@ -164,6 +164,7 @@ layers = [
     "quail.planner.operators",
     "quail.planner.statistics",
     "quail.planner.optimize",
+    "quail.planner.native",
     "quail.planner.optimizer",
     "quail.planner.validation | quail.planner.prompt_lowering",
     "quail.planner.plan",

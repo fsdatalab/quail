@@ -39,6 +39,11 @@ CACHE_ENV = {
 # the package that declares Quail's vLLM plugin, installed in the images
 VLLM_PLUGIN_DIR = Path(__file__).parent / "vllm_plugin"
 
+# the Rust workspace the planner's native module builds from
+REPOSITORY = Path(__file__).resolve().parents[2]
+NATIVE_SOURCE = "/opt/quail-native"
+MATURIN = "maturin>=1.9,<2"
+
 # local variables copied into the image when set
 FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
 
@@ -51,6 +56,28 @@ def _cuda_base() -> modal.Image:
             .entrypoint([])
             .apt_install("git")
             .env(CACHE_ENV | forwarded))
+
+
+def _with_native_planner(image: modal.Image) -> modal.Image:
+    """Build the _quail_native module, which plans queries in Rust, into an image.
+
+    Without it, Quail plans in Python (quail.planner.native).
+    """
+    return (image.apt_install("curl", "build-essential")
+            .run_commands("curl -sSf https://sh.rustup.rs | sh -s -- -y "
+                          "--profile minimal")
+            .add_local_file(REPOSITORY / "Cargo.toml", f"{NATIVE_SOURCE}/Cargo.toml",
+                            copy=True)
+            .add_local_file(REPOSITORY / "Cargo.lock", f"{NATIVE_SOURCE}/Cargo.lock",
+                            copy=True)
+            .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True)
+            .run_commands(
+                f"cd {NATIVE_SOURCE} && PATH=$HOME/.cargo/bin:$PATH "
+                f"python -m pip install '{MATURIN}' && PATH=$HOME/.cargo/bin:$PATH "
+                f"maturin build --release -m crates/quail-native/Cargo.toml "
+                f"-o {NATIVE_SOURCE}/wheels",
+                f"python -m pip install {NATIVE_SOURCE}/wheels/quail_native-*.whl",
+                "python -c 'import _quail_native'"))
 
 
 def gpu_image(*local_dirs: tuple[str, str],
@@ -69,6 +96,7 @@ def gpu_image(*local_dirs: tuple[str, str],
     image = (_cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
              .add_local_dir(VLLM_PLUGIN_DIR, "/opt/quail-vllm-plugin", copy=True)
              .uv_pip_install("/opt/quail-vllm-plugin", uv_version=UV_VERSION))
+    image = _with_native_planner(image)
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
     if commands:

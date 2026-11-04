@@ -259,7 +259,7 @@ physical_nodes! {
         "quail.aggregate", "quail.physical.nodes.relational.Aggregate" {
         keys: Vec<String>,
         aggregates: Vec<(String, String, Option<String>)>,
-        having: Vec<(String, String, f64)>,
+        having: Vec<(String, String, Value)>,
         columns: Vec<String>,
     }
     /// An `ORDER BY`, with `DISTINCT`, `OFFSET`, and `FETCH`.

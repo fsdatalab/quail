@@ -822,6 +822,13 @@ fn plan_operator<'py>(
                 &plan, &context, inputs, &oracles,
             ))
         }
+        "price" => {
+            let pricer = read_pricer(&get("pricer"))?;
+            let graph: quail_physical::PhysicalGraph = json_value(get("graph"))?;
+            lowering_result(pricer.price(&context, &graph.nodes).map(|(seconds, estimates)| {
+                serde_json::json!({"seconds": seconds, "estimates": estimates})
+            }))
+        }
         "search_plan" => {
             let alternatives: Vec<(quail_planner::LogicalPlan, Vec<String>)> =
                 json_value(get("alternatives"))?;
@@ -838,6 +845,7 @@ fn plan_operator<'py>(
                             "estimated_seconds": selected.plan.estimated_seconds,
                             "estimates": selected.plan.estimates,
                             "alternative": selected.alternative,
+                            "pricer": pricer_fields(&selected.plan.pricer),
                         }),
                         Err(refusal) => refusal_fields(&refusal),
                     },
@@ -959,4 +967,99 @@ mod erased_json {
             serde_json::to_string(self).expect("a JSON value")
         }
     }
+}
+
+const WORK_FIELDS: [&str; 9] = [
+    "tokens",
+    "pairs",
+    "kv_written",
+    "kv_read",
+    "sliding_pairs",
+    "sliding_kv_read",
+    "state_written",
+    "state_read",
+    "sae_encoded",
+];
+
+fn work_values(work: &quail_cost::work::Work) -> [&quail_cost::quantity::Quantity; 9] {
+    [
+        &work.tokens,
+        &work.pairs,
+        &work.kv_written,
+        &work.kv_read,
+        &work.sliding_pairs,
+        &work.sliding_kv_read,
+        &work.state_written,
+        &work.state_read,
+        &work.sae_encoded,
+    ]
+}
+
+/// A plan's pricer as JSON, for Python to hand back when it reprices an
+/// edited graph.
+fn pricer_fields(pricer: &quail_planner::pricing::PlanPricer) -> serde_json::Value {
+    let work = |work: &quail_cost::work::Work| {
+        WORK_FIELDS
+            .iter()
+            .zip(work_values(work))
+            .map(|(name, value)| (name.to_string(), serde_json::Value::from(value.total())))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+    };
+    serde_json::json!({
+        "chunk": pricer.chunk,
+        "cap_pages": pricer.cap_pages,
+        "stats": pricer.stats.iter().map(|(alias, stats)| (alias.clone(), serde_json::json!(
+            [stats.num_documents, stats.total_tokens, stats.max_document_tokens]
+        ))).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "stage_works": pricer.stage_works.iter().map(|(position, found)| (position.to_string(),
+            serde_json::Value::Object(work(found)))).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "expected_rows": pricer.expected_rows,
+    })
+}
+
+fn read_pricer(value: &serde_json::Value) -> PyResult<quail_planner::pricing::PlanPricer> {
+    let bad = || pyo3::exceptions::PyValueError::new_err("a malformed plan pricer");
+    let stats: std::collections::BTreeMap<String, (i64, i64, i64)> =
+        json_value(value["stats"].clone())?;
+    let works: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>> =
+        json_value(value["stage_works"].clone())?;
+    let mut stage_works = std::collections::BTreeMap::new();
+    for (position, fields) in works {
+        let field = |name: &str| quail_cost::quantity::Quantity::Scalar(fields[name]);
+        stage_works.insert(
+            position.parse().map_err(|_| bad())?,
+            quail_cost::work::Work {
+                tokens: field("tokens"),
+                pairs: field("pairs"),
+                kv_written: field("kv_written"),
+                kv_read: field("kv_read"),
+                sliding_pairs: field("sliding_pairs"),
+                sliding_kv_read: field("sliding_kv_read"),
+                state_written: field("state_written"),
+                state_read: field("state_read"),
+                sae_encoded: field("sae_encoded"),
+            },
+        );
+    }
+    Ok(quail_planner::pricing::PlanPricer {
+        chunk: value["chunk"].as_i64().ok_or_else(bad)?,
+        cap_pages: value["cap_pages"].as_i64().ok_or_else(bad)?,
+        stats: stats
+            .into_iter()
+            .map(
+                |(alias, (num_documents, total_tokens, max_document_tokens))| {
+                    (
+                        alias,
+                        quail_planner::plan_statistics::CorpusStats {
+                            num_documents,
+                            total_tokens,
+                            max_document_tokens,
+                        },
+                    )
+                },
+            )
+            .collect(),
+        stage_works,
+        expected_rows: json_value(value["expected_rows"].clone())?,
+    })
 }

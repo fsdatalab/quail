@@ -102,7 +102,7 @@ class Aggregate(PhysicalNode):
 
     keys: tuple[str, ...] = ()
     aggregates: tuple[tuple[str, str, str | None], ...] = ()
-    having: tuple[tuple[str, str, float], ...] = ()
+    having: tuple[tuple[str, str, int | float], ...] = ()
     columns: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.aggregate"

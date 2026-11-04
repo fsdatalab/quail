@@ -3,6 +3,7 @@
 from dataclasses import replace
 
 from quail.logical import LogicalPlan
+from quail.planner import native
 from quail.planner.optimizer.candidates import ModelRegion, PhysicalCandidate
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.graph_refinement import apply_plan_rules
@@ -136,7 +137,23 @@ def search_candidates(
 
 
 def search_plan(logical, context, registry, *, logical_candidates=None):
-    """Select the cheapest refined candidate and record the comparison."""
+    """Select the cheapest refined candidate and record the comparison.
+
+    The Rust planner selects it when it covers the request
+    (quail.planner.native); the Python planner otherwise.
+    """
+    alternatives = (logical_alternatives(
+        logical, tuple(registry.logical_rules.values()), context)
+        if logical_candidates is None else logical_candidates)
+    planned = native.search_plan(alternatives, context, registry)
+    if planned is not None:
+        return planned
+    return search_plan_in_python(
+        logical, context, registry, logical_candidates=alternatives)
+
+
+def search_plan_in_python(logical, context, registry, *, logical_candidates=None):
+    """Select the cheapest refined candidate with the Python planner."""
     candidates = search_candidates(
         logical, context, registry, logical_candidates=logical_candidates)
     if not candidates:

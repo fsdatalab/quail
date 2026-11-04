@@ -204,7 +204,7 @@ pub fn result_nodes(
                         (
                             test.aggregate.name.clone(),
                             test.comparison.clone(),
-                            test.value.as_f64().unwrap_or(f64::NAN),
+                            test.value.clone(),
                         )
                     })
                     .collect(),

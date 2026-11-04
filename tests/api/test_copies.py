@@ -70,6 +70,8 @@ def _run(build, deduplicate, monkeypatch, session=_session, **oracle):
     asked = []
     with session() as opened, monkeypatch.context() as patch:
         if not deduplicate:
+            # the Rust planner cannot see a patched rule
+            patch.setenv("QUAIL_PLANNER", "python")
             patch.setattr(ShouldDeduplicate, "rewrite", lambda *_: None)
         query = build(opened)
         plan = _planned(query)
