@@ -15,6 +15,7 @@ from .base import (
     Precision,
     Role,
     SaeSpec,
+    SupportResult,
 )
 from .d1_2b import D1_2B_BF16, D1_2B_FP8
 from .decision_2_kai_0_6b import DECISION_2_KAI_0_6B_BF16
@@ -78,7 +79,8 @@ def modal_gpu_type(device: str, gpus: int = 1) -> str:
 
 __all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "LayerKind",
            "ModelSpec",
-           "Precision", "Role", "SaeSpec", "MODELS", "DEVICES", "QWEN3_4B_FP8",
+           "Precision", "Role", "SaeSpec", "SupportResult", "MODELS", "DEVICES",
+           "QWEN3_4B_FP8",
            "QWEN3_5_2B_SAE_BF16", "QWEN3_5_4B_BF16",
            "QWEN3_5_4B_FP8", "QWEN3_5_27B_FP8", "QWEN3_8_27B_FP8", "LFM2_2_6B_BF16",
            "QWEN3_32B_FP8", "QWEN3_6_35B_A3B_FP8",

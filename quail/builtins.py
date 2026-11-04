@@ -6,6 +6,7 @@ from quail.baselines import register_baselines
 from quail.execution.runtimes import built_in_runtimes
 from quail.extensions import ExtensionRegistry
 from quail.physical import built_in_codecs
+from quail.planner.lowering import plan_region
 from quail.planner.optimizer.rules import LogicalRule
 from quail.planner.rules import built_in_rules
 from quail.specs import DEVICES, MODELS
@@ -18,7 +19,7 @@ def built_in_registry() -> ExtensionRegistry:
         registry.register_model(model)
     for device in DEVICES.values():
         registry.register_device(device)
-    registry.register_backend(QuailBackend())
+    registry.register_backend(QuailBackend(plan_region))
     for rule in built_in_rules():
         register = (registry.register_logical_rule if isinstance(rule, LogicalRule)
                     else registry.register_physical_rule)

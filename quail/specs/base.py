@@ -34,6 +34,22 @@ CANVAS_ENTROPY_NATS = 0.1
 
 
 @dataclass(frozen=True)
+class SupportResult:
+    """Result of checking one backend configuration."""
+
+    supported: bool
+    reason: str | None = None
+
+    @classmethod
+    def accept(cls) -> "SupportResult":
+        return cls(True)
+
+    @classmethod
+    def reject(cls, reason: str) -> "SupportResult":
+        return cls(False, reason)
+
+
+@dataclass(frozen=True)
 class AnswerCanvas:
     """Token layout for a diffusion model's classification answer.
 

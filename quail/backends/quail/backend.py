@@ -1,34 +1,42 @@
 """Capabilities and entry points for the Quail engine."""
 
+from __future__ import annotations
+
 import os
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.runtime import QuailModelExecution
-from quail.backends.quail.lowering import plan_region
 from quail.backends.quail.worker import (
     execute_quail_request,
     prepare_quail_request,
     release_quail_request,
 )
-from quail.planner.optimizer.candidates import (
-    ModelRegion,
-    PhysicalCandidate,
-    SupportResult,
-)
-from quail.planner.optimizer.context import PlanningContext
-from quail.specs import DEVICES
+from quail.specs import DEVICES, SupportResult
+
+if TYPE_CHECKING:
+    from quail.planner.optimizer.candidates import ModelRegion, PhysicalCandidate
+    from quail.planner.optimizer.context import PlanningContext
 
 
 class QuailBackend:
-    """Plan and start Quail model execution."""
+    """Plan and start Quail model execution.
+
+    Args:
+        plan_region: The Quail planner, `quail.planner.lowering.plan_region`:
+            it lowers a model region into physical candidates.
+    """
 
     name = "quail"
     engine_name = "quail"
     runtime_package = "vllm==0.29.0"
     reads_document_text = False
     locates_answers_in_text = True
+
+    def __init__(self, plan_region: Callable) -> None:
+        self._plan_region = plan_region
 
     def supports(self, model, device, gpus: int) -> SupportResult:
         if device.name not in DEVICES:
@@ -57,7 +65,7 @@ class QuailBackend:
 
     def plan(self, region: ModelRegion,
              context: PlanningContext) -> tuple[PhysicalCandidate, ...]:
-        return plan_region(region, context)
+        return self._plan_region(region, context)
 
     def start(self, context: GpuContext) -> QuailModelExecution:
         return QuailModelExecution(context)

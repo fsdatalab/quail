@@ -1,4 +1,4 @@
-"""Lower one logical alternative for the Quail engine."""
+"""Lower one logical alternative for the Quail engine: the Quail backend's planner."""
 
 from dataclasses import replace
 

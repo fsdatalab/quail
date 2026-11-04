@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
 from quail.physical import PhysicalNode
-from quail.planner.optimizer.candidates import (
-    ModelRegion,
-    PhysicalCandidate,
-    SupportResult,
-)
-from quail.planner.optimizer.context import PlanningContext
-from quail.specs import DeviceSpec, ModelSpec
+from quail.specs import DeviceSpec, ModelSpec, SupportResult
+
+if TYPE_CHECKING:
+    from quail.planner.optimizer.candidates import ModelRegion, PhysicalCandidate
+    from quail.planner.optimizer.context import PlanningContext
 
 
 @dataclass(frozen=True)

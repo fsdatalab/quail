@@ -17,8 +17,7 @@ from quail.execution.runner import ExecutionContext, GenericRunner, compute_subg
 from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.physical import Scan
-from quail.planner.optimizer.candidates import SupportResult
-from quail.specs import DEVICES
+from quail.specs import DEVICES, SupportResult
 
 
 def execute_request_graph(context, backend, engine_state, boot):

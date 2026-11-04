@@ -244,8 +244,8 @@ def _ends(head, tail, documents):
 def _yes_no_questions(templates):
     """AI filter templates as the SetQuestions of one pass group."""
     from quail.backends.quail.executor.pass_groups import SetQuestion
-    from quail.backends.quail.lowering import set_question_parts
     from quail.logical import bind_prompt
+    from quail.planner.lowering import set_question_parts
     from quail.planner.prompt_lowering import lower_prompt
 
     spec, ids = _spec(), _tokenizer()
