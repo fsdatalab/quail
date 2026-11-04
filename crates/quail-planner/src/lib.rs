@@ -6,6 +6,7 @@
 //! | `expressions` | the helpers of `quail/common/expressions.py` |
 //! | `builder` | `quail/logical/naive.py`, `placement.py`, `builder.py` |
 //! | `nodes` | the methods of the node classes in `quail/logical/nodes` |
+//! | `prompts` | the prompt binding of `quail/common/prompts.py` |
 //! | `arrow_functions` | `pyarrow.compute`'s function list |
 
 pub mod arrow_functions;
@@ -13,6 +14,7 @@ pub mod builder;
 pub mod expressions;
 pub mod logical;
 pub mod nodes;
+pub mod prompts;
 
 pub use expressions::CompileError;
 pub use logical::{LogicalNode, LogicalPlan, read_logical_plan, write_logical_plan};

@@ -297,6 +297,39 @@ fn build_select(place: &str, project: Option<&str>) -> PyResult<(Option<String>,
     }
 }
 
+/// Bind one AI function call's prompt, as `PromptBinder.bind` does.
+///
+/// Returns (the Prompt as JSON, None), or (None, the CompileError's message).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn bind_prompt(
+    kind: &str,
+    template: &str,
+    args: &str,
+    labels: Vec<String>,
+    descriptions: Vec<String>,
+    task_description: &str,
+    turn: (String, String),
+    layout: &str,
+) -> PyResult<(Option<String>, Option<String>)> {
+    let invalid =
+        |error: serde_json::Error| pyo3::exceptions::PyValueError::new_err(error.to_string());
+    let args: Vec<quail_physical::ValueExpression> = serde_json::from_str(args).map_err(invalid)?;
+    match quail_planner::prompts::bind(
+        kind,
+        template,
+        &args,
+        &labels,
+        &descriptions,
+        task_description,
+        &turn,
+        layout,
+    ) {
+        Ok(prompt) => Ok((Some(serde_json::to_string(&prompt).map_err(invalid)?), None)),
+        Err(error) => Ok((None, Some(error.0))),
+    }
+}
+
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContext>()?;
@@ -304,5 +337,6 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(build_select, module)?)?;
+    module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }

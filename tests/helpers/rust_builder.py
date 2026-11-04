@@ -114,3 +114,32 @@ def shadow_place_relation(native, original):
         return placed
 
     return place_relation
+
+
+def shadow_prompt_binder(native, original):
+    """Return PromptBinder.bind, also binding each prompt in Rust."""
+
+    def bind(self, kind, template, args, *, labels=(), descriptions=(),
+             task_description=""):
+        turn = self.turn if self.model is None else self.model.turn
+        layout = self.layout if self.model is None else self.model.prompt_layout
+        rust_prompt, rust_message = native.bind_prompt(
+            kind, template, json.dumps(encode_value(tuple(args))), list(labels),
+            list(descriptions), task_description, tuple(turn), layout)
+        try:
+            prompt = original(self, kind, template, args, labels=labels,
+                              descriptions=descriptions,
+                              task_description=task_description)
+        except CompileError as error:
+            assert rust_message == str(error), (
+                f"Rust bound the prompt with {rust_message!r}; Python refused with "
+                f"{error}")
+            raise
+        assert rust_message is None, f"Rust refused the prompt: {rust_message}"
+        built = json.loads(rust_prompt)
+        expected = json.loads(json.dumps(encode_value(prompt)))
+        assert built == expected, (
+            f"Rust bound another prompt: {first_difference(built, expected)}")
+        return prompt
+
+    return bind
