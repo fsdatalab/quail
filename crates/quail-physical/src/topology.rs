@@ -209,6 +209,45 @@ impl PhysicalNode {
         }
     }
 
+    /// The column schema of the node's first output, for the relational
+    /// nodes; empty for any other.
+    pub fn output_schema(&self) -> Vec<String> {
+        match self {
+            PhysicalNode::Project(node) => {
+                let attributes = &node.attributes;
+                let mut out: Vec<String> = Vec::new();
+                for column in &attributes.columns {
+                    let mut name = column.clone();
+                    if let serde_json::Value::Array(structs) = &attributes.structs {
+                        for entry in structs {
+                            let packs = entry[1].as_array().is_some_and(|members| {
+                                members.iter().any(|pair| pair[1].as_str() == Some(column))
+                            });
+                            if packs {
+                                name = entry[0].as_str().unwrap_or_default().to_string();
+                                break;
+                            }
+                        }
+                    }
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+                out
+            }
+            PhysicalNode::Aggregate(node) => node.attributes.columns.clone(),
+            PhysicalNode::Sort(node) => node.attributes.columns.clone(),
+            PhysicalNode::Window(node) => node.attributes.columns.clone(),
+            PhysicalNode::Unnest(node) => node.attributes.columns.clone(),
+            PhysicalNode::QueryStage(node) => node.attributes.columns.clone(),
+            PhysicalNode::Filter(node) if node.attributes.aliases.is_empty() => {
+                node.attributes.columns.clone()
+            }
+            PhysicalNode::Recombine(node) => node.attributes.alias_order.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The aliases whose documents the node processes one at a time.
     pub fn document_aliases(&self) -> Vec<String> {
         match self {

@@ -444,7 +444,7 @@ def same_values(built, expected, path="") -> str | None:
 def _interning(tokenizer):
     """Return a token's id, the tokenizer with ids interned, and a decoder.
 
-    The decoder is the tokenizer's decode of one interned id, or None.
+    The decoder is the tokenizer's decode of a list of interned ids, or None.
     """
     table, words = {}, {}
 
@@ -462,8 +462,8 @@ def _interning(tokenizer):
     decoder = getattr(tokenizer, "decode", None)
     decode = None
     if decoder is not None:
-        def decode(token):
-            piece = decoder([words.get(token, token)])
+        def decode(ids):
+            piece = decoder([words.get(token, token) for token in ids])
             return (piece.decode("utf-8", errors="replace")
                     if isinstance(piece, bytes) else str(piece))
 
@@ -942,3 +942,149 @@ def shadow_plan_region(native, original):
         return found
 
     return plan_region
+
+
+def _sharing_fields(context) -> dict:
+    """Each table store's page sharing, reader groups, and last tokens."""
+    import pyarrow as pa
+
+    from quail.common.document_ends import last_tokens
+    from quail.planner.statistics.prefixes import page_tree
+
+    page_shared, reader_groups, last = {}, {}, {}
+    for alias, lengths in context.document_tokens.items():
+        store = getattr(lengths, "store", None)
+        if store is None:
+            continue
+        tree = page_tree(store, context.device.page_tokens)
+        page_shared[alias] = [int(value) for value in tree.shared]
+        reader_groups[alias] = [[int(value) for value in group]
+                                for group in zip(*tree.reader_groups(lengths))]
+        try:
+            ends = last_tokens(store.arrow_array)
+            last[alias] = sorted({int(token) for token in ends})
+        except (TypeError, ValueError, pa.ArrowInvalid):
+            # a test store of words has no integer last tokens
+            pass
+    return {"page_shared": page_shared, "reader_groups": reader_groups,
+            "last_tokens": last}
+
+
+def _document_ends_sorted(value):
+    """A plan with each node's document ends in token order."""
+    if isinstance(value, list):
+        return [_document_ends_sorted(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    out = {key: _document_ends_sorted(item) for key, item in value.items()}
+    if out.get("document_ends"):
+        out["document_ends"] = [[alias, tail, sorted(joins, key=repr)]
+                                for alias, tail, joins in out["document_ends"]]
+    return out
+
+
+def shadow_search_plan(native, original):
+    """Return search_plan, also selecting the plan in Rust.
+
+    The shadow runs only for the Quail backend with the built-in rules
+    and no other physical planner, which is every plan the suite makes
+    unless a test registers its own.
+    """
+    import numpy as np
+
+    from quail.planner.optimizer.tree_rewrites import logical_alternatives
+    from quail.planner.rules import built_in_rules
+
+    built_in = [rule.name for rule in built_in_rules()]
+    # a test that patches a rule's rewrite plans with a rule Rust lacks
+    methods = {rule.name: (getattr(type(rule), "rewrite", None),
+                           getattr(type(rule), "rewrites", None))
+               for rule in built_in_rules()}
+
+    def search_plan(logical, context, registry, *, logical_candidates=None):
+        found = original(logical, context, registry,
+                         logical_candidates=logical_candidates)
+        logical_rules = [rule.name for rule in registry.logical_rules.values()]
+        rules = [rule.name for rule in registry.physical_rules.values()]
+        if (context.tokenizer is None or context.backend != "quail"
+                or registry.physical_planners or logical_rules + rules != built_in
+                or any((getattr(type(rule), "rewrite", None),
+                        getattr(type(rule), "rewrites", None)) != methods[rule.name]
+                       for rule in (*registry.logical_rules.values(),
+                                    *registry.physical_rules.values()))):
+            return found
+        alternatives = (logical_candidates if logical_candidates is not None
+                        else logical_alternatives(
+                            logical, tuple(registry.logical_rules.values()), context))
+        fields = json.loads(_context_json(context))
+        fields.update(
+            order=context.order,
+            pair_fractions={str(key): float(value)
+                            for key, value in (context.pair_fractions or {}).items()},
+            scan_fractions={alias: float(value)
+                            for alias, value in (context.scan_fractions or {}).items()},
+            document_tokens={alias: np.asarray(values).astype(int).tolist()
+                             for alias, values in context.document_tokens.items()},
+            first_documents=_first_documents(context), **_sharing_fields(context))
+        intern, tokens, decode = _interning(context.tokenizer)
+        rust, message = native.plan_operator(
+            "search_plan", json.dumps(fields),
+            json.dumps({"alternatives": [[encode_value(alternative.plan),
+                                          list(alternative.rules)]
+                                         for alternative in alternatives],
+                        "rules": rules}), tokens, decode)
+        assert message is None, f"Rust refused the search: {message}"
+        built = json.loads(rust)
+        expected = _candidate_fields(_Selected(found), intern)
+        built.pop("alternative", None)
+        for plan in (built, expected):
+            for key in ("true_ids", "false_ids"):
+                if key in plan.get("envelope", {}).get("settings", {}):
+                    plan["envelope"]["settings"][key].sort()
+        difference = same_values(_document_ends_sorted(built),
+                                 _document_ends_sorted(expected))
+        if os.environ.get("QUAIL_RUST_OPERATOR_LOG"):
+            settings = expected.get("envelope", {}).get("settings", {})
+            with open(os.environ["QUAIL_RUST_OPERATOR_LOG"], "a") as log:
+                log.write(f"search_plan {type(found).__name__} "
+                          f"{'same' if difference is None else 'differs'} "
+                          f"{context.model.attention_mask} "
+                          f"sharing={bool(fields['page_shared'])} "
+                          f"retention={'retention' in settings} "
+                          f"candidates={len(alternatives)} "
+                          f"fired={_fired(expected)}\n")
+        assert difference is None, f"Rust selected another plan: {difference}"
+        return found
+
+    return search_plan
+
+
+class _Selected:
+    """A selected plan or refusal, shaped as a candidate."""
+
+    def __init__(self, plan):
+        self.plan = plan
+
+
+def _fired(plan) -> str:
+    """Which physical rules left a mark on an encoded plan, for the log."""
+    nodes = plan.get("envelope", {}).get("graph", {}).get("nodes", [])
+    marks = set()
+    for node in nodes:
+        attributes = node["attributes"]
+        spec = attributes.get("spec") or {}
+        if attributes.get("share_prefixes") or spec.get("share_prefixes"):
+            marks.add("share")
+        if attributes.get("pass_group", -1) >= 0:
+            marks.add("passes")
+        if attributes.get("document_ends"):
+            marks.add("ends")
+        if attributes.get("attention") == "tree":
+            marks.add("tree")
+        if attributes.get("keep_kv"):
+            marks.add("keep")
+        if spec.get("scoring"):
+            marks.add("classify")
+    settings = plan.get("envelope", {}).get("settings", {})
+    marks.update(key for key in ("deduplicate", "filter_limit") if key in settings)
+    return ",".join(sorted(marks)) or "-"

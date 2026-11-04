@@ -168,3 +168,55 @@ def test_a_d1_score_and_a_classification_of_one_table_share_a_pass(tmp_path):
     assert score.pass_group == label.pass_group >= 0
     assert sorted(members) == sorted((score.node_id, label.node_id))
     session.close()
+
+
+class _Vocabulary:
+    """Split on spaces into integer ids, and decode them back."""
+
+    def __init__(self):
+        self.ids, self.words = {}, []
+
+    def __call__(self, text):
+        out = []
+        for word in text.split():
+            if word not in self.ids:
+                self.ids[word] = len(self.words)
+                self.words.append(word)
+            out.append(self.ids[word])
+        return out
+
+    def decode(self, ids):
+        return " ".join(self.words[token] for token in ids)
+
+
+def test_a_d1_filter_ends_each_document_joined_with_its_question(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.physical import AiFilter
+    from quail.planner.plan import EngineConfig
+
+    pq.write_table(pa.table({"id": [1, 2], "body": ["a kind note", "a short one"]}),
+                   tmp_path / "reviews.parquet")
+    vocabulary = _Vocabulary()
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=vocabulary)
+    session.register("reviews", DocumentProvider.from_parquet(
+        str(tmp_path / "reviews.parquet"), id_col="id"))
+
+    query = session.sql(
+        "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('Is it kind? {0}', r.body))")
+    # the first plan estimates lengths; the plan over exact tokens ends documents
+    query.plan()
+    query.wait_for_tokens()
+    plan = query.plan()
+
+    (node,) = [node for node in plan.nodes if isinstance(node, AiFilter)]
+    ((alias, tail, joins),) = node.document_ends
+    ends = dict(joins)
+    assert alias == "r"
+    assert {vocabulary.ids["note"], vocabulary.ids["one"]} <= set(ends)
+    assert ends[vocabulary.ids["note"]] == (vocabulary.ids["note"], *tail)
+    session.close()

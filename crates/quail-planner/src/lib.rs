@@ -32,6 +32,8 @@ pub mod logical;
 pub mod lowering;
 pub mod nodes;
 pub mod operators;
+pub mod optimize;
+pub mod physical_rules;
 pub mod plan_statistics;
 pub mod pricing;
 pub mod prompts;

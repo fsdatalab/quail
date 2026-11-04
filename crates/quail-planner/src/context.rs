@@ -9,6 +9,7 @@ use crate::logical::LogicalPlan;
 use crate::lowering::{Decoder, LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
 
 /// The model, device, table statistics, and tokenizer of one query's planning.
+#[derive(Clone)]
 pub struct PlanningContext<'a> {
     pub model: ModelSpec,
     pub device: DeviceSpec,
@@ -37,6 +38,13 @@ pub struct PlanningContext<'a> {
     /// alias -> per document, the prefix tokens in whole KV pages an
     /// earlier document also has.
     pub page_shared: BTreeMap<String, Vec<i64>>,
+    /// alias -> its documents grouped by the parent they borrow pages
+    /// from: (shared tokens, documents, their unshared tokens summed).
+    pub reader_groups: BTreeMap<String, Vec<(i64, i64, i64)>>,
+    /// alias -> the distinct last tokens of its documents, ascending.
+    pub last_tokens: BTreeMap<String, Vec<i64>>,
+    /// The engine backend the plan is for.
+    pub backend: String,
 }
 
 impl PlanningContext<'_> {

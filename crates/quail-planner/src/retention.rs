@@ -101,10 +101,8 @@ pub fn schedule(
     }
     let named = |offset: usize| {
         Value::Object(
-            group_ids
-                .iter()
-                .enumerate()
-                .map(|(index, id)| (id.clone(), uses[index + offset].clone()))
+            (0..groups.len())
+                .map(|index| (group_ids[index].clone(), uses[index + offset].clone()))
                 .collect(),
         )
     };

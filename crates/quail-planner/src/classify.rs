@@ -53,7 +53,7 @@ pub fn word_starts(
     for ids in labels {
         let pieces: Vec<String> = ids
             .iter()
-            .map(|token| decode(*token))
+            .map(|token| decode(std::slice::from_ref(token)))
             .collect::<Result<_, _>>()?;
         flags.push(
             (0..ids.len())

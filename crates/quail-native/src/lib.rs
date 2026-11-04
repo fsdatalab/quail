@@ -552,6 +552,16 @@ struct ContextFields {
     first_documents: std::collections::BTreeMap<String, Vec<bool>>,
     #[serde(default)]
     page_shared: std::collections::BTreeMap<String, Vec<i64>>,
+    #[serde(default)]
+    reader_groups: std::collections::BTreeMap<String, Vec<(i64, i64, i64)>>,
+    #[serde(default)]
+    last_tokens: std::collections::BTreeMap<String, Vec<i64>>,
+    #[serde(default = "quail_backend")]
+    backend: String,
+}
+
+fn quail_backend() -> String {
+    "quail".to_string()
 }
 
 /// Run one operator planning function of `quail/planner/operators` in Rust.
@@ -572,9 +582,9 @@ fn plan_operator<'py>(
     use quail_planner::{classify, columns, costs, scores};
     let tokens = python_tokenizer(py, &tokenizer);
     let decoder = decode.as_ref().map(|decode| {
-        move |token: i64| -> Result<String, quail_planner::CompileError> {
+        move |ids: &[i64]| -> Result<String, quail_planner::CompileError> {
             decode
-                .call1((token,))
+                .call1((ids.to_vec(),))
                 .and_then(|text| text.extract::<String>())
                 .map_err(|error| quail_planner::CompileError::new(error.value(py).to_string()))
         }
@@ -602,6 +612,9 @@ fn plan_operator<'py>(
         logical_plan: fields.plan.map(json_value).transpose()?,
         first_documents: fields.first_documents,
         page_shared: fields.page_shared,
+        reader_groups: fields.reader_groups,
+        last_tokens: fields.last_tokens,
+        backend: fields.backend,
     };
     let arguments: serde_json::Value = from_json(arguments)?;
     let get = |key: &str| arguments[key].clone();
@@ -747,6 +760,28 @@ fn plan_operator<'py>(
             lowering_result(
                 quail_planner::search::choose_operator_order(&plan, &context)
                     .map(|found| operator_order_fields(&found)),
+            )
+        }
+        "search_plan" => {
+            let alternatives: Vec<(quail_planner::LogicalPlan, Vec<String>)> =
+                json_value(get("alternatives"))?;
+            let alternatives: Vec<quail_planner::rules::LogicalAlternative> = alternatives
+                .into_iter()
+                .map(|(plan, rules)| quail_planner::rules::LogicalAlternative { plan, rules })
+                .collect();
+            let rules: Vec<String> = json_value(get("rules"))?;
+            lowering_result(
+                quail_planner::optimize::search_plan(&alternatives, &context, &rules).map(
+                    |found| match found {
+                        Ok(selected) => serde_json::json!({
+                            "envelope": selected.plan.envelope(),
+                            "estimated_seconds": selected.plan.estimated_seconds,
+                            "estimates": selected.plan.estimates,
+                            "alternative": selected.alternative,
+                        }),
+                        Err(refusal) => refusal_fields(&refusal),
+                    },
+                ),
             )
         }
         "plan_region" => {
