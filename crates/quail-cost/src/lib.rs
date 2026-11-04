@@ -16,17 +16,24 @@
 //! | `draft_policy` | `quail/common/draft_policy.py` |
 //! | `retention` | `quail/common/retention.py` |
 //! | `decode` | `quail/common/decode.py`, the planner's part |
+//! | `statistics` | `AliasStats` in `quail/planner/statistics/tables.py` |
+//! | `filters`, `packing`, `score`, `sae_features` | the same modules of `quail/cost` |
 
 pub mod answers;
 pub mod budgets;
 pub mod decode;
 pub mod dense_decoder_cost;
 pub mod draft_policy;
+pub mod filters;
+pub mod packing;
 pub mod quantity;
 pub mod retention;
 pub mod roofline;
+pub mod sae_features;
+pub mod score;
 pub mod sol;
 pub mod specs;
+pub mod statistics;
 pub mod work;
 
 #[cfg(test)]

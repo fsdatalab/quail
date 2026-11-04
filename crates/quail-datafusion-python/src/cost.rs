@@ -10,9 +10,14 @@ use pyo3::types::PyDict;
 use quail_cost::decode::DecodeCost;
 use quail_cost::draft_policy::DraftPolicy;
 use quail_cost::quantity::{Quantity, numpy_sum};
+use quail_cost::sae_features::SaeFeaturesCost;
+use quail_cost::score::ScoreCost;
 use quail_cost::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
+use quail_cost::statistics::AliasStats;
 use quail_cost::work::{self, Work};
-use quail_cost::{answers, budgets, dense_decoder_cost, draft_policy, retention, sol};
+use quail_cost::{
+    answers, budgets, dense_decoder_cost, draft_policy, filters, packing, retention, sol,
+};
 
 /// A number, or a list of numbers, from Python.
 fn quantity(value: &Bound<'_, PyAny>) -> PyResult<Quantity> {
@@ -28,6 +33,34 @@ fn to_python<'py>(py: Python<'py>, value: &Quantity) -> PyResult<Bound<'py, PyAn
         Quantity::Array(numbers) => Ok(numbers.clone().into_pyobject(py)?.into_any()),
     }
 }
+
+/// An `AliasStats` from its fields: count, total, squared, maximum,
+/// window, and short_counts.
+fn alias_stats(fields: &Bound<'_, PyDict>) -> PyResult<AliasStats> {
+    let get = |name: &str| -> PyResult<Bound<'_, PyAny>> {
+        fields
+            .get_item(name)?
+            .ok_or_else(|| PyKeyError::new_err(name.to_string()))
+    };
+    Ok(AliasStats {
+        count: get("count")?.extract()?,
+        total: get("total")?.extract()?,
+        squared: get("squared")?.extract()?,
+        maximum: get("maximum")?.extract()?,
+        window: get("window")?.extract()?,
+        short_counts: get("short_counts")?
+            .extract::<Vec<Vec<i64>>>()?
+            .into_iter()
+            .map(|pair| (pair[0], pair[1]))
+            .collect(),
+    })
+}
+
+/// A scaled `AliasStats`: count, total, squared, and short_counts.
+type ScaledStats = (i64, i64, i128, Vec<(i64, i64)>);
+/// An `AliasStats`'s mean, variance, window pairs, window reads, and
+/// its scaling.
+type StatsValues = (f64, f64, f64, f64, ScaledStats);
 
 /// One component's name, FLOPs, and bytes moved.
 type ComponentCounts<'py> = (String, Bound<'py, PyAny>, Bound<'py, PyAny>);
@@ -553,6 +586,153 @@ impl CostModel {
     ) -> PyResult<f64> {
         let cost = DecodeCost::from_specs(self.model(model)?, self.device(device)?);
         Ok(cost.lower_bound_seconds(&work_from(work)?, passes))
+    }
+
+    /// An `AliasStats`'s mean, variance, window pairs and reads at an
+    /// offset, and the fields of its scaling by a fraction.
+    #[staticmethod]
+    fn alias_stats_values(
+        fields: &Bound<'_, PyDict>,
+        offset: f64,
+        fraction: f64,
+    ) -> PyResult<StatsValues> {
+        let stats = alias_stats(fields)?;
+        let (pairs, reads) = if stats.window != 0 {
+            (stats.window_pairs(offset), stats.window_reads(offset))
+        } else {
+            (0.0, 0.0)
+        };
+        let scaled = stats.scale(fraction);
+        Ok((
+            stats.mean(),
+            stats.variance(),
+            pairs,
+            reads,
+            (
+                scaled.count,
+                scaled.total,
+                scaled.squared,
+                scaled.short_counts,
+            ),
+        ))
+    }
+
+    /// `filter_cost`.
+    #[allow(clippy::too_many_arguments)]
+    fn filter_cost(
+        &self,
+        question_tokens: i64,
+        mean_tokens: f64,
+        model: &str,
+        device: &str,
+        chunk_tokens: i64,
+        first: bool,
+    ) -> PyResult<f64> {
+        Ok(filters::filter_cost(
+            question_tokens,
+            mean_tokens,
+            self.model(model)?,
+            self.device(device)?,
+            chunk_tokens,
+            first,
+        ))
+    }
+
+    /// `choose_pass_groups`; raises ValueError where Python's does.
+    #[allow(clippy::too_many_arguments)]
+    fn choose_pass_groups(
+        &self,
+        question_tokens: Vec<i64>,
+        selectivities: Vec<f64>,
+        rows: f64,
+        state_tokens: f64,
+        longest_state: i64,
+        model: &str,
+        device: &str,
+        chunk_tokens: i64,
+        set_size: usize,
+        header: i64,
+    ) -> PyResult<Vec<usize>> {
+        packing::choose_pass_groups(
+            &question_tokens,
+            &selectivities,
+            rows,
+            state_tokens,
+            longest_state,
+            self.model(model)?,
+            self.device(device)?,
+            chunk_tokens,
+            set_size,
+            header,
+        )
+        .map_err(PyValueError::new_err)
+    }
+
+    /// `ScoreCost(...).estimate(expected_rows, prefix_groups=...)`: the
+    /// work's fields and the seconds.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (token_lengths, summaries, mean_tokens, model, device, chunk_tokens, capacity, gpus, draws, expected_rows, prefix_groups=None))]
+    fn score_estimate<'py>(
+        &self,
+        py: Python<'py>,
+        token_lengths: Vec<i64>,
+        summaries: Vec<Bound<'py, PyDict>>,
+        mean_tokens: f64,
+        model: &str,
+        device: &str,
+        chunk_tokens: i64,
+        capacity: i64,
+        gpus: i64,
+        draws: i64,
+        expected_rows: f64,
+        prefix_groups: Option<f64>,
+    ) -> PyResult<(Bound<'py, PyDict>, f64)> {
+        let cost = ScoreCost {
+            token_lengths,
+            summaries: summaries
+                .iter()
+                .map(alias_stats)
+                .collect::<PyResult<Vec<_>>>()?,
+            mean_tokens,
+            model: self.model(model)?.clone(),
+            device: self.device(device)?.clone(),
+            chunk_tokens,
+            capacity,
+            gpus,
+            draws,
+        };
+        let (work, seconds) = cost.estimate(expected_rows, prefix_groups);
+        Ok((work_to(py, &work)?, seconds))
+    }
+
+    /// `SaeFeaturesCost(...).estimate(expected_rows, resident)`.
+    #[allow(clippy::too_many_arguments)]
+    fn sae_features_estimate<'py>(
+        &self,
+        py: Python<'py>,
+        token_lengths: Vec<i64>,
+        summary: &Bound<'py, PyDict>,
+        pooling: String,
+        model: &str,
+        device: &str,
+        chunk_tokens: i64,
+        gpus: i64,
+        max_pooling: bool,
+        expected_rows: f64,
+        resident: bool,
+    ) -> PyResult<(Bound<'py, PyDict>, f64)> {
+        let cost = SaeFeaturesCost {
+            token_lengths,
+            summary: alias_stats(summary)?,
+            pooling,
+            model: self.model(model)?.clone(),
+            device: self.device(device)?.clone(),
+            chunk_tokens,
+            gpus,
+            max_pooling,
+        };
+        let (work, seconds) = cost.estimate(expected_rows, resident);
+        Ok((work_to(py, &work)?, seconds))
     }
 
     /// `float(np.sum(values))`, as the Rust port rounds it.

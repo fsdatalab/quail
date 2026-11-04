@@ -214,6 +214,27 @@ def test_the_memory_budgets_are_the_same(rust):
                 budgets.parallel_copies(gpus, documents))
 
 
+def same_numbers(rust_value, python_value) -> bool:
+    """Whether two results agree: floats to 1e-12 relative, the rest exactly.
+
+    Python's sum() compensates its rounding only while every item is an
+    exact float; once a numpy scalar appears, as it does where work.py
+    builds a count with numpy, it adds plainly. Which values are numpy
+    scalars is an accident of Python's types, so an operator's cost can
+    differ from the Rust port's in the last bit.
+    """
+    rust_value, python_value = plain(rust_value), plain(python_value)
+    if isinstance(python_value, float) or isinstance(rust_value, float):
+        return bool(np.isclose(rust_value, python_value, rtol=1e-12, atol=0.0))
+    if isinstance(python_value, dict):
+        return (rust_value.keys() == python_value.keys() and all(
+            same_numbers(rust_value[key], python_value[key]) for key in python_value))
+    if isinstance(python_value, list):
+        return len(rust_value) == len(python_value) and all(
+            same_numbers(a, b) for a, b in zip(rust_value, python_value))
+    return rust_value == python_value
+
+
 def close(rust_values, python_values) -> bool:
     """Whether two curves agree to 1e-12 relative.
 
@@ -298,3 +319,85 @@ def test_the_retention_and_decode_prices_are_the_same(rust):
     for arena, chunk, page in ((0, 1, 16), (100_000, 2_048, 16), (5_000, 4_096, 32)):
         assert native.CostModel.retention_pages(arena, chunk, page) == (
             retention_pages(arena, chunk, page))
+
+
+def _stats_cases():
+    from quail.planner.statistics.tables import AliasStats
+
+    yield AliasStats(count=0, total=0, squared=0, maximum=0)
+    yield AliasStats(count=4, total=1_000, squared=400_000, maximum=600)
+    yield AliasStats(count=1_000_000, total=30_000_000_000,
+                     squared=10**22 + 7, maximum=90_000)
+    yield AliasStats(count=50, total=40_000, squared=40_000_000, maximum=4_000,
+                     window=1_024, short_counts=((100, 20), (700, 9), (1_023, 1)))
+
+
+def test_the_table_statistics_are_the_same():
+    from dataclasses import asdict
+
+    from quail.planner.statistics.tables import scale_alias
+
+    for stats in _stats_cases():
+        for offset, fraction in ((0.0, 1.0), (12.5, 0.37), (900.0, 0.5)):
+            scaled = scale_alias(stats, fraction)
+            window = ((stats.window_pairs(offset), stats.window_reads(offset))
+                      if stats.window else (0.0, 0.0))
+            assert plain(native.CostModel.alias_stats_values(
+                plain(asdict(stats)), offset, fraction)) == plain((
+                stats.mean, stats.variance, *window,
+                (scaled.count, scaled.total, scaled.squared, scaled.short_counts)))
+
+
+def test_the_filter_score_and_feature_costs_are_the_same(rust):
+    from quail.common.budgets import chunk_budget
+    from quail.cost.filters import filter_cost
+    from quail.cost.packing import choose_pass_groups
+    from quail.cost.sae_features import SaeFeaturesCost
+    from quail.cost.score import ScoreCost
+
+    stats = list(_stats_cases())[1:]
+    for model_name, model in MODELS.items():
+        for device_name, device in DEVICES.items():
+            chunk = max(1, chunk_budget(model, device))
+            for question, mean in ((12, 300.0), (90, 4_500.5)):
+                for first in (True, False):
+                    assert same_numbers(rust.filter_cost(
+                        question, mean, model_name, device_name, chunk, first),
+                        filter_cost(question, mean, model, device, chunk, first=first))
+            for summaries in ((stats[0],), (stats[0], stats[2]), (stats[2],)):
+                for capacity in (500, 10**9):
+                    for gpus, draws in ((1, 1), (4, 3)):
+                        cost = ScoreCost((40, 9, 15)[:len(summaries) + 1],
+                                         summaries, 777.0, model, device, chunk,
+                                         capacity, gpus, draws)
+                        for rows in (0.0, 3.0, 2_500.0):
+                            for prefix_groups in (None, 2.0):
+                                work, seconds = cost.estimate(
+                                    rows, prefix_groups=prefix_groups)
+                                assert same_numbers(rust.score_estimate(
+                                    list(cost.token_lengths),
+                                    [plain(asdict(s)) for s in summaries],
+                                    cost.mean_tokens, model_name, device_name,
+                                    chunk, capacity, gpus, draws, rows,
+                                    prefix_groups), (asdict(work), seconds))
+            for pooling, max_pooling in (("last", False), ("max", False),
+                                         ("last", True)):
+                cost = SaeFeaturesCost((40, 12), stats[2], pooling, model, device,
+                                       chunk, 2, max_pooling)
+                for rows in (0.0, 30.0):
+                    for resident in (False, True):
+                        work, seconds = cost.estimate(rows, resident)
+                        assert same_numbers(rust.sae_features_estimate(
+                            [40, 12], plain(asdict(stats[2])), pooling, model_name,
+                            device_name, chunk, 2, max_pooling, rows, resident
+                        ), (asdict(work), seconds))
+    model = MODELS["d1-2b-bf16"]
+    device = DEVICES["h100-sxm"]
+    for chunk in (40, 4_096):
+        for header in (0, 3):
+            arguments = ((12, 30, 7, 9), (0.5, 0.9, 0.2, 1.0), 1_000.0, 300.0, 600)
+            assert _outcome(rust.choose_pass_groups, *arguments, model.name,
+                            device.name, chunk, 3, header) == _outcome(
+                lambda *values: choose_pass_groups(
+                    *values, model, device, chunk, set_size=3, header=header),
+                *arguments)
