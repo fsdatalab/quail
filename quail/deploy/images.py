@@ -47,7 +47,7 @@ MATURIN = "maturin>=1.9,<2"
 SPEC_DATA = Path(__file__).resolve().parents[1] / "specs" / "data"
 
 # local variables copied into the image when set
-FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
+FORWARDED_ENV = ("QUAIL_GDN_PREFILL", "QUAIL_PLANNER")
 
 
 def _cuda_base() -> modal.Image:
