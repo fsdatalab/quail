@@ -8,7 +8,7 @@ from helpers.sessions import CONFIG, check_table, fake_tok
 import quail
 from quail.physical import encode_graph
 
-pytest.importorskip("_quail_datafusion")
+pytest.importorskip("_quail_native")
 
 REVIEWS = pa.table({
     "id": ["r0", "r1", "r2", "r3"],

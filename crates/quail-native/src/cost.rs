@@ -117,7 +117,7 @@ fn work_to<'py>(py: Python<'py>, work: &Work) -> PyResult<Bound<'py, PyDict>> {
 }
 
 /// The Rust cost model over the specs in one directory.
-#[pyclass(name = "CostModel", module = "_quail_datafusion")]
+#[pyclass(name = "CostModel", module = "_quail_native")]
 pub struct CostModel {
     models: BTreeMap<String, ModelSpec>,
     devices: BTreeMap<String, DeviceSpec>,

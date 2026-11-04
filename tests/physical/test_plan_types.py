@@ -10,7 +10,7 @@ from helpers.sessions import CONFIG, check_table
 import quail
 from quail.planner.plan import EngineConfig, Refusal
 
-native = pytest.importorskip("_quail_datafusion")
+native = pytest.importorskip("_quail_native")
 
 
 def token_ids(text):

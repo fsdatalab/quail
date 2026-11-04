@@ -17,7 +17,7 @@ from quail.common.sol import compute_seconds, speed_of_light, unrounded_seconds
 from quail.specs import DEVICES, MODELS
 from quail.specs.loading import DATA
 
-native = pytest.importorskip("_quail_datafusion")
+native = pytest.importorskip("_quail_native")
 
 
 @pytest.fixture(scope="module")

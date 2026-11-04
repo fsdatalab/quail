@@ -34,12 +34,12 @@ jobs:
       - name: Rust tests
         run: cargo test
       # tests/api/test_session_context.py imports this module
-      - name: Build the DataFusion Python module (maturin)
+      - name: Build the native Python module (maturin)
         run: |
           uv run --frozen --with "maturin>=1.9,<2" maturin build \
-            -m crates/quail-datafusion-python/Cargo.toml -o target/wheels
-          uv pip install target/wheels/quail_datafusion-*.whl
-          uv run --frozen python -c "import _quail_datafusion"
+            -m crates/quail-native/Cargo.toml -o target/wheels
+          uv pip install target/wheels/quail_native-*.whl
+          uv run --frozen python -c "import _quail_native"
       - name: Lint (ruff)
         run: uv run --frozen ruff check quail bench calibrate tests experiments tools
       - name: Long string literals

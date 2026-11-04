@@ -1,4 +1,4 @@
-//! The `_quail_datafusion` Python module.
+//! The `_quail_native` Python module: Quail's Rust crates for Python.
 //!
 //! Tables and results cross between Python and Rust as Arrow IPC
 //! stream bytes, so the module does not depend on pyarrow's version.
@@ -145,7 +145,7 @@ fn python_error(error: DataFusionError) -> PyErr {
 }
 
 /// A DataFusion session context with Quail registered.
-#[pyclass(name = "NativeContext", module = "_quail_datafusion")]
+#[pyclass(name = "NativeContext", module = "_quail_native")]
 struct NativeContext {
     context: SessionContext,
     runtime: Runtime,
@@ -244,7 +244,7 @@ fn read_and_write_plan(text: &str) -> PyResult<String> {
 }
 
 #[pymodule]
-fn _quail_datafusion(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContext>()?;
     module.add_class::<cost::CostModel>()?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)

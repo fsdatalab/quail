@@ -1,13 +1,13 @@
 [package]
-name = "quail-datafusion-python"
+name = "quail-native"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Python bindings for quail-datafusion"
+description = "Python bindings for Quail's Rust crates"
 publish = false
 
 [lib]
-name = "_quail_datafusion"
+name = "_quail_native"
 crate-type = ["cdylib"]
 
 [dependencies]

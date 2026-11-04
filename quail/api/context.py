@@ -17,8 +17,8 @@ For example, imagine a ``reviews`` table with review text in ``body``:
         "r.body))")
 
 The DataFusion side lives in the ``quail-datafusion`` crate. Its Python
-module, ``_quail_datafusion``, is a wheel that maturin builds from
-``crates/quail-datafusion-python``; install the wheel into Quail's
+module, ``_quail_native``, is a wheel that maturin builds from
+``crates/quail-native``; install the wheel into Quail's
 environment.
 """
 
@@ -56,11 +56,11 @@ class SessionContext:
             returns the PhysicalResponse, for tests without a GPU.
 
     Raises:
-        ImportError: The ``_quail_datafusion`` module is not built.
+        ImportError: The ``_quail_native`` module is not built.
     """
 
     def __init__(self, session, physical_executor: Callable | None = None):
-        from _quail_datafusion import NativeContext
+        from _quail_native import NativeContext
 
         self.session = session
         self._physical_executor = physical_executor
