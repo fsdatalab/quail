@@ -1,4 +1,4 @@
-//! Classification costs, as `quail/cost/classify.py` estimates them.
+//! Classification costs.
 
 use std::collections::BTreeSet;
 

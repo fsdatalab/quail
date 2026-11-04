@@ -43,7 +43,7 @@ Include the tests and documentation needed to check and use your change.
 | `quail/catalog/` | Table providers and the tokenized inputs of a session. |
 | `quail/logical/`, `quail/physical/` | Logical and physical plan definitions. |
 | `crates/` | SQL parsing and binding on DataFusion, the Rust planner, and the cost model, built into the `_quail_native` module. |
-| `quail/planner/`, `quail/cost/`, `quail/specs/` | The bridge to the Rust planner, the Python cost model, and model and device specifications. |
+| `quail/planner/`, `quail/specs/` | The bridge to the Rust planner, and model and device specifications. The cost model is in `crates/quail-cost/`. |
 | `quail/execution/` | The runner and the CPU operators. |
 | `quail/backends/` | The Quail inference engine. |
 | `quail/baselines/` | The stock vLLM and SGLang backends the benchmark compares against. |

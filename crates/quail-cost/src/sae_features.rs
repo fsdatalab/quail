@@ -1,5 +1,4 @@
-//! Work and time of an `AI.SAE_FEATURES` call, as
-//! `quail/cost/sae_features.py` estimates them.
+//! Work and time of an `AI.SAE_FEATURES` call.
 
 use crate::budgets::parallel_copies;
 use crate::quantity::Quantity;

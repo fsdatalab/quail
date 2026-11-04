@@ -1,5 +1,4 @@
-//! The Rust cost model, exposed to Python so tests can compare it with
-//! Python's.
+//! The Rust cost model, exposed to Python for tests.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -777,7 +776,7 @@ impl CostModel {
         ))
     }
 
-    /// `quail.cost.classify.estimate`: seconds, passes, the work's
+    /// `classify::estimate`: seconds, passes, the work's
     /// fields, suffix tokens, and rounds.
     #[allow(clippy::too_many_arguments)]
     fn classify_estimate<'py>(
@@ -821,7 +820,7 @@ impl CostModel {
         ))
     }
 
-    /// `quail.cost.classify.estimate_suffixes`: seconds, passes, the
+    /// `classify::estimate_suffixes`: seconds, passes, the
     /// work's fields, suffix tokens, and rounds.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (head_tokens, frame_tokens, suffixes, expected_rows, lengths, shared, chunk, model, device, resident, canvas_rows, runs, answer_rows, head_rows, gpus))]
@@ -873,7 +872,7 @@ impl CostModel {
         ))
     }
 
-    /// `quail.cost.extract.estimate`: seconds, passes, the work's
+    /// `extract::estimate`: seconds, passes, the work's
     /// fields, suffix tokens, and rows.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (expected_rows, lengths, shared, head_tokens, tail_tokens, chunk, model, device, resident, max_answer_tokens, draft_tokens, draft_policy, round_cost_per_token, gpus, answer_tokens))]
@@ -926,6 +925,96 @@ impl CostModel {
             cost.suffix_tokens,
             cost.rows,
         ))
+    }
+
+    /// `extract::document_work`: each document's work fields, fed
+    /// tokens, and readout rows.
+    #[allow(clippy::too_many_arguments)]
+    #[staticmethod]
+    #[pyo3(signature = (lengths, shared, head_tokens, tail_tokens, window, resident, max_answer_tokens, draft_tokens, draft_policy, round_cost_per_token, answer_tokens, recurrent))]
+    fn extract_document_work<'py>(
+        py: Python<'py>,
+        lengths: Vec<f64>,
+        shared: Vec<f64>,
+        head_tokens: i64,
+        tail_tokens: i64,
+        window: i64,
+        resident: bool,
+        max_answer_tokens: i64,
+        draft_tokens: i64,
+        draft_policy: String,
+        round_cost_per_token: f64,
+        answer_tokens: i64,
+        recurrent: bool,
+    ) -> PyResult<Vec<(Bound<'py, PyDict>, f64, f64)>> {
+        let inputs = ExtractInputs {
+            head_tokens,
+            tail_tokens,
+            window,
+            resident,
+            max_answer_tokens,
+            draft_tokens,
+            draft_policy,
+            round_cost_per_token,
+            answer_tokens,
+            recurrent,
+        };
+        extract::document_work(&lengths, &shared, &inputs)
+            .map_err(PyValueError::new_err)?
+            .iter()
+            .map(|(work, fed, rows)| Ok((work_to(py, work)?, *fed, *rows)))
+            .collect()
+    }
+
+    /// `extract::table_work`: the table's work fields, fed tokens, and
+    /// readout rows.
+    #[allow(clippy::too_many_arguments)]
+    #[staticmethod]
+    #[pyo3(signature = (lengths, shared, head_tokens, tail_tokens, window, resident, max_answer_tokens, draft_tokens, draft_policy, round_cost_per_token, answer_tokens, recurrent))]
+    fn extract_table_work<'py>(
+        py: Python<'py>,
+        lengths: Vec<f64>,
+        shared: Vec<f64>,
+        head_tokens: i64,
+        tail_tokens: i64,
+        window: i64,
+        resident: bool,
+        max_answer_tokens: i64,
+        draft_tokens: i64,
+        draft_policy: String,
+        round_cost_per_token: f64,
+        answer_tokens: i64,
+        recurrent: bool,
+    ) -> PyResult<(Bound<'py, PyDict>, f64, f64)> {
+        let inputs = ExtractInputs {
+            head_tokens,
+            tail_tokens,
+            window,
+            resident,
+            max_answer_tokens,
+            draft_tokens,
+            draft_policy,
+            round_cost_per_token,
+            answer_tokens,
+            recurrent,
+        };
+        let (work, fed, rows) =
+            extract::table_work(&lengths, &shared, &inputs).map_err(PyValueError::new_err)?;
+        Ok((work_to(py, &work)?, fed, rows))
+    }
+
+    /// `extract::survival`: the chance an answer of mean `answer_tokens`
+    /// has more than `tokens` tokens after its first.
+    #[staticmethod]
+    fn extract_survival(answer_tokens: i64, tokens: f64) -> f64 {
+        extract::survival(answer_tokens, tokens)
+    }
+
+    /// `extract::expected_rounds` with `draft_tokens` per round after
+    /// the chosen token.
+    #[staticmethod]
+    fn extract_rounds(answer_tokens: i64, max_answer_tokens: i64, draft_tokens: i64) -> f64 {
+        extract::expected_rounds(answer_tokens, max_answer_tokens, 1 + draft_tokens)
     }
 
     /// `stage_work`, or `packed_join_work` when `set_size` is given:

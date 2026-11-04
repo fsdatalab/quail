@@ -1,5 +1,4 @@
-//! Pass groups of a set-attention chain, as `quail/cost/packing.py`
-//! chooses them.
+//! Pass groups of a set-attention chain.
 
 use crate::quantity::Quantity;
 use crate::sol::unrounded_seconds;

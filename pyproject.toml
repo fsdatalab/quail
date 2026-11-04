@@ -96,7 +96,6 @@ type = "forbidden"
 source_modules = ["quail.backends", "quail.execution"]
 forbidden_modules = [
     "quail.planner",
-    "quail.cost",
     "quail.logical",
     "quail.catalog",
 ]
@@ -149,7 +148,6 @@ layers = [
     "quail.physical",
     "quail.catalog",
     "quail.logical",
-    "quail.cost",
     "quail.common",
     "quail.specs | quail.labels | quail.progress | quail.deploy",
 ]

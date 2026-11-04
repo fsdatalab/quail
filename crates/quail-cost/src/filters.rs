@@ -1,4 +1,4 @@
-//! The cost of one boolean filter, as `quail/cost/filters.py` prices it.
+//! The cost of one boolean filter.
 
 use crate::quantity::Quantity;
 use crate::sol::unrounded_seconds;

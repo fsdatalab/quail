@@ -1,5 +1,4 @@
-//! Work and time of an `AI.SCORE` call, as `quail/cost/score.py`
-//! estimates them.
+//! Work and time of an `AI.SCORE` call.
 
 use crate::budgets::parallel_copies;
 use crate::quantity::{Quantity, python_sum};

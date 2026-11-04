@@ -1,7 +1,7 @@
 //! Quail's model and device specs and its cost model, in Rust.
 //!
-//! Each module mirrors one Python module and computes the same
-//! numbers in the same order, so results equal Python's:
+//! The modules with a Python counterpart compute the same numbers
+//! in the same order, so results equal Python's:
 //!
 //! | Module | Python |
 //! | --- | --- |
@@ -16,8 +16,7 @@
 //! | `draft_policy` | `quail/common/draft_policy.py` |
 //! | `retention` | `quail/common/retention.py` |
 //! | `decode` | `quail/common/decode.py`, the planner's part |
-//! | `statistics` | `AliasStats` in `quail/planner/statistics/tables.py` |
-//! | `filters`, `packing`, `score`, `sae_features`, `classify`, `joins`, `extract` | the same modules of `quail/cost` |
+//! | `statistics`, `filters`, `packing`, `score`, `sae_features`, `classify`, `joins`, `extract` | none; Rust only |
 //! | `labels` | `quail/labels.py`, the trie the costs read |
 
 pub mod answers;

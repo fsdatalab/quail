@@ -1,7 +1,7 @@
-//! Extraction costs, as `quail/cost/extract.py` estimates them.
+//! Extraction costs.
 //!
 //! Each document's work is a record of scalars; the table's work sums
-//! them as numpy sums the Python cost model's per-document arrays.
+//! them as numpy sums an array.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +30,16 @@ fn tri(tokens: f64, window: i64) -> f64 {
 /// The keep chance of `ExtractAssumptions`: 1 - 1/max(1, answer_tokens).
 fn keep(answer_tokens: i64) -> f64 {
     1.0 - 1.0 / (answer_tokens as f64).max(1.0)
+}
+
+/// `ExtractAssumptions.survival`: the chance an answer has more than
+/// `tokens` tokens after its first.
+pub fn survival(answer_tokens: i64, tokens: f64) -> f64 {
+    if answer_tokens == 0 {
+        0.0
+    } else {
+        keep(answer_tokens).powf(tokens)
+    }
 }
 
 /// Rounds an answer may take at the limit: ceil((limit - 1) / per_round), at least 0.

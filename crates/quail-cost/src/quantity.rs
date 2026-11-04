@@ -1,6 +1,6 @@
 //! A count that is one number, or one number per document.
 //!
-//! The Python cost model passes floats and numpy arrays through the
+//! `quail/common` passes floats and numpy arrays through the
 //! same arithmetic. `Quantity` does the same with numpy's
 //! broadcasting, and its sums round as numpy's and Python's do.
 

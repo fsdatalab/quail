@@ -1,5 +1,4 @@
-//! Model work of a join at given row counts and KV residency, as
-//! `quail/cost/joins.py` counts it.
+//! Model work of a join at given row counts and KV residency.
 
 use std::collections::BTreeMap;
 

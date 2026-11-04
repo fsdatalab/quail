@@ -1,4 +1,4 @@
-"""The Rust cost model (crates/quail-cost) computes Python's numbers exactly."""
+"""The Rust cost model (crates/quail-cost) matches quail.common and quail.labels."""
 
 from dataclasses import asdict
 
@@ -214,27 +214,6 @@ def test_the_memory_budgets_are_the_same(rust):
                 budgets.parallel_copies(gpus, documents))
 
 
-def same_numbers(rust_value, python_value) -> bool:
-    """Whether two results agree: floats to 1e-12 relative, the rest exactly.
-
-    Python's sum() compensates its rounding only while every item is an
-    exact float; once a numpy scalar appears, as it does where work.py
-    builds a count with numpy, it adds plainly. Which values are numpy
-    scalars is an accident of Python's types, so an operator's cost can
-    differ from the Rust port's in the last bit.
-    """
-    rust_value, python_value = plain(rust_value), plain(python_value)
-    if isinstance(python_value, float) or isinstance(rust_value, float):
-        return bool(np.isclose(rust_value, python_value, rtol=1e-12, atol=0.0))
-    if isinstance(python_value, dict):
-        return (rust_value.keys() == python_value.keys() and all(
-            same_numbers(rust_value[key], python_value[key]) for key in python_value))
-    if isinstance(python_value, list):
-        return len(rust_value) == len(python_value) and all(
-            same_numbers(a, b) for a, b in zip(rust_value, python_value))
-    return rust_value == python_value
-
-
 def close(rust_values, python_values) -> bool:
     """Whether two curves agree to 1e-12 relative.
 
@@ -321,88 +300,6 @@ def test_the_retention_and_decode_prices_are_the_same(rust):
             retention_pages(arena, chunk, page))
 
 
-def _stats_cases():
-    from quail.cost.statistics import AliasStats
-
-    yield AliasStats(count=0, total=0, squared=0, maximum=0)
-    yield AliasStats(count=4, total=1_000, squared=400_000, maximum=600)
-    yield AliasStats(count=1_000_000, total=30_000_000_000,
-                     squared=10**22 + 7, maximum=90_000)
-    yield AliasStats(count=50, total=40_000, squared=40_000_000, maximum=4_000,
-                     window=1_024, short_counts=((100, 20), (700, 9), (1_023, 1)))
-
-
-def test_the_table_statistics_are_the_same():
-    from dataclasses import asdict
-
-    from quail.cost.statistics import scale_alias
-
-    for stats in _stats_cases():
-        for offset, fraction in ((0.0, 1.0), (12.5, 0.37), (900.0, 0.5)):
-            scaled = scale_alias(stats, fraction)
-            window = ((stats.window_pairs(offset), stats.window_reads(offset))
-                      if stats.window else (0.0, 0.0))
-            assert plain(native.CostModel.alias_stats_values(
-                plain(asdict(stats)), offset, fraction)) == plain((
-                stats.mean, stats.variance, *window,
-                (scaled.count, scaled.total, scaled.squared, scaled.short_counts)))
-
-
-def test_the_filter_score_and_feature_costs_are_the_same(rust):
-    from quail.common.budgets import chunk_budget
-    from quail.cost.filters import filter_cost
-    from quail.cost.packing import choose_pass_groups
-    from quail.cost.sae_features import SaeFeaturesCost
-    from quail.cost.score import ScoreCost
-
-    stats = list(_stats_cases())[1:]
-    for model_name, model in MODELS.items():
-        for device_name, device in DEVICES.items():
-            chunk = max(1, chunk_budget(model, device))
-            for question, mean in ((12, 300.0), (90, 4_500.5)):
-                for first in (True, False):
-                    assert same_numbers(rust.filter_cost(
-                        question, mean, model_name, device_name, chunk, first),
-                        filter_cost(question, mean, model, device, chunk, first=first))
-            for summaries in ((stats[0],), (stats[0], stats[2]), (stats[2],)):
-                for capacity in (500, 10**9):
-                    for gpus, draws in ((1, 1), (4, 3)):
-                        cost = ScoreCost((40, 9, 15)[:len(summaries) + 1],
-                                         summaries, 777.0, model, device, chunk,
-                                         capacity, gpus, draws)
-                        for rows in (0.0, 3.0, 2_500.0):
-                            for prefix_groups in (None, 2.0):
-                                work, seconds = cost.estimate(
-                                    rows, prefix_groups=prefix_groups)
-                                assert same_numbers(rust.score_estimate(
-                                    list(cost.token_lengths),
-                                    [plain(asdict(s)) for s in summaries],
-                                    cost.mean_tokens, model_name, device_name,
-                                    chunk, capacity, gpus, draws, rows,
-                                    prefix_groups), (asdict(work), seconds))
-            for pooling, max_pooling in (("last", False), ("max", False),
-                                         ("last", True)):
-                cost = SaeFeaturesCost((40, 12), stats[2], pooling, model, device,
-                                       chunk, 2, max_pooling)
-                for rows in (0.0, 30.0):
-                    for resident in (False, True):
-                        work, seconds = cost.estimate(rows, resident)
-                        assert same_numbers(rust.sae_features_estimate(
-                            [40, 12], plain(asdict(stats[2])), pooling, model_name,
-                            device_name, chunk, 2, max_pooling, rows, resident
-                        ), (asdict(work), seconds))
-    model = MODELS["d1-2b-bf16"]
-    device = DEVICES["h100-sxm"]
-    for chunk in (40, 4_096):
-        for header in (0, 3):
-            arguments = ((12, 30, 7, 9), (0.5, 0.9, 0.2, 1.0), 1_000.0, 300.0, 600)
-            assert _outcome(rust.choose_pass_groups, *arguments, model.name,
-                            device.name, chunk, 3, header) == _outcome(
-                lambda *values: choose_pass_groups(
-                    *values, model, device, chunk, set_size=3, header=header),
-                *arguments)
-
-
 # label token ids: one token each; shared prefixes; a label that ends
 # where another continues
 LABEL_SETS = (
@@ -425,120 +322,10 @@ def test_the_label_trie_reads_the_same_nodes():
                 python_labels.decode_round_tokens(label_ids)))
 
 
-# whether the documents' KV is resident, and their borrowed prefixes
-RESIDENCY = ((False, []), (False, [0.0, 900.0, 0.0, 30.0]), (True, []))
-
-
-def test_the_classify_costs_are_the_same(rust):
-    from quail.common.budgets import chunk_budget
-    from quail.cost import classify
-    from quail.labels import DECODE_SCORING, LETTERS_SCORING, TREE_SCORING
-
-    lengths = [120.0, 3_000.0, 45.0, 800.0]
-    for model_name, model in MODELS.items():
-        for device_name, device in DEVICES.items():
-            chunk = max(1, chunk_budget(model, device))
-            for scoring in (LETTERS_SCORING, TREE_SCORING, DECODE_SCORING):
-                for label_ids in LABEL_SETS:
-                    for resident, shared in RESIDENCY:
-                        for rows, gpus in ((4.0, 1), (1_000.0, 2)):
-                            expected = classify.estimate(
-                                scoring, rows, 30, 12, label_ids, lengths=lengths,
-                                shared=shared, chunk=chunk, model=model,
-                                device=device, resident=resident, draws=2, gpus=gpus)
-                            assert same_numbers(rust.classify_estimate(
-                                scoring, rows, 30, 12, label_ids, lengths, shared,
-                                chunk, model_name, device_name, resident, 2, [], gpus,
-                            ), (expected.seconds, expected.passes,
-                                asdict(expected.work), expected.suffix_tokens,
-                                expected.rounds)), (model_name, scoring, label_ids)
-
-
-def test_the_join_work_is_the_same():
-    from quail.cost.joins import PricedJoin, packed_join_work, stage_work
-    from quail.cost.statistics import AliasStats
-
-    for window in (0, 1_024):
-        short = ((100, 20), (700, 9)) if window else ()
-        lengths = {
-            "r": AliasStats(50, 40_000, 40_000_000, 4_000, window, short),
-            "a": AliasStats(8, 300, 12_000, 60, window, ((30, 8),) if window else ()),
-            "c": AliasStats(1_000_000, 30_000_000_000, 10**22 + 7, 90_000, window,
-                            short),
-        }
-        for aliases in (("r", "a"), ("r", "a", "c")):
-            spec = PricedJoin(
-                written_position=0, aliases=aliases, anchor=None, anchor_free=True,
-                semantics="full", selectivity=0.3,
-                frame_tokens={alias: 7 + index for index, alias in enumerate(aliases)},
-                label_tokens={alias: 3 + index for index, alias in enumerate(aliases)},
-                tail_tokens=11)
-            fields = {alias: plain(asdict(stats)) for alias, stats in lengths.items()}
-            arguments = (list(aliases), dict(spec.frame_tokens),
-                         dict(spec.label_tokens), spec.tail_tokens)
-            for anchor in aliases:
-                for n, tuples in ((0.0, 0.0), (4.0, 30.0), (40.0, 2_000.5)):
-                    for resident in (False, True):
-                        expected = stage_work(spec, anchor, n, tuples, lengths, 25,
-                                              resident=resident, window=window)
-                        assert same_numbers(native.CostModel.join_work(
-                            *arguments, anchor, n, tuples, fields, 25, resident,
-                            window), asdict(expected)), (aliases, anchor, n, resident)
-                    for set_size in (1, 4):
-                        expected = packed_join_work(spec, anchor, n, tuples, lengths,
-                                                    25, window=window,
-                                                    set_size=set_size)
-                        assert same_numbers(native.CostModel.join_work(
-                            *arguments, anchor, n, tuples, fields, 25, False, window,
-                            set_size), asdict(expected))
-
-
-def test_the_extract_costs_are_the_same(rust):
-    from quail.common.budgets import chunk_budget
-    from quail.cost import extract
-
-    rng = np.random.default_rng(7)
-    tables = {
-        "short": ([120.0, 3_000.0, 45.0, 800.0], [0.0, 20.0, 0.0, 40.0]),
-        "sampled": (rng.integers(1, 9_000, 2_000).astype(float).tolist(),
-                    rng.integers(0, 60, 2_000).astype(float).tolist()),
-    }
-    windows = {MODELS[name].sliding_window > 0 for name in MODELS}
-    recurrent = {bool(MODELS[name].state_layers) for name in MODELS}
-    assert windows == recurrent == {False, True}
-    device_name = "h100-sxm"
-    device = DEVICES[device_name]
-    for model_name, model in MODELS.items():
-        chunk = max(1, chunk_budget(model, device))
-        for table_name, (lengths, shared) in tables.items():
-            for policy, draft_tokens in (("fixed", 0), ("fixed", 3), ("adaptive", 6)):
-                for answer_tokens, max_answer_tokens in ((16, 40), (1, 8), (0, 8),
-                                                         (40, 1)):
-                    for resident, shared_lengths in ((False, None), (False, shared),
-                                                     (True, None)):
-                        assumptions = extract.ExtractAssumptions(answer_tokens)
-                        expected = extract.estimate(
-                            1_500.0, lengths, 30, 12, chunk=chunk, model=model,
-                            device=device, resident=resident, shared=shared_lengths,
-                            max_answer_tokens=max_answer_tokens,
-                            draft_tokens=draft_tokens, draft_policy=policy,
-                            round_cost_per_token=0.002, gpus=2,
-                            assumptions=assumptions)
-                        assert same_numbers(rust.extract_estimate(
-                            1_500.0, lengths, shared_lengths or [], 30, 12, chunk,
-                            model_name, device_name, resident, max_answer_tokens,
-                            draft_tokens, policy, 0.002, 2, answer_tokens,
-                        ), (expected.seconds, expected.passes,
-                            asdict(expected.work), expected.suffix_tokens,
-                            expected.rows)), (model_name, table_name, policy,
-                                              answer_tokens, resident)
-
-
-def test_a_length_column_summarizes_the_same(rust):
+def test_a_length_column_summarizes_to_its_sums_and_short_counts():
     import pyarrow as pa
 
     from quail.common.tokens import TokenLengths
-    from quail.cost.statistics import summarize_alias
 
     rng = np.random.default_rng(3)
     columns = (
@@ -548,8 +335,14 @@ def test_a_length_column_summarizes_the_same(rust):
         pa.chunked_array([rng.integers(1, 3_000, 500), rng.integers(1, 90_000, 700)]),
     )
     for column in columns:
-        lengths = TokenLengths(column)
+        values = np.asarray(TokenLengths(column), dtype=np.int64)
         for window in (0, 512, 4_096):
-            expected = summarize_alias(lengths, window)
-            fields = native.CostModel.summarize_alias(np.asarray(lengths), window)
-            assert plain(fields) == plain(asdict(expected)), (len(lengths), window)
+            short, counts = np.unique(values[values < window], return_counts=True)
+            expected = dict(
+                count=len(values), total=int(values.sum()),
+                squared=sum(int(value) ** 2 for value in values),
+                maximum=int(values.max(initial=0)), window=window,
+                short_counts=[list(pair) for pair in zip(short.tolist(),
+                                                         counts.tolist())])
+            fields = native.CostModel.summarize_alias(values, window)
+            assert plain(fields) == expected, (len(values), window)
