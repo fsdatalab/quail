@@ -15,4 +15,5 @@ async-trait = "0.1"
 datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
 pyo3 = { version = "0.30", features = ["extension-module", "abi3-py312"] }
 quail-datafusion = { path = "../quail-datafusion" }
+quail-physical = { path = "../quail-physical" }
 tokio = { version = "1", features = ["rt-multi-thread"] }

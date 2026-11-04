@@ -3,7 +3,7 @@
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, finish, oracle_executor
-from helpers.sessions import CONFIG, fake_tok
+from helpers.sessions import CONFIG, check_table, fake_tok
 
 import quail
 from quail.physical import encode_graph
@@ -122,16 +122,6 @@ def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
     assert len(_rows(table)) == 2
 
 
-def _check_table(columns) -> pa.Table:
-    """Four rows in a check query table's schema, given as Substrait type names."""
-    values = {"string": lambda index: f"document {index} " + "pad " * (10 + index),
-              "i64": lambda index: index, "i32": lambda index: index,
-              "fp64": float, "bool": lambda index: index % 2 == 0}
-    return pa.table({
-        column: [values.get(kind, values["string"])(index) for index in range(4)]
-        for column, kind in columns})
-
-
 def test_every_check_query_plans_the_same_graph_through_datafusion():
     from tools.dump_check_queries import check_query_entries
 
@@ -140,7 +130,7 @@ def test_every_check_query_plans_the_same_graph_through_datafusion():
         context = quail.SessionContext(session)
         for name, columns in entry["tables"].items():
             context.register(name, quail.DocumentProvider.from_table(
-                _check_table(columns), id_col="id"))
+                check_table(columns), id_col="id"))
         (region,) = context.region_sql(entry["sql"])
         codecs = session.registry.codecs
         assert (encode_graph(session.sql(region).plan().graph, codecs)

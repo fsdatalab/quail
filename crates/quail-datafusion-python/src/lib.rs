@@ -229,7 +229,20 @@ impl NativeContext {
     }
 }
 
+/// Read a physical plan envelope into the Rust plan types and write
+/// it back as JSON.
+///
+/// Raises a ValueError when the plan does not fit the Rust types.
+#[pyfunction]
+fn read_and_write_plan(text: &str) -> PyResult<String> {
+    let plan = quail_physical::read_plan(text)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    quail_physical::write_plan(&plan)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
 #[pymodule]
 fn _quail_datafusion(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<NativeContext>()
+    module.add_class::<NativeContext>()?;
+    module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }

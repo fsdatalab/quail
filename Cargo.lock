@@ -1945,7 +1945,16 @@ dependencies = [
  "datafusion",
  "pyo3",
  "quail-datafusion",
+ "quail-physical",
  "tokio",
+]
+
+[[package]]
+name = "quail-physical"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
