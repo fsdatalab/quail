@@ -7,11 +7,14 @@ description = "Quail's AI functions and model region planning as a DataFusion ex
 
 [dependencies]
 async-trait = "0.1"
-datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
+datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions", "string_expressions", "unicode_expressions", "math_expressions", "regex_expressions"] }
 datafusion-common-runtime = "55.2.0"
+base64 = "0.23"
 futures = "0.3"
+quail-physical = { path = "../quail-physical" }
+quail-planner = { path = "../quail-planner" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sqlparser = { version = "0.62.0", features = ["visitor"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-serde_json = "1"

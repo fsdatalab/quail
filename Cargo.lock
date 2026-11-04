@@ -1937,9 +1937,12 @@ name = "quail-datafusion"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "datafusion",
  "datafusion-common-runtime",
  "futures",
+ "quail-physical",
+ "quail-planner",
  "serde_json",
  "sqlparser",
  "tokio",

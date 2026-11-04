@@ -156,6 +156,62 @@ pub fn quail_functions() -> Vec<Arc<ScalarUDF>> {
     .collect()
 }
 
+/// A scalar function of Arrow compute that DataFusion does not have,
+/// such as `utf8_is_upper`.
+///
+/// Quail's language calls any scalar function of Arrow compute by its
+/// name; Quail evaluates it, so it runs only inside a model region.
+/// DataFusion needs its type to plan the query: a function named
+/// `is_*` or `utf8_is_*` is a test, another `utf8_*` function returns
+/// text, and any other returns its first argument's type.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ArrowFunction {
+    name: String,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ArrowFunction {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if self.name.starts_with("is_") || self.name.starts_with("utf8_is_") {
+            return Ok(DataType::Boolean);
+        }
+        if self.name.starts_with("utf8_") {
+            return Ok(DataType::Utf8);
+        }
+        Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        exec_err!(
+            "{} is an Arrow compute function Quail evaluates; it runs only inside a model region",
+            self.name
+        )
+    }
+}
+
+/// A UDF for each scalar function of Arrow compute whose name is not in
+/// `taken`, the names DataFusion already has.
+pub fn arrow_functions(taken: &dyn Fn(&str) -> bool) -> Vec<Arc<ScalarUDF>> {
+    quail_planner::arrow_functions::ARROW_FUNCTIONS
+        .iter()
+        .filter(|(name, kind, attribute)| *kind == "scalar" && *attribute && !taken(name))
+        .map(|(name, _, _)| {
+            Arc::new(ScalarUDF::new_from_impl(ArrowFunction {
+                name: name.to_string(),
+                signature: Signature::variadic_any(Volatility::Immutable),
+            }))
+        })
+        .collect()
+}
+
 /// Whether an expression is a call to an AI function.
 pub fn is_ai_call(expr: &Expr) -> bool {
     matches!(expr, Expr::ScalarFunction(call) if AI_FUNCTION_NAMES.contains(&call.name()))
@@ -174,7 +230,12 @@ pub fn normalize_ai_calls(sql: &str) -> String {
     while let Some((position, c)) = chars.next() {
         if let Some(open) = quote {
             out.push(c);
-            if c == open {
+            if c == '\\' && open == '\'' {
+                // Snowflake escapes a quote in a string as \'
+                if let Some((_, escaped)) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if c == open {
                 quote = None;
             }
             continue;

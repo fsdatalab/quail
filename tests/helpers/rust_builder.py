@@ -143,3 +143,125 @@ def shadow_prompt_binder(native, original):
         return prompt
 
     return bind
+
+
+def _schemas_as_text(value):
+    """The value with each encoded Arrow schema replaced by its text."""
+    import base64
+
+    import pyarrow as pa
+
+    if isinstance(value, dict):
+        if value.get("type") == "pyarrow.Schema":
+            schema = pa.ipc.read_schema(pa.py_buffer(base64.b64decode(value["ipc"])))
+            return schema.to_string(show_schema_metadata=True)
+        return {key: _schemas_as_text(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_schemas_as_text(item) for item in value]
+    return value
+
+
+def rust_logical_plans(native, sql, catalog, prompts):
+    """Bind a query with DataFusion and the Rust binder: (results, whole)."""
+    import pyarrow as pa
+
+    def refuse(columns):
+        raise RuntimeError("the binder check does not scan tables")
+
+    def run_region(text):
+        raise RuntimeError("the binder check does not run regions")
+
+    context = native.NativeContext(run_region)
+    for name, provider in catalog.providers.items():
+        sink = pa.BufferOutputStream()
+        schema = provider.schema()
+        with pa.ipc.new_stream(sink, schema) as writer:
+            writer.write_table(schema.empty_table())
+        context.register(name, sink.getvalue().to_pybytes(), refuse)
+    model = prompts.model
+    turn = prompts.turn if model is None else model.turn
+    layout = prompts.layout if model is None else model.prompt_layout
+    return context.logical_plans(sql, tuple(turn), layout)
+
+
+def binder_outcome(native, sql, catalog, prompts, plan, message) -> str:
+    """One line on how the Rust binder's plan compares with Python's."""
+    try:
+        results, whole = rust_logical_plans(native, sql, catalog, prompts)
+    except Exception as error:  # noqa: BLE001 - every failure is an outcome
+        return f"datafusion error: {str(error).splitlines()[0][:200]}"
+    if len(results) != 1 or not whole:
+        return f"not one whole region: {len(results)} regions, whole={whole}"
+    rust_plan, rust_message = results[0]
+    if message is not None:
+        return ("same refusal" if rust_message == message
+                else f"refusal differs: Rust {rust_message!r}, Python {message!r}")
+    if rust_message is not None:
+        return f"rust refused: {rust_message[:200]}"
+    built = _schemas_as_text(json.loads(rust_plan))
+    expected = _schemas_as_text(json.loads(json.dumps(encode_value(plan))))
+    if built == expected:
+        return "same plan"
+    return f"plan differs: {first_difference(built, expected)}"
+
+
+# Queries Python's front end compiles that DataFusion or the Rust binder
+# cannot yet, by a phrase of the outcome, with the reason.
+KNOWN_GAPS = {
+    "table function 'UNNEST' not found":
+        "DataFusion's Snowflake dialect has no UNNEST in FROM",
+    "FROM must name one registered provider":
+        "sqlglot merges a CTE into one SELECT; the Rust binder reads a table",
+    "For SELECT DISTINCT, ORDER BY expressions":
+        "DataFusion refuses DISTINCT with ORDER BY a struct field",
+}
+
+
+def check_outcome(outcome: str, accepted: bool) -> None:
+    """Raise AssertionError where the Rust binder disagrees with Python's.
+
+    A query Python accepts must bind to the same plan, unless a known
+    gap stops it; a query Python refuses must be refused, in any words.
+    """
+    if outcome in ("same plan", "same refusal"):
+        return
+    if accepted:
+        assert any(phrase in outcome for phrase in KNOWN_GAPS), (
+            f"the Rust binder disagrees: {outcome}")
+        return
+    assert not outcome.startswith("refusal differs: Rust None"), (
+        f"the Rust binder accepted a query Python refuses: {outcome}")
+
+
+def checked_compile_sql(native, original, path=None):
+    """Return compile_sql, also binding each query with DataFusion in Rust.
+
+    Args:
+        native: The _quail_native module.
+        original: Python's compile_sql.
+        path: A file to log each query's outcome to, or None.
+    """
+
+    def compile_sql(sql, catalog, dialect="snowflake", turn=("", ""),
+                    layout="ai-if", prompts=None):
+        from quail.frontend.prompts import PromptBinder
+        from quail.logical.nodes import WithCTE
+
+        binder = prompts or PromptBinder(turn=turn, layout=layout)
+        plan = message = None
+        try:
+            plan = original(sql, catalog, dialect=dialect, prompts=binder)
+        except CompileError as error:
+            message = str(error)
+            raise
+        finally:
+            if str(dialect).lower().endswith("snowflake") and not (
+                    plan is not None and isinstance(plan.root, WithCTE)):
+                outcome = binder_outcome(native, sql, catalog, binder, plan, message)
+                if path:
+                    with open(path, "a") as log:
+                        log.write(json.dumps({"sql": sql, "outcome": outcome}) + "\n")
+                check_outcome(outcome, accepted=message is None)
+        return plan
+
+    return compile_sql

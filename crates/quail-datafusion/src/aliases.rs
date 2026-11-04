@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AccessExpr, Expr, GroupByExpr, Ident, ObjectName, OrderByExpr, OrderByKind, Query, Select,
-    SelectItem, SetExpr, Statement, Subscript, TableFactor, Value, visit_expressions_mut,
+    AccessExpr, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
+    GroupByExpr, Ident, ObjectName, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr,
+    Statement, Subscript, TableFactor, Value, visit_expressions_mut,
 };
 
 /// Replace each `SELECT` alias named in a `WHERE` clause with the
@@ -20,6 +21,59 @@ use sqlparser::ast::{
 /// in `FROM` is left alone.
 pub fn inline_select_aliases(statement: &mut Statement) {
     for_each_select(statement, &mut |select, _| inline_in_select(select));
+}
+
+/// Write each named argument of an AI function, `name => value`, as a
+/// trailing `named_struct('name', value)` argument.
+///
+/// DataFusion's UDFs take positional arguments only. For example,
+/// `ai_sae_features(PROMPT(...), pooling => 'last')` becomes
+/// `ai_sae_features(PROMPT(...), named_struct('pooling', 'last'))`,
+/// which the Rust binder reads as the option.
+pub fn positional_ai_arguments(statement: &mut Statement) {
+    let _ = visit_expressions_mut(statement, |expr| {
+        if let Expr::Function(call) = expr
+            && call
+                .name
+                .to_string()
+                .to_ascii_lowercase()
+                .starts_with("ai_")
+        {
+            let template = call.clone();
+            let FunctionArguments::List(list) = &mut call.args else {
+                return ControlFlow::Continue(());
+            };
+            for argument in &mut list.args {
+                let (name, value) = match argument {
+                    FunctionArg::Named {
+                        name,
+                        arg: FunctionArgExpr::Expr(value),
+                        ..
+                    } => (name.value.clone(), value.clone()),
+                    FunctionArg::ExprNamed {
+                        name: Expr::Identifier(name),
+                        arg: FunctionArgExpr::Expr(value),
+                        ..
+                    } => (name.value.clone(), value.clone()),
+                    _ => continue,
+                };
+                let mut named = template.clone();
+                named.name = ObjectName::from(vec![Ident::new("named_struct")]);
+                named.args = FunctionArguments::List(FunctionArgumentList {
+                    duplicate_treatment: None,
+                    args: vec![
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::value(
+                            Value::SingleQuotedString(name),
+                        ))),
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(value)),
+                    ],
+                    clauses: Vec::new(),
+                });
+                *argument = FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Function(named)));
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
 }
 
 /// The suffix of the column that holds an extraction's answer
@@ -211,6 +265,35 @@ fn inline_in_select(select: &mut Select) {
         return;
     }
     let tables = table_names(select);
+    // a window function in SELECT may read another SELECT column by name
+    for item in &mut select.projection {
+        let own = match item {
+            SelectItem::ExprWithAlias { alias, .. } => Some(key(alias)),
+            _ => None,
+        };
+        let others: HashMap<String, Expr> = aliases
+            .iter()
+            .filter(|(name, _)| Some(*name) != own.as_ref())
+            .map(|(name, expr)| (name.clone(), expr.clone()))
+            .collect();
+        let expr = match item {
+            SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => expr,
+            _ => continue,
+        };
+        let _ = visit_expressions_mut(expr, |inner| {
+            if let Expr::Function(call) = inner
+                && call.over.is_some()
+            {
+                let _ = visit_expressions_mut(call, |reference| {
+                    if let Some(replacement) = resolve(reference, &others, &tables) {
+                        *reference = replacement;
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
     let Some(selection) = &mut select.selection else {
         return;
     };

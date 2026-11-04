@@ -16,6 +16,7 @@
 //! ```
 
 mod aliases;
+pub mod bind;
 mod claim;
 mod exec;
 mod functions;
@@ -33,12 +34,14 @@ use datafusion::optimizer::{Analyzer, AnalyzerRule};
 use datafusion::sql::parser::Statement;
 
 pub use aliases::{
-    SPAN_SUFFIX, add_extract_spans, inline_select_aliases, remove_select_calls,
-    restore_select_aliases,
+    SPAN_SUFFIX, add_extract_spans, inline_select_aliases, positional_ai_arguments,
+    remove_select_calls, restore_select_aliases,
 };
 pub use claim::ClaimModelRegions;
 pub use exec::{ModelRegionExec, ModelRegionPlanner, RegionRunner};
-pub use functions::{AI_FUNCTION_NAMES, is_ai_call, normalize_ai_calls, quail_functions};
+pub use functions::{
+    AI_FUNCTION_NAMES, arrow_functions, is_ai_call, normalize_ai_calls, quail_functions,
+};
 pub use region::ModelRegion;
 pub use unparse::region_sql;
 
@@ -75,6 +78,11 @@ pub fn session_context(runner: Arc<dyn RegionRunner>) -> SessionContext {
     for function in quail_functions() {
         context.register_udf(function.as_ref().clone());
     }
+    let state = context.state();
+    let taken = |name: &str| state.scalar_functions().contains_key(name);
+    for function in arrow_functions(&taken) {
+        context.register_udf(function.as_ref().clone());
+    }
     context
 }
 
@@ -89,6 +97,7 @@ pub async fn sql(context: &SessionContext, query: &str) -> Result<DataFrame> {
     let dialect = state.config().options().sql_parser.dialect;
     let mut statement = state.sql_to_statement(&normalize_ai_calls(query), &dialect)?;
     if let Statement::Statement(inner) = &mut statement {
+        positional_ai_arguments(inner);
         add_extract_spans(inner);
         inline_select_aliases(inner);
     }

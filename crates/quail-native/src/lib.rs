@@ -219,6 +219,53 @@ impl NativeContext {
         .map_err(python_error)
     }
 
+    /// Bind each model region of a query into Quail's logical plan.
+    ///
+    /// Returns one (plan JSON, None) or (None, CompileError message)
+    /// per region, and whether one region is the whole query.
+    /// `turn` and `layout` are the model's chat-turn text and prompt
+    /// layout.
+    #[allow(clippy::type_complexity)]
+    fn logical_plans(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        turn: (String, String),
+        layout: &str,
+    ) -> PyResult<(Vec<(Option<String>, Option<String>)>, bool)> {
+        py.detach(|| {
+            self.runtime.block_on(async {
+                let plan = sql(&self.context, query).await?.into_optimized_plan()?;
+                let mut bound = Vec::new();
+                plan.apply(|node| {
+                    if let LogicalPlan::Extension(extension) = node
+                        && let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>()
+                    {
+                        bound.push(
+                            match quail_datafusion::bind::bind_region(&region.plan, &turn, layout) {
+                                Ok(found) => (
+                                    Some(quail_planner::write_logical_plan(&found).map_err(
+                                        |error| {
+                                            datafusion::error::DataFusionError::External(Box::new(
+                                                error,
+                                            ))
+                                        },
+                                    )?),
+                                    None,
+                                ),
+                                Err(error) => (None, Some(error.0)),
+                            },
+                        );
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+                let whole = matches!(&plan, LogicalPlan::Extension(_));
+                Ok((bound, whole))
+            })
+        })
+        .map_err(python_error)
+    }
+
     /// Return DataFusion's optimized logical plan for a query.
     fn explain(&self, py: Python<'_>, query: &str) -> PyResult<String> {
         py.detach(|| {
