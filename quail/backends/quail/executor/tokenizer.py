@@ -1,5 +1,8 @@
 """A loaded model's tokenizer: encoding, decoding, and the tokens that end an answer."""
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pyarrow as pa
 
@@ -14,13 +17,15 @@ class ModelTokenizer:
             supplied by the caller.
         turn_suffix: The model's chat-turn text after a prompt; its first
             token closes a turn. Empty for a model without chat turns.
+        eos_token: The end-of-text token's text, for a tokenizer that
+            does not report its id. Empty to use the tokenizer's own.
 
     Raises:
         ValueError: The model has neither a turn close nor an
             end-of-text token, so no answer could end.
     """
 
-    def __init__(self, tokenizer, turn_suffix: str = ""):
+    def __init__(self, tokenizer, turn_suffix: str = "", eos_token: str = ""):
         self.encoder = tokenizer if isinstance(tokenizer, GigatokenEncoder) else None
         self.hf = (self.encoder.tokenizer.as_hf() if self.encoder is not None
                    else tokenizer)
@@ -29,8 +34,12 @@ class ModelTokenizer:
         # the answer ends where the model ends its turn: the turn close
         # or the end of text, which no document holds
         stops = {self.encode_ids(turn_suffix)[0]} if turn_suffix else set()
-        if self.hf.eos_token_id is not None:
-            stops.add(int(self.hf.eos_token_id))
+        eos_id = self.hf.eos_token_id
+        if eos_id is None and eos_token:
+            # Gigatoken's Hugging Face view leaves out the end-of-text id
+            eos_id = self.hf.convert_tokens_to_ids(eos_token)
+        if eos_id is not None:
+            stops.add(int(eos_id))
         if not stops:
             raise ValueError("an answer needs a turn close or an end-of-text token")
         self.stop_ids = tuple(sorted(stops))
@@ -54,7 +63,8 @@ class ModelTokenizer:
         path = resolve_model_path(model_path or spec.hf_name,
                                   None if model_path else spec.revision,
                                   include_weights=False)
-        return cls(GigatokenEncoder(path), spec.turn_suffix)
+        return cls(GigatokenEncoder(path), spec.turn_suffix,
+                   _config_eos_token(path))
 
     def __len__(self) -> int:
         return len(self.hf)
@@ -135,3 +145,12 @@ class ModelTokenizer:
                 pa.array(ids, type=pa.int32()),
                 pa.FixedSizeListArray.from_arrays(pa.array(bounds), 2))
         return result
+
+
+def _config_eos_token(path) -> str:
+    """Return the end-of-text token text a checkpoint's tokenizer config names."""
+    config = Path(path) / "tokenizer_config.json"
+    if not config.exists():
+        return ""
+    token = json.loads(config.read_text()).get("eos_token") or ""
+    return token.get("content", "") if isinstance(token, dict) else token
