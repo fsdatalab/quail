@@ -43,6 +43,8 @@ VLLM_PLUGIN_DIR = Path(__file__).parent / "vllm_plugin"
 REPOSITORY = Path(__file__).resolve().parents[2]
 NATIVE_SOURCE = "/opt/quail-native"
 MATURIN = "maturin>=1.9,<2"
+# the model and device spec files quail.specs reads
+SPEC_DATA = Path(__file__).resolve().parents[1] / "specs" / "data"
 
 # local variables copied into the image when set
 FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
@@ -56,6 +58,15 @@ def _cuda_base() -> modal.Image:
             .entrypoint([])
             .apt_install("git")
             .env(CACHE_ENV | forwarded))
+
+
+def _with_sources(image: modal.Image) -> modal.Image:
+    """Mount the quail and bench packages, with the model and device specs.
+
+    A Python source mount copies Python files only; the specs are TOML.
+    """
+    return (image.add_local_python_source("quail", "bench")
+            .add_local_dir(SPEC_DATA, "/root/quail/specs/data"))
 
 
 def _with_native_planner(image: modal.Image) -> modal.Image:
@@ -105,7 +116,7 @@ def gpu_image(*local_dirs: tuple[str, str],
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
     if commands:
         image = image.run_commands(*commands)
-    image = image.add_local_python_source("quail", "bench")
+    image = _with_sources(image)
     for local, remote in local_dirs:
         image = image.add_local_dir(local, remote_path=remote)
     return image
@@ -127,17 +138,17 @@ def pypi_gpu_image(*local_dirs: tuple[str, str]) -> modal.Image:
 
 def sglang_image() -> modal.Image:
     """The GPU image with SGLang's serving stack in place of vLLM."""
-    return (_cuda_base()
-            .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-                     extra_options="--no-install-package vllm")
-            .uv_pip_install("sglang==0.5.18")
-            .add_local_python_source("quail", "bench"))
+    image = (_cuda_base()
+             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
+                      extra_options="--no-install-package vllm")
+             .uv_pip_install("sglang==0.5.18"))
+    return _with_sources(image)
 
 
 def cpu_image() -> modal.Image:
     """The CPU image: the locked dependencies without the GPU stack."""
-    return (modal.Image.debian_slim(python_version="3.12")
-            .apt_install("git")
-            .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-                     extra_options="--no-install-package vllm")
-            .add_local_python_source("quail", "bench"))
+    image = (modal.Image.debian_slim(python_version="3.12")
+             .apt_install("git")
+             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
+                      extra_options="--no-install-package vllm"))
+    return _with_sources(image)
