@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/quail-datafusion", "crates/quail-datafusion-python"]
+
+# Full debug info for DataFusion's dependency tree takes many gigabytes.
+[profile.dev]
+debug = "line-tables-only"

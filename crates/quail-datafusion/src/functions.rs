@@ -99,11 +99,12 @@ impl ScalarUDFImpl for QuailFunction {
     }
 }
 
-/// The type of `AI.SAE_FEATURES`: one struct per nonzero feature.
+/// The type of `AI.SAE_FEATURES`: one struct per nonzero feature, as
+/// Quail's `FEATURE_LIST`.
 fn sae_features_type() -> DataType {
     let feature = Fields::from(vec![
-        Field::new("feature", DataType::Int64, false),
-        Field::new("strength", DataType::Float64, false),
+        Field::new("feature", DataType::Int32, true),
+        Field::new("strength", DataType::Float32, true),
     ]);
     DataType::List(Arc::new(Field::new(
         "item",
