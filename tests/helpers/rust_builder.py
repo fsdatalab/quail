@@ -206,30 +206,15 @@ def binder_outcome(native, sql, catalog, prompts, plan, message) -> str:
     return f"plan differs: {first_difference(built, expected)}"
 
 
-# Queries Python's front end compiles that DataFusion or the Rust binder
-# cannot yet, by a phrase of the outcome, with the reason.
-KNOWN_GAPS = {
-    "table function 'UNNEST' not found":
-        "DataFusion's Snowflake dialect has no UNNEST in FROM",
-    "a subquery in FROM is outside what Quail binds":
-        "sqlglot merges a CTE into one SELECT; the Rust binder reads a table",
-    "For SELECT DISTINCT, ORDER BY expressions":
-        "DataFusion refuses DISTINCT with ORDER BY a struct field",
-}
-
-
 def check_outcome(outcome: str, accepted: bool) -> None:
     """Raise AssertionError where the Rust binder disagrees with Python's.
 
-    A query Python accepts must bind to the same plan, unless a known
-    gap stops it; a query Python refuses must be refused, in any words.
+    A query Python accepts must bind to the same plan; a query Python
+    refuses must be refused, in any words.
     """
     if outcome in ("same plan", "same refusal"):
         return
-    if accepted:
-        assert any(phrase in outcome for phrase in KNOWN_GAPS), (
-            f"the Rust binder disagrees: {outcome}")
-        return
+    assert not accepted, f"the Rust binder disagrees: {outcome}"
     assert not outcome.startswith("refusal differs: Rust None"), (
         f"the Rust binder accepted a query Python refuses: {outcome}")
 

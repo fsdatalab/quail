@@ -67,7 +67,8 @@ pub fn bind_select(
     turn: &Turn,
     layout: &str,
 ) -> Result<(PlaceRelationArguments, ProjectArguments), CompileError> {
-    let select = Select::read(plan)?;
+    let mut select = Select::read(plan)?;
+    let unnests = select.take_unnests();
     let mut binder = Binder {
         turn: turn.clone(),
         layout: layout.to_string(),
@@ -91,6 +92,11 @@ pub fn bind_select(
         })
         .collect();
     let scans = binder.bind_tables(select.relation)?;
+    for unnest in &unnests {
+        for (name, _) in &unnest.lists {
+            binder.add_table(name, "", feature_schema())?;
+        }
+    }
     if let Some(condition) = &select.condition {
         binder.bind_where(condition)?;
     }
@@ -98,12 +104,21 @@ pub fn bind_select(
     selection.bind_projection(&select.projection, &select.windows)?;
     let aggregation = selection.bind_grouping(&select)?;
     let SelectBinder {
-        columns,
+        mut columns,
         structs,
         windows,
         output,
         ..
     } = selection;
+    for unnest in &unnests {
+        for (name, list) in &unnest.lists {
+            let call = binder.bind_ai_sae_features(list)?;
+            columns.push(ValueExpression::Alias(quail_physical::Alias {
+                expression: Box::new(ValueExpression::ModelCall(call)),
+                name: name.clone(),
+            }));
+        }
+    }
     let order = binder.bind_order(
         &select.order,
         &columns,
@@ -123,8 +138,11 @@ pub fn bind_select(
         structs,
         windows,
         output,
-        unnests: Vec::new(),
-        unnest_outer: Vec::new(),
+        unnests: unnests
+            .iter()
+            .map(|unnest| unnest.lists.iter().map(|(name, _)| name.clone()).collect())
+            .collect(),
+        unnest_outer: unnests.iter().map(|unnest| unnest.outer).collect(),
     };
     Ok((place, project))
 }
@@ -257,7 +275,7 @@ impl<'a> Select<'a> {
             condition = Some(filter.predicate.clone());
             node = &filter.input;
         }
-        Ok(Self {
+        let mut select = Self {
             limit,
             offset,
             distinct,
@@ -269,7 +287,198 @@ impl<'a> Select<'a> {
             condition,
             relation: node,
             outputs,
-        })
+        };
+        select.merge_subquery();
+        Ok(select)
+    }
+
+    /// Take the `UNNEST` tests out of `WHERE`, and read each unnested
+    /// field as a column of its list's relation; see
+    /// [`crate::take_unnests`].
+    fn take_unnests(&mut self) -> Vec<Unnested> {
+        let mut unnests = Vec::new();
+        if let Some(condition) = &self.condition {
+            let mut kept = Vec::new();
+            for term in conjuncts(condition) {
+                match &term {
+                    Expr::ScalarFunction(call) if call.name() == crate::UNNEST_TEST => {
+                        let outer = matches!(
+                            call.args.first(),
+                            Some(Expr::Literal(ScalarValue::Boolean(Some(true)), _))
+                        );
+                        let lists = call.args[1..]
+                            .chunks(2)
+                            .filter_map(|pair| {
+                                string_literal(&pair[0]).map(|name| (name, pair[1].clone()))
+                            })
+                            .collect();
+                        unnests.push(Unnested { lists, outer });
+                    }
+                    _ => kept.push(term),
+                }
+            }
+            self.condition = kept.into_iter().reduce(Expr::and);
+        }
+        if unnests.is_empty() {
+            return unnests;
+        }
+        let field = |expr: &Expr| -> Expr {
+            expr.clone()
+                .transform_up(|node| {
+                    if let Expr::ScalarFunction(call) = &node
+                        && call.name() == crate::UNNEST_FIELD
+                        && let (Some(list), Some(field)) =
+                            (string_literal(&call.args[1]), string_literal(&call.args[2]))
+                    {
+                        return Ok(datafusion::common::tree_node::Transformed::yes(
+                            Expr::Column(Column::new(Some(list), field)),
+                        ));
+                    }
+                    Ok(datafusion::common::tree_node::Transformed::no(node))
+                })
+                .map(|found| found.data)
+                .unwrap_or_else(|_| expr.clone())
+        };
+        self.projection = self.projection.iter().map(field).collect();
+        self.condition = self.condition.as_ref().map(field);
+        if let Some(having) = &mut self.having {
+            *having = field(having);
+        }
+        if let Some(group) = &mut self.group {
+            *group = group.iter().map(field).collect();
+        }
+        for key in &mut self.order {
+            key.expr = field(&key.expr);
+        }
+        for (_, expr) in &mut self.outputs {
+            *expr = field(expr);
+        }
+        for (_, expr) in &mut self.windows {
+            *expr = field(expr);
+        }
+        unnests
+    }
+
+    /// Merge a FROM subquery that only selects and filters into this
+    /// SELECT, as sqlglot's `merge_subqueries` does for Quail's front end.
+    ///
+    /// For example, `WITH m AS (SELECT r.id, AI.MAP(...) AS topic FROM
+    /// reviews r) SELECT m.id, m.topic FROM m WHERE m.topic = 'x'`
+    /// reads as `SELECT r.id, AI.MAP(...) AS topic FROM reviews r WHERE
+    /// AI.MAP(...) = 'x'`. The subquery's WHERE runs first.
+    fn merge_subquery(&mut self) {
+        let LogicalPlan::SubqueryAlias(alias) = self.relation else {
+            return;
+        };
+        let LogicalPlan::Projection(inner) = alias.input.as_ref() else {
+            return;
+        };
+        if self.group.is_some() || !self.windows.is_empty() {
+            return;
+        }
+        let (mut input, mut inner_condition) = (inner.input.as_ref(), None);
+        if let LogicalPlan::Filter(filter) = input {
+            inner_condition = Some(filter.predicate.clone());
+            input = &filter.input;
+        }
+        let plain = input
+            .exists(|node| {
+                Ok(!matches!(
+                    node,
+                    LogicalPlan::Join(_)
+                        | LogicalPlan::TableScan(_)
+                        | LogicalPlan::SubqueryAlias(_)
+                ))
+            })
+            .unwrap_or(true);
+        let nested = input
+            .exists(|node| {
+                Ok(matches!(node, LogicalPlan::SubqueryAlias(found)
+                    if !matches!(found.input.as_ref(), LogicalPlan::TableScan(_))))
+            })
+            .unwrap_or(true);
+        if plain || nested {
+            return;
+        }
+        let name = alias.alias.table().to_string();
+        let definitions: Vec<(String, Expr)> = inner
+            .expr
+            .iter()
+            .map(|expr| (output_name(expr), unalias(expr).0.clone()))
+            .collect();
+        // an AI call that reads a column another AI call computes runs
+        // the subquery as its own stage
+        let computed: Vec<&String> = definitions
+            .iter()
+            .filter(|(_, definition)| contains_ai_call(definition))
+            .map(|(found, _)| found)
+            .collect();
+        let reads_computed = |expr: &Expr| {
+            expr.exists(|node| {
+                Ok(crate::is_ai_call(node)
+                    && node
+                        .column_refs()
+                        .iter()
+                        .any(|column| computed.contains(&&column.name)))
+            })
+            .unwrap_or(true)
+        };
+        if self.projection.iter().any(reads_computed)
+            || self.condition.as_ref().is_some_and(reads_computed)
+        {
+            return;
+        }
+        let substitute = |expr: &Expr| -> Expr {
+            expr.clone()
+                .transform_up(|node| {
+                    if let Expr::Column(column) = &node
+                        && column
+                            .relation
+                            .as_ref()
+                            .is_none_or(|relation| relation.table() == name)
+                        && let Some((_, definition)) =
+                            definitions.iter().find(|(found, _)| *found == column.name)
+                    {
+                        return Ok(datafusion::common::tree_node::Transformed::yes(
+                            definition.clone(),
+                        ));
+                    }
+                    Ok(datafusion::common::tree_node::Transformed::no(node))
+                })
+                .map(|found| found.data)
+                .unwrap_or_else(|_| expr.clone())
+        };
+        self.projection = self
+            .projection
+            .iter()
+            .map(|item| {
+                let name = output_name(item);
+                let merged = substitute(unalias(item).0);
+                let keeps_name = matches!(&merged, Expr::Column(column) if column.name == name);
+                if keeps_name && !matches!(item, Expr::Alias(_)) {
+                    merged
+                } else {
+                    merged.alias(name)
+                }
+            })
+            .collect();
+        for (_, expr) in &mut self.outputs {
+            *expr = substitute(expr);
+        }
+        self.outputs
+            .retain(|(name, expr)| !matches!(expr, Expr::Column(column) if column.name == *name));
+        for key in &mut self.order {
+            key.expr = substitute(&key.expr);
+        }
+        if let Some(having) = &mut self.having {
+            *having = substitute(having);
+        }
+        let outer = self.condition.as_ref().map(substitute);
+        self.condition = match (inner_condition, outer) {
+            (Some(first), Some(second)) => Some(first.and(second)),
+            (first, second) => first.or(second),
+        };
+        self.relation = input;
     }
 }
 
@@ -1976,7 +2185,8 @@ impl Binder {
         columns: &[ValueExpression],
         structs: &[ExtractStruct],
     ) -> Result<(), CompileError> {
-        let is_alias = |name: &str| self.provider(name).is_some();
+        // an unnested list has no provider; its name is not a table's
+        let is_alias = |name: &str| self.provider(name).is_some_and(|found| !found.is_empty());
         for found in structs {
             if is_alias(&found.name) {
                 return compile_error(format!(
@@ -2098,7 +2308,13 @@ impl Binder {
                 .into_iter()
                 .map(|provider| (provider.clone(), Some(schema_of(&self.schemas[provider]))))
                 .collect(),
-            unnested: Vec::new(),
+            // the unnested lists are the tables without a provider
+            unnested: self
+                .tables
+                .iter()
+                .filter(|(_, provider)| provider.is_empty())
+                .map(|(alias, _)| alias.clone())
+                .collect(),
             tested: self
                 .tested
                 .iter()
@@ -2963,4 +3179,25 @@ fn translate(
         "log10" | "log2" | "ln" => function(name, args),
         other => function(other, args),
     })
+}
+
+/// Whether an expression calls an AI function anywhere.
+fn contains_ai_call(expr: &Expr) -> bool {
+    expr.exists(|node| Ok(crate::is_ai_call(node)))
+        .unwrap_or(false)
+}
+
+/// One `UNNEST` of `FROM`: each list's name and call, and whether a row
+/// with no elements stays as one row of nulls.
+struct Unnested {
+    lists: Vec<(String, Expr)>,
+    outer: bool,
+}
+
+/// The schema of an `AI.SAE_FEATURES` element, as Quail's `FEATURE_LIST`.
+fn feature_schema() -> SchemaRef {
+    std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new("feature", DataType::Int32, true),
+        datafusion::arrow::datatypes::Field::new("strength", DataType::Float32, true),
+    ]))
 }

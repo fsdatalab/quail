@@ -23,6 +23,34 @@ pub fn inline_select_aliases(statement: &mut Statement) {
     for_each_select(statement, &mut |select, _| inline_in_select(select));
 }
 
+/// Order a `SELECT DISTINCT` by the position of each `SELECT` column its
+/// `ORDER BY` repeats.
+///
+/// DataFusion refuses `SELECT DISTINCT r.details.kind ... ORDER BY
+/// r.details.kind`: it compares the sort key with the select list after
+/// naming the struct field access differently. `ORDER BY 1` names the
+/// same column.
+pub fn distinct_order_ordinals(statement: &mut Statement) {
+    for_each_select(statement, &mut |select, order_by| {
+        let (Some(_), Some(order_by)) = (&select.distinct, order_by) else {
+            return;
+        };
+        for key in order_by.iter_mut() {
+            let position = select.projection.iter().position(|item| match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    *expr == key.expr
+                }
+                _ => false,
+            });
+            if let Some(position) = position
+                && !matches!(key.expr, Expr::Identifier(_))
+            {
+                key.expr = Expr::value(Value::Number((position + 1).to_string(), false));
+            }
+        }
+    });
+}
+
 /// Write each named argument of an AI function, `name => value`, as a
 /// trailing `named_struct('name', value)` argument.
 ///

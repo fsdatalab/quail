@@ -41,6 +41,10 @@ enum FunctionKind {
     SaeFeatures,
     Prompt,
     Hint,
+    /// The `WHERE` test recording an `UNNEST`; see [`crate::take_unnests`].
+    Unnest,
+    /// A field of an unnested list's element.
+    UnnestField,
 }
 
 /// One Quail function: an AI function, `PROMPT`, or `HINT`.
@@ -72,12 +76,15 @@ impl ScalarUDFImpl for QuailFunction {
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         match self.kind {
-            FunctionKind::If | FunctionKind::Hint => Ok(DataType::Boolean),
+            FunctionKind::If | FunctionKind::Hint | FunctionKind::Unnest => Ok(DataType::Boolean),
             FunctionKind::Score => Ok(DataType::Float64),
             FunctionKind::Classify | FunctionKind::Map | FunctionKind::Prompt => Ok(DataType::Utf8),
             FunctionKind::SaeFeatures => Ok(sae_features_type()),
             FunctionKind::Extract | FunctionKind::ExtractSpan => {
                 plan_err!("{}'s type depends on its questions argument", self.name)
+            }
+            FunctionKind::UnnestField => {
+                plan_err!("{}'s type depends on its list and field", self.name)
             }
         }
     }
@@ -86,6 +93,7 @@ impl ScalarUDFImpl for QuailFunction {
         let data_type = match self.kind {
             FunctionKind::Extract => extract_type(args.arg_fields, DataType::Utf8)?,
             FunctionKind::ExtractSpan => extract_type(args.arg_fields, span_type())?,
+            FunctionKind::UnnestField => unnest_field_type(&args)?,
             _ => self.return_type(&[])?,
         };
         Ok(Arc::new(Field::new(self.name, data_type, true)))
@@ -96,6 +104,25 @@ impl ScalarUDFImpl for QuailFunction {
             "{} runs only inside a model region; ClaimModelRegions did not claim it",
             self.name
         )
+    }
+}
+
+/// The type of one field of an unnested list's element: the list, the
+/// list's name, and the field's name are the arguments.
+fn unnest_field_type(args: &ReturnFieldArgs) -> Result<DataType> {
+    let field = match args.scalar_arguments.get(2) {
+        Some(Some(datafusion::common::ScalarValue::Utf8(Some(name)))) => name.clone(),
+        _ => return plan_err!("an unnested field is named by a string literal"),
+    };
+    match args.arg_fields.first().map(|found| found.data_type()) {
+        Some(DataType::List(item)) => match item.data_type() {
+            DataType::Struct(fields) => match fields.iter().find(|found| found.name() == &field) {
+                Some(found) => Ok(found.data_type().clone()),
+                None => plan_err!("the unnested list has no field {field}"),
+            },
+            other => Ok(other.clone()),
+        },
+        _ => plan_err!("UNNEST reads a list"),
     }
 }
 
@@ -150,6 +177,8 @@ pub fn quail_functions() -> Vec<Arc<ScalarUDF>> {
         ("ai_sae_features", FunctionKind::SaeFeatures),
         ("prompt", FunctionKind::Prompt),
         ("hint", FunctionKind::Hint),
+        (crate::unnest::UNNEST_TEST, FunctionKind::Unnest),
+        (crate::unnest::UNNEST_FIELD, FunctionKind::UnnestField),
     ]
     .into_iter()
     .map(|(name, kind)| Arc::new(ScalarUDF::new_from_impl(QuailFunction::new(name, kind))))

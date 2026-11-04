@@ -21,6 +21,7 @@ mod claim;
 mod exec;
 mod functions;
 mod region;
+mod unnest;
 mod unparse;
 
 use std::sync::Arc;
@@ -34,8 +35,8 @@ use datafusion::optimizer::{Analyzer, AnalyzerRule};
 use datafusion::sql::parser::Statement;
 
 pub use aliases::{
-    SPAN_SUFFIX, add_extract_spans, inline_select_aliases, positional_ai_arguments,
-    remove_select_calls, restore_select_aliases,
+    SPAN_SUFFIX, add_extract_spans, distinct_order_ordinals, inline_select_aliases,
+    positional_ai_arguments, remove_select_calls, restore_select_aliases,
 };
 pub use claim::ClaimModelRegions;
 pub use exec::{ModelRegionExec, ModelRegionPlanner, RegionRunner};
@@ -43,6 +44,7 @@ pub use functions::{
     AI_FUNCTION_NAMES, arrow_functions, is_ai_call, normalize_ai_calls, quail_functions,
 };
 pub use region::ModelRegion;
+pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 pub use unparse::region_sql;
 
 /// Return DataFusion's analyzer rules with `ClaimModelRegions` first.
@@ -97,9 +99,11 @@ pub async fn sql(context: &SessionContext, query: &str) -> Result<DataFrame> {
     let dialect = state.config().options().sql_parser.dialect;
     let mut statement = state.sql_to_statement(&normalize_ai_calls(query), &dialect)?;
     if let Statement::Statement(inner) = &mut statement {
+        take_unnests(inner);
         positional_ai_arguments(inner);
         add_extract_spans(inner);
         inline_select_aliases(inner);
+        distinct_order_ordinals(inner);
     }
     let plan = state.statement_to_plan(statement).await?;
     Ok(DataFrame::new(state, plan))
