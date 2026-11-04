@@ -217,7 +217,7 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     # the classification sits above the join of the two tables
     assert [type(node).__name__ for node in query.logical.walk()] == [
         "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify", "Project"]
-    assert query.logical.root.input.call is call
+    assert query.logical.root.input.call == call
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     (join,) = [n for n in plan.nodes if isinstance(n, AiJoin)]

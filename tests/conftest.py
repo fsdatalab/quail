@@ -34,7 +34,6 @@ def _rust_builder(monkeypatch):
         _quail_native, frontend.place_relation))
     from helpers.rust_builder import (
         LOWERING_FUNCTIONS,
-        checked_compile_sql,
         shadow_logical_alternatives,
         shadow_lowering,
     )
@@ -121,6 +120,10 @@ def _rust_builder(monkeypatch):
     for module in (query_module, optimize_module):
         monkeypatch.setattr(module, "logical_alternatives", shadow_logical_alternatives(
             _quail_native, module.logical_alternatives))
-    monkeypatch.setattr(session_module, "compile_sql", checked_compile_sql(
-        _quail_native, session_module.compile_sql,
+    from helpers.rust_builder import checked_compile
+
+    from quail.frontend.sql import compile_sql
+
+    monkeypatch.setattr(session_module, "compile_with_datafusion", checked_compile(
+        session_module.compile_with_datafusion, compile_sql,
         os.environ.get("QUAIL_RUST_BINDER_LOG")))

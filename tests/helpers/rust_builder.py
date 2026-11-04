@@ -1198,3 +1198,52 @@ def shadow_speed_of_light(native, original):
         return found
 
     return speed_of_light_estimate
+
+
+def checked_compile(original, python_compile, path=None):
+    """Return compile_with_datafusion, also compiling with the Python front end.
+
+    The two must give the same plan, or both refuse the query.
+
+    Args:
+        original: compile_with_datafusion.
+        python_compile: The Python front end's compile_sql.
+        path: A file to log each query's outcome to, or None.
+    """
+    from quail.logical.nodes import WithCTE
+
+    def compile_with_datafusion(sql, catalog, prompts, dialect="snowflake"):
+        try:
+            found, error = original(sql, catalog, prompts, dialect=dialect), None
+        except CompileError as raised:
+            found, error = None, raised
+        try:
+            expected, message = python_compile(
+                sql, catalog, dialect=dialect, prompts=prompts), None
+        except CompileError as raised:
+            expected, message = None, str(raised)
+        if expected is None or found is None:
+            outcome = ("same refusal" if error is not None and str(error) == message
+                       else "both refused" if error is not None and expected is None
+                       else f"rust refused: {error}" if error is not None
+                       else f"python refused: {message}")
+        else:
+            built, wanted = (
+                json.loads(json.dumps(_schemas_as_text(encode_value(plan))))
+                for plan in (found, expected))
+            outcome = ("same plan" if built == wanted
+                       else f"plan differs: {first_difference(built, wanted)}")
+        if path:
+            with open(path, "a") as log:
+                log.write(json.dumps({
+                    "sql": sql, "outcome": outcome, "dialect": str(dialect),
+                    "staged": isinstance(getattr(expected, "root", None), WithCTE),
+                    "rust_message": None if error is None else str(error),
+                    "python_message": message}) + "\n")
+        assert outcome in ("same plan", "same refusal", "both refused"), (
+            f"DataFusion and the front end disagree: {outcome}")
+        if error is not None:
+            raise error
+        return found
+
+    return compile_with_datafusion
