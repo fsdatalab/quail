@@ -10,6 +10,7 @@ use pyo3::types::PyDict;
 use quail_cost::classify::{self, ClassifyInputs};
 use quail_cost::decode::DecodeCost;
 use quail_cost::draft_policy::DraftPolicy;
+use quail_cost::joins::{self, PricedJoin};
 use quail_cost::labels;
 use quail_cost::quantity::{Quantity, numpy_sum};
 use quail_cost::sae_features::SaeFeaturesCost;
@@ -796,6 +797,46 @@ impl CostModel {
             cost.suffix_tokens,
             cost.rounds,
         ))
+    }
+
+    /// `stage_work`, or `packed_join_work` when `set_size` is given:
+    /// the work's fields.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (aliases, frame_tokens, label_tokens, tail_tokens, anchor, n, tuples, lengths, pre, resident, window, set_size=None))]
+    #[staticmethod]
+    fn join_work<'py>(
+        py: Python<'py>,
+        aliases: Vec<String>,
+        frame_tokens: BTreeMap<String, i64>,
+        label_tokens: BTreeMap<String, i64>,
+        tail_tokens: i64,
+        anchor: &str,
+        n: f64,
+        tuples: f64,
+        lengths: BTreeMap<String, Bound<'py, PyDict>>,
+        pre: i64,
+        resident: bool,
+        window: i64,
+        set_size: Option<i64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let spec = PricedJoin {
+            aliases,
+            frame_tokens,
+            label_tokens,
+            tail_tokens,
+        };
+        let lengths = lengths
+            .iter()
+            .map(|(alias, fields)| Ok((alias.clone(), alias_stats(fields)?)))
+            .collect::<PyResult<BTreeMap<_, _>>>()?;
+        let work = match set_size {
+            Some(set_size) => {
+                joins::packed_join_work(&spec, anchor, n, tuples, &lengths, pre, window, set_size)
+            }
+            None => joins::stage_work(&spec, anchor, n, tuples, &lengths, pre, resident, window),
+        }
+        .map_err(PyValueError::new_err)?;
+        work_to(py, &work)
     }
 
     /// `float(np.sum(values))`, as the Rust port rounds it.

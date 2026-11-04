@@ -452,3 +452,42 @@ def test_the_classify_costs_are_the_same(rust):
                             ), (expected.seconds, expected.passes,
                                 asdict(expected.work), expected.suffix_tokens,
                                 expected.rounds)), (model_name, scoring, label_ids)
+
+
+def test_the_join_work_is_the_same():
+    from quail.cost.joins import PricedJoin, packed_join_work, stage_work
+    from quail.planner.statistics.tables import AliasStats
+
+    for window in (0, 1_024):
+        short = ((100, 20), (700, 9)) if window else ()
+        lengths = {
+            "r": AliasStats(50, 40_000, 40_000_000, 4_000, window, short),
+            "a": AliasStats(8, 300, 12_000, 60, window, ((30, 8),) if window else ()),
+            "c": AliasStats(1_000_000, 30_000_000_000, 10**22 + 7, 90_000, window,
+                            short),
+        }
+        for aliases in (("r", "a"), ("r", "a", "c")):
+            spec = PricedJoin(
+                written_position=0, aliases=aliases, anchor=None, anchor_free=True,
+                semantics="full", selectivity=0.3,
+                frame_tokens={alias: 7 + index for index, alias in enumerate(aliases)},
+                label_tokens={alias: 3 + index for index, alias in enumerate(aliases)},
+                tail_tokens=11)
+            fields = {alias: plain(asdict(stats)) for alias, stats in lengths.items()}
+            arguments = (list(aliases), dict(spec.frame_tokens),
+                         dict(spec.label_tokens), spec.tail_tokens)
+            for anchor in aliases:
+                for n, tuples in ((0.0, 0.0), (4.0, 30.0), (40.0, 2_000.5)):
+                    for resident in (False, True):
+                        expected = stage_work(spec, anchor, n, tuples, lengths, 25,
+                                              resident=resident, window=window)
+                        assert same_numbers(native.CostModel.join_work(
+                            *arguments, anchor, n, tuples, fields, 25, resident,
+                            window), asdict(expected)), (aliases, anchor, n, resident)
+                    for set_size in (1, 4):
+                        expected = packed_join_work(spec, anchor, n, tuples, lengths,
+                                                    25, window=window,
+                                                    set_size=set_size)
+                        assert same_numbers(native.CostModel.join_work(
+                            *arguments, anchor, n, tuples, fields, 25, False, window,
+                            set_size), asdict(expected))
