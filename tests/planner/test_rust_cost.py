@@ -491,3 +491,44 @@ def test_the_join_work_is_the_same():
                         assert same_numbers(native.CostModel.join_work(
                             *arguments, anchor, n, tuples, fields, 25, False, window,
                             set_size), asdict(expected))
+
+
+def test_the_extract_costs_are_the_same(rust):
+    from quail.common.budgets import chunk_budget
+    from quail.cost import extract
+
+    rng = np.random.default_rng(7)
+    tables = {
+        "short": ([120.0, 3_000.0, 45.0, 800.0], [0.0, 20.0, 0.0, 40.0]),
+        "sampled": (rng.integers(1, 9_000, 2_000).astype(float).tolist(),
+                    rng.integers(0, 60, 2_000).astype(float).tolist()),
+    }
+    windows = {MODELS[name].sliding_window > 0 for name in MODELS}
+    recurrent = {bool(MODELS[name].state_layers) for name in MODELS}
+    assert windows == recurrent == {False, True}
+    device_name = "h100-sxm"
+    device = DEVICES[device_name]
+    for model_name, model in MODELS.items():
+        chunk = max(1, chunk_budget(model, device))
+        for table_name, (lengths, shared) in tables.items():
+            for policy, draft_tokens in (("fixed", 0), ("fixed", 3), ("adaptive", 6)):
+                for answer_tokens, max_answer_tokens in ((16, 40), (1, 8), (0, 8),
+                                                         (40, 1)):
+                    for resident, shared_lengths in ((False, None), (False, shared),
+                                                     (True, None)):
+                        assumptions = extract.ExtractAssumptions(answer_tokens)
+                        expected = extract.estimate(
+                            1_500.0, lengths, 30, 12, chunk=chunk, model=model,
+                            device=device, resident=resident, shared=shared_lengths,
+                            max_answer_tokens=max_answer_tokens,
+                            draft_tokens=draft_tokens, draft_policy=policy,
+                            round_cost_per_token=0.002, gpus=2,
+                            assumptions=assumptions)
+                        assert same_numbers(rust.extract_estimate(
+                            1_500.0, lengths, shared_lengths or [], 30, 12, chunk,
+                            model_name, device_name, resident, max_answer_tokens,
+                            draft_tokens, policy, 0.002, 2, answer_tokens,
+                        ), (expected.seconds, expected.passes,
+                            asdict(expected.work), expected.suffix_tokens,
+                            expected.rows)), (model_name, table_name, policy,
+                                              answer_tokens, resident)

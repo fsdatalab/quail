@@ -10,6 +10,7 @@ use pyo3::types::PyDict;
 use quail_cost::classify::{self, ClassifyInputs};
 use quail_cost::decode::DecodeCost;
 use quail_cost::draft_policy::DraftPolicy;
+use quail_cost::extract::{self, ExtractInputs};
 use quail_cost::joins::{self, PricedJoin};
 use quail_cost::labels;
 use quail_cost::quantity::{Quantity, numpy_sum};
@@ -796,6 +797,61 @@ impl CostModel {
             work_to(py, &cost.work)?,
             cost.suffix_tokens,
             cost.rounds,
+        ))
+    }
+
+    /// `quail.cost.extract.estimate`: seconds, passes, the work's
+    /// fields, suffix tokens, and rows.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (expected_rows, lengths, shared, head_tokens, tail_tokens, chunk, model, device, resident, max_answer_tokens, draft_tokens, draft_policy, round_cost_per_token, gpus, answer_tokens))]
+    fn extract_estimate<'py>(
+        &self,
+        py: Python<'py>,
+        expected_rows: f64,
+        lengths: Vec<f64>,
+        shared: Vec<f64>,
+        head_tokens: i64,
+        tail_tokens: i64,
+        chunk: i64,
+        model: &str,
+        device: &str,
+        resident: bool,
+        max_answer_tokens: i64,
+        draft_tokens: i64,
+        draft_policy: String,
+        round_cost_per_token: f64,
+        gpus: i64,
+        answer_tokens: i64,
+    ) -> PyResult<(f64, f64, Bound<'py, PyDict>, f64, f64)> {
+        let inputs = ExtractInputs {
+            head_tokens,
+            tail_tokens,
+            window: 0,
+            resident,
+            max_answer_tokens,
+            draft_tokens,
+            draft_policy,
+            round_cost_per_token,
+            answer_tokens,
+            recurrent: false,
+        };
+        let cost = extract::estimate(
+            expected_rows,
+            &lengths,
+            &shared,
+            &inputs,
+            chunk,
+            self.model(model)?,
+            self.device(device)?,
+            gpus,
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok((
+            cost.seconds,
+            cost.passes,
+            work_to(py, &cost.work)?,
+            cost.suffix_tokens,
+            cost.rows,
         ))
     }
 
