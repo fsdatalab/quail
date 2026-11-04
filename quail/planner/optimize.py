@@ -136,15 +136,23 @@ def search_candidates(
     return tuple(candidates)
 
 
+def _alternatives(logical, context, registry):
+    """The logical alternatives, from the Rust rules when they are the built-ins."""
+    found = native.logical_alternatives(logical, registry, context)
+    if found is not None:
+        return found
+    return logical_alternatives(
+        logical, tuple(registry.logical_rules.values()), context)
+
+
 def search_plan(logical, context, registry, *, logical_candidates=None):
     """Select the cheapest refined candidate and record the comparison.
 
     The Rust planner selects it when it covers the request
     (quail.planner.native); the Python planner otherwise.
     """
-    alternatives = (logical_alternatives(
-        logical, tuple(registry.logical_rules.values()), context)
-        if logical_candidates is None else logical_candidates)
+    alternatives = (_alternatives(logical, context, registry)
+                    if logical_candidates is None else logical_candidates)
     planned = native.search_plan(alternatives, context, registry)
     if planned is not None:
         return planned
@@ -206,5 +214,8 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )
+    refined = native.refine_plan(plan, context, registry)
+    if refined is not None:
+        return refined
     return apply_plan_rules(
         plan, tuple(registry.physical_rules.values()), context)

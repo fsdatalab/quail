@@ -19,15 +19,25 @@ import os
 import numpy as np
 
 from quail.common.document_ends import last_tokens
+from quail.common.expressions import CompileError
 from quail.common.tokens import prefix_tree
+from quail.logical import LogicalPlan
 from quail.physical.codec import (
     built_in_codecs,
     decode_graph,
+    decode_value,
     encode_graph,
     encode_value,
 )
+from quail.planner.optimizer.candidates import LogicalAlternative
 from quail.planner.plan import PhysicalPlan, Refusal
 
+# the built-in logical rules, in registry order
+LOGICAL_RULES = (
+    "should_eliminate_distinct", "should_push_down_distinct",
+    "should_push_down_projection", "should_push_down_filters",
+    "should_lift_column_operators",
+)
 # the built-in logical then physical rules, in registry order
 BUILT_IN_RULES = (
     "should_eliminate_distinct", "should_push_down_distinct",
@@ -262,3 +272,105 @@ def search_plan(alternatives, context, registry):
         estimates=_estimates(found["estimates"]),
         estimator=NativePricer(native, fields, found["pricer"], vocabulary),
         logical_plan=alternatives[found["alternative"]].plan)
+
+
+def logical_alternatives(plan, registry, context):
+    """Apply the registry's logical rules in Rust, or None to apply them in Python.
+
+    Args:
+        plan: The input logical plan.
+        registry: The session extension registry.
+        context: The planning context, whose catalog names each table's
+            id column.
+
+    Returns:
+        The alternatives in order, each with its plan and the rules that
+        made it, or None when a rule is not a built-in one.
+
+    Raises:
+        CompileError: A rule refuses the plan.
+    """
+    native = _module()
+    names = tuple(rule.name for rule in registry.logical_rules.values())
+    if native is None or names != LOGICAL_RULES:
+        return None
+    catalog = context.catalog
+    id_columns = (None if catalog is None else {
+        name: provider.id_col for name, provider in catalog.providers.items()
+        if hasattr(provider, "id_col")})
+    found, message = native.logical_alternatives(
+        json.dumps(encode_value(plan)), list(names), id_columns)
+    if message is not None:
+        raise CompileError(message)
+    return tuple(LogicalAlternative(decode_value(LogicalPlan, json.loads(text)),
+                                    tuple(rules))
+                 for text, rules in found)
+
+
+def _plan_from(found: dict, native, fields, vocabulary, logical_plan, pricer=None):
+    """A PhysicalPlan, or a Refusal, from what a native planning call returns."""
+    if "refusal" in found:
+        refusal = found["refusal"]
+        return Refusal(reasons=tuple(refusal["reasons"]),
+                       constraint=refusal["constraint"], needed=refusal["needed"],
+                       available=refusal["available"], unit=refusal["unit"])
+    envelope = found["envelope"]
+    codecs = {codec.type_name: codec for codec in built_in_codecs()}
+    graph = decode_graph(_tokens_mapped(envelope["graph"], vocabulary.word), codecs)
+    pricer = found.get("pricer", pricer)
+    return PhysicalPlan(
+        model=envelope["model"], device=envelope["device"], gpus=envelope["gpus"],
+        backend=envelope["backend"],
+        estimated_seconds=found.get("estimated_seconds", 0.0),
+        nodes=graph.nodes, settings=dict(envelope["settings"]), root=graph.root,
+        estimates=_estimates(found.get("estimates", {})),
+        estimator=(None if pricer is None
+                   else NativePricer(native, fields, pricer, vocabulary)),
+        logical_plan=logical_plan)
+
+
+def relational_plan(logical, context, num_documents: int):
+    """The plan of a stage that asks no model, or None to build it in Python."""
+    native = _module()
+    if native is None:
+        return None
+    vocabulary = Vocabulary(context.tokenizer or (lambda text: []))
+    fields = context_fields(context, vocabulary)
+    found, message = native.plan_operator(
+        "relational_plan", json.dumps(fields),
+        json.dumps({"plan": encode_value(logical), "num_documents": num_documents}),
+        vocabulary.tokens, None)
+    if message is not None:
+        raise ValueError(message)
+    envelope = json.loads(found)
+    return _plan_from({"envelope": envelope}, native, fields, vocabulary, logical)
+
+
+def refine_plan(plan, context, registry):
+    """Apply the physical rules to an edited plan in Rust, or None for Python.
+
+    Rust refines a plan whose pricer is Rust's, with the built-in rules.
+    """
+    native = _module()
+    estimator = getattr(plan, "estimator", None)
+    rules = tuple(rule.name for rule in (*registry.logical_rules.values(),
+                                         *registry.physical_rules.values()))
+    if (native is None or not isinstance(estimator, NativePricer)
+            or context.tokenizer is None or rules != BUILT_IN_RULES):
+        return None
+    vocabulary = estimator._vocabulary
+    fields = context_fields(context, vocabulary)
+    codecs = {codec.type_name: codec for codec in built_in_codecs()}
+    envelope = json.loads(json.dumps(plan.to_envelope(codecs)))
+    envelope["graph"] = _tokens_mapped(envelope["graph"], vocabulary.intern)
+    found, message = native.plan_operator(
+        "refine_plan", json.dumps(fields),
+        json.dumps({"envelope": envelope, "pricer": estimator._pricer,
+                    "estimated_seconds": plan.estimated_seconds,
+                    "estimates": json.loads(json.dumps(dict(plan.estimates))),
+                    "rules": [rule.name for rule in registry.physical_rules.values()]}),
+        vocabulary.tokens, vocabulary.decoder())
+    if message is not None:
+        raise ValueError(message)
+    return _plan_from(json.loads(found), native, fields, vocabulary,
+                      plan.logical_plan, estimator._pricer)

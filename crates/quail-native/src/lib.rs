@@ -834,6 +834,43 @@ fn plan_operator<'py>(
                 serde_json::json!({"seconds": seconds, "estimates": estimates})
             }))
         }
+        "relational_plan" => {
+            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
+            let num_documents = get("num_documents").as_i64().unwrap_or_default();
+            lowering_result(Ok::<_, quail_planner::CompileError>(
+                quail_planner::graph::relational_plan(&plan, num_documents, &context),
+            ))
+        }
+        "refine_plan" => {
+            let envelope: quail_physical::PlanEnvelope = json_value(get("envelope"))?;
+            let rules: Vec<String> = json_value(get("rules"))?;
+            let plan = quail_planner::graph::PhysicalPlan {
+                model: envelope.model,
+                device: envelope.device,
+                gpus: envelope.gpus,
+                backend: envelope.backend,
+                estimated_seconds: get("estimated_seconds").as_f64().unwrap_or_default(),
+                nodes: envelope.graph.nodes,
+                settings: envelope.settings,
+                root: envelope.graph.root,
+                estimates: json_value(get("estimates"))?,
+                pricer: read_pricer(&get("pricer"))?,
+            };
+            let pricer = pricer_fields(&plan.pricer);
+            lowering_result(
+                quail_planner::physical_rules::apply_plan_rules(plan, &rules, &context).map(
+                    |found| match found {
+                        Ok(plan) => serde_json::json!({
+                            "envelope": plan.envelope(),
+                            "estimated_seconds": plan.estimated_seconds,
+                            "estimates": plan.estimates,
+                            "pricer": pricer,
+                        }),
+                        Err(refusal) => refusal_fields(&refusal),
+                    },
+                ),
+            )
+        }
         "search_plan" => {
             let alternatives: Vec<(quail_planner::LogicalPlan, Vec<String>)> =
                 json_value(get("alternatives"))?;

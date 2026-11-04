@@ -1247,3 +1247,28 @@ def checked_compile(original, python_compile, path=None):
         return found
 
     return compile_with_datafusion
+
+
+def shadow_native_alternatives(original, python_alternatives):
+    """Return native.logical_alternatives, also applying the rules in Python.
+
+    The alternatives, and the rules that made each, must be the same.
+    """
+
+    def logical_alternatives(plan, registry, context):
+        found = original(plan, registry, context)
+        if found is None:
+            return found
+        expected = python_alternatives(
+            plan, tuple(registry.logical_rules.values()), context)
+        assert [alternative.rules for alternative in found] == [
+            alternative.rules for alternative in expected], (
+            "the Rust rules made other alternatives")
+        for mine, theirs in zip(found, expected):
+            built, wanted = (json.loads(json.dumps(encode_value(alternative.plan)))
+                             for alternative in (mine, theirs))
+            difference = first_difference(built, wanted)
+            assert built == wanted, f"the Rust rules rewrote another plan: {difference}"
+        return found
+
+    return logical_alternatives

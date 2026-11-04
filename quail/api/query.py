@@ -34,7 +34,7 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import Scan, encode_graph
-from quail.planner import plan_query, refine_plan
+from quail.planner import native, plan_query, refine_plan
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import Refusal, RefusalError
@@ -128,8 +128,7 @@ class Query:
             if self.inputs.pending(scan.provider):
                 num_documents = len(self.inputs.estimate_lengths(
                     scan.provider, scan.column))
-            self._plan = relational_plan(
-                self.logical, self.session.config, num_documents or 0)
+            self._plan = self._relational_plan(num_documents or 0)
             return self._plan
         if self._plan is None:
             self._planning_started_at = time.perf_counter()
@@ -164,10 +163,12 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions)
-            candidates = logical_alternatives(
-                self._logical_input,
-                tuple(self.session.registry.logical_rules.values()),
-                context)
+            candidates = (native.logical_alternatives(
+                self._logical_input, self.session.registry, context)
+                or logical_alternatives(
+                    self._logical_input,
+                    tuple(self.session.registry.logical_rules.values()),
+                    context))
             self.logical = candidates[0].plan
             scans = {}
             offset_aliases = set()
@@ -413,7 +414,16 @@ class Query:
             table = reader.read_all()
         self._token_inputs = {scan.alias: table}
         self._document_tokens = {scan.alias: TokenLengths([0] * table.num_rows)}
-        self._plan = relational_plan(self.logical, self.session.config, table.num_rows)
+        self._plan = self._relational_plan(table.num_rows)
+
+    def _relational_plan(self, num_documents: int):
+        """The plan of a stage that asks no model: in Rust, else in Python."""
+        config = self.session.config
+        context = PlanningContext(
+            model=self.session.model, device=self.session.device, gpus=config.gpus,
+            document_tokens={}, backend=config.backend)
+        return (native.relational_plan(self.logical, context, num_documents)
+                or relational_plan(self.logical, config, num_documents))
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
