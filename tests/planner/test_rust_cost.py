@@ -212,3 +212,89 @@ def test_the_memory_budgets_are_the_same(rust):
         for documents in (0.0, 1.0, 3.5, 100.0):
             assert native.CostModel.parallel_copies(gpus, documents) == (
                 budgets.parallel_copies(gpus, documents))
+
+
+def close(rust_values, python_values) -> bool:
+    """Whether two curves agree to 1e-12 relative.
+
+    numpy raises an array to a power with its own vectorized code on
+    CPUs with AVX-512, which can differ from the C library's pow (and
+    from Python's own ``**``) in the last bit, so a curve built with
+    ``keep ** np.arange(...)`` differs between machines too.
+    """
+    return np.allclose(rust_values, python_values, rtol=1e-12, atol=0.0)
+
+
+def test_the_answer_survival_curves_are_the_same():
+    from quail.common import answers
+
+    generator = np.random.default_rng(1)
+    for expected in (0.5, 1.0, 4.0, 37.5, 300.0):
+        for limit in (1, 8, 64, 512):
+            assert close(native.CostModel.prior_survival(expected, limit),
+                         answers.prior_survival(expected, limit))
+            lengths = generator.integers(-1, limit + 1, 40).tolist()
+            written = generator.integers(0, limit + 1, 40).tolist()
+            survival = answers.answer_survival(lengths, written, expected, limit)
+            assert close(native.CostModel.answer_survival(
+                lengths, written, expected, limit), survival)
+            assert native.CostModel.remaining_tokens(survival.tolist()) == (
+                answers.remaining_tokens(lengths, written, expected, limit,
+                                         survival=survival).tolist())
+
+
+def test_the_draft_lengths_are_the_same():
+    from quail.common import draft_policy
+
+    generator = np.random.default_rng(2)
+    for streams in (1, 2, 4, 7, 15, 80, 333, 900, 5000):
+        assert native.CostModel.live_bucket(streams) == int(
+            draft_policy.live_buckets(streams))
+    trials = generator.integers(0, 50, len(draft_policy.LIVE_BUCKETS)).tolist()
+    accepts = [int(generator.integers(0, count + 1)) for count in trials]
+    for streams in (1, 3, 60, 1500):
+        assert native.CostModel.source_odds(streams, trials, accepts) == float(
+            draft_policy.source_odds([streams], trials, accepts)[0])
+    for cap, limit, expected in ((1, 16, 4.0), (8, 64, 12.0), (32, 256, 90.0)):
+        policy = draft_policy.DraftPolicy(cap, limit, expected)
+        curve = policy.curve()
+        assert close(native.CostModel.draft_policy_curve(cap, limit, expected), curve)
+        written = generator.integers(0, limit, 30).tolist()
+        streams = generator.integers(1, 2000, 30).tolist()
+        rho = (generator.random(30) * 500).tolist()
+        assert native.CostModel.draft_lengths(
+            cap, limit, curve.tolist(), written, streams, rho, trials, accepts
+        ) == draft_policy.draft_lengths(
+            cap, limit, curve, written, streams, rho, np.array(trials),
+            np.array(accepts)).tolist()
+
+
+def test_the_retention_and_decode_prices_are_the_same(rust):
+    from quail.common.decode import DecodeCost
+    from quail.common.retention import (
+        RetentionPolicy,
+        coefficients,
+        retention_pages,
+    )
+
+    for model_name, model in MODELS.items():
+        for device_name, device in DEVICES.items():
+            for peak in (False, True):
+                assert rust.coefficients(model_name, device_name, peak) == (
+                    coefficients(model, device, peak=peak))
+            policy = RetentionPolicy(**coefficients(model, device))
+            for tokens in (1, 37, 4_096, 70_000):
+                assert rust.prefill_seconds(model_name, device_name, tokens) == (
+                    policy.prefill_seconds(tokens))
+            cost = DecodeCost.from_specs(model, device)
+            assert rust.decode_cost(model_name, device_name) == (
+                cost.weight_seconds, cost.kv_seconds, cost.sliding_kv_seconds,
+                cost.state_seconds)
+            for work in _workloads():
+                for passes in (1, 7.5, 300):
+                    assert rust.decode_lower_bound_seconds(
+                        model_name, device_name, plain(asdict(work)), passes
+                    ) == cost.lower_bound_seconds(work, passes)
+    for arena, chunk, page in ((0, 1, 16), (100_000, 2_048, 16), (5_000, 4_096, 32)):
+        assert native.CostModel.retention_pages(arena, chunk, page) == (
+            retention_pages(arena, chunk, page))

@@ -7,10 +7,12 @@ use std::path::Path;
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use quail_cost::decode::DecodeCost;
+use quail_cost::draft_policy::DraftPolicy;
 use quail_cost::quantity::{Quantity, numpy_sum};
 use quail_cost::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
 use quail_cost::work::{self, Work};
-use quail_cost::{budgets, dense_decoder_cost, sol};
+use quail_cost::{answers, budgets, dense_decoder_cost, draft_policy, retention, sol};
 
 /// A number, or a list of numbers, from Python.
 fn quantity(value: &Bound<'_, PyAny>) -> PyResult<Quantity> {
@@ -428,6 +430,129 @@ impl CostModel {
     #[staticmethod]
     fn parallel_copies(gpus: i64, num_documents: f64) -> f64 {
         budgets::parallel_copies(gpus, num_documents)
+    }
+
+    /// `prior_survival`.
+    #[staticmethod]
+    fn prior_survival(expected_tokens: f64, limit: usize) -> Vec<f64> {
+        answers::prior_survival(expected_tokens, limit)
+    }
+
+    /// `answer_survival` with the geometric prior.
+    #[staticmethod]
+    fn answer_survival(
+        lengths: Vec<i64>,
+        written: Vec<i64>,
+        expected_tokens: f64,
+        limit: usize,
+    ) -> Vec<f64> {
+        answers::answer_survival(&lengths, &written, expected_tokens, limit, None)
+    }
+
+    /// `remaining_tokens` of a survival curve.
+    #[staticmethod]
+    fn remaining_tokens(survival: Vec<f64>) -> Vec<f64> {
+        answers::remaining_tokens(&survival)
+    }
+
+    /// `live_buckets` of one count of live positions.
+    #[staticmethod]
+    fn live_bucket(num_streams: i64) -> usize {
+        draft_policy::live_bucket(num_streams)
+    }
+
+    /// `source_odds` of one count of live positions.
+    #[staticmethod]
+    fn source_odds(num_streams: i64, trials: Vec<i64>, accepts: Vec<i64>) -> f64 {
+        draft_policy::source_odds(num_streams, &trials, &accepts)
+    }
+
+    /// `draft_lengths`.
+    #[staticmethod]
+    #[allow(clippy::too_many_arguments)]
+    fn draft_lengths(
+        cap: usize,
+        limit: usize,
+        survival: Vec<f64>,
+        written: Vec<i64>,
+        num_streams: Vec<i64>,
+        rho: Vec<f64>,
+        trials: Vec<i64>,
+        accepts: Vec<i64>,
+    ) -> Vec<usize> {
+        draft_policy::draft_lengths(
+            cap,
+            limit,
+            &survival,
+            &written,
+            &num_streams,
+            &rho,
+            &trials,
+            &accepts,
+        )
+    }
+
+    /// `DraftPolicy(cap, max_answer_tokens, expected).curve()`.
+    #[staticmethod]
+    fn draft_policy_curve(cap: usize, max_answer_tokens: usize, expected: f64) -> Vec<f64> {
+        DraftPolicy::new(cap, max_answer_tokens, expected).curve()
+    }
+
+    /// `retention.coefficients`, as the dict Python returns.
+    fn coefficients<'py>(
+        &self,
+        py: Python<'py>,
+        model: &str,
+        device: &str,
+        peak: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let values = retention::coefficients(self.model(model)?, self.device(device)?, peak);
+        let config = PyDict::new(py);
+        config.set_item("linear_seconds", values.linear_seconds)?;
+        config.set_item("pair_seconds", values.pair_seconds)?;
+        config.set_item("sliding_pair_seconds", values.sliding_pair_seconds)?;
+        config.set_item("sliding_window", values.sliding_window)?;
+        if let Some(pages) = values.checkpoint_pages {
+            config.set_item("checkpoint_pages", pages)?;
+        }
+        Ok(config)
+    }
+
+    /// `RetentionPolicy(**coefficients(model, device)).prefill_seconds`.
+    fn prefill_seconds(&self, model: &str, device: &str, tokens: f64) -> PyResult<f64> {
+        Ok(
+            retention::coefficients(self.model(model)?, self.device(device)?, false)
+                .prefill_seconds(tokens),
+        )
+    }
+
+    /// `retention_pages`.
+    #[staticmethod]
+    fn retention_pages(arena_tokens: i64, chunk_tokens: i64, page_tokens: i64) -> i64 {
+        retention::retention_pages(arena_tokens, chunk_tokens, page_tokens)
+    }
+
+    /// `DecodeCost.from_specs(model, device)`'s weight, KV, and state seconds.
+    fn decode_cost(&self, model: &str, device: &str) -> PyResult<(f64, f64, f64, f64)> {
+        let cost = DecodeCost::from_specs(self.model(model)?, self.device(device)?);
+        Ok((
+            cost.weight_seconds,
+            cost.kv_seconds,
+            cost.sliding_kv_seconds,
+            cost.state_seconds,
+        ))
+    }
+
+    /// `DecodeCost.from_specs(model, device).lower_bound_seconds(work, passes)`.
+    fn decode_lower_bound_seconds(
+        &self,
+        model: &str,
+        device: &str,
+        work: &Bound<'_, PyDict>,
+        passes: f64,
+    ) -> PyResult<f64> {
+        let cost = DecodeCost::from_specs(self.model(model)?, self.device(device)?);
+        Ok(cost.lower_bound_seconds(&work_from(work)?, passes))
     }
 
     /// `float(np.sum(values))`, as the Rust port rounds it.

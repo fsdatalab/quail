@@ -12,10 +12,18 @@
 //! | `dense_decoder_cost` | `quail/common/dense_decoder_cost.py` |
 //! | `sol` | `quail/common/sol.py` |
 //! | `budgets` | `quail/common/budgets.py` |
+//! | `answers` | `quail/common/answers.py` |
+//! | `draft_policy` | `quail/common/draft_policy.py` |
+//! | `retention` | `quail/common/retention.py` |
+//! | `decode` | `quail/common/decode.py`, the planner's part |
 
+pub mod answers;
 pub mod budgets;
+pub mod decode;
 pub mod dense_decoder_cost;
+pub mod draft_policy;
 pub mod quantity;
+pub mod retention;
 pub mod roofline;
 pub mod sol;
 pub mod specs;
