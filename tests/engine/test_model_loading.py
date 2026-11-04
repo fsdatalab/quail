@@ -154,3 +154,25 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
     assert result.metrics["boot_s"] == 5.0
     assert result.metrics["boot"]["model_files_s"] == 2.0
     assert result.metrics["wall_s"] == 7.0
+
+
+def test_a_base_model_without_a_turn_close_ends_answers_at_its_config_eos(
+        tmp_path):
+    from quail.backends.quail.executor.tokenizer import (
+        ModelTokenizer,
+        _config_eos_token,
+    )
+
+    class NoEosId:    # Gigatoken's Hugging Face view of a base checkpoint
+        eos_token_id = None
+
+        def __len__(self):
+            return 4
+
+        def convert_tokens_to_ids(self, token):
+            return {"<|endoftext|>": 2}[token]
+
+    (tmp_path / "tokenizer_config.json").write_text(
+        '{"eos_token": "<|endoftext|>"}')
+    tokenizer = ModelTokenizer(NoEosId(), "", _config_eos_token(tmp_path))
+    assert tokenizer.stop_ids == (2,)
