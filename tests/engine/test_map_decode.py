@@ -17,7 +17,11 @@ from helpers.fakes import cpu_staging, fake_pipeline
 from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 
 from quail.backends.quail.executor.admission import pages_for
-from quail.backends.quail.executor.answer_admission import HeadroomAdmission
+from quail.backends.quail.executor.answer_admission import (
+    HeadroomAdmission,
+    admission_cost,
+    allocate_headroom,
+)
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.operators.classify import ClassifyPart
 from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
@@ -602,16 +606,50 @@ def test_zero_headroom_admits_when_the_prompt_fits_but_waits_for_replays():
     assert admission.waits()
 
 
-def test_headroom_of_running_answers_is_counted_against_new_documents():
-    # rebuilding a long prompt costs more than a page saves the next document
+def test_a_new_document_leaves_running_headroom_alone_when_pages_are_ample():
     decoder, admission = headroom_admission(ended=[(2, 30)], prefix_tokens=8000)
     decoder.start(0, 0, 8006, list(range(2003)))
-    admission.refresh(np.array([0, -1, -2]))
-    held = admission.headroom_pages
+    admission.refresh(np.array([0, -1, -2]), free_pages=1000)
+    held = int(admission._remaining(np.array([0]))[0])
     assert held > 0
-    need = 4 + admission._candidate_headroom(1)
-    assert admission.allows(1, held + need, 4)
-    assert not admission.allows(1, held + need - 1, 4)
+    assert not admission.allows(1, 3, 4)
+    for prompt_pages in (4, 1):
+        assert admission.allows(1, 1000, prompt_pages)
+        assert admission._remaining(np.array([0]))[0] == held
+    admission.admit(1)
+    assert admission._remaining(np.array([0]))[0] == held
+    assert admission.headroom_pages + 4 <= 1000
+
+
+def test_a_second_document_in_a_round_shrinks_the_first_ones_headroom_to_fit():
+    decoder, admission = headroom_admission(prefix_tokens=8, limit=128,
+                                            expected_tokens=64)
+    admission.refresh(np.array([-1, -1, -1]), free_pages=30)
+    assert admission.allows(0, 30, 4)
+    admission.admit(0)
+    first = admission.headroom_pages
+    assert first == 30 - 4
+    assert admission.allows(1, 26, 4)
+    admission.admit(1)
+    assert admission.headroom_pages < first
+    assert admission.headroom_pages <= 30 - 8
+
+
+def test_headroom_that_pays_off_only_after_two_pages_is_taken_whole_or_not_at_all():
+    risk = np.array([[10.0, 10.0, 0.0], [5.0, 4.0, 4.0]])
+    assert allocate_headroom(risk, 2).tolist() == [2, 0]
+    assert allocate_headroom(risk, 1).tolist() == [0, 1]
+    assert allocate_headroom(risk, 0).tolist() == [0, 0]
+
+
+def test_admitting_a_document_costs_the_rebuild_risk_it_pushes_onto_held_answers():
+    held = np.array([[100.0, 80.0, 0.0]])
+    candidate = np.array([[3.0, 3.0, 3.0]])
+    extra, chosen = admission_cost(held, np.array([2]), candidate, 1)
+    assert extra == 80.0
+    assert chosen.tolist() == [1, 0]
+    extra, _ = admission_cost(held, np.array([2]), candidate, 2)
+    assert extra == 0.0
 
 
 def test_eviction_takes_remaining_tokens_from_each_answers_length_bucket():
@@ -632,17 +670,6 @@ def test_eviction_takes_remaining_tokens_from_each_answers_length_bucket():
     decoder.written[0][[0, 10]] = 2
     assert decoder.eviction_order()[0] == 0
     assert admission.eviction_order()[0] == 10
-
-
-def test_the_page_price_counts_only_the_pages_a_waiting_document_adds():
-    decoder, admission = headroom_admission(ended=[(2, 30)], prefix_tokens=8000)
-    decoder.start(0, 0, 8006, list(range(2003)))
-    admission.refresh(np.array([0, -1, -2]))
-    alone = admission.page_value
-    admission.tree_shared[1] = 7000
-    admission.refresh(np.array([0, -1, -2]))
-    assert admission._new_prompt_pages(1) == pages_for(8006 - 7000, 4)
-    assert admission.page_value > alone
 
 
 def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():

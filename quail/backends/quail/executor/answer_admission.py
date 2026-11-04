@@ -13,34 +13,122 @@ def input_bucket(tokens):
                     ).astype(np.int64)
 
 
+PRICE_STEPS = 24
+
+
+def allocate_headroom(risk, budget):
+    """Choose each row's headroom pages to keep the summed risk low within a budget.
+
+    Rows take the choices that minimize risk[r, j] + price * j at the
+    lowest page price whose pages fit the budget, so a row whose risk
+    falls only after several pages takes them all or none. Pages left
+    under the budget then go, a whole step at a time, to the row whose
+    step saves the most.
+
+    Args:
+        risk: Expected rebuild seconds per row and headroom page count,
+            inf past a row's limit; column 0 is finite.
+        budget: Pages all rows may reserve together.
+
+    Returns:
+        Headroom pages per row.
+    """
+    risk = np.asarray(risk, dtype=float)
+    budget = max(0, int(budget))
+    chosen = np.argmin(risk, axis=1)
+    if int(chosen.sum()) <= budget:
+        return chosen
+    pages = np.arange(risk.shape[1])
+    rows = np.arange(len(risk))
+    # at this price no page saves more than it costs, so every row takes 0
+    high = float(np.max(risk[:, 0] - risk[rows, chosen]))
+    low = high * 1e-12
+
+    def choose(price):
+        return np.argmin(risk + price * pages, axis=1)
+
+    chosen = choose(low)
+    if int(chosen.sum()) > budget:
+        for _ in range(PRICE_STEPS):
+            middle = float(np.sqrt(low * high))
+            trial = choose(middle)
+            used = int(trial.sum())
+            if used > budget:
+                low = middle
+            else:
+                high = middle
+                if used == budget:
+                    break
+        chosen = choose(high)
+    left = budget - int(chosen.sum())
+    while left > 0:
+        steps = (pages > chosen[:, None]) & (pages <= chosen[:, None] + left)
+        reachable = np.where(steps, risk, np.inf)
+        target = np.argmin(reachable, axis=1)
+        saved = risk[rows, chosen] - reachable[rows, target]
+        row = int(np.argmax(saved))
+        if not saved[row] > 0:
+            break
+        left -= int(target[row] - chosen[row])
+        chosen[row] = target[row]
+    return chosen
+
+
+def admission_cost(held_risk, held_pages, candidate_risk, budget):
+    """Expected rebuild seconds that admitting a document adds to the held answers.
+
+    The candidate's own least risk is left out: its answers carry it
+    whenever they start.
+
+    Args:
+        held_risk: Risk grid of the answers already holding pages.
+        held_pages: Their headroom without the candidate, within the
+            whole budget.
+        candidate_risk: Risk grid of the candidate's answers.
+        budget: Pages left for headroom once the candidate's prompts
+            are placed.
+
+    Returns:
+        The added seconds and the headroom of the held answers followed
+        by the candidate's.
+    """
+    risk = np.concatenate((held_risk, candidate_risk))
+    chosen = allocate_headroom(risk, budget)
+    before = held_risk[np.arange(len(held_risk)), held_pages].sum()
+    after = risk[np.arange(len(risk)), chosen].sum()
+    least = np.min(candidate_risk, axis=1).sum()
+    return max(0.0, float(after - before - least)), chosen
+
+
 class HeadroomAdmission:
-    """Admit a document when its prompt and its answers' headroom fit.
+    """Admit a document when the time it saves covers the rebuilds it risks.
 
     Each answer has its own headroom: pages its answer may grow into
-    beyond the pages it holds. Free pages minus the headroom of running
-    answers, minus the pages evicted answers need to come back, must
-    cover a new document's prompt and its answers' headroom. The pages
+    beyond the pages it holds. The headroom of all answers holding
+    pages, the prompts of admitted branches, and the pages evicted
+    answers need to come back must fit in the free pages. The pages
     are counted, not allocated: answers still grow one page at a time.
 
     With choose_headroom False every headroom is zero, so a document is
-    admitted when its prompt fits. Otherwise each answer's headroom is
-    the page count j minimizing D(j) + P(Y > j) * R(j):
+    admitted when its prompt fits. Otherwise headroom keeps the summed
+    P(Y > j) * R(j) of the answers holding pages low within the free
+    pages (allocate_headroom):
 
     - P(Y > j): the chance the answer needs more than j more pages,
       from the Kaplan-Meier curve of its map and input-length bucket,
       conditional on the tokens it has written. A bucket uses the curve
       of all its map's answers until bucket_answers of its own ended.
-    - D(j): j times the value of one page to waiting documents, the
-      SoL seconds one waiting document saves by joining passes that
-      run anyway, divided by the pages it takes: its prompt and the
-      headroom its answers get at that value.
     - R(j): the SoL seconds rebuilding the answer's whole prefix adds
       when it outgrows j pages and is evicted.
 
-    Every refresh rebuilds the curves of maps whose answers moved, the
-    value of a page, and the headroom of running answers, pricing
-    every R(j) in one array. With trace, each refresh also records the
-    running answers' headroom by map and bucket.
+    A waiting document is admitted when its prompts fit and the SoL
+    seconds its answers save by joining passes that run anyway are at
+    least the rebuild seconds that fitting it adds (admission_cost).
+    Its answers' headroom is then re-chosen with everyone else's at the
+    next admission. Every refresh rebuilds the curves of maps whose
+    answers moved and the headroom of running answers. With trace,
+    each refresh also records the running answers' headroom by map and
+    bucket.
     """
 
     def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
@@ -66,11 +154,6 @@ class HeadroomAdmission:
         self.borrowed = np.where(self.roots, 0, shared)
         self.lead = np.zeros(len(self.prefix), dtype=np.int64)
         np.maximum.at(self.lead, self.parent, self.borrowed)
-        self.page_cost = page_cost
-        self.capacity_extra = capacity_extra
-        # the prefix each document can borrow; the scheduler zeroes an entry
-        # when its parent leaves, so this is its list, not a copy
-        self.tree_shared = shared
         self.choose_headroom = choose_headroom and decode_cost is not None
         self.chunk_tokens = chunk_tokens
         self.bucket_answers = bucket_answers
@@ -94,7 +177,19 @@ class HeadroomAdmission:
         self.reach = np.zeros(len(self.prefix), dtype=np.int64)
         self.headroom_pages = 0
         self.replay_pages = 0
-        self.page_value = 0.0
+        # prompt pages of admitted documents' branches not yet placed
+        self.fixed_pages = 0
+        # answers holding pages: slots, risk grids, the pages each holds
+        # at headroom 0, the headroom each reserves, and the budget it fits
+        grid = -(-(self.width - 1) // page_tokens) + 1
+        self.held_slots = np.zeros(0, dtype=np.int64)
+        self.held_risk = np.zeros((0, grid))
+        self.held_base = np.zeros(0, dtype=np.int64)
+        self.held_pages = np.zeros(0, dtype=np.int64)
+        self.held_budget = None
+        # (anchor, budget, headroom of held answers then its own) of the
+        # last document allows() accepted
+        self._decision = None
         self.work = Work()
         self.added_work = {}
         # (anchor, its answer slots, their R(j) grid) for the first
@@ -132,23 +227,30 @@ class HeadroomAdmission:
         return {(int(row // self.num_buckets), int(row % self.num_buckets)):
                 self.curves[row, :self.row_limit[row] + 1] for row in self.rows}
 
-    def refresh(self, stages, replays=(), replay_pages=0):
-        """Count held pages; with headroom, rebuild the curves and choose it."""
+    def refresh(self, stages, replays=(), replay_pages=0, free_pages=None):
+        """Count held pages; with headroom, rebuild the curves and choose it.
+
+        Args:
+            stages: Each anchor's stage: -1 waiting, -2 done.
+            replays: (slot, start, end) of evicted answers rebuilt this round.
+            replay_pages: Pages evicted answers not yet rebuilding need.
+            free_pages: Free KV pages, or None for no limit.
+        """
         self.committed = stages >= 0
         self.pending_pages = np.where(stages == -1, self.prompt_pages, 0)
         self.replay_pages = int(replay_pages)
         self._refreshes += 1
         running = self._running()
         self._update_curves()
+        roots = self.committed[self.parent]
+        self.fixed_pages = int(self.pending_pages[roots].sum())
+        self._decision = None
         if self.choose_headroom:
             self._refresh_curves(stages, replays)
-            self._choose_running(stages, running)
+            self._hold_running(running, free_pages)
             if self.traced:
                 self._record(running)
-        self.headroom_pages = int(self._remaining(running).sum())
-        # pending branches of admitted documents need their prompt pages
-        roots = self.committed[self.parent]
-        self.headroom_pages += int(self.pending_pages[roots].sum())
+        self.headroom_pages = self.fixed_pages + int(self._remaining(running).sum())
 
     def _update_curves(self):
         """Rebuild the curves of maps whose answers moved since the last update."""
@@ -301,64 +403,26 @@ class HeadroomAdmission:
     def _answer_slots(self, anchor):
         return np.flatnonzero((self.parent == anchor) & (self.slot_map >= 0))
 
-    def _choose_running(self, stages, running):
-        """Price a page and choose running answers' headroom from one R(j) grid."""
+    def _hold_running(self, running, free_pages):
+        """Price running answers' risk; choose their headroom within the free pages."""
         decoder = self.decoder
-        anchor = self._waiting(stages)
-        pending = (self._answer_slots(anchor) if anchor is not None
-                   else np.zeros(0, dtype=np.int64))
         maps = decoder.map[running]
-        risk = self._risk(
-            np.r_[running, pending], np.r_[maps, self.slot_map[pending]],
-            np.r_[decoder.written[maps, running], np.zeros(len(pending), np.int64)],
-            np.r_[self._available(running),
-                  self.capacity[pending] - self.prompt[pending]],
-            np.r_[decoder.origin[running], self.prompt[pending]])
-        if anchor is not None:
-            self._candidate = (anchor, pending, risk[len(running):])
-            self.page_value = self._page_value(anchor, risk[len(running):])
+        self.held_slots = running
+        self.held_risk = self._risk(running, maps, decoder.written[maps, running],
+                                    self._available(running), decoder.origin[running])
+        self.held_base = decoder.kv.num_pages[running].astype(np.int64)
+        if free_pages is None:
+            self._hold(np.argmin(self.held_risk, axis=1), None)
         else:
-            self.page_value = 0.0
-        chosen = self._argmin(risk[:len(running)], self.page_value)
-        self.reach[running] = (decoder.kv.num_pages[running] + chosen
-                               ) * decoder.page_tokens
+            budget = free_pages - self.fixed_pages - self.replay_pages
+            self._hold(allocate_headroom(self.held_risk, budget), budget)
 
-    def _page_value(self, anchor, risk):
-        """SoL seconds one page saves a waiting document, 0 when none waits.
-
-        The document takes its prompt's pages and its answers' headroom,
-        and that headroom depends on the value of a page. The value is
-        the fixed point v = gain / (prompt pages + headroom at v), found
-        from the prompt-only value: each step lowers v and raises the
-        headroom, a whole number of pages, so it ends where the headroom
-        repeats.
-        """
-        added = self._added_work(anchor)
-        # with nothing running, price joining a pass that holds one such answer
-        base = self.work if self.work.tokens else added
-        gain = self.decode_cost.gain(base, added, self.expected_tokens[anchor])
-        prompt_pages = self._new_prompt_pages(anchor)
-        value, headroom = gain / max(1, prompt_pages), None
-        while True:
-            pages = int(self._argmin(risk, value).sum())
-            if pages == headroom:
-                return value
-            headroom = pages
-            value = gain / max(1, prompt_pages + headroom)
-
-    def _new_prompt_pages(self, anchor):
-        """Pages a waiting document's prompts add, past any prefix they borrow."""
-        shared = int(self.tree_shared[anchor]) if anchor < len(self.tree_shared) else 0
-        own = self.page_cost(int(self.prefix[anchor]) + self.capacity_extra - shared)
-        branches = (self.parent == anchor) & (np.arange(len(self.prefix)) != anchor)
-        return own + int(self.prompt_pages[branches].sum())
-
-    @staticmethod
-    def _argmin(risk, page_value):
-        """Each row's page count minimizing j * page_value + R(j) grid."""
-        if not len(risk):
-            return np.zeros(0, dtype=np.int64)
-        return np.argmin(np.arange(risk.shape[1]) * page_value + risk, axis=1)
+    def _hold(self, chosen, budget):
+        """Reserve the chosen headroom pages for the held answers."""
+        self.held_pages = np.asarray(chosen, dtype=np.int64)
+        self.held_budget = budget
+        self.reach[self.held_slots] = ((self.held_base + self.held_pages)
+                                       * self.decoder.page_tokens)
 
     def _risk(self, slots, maps, written, available, origin):
         """Return P(Y > j) * R(j) per slot and headroom j, inf past its limit.
@@ -398,13 +462,8 @@ class HeadroomAdmission:
                                row % self.num_buckets, int(num_answers[row]),
                                float(pages[row] / num_answers[row])))
 
-    def _admission_headroom(self, anchor, page_value=None):
-        """Headroom pages each of a document's answers would get if admitted.
-
-        Returns:
-            The answer slots and their headroom pages, before any answer
-            token is written.
-        """
+    def _admission_risk(self, anchor):
+        """The answer slots of a waiting document and their R(j) grid."""
         if self._candidate is not None and self._candidate[0] == anchor:
             _, slots, risk = self._candidate
         else:
@@ -413,43 +472,87 @@ class HeadroomAdmission:
                 slots, self.slot_map[slots], np.zeros(len(slots), dtype=np.int64),
                 self.capacity[slots] - self.prompt[slots], self.prompt[slots])
             self._candidate = (anchor, slots, risk)
-        return slots, self._argmin(
-            risk, self.page_value if page_value is None else page_value)
+        return slots, risk
 
-    def _candidate_headroom(self, anchor):
-        """Headroom pages a document's answers would hold, chosen now."""
-        if not self.choose_headroom:
-            return 0
-        slots, chosen = self._admission_headroom(anchor)
-        self.reach[slots] = self.capacity[slots] + chosen * self.decoder.page_tokens
-        return int(chosen.sum())
+    def _branch_pages(self, anchor):
+        """Prompt pages a document's branches will place after it is admitted."""
+        branches = (self.parent == anchor) & (np.arange(len(self.prefix)) != anchor)
+        return int(self.pending_pages[branches].sum())
 
     def allows(self, anchor, free_pages, prompt_pages):
-        """Admit when the prompt and its answers' headroom fit beside what is held."""
+        """Admit when the prompts fit and the time saved covers the rebuilds added.
+
+        Args:
+            anchor: The waiting document, or a branch of an admitted one.
+            free_pages: Free KV pages.
+            prompt_pages: Pages the document's prompt takes now.
+        """
         if self.committed[self.parent[anchor]]:
             return True
-        need = prompt_pages + self._candidate_headroom(anchor)
-        return free_pages - self.headroom_pages - self.replay_pages >= need
+        self._decision = None
+        if not self.choose_headroom:
+            return free_pages - self.headroom_pages - self.replay_pages >= prompt_pages
+        budget = free_pages - self.fixed_pages - self.replay_pages
+        need = prompt_pages + self._branch_pages(anchor)
+        if need > budget:
+            return False
+        if self.held_budget != budget:
+            self._hold(allocate_headroom(self.held_risk, budget), budget)
+            self.headroom_pages = self.fixed_pages + int(self.held_pages.sum())
+        _, risk = self._admission_risk(anchor)
+        extra, chosen = admission_cost(self.held_risk, self.held_pages, risk,
+                                       budget - need)
+        added = self._added_work(anchor)
+        # with nothing running, price joining a pass that holds one such answer
+        base = self.work if self.work.tokens else added
+        gain = self.decode_cost.gain(base, added, self.expected_tokens[anchor])
+        if extra > gain * (1 + 1e-9):
+            return False
+        self._decision = (anchor, budget - need, chosen)
+        return True
 
     def admit(self, anchor):
         """Count an admitted document's headroom, or a branch's allocated prompt."""
         if self.committed[self.parent[anchor]]:
-            self.headroom_pages -= int(self.pending_pages[anchor])
+            pages = int(self.pending_pages[anchor])
+            self.headroom_pages -= pages
+            self.fixed_pages -= pages
             self.pending_pages[anchor] = 0
             return
         self.committed[anchor] = True
-        self.work = self.work + self._added_work(anchor)
-        self._candidate = None
         slots = self._answer_slots(anchor)
+        if self.choose_headroom:
+            self._hold_admitted(anchor, slots)
         granted = ((self.reach[slots] - self.capacity[slots])
                    // self.decoder.page_tokens).clip(0)
+        self.work = self.work + self._added_work(anchor)
+        self._candidate = None
         self.granted.extend(granted.tolist())
         self.granted_at.extend(zip([self._refreshes] * len(slots),
                                    self.bucket[slots].tolist(), granted.tolist()))
-        self.headroom_pages += int(granted.sum())
-        branches = np.flatnonzero((self.parent == anchor)
-                                  & (np.arange(len(self.prefix)) != anchor))
-        self.headroom_pages += int(self.pending_pages[branches].sum())
+        self.fixed_pages += self._branch_pages(anchor)
+        if self.choose_headroom:
+            self.headroom_pages = self.fixed_pages + int(self.held_pages.sum())
+        else:
+            self.headroom_pages += int(granted.sum()) + self._branch_pages(anchor)
+
+    def _hold_admitted(self, anchor, slots):
+        """Add an admitted document's answers to the held ones with allows()'s headroom.
+
+        A document admitted without allows() accepting it, because no
+        answer could free pages, starts with no headroom.
+        """
+        _, risk = self._admission_risk(anchor)
+        decision = self._decision
+        self._decision = None
+        self.held_slots = np.r_[self.held_slots, slots]
+        self.held_risk = np.concatenate((self.held_risk, risk))
+        self.held_base = np.r_[self.held_base,
+                               self.capacity[slots] // self.decoder.page_tokens]
+        if decision is not None and decision[0] == anchor:
+            self._hold(decision[2], decision[1])
+        else:
+            self._hold(np.r_[self.held_pages, np.zeros(len(slots), np.int64)], None)
 
     def waits(self):
         """Return whether a refused document can wait for pages to free."""
