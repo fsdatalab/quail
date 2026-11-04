@@ -141,3 +141,71 @@ def test_the_array_sum_rounds_as_numpy_does():
     for length in (0, 1, 7, 8, 9, 127, 128, 129, 1000, 4097):
         values = generator.random(length) * 10 ** generator.integers(0, 12, length)
         assert native.CostModel.numpy_sum(values.tolist()) == float(np.sum(values))
+
+
+def _outcome(function, *arguments):
+    """A function's value, or the message of the ValueError it raises."""
+    try:
+        return plain(function(*arguments))
+    except ValueError as error:
+        return ("error", str(error))
+
+
+def test_the_memory_budgets_are_the_same(rust):
+    from quail.common import budgets
+
+    for model_name, model in MODELS.items():
+        for device_name, device in DEVICES.items():
+            expected = {
+                "chunk_budget": budgets.chunk_budget(model, device),
+                "chunk_memory_bound": budgets.chunk_memory_bound(model, device),
+                "kernel_index_cap": budgets.kernel_index_cap(model),
+                "minimum_weight_gpus": budgets.minimum_weight_gpus(model, device),
+                "graph_memory_bytes": budgets.graph_memory_bytes(model, device),
+                "graph_token_buckets": list(
+                    budgets.graph_token_buckets(model, device)),
+                "tree_attention_allowed": budgets.tree_attention_allowed(model),
+                "sliding_kv_fits": budgets.sliding_kv_fits(model, device),
+                "compute_knee": budgets.compute_knee(model, device),
+            }
+            pair = (model_name, device_name)
+            assert plain(rust.model_budgets(model_name, device_name)) == expected, pair
+            chunks = (1, 64, 2_048, max(1, expected["chunk_budget"]))
+            for chunk in chunks:
+                page_tokens = device.page_tokens
+                questions = budgets.CHECKPOINT_PASS_QUESTIONS
+                assert rust.chunk_budgets(model_name, device_name, chunk) == {
+                    "arena_bytes": budgets.arena_bytes(model, device, chunk),
+                    "checkpoint_memory_bytes": budgets.checkpoint_memory_bytes(
+                        model, chunk, page_tokens),
+                    "chunk_memory_bytes": budgets.chunk_memory_bytes(
+                        model, chunk, page_tokens),
+                    "copy_verification_workspace_bytes":
+                        budgets.copy_verification_workspace_bytes(model, chunk),
+                    "checkpoint_pass_bytes": budgets.checkpoint_pass_bytes(
+                        model, questions, chunk),
+                    "hybrid_pool_pages": budgets.hybrid_pool_pages(model, device, chunk),
+                    "checkpoint_pages": budgets.checkpoint_pages(model, page_tokens),
+                }, (pair, chunk)
+                for mean in (None, 1.0, 300.5, 5_000.0):
+                    assert _outcome(rust.arena_pages, model_name, device_name, chunk,
+                                    mean) == _outcome(budgets.arena_pages, model,
+                                                      device, chunk, mean), (pair, chunk, mean)
+                for kv_pages in (0, 1_000, 50_000):
+                    assert rust.checkpoint_slots(
+                        model_name, device_name, chunk, kv_pages
+                    ) == budgets.checkpoint_slots(model, device, chunk, kv_pages)
+            assert _outcome(rust.arena_pages, model_name, device_name) == _outcome(
+                budgets.arena_pages, model, device)
+            for readers in (1.0, 2.0, 16.0, 400.0):
+                for rows in (1.0, 30.0, 900.0):
+                    for node in (0.0, 120.0, 30_000.0):
+                        assert rust.cheaper_attention_path(
+                            model_name, device_name, readers, rows, node
+                        ) == budgets.cheaper_attention_path(
+                            model, device, readers=readers, reader_rows=rows,
+                            node_tokens=node)
+    for gpus in (1, 2, 8):
+        for documents in (0.0, 1.0, 3.5, 100.0):
+            assert native.CostModel.parallel_copies(gpus, documents) == (
+                budgets.parallel_copies(gpus, documents))

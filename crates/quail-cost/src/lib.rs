@@ -11,7 +11,9 @@
 //! | `roofline` | `quail/common/roofline.py` |
 //! | `dense_decoder_cost` | `quail/common/dense_decoder_cost.py` |
 //! | `sol` | `quail/common/sol.py` |
+//! | `budgets` | `quail/common/budgets.py` |
 
+pub mod budgets;
 pub mod dense_decoder_cost;
 pub mod quantity;
 pub mod roofline;

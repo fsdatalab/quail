@@ -10,7 +10,7 @@ use pyo3::types::PyDict;
 use quail_cost::quantity::{Quantity, numpy_sum};
 use quail_cost::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
 use quail_cost::work::{self, Work};
-use quail_cost::{dense_decoder_cost, sol};
+use quail_cost::{budgets, dense_decoder_cost, sol};
 
 /// A number, or a list of numbers, from Python.
 fn quantity(value: &Bound<'_, PyAny>) -> PyResult<Quantity> {
@@ -292,6 +292,142 @@ impl CostModel {
             estimate.memory(),
             estimate.bytes_moved(),
         ))
+    }
+
+    /// The budgets of one model on one device that take no chunk size.
+    fn model_budgets<'py>(
+        &self,
+        py: Python<'py>,
+        model: &str,
+        device: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let (model, device) = (self.model(model)?, self.device(device)?);
+        let values = PyDict::new(py);
+        values.set_item("chunk_budget", budgets::chunk_budget(model, device))?;
+        values.set_item(
+            "chunk_memory_bound",
+            budgets::chunk_memory_bound(model, device),
+        )?;
+        values.set_item("kernel_index_cap", budgets::kernel_index_cap(model))?;
+        values.set_item(
+            "minimum_weight_gpus",
+            budgets::minimum_weight_gpus(model, device),
+        )?;
+        values.set_item("graph_memory_bytes", budgets::graph_memory_bytes(model))?;
+        values.set_item("graph_token_buckets", budgets::graph_token_buckets(model))?;
+        values.set_item(
+            "tree_attention_allowed",
+            budgets::tree_attention_allowed(model),
+        )?;
+        values.set_item(
+            "sliding_kv_fits",
+            budgets::sliding_kv_fits(model, device, None),
+        )?;
+        values.set_item(
+            "compute_knee",
+            budgets::compute_knee(model, device).map_err(PyValueError::new_err)?,
+        )?;
+        Ok(values)
+    }
+
+    /// The budgets of one model on one device at one chunk size.
+    fn chunk_budgets<'py>(
+        &self,
+        py: Python<'py>,
+        model: &str,
+        device: &str,
+        chunk_tokens: i64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let (model, device) = (self.model(model)?, self.device(device)?);
+        let page_tokens = device.page_tokens;
+        let values = PyDict::new(py);
+        values.set_item(
+            "arena_bytes",
+            budgets::arena_bytes(model, device, chunk_tokens),
+        )?;
+        values.set_item(
+            "checkpoint_memory_bytes",
+            budgets::checkpoint_memory_bytes(model, chunk_tokens, page_tokens),
+        )?;
+        values.set_item(
+            "chunk_memory_bytes",
+            budgets::chunk_memory_bytes(model, chunk_tokens, page_tokens),
+        )?;
+        values.set_item(
+            "copy_verification_workspace_bytes",
+            budgets::copy_verification_workspace_bytes(model, chunk_tokens),
+        )?;
+        values.set_item(
+            "checkpoint_pass_bytes",
+            budgets::checkpoint_pass_bytes(model, budgets::CHECKPOINT_PASS_QUESTIONS, chunk_tokens),
+        )?;
+        values.set_item(
+            "hybrid_pool_pages",
+            budgets::hybrid_pool_pages(model, device, chunk_tokens),
+        )?;
+        values.set_item(
+            "checkpoint_pages",
+            budgets::checkpoint_pages(model, page_tokens),
+        )?;
+        Ok(values)
+    }
+
+    /// `arena_pages`; raises ValueError where Python's does.
+    #[pyo3(signature = (model, device, chunk_tokens=None, mean_document_tokens=None))]
+    fn arena_pages(
+        &self,
+        model: &str,
+        device: &str,
+        chunk_tokens: Option<i64>,
+        mean_document_tokens: Option<f64>,
+    ) -> PyResult<(i64, i64)> {
+        budgets::arena_pages(
+            self.model(model)?,
+            self.device(device)?,
+            chunk_tokens,
+            mean_document_tokens,
+        )
+        .map_err(PyValueError::new_err)
+    }
+
+    /// `checkpoint_slots`.
+    fn checkpoint_slots(
+        &self,
+        model: &str,
+        device: &str,
+        chunk_tokens: i64,
+        kv_pages: i64,
+    ) -> PyResult<i64> {
+        Ok(budgets::checkpoint_slots(
+            self.model(model)?,
+            self.device(device)?,
+            chunk_tokens,
+            kv_pages,
+        ))
+    }
+
+    /// `cheaper_attention_path`.
+    fn cheaper_attention_path(
+        &self,
+        model: &str,
+        device: &str,
+        readers: f64,
+        reader_rows: f64,
+        node_tokens: f64,
+    ) -> PyResult<&'static str> {
+        Ok(budgets::cheaper_attention_path(
+            self.model(model)?,
+            self.device(device)?,
+            readers,
+            reader_rows,
+            node_tokens,
+        ))
+    }
+
+    /// `parallel_copies`.
+    #[staticmethod]
+    fn parallel_copies(gpus: i64, num_documents: f64) -> f64 {
+        budgets::parallel_copies(gpus, num_documents)
     }
 
     /// `float(np.sum(values))`, as the Rust port rounds it.
