@@ -241,3 +241,15 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     registry.load_extension(module)
     response = _execute_physical(request, registry)
     assert response.metrics == {"backend": "test.example", "nodes": ["input:d"]}
+
+
+def test_a_plan_saved_before_the_expressions_moved_still_decodes():
+    from quail.common.expressions import ColumnRef, RegularPredicate
+    from quail.physical.codec import decode_value, encode_value
+
+    predicate = RegularPredicate(ColumnRef("r", "reviews", "stars"), ">", 3)
+    saved = encode_value(predicate)
+    for value in (saved, saved["expression"]):
+        value["type"] = value["type"].replace(
+            "quail.common.expressions", "quail.logical.expressions")
+    assert decode_value(RegularPredicate, saved) == predicate

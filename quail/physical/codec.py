@@ -43,6 +43,8 @@ from .nodes import (
 )
 
 TYPE_KEY = "type"
+# Old module -> new module, for tags in plans saved before a class moved.
+MOVED_MODULES = {"quail.logical.expressions": "quail.common.expressions"}
 _SCALARS = (str, int, float, bool)
 
 
@@ -151,6 +153,7 @@ def _tagged_type(tag, annotation: type) -> type:
     if tag is None:
         return annotation
     module, _, name = str(tag).rpartition(".")
+    module = MOVED_MODULES.get(module, module)
     kind = getattr(import_module(module), name, None) if module else None
     if not isinstance(kind, type) or not issubclass(kind, annotation):
         raise ValueError(f"{tag!r} is not a {annotation.__name__}")
