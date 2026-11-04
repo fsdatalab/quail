@@ -68,21 +68,34 @@ impl Dialect for QuailDialect {
 /// Print `get_field(root, 'a', 'b')` as `root['a']['b']` when the root
 /// is a Quail function, so its answer prints as Quail's front end
 /// reads it; any other root prints as DataFusion prints it.
+///
+/// Nested accesses, `get_field(get_field(root, 'a'), 'b')`, print as one chain.
 fn field_access_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
-    let Some((Expr::ScalarFunction(root), fields)) = args.split_first() else {
+    let Some((mut root, fields)) = args.split_first() else {
         return Ok(None);
     };
-    if !QUAIL_NAMES.iter().any(|(name, _)| *name == root.name()) {
+    let mut chain: Vec<&Expr> = fields.iter().rev().collect();
+    while let Expr::ScalarFunction(inner) = root
+        && inner.name() == "get_field"
+        && let Some((inner_root, inner_fields)) = inner.args.split_first()
+    {
+        chain.extend(inner_fields.iter().rev());
+        root = inner_root;
+    }
+    let Expr::ScalarFunction(call) = root else {
+        return Ok(None);
+    };
+    if !QUAIL_NAMES.iter().any(|(name, _)| *name == call.name()) {
         return Ok(None);
     }
-    let mut access_chain = Vec::with_capacity(fields.len());
-    for field in fields {
+    let mut access_chain = Vec::with_capacity(chain.len());
+    for field in chain.into_iter().rev() {
         access_chain.push(ast::AccessExpr::Subscript(ast::Subscript::Index {
             index: parse_expr(&argument_sql(unparser, field)?)?,
         }));
     }
     Ok(Some(ast::Expr::CompoundFieldAccess {
-        root: Box::new(parse_expr(&argument_sql(unparser, &args[0])?)?),
+        root: Box::new(parse_expr(&argument_sql(unparser, root)?)?),
         access_chain,
     }))
 }

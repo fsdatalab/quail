@@ -1,11 +1,12 @@
-//! The `ClaimModelRegions` optimizer rule.
+//! The `ClaimModelRegions` analyzer rule.
 
 use std::sync::Arc;
 
 use datafusion::common::Result;
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan};
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
+use datafusion::optimizer::AnalyzerRule;
 
 use crate::functions::is_ai_call;
 use crate::region::ModelRegion;
@@ -27,38 +28,37 @@ impl ClaimModelRegions {
     }
 }
 
-impl OptimizerRule for ClaimModelRegions {
+impl AnalyzerRule for ClaimModelRegions {
     fn name(&self) -> &str {
         "claim_model_regions"
     }
 
-    fn supports_rewrite(&self) -> bool {
-        true
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_down(|node| {
-            if calls_ai(&node)? && quail_plans(&node)? {
-                let region = LogicalPlan::Extension(Extension {
-                    node: Arc::new(ModelRegion::new(node)),
-                });
-                Ok(Transformed::new(region, true, TreeNodeRecursion::Jump))
-            } else {
-                Ok(Transformed::no(node))
-            }
-        })
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        Ok(plan
+            .transform_down(|node| {
+                if calls_ai(&node)? && quail_plans(&node)? {
+                    let region = LogicalPlan::Extension(Extension {
+                        node: Arc::new(ModelRegion::new(node)),
+                    });
+                    Ok(Transformed::new(region, true, TreeNodeRecursion::Jump))
+                } else {
+                    Ok(Transformed::no(node))
+                }
+            })?
+            .data)
     }
 }
 
-/// Whether any operator in the subtree calls an AI function.
+/// Whether any operator in the subtree, or an EXISTS subquery in it,
+/// calls an AI function.
 fn calls_ai(plan: &LogicalPlan) -> Result<bool> {
     plan.exists(|node| {
         for expr in node.expressions() {
-            if expr.exists(|inner| Ok(is_ai_call(inner)))? {
+            let found = expr.exists(|inner| match inner {
+                Expr::Exists(exists) => calls_ai(&exists.subquery.subquery),
+                other => Ok(is_ai_call(other)),
+            })?;
+            if found {
                 return Ok(true);
             }
         }
@@ -100,11 +100,12 @@ fn is_quail_operator(plan: &LogicalPlan) -> bool {
     )
 }
 
-/// Whether an expression is a subquery that DataFusion did not turn
-/// into a join.
+/// Whether an expression is a subquery Quail does not plan: anything
+/// but an EXISTS gate, whose subquery Quail's binder checks.
 fn is_subquery(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
-    )
+    match expr {
+        Expr::Exists(exists) => !quail_plans(&exists.subquery.subquery).unwrap_or(false),
+        Expr::InSubquery(_) | Expr::ScalarSubquery(_) => true,
+        _ => false,
+    }
 }

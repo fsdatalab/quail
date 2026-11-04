@@ -140,7 +140,7 @@ async fn a_union_keeps_one_region_per_branch() -> Result<()> {
 }
 
 #[tokio::test]
-async fn an_exists_subquery_becomes_a_join_inside_the_region() -> Result<()> {
+async fn an_exists_gate_stays_a_subquery_inside_the_region() -> Result<()> {
     let context = context()?;
     let query = "SELECT r.id FROM reviews r WHERE EXISTS (SELECT 1 FROM aspects a \
         WHERE AI.IF(PROMPT('Does the review discuss {1}?\n\n{0}', r.body, a.aspect)))";
@@ -152,7 +152,9 @@ async fn an_exists_subquery_becomes_a_join_inside_the_region() -> Result<()> {
             .plan
             .display_indent()
             .to_string()
-            .contains("LeftSemi")
+            .contains("EXISTS"),
+        "{}",
+        found[0].plan.display_indent()
     );
     Ok(())
 }

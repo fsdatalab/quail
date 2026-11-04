@@ -29,7 +29,7 @@ use datafusion::common::{DFSchema, Result};
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
-use datafusion::optimizer::{Optimizer, OptimizerRule};
+use datafusion::optimizer::{Analyzer, AnalyzerRule};
 use datafusion::sql::parser::Statement;
 
 pub use aliases::{
@@ -42,35 +42,16 @@ pub use functions::{AI_FUNCTION_NAMES, is_ai_call, normalize_ai_calls, quail_fun
 pub use region::ModelRegion;
 pub use unparse::region_sql;
 
-/// The optimizer rule after which `ClaimModelRegions` runs.
+/// Return DataFusion's analyzer rules with `ClaimModelRegions` first.
 ///
-/// Rules up to and including this one rewrite the query without
-/// choosing an order: subqueries become joins and join conditions
-/// split into keys and filters.
-const CLAIM_AFTER: &str = "extract_equijoin_predicate";
-
-/// DataFusion rules that must not see an operator Quail plans, so
-/// they run after `ClaimModelRegions`.
-const AFTER_CLAIM: [&str; 1] = ["replace_distinct_aggregate"];
-
-/// Return DataFusion's optimizer rules with `ClaimModelRegions` placed
-/// among them.
-pub fn optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
-    let mut rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = Vec::new();
-    let mut delayed = Vec::new();
-    for rule in Optimizer::new().rules {
-        if AFTER_CLAIM.contains(&rule.name()) {
-            delayed.push(rule);
-            continue;
-        }
-        let claim_next = rule.name() == CLAIM_AFTER;
-        rules.push(rule);
-        if claim_next {
-            rules.push(Arc::new(ClaimModelRegions::new()));
-            rules.append(&mut delayed);
-        }
-    }
-    rules.append(&mut delayed);
+/// A region then holds the plan as DataFusion's SQL planner bound it,
+/// before type coercion adds casts: its conditions as written, its ON
+/// clauses whole, and an EXISTS gate as a subquery, as Quail's own SQL
+/// front end binds them.
+pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> =
+        vec![Arc::new(ClaimModelRegions::new())];
+    rules.extend(Analyzer::new().rules);
     rules
 }
 
@@ -83,7 +64,7 @@ pub fn session_state(runner: Arc<dyn RegionRunner>) -> SessionState {
     SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()
-        .with_optimizer_rules(optimizer_rules())
+        .with_analyzer_rules(analyzer_rules())
         .with_query_planner(Arc::new(exec::QuailQueryPlanner::new(runner)))
         .build()
 }
