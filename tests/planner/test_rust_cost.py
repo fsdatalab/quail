@@ -698,3 +698,24 @@ def test_every_cost_the_planner_asks_for_is_the_same_in_rust(rust, monkeypatch):
                           "stage_work", "packed_join_work", "choose_pass_groups",
                           "score"}, kinds
     assert differ == [], differ[:10]
+
+
+def test_a_length_column_summarizes_the_same(rust):
+    import pyarrow as pa
+
+    from quail.common.tokens import TokenLengths
+    from quail.planner.statistics.tables import summarize_alias
+
+    rng = np.random.default_rng(3)
+    columns = (
+        pa.chunked_array([], pa.int64()),
+        pa.chunked_array([[7]]),
+        # a token store yields one chunk per record batch
+        pa.chunked_array([rng.integers(1, 3_000, 500), rng.integers(1, 90_000, 700)]),
+    )
+    for column in columns:
+        lengths = TokenLengths(column)
+        for window in (0, 512, 4_096):
+            expected = summarize_alias(lengths, window)
+            fields = native.CostModel.summarize_alias(np.asarray(lengths), window)
+            assert plain(fields) == plain(asdict(expected)), (len(lengths), window)

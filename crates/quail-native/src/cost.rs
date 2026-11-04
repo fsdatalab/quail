@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -593,6 +594,26 @@ impl CostModel {
     ) -> PyResult<f64> {
         let cost = DecodeCost::from_specs(self.model(model)?, self.device(device)?);
         Ok(cost.lower_bound_seconds(&work_from(work)?, passes))
+    }
+
+    /// `summarize_alias`: the summary's fields, from an int64 buffer of
+    /// document token lengths.
+    #[staticmethod]
+    fn summarize_alias<'py>(
+        py: Python<'py>,
+        lengths: PyBuffer<i64>,
+        window: i64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let values = lengths.to_vec(py)?;
+        let stats = AliasStats::summarize(&values, window);
+        let fields = PyDict::new(py);
+        fields.set_item("count", stats.count)?;
+        fields.set_item("total", stats.total)?;
+        fields.set_item("squared", stats.squared)?;
+        fields.set_item("maximum", stats.maximum)?;
+        fields.set_item("window", stats.window)?;
+        fields.set_item("short_counts", stats.short_counts)?;
+        Ok(fields)
     }
 
     /// An `AliasStats`'s mean, variance, window pairs and reads at an

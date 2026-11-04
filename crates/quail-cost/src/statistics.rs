@@ -1,6 +1,8 @@
 //! Per-table document-length summaries, as `AliasStats` in
 //! `quail/planner/statistics/tables.py` holds them.
 
+use std::collections::BTreeMap;
+
 use crate::quantity::{Quantity, python_sum};
 use crate::work::triangle;
 
@@ -65,6 +67,28 @@ pub struct AliasStats {
 }
 
 impl AliasStats {
+    /// Summarize a column of document token lengths, as
+    /// `summarize_alias` does; `short_counts` is sorted by length.
+    pub fn summarize(lengths: &[i64], window: i64) -> AliasStats {
+        let mut short = BTreeMap::new();
+        if window != 0 {
+            for length in lengths.iter().filter(|length| **length < window) {
+                *short.entry(*length).or_insert(0_i64) += 1;
+            }
+        }
+        AliasStats {
+            count: lengths.len() as i64,
+            total: lengths.iter().sum(),
+            squared: lengths
+                .iter()
+                .map(|length| *length as i128 * *length as i128)
+                .sum(),
+            maximum: lengths.iter().copied().max().unwrap_or(0),
+            window,
+            short_counts: short.into_iter().collect(),
+        }
+    }
+
     /// The mean document length.
     pub fn mean(&self) -> f64 {
         if self.count == 0 {
