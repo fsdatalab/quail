@@ -7,6 +7,7 @@
 //! | `context` | `PlanningContext` |
 //! | `costs` | the filter costs and join specs of `quail/planner/operators` |
 //! | `columns` | the column planners of `quail/planner/operators` |
+//! | `classify` | `quail/planner/operators/classify.py` |
 //! | `builder` | `quail/logical/naive.py`, `placement.py`, `builder.py` |
 //! | `nodes` | the methods of the node classes in `quail/logical/nodes` |
 //! | `lowering` | `quail/planner/prompt_lowering.py`, with a tokenizer callback |
@@ -19,6 +20,7 @@
 
 pub mod arrow_functions;
 pub mod builder;
+pub mod classify;
 pub mod columns;
 pub mod context;
 pub mod costs;

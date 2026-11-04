@@ -3,7 +3,7 @@
 tests/conftest.py repeats each prompt_lowering call in Rust. The suite
 plans on ai-if and d1 models; these queries also plan classifications
 on the decision2-noul model, whose option blocks choice_token_parts
-lowers.
+lowers, and classify joined rows on it.
 """
 
 import pyarrow as pa
@@ -24,6 +24,9 @@ QUERIES = (
     "[('good', 'liked it'), ('bad', 'did not')]) AS s FROM reviews r "
     "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))",
     "SELECT r.id, a.id FROM reviews r JOIN aspects a "
+    "ON AI_FILTER(PROMPT('Does {0} discuss {1}?', r.body, a.aspect))",
+    "SELECT r.id, a.id, AI.CLASSIFY(PROMPT('How does {0} treat {1}?', r.body, "
+    "a.aspect), ['well', 'badly']) AS s FROM reviews r JOIN aspects a "
     "ON AI_FILTER(PROMPT('Does {0} discuss {1}?', r.body, a.aspect))",
 )
 

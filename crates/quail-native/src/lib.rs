@@ -541,6 +541,7 @@ struct ContextFields {
     canvas_draws: i64,
     document_tokens: std::collections::BTreeMap<String, Vec<i64>>,
     plan: Option<serde_json::Value>,
+    attention: Option<String>,
 }
 
 /// Run one operator planning function of `quail/planner/operators` in Rust.
@@ -549,15 +550,28 @@ struct ContextFields {
 /// the function's other arguments. Returns (the result as JSON, None),
 /// or (None, the refusal's message).
 #[pyfunction]
+#[pyo3(signature = (name, context, arguments, tokenizer, decode=None))]
 fn plan_operator<'py>(
     py: Python<'py>,
     name: &str,
     context: &str,
     arguments: &str,
     tokenizer: Bound<'py, PyAny>,
+    decode: Option<Bound<'py, PyAny>>,
 ) -> PyResult<(Option<String>, Option<String>)> {
-    use quail_planner::{columns, costs, scores};
+    use quail_planner::{classify, columns, costs, scores};
     let tokens = python_tokenizer(py, &tokenizer);
+    let decoder = decode.as_ref().map(|decode| {
+        move |token: i64| -> Result<String, quail_planner::CompileError> {
+            decode
+                .call1((token,))
+                .and_then(|text| text.extract::<String>())
+                .map_err(|error| quail_planner::CompileError(error.value(py).to_string()))
+        }
+    });
+    let decoder_ref: Option<&quail_planner::lowering::Decoder> = decoder
+        .as_ref()
+        .map(|found| found as &quail_planner::lowering::Decoder);
     let fields: ContextFields = from_json(context)?;
     let context = quail_planner::context::PlanningContext {
         model: json_value(fields.model)?,
@@ -566,6 +580,8 @@ fn plan_operator<'py>(
         canvas_draws: fields.canvas_draws,
         document_tokens: fields.document_tokens,
         tokenizer: &tokens,
+        decode: decoder_ref,
+        attention: fields.attention,
         logical_plan: fields.plan.map(json_value).transpose()?,
     };
     let arguments: serde_json::Value = from_json(arguments)?;
@@ -648,6 +664,64 @@ fn plan_operator<'py>(
                     })
                     .collect::<Vec<_>>()
             }))
+        }
+        "classify_spec" | "classify_seconds" => {
+            let node: quail_planner::LogicalNode = json_value(get("node"))?;
+            let quail_planner::LogicalNode::SemanticClassify(column) = &node else {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "not a SemanticClassify",
+                ));
+            };
+            let call = quail_planner::nodes::column_call(column);
+            let alias = quail_planner::nodes::column_alias(column);
+            let rows = get("expected_rows").as_f64().unwrap_or_default();
+            if name == "classify_spec" {
+                lowering_result(classify::classify_spec(
+                    &context,
+                    call,
+                    &column.name,
+                    &alias,
+                    rows,
+                ))
+            } else {
+                lowering_result(classify::classify_seconds(
+                    &context,
+                    call,
+                    &column.name,
+                    &alias,
+                    get("resident").as_bool().unwrap_or_default(),
+                    rows,
+                ))
+            }
+        }
+        "choose_scoring" => {
+            let table: classify::ClassifyTable = json_value(get("table"))?;
+            let call: quail_physical::TaggedModelCall = json_value(get("call"))?;
+            let quail_physical::TaggedModelCall::Call(call) = &call;
+            lowering_result(table.choose_scoring(
+                &json_value(get("spec"))?,
+                call,
+                get("resident").as_bool().unwrap_or_default(),
+                &tokens,
+            ))
+        }
+        "classify_joined" => {
+            let table: classify::ClassifyTable = json_value(get("table"))?;
+            let call: quail_physical::TaggedModelCall = json_value(get("call"))?;
+            let quail_physical::TaggedModelCall::Call(call) = &call;
+            lowering_result(
+                table
+                    .classify_joined(
+                        call,
+                        get("name").as_str().unwrap_or_default(),
+                        get("partner").as_str().unwrap_or_default(),
+                        get("expected_rows").as_f64().unwrap_or_default(),
+                        get("partner_tokens").as_f64().unwrap_or_default(),
+                        get("anchors").as_f64(),
+                        &tokens,
+                    )
+                    .map(|(spec, work)| (spec, work_fields(&work))),
+            )
         }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "no operator planning function {other}"

@@ -6,7 +6,7 @@ use quail_cost::specs::{DeviceSpec, ModelSpec};
 
 use crate::expressions::CompileError;
 use crate::logical::LogicalPlan;
-use crate::lowering::{LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
+use crate::lowering::{Decoder, LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
 
 /// The model, device, table statistics, and tokenizer of one query's planning.
 pub struct PlanningContext<'a> {
@@ -18,6 +18,10 @@ pub struct PlanningContext<'a> {
     /// alias -> each document's token count.
     pub document_tokens: BTreeMap<String, Vec<i64>>,
     pub tokenizer: &'a Tokenizer<'a>,
+    /// The tokenizer's decode of one token, if it has one.
+    pub decode: Option<&'a Decoder<'a>>,
+    /// An attention path forced for every operator, "tree" or "unified".
+    pub attention: Option<String>,
     /// The logical plan being planned, if any.
     pub logical_plan: Option<LogicalPlan>,
 }

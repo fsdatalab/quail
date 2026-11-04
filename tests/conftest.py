@@ -61,6 +61,7 @@ def _rust_builder(monkeypatch):
         monkeypatch.setattr(planner, "spec", shadow_column_spec(
             _quail_native, planner.spec))
     from helpers.rust_builder import (
+        shadow_classify,
         shadow_filter_costs,
         shadow_join_specs,
         shadow_score_spec,
@@ -69,7 +70,15 @@ def _rust_builder(monkeypatch):
     import quail.planner.operators.filter as filter_module
     import quail.planner.operators.join as join_module
     import quail.planner.operators.score as score_module
+    from quail.planner.operators.classify import (
+        ClassifyBuilder,
+        ClassifyPlanner,
+        ClassifyScoring,
+    )
 
+    for owner, name, replacement in shadow_classify(
+            _quail_native, ClassifyPlanner, ClassifyScoring, ClassifyBuilder):
+        monkeypatch.setattr(owner, name, replacement)
     for owner, name, make in ((score_module, "score_spec", shadow_score_spec),
                               (filter_module, "prepare_filter_costs",
                                shadow_filter_costs),

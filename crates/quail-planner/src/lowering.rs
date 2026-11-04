@@ -15,6 +15,9 @@ use crate::prompts::{Turn, bind_classify_prompt, bind_join_prompt, bind_prompt, 
 /// Text -> token ids, without special tokens.
 pub type Tokenizer<'a> = dyn Fn(&str) -> Result<Vec<i64>, CompileError> + 'a;
 
+/// A token id -> its text, as a tokenizer's `decode` of one token.
+pub type Decoder<'a> = dyn Fn(i64) -> Result<String, CompileError> + 'a;
+
 /// AI.CLASSIFY's most labels; Jev's limit on one choice's options.
 pub const MAX_LETTERS: usize = 255;
 

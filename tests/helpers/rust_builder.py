@@ -371,17 +371,7 @@ def shadow_lowering(native, name, original):
             arguments = None
         if tokenizer is None:
             return original(*args, **kwargs)
-        table = {}
-
-        def intern(token):
-            # an integer id passes through; a test tokenizer's word gets
-            # an id past every real one
-            if isinstance(token, int) and not isinstance(token, bool):
-                return token
-            return table.setdefault(token, 1 << 40 | len(table))
-
-        def tokens(text):
-            return [intern(token) for token in tokenizer(text)]
+        intern, tokens, _ = _interning(tokenizer)
 
         if arguments is None:
             arguments = [_lowered_fields(lowered, intern), *(
@@ -452,24 +442,39 @@ def same_values(built, expected, path="") -> str | None:
 
 
 def _interning(tokenizer):
-    """(intern, tokens): a token's id, and the tokenizer with ids interned."""
-    table = {}
+    """Return a token's id, the tokenizer with ids interned, and a decoder.
+
+    The decoder is the tokenizer's decode of one interned id, or None.
+    """
+    table, words = {}, {}
 
     def intern(token):
         if isinstance(token, int) and not isinstance(token, bool):
             return token
-        return table.setdefault(token, 1 << 40 | len(table))
+        if token not in table:
+            table[token] = 1 << 40 | len(table)
+            words[table[token]] = token
+        return table[token]
 
     def tokens(text):
         return [intern(token) for token in tokenizer(text)]
 
-    return intern, tokens
+    decoder = getattr(tokenizer, "decode", None)
+    decode = None
+    if decoder is not None:
+        def decode(token):
+            piece = decoder([words.get(token, token)])
+            return (piece.decode("utf-8", errors="replace")
+                    if isinstance(piece, bytes) else str(piece))
+
+    return intern, tokens, decode
 
 
 def _token_fields(spec: dict, intern) -> dict:
     """A spec's token id fields with their ids interned."""
     out = dict(spec)
-    for key in ("prompt_token_parts", "label_token_ids", "question_header_token_ids"):
+    for key in ("prompt_token_parts", "label_token_ids", "question_header_token_ids",
+                "join_layout"):
         if key in out and out[key] is not None:
             out[key] = _interned(out[key], intern)
     return out
@@ -487,17 +492,18 @@ def _context_json(context) -> str:
                             for alias, values in context.document_tokens.items()},
         "plan": (None if context.logical_plan is None
                  else encode_value(context.logical_plan)),
+        "attention": context.attention,
     })
 
 
-def _plan_operator(native, name, context, arguments):
+def _plan_operator(native, name, context, arguments, tokenizer=None, interning=None):
     """(intern, the Rust result or None, its refusal or None)."""
-    intern, tokens = _interning(context.tokenizer)
+    intern, tokens, decode = interning or _interning(tokenizer or context.tokenizer)
     if os.environ.get("QUAIL_RUST_OPERATOR_LOG"):
         with open(os.environ["QUAIL_RUST_OPERATOR_LOG"], "a") as log:
             log.write(f"{name} {context.model.attention_mask}\n")
     rust, message = native.plan_operator(
-        name, _context_json(context), json.dumps(arguments), tokens)
+        name, _context_json(context), json.dumps(arguments), tokens, decode)
     return intern, (None if rust is None else json.loads(rust)), message
 
 
@@ -629,3 +635,116 @@ def shadow_join_specs(native, original):
 def _untagged_top(value: dict) -> dict:
     """An encoded dataclass without its own class tag."""
     return {key: item for key, item in value.items() if key != "type"}
+
+
+def _table_fields(table) -> dict:
+    """A ClassifyStatistics' fields, as the Rust ClassifyTable reads them."""
+    import numpy as np
+
+    return {
+        "alias": table.alias, "mean": float(table.mean), "longest": int(table.longest),
+        "budget": int(table.budget), "chunk": int(table.chunk),
+        "model": _untagged(encode_value(table.model)),
+        "device": _untagged(encode_value(table.device)),
+        "capacity": int(table.capacity), "draws": int(table.draws),
+        "lengths": np.asarray(table.lengths, dtype=float).tolist(),
+        "shared": [float(value) for value in table.shared],
+        "tree": bool(table.tree), "gpus": int(table.gpus),
+    }
+
+
+class _TableContext:
+    """The context fields a classification table's calls do not read."""
+
+    def __init__(self, table):
+        self.model, self.device, self.gpus = table.model, table.device, table.gpus
+        self.canvas_draws, self.document_tokens = 1, {}
+        self.logical_plan, self.attention = None, None
+        self.tokenizer = table.tokenizer
+
+
+def _spec_json(spec, intern) -> dict:
+    return _token_fields(json.loads(json.dumps(encode_value(spec))), intern)
+
+
+def shadow_classify(native, planner, scoring, builder):
+    """Patch the classification planner's methods to also run in Rust.
+
+    Args:
+        native: The _quail_native module.
+        planner: The ClassifyPlanner class.
+        scoring: The ClassifyScoring class.
+        builder: The ClassifyBuilder class.
+
+    Returns:
+        (attribute owner, name, replacement) for each method.
+    """
+    from quail.planner.validation import ClassifyRefusedError
+
+    def compare(name, context, arguments, call, expected_of, interning=None):
+        intern, rust, message = _plan_operator(native, name, context, arguments,
+                                               interning=interning)
+        try:
+            found = call()
+        except ClassifyRefusedError as error:
+            assert message == str(error), (
+                f"Rust {name} refused with {message!r}, Python with {error}")
+            raise
+        assert message is None, f"Rust {name} refused: {message}"
+        difference = same_values(rust, expected_of(found, intern))
+        assert difference is None, f"Rust {name} differs: {difference}"
+        return found
+
+    original_spec, original_seconds = planner.spec, planner.seconds
+    original_choose, original_joined = scoring.choose_scoring, builder.classify_joined
+
+    def spec(self, context, node, expected_rows, resident=False):
+        if context.tokenizer is None:
+            return original_spec(self, context, node, expected_rows, resident)
+        return compare(
+            "classify_spec", context,
+            {"node": encode_value(node), "expected_rows": float(expected_rows)},
+            lambda: original_spec(self, context, node, expected_rows, resident),
+            _spec_json)
+
+    def seconds(self, context, node, resident, expected_rows):
+        if context.tokenizer is None:
+            return original_seconds(self, context, node, resident, expected_rows)
+        intern, rust, message = _plan_operator(
+            native, "classify_seconds", context,
+            {"node": encode_value(node), "expected_rows": float(expected_rows),
+             "resident": resident})
+        found = original_seconds(self, context, node, resident, expected_rows)
+        assert message is None, f"Rust classify_seconds refused: {message}"
+        rust = float("inf") if rust is None else rust
+        assert same_values(rust, float(found)) is None or rust == found, (
+            f"Rust classify_seconds {rust} != Python {found}")
+        return found
+
+    def choose_scoring(self, spec, call, resident):
+        context = _TableContext(self)
+        interning = _interning(self.tokenizer)
+        return compare(
+            "choose_scoring", context,
+            {"table": _table_fields(self), "spec": _spec_json(spec, interning[0]),
+             "call": encode_value(call), "resident": resident},
+            lambda: original_choose(self, spec, call, resident), _spec_json,
+            interning)
+
+    def classify_joined(self, call, name, partner, expected_rows, partner_tokens,
+                        anchors=None):
+        context = _TableContext(self)
+        return compare(
+            "classify_joined", context,
+            {"table": _table_fields(self), "call": encode_value(call), "name": name,
+             "partner": partner, "expected_rows": float(expected_rows),
+             "partner_tokens": float(partner_tokens),
+             "anchors": None if anchors is None else float(anchors)},
+            lambda: original_joined(self, call, name, partner, expected_rows,
+                                    partner_tokens, anchors),
+            lambda found, intern: [_spec_json(found[0], intern),
+                                   _work_fields(found[1])])
+
+    return ((planner, "spec", spec), (planner, "seconds", seconds),
+            (scoring, "choose_scoring", choose_scoring),
+            (builder, "classify_joined", classify_joined))
