@@ -32,12 +32,25 @@ def _rust_builder(monkeypatch):
         _quail_native, PromptBinder.bind))
     monkeypatch.setattr(frontend, "place_relation", shadow_place_relation(
         _quail_native, frontend.place_relation))
-    from helpers.rust_builder import checked_compile_sql, shadow_logical_alternatives
+    from helpers.rust_builder import (
+        LOWERING_FUNCTIONS,
+        checked_compile_sql,
+        shadow_logical_alternatives,
+        shadow_lowering,
+    )
 
     import quail.api.query as query_module
     import quail.api.session as session_module
     import quail.planner.optimize as optimize_module
+    import quail.planner.prompt_lowering as lowering_module
 
+    for name in LOWERING_FUNCTIONS:
+        original = getattr(lowering_module, name)
+        shadow = shadow_lowering(_quail_native, name, original)
+        for module in [module for key, module in list(sys.modules.items())
+                       if key.startswith("quail.") and module is not None]:
+            if getattr(module, name, None) is original:
+                monkeypatch.setattr(module, name, shadow)
     for module in (query_module, optimize_module):
         monkeypatch.setattr(module, "logical_alternatives", shadow_logical_alternatives(
             _quail_native, module.logical_alternatives))

@@ -450,6 +450,87 @@ fn logical_alternatives(
     }
 }
 
+/// A Rust tokenizer that calls a Python callable text -> token ids.
+fn python_tokenizer<'py>(
+    py: Python<'py>,
+    tokenizer: &'py Bound<'py, PyAny>,
+) -> impl Fn(&str) -> Result<Vec<i64>, quail_planner::CompileError> + 'py {
+    move |text: &str| {
+        tokenizer
+            .call1((text,))
+            .and_then(|ids| ids.extract::<Vec<i64>>())
+            .map_err(|error| quail_planner::CompileError(error.value(py).to_string()))
+    }
+}
+
+/// Serialize a lowering result: (JSON, None), or (None, the error's message).
+fn lowering_result<T: serde::Serialize>(
+    found: Result<T, quail_planner::CompileError>,
+) -> PyResult<(Option<String>, Option<String>)> {
+    match found {
+        Ok(value) => Ok((
+            Some(
+                serde_json::to_string(&value)
+                    .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?,
+            ),
+            None,
+        )),
+        Err(error) => Ok((None, Some(error.0))),
+    }
+}
+
+fn from_json<T: serde::de::DeserializeOwned>(text: &str) -> PyResult<T> {
+    serde_json::from_str(text)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+/// Run one function of `quail/planner/prompt_lowering.py` in Rust.
+///
+/// `name` is the function; `arguments` its JSON-encoded arguments other
+/// than the tokenizer. Returns (the result as JSON, None), or (None, the
+/// error's message).
+#[pyfunction]
+fn prompt_lowering<'py>(
+    py: Python<'py>,
+    name: &str,
+    arguments: &str,
+    tokenizer: Bound<'py, PyAny>,
+) -> PyResult<(Option<String>, Option<String>)> {
+    use quail_planner::lowering as lower;
+    let tokens = python_tokenizer(py, &tokenizer);
+    let arguments: serde_json::Value = from_json(arguments)?;
+    let get = |index: usize| arguments[index].to_string();
+    match name {
+        "lower_prompt" => lowering_result(lower::lower_prompt(&from_json(&get(0))?, &tokens)),
+        "score_token_parts" => lowering_result(lower::score_token_parts(
+            &from_json(&get(0))?,
+            &from_json(&get(1))?,
+            &tokens,
+        )),
+        "answer_ids" => lowering_result(lower::answer_ids(&from_json(&get(0))?, &tokens)),
+        "option_spellings" => lowering_result(lower::option_spellings(
+            &from_json::<Vec<String>>(&get(0))?,
+            &tokens,
+        )),
+        "read_slot_offsets" => lowering_result(lower::read_slot_offsets(
+            &from_json::<String>(&get(0))?,
+            &from_json::<Vec<String>>(&get(1))?,
+            &tokens,
+        )),
+        "classify_prompt_tokens" => lowering_result(lower::classify_prompt_tokens(
+            &from_json(&get(0))?,
+            &from_json::<Vec<String>>(&get(1))?,
+            &tokens,
+        )),
+        "choice_token_parts" => {
+            lowering_result(lower::choice_token_parts(&from_json(&get(0))?, &tokens))
+        }
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "no prompt lowering function {other}"
+        ))),
+    }
+}
+
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContext>()?;
@@ -459,5 +540,6 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_select, module)?)?;
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;
     module.add_function(wrap_pyfunction!(logical_alternatives, module)?)?;
+    module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }

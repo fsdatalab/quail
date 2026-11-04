@@ -1959,6 +1959,7 @@ dependencies = [
  "quail-datafusion",
  "quail-physical",
  "quail-planner",
+ "serde",
  "serde_json",
  "tokio",
 ]

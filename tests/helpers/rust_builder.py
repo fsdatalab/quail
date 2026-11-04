@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 
 from quail.common.expressions import And, CompileError
 from quail.logical.naive import Exists, Hint, _equalities, _scans
@@ -302,3 +303,112 @@ def shadow_logical_alternatives(native, original):
         return found
 
     return logical_alternatives
+
+
+# The prompt_lowering functions repeated in Rust, by name.
+LOWERING_FUNCTIONS = ("lower_prompt", "score_token_parts", "answer_ids",
+                      "option_spellings", "read_slot_offsets",
+                      "classify_prompt_tokens", "choice_token_parts")
+
+
+def _lowered_fields(lowered, intern):
+    """A LoweredPrompt as the Rust type writes it, its tokens interned."""
+    return {
+        "prompt": json.loads(json.dumps(encode_value(lowered.prompt))),
+        "preamble_token_ids": [intern(t) for t in lowered.preamble_token_ids],
+        "tail_token_ids": [intern(t) for t in lowered.tail_token_ids],
+        "frame_tokens": lowered.frame_tokens,
+        "label_token_ids": [
+            [alias, [intern(t) for t in label], [intern(t) for t in frame]]
+            for alias, label, frame in lowered.label_token_ids],
+        "lettered": (None if lowered.lettered is None
+                     else _lowered_fields(lowered.lettered, intern)),
+    }
+
+
+def _model_fields(model) -> dict:
+    return {"role": model.role,
+            "answer_spellings": [list(words) for words in model.answer_spellings],
+            "turn": list(model.turn), "prompt_layout": model.prompt_layout}
+
+
+def _interned(value, intern):
+    """Every token id in a nested result, interned."""
+    if isinstance(value, (list, tuple)):
+        return [_interned(item, intern) for item in value]
+    if isinstance(value, (int, str)) and not isinstance(value, bool):
+        return intern(value)
+    return value
+
+
+def shadow_lowering(native, name, original):
+    """Return a prompt_lowering function that also runs in Rust.
+
+    The tokenizer's tokens are interned to integers on both sides, so a
+    test tokenizer that returns words compares as one returning ids.
+    """
+    from quail.common.expressions import CompileError as Refused
+
+    def lowering(*args, **kwargs):
+        if name == "lower_prompt":
+            prompt, tokenizer = args
+            arguments = [encode_value(prompt)]
+        elif name == "score_token_parts":
+            prompt, model, tokenizer = args
+            arguments = [encode_value(prompt), _model_fields(model)]
+        elif name == "answer_ids":
+            model, tokenizer = args
+            arguments = [_model_fields(model)]
+        elif name in ("option_spellings",):
+            codes, tokenizer = args
+            arguments = [list(codes)]
+        elif name == "read_slot_offsets":
+            segment, names, tokenizer = args
+            arguments = [segment, list(names)]
+        else:
+            lowered, *rest = args
+            tokenizer = rest[-1]
+            arguments = None
+        if tokenizer is None:
+            return original(*args, **kwargs)
+        table = {}
+
+        def intern(token):
+            # an integer id passes through; a test tokenizer's word gets
+            # an id past every real one
+            if isinstance(token, int) and not isinstance(token, bool):
+                return token
+            return table.setdefault(token, 1 << 40 | len(table))
+
+        def tokens(text):
+            return [intern(token) for token in tokenizer(text)]
+
+        if arguments is None:
+            arguments = [_lowered_fields(lowered, intern), *(
+                [list(rest[0])] if name == "classify_prompt_tokens" else [])]
+        rust, message = native.prompt_lowering(name, json.dumps(arguments), tokens)
+        if os.environ.get("QUAIL_RUST_LOWERING_LOG"):
+            with open(os.environ["QUAIL_RUST_LOWERING_LOG"], "a") as log:
+                log.write(f"{name} {getattr(args[0], 'kind', '')}\n")
+        try:
+            found = original(*args, **kwargs)
+        except (Refused, ValueError) as error:
+            assert message is not None, f"Rust {name} did not refuse: {error}"
+            raise
+        assert message is None, f"Rust {name} refused: {message}"
+        expected = (_lowered_fields(found, intern) if name == "lower_prompt"
+                    else _interned(found, intern))
+        built = json.loads(rust)
+        if name == "lower_prompt":
+            assert built == expected, (
+                f"Rust lowered another prompt: {first_difference(built, expected)}")
+        elif name == "answer_ids":
+            # each side is sorted by token id, and a word's id is made up
+            assert [set(side) for side in built] == [set(side) for side in expected], (
+                f"Rust answer_ids differs: {built} != {expected}")
+        else:
+            assert _interned(built, lambda token: token) == expected, (
+                f"Rust {name} differs: {built} != {expected}")
+        return found
+
+    return lowering
