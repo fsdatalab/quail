@@ -265,16 +265,21 @@ impl NativeContext {
     /// `turn` and `layout` are the model's chat-turn text and prompt
     /// layout.
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (query, turn, layout, dialect=None))]
     fn logical_plans(
         &self,
         py: Python<'_>,
         query: &str,
         turn: (String, String),
         layout: &str,
+        dialect: Option<String>,
     ) -> PyResult<(Vec<(Option<String>, Option<String>)>, bool)> {
         py.detach(|| {
             self.runtime.block_on(async {
-                let plan = sql(&self.context, query).await?.into_optimized_plan()?;
+                let plan =
+                    quail_datafusion::sql_in_dialect(&self.context, query, dialect.as_deref())
+                        .await?
+                        .into_optimized_plan()?;
                 let mut bound = Vec::new();
                 plan.apply(|node| {
                     if let LogicalPlan::Extension(extension) = node

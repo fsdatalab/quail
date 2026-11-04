@@ -331,3 +331,73 @@ mod tests {
         assert_eq!(normalize_ai_calls(sql), sql);
     }
 }
+
+/// Write each `{'key': value, ...}` literal outside quotes as
+/// `named_struct('key', value, ...)`.
+///
+/// DataFusion reads the brace literal in the Snowflake dialect only;
+/// the front end also takes it in BigQuery SQL, as the questions of an
+/// `AI.EXTRACT`.
+pub fn brace_structs(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    // per open brace, the parentheses opened inside it
+    let mut braces: Vec<usize> = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(open) = quote {
+            out.push(c);
+            if c == open {
+                if chars.peek() == Some(&open) {
+                    out.push(chars.next().expect("a doubled quote"));
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            '{' => {
+                braces.push(0);
+                out.push_str("named_struct(");
+            }
+            '}' if !braces.is_empty() => {
+                braces.pop();
+                out.push(')');
+            }
+            '(' => {
+                if let Some(depth) = braces.last_mut() {
+                    *depth += 1;
+                }
+                out.push(c);
+            }
+            ')' => {
+                if let Some(depth) = braces.last_mut() {
+                    *depth = depth.saturating_sub(1);
+                }
+                out.push(c);
+            }
+            ':' if braces.last() == Some(&0) => out.push(','),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod brace_tests {
+    use super::brace_structs;
+
+    #[test]
+    fn a_brace_literal_becomes_a_named_struct_outside_quotes() {
+        assert_eq!(
+            brace_structs("AI.EXTRACT(c.text, {'terms': 'Why: {0}?', 'n': f(a, b)})"),
+            "AI.EXTRACT(c.text, named_struct('terms', 'Why: {0}?', 'n', f(a, b)))"
+        );
+        assert_eq!(brace_structs("SELECT 'it''s {x}'"), "SELECT 'it''s {x}'");
+    }
+}

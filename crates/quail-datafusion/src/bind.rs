@@ -55,6 +55,18 @@ pub fn bind_region(
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
     let (place, project, stages) = bind_with_stages(plan, turn, layout)?;
     let built = build_select(place, &project)?;
+    if has_subqueries(plan) {
+        let asks = |root: &LogicalNode| {
+            let stage = quail_planner::LogicalPlan { root: root.clone() };
+            !quail_planner::plan_statistics::plan_prompts(&quail_planner::operators::operators(
+                &stage,
+            ))
+            .is_empty()
+        };
+        if !asks(&built.root) && !stages.iter().any(|(_, root)| asks(root)) {
+            return compile_error("the query has no AI predicate");
+        }
+    }
     if stages.is_empty() {
         return Ok(built);
     }
@@ -91,7 +103,16 @@ fn bind_with_stages(
     turn: &Turn,
     layout: &str,
 ) -> Result<(PlaceRelationArguments, ProjectArguments, Vec<Stage>), CompileError> {
+    let staged_query = has_subqueries(plan);
+    let (merged, lifted) = merge_join_subqueries(plan)?;
+    let plan = &merged;
     let mut select = Select::read(plan)?;
+    if !lifted.is_empty() {
+        // a merged subquery's WHERE runs before its reader's
+        let mut terms = lifted;
+        terms.extend(select.condition.take());
+        select.condition = terms.into_iter().reduce(Expr::and);
+    }
     let unnests = select.take_unnests();
     let mut binder = Binder {
         turn: turn.clone(),
@@ -105,6 +126,8 @@ fn bind_with_stages(
         selected: Vec::new(),
         outputs: select.outputs.clone(),
         stages: Vec::new(),
+        stage_schemas: Vec::new(),
+        allow_relational: staged_query,
     };
     binder.selected = select
         .projection
@@ -791,6 +814,11 @@ struct Binder {
     outputs: Vec<(String, Expr)>,
     /// The stages FROM reads, in dependency order.
     stages: Vec<Stage>,
+    /// Each stage's result schema, by its name.
+    stage_schemas: Vec<(String, SchemaRef)>,
+    /// Whether a SELECT with no model call is allowed: in a statement
+    /// with a CTE or FROM subquery, as the front end allows it.
+    allow_relational: bool,
 }
 
 /// A join's ON parts before they join the query's parts.
@@ -862,9 +890,7 @@ impl Binder {
             body => (reference.clone(), body),
         };
         // a CTE two queries read runs once
-        if self.stages.iter().any(|(found, _)| *found == name)
-            && let Some(schema) = self.schemas.get(&name)
-        {
+        if let Some((_, schema)) = self.stage_schemas.iter().find(|(found, _)| *found == name) {
             return Ok(Some((reference, name, schema.clone())));
         }
         if self.provider_named(&name) {
@@ -878,6 +904,7 @@ impl Binder {
         let schema = stage_schema(body)?;
         self.stages.extend(inner);
         self.stages.push((name.clone(), built.root));
+        self.stage_schemas.push((name.clone(), schema.clone()));
         Ok(Some((reference, name, schema)))
     }
 
@@ -2388,7 +2415,7 @@ impl Binder {
                 .iter()
                 .map(|(call, name)| (TaggedModelCall::Call(call.clone()), name.clone()))
                 .collect(),
-            allow_relational: false,
+            allow_relational: self.allow_relational,
         }
     }
 }
@@ -3315,5 +3342,152 @@ fn stage_schema(body: &LogicalPlan) -> Result<SchemaRef, CompileError> {
     }
     Ok(std::sync::Arc::new(
         datafusion::arrow::datatypes::Schema::new(fields),
+    ))
+}
+
+/// Whether a plan reads a CTE or a FROM subquery.
+fn has_subqueries(plan: &LogicalPlan) -> bool {
+    plan.exists(|node| {
+        Ok(matches!(node, LogicalPlan::SubqueryAlias(alias)
+            if !matches!(alias.input.as_ref(), LogicalPlan::TableScan(_))))
+    })
+    .unwrap_or(false)
+}
+
+/// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,
+/// or the subquery itself.
+fn subquery_body(alias: &datafusion::logical_expr::SubqueryAlias) -> (String, &LogicalPlan) {
+    match alias.input.as_ref() {
+        LogicalPlan::SubqueryAlias(cte) => (cte.alias.table().to_string(), cte.input.as_ref()),
+        body => (alias.alias.table().to_string(), body),
+    }
+}
+
+/// A merged JOIN input: its alias, each column's expression, the table it
+/// reads, and its WHERE condition.
+type Merged = (String, Vec<(String, Expr)>, LogicalPlan, Option<Expr>);
+
+/// Merge each JOIN input that is a subquery reading one table, selecting
+/// and filtering it without a model call, into the query that reads it,
+/// as sqlglot's `merge_subqueries` does.
+///
+/// For example, `FROM contracts a JOIN kept b ON AI.IF(...b.text...)`,
+/// with `kept` as `SELECT c.id, c.text FROM contracts c WHERE AI.IF(...)`,
+/// reads as `FROM contracts a JOIN contracts c ON AI.IF(...c.text...)`
+/// with the subquery's WHERE. A subquery read more than once, or one
+/// that calls an AI function in its SELECT list, is left for a stage.
+///
+/// Returns:
+///     The rewritten plan and the merged subqueries' WHERE conditions,
+///     to run before the query's own.
+fn merge_join_subqueries(plan: &LogicalPlan) -> Result<(LogicalPlan, Vec<Expr>), CompileError> {
+    use datafusion::common::tree_node::Transformed;
+    let mut readers: BTreeMap<String, usize> = BTreeMap::new();
+    let _ = plan.apply(|node| {
+        // each read of a CTE is one copy of its body under the CTE's name
+        if let LogicalPlan::SubqueryAlias(alias) = node
+            && !matches!(
+                alias.input.as_ref(),
+                LogicalPlan::TableScan(_) | LogicalPlan::SubqueryAlias(_)
+            )
+        {
+            *readers.entry(alias.alias.table().to_string()).or_default() += 1;
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    });
+    // the join inputs to merge: alias -> (its columns' expressions, its base, its WHERE)
+    let mut merged: Vec<Merged> = Vec::new();
+    let _ = plan.apply(|node| {
+        let LogicalPlan::Join(join) = node else {
+            return Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue);
+        };
+        for side in [join.left.as_ref(), join.right.as_ref()] {
+            let LogicalPlan::SubqueryAlias(alias) = side else {
+                continue;
+            };
+            let (name, body) = subquery_body(alias);
+            let LogicalPlan::Projection(projection) = body else {
+                continue;
+            };
+            let (base, condition) = match projection.input.as_ref() {
+                LogicalPlan::Filter(filter) => {
+                    (filter.input.as_ref(), Some(filter.predicate.clone()))
+                }
+                other => (other, None),
+            };
+            let is_table = matches!(base, LogicalPlan::SubqueryAlias(found)
+                if matches!(found.input.as_ref(), LogicalPlan::TableScan(_)));
+            if !is_table
+                || readers.get(&name).copied().unwrap_or(0) > 1
+                || projection.expr.iter().any(contains_ai_call)
+            {
+                continue;
+            }
+            let columns = projection
+                .expr
+                .iter()
+                .map(|expr| (output_name(expr), unalias(expr).0.clone()))
+                .collect();
+            merged.push((
+                alias.alias.table().to_string(),
+                columns,
+                base.clone(),
+                condition,
+            ));
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    });
+    if merged.is_empty() {
+        return Ok((plan.clone(), Vec::new()));
+    }
+    let substitute = |expr: Expr| -> Expr {
+        expr.clone()
+            .transform_up(|node| {
+                if let Expr::Column(column) = &node
+                    && let Some(relation) = &column.relation
+                    && let Some((_, columns, _, _)) = merged
+                        .iter()
+                        .find(|(alias, _, _, _)| alias == relation.table())
+                    && let Some((_, definition)) =
+                        columns.iter().find(|(name, _)| *name == column.name)
+                {
+                    return Ok(Transformed::yes(definition.clone()));
+                }
+                Ok(Transformed::no(node))
+            })
+            .map(|found| found.data)
+            .unwrap_or(expr)
+    };
+    let rewritten = plan
+        .clone()
+        .transform_up(|node| {
+            if let LogicalPlan::SubqueryAlias(alias) = &node
+                && let Some((_, _, base, _)) = merged
+                    .iter()
+                    .find(|(name, _, _, _)| name == alias.alias.table())
+            {
+                return Ok(Transformed::yes(base.clone()));
+            }
+            let node = node
+                .map_expressions(|expr| {
+                    let before = expr.clone();
+                    let after = substitute(expr);
+                    Ok(if after == before {
+                        Transformed::no(after)
+                    } else {
+                        Transformed::yes(after)
+                    })
+                })?
+                .data;
+            Ok(Transformed::yes(node.recompute_schema()?))
+        })
+        .map(|found| found.data)
+        .map_err(|error| CompileError::new(error.to_string()))?;
+    Ok((
+        rewritten,
+        merged
+            .into_iter()
+            .filter_map(|(_, _, _, condition)| condition)
+            .collect(),
     ))
 }

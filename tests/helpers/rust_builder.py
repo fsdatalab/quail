@@ -162,7 +162,11 @@ def _schemas_as_text(value):
     return value
 
 
-def rust_logical_plans(native, sql, catalog, prompts):
+# a front end dialect -> DataFusion's name for it
+DATAFUSION_DIALECTS = {"snowflake": "Snowflake", "bq": "BigQuery"}
+
+
+def rust_logical_plans(native, sql, catalog, prompts, dialect="snowflake"):
     """Bind a query with DataFusion and the Rust binder: (results, whole)."""
     import pyarrow as pa
 
@@ -182,13 +186,15 @@ def rust_logical_plans(native, sql, catalog, prompts):
     model = prompts.model
     turn = prompts.turn if model is None else model.turn
     layout = prompts.layout if model is None else model.prompt_layout
-    return context.logical_plans(sql, tuple(turn), layout)
+    return context.logical_plans(sql, tuple(turn), layout,
+                                 DATAFUSION_DIALECTS[str(dialect).lower()])
 
 
-def binder_outcome(native, sql, catalog, prompts, plan, message) -> str:
+def binder_outcome(native, sql, catalog, prompts, plan, message,
+                   dialect="snowflake") -> str:
     """One line on how the Rust binder's plan compares with Python's."""
     try:
-        results, whole = rust_logical_plans(native, sql, catalog, prompts)
+        results, whole = rust_logical_plans(native, sql, catalog, prompts, dialect)
     except Exception as error:  # noqa: BLE001 - every failure is an outcome
         return f"datafusion error: {str(error).splitlines()[0][:200]}"
     if len(results) != 1 or not whole:
@@ -241,8 +247,9 @@ def checked_compile_sql(native, original, path=None):
             message = str(error)
             raise
         finally:
-            if str(dialect).lower().endswith("snowflake"):
-                outcome = binder_outcome(native, sql, catalog, binder, plan, message)
+            if str(dialect).lower() in DATAFUSION_DIALECTS:
+                outcome = binder_outcome(native, sql, catalog, binder, plan, message,
+                                         str(dialect).lower())
                 if path:
                     staged = plan is not None and isinstance(plan.root, WithCTE)
                     with open(path, "a") as log:

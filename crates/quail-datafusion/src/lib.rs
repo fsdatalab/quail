@@ -41,7 +41,8 @@ pub use aliases::{
 pub use claim::ClaimModelRegions;
 pub use exec::{ModelRegionExec, ModelRegionPlanner, RegionRunner};
 pub use functions::{
-    AI_FUNCTION_NAMES, arrow_functions, is_ai_call, normalize_ai_calls, quail_functions,
+    AI_FUNCTION_NAMES, arrow_functions, brace_structs, is_ai_call, normalize_ai_calls,
+    quail_functions,
 };
 pub use region::ModelRegion;
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
@@ -95,9 +96,34 @@ pub fn session_context(runner: Arc<dyn RegionRunner>) -> SessionContext {
 /// [`add_extract_spans`]), and `SELECT` aliases named in `WHERE` are
 /// replaced by their expressions (see [`inline_select_aliases`]).
 pub async fn sql(context: &SessionContext, query: &str) -> Result<DataFrame> {
-    let state = context.state();
-    let dialect = state.config().options().sql_parser.dialect;
-    let mut statement = state.sql_to_statement(&normalize_ai_calls(query), &dialect)?;
+    sql_in_dialect(context, query, None).await
+}
+
+/// Plan a SQL query as [`sql`] does, read in `dialect` (a DataFusion
+/// dialect name, such as `BigQuery`) instead of the session's.
+pub async fn sql_in_dialect(
+    context: &SessionContext,
+    query: &str,
+    dialect: Option<&str>,
+) -> Result<DataFrame> {
+    let mut state = context.state();
+    let dialect = match dialect {
+        Some(name) => name.parse()?,
+        None => state.config().options().sql_parser.dialect,
+    };
+    if matches!(dialect, datafusion::config::Dialect::BigQuery) {
+        // BigQuery sorts NULLs first in ascending order, as the front end reads it
+        state
+            .config_mut()
+            .options_mut()
+            .sql_parser
+            .default_null_ordering = "nulls_min".to_string();
+    }
+    let mut text = normalize_ai_calls(query);
+    if matches!(dialect, datafusion::config::Dialect::BigQuery) {
+        text = brace_structs(&text);
+    }
+    let mut statement = state.sql_to_statement(&text, &dialect)?;
     if let Statement::Statement(inner) = &mut statement {
         take_unnests(inner);
         positional_ai_arguments(inner);
