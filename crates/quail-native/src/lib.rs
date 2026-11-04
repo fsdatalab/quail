@@ -416,6 +416,40 @@ fn bind_prompt(
     }
 }
 
+/// Apply the built-in logical rules, as `logical_alternatives` does.
+///
+/// Returns ([(plan JSON, rule names), ...], None), or ([], the
+/// CompileError's message). `id_columns` maps each provider to its id
+/// column, or is None without a catalog.
+#[pyfunction]
+#[pyo3(signature = (plan, rules, id_columns=None))]
+#[allow(clippy::type_complexity)]
+fn logical_alternatives(
+    plan: &str,
+    rules: Vec<String>,
+    id_columns: Option<std::collections::BTreeMap<String, String>>,
+) -> PyResult<(Vec<(String, Vec<String>)>, Option<String>)> {
+    let invalid =
+        |error: serde_json::Error| pyo3::exceptions::PyValueError::new_err(error.to_string());
+    let plan = quail_planner::read_logical_plan(plan).map_err(invalid)?;
+    let context = quail_planner::rules::RuleContext { id_columns };
+    match quail_planner::rules::logical_alternatives(plan, &rules, &context) {
+        Ok(found) => Ok((
+            found
+                .into_iter()
+                .map(|alternative| {
+                    Ok((
+                        quail_planner::write_logical_plan(&alternative.plan).map_err(invalid)?,
+                        alternative.rules,
+                    ))
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+            None,
+        )),
+        Err(error) => Ok((Vec::new(), Some(error.0))),
+    }
+}
+
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContext>()?;
@@ -424,5 +458,6 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(build_select, module)?)?;
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;
+    module.add_function(wrap_pyfunction!(logical_alternatives, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }

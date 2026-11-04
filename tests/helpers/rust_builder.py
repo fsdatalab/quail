@@ -265,3 +265,40 @@ def checked_compile_sql(native, original, path=None):
         return plan
 
     return compile_sql
+
+
+def shadow_logical_alternatives(native, original):
+    """Return logical_alternatives, also applying the rules in Rust.
+
+    Rules other than the built-in ones are Python's alone; a call with
+    one is not compared.
+    """
+    from quail.planner.optimizer.rules import LogicalRule
+    from quail.planner.rules import logical as built_in
+
+    classes = {getattr(built_in, name) for name in dir(built_in)
+               if name.startswith("Should")}
+
+    def logical_alternatives(plan, rules, context, **options):
+        found = original(plan, rules, context, **options)
+        used = [rule for rule in rules if isinstance(rule, LogicalRule)]
+        if options or any(type(rule) not in classes for rule in used):
+            return found
+        catalog = context.catalog
+        id_columns = (None if catalog is None else {
+            name: provider.id_col for name, provider in catalog.providers.items()
+            if hasattr(provider, "id_col")})
+        built, message = native.logical_alternatives(
+            json.dumps(encode_value(plan)), [rule.name for rule in used], id_columns)
+        assert message is None, f"the Rust rules refused: {message}"
+        built = [(json.loads(text), list(names)) for text, names in built]
+        expected = [(json.loads(json.dumps(encode_value(alternative.plan))),
+                     list(alternative.rules)) for alternative in found]
+        assert [names for _, names in built] == [names for _, names in expected], (
+            "the Rust rules made other alternatives")
+        for (mine, _), (theirs, _) in zip(built, expected):
+            difference = first_difference(mine, theirs)
+            assert mine == theirs, f"the Rust rules rewrote another plan: {difference}"
+        return found
+
+    return logical_alternatives
