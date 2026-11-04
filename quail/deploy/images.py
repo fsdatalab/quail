@@ -71,12 +71,16 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
             .add_local_file(REPOSITORY / "Cargo.lock", f"{NATIVE_SOURCE}/Cargo.lock",
                             copy=True)
             .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True)
+            .uv_pip_install(MATURIN, uv_version=UV_VERSION)
             .run_commands(
                 f"cd {NATIVE_SOURCE} && PATH=$HOME/.cargo/bin:$PATH "
-                f"python -m pip install '{MATURIN}' && PATH=$HOME/.cargo/bin:$PATH "
                 f"maturin build --release -m crates/quail-native/Cargo.toml "
                 f"-o {NATIVE_SOURCE}/wheels",
-                f"python -m pip install {NATIVE_SOURCE}/wheels/quail_native-*.whl",
+                # the image's environment has no pip; a wheel is a zip archive
+                "python -c \"import glob, sysconfig, zipfile; "
+                "zipfile.ZipFile(glob.glob("
+                f"'{NATIVE_SOURCE}/wheels/quail_native-*.whl')[0]).extractall("
+                "sysconfig.get_paths()['platlib'])\"",
                 "python -c 'import _quail_native'"))
 
 
