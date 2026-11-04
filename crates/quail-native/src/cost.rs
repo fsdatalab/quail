@@ -7,8 +7,10 @@ use std::path::Path;
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use quail_cost::classify::{self, ClassifyInputs};
 use quail_cost::decode::DecodeCost;
 use quail_cost::draft_policy::DraftPolicy;
+use quail_cost::labels;
 use quail_cost::quantity::{Quantity, numpy_sum};
 use quail_cost::sae_features::SaeFeaturesCost;
 use quail_cost::score::ScoreCost;
@@ -61,6 +63,9 @@ type ScaledStats = (i64, i64, i128, Vec<(i64, i64)>);
 /// An `AliasStats`'s mean, variance, window pairs, window reads, and
 /// its scaling.
 type StatsValues = (f64, f64, f64, f64, ScaledStats);
+
+/// Read nodes, fed nodes, and each label's decode round tokens.
+type LabelNodes = (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<Vec<i64>>);
 
 /// One component's name, FLOPs, and bytes moved.
 type ComponentCounts<'py> = (String, Bound<'py, PyAny>, Bound<'py, PyAny>);
@@ -733,6 +738,64 @@ impl CostModel {
         };
         let (work, seconds) = cost.estimate(expected_rows, resident);
         Ok((work_to(py, &work)?, seconds))
+    }
+
+    /// The label trie helpers: the read nodes, the fed nodes, and the
+    /// decode round tokens, as sorted lists.
+    #[staticmethod]
+    fn label_nodes(labels: Vec<Vec<i64>>, starts: Vec<Vec<bool>>) -> PyResult<LabelNodes> {
+        let read = labels::read_nodes(&labels, &starts).map_err(PyValueError::new_err)?;
+        let fed = labels::fed_nodes(&read);
+        let rounds = labels::decode_round_tokens(&labels).map_err(PyValueError::new_err)?;
+        Ok((
+            read.into_iter().collect(),
+            fed.into_iter().collect(),
+            rounds,
+        ))
+    }
+
+    /// `quail.cost.classify.estimate`: seconds, passes, the work's
+    /// fields, suffix tokens, and rounds.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_estimate<'py>(
+        &self,
+        py: Python<'py>,
+        scoring: &str,
+        expected_rows: f64,
+        head_tokens: i64,
+        frame_tokens: i64,
+        labels: Vec<Vec<i64>>,
+        lengths: Vec<f64>,
+        shared: Vec<f64>,
+        chunk: i64,
+        model: &str,
+        device: &str,
+        resident: bool,
+        draws: i64,
+        starts: Vec<Vec<bool>>,
+        gpus: i64,
+    ) -> PyResult<(f64, f64, Bound<'py, PyDict>, f64, usize)> {
+        let inputs = ClassifyInputs {
+            head_tokens,
+            frame_tokens,
+            expected_rows,
+            lengths: &lengths,
+            shared: &shared,
+            chunk,
+            model: self.model(model)?,
+            device: self.device(device)?,
+            resident,
+            gpus,
+        };
+        let cost = classify::estimate(&inputs, scoring, &labels, draws, &starts)
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            cost.seconds,
+            cost.passes,
+            work_to(py, &cost.work)?,
+            cost.suffix_tokens,
+            cost.rounds,
+        ))
     }
 
     /// `float(np.sum(values))`, as the Rust port rounds it.

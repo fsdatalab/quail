@@ -17,14 +17,17 @@
 //! | `retention` | `quail/common/retention.py` |
 //! | `decode` | `quail/common/decode.py`, the planner's part |
 //! | `statistics` | `AliasStats` in `quail/planner/statistics/tables.py` |
-//! | `filters`, `packing`, `score`, `sae_features` | the same modules of `quail/cost` |
+//! | `filters`, `packing`, `score`, `sae_features`, `classify` | the same modules of `quail/cost` |
+//! | `labels` | `quail/labels.py`, the trie the costs read |
 
 pub mod answers;
 pub mod budgets;
+pub mod classify;
 pub mod decode;
 pub mod dense_decoder_cost;
 pub mod draft_policy;
 pub mod filters;
+pub mod labels;
 pub mod packing;
 pub mod quantity;
 pub mod retention;

@@ -401,3 +401,54 @@ def test_the_filter_score_and_feature_costs_are_the_same(rust):
                 lambda *values: choose_pass_groups(
                     *values, model, device, chunk, set_size=3, header=header),
                 *arguments)
+
+
+# label token ids: one token each; shared prefixes; a label that ends
+# where another continues
+LABEL_SETS = (
+    [[11], [12], [13]],
+    [[5, 6, 7], [5, 6, 8], [5, 9], [4]],
+    [[5, 6], [5, 6, 7, 8], [9, 1, 2]],
+)
+
+
+def test_the_label_trie_reads_the_same_nodes():
+    from quail import labels as python_labels
+
+    for label_ids in LABEL_SETS:
+        for starts in ((), tuple((True,) + (False,) * (len(ids) - 1)
+                                 for ids in label_ids)):
+            read = python_labels.read_nodes(label_ids, starts)
+            assert plain(native.CostModel.label_nodes(
+                label_ids, [list(flags) for flags in starts])) == plain((
+                sorted(read), sorted(python_labels.fed_nodes(read)),
+                python_labels.decode_round_tokens(label_ids)))
+
+
+# whether the documents' KV is resident, and their borrowed prefixes
+RESIDENCY = ((False, []), (False, [0.0, 900.0, 0.0, 30.0]), (True, []))
+
+
+def test_the_classify_costs_are_the_same(rust):
+    from quail.common.budgets import chunk_budget
+    from quail.cost import classify
+    from quail.labels import DECODE_SCORING, LETTERS_SCORING, TREE_SCORING
+
+    lengths = [120.0, 3_000.0, 45.0, 800.0]
+    for model_name, model in MODELS.items():
+        for device_name, device in DEVICES.items():
+            chunk = max(1, chunk_budget(model, device))
+            for scoring in (LETTERS_SCORING, TREE_SCORING, DECODE_SCORING):
+                for label_ids in LABEL_SETS:
+                    for resident, shared in RESIDENCY:
+                        for rows, gpus in ((4.0, 1), (1_000.0, 2)):
+                            expected = classify.estimate(
+                                scoring, rows, 30, 12, label_ids, lengths=lengths,
+                                shared=shared, chunk=chunk, model=model,
+                                device=device, resident=resident, draws=2, gpus=gpus)
+                            assert same_numbers(rust.classify_estimate(
+                                scoring, rows, 30, 12, label_ids, lengths, shared,
+                                chunk, model_name, device_name, resident, 2, [], gpus,
+                            ), (expected.seconds, expected.passes,
+                                asdict(expected.work), expected.suffix_tokens,
+                                expected.rounds)), (model_name, scoring, label_ids)
