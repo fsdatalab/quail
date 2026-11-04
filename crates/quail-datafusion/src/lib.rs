@@ -21,6 +21,7 @@ mod claim;
 mod exec;
 mod functions;
 mod region;
+pub mod semantic;
 mod unnest;
 mod unparse;
 
