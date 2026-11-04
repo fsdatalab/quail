@@ -341,6 +341,17 @@ def has_extract(logical) -> bool:
     return any(isinstance(node, SemanticExtract) for node in logical.walk())
 
 
+
+def filter_stop_keys(plan: LogicalPlan) -> dict:
+    """Return each alias's DISTINCT stop key from its filters."""
+    keys = {}
+    for node in plan.walk():
+        if isinstance(node, SemanticFilter) and node.stop_key:
+            (alias,) = model_call(node.predicates[0].expression).aliases()
+            keys[alias] = tuple(node.stop_key)
+    return keys
+
+
 def join_outer_input(join: "SemanticJoin") -> "LogicalNode":
     """The tree the join extends: everything before its new tables."""
     node = join.input

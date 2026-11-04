@@ -1,8 +1,7 @@
 """Build a physical dependency graph for a statement's query stages."""
 
-from quail.logical import column_name, cte_schema
-from quail.physical import InputPort, PortRef, QueryStage, Scan, ValueType
-from quail.planner.graph.results import result_nodes
+from quail.logical import cte_schema
+from quail.physical import InputPort, PortRef, QueryStage, ValueType
 from quail.planner.plan import PhysicalPlan
 
 
@@ -32,18 +31,3 @@ def stage_plan(logical, plans, assumptions=None) -> PhysicalPlan:
         estimated_seconds=sum(node.estimated_seconds for node in nodes),
         estimates={node.node_id: {"seconds": node.estimated_seconds}
                    for node in nodes}, logical_plan=logical)
-
-
-def relational_plan(logical, config, num_documents) -> PhysicalPlan:
-    """Plan a relational stage using the ordinary scan and result operators."""
-    (scan,) = logical.operators().scans
-    source = Scan(node_id=f"scan:{scan.alias}", alias=scan.alias,
-                  input_id=scan.alias, num_documents=num_documents,
-                  predicates=scan.predicates)
-    nodes = (source, *result_nodes(
-        logical.result, (PortRef(source.node_id, f"rows:{scan.alias}"),),
-        tuple(column_name(column) for column in logical.projection.columns),
-        logical.projection.packing()))
-    return PhysicalPlan(
-        model=config.model, device=config.device, gpus=config.gpus,
-        backend=config.backend, nodes=nodes, logical_plan=logical)

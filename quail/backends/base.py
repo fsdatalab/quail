@@ -79,7 +79,7 @@ class ModelBackend(Protocol):
         region: ModelRegion,
         context: PlanningContext,
     ) -> Sequence[PhysicalCandidate]:
-        """Lower one logical alternative; the planner applies optimizer rules."""
+        """Lower one logical alternative into candidates; not called for Quail."""
         ...
 
     def start(self, context: GpuContext) -> ModelExecution: ...

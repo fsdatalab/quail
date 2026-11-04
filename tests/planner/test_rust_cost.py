@@ -322,7 +322,7 @@ def test_the_retention_and_decode_prices_are_the_same(rust):
 
 
 def _stats_cases():
-    from quail.planner.statistics.tables import AliasStats
+    from quail.cost.statistics import AliasStats
 
     yield AliasStats(count=0, total=0, squared=0, maximum=0)
     yield AliasStats(count=4, total=1_000, squared=400_000, maximum=600)
@@ -335,7 +335,7 @@ def _stats_cases():
 def test_the_table_statistics_are_the_same():
     from dataclasses import asdict
 
-    from quail.planner.statistics.tables import scale_alias
+    from quail.cost.statistics import scale_alias
 
     for stats in _stats_cases():
         for offset, fraction in ((0.0, 1.0), (12.5, 0.37), (900.0, 0.5)):
@@ -456,7 +456,7 @@ def test_the_classify_costs_are_the_same(rust):
 
 def test_the_join_work_is_the_same():
     from quail.cost.joins import PricedJoin, packed_join_work, stage_work
-    from quail.planner.statistics.tables import AliasStats
+    from quail.cost.statistics import AliasStats
 
     for window in (0, 1_024):
         short = ((100, 20), (700, 9)) if window else ()
@@ -534,177 +534,11 @@ def test_the_extract_costs_are_the_same(rust):
                                               answer_tokens, resident)
 
 
-def _name(specs, spec) -> str:
-    """The registered name of a model or device spec the planner passed."""
-    (name,) = [name for name, registered in specs.items() if registered == spec]
-    return name
-
-
-def _replay(rust, kind, call):
-    """The Rust value of one recorded cost call, as (rust, python) results."""
-    a = call.arguments
-    model = _name(MODELS, a["self"].model if "self" in a else a["model"])
-    device = _name(DEVICES, a["self"].device if "self" in a else a["device"])
-    if kind == "filter_cost":
-        return rust.filter_cost(a["question_tokens"], a["mean_tokens"], model, device,
-                                a["chunk_tokens"], a["first"])
-    if kind == "estimate_suffixes":
-        return rust.classify_estimate_suffixes(
-            a["head_tokens"], a["frame_tokens"], plain(list(a["suffixes"])),
-            a["expected_rows"], plain(list(a["lengths"])), plain(list(a["shared"])),
-            a["chunk"], model, device, a["resident"], a["canvas_rows"],
-            None if a["runs"] is None else plain(a["runs"]), a["answer_rows"],
-            a["head_rows"], a["gpus"])
-    if kind == "classify_estimate":
-        return rust.classify_estimate(
-            a["scoring"], a["expected_rows"], a["head_tokens"], a["frame_tokens"],
-            plain(a["labels"]), plain(list(a["lengths"])), plain(list(a["shared"])),
-            a["chunk"], model, device, a["resident"], a["draws"], plain(a["starts"]),
-            a["gpus"])
-    if kind == "extract_estimate":
-        assumptions = a["assumptions"]
-        return rust.extract_estimate(
-            a["expected_rows"], plain(list(a["lengths"])),
-            [] if a["shared"] is None else plain(list(a["shared"])), a["head_tokens"],
-            a["tail_tokens"], a["chunk"], model, device, a["resident"],
-            a["max_answer_tokens"], a["draft_tokens"], a["draft_policy"],
-            a["round_cost_per_token"], a["gpus"],
-            16 if assumptions is None else assumptions.answer_tokens)
-    if kind == "choose_pass_groups":
-        return _outcome(rust.choose_pass_groups, plain(a["question_tokens"]),
-                        plain(a["selectivities"]), a["rows"], a["state_tokens"],
-                        a["longest_state"], model, device, a["chunk_tokens"],
-                        a["set_size"], a["header"])
-    if kind == "score":
-        cost = a["self"]
-        return rust.score_estimate(
-            list(cost.token_lengths), [plain(asdict(s)) for s in cost.summaries],
-            cost.mean_tokens, model, device, cost.chunk_tokens, cost.capacity,
-            cost.gpus, cost.draws, a["expected_rows"], a["prefix_groups"])
-    if kind == "sae_features":
-        cost = a["self"]
-        return rust.sae_features_estimate(
-            list(cost.token_lengths), plain(asdict(cost.summary)), cost.pooling, model,
-            device, cost.chunk_tokens, cost.gpus, cost.max_pooling,
-            a["expected_rows"], a["resident"])
-    raise AssertionError(kind)
-
-
-def _join_replay(kind, call):
-    """The Rust value of one recorded join work call."""
-    a = call.arguments
-    spec = a["spec"]
-    return native.CostModel.join_work(
-        list(spec.aliases), dict(spec.frame_tokens), dict(spec.label_tokens),
-        spec.tail_tokens, a["anchor"], a["n"], a["tuples"],
-        {alias: plain(asdict(stats)) for alias, stats in a["lengths"].items()},
-        a["pre"], a.get("resident", False), a["window"],
-        a["set_size"] if kind == "packed_join_work" else None)
-
-
-def _python_value(kind, result):
-    """A recorded Python result in the shape the Rust binding returns."""
-    if kind in ("estimate_suffixes", "classify_estimate"):
-        return (result.seconds, result.passes, asdict(result.work),
-                result.suffix_tokens, result.rounds)
-    if kind == "extract_estimate":
-        return (result.seconds, result.passes, asdict(result.work),
-                result.suffix_tokens, result.rows)
-    if kind in ("score", "sae_features"):
-        work, seconds = result
-        return asdict(work), seconds
-    if kind in ("stage_work", "packed_join_work"):
-        return asdict(result)
-    return plain(result)
-
-
-def _recorders():
-    """(owner, attribute, kind) for each cost function the planner calls."""
-    from quail.cost import classify, extract
-    from quail.cost.sae_features import SaeFeaturesCost
-    from quail.cost.score import ScoreCost
-    from quail.planner.graph import passes, pricing
-    from quail.planner.operators import filter as filters
-    from quail.planner.search import join_order
-
-    return (
-        (filters, "filter_cost", "filter_cost"),
-        (classify, "estimate_suffixes", "estimate_suffixes"),
-        (classify, "estimate", "classify_estimate"),
-        (extract, "estimate", "extract_estimate"),
-        (pricing, "extract_estimate", "extract_estimate"),
-        (passes, "choose_pass_groups", "choose_pass_groups"),
-        (join_order, "join_work", "stage_work"),
-        (join_order, "packed_join_work", "packed_join_work"),
-        (ScoreCost, "estimate", "score"),
-        (SaeFeaturesCost, "estimate", "sae_features"),
-    )
-
-
-# a dense model, a sliding-window model, a hybrid model with state layers,
-# and a set-attention model
-REPLAY_MODELS = ("qwen3-4b-fp8", "diffusion-gemma-26b-a4b-fp8", "qwen3.5-4b-bf16",
-                 "d1-2b-bf16")
-
-
-def test_every_cost_the_planner_asks_for_is_the_same_in_rust(rust, monkeypatch):
-    import inspect
-    import zlib
-
-    from helpers.sessions import check_table
-
-    import quail
-    from quail.planner.plan import EngineConfig
-    from quail_b.queries import queries
-    from tools.dump_check_queries import check_query_entries
-
-    calls = []
-    for owner, attribute, kind in _recorders():
-        original = getattr(owner, attribute)
-        signature = inspect.signature(original)
-
-        def recorded(*args, _original=original, _signature=signature, _kind=kind,
-                     **kwargs):
-            result = _original(*args, **kwargs)
-            bound = _signature.bind(*args, **kwargs)
-            bound.apply_defaults()
-            calls.append((_kind, bound, result))
-            return result
-
-        monkeypatch.setattr(owner, attribute, recorded)
-
-    def token_ids(text):
-        return [zlib.crc32(word.encode()) % 151_936 for word in text.split()]
-
-    entries = check_query_entries(list(queries(include_draft=True)))
-    for model in REPLAY_MODELS:
-        config = EngineConfig(model=model, device="h100-sxm")
-        for entry in entries:
-            with quail.Session(config, tokenizer=token_ids) as session:
-                for name, columns in entry["tables"].items():
-                    session.register(name, quail.DocumentProvider.from_table(
-                        check_table(columns), id_col="id"))
-                session.sql(entry["sql"]).plan()
-
-    kinds, differ = {}, []
-    for kind, call, result in calls:
-        kinds[kind] = kinds.get(kind, 0) + 1
-        value = (_join_replay(kind, call) if kind in ("stage_work", "packed_join_work")
-                 else _replay(rust, kind, call))
-        if not same_numbers(value, _python_value(kind, result)):
-            differ.append(kind)
-    print(kinds)
-    assert set(kinds) >= {"filter_cost", "estimate_suffixes", "extract_estimate",
-                          "stage_work", "packed_join_work", "choose_pass_groups",
-                          "score"}, kinds
-    assert differ == [], differ[:10]
-
-
 def test_a_length_column_summarizes_the_same(rust):
     import pyarrow as pa
 
     from quail.common.tokens import TokenLengths
-    from quail.planner.statistics.tables import summarize_alias
+    from quail.cost.statistics import summarize_alias
 
     rng = np.random.default_rng(3)
     columns = (

@@ -1,10 +1,8 @@
 """Plan a query with Quail's Rust planner in the ``_quail_native`` module.
 
-The Rust planner runs the same search, graph builder, physical rules,
-and pricing as the Python planner, which ``optimize.search_plan`` keeps
-as the fallback: for another backend, a registry with rules or physical
-planners of its own, a session without a tokenizer, a missing native
-module, or ``QUAIL_PLANNER=python``.
+The Rust planner applies the logical rules, searches the alternatives,
+builds and prices each graph, and applies the physical rules, each in
+the order the session's registry lists them by name.
 
 A tokenizer that returns words instead of integer ids, as the tests'
 does, crosses to Rust with each word interned as an integer id, and the
@@ -14,8 +12,8 @@ plan comes back with the words in place.
 from __future__ import annotations
 
 import json
-import os
 
+import _quail_native
 import numpy as np
 
 from quail.common.document_ends import last_tokens
@@ -33,37 +31,24 @@ from quail.physical.lowering import Vocabulary
 from quail.planner.optimizer.candidates import LogicalAlternative
 from quail.planner.plan import PhysicalPlan, Refusal
 
-# the built-in logical rules, in registry order
+# the built-in logical rules, in the order they apply
 LOGICAL_RULES = (
     "should_eliminate_distinct", "should_push_down_distinct",
     "should_push_down_projection", "should_push_down_filters",
     "should_lift_column_operators",
 )
-# the built-in logical then physical rules, in registry order
-BUILT_IN_RULES = (
-    "should_eliminate_distinct", "should_push_down_distinct",
-    "should_push_down_projection", "should_push_down_filters",
-    "should_lift_column_operators", "should_eliminate_window_sort",
-    "should_push_down_limit_through_window", "should_push_down_limit",
-    "choose_classify_implementation", "pack_set_passes", "join_document_ends",
-    "should_retain_kv", "should_share_prefixes", "choose_attention_path",
-    "should_deduplicate",
+# the built-in physical rules, in the order they apply
+PHYSICAL_RULES = (
+    "should_eliminate_window_sort", "should_push_down_limit_through_window",
+    "should_push_down_limit", "choose_classify_implementation", "pack_set_passes",
+    "join_document_ends", "should_retain_kv", "should_share_prefixes",
+    "choose_attention_path", "should_deduplicate",
 )
 
 # node attribute and spec fields that hold token ids
 _TOKEN_FIELDS = ("question_token_ids", "document_head", "question_header_token_ids",
                  "frame_token_ids", "tail_token_ids", "prompt_token_parts",
                  "join_layout")
-
-def _module():
-    if os.environ.get("QUAIL_PLANNER") == "python":
-        return None
-    try:
-        import _quail_native
-    except ImportError:
-        return None
-    return _quail_native
-
 
 def _mapped(value, convert):
     """Every token in a nested list, converted."""
@@ -98,11 +83,12 @@ def _tokens_mapped(value, convert):
     return out
 
 
-def _untagged(value):
+def untagged(value):
+    """Encoded data without the codec's type tags, as the Rust specs read it."""
     if isinstance(value, dict):
-        return {key: _untagged(item) for key, item in value.items() if key != "type"}
+        return {key: untagged(item) for key, item in value.items() if key != "type"}
     if isinstance(value, list):
-        return [_untagged(item) for item in value]
+        return [untagged(item) for item in value]
     return value
 
 
@@ -134,8 +120,8 @@ def _table_statistics(context, vocabulary) -> dict:
 def context_fields(context, vocabulary) -> dict:
     """The planning context's fields, as the native module reads them."""
     return {
-        "model": _untagged(encode_value(context.model)),
-        "device": _untagged(encode_value(context.device)),
+        "model": untagged(encode_value(context.model)),
+        "device": untagged(encode_value(context.device)),
         "gpus": context.gpus, "canvas_draws": context.canvas_draws,
         "document_tokens": {alias: np.asarray(values).astype(int).tolist()
                             for alias, values in context.document_tokens.items()},
@@ -180,23 +166,18 @@ def _estimates(estimates: dict) -> dict:
 
 
 def search_plan(alternatives, context, registry):
-    """Select the cheapest refined plan in Rust, or None to plan in Python.
+    """Select the cheapest refined Quail plan of the logical alternatives.
 
     Args:
         alternatives: The logical alternatives, each with its plan and rules.
         context: The planning context.
-        registry: The session extension registry.
+        registry: The session extension registry, whose physical rules
+            the planner applies in order.
 
     Returns:
-        A PhysicalPlan or a Refusal, or None when the Rust planner does
-        not cover the request.
+        A PhysicalPlan, or a Refusal explaining why the query cannot run.
     """
-    native = _module()
-    rules = tuple(rule.name for rule in (*registry.logical_rules.values(),
-                                         *registry.physical_rules.values()))
-    if (native is None or context.tokenizer is None or context.backend != "quail"
-            or registry.physical_planners or rules != BUILT_IN_RULES):
-        return None
+    native = _quail_native
     vocabulary = Vocabulary(context.tokenizer)
     fields = context_fields(context, vocabulary)
     found, message = native.plan_operator(
@@ -234,7 +215,7 @@ def search_plan(alternatives, context, registry):
 
 
 def logical_alternatives(plan, registry, context):
-    """Apply the registry's logical rules in Rust, or None to apply them in Python.
+    """Apply the registry's logical rules in order.
 
     Args:
         plan: The input logical plan.
@@ -244,20 +225,17 @@ def logical_alternatives(plan, registry, context):
 
     Returns:
         The alternatives in order, each with its plan and the rules that
-        made it, or None when a rule is not a built-in one.
+        made it.
 
     Raises:
         CompileError: A rule refuses the plan.
     """
-    native = _module()
     names = tuple(rule.name for rule in registry.logical_rules.values())
-    if native is None or names != LOGICAL_RULES:
-        return None
     catalog = context.catalog
     id_columns = (None if catalog is None else {
         name: provider.id_col for name, provider in catalog.providers.items()
         if hasattr(provider, "id_col")})
-    found, message = native.logical_alternatives(
+    found, message = _quail_native.logical_alternatives(
         json.dumps(encode_value(plan)), list(names), id_columns)
     if message is not None:
         raise CompileError(message)
@@ -289,10 +267,8 @@ def _plan_from(found: dict, native, fields, vocabulary, logical_plan, pricer=Non
 
 
 def relational_plan(logical, context, num_documents: int):
-    """The plan of a stage that asks no model, or None to build it in Python."""
-    native = _module()
-    if native is None:
-        return None
+    """Plan a stage that asks no model."""
+    native = _quail_native
     vocabulary = Vocabulary(context.tokenizer or (lambda text: []))
     fields = context_fields(context, vocabulary)
     found, message = native.plan_operator(
@@ -318,8 +294,6 @@ def request_order(logical, context) -> dict:
     Raises:
         CompileError: A prompt cannot be lowered, or a table has no tokens.
     """
-    import _quail_native
-
     vocabulary = Vocabulary(context.tokenizer)
     fields = context_fields(context, vocabulary)
     found, message = _quail_native.plan_operator(
@@ -339,17 +313,15 @@ def request_order(logical, context) -> dict:
 
 
 def refine_plan(plan, context, registry):
-    """Apply the physical rules to an edited plan in Rust, or None for Python.
+    """Apply the registry's physical rules again to an edited plan.
 
-    Rust refines a plan whose pricer is Rust's, with the built-in rules.
+    A plan the Rust planner did not price, such as another backend's,
+    is returned unchanged.
     """
-    native = _module()
+    native = _quail_native
     estimator = getattr(plan, "estimator", None)
-    rules = tuple(rule.name for rule in (*registry.logical_rules.values(),
-                                         *registry.physical_rules.values()))
-    if (native is None or not isinstance(estimator, NativePricer)
-            or context.tokenizer is None or rules != BUILT_IN_RULES):
-        return None
+    if not isinstance(estimator, NativePricer):
+        return plan
     vocabulary = estimator._vocabulary
     fields = context_fields(context, vocabulary)
     codecs = {codec.type_name: codec for codec in built_in_codecs()}

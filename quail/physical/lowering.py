@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from quail.common.expressions import CompileError, Prompt
+from quail.common.prompts import PROMPT_LAYOUTS
 from quail.physical.codec import decode_value, encode_value
 
 # interned word ids start here, above any vocabulary
@@ -187,3 +188,54 @@ def answer_ids(model, tokenizer) -> tuple[list, list]:
         "answer_ids", [model_fields(model)], tokenizer)
     return ([vocabulary.word(token) for token in true_ids],
             [vocabulary.word(token) for token in false_ids])
+
+
+def option_aliases(codes, tokenizer) -> tuple[str, ...]:
+    """Each option's code as d1 writes it.
+
+    An option keeps its own code when that is one unused token, else it
+    takes the first unused one-token fallback.
+
+    Raises:
+        CompileError: No one-token code is left for an option.
+    """
+    found, _ = _call("option_aliases", [list(codes)], tokenizer)
+    return tuple(found)
+
+
+def option_spellings(codes, tokenizer) -> tuple[tuple, ...]:
+    """Per option, the token ids d1 scores: its code, then " code" when one token."""
+    found, vocabulary = _call("option_spellings", [list(codes)], tokenizer)
+    return tuple(tuple(vocabulary.word(token) for token in ids) for ids in found)
+
+
+def read_slot_offsets(segment: str, names, tokenizer) -> tuple[int, ...]:
+    """Each read slot's row, counted back from the segment's last token.
+
+    Raises:
+        CompileError: The segment does not end in its slot lines, or a
+            colon is not one token apart from the text before it.
+    """
+    found, _ = _call("read_slot_offsets", [segment, list(names)], tokenizer)
+    return tuple(found)
+
+
+def render_filter_prompt_ids(lowered: LoweredPrompt, document_ids) -> list:
+    """Return the complete token ids for one filter document."""
+    return (list(lowered.preamble_token_ids) + list(document_ids)
+            + list(lowered.tail_token_ids))
+
+
+def set_question_parts(lowered: LoweredPrompt, model, tokenizer) -> dict:
+    """A set-attention filter's state tail length and later-question header.
+
+    Raises:
+        ValueError: The model's layout does not tokenize the label alone.
+    """
+    layout = PROMPT_LAYOUTS[model.prompt_layout]
+    if not layout.label_segment:
+        raise ValueError(f"{model.name!r}: a set-attention layout tokenizes "
+                         f"its question label as its own segment")
+    first = lowered.prompt.tail_segments[0]
+    return dict(state_tail_tokens=len(tokenizer(first)),
+                question_header_token_ids=tuple(tokenizer(layout.question_label)))

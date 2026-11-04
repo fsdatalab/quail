@@ -30,16 +30,14 @@ from quail.explain import explain
 from quail.logical import (
     LogicalPlan,
     WithCTE,
+    filter_stop_keys,
     join_conditions,
     oriented_join_conditions,
 )
 from quail.physical import Scan, encode_graph
 from quail.planner import native, plan_query, refine_plan
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import Refusal, RefusalError
-from quail.planner.search.statistics import filter_stop_keys
-from quail.planner.stages import relational_plan
 
 if TYPE_CHECKING:
     from quail.api.session import Session
@@ -163,12 +161,8 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions)
-            candidates = (native.logical_alternatives(
+            candidates = native.logical_alternatives(
                 self._logical_input, self.session.registry, context)
-                or logical_alternatives(
-                    self._logical_input,
-                    tuple(self.session.registry.logical_rules.values()),
-                    context))
             self.logical = candidates[0].plan
             scans = {}
             offset_aliases = set()
@@ -417,13 +411,12 @@ class Query:
         self._plan = self._relational_plan(table.num_rows)
 
     def _relational_plan(self, num_documents: int):
-        """The plan of a stage that asks no model: in Rust, else in Python."""
+        """Plan a stage that asks no model."""
         config = self.session.config
         context = PlanningContext(
             model=self.session.model, device=self.session.device, gpus=config.gpus,
             document_tokens={}, backend=config.backend)
-        return (native.relational_plan(self.logical, context, num_documents)
-                or relational_plan(self.logical, config, num_documents))
+        return native.relational_plan(self.logical, context, num_documents)
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.

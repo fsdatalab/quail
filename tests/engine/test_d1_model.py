@@ -35,13 +35,28 @@ def test_the_vllm_baseline_refuses_d1_2b():
     assert "lfm3" in support.reason
 
 
-def test_d1_2b_refuses_map_with_a_reason():
-    from quail.planner.validation import extraction_refusal
+def test_d1_2b_extracts_but_refuses_map_with_a_reason(tmp_path):
+    import pyarrow as pa
 
-    context = SimpleNamespace(model=D1_2B_BF16, tokenizer=lambda text: [1])
+    import quail
+    from quail.catalog import DocumentProvider
+    from quail.planner.plan import EngineConfig, Refusal
 
-    assert extraction_refusal(context) is None
-    assert "writes text" in extraction_refusal(context, "AI.MAP").reasons[0]
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=str.split)
+    session.register("reviews", DocumentProvider.from_table(
+        pa.table({"id": [0, 1], "body": ["good food", "slow service"]}), id_col="id"))
+    extracted = session.sql(
+        "SELECT r.id, AI.EXTRACT(r.body, {'dish': 'Which dish?'}) AS x "
+        "FROM reviews r").plan()
+    mapped = session.sql(
+        "SELECT r.id, AI.MAP(r.body, 'Name the topic.', 8) AS topic "
+        "FROM reviews r").plan()
+
+    assert not isinstance(extracted, Refusal)
+    assert isinstance(mapped, Refusal)
+    assert "writes text" in mapped.reasons[0]
+    session.close()
 
 
 def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
@@ -79,7 +94,7 @@ def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
 
 def test_an_option_whose_code_is_two_tokens_takes_d1s_first_free_fallback():
     from quail.common.prompts import option_codes
-    from quail.planner.prompt_lowering import option_aliases
+    from quail.physical.lowering import option_aliases
 
     def tokenizer(text):
         return list(text) if text.isupper() else [text]

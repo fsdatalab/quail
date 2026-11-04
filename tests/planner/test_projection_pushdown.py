@@ -4,11 +4,10 @@ from dataclasses import replace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from helpers.planning import rewrite
 from helpers.sessions import _run, fake_tok, make_executor
 
 import quail
-from quail.catalog import Catalog
-from quail.frontend.sql import compile_sql
 from quail.logical import (
     Filter,
     LogicalPlan,
@@ -17,15 +16,9 @@ from quail.logical import (
     SemanticJoin,
 )
 from quail.physical import Recombine
+from quail.planner import native
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import EngineConfig
-from quail.planner.rules import built_in_rules
-from quail.planner.rules.tree_transforms import (
-    lift_column_operators,
-    push_down_filters,
-    push_down_projection,
-)
 
 
 def _scans(plan):
@@ -72,7 +65,8 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     assert sorted(result.to_rows()) == [(3, "r2"), (5, "r0")]
     scan = _scans(query.logical)["r"]
     assert scan.columns == ("stars", "id")
-    assert push_down_projection(query.logical.root) is query.logical.root
+    (unchanged,) = rewrite(query.logical, "should_push_down_projection")
+    assert unchanged.rules == ()
     store = query._token_inputs["r"]
     assert store.projected_columns == ("stars", "id")
     tokenized = len(calls)
@@ -121,15 +115,17 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     session.close()
 
 
-def _pair_catalog():
-    catalog = Catalog()
-    catalog.register("reviews", quail.DocumentProvider.from_table(
+def _pair_session():
+    session = quail.Session(
+        EngineConfig(gpus=1, model="qwen3-4b-fp8", device="h100-sxm"),
+        tokenizer=fake_tok)
+    session.register("reviews", quail.DocumentProvider.from_table(
         pa.table({"id": ["r0", "r1"], "review": ["good one", "bad one"],
                   "stars": [5, 1]}), id_col="id"))
-    catalog.register("products", quail.DocumentProvider.from_table(
+    session.register("products", quail.DocumentProvider.from_table(
         pa.table({"asin": ["p0"], "description": ["a thing"]}),
         id_col="asin"))
-    return catalog
+    return session
 
 
 JOIN_SQL = """
@@ -147,21 +143,24 @@ LABELLED_JOIN_SQL = """
 
 
 def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
-    catalog = _pair_catalog()
-    plan = compile_sql(JOIN_SQL, catalog)
+    session = _pair_session()
+    catalog = session.catalog
+    plan = session.sql(JOIN_SQL).logical
     assert isinstance(plan.root.input, SemanticJoin)
 
     # the front end places the filter on its table, so the rule leaves
     # the plan alone and only the projection moves
-    assert push_down_filters(plan.root) is None
-    candidate, = logical_alternatives(
-        plan, built_in_rules(), PlanningContext(catalog=catalog))
+    (unchanged,) = rewrite(plan, "should_push_down_filters", catalog=catalog)
+    assert unchanged.rules == ()
+    candidate, = native.logical_alternatives(
+        plan, session.registry, PlanningContext(catalog=catalog))
     assert candidate.rules == ("should_push_down_projection",)
-    assert candidate.plan.root == push_down_projection(plan.root)
+    (projected,) = rewrite(plan, "should_push_down_projection", catalog=catalog)
+    assert candidate.plan.root == projected.plan.root
 
     # a filter on a label returns to its table, above the
     # classification that computes the label
-    labelled = compile_sql(LABELLED_JOIN_SQL, catalog)
+    labelled = session.sql(LABELLED_JOIN_SQL).logical
     joined = labelled.root.input
     label_filter = joined.input.left
     assert isinstance(label_filter, Filter)
@@ -170,8 +169,11 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
         label_filter, input=replace(joined, input=replace(
             joined.input, left=label_filter.input))))
     LogicalPlan(lifted).validate()
-    assert push_down_filters(lifted) == labelled.root
+    (pushed,) = rewrite(LogicalPlan(lifted), "should_push_down_filters",
+                        catalog=catalog)
+    assert pushed.plan.root == labelled.root
     # the placement rule offers the lifted plan for a full join
-    assert [type(node).__name__ for node in LogicalPlan(
-        lift_column_operators(labelled.root)).walk()][-4:] == [
+    *_, placed = rewrite(labelled, "should_lift_column_operators", catalog=catalog)
+    assert [type(node).__name__ for node in placed.plan.walk()][-4:] == [
         "SemanticJoin", "SemanticClassify", "Filter", "Project"]
+    session.close()

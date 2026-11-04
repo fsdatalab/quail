@@ -1,13 +1,12 @@
-"""Candidate plans and the interface used by backend planners."""
+"""Candidate plans and the logical alternatives they lower."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 from quail.logical import LogicalPlan
 from quail.physical.base import PhysicalGraph
-from quail.planner.optimizer.context import PlanningContext
 
 
 @dataclass(frozen=True)
@@ -46,19 +45,3 @@ class PhysicalCandidate:
     estimated_seconds: float
     logical_plan: Any = None
     rewrites: tuple[str, ...] = ()
-
-
-class PhysicalPlanner(Protocol):
-    """Lower one logical alternative into physical candidates.
-
-    The common planner refines each graph and compares the resulting
-    estimates. Implementations do not run logical alternatives.
-    """
-
-    name: str
-
-    def plan(
-        self,
-        region: ModelRegion,
-        context: PlanningContext,
-    ) -> tuple[PhysicalCandidate, ...]: ...

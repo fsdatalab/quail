@@ -13,12 +13,11 @@ from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 if TYPE_CHECKING:
     from quail.backends.base import ModelBackend
     from quail.execution.runner import ExecutionObserver, NodeRuntime
-    from quail.planner.optimizer.candidates import PhysicalPlanner
     from quail.specs import DeviceSpec, ModelSpec
 
 
 _KINDS = {
-    "logical_rule", "physical_planner", "physical_rule",
+    "logical_rule", "physical_rule",
     "backend",
     "model", "device", "codec", "runtime", "observer",
 }
@@ -49,10 +48,6 @@ class ExtensionRegistry:
     @property
     def logical_rules(self) -> Mapping[str, LogicalRule]:
         return self._values("logical_rule")
-
-    @property
-    def physical_planners(self) -> Mapping[str, PhysicalPlanner]:
-        return self._values("physical_planner")
 
     @property
     def physical_rules(self) -> Mapping[str, PhysicalRule]:
@@ -161,7 +156,9 @@ class ExtensionRegistry:
 
     def _register_rule(self, rule, name, *, kind, rule_type):
         if not isinstance(rule, rule_type):
-            raise TypeError(f"{kind} needs a {rule_type.__name__} subclass")
+            raise TypeError(
+                f"{kind} needs a {rule_type.__name__}: Quail's rules are "
+                f"written in Rust and registered by name")
         name = rule.name if name is None else name
         self._check_name(kind, name)
         if name in self.rules:
@@ -171,21 +168,14 @@ class ExtensionRegistry:
     def register_logical_rule(
         self, rule: LogicalRule, *, name: str | None = None,
     ) -> ExtensionRegistry:
-        """Register a rule that simplifies or proposes query trees."""
+        """Register a logical rule of the Rust planner by name."""
         return self._register_rule(
             rule, name, kind="logical_rule", rule_type=LogicalRule)
-
-    def register_physical_planner(
-        self, planner: PhysicalPlanner, *, name: str | None = None,
-    ) -> ExtensionRegistry:
-        return self._add(
-            "physical_planner", planner.name if name is None else name, planner,
-        )
 
     def register_physical_rule(
         self, rule: PhysicalRule, *, name: str | None = None,
     ) -> ExtensionRegistry:
-        """Register an executable graph rule in dependency order."""
+        """Register a physical rule of the Rust planner by name, in apply order."""
         return self._register_rule(
             rule, name, kind="physical_rule", rule_type=PhysicalRule)
 

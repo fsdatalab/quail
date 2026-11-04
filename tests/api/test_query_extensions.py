@@ -13,7 +13,7 @@ from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.result import filter_answer_table
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.physical import AiFilter, Scan, decode_graph
-from quail.planner.optimizer.rules import PhysicalRule
+from quail.planner import optimize
 
 
 def _tokens(text):
@@ -38,13 +38,14 @@ def test_query_scans_provider_and_preserves_extension_objects(
     calls = ["initialize"]
     lock = Lock()
 
-    class CheckPlanning(PhysicalRule):
-        name = "test.planning"
+    searched = optimize.search_plan
 
-        def rewrite(self, graph, context):
-            with lock:
-                calls.append("plan")
-            return None
+    def search_plan(*args, **kwargs):
+        with lock:
+            calls.append("plan")
+        return searched(*args, **kwargs)
+
+    monkeypatch.setattr(optimize, "search_plan", search_plan)
 
     def execute(physical, registry):
         assert registry is session.registry
@@ -75,7 +76,6 @@ def test_query_scans_provider_and_preserves_extension_objects(
     monkeypatch.setattr(runtime, "_execute_physical", execute)
     monkeypatch.setattr(runtime, "_prepare_backend", lambda plan, registry: None)
 
-    session.registry.register_physical_rule(CheckPlanning())
     session.register(
         "documents", quail.DocumentProvider.from_parquet(path, id_col="id")
     )

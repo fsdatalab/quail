@@ -1,37 +1,27 @@
-"""Interfaces for query tree rules and executable graph rules."""
+"""The optimizer rules a session's registry lists, by their Rust names.
 
-from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+The Rust planner in ``_quail_native`` implements every rule
+(``crates/quail-planner/src/rules.rs`` for the logical rules and
+``physical_rules.rs`` for the physical ones). The registry lists the
+rules a session applies and their order; a rule is added by writing it
+in Rust and registering its name.
+"""
 
-if TYPE_CHECKING:
-    from quail.logical import LogicalNode
-    from quail.physical import PhysicalGraph
-    from quail.planner.optimizer.context import PlanningContext
-
-
-class LogicalRule(ABC):
-    """Return equivalent query trees to compare after physical planning."""
-
-    name: str
-
-    @abstractmethod
-    def rewrites(
-        self, root: "LogicalNode", context: "PlanningContext",
-    ) -> "list[LogicalNode]":
-        """Return candidate roots, including root if it should remain a candidate.
-
-        Return [root] for no change, [replacement] to replace it, or multiple
-        roots to compare. The list must not be empty.
-        """
+from dataclasses import dataclass
+from typing import ClassVar
 
 
-class PhysicalRule(ABC):
-    """Update an executable graph and its candidate's settings."""
+@dataclass(frozen=True)
+class LogicalRule:
+    """A rule that rewrites a logical plan or proposes alternatives to it."""
 
     name: str
+    kind: ClassVar[str] = "logical"
 
-    @abstractmethod
-    def rewrite(
-        self, graph: "PhysicalGraph", context: "PlanningContext",
-    ) -> "PhysicalGraph | None":
-        """Return a replacement graph, or None to keep the input."""
+
+@dataclass(frozen=True)
+class PhysicalRule:
+    """A rule that rewrites a physical graph and its settings."""
+
+    name: str
+    kind: ClassVar[str] = "physical"

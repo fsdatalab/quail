@@ -69,7 +69,7 @@ def _prompt_ids():
     from gigatoken import Tokenizer
 
     from quail.logical import bind_prompt
-    from quail.planner.prompt_lowering import (
+    from quail.physical.lowering import (
         lower_prompt,
         render_filter_prompt_ids,
     )

@@ -3,7 +3,7 @@
 import copy
 import sys
 import types
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import ClassVar
 
 import pyarrow as pa
@@ -33,7 +33,6 @@ from quail.physical import (
     plan_envelope,
 )
 from quail.planner.optimizer.candidates import PhysicalCandidate
-from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import EngineConfig, PhysicalPlan
 from quail.specs import SupportResult
 
@@ -149,35 +148,10 @@ class LocalFilterBackend:
         return (local_plan(context, count=1, estimate=0.0, source="backend"),)
 
 
-class PreferredPlanner:
-    name = "preferred"
-
-    def __init__(self):
-        self.called = False
-
-    def plan(self, region, context):
-        self.called = True
-        return (local_plan(
-            context, count=2, estimate=-1.0, source="preferred planner"),)
-
-
-class KeepFirstDocument(PhysicalRule):
-    name = "keep_first_document"
-
-    def rewrite(self, graph, context):
-        return PhysicalGraph(
-            tuple(replace(node, count=1) if isinstance(node, FirstDocuments)
-                  else node for node in graph.nodes),
-            graph.root)
-
-
 def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     registry = quail.ExtensionRegistry.with_built_ins()
     backend = LocalFilterBackend()
-    planner = PreferredPlanner()
     registry.register_backend(backend)
-    registry.register_physical_planner(planner)
-    registry.register_physical_rule(KeepFirstDocument())
     registry.register_node(FirstDocuments, runtime=FirstDocumentsRuntime())
     session = quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
@@ -194,9 +168,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     envelope = plan.to_envelope(registry.codecs)
 
     assert backend.called
-    assert planner.called
-    assert plan.settings["planner_source"] == "preferred planner"
-    # the registered extension rule rewrote the planner's node
+    assert plan.settings["planner_source"] == "backend"
     firsts = [node for node in plan.nodes if isinstance(node, FirstDocuments)]
     assert firsts and all(node.count == 1 for node in firsts)
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph

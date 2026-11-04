@@ -24,52 +24,50 @@ predicate or column, a LIMIT, or a join without full semantics raises
 NotImplementedError.
 
 docs/content/docs/architecture/optimizer.mdx describes the model. The
-work counting and component pricing are the planner's own
-(quail.common.work, quail.common.sol); the search does not call or
-simulate the production planner.
+Rust planner in ``_quail_native`` runs the search, calling back into
+the oracles for each answer; the work counting and component pricing
+are the planner's own, and the search does not call or simulate the
+production planner.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from typing import Callable, Mapping
+
+import _quail_native
+import numpy as np
+import pyarrow as pa
 
 from quail.common import budgets
-from quail.common.sol import SpeedOfLight
+from quail.common.expressions import Prompt, column_name, evaluate_expression
+from quail.common.pairs import pair_table, partner_map
+from quail.common.sol import SpeedOfLight, speed_of_light
+from quail.common.tokens import prefix_tree
 from quail.common.work import Work
-from quail.logical import (
-    SPAN_SUFFIX,
-    Aggregate,
-    Filter,
-    Join,
-    ModelCall,
-    Project,
-    Result,
-    Scan,
-    SemanticClassify,
-    SemanticExtract,
-    SemanticFilter,
-    SemanticJoin,
-    SemanticMap,
-    SemanticSaeFeatures,
-    Unnest,
-    Window,
-    condition_columns,
-)
-from quail.planner.sol.search import (
-    ANSWER_TEST,
-    CLASSIFY,
-    EXTRACT,
-    FILTER,
-    LABEL_IN,
-    AnswerOracle,
-    LabelOracle,
-    Search,
-)
+from quail.logical import condition_columns, filter_stop_keys, oriented_join_conditions
+from quail.physical.codec import decode_value, encode_value
+from quail.physical.lowering import Vocabulary
+from quail.planner.native import untagged
 from quail.specs import DeviceSpec, ModelSpec
 
-_PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, SemanticExtract,
-                 SemanticSaeFeatures, SemanticMap, Filter, Join, SemanticJoin,
-                 Project, Unnest, Aggregate, Window, Result)
+# answer(prompt, assignment) -> bool, where assignment maps each alias
+# in the prompt to a row index of that alias's corpus table; for an
+# AI.EXTRACT prompt, the reference answer text, or None for no answer;
+# for an AI.MAP prompt, the answer the map writes
+AnswerOracle = Callable[[object, Mapping[str, int]], object]
+# label(prompt, assignment) -> str, the reference label of an
+# AI.CLASSIFY prompt for one row assignment
+LabelOracle = Callable[[object, Mapping[str, int]], str]
+
+# the operators of one alias, as the stage records name them
+FILTER = "AI.IF"
+CLASSIFY = "AI.CLASSIFY"
+EXTRACT = "AI.EXTRACT"
+
+# the exceptions a refused estimate raises, by the name Rust gives
+_ERRORS = {"NotImplementedError": NotImplementedError, "ValueError": ValueError}
 
 
 @dataclass(frozen=True)
@@ -225,90 +223,105 @@ class SpeedOfLightEstimate:
         }
 
 
-def _refuse_unpriced(logical) -> None:
-    """Raise NotImplementedError for any operator the estimate cannot price."""
-    for node in logical.walk():
-        if not isinstance(node, _PRICED_NODES):
-            raise NotImplementedError(
-                f"the speed of light estimate does not price {node.type_name}")
-        if isinstance(node, Result) and node.limit is not None \
-                and not (node.order or node.distinct or node.offset
-                         or isinstance(node.input, (Aggregate, Window))):
-            # a sorted, offset, or grouped result runs every document,
-            # and a distinct one stops each key at its first survivor;
-            # the estimate prices both. A bare LIMIT stops early.
-            raise NotImplementedError(
-                "the speed of light estimate does not price LIMIT")
-    operators = logical.operators()
-    for alias, predicates in operators.filters.items():
-        for predicate in predicates:
-            expression = predicate.expression
-            if not (isinstance(expression, ModelCall)
-                    and expression.kind == "boolean"):
-                raise NotImplementedError(
-                    f"the speed of light estimate does not price the filter "
-                    f"{expression} on {alias!r}; it prices AI.IF and label "
-                    f"filters")
-    for tests in operators.column_filters.values():
-        for test in tests:
-            if test.call.kind == "features":
-                raise NotImplementedError(
-                    "the speed of light estimate has no oracle for SAE feature tests")
-            if test.call.kind == "map":
-                raise NotImplementedError(
-                    "the speed of light estimate does not price a test of a "
-                    "map answer")
-            if len(condition_columns(test.condition)) > 1:
-                raise NotImplementedError(
-                    f"the speed of light estimate does not price the test "
-                    f"{test.condition}, which reads more than one column")
-            if any(column.endswith(SPAN_SUFFIX)
-                   for column in condition_columns(test.condition)):
-                raise NotImplementedError(
-                    f"the speed of light estimate does not price the test "
-                    f"{test.condition} of an answer's span; the answer "
-                    f"oracle gives the answer's text only")
-    if operators.maps and operators.joins:
-        # a map above a join writes only for the documents the join keeps
-        raise NotImplementedError(
-            "the speed of light estimate prices AI.MAP only in queries "
-            "without joins")
-    for join in operators.joins:
-        if not (isinstance(join.predicate, ModelCall)
-                and join.predicate.kind == "boolean"):
-            raise NotImplementedError(
-                f"the speed of light estimate does not price a join on "
-                f"{type(join.predicate).__name__}; it prices AI.IF joins")
-        if join.semantics != "full":
-            raise NotImplementedError(
-                f"the speed of light estimate does not price "
-                f"{join.semantics!r} joins; it prices full joins")
-        if len({arg.alias for arg in join.prompt.args}) != 2:
-            raise NotImplementedError(
-                "the speed of light estimate prices binary join predicates")
-    for column in operators.projections:
-        if column.expression.kind not in ("label", "extract", "features", "map"):
-            raise NotImplementedError(
-                f"the speed of light estimate does not price the "
-                f"{column.expression.kind!r} column {column.name!r}; it "
-                f"prices AI.CLASSIFY, AI.EXTRACT, AI.SAE_FEATURES, and "
-                f"AI.MAP columns")
-    joined = [frozenset(arg.alias for arg in join.prompt.args)
-              for join in operators.joins]
-    for call, _ in operators.labels.calls:
-        aliases = call.aliases()
-        if len(aliases) == 1:
+def _plain(value):
+    """A value with its NumPy scalars as Python ones."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _shared_tokens(store, rows=None) -> list[int]:
+    """Per document, the prefix tokens an earlier computed document also has.
+
+    With rows, only those documents compute: a document outside rows
+    shares nothing, and one in rows shares only with earlier ones in rows.
+    """
+    if rows is None:
+        return [int(tokens) for tokens in prefix_tree(store, 1).shared]
+    rows = list(rows)
+    tree = prefix_tree([store[row] for row in rows], 1)
+    shared = [0] * len(store)
+    for row, tokens in zip(rows, tree.shared):
+        shared[row] = int(tokens)
+    return shared
+
+
+class _Oracles:
+    """The estimate's oracles, as the native module calls them."""
+
+    def __init__(self, answer, label, stores):
+        self.has_label = label is not None
+        self._answer, self._label, self._stores = answer, label, stores
+        self._prompts = {}
+
+    def _prompt(self, text):
+        if text not in self._prompts:
+            self._prompts[text] = decode_value(Prompt, json.loads(text))
+        return self._prompts[text]
+
+    def answer(self, prompt, assignment):
+        found = self._answer(self._prompt(prompt), dict(json.loads(assignment)))
+        return json.dumps(_plain(found))
+
+    def label(self, prompt, assignment):
+        return str(self._label(self._prompt(prompt), dict(json.loads(assignment))))
+
+    def accepts(self, condition, values):
+        condition = decode_value(object, json.loads(condition))
+        (column,) = condition_columns(condition)
+        kept = condition.accepts(pa.table({column: pa.array(json.loads(values),
+                                                            pa.string())}))
+        return json.dumps(kept.to_pylist())
+
+    def subset_shared(self, alias, rows):
+        return json.dumps(_shared_tokens(self._stores[alias].tokens, json.loads(rows)))
+
+
+def _estimate_inputs(query, stores, chunk: int, credit: bool) -> dict:
+    """What the estimate reads from the query's tables.
+
+    Returns:
+        Each scanned table's column, token lengths, and shared prefix
+        tokens; each stop key's values per row; and each join's allowed
+        pairs, by the rows of each side.
+    """
+    operators = query.logical.operators()
+    aliases = []
+    for scan in operators.scans:
+        store = stores[scan.alias]
+        tokens = [int(length) for length in store.lengths]
+        aliases.append({
+            "alias": scan.alias,
+            "column": f"{scan.provider}.{column_name(scan.column, qualified=False)}",
+            "tokens": tokens,
+            "shared": _shared_tokens(store.tokens) if credit else [0] * len(tokens)})
+    stop_groups = {}
+    for alias, key in filter_stop_keys(query.logical).items():
+        columns = [stores[alias].column(name).to_pylist() for name in key]
+        stop_groups[alias] = [_plain(list(values)) for values in zip(*columns)]
+    allowed_pairs = {}
+    for position, join in enumerate(operators.joins):
+        oriented = oriented_join_conditions(join)
+        if oriented is None:
             continue
-        name = operators.labels.names[call]
-        if len(aliases) != 2 or frozenset(aliases) not in joined:
-            raise NotImplementedError(
-                f"the classification {name!r} reads {list(aliases)}; the "
-                f"speed of light estimate prices a classification of one "
-                f"document or of one join's rows")
-        if operators.labels.tests.get(call):
-            raise NotImplementedError(
-                f"the speed of light estimate does not price a label "
-                f"filter on {name!r}, a classification of joined rows")
+        left_alias, right_alias, conditions = oriented
+        pairs = pair_table(
+            left_alias, [evaluate_expression(left, stores[left.alias])
+                         for left, _ in conditions],
+            right_alias, [evaluate_expression(right, stores[right.alias])
+                          for _, right in conditions])
+        allowed_pairs[str(position)] = {
+            alias: [[int(key), [int(row) for row in groups.rows[
+                groups.offsets[index]:groups.offsets[index + 1]]]]
+                    for index, key in enumerate(groups.keys)]
+            for alias, groups in (
+                (left_alias, partner_map(pairs, left_alias, right_alias)),
+                (right_alias, partner_map(pairs, right_alias, left_alias)))}
+    return {"aliases": aliases, "stop_groups": stop_groups,
+            "allowed_pairs": allowed_pairs, "order": query.order,
+            "credit_shared": credit, "chunk_tokens": chunk}
 
 
 def speed_of_light_estimate(
@@ -350,38 +363,47 @@ def speed_of_light_estimate(
     """
     model = model or query.session.model
     device = device or query.session.device
-    if chunk_tokens is None:
-        chunk_tokens = budgets.chunk_budget(model, device)
-    _refuse_unpriced(query.logical)
-    search = Search(query, answer, label, model, device, chunk_tokens,
-                    credit_shared_prefixes)
-    survivors, filter_work, filter_stages = search.run_filters()
-    resident = frozenset(stage["alias"] for stage in filter_stages
-                         if stage["operator"] not in (LABEL_IN, ANSWER_TEST))
-    base_rows = {alias: tuple(rows) for alias, rows in survivors.items()}
-    best, result = search.search_joins_sol(base_rows, resident, filter_work)
+    chunk = (budgets.chunk_budget(model, device) if chunk_tokens is None
+             else chunk_tokens)
+    stores = query.token_inputs()
+    try:
+        inputs = _estimate_inputs(query, stores, chunk, credit_shared_prefixes)
+    except (NotImplementedError, ValueError):
+        # an operator the estimate cannot price; Rust names it
+        inputs = {"aliases": [], "stop_groups": {}, "allowed_pairs": {},
+                  "order": query.order, "credit_shared": credit_shared_prefixes,
+                  "chunk_tokens": chunk}
+    vocabulary = Vocabulary(query.session.tokenizer)
+    fields = {"model": untagged(encode_value(model)),
+              "device": untagged(encode_value(device)),
+              "gpus": 1, "canvas_draws": 4,
+              "document_tokens": {data["alias"]: data["tokens"]
+                                  for data in inputs["aliases"]},
+              "plan": None, "attention": None}
+    found, message = _quail_native.plan_operator(
+        "speed_of_light", json.dumps(fields),
+        json.dumps({"plan": encode_value(query.logical), "inputs": inputs}),
+        vocabulary.tokens, vocabulary.decoder(),
+        _Oracles(answer, label, stores))
+    if message is not None:
+        name, _, text = message.partition(": ")
+        raise _ERRORS.get(name, ValueError)(text if name in _ERRORS else message)
+    found = json.loads(found)
+    work = Work(**found["work"])
     return SpeedOfLightEstimate(
-        model=model.name,
-        device=device.name,
-        chunk_tokens=chunk_tokens,
-        credit_shared_prefixes=credit_shared_prefixes,
-        work=best.work,
-        latency=search.latency(best),
-        seconds=search.seconds(best),
-        usd_per_hour=device.usd_per_hour,
-        alias_columns={
-            alias: data.column for alias, data in search.aliases.items()},
-        documents_by_alias={
-            alias: len(data.tokens) for alias, data in search.aliases.items()},
-        post_filter_counts={
-            alias: len(rows) for alias, rows in survivors.items()},
-        filter_stages=tuple(filter_stages),
-        join_stages=tuple(best.steps),
-        relation_order=tuple(best.relation_order),
-        cached_prefixes=tuple(sorted(best.state_property)),
-        search={
-            "dp_states": result.num_states,
-            "dp_records_generated": result.num_generated,
-            "dp_final_records": len(result.candidates),
-        },
-    )
+        model=found["model"], device=found["device"],
+        chunk_tokens=found["chunk_tokens"],
+        credit_shared_prefixes=found["credit_shared_prefixes"],
+        work=work,
+        latency=speed_of_light(work, model, device, chunk,
+                               rows=found["answer_rows"],
+                               min_passes=found["decode_passes"]),
+        seconds=found["sol_s"], usd_per_hour=found["usd_per_hour"],
+        alias_columns=found["alias_columns"],
+        documents_by_alias=found["documents_by_alias"],
+        post_filter_counts=found["post_filter_counts"],
+        filter_stages=tuple(found["filter_stages"]),
+        join_stages=tuple(found["join_stages"]),
+        relation_order=tuple(found["relation_order"]),
+        cached_prefixes=tuple(found["cached_prefixes"]),
+        search=found["search"])

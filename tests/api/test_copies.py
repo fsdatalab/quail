@@ -10,7 +10,7 @@ from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, fake_tok
 
 import quail
-from quail.planner.rules.physical import ShouldDeduplicate
+import quail.builtins
 
 BODIES = ["noisy room", "cold room", "noisy room", "slow lift", "noisy room",
           "cold room"]
@@ -68,11 +68,13 @@ def _oracle(asked, pipelines=False, filters=None):
 def _run(build, deduplicate, monkeypatch, session=_session, **oracle):
     """The query's rows, its answer tables, its plan, and what it asked."""
     asked = []
-    with session() as opened, monkeypatch.context() as patch:
+    with monkeypatch.context() as patch:
         if not deduplicate:
-            # the Rust planner cannot see a patched rule
-            patch.setenv("QUAIL_PLANNER", "python")
-            patch.setattr(ShouldDeduplicate, "rewrite", lambda *_: None)
+            patch.setattr(quail.builtins, "PHYSICAL_RULES", tuple(
+                name for name in quail.builtins.PHYSICAL_RULES
+                if name != "should_deduplicate"))
+        opened = session()
+    with opened:
         query = build(opened)
         plan = _planned(query)
         result = finish(query, _oracle(asked, **oracle))

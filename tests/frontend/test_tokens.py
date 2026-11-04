@@ -8,13 +8,11 @@ import pytest
 from quail.common.shards import contiguous_shards
 from quail.common.tokens import (
     ArrowTokenDocuments,
-    TokenLengths,
     TokenStore,
     concat_tokens,
     decode_token_documents,
     prefix_tree,
 )
-from quail.planner.statistics.tables import AliasStats, summarize_alias
 
 
 def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypatch):
@@ -51,26 +49,8 @@ def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypa
         ["one", "two"], ["three"], ["four", "five", "six"]]
     assert store._reader.schema.names == [
         "__quail_token_ids", "__quail_token_count"]
-    with monkeypatch.context() as patch:
-        patch.setattr(type(store.lengths), "__getitem__",
-                      lambda *_: pytest.fail("statistics read an Arrow scalar"))
-        memo = {}
-        summary = summarize_alias(store.lengths, 3, memo=memo)
-        assert summary == AliasStats(3, 6, 14, 3, 3, ((1, 1), (2, 1)))
-        assert summary.variance == pytest.approx(2 / 3)
-        assert contiguous_shards(store.lengths, 1, total=summary.total) == (
-            ((0, 3),), [6])
-        assert contiguous_shards(store.lengths, 2) == (((0, 2), (2, 3)), [3, 3])
-        assert summarize_alias(store.lengths, 3, memo=memo) is summary
-        assert summarize_alias(store.lengths, memo=memo).short_counts == ()
-        assert summarize_alias(TokenLengths([4]), 3, memo=memo) == AliasStats(
-            1, 4, 16, 4, 3)
-    assert summarize_alias(TokenLengths(pa.array([], pa.int32())), 3) == AliasStats(
-        0, 0, 0, 0, 3)
-    assert summarize_alias(TokenLengths([])).variance == 0
-    assert summarize_alias(TokenLengths([100_000_000, 100_000_001])).variance == 0.25
-    assert summarize_alias(
-        TokenLengths(pa.array([100_000], pa.int32()))).squared == 10_000_000_000
+    assert contiguous_shards(store.lengths, 1, total=6) == (((0, 3),), [6])
+    assert contiguous_shards(store.lengths, 2) == (((0, 2), (2, 3)), [3, 3])
     index = store.prefix_index
     with monkeypatch.context() as patch:
         patch.setattr("quail.common.tokens._token_array",

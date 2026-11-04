@@ -125,7 +125,7 @@ def _quail_state():
     from quail.backends.quail.executor.readout import AnswerRows
     from quail.common import budgets
     from quail.common.tokens import GigatokenEncoder
-    from quail.planner.prompt_lowering import answer_ids
+    from quail.physical.lowering import answer_ids
     from quail.specs import D1_2B_BF16, H100_SXM
     from quail.specs.files import resolve_model_path
 
@@ -158,7 +158,7 @@ def _classify_spec(encoder):
     from quail.common.prompts import bind_classify_prompt
     from quail.logical import ColumnRef
     from quail.physical import ClassifySpec
-    from quail.planner.prompt_lowering import lower_prompt, option_spellings
+    from quail.physical.lowering import lower_prompt, option_spellings
     from quail.specs import D1_2B_BF16
 
     spec = D1_2B_BF16
@@ -181,11 +181,14 @@ def _classify_spec(encoder):
 def _mixed_questions(encoder, choice):
     """A yes/no, IMDB-11's choice, and a read, as one pass group's SetQuestions."""
     from quail.backends.quail.executor.pass_groups import SetQuestion, node_question
-    from quail.backends.quail.lowering import set_question_parts
     from quail.common.prompts import PROMPT_LAYOUTS, bind_extract_prompt
     from quail.logical import ColumnRef, bind_prompt
     from quail.physical import AiClassify
-    from quail.planner.prompt_lowering import lower_prompt, read_slot_offsets
+    from quail.physical.lowering import (
+        lower_prompt,
+        read_slot_offsets,
+        set_question_parts,
+    )
     from quail.specs import D1_2B_BF16
 
     spec = D1_2B_BF16

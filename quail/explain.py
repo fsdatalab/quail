@@ -31,7 +31,6 @@ from quail.physical import (
     Window,
 )
 from quail.physical.pipelines import build_pipelines
-from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 from quail.planner.plan import Refusal
 
 
@@ -623,13 +622,13 @@ def rule_lines(rules) -> list[str]:
 
     return [
         "optimizer rules:",
-        "  logical: " + names(rule for rule in rules if isinstance(rule, LogicalRule)),
+        "  logical: " + names(rule for rule in rules if rule.kind == "logical"),
         "  physical: " + names(
-            rule for rule in rules if isinstance(rule, PhysicalRule)),
+            rule for rule in rules if rule.kind == "physical"),
         "  search: rewrite logical candidates, "
         "then lower each alternative",
         "  refine each graph in order: " + names(
-            rule for rule in rules if isinstance(rule, PhysicalRule)),
+            rule for rule in rules if rule.kind == "physical"),
         "  selection: lowest estimated cost after graph refinement",
     ]
 

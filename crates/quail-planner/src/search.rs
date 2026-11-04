@@ -1150,3 +1150,106 @@ pub fn choose_operator_order(
         order_source: source,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use quail_cost::specs::{read_devices, read_models};
+
+    use super::*;
+
+    fn spec(position: usize, aliases: [&str; 2], selectivity: f64) -> PricedJoin {
+        PricedJoin {
+            written_position: position,
+            aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+            anchor: Some(aliases[0].to_string()),
+            anchor_free: true,
+            semantics: "full".to_string(),
+            selectivity: Some(selectivity),
+            on: Vec::new(),
+            pair_fraction: 1.0,
+            score: None,
+            frame_tokens: aliases.iter().map(|alias| (alias.to_string(), 8)).collect(),
+            label_tokens: aliases.iter().map(|alias| (alias.to_string(), 4)).collect(),
+            tail_tokens: 2,
+        }
+    }
+
+    #[test]
+    fn the_join_search_finds_the_cheapest_enumerated_sequence() {
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../quail/specs/data");
+        let model = read_models(&data.join("models")).unwrap()["qwen3-4b-fp8"].clone();
+        let device = read_devices(&data.join("devices")).unwrap()["h100-sxm"].clone();
+        let tokenizer = |_: &str| Ok(Vec::new());
+        let context = PlanningContext {
+            model: model.clone(),
+            device: device.clone(),
+            gpus: 1,
+            canvas_draws: 4,
+            document_tokens: BTreeMap::new(),
+            tokenizer: &tokenizer,
+            decode: None,
+            attention: None,
+            pair_fractions: BTreeMap::new(),
+            scan_fractions: BTreeMap::new(),
+            order: None,
+            logical_plan: None,
+            first_documents: BTreeMap::new(),
+            page_shared: BTreeMap::new(),
+            reader_groups: BTreeMap::new(),
+            last_tokens: BTreeMap::new(),
+            backend: "quail".to_string(),
+        };
+        let specs = [spec(0, ["a", "b"], 0.01), spec(1, ["b", "c"], 0.1)];
+        let lengths: BTreeMap<String, AliasStats> =
+            [("a", 800, 20), ("b", 100, 30), ("c", 400, 10)]
+                .into_iter()
+                .map(|(alias, tokens, count)| {
+                    (
+                        alias.to_string(),
+                        AliasStats::summarize(&vec![tokens; count], 0),
+                    )
+                })
+                .collect();
+        let resident: BTreeSet<String> = ["a", "c"].iter().map(|alias| alias.to_string()).collect();
+        let expected: BTreeMap<String, f64> = [("a", 10.0), ("b", 6.0), ("c", 8.0)]
+            .into_iter()
+            .map(|(alias, rows)| (alias.to_string(), rows))
+            .collect();
+        let seconds = |work: &Work| speed_of_light(work, &model, &device, 8192, 0.0, 0).seconds();
+        let found = search_joins(
+            &specs,
+            &expected,
+            &lengths,
+            &resident,
+            5,
+            8192,
+            &context,
+            &Work::default(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let mut cheapest = f64::INFINITY;
+        for order in [[0, 1], [1, 0]] {
+            for first in &specs[order[0]].aliases {
+                for second in &specs[order[1]].aliases {
+                    let sequence = [
+                        (specs[order[0]].clone(), first.clone()),
+                        (specs[order[1]].clone(), second.clone()),
+                    ];
+                    let (work, steps) =
+                        walk(&sequence, &expected, &lengths, &resident, 5, &context).unwrap();
+                    // a table's filter KV is read once, by its first anchor use
+                    let anchors: Vec<&String> = steps.iter().map(|step| &step.anchor).collect();
+                    if anchors[0] == anchors[1] {
+                        assert_ne!(steps[1].resident, "filter");
+                    }
+                    cheapest = cheapest.min(seconds(&work));
+                }
+            }
+        }
+        assert_eq!(seconds(&found.work), cheapest);
+    }
+}

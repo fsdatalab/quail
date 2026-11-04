@@ -1,11 +1,13 @@
 """Plan as a session would: the tree rewrites, then the physical planner."""
 
+from types import SimpleNamespace
+
 from quail.builtins import built_in_registry
 from quail.common.tokens import TokenLengths
+from quail.planner import native
 from quail.planner.optimize import plan_query
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import logical_alternatives
-from quail.planner.rules import built_in_rules
+from quail.planner.optimizer.rules import LogicalRule
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
@@ -28,8 +30,20 @@ def _optimize(logical, document_tokens, model=QWEN3_4B_FP8, **kwargs):
         gpus=kwargs.get("gpus", 1), document_tokens=token_lengths(document_tokens),
         order=kwargs.get("order"), tokenizer=tokenizer,
         pair_fractions=kwargs.get("pair_fractions") or {})
-    candidate, = logical_alternatives(logical, built_in_rules(), context)
+    candidate, = native.logical_alternatives(logical, built_in_registry(), context)
     return candidate.plan, candidate.rules
+
+
+def rewrite(logical, *rules, catalog=None):
+    """Apply the named logical rules, in order, as the planner does.
+
+    Returns:
+        The alternatives, each with its plan and the rules that changed it.
+    """
+    named = {name: LogicalRule(name) for name in rules}
+    registry = SimpleNamespace(logical_rules=named)
+    return native.logical_alternatives(
+        logical, registry, PlanningContext(catalog=catalog))
 
 
 def _plan(logical, document_tokens, model=QWEN3_4B_FP8, **kwargs):

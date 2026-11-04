@@ -1,15 +1,10 @@
-"""Per-table document-length summaries and the survivors of joins."""
+"""Token length statistics of a table, as the cost model reads them."""
 
-import math
 from dataclasses import dataclass
 
 import pyarrow.compute as pc
 
 from quail.common.work import triangle
-from quail.cost.joins import PricedJoin
-from quail.logical import (
-    effective_selectivity,
-)
 
 
 @dataclass(frozen=True)
@@ -87,74 +82,3 @@ def scale_alias(stats: AliasStats, fraction: float) -> AliasStats:
         short_counts=tuple((length, round(count * fraction))
                            for length, count in stats.short_counts),
     )
-
-
-def alias_stats(lengths: dict, window: int = 0) -> dict[str, AliasStats]:
-    """Normalize raw length lists or accept summaries from a caller."""
-    return {
-        alias: (values if isinstance(values, AliasStats)
-                else summarize_alias(values, window))
-        for alias, values in lengths.items()
-    }
-
-
-def surviving_documents(num_documents: float, num_partners: float,
-                        tuple_selectivity) -> float:
-    """Expected documents with at least one matching tuple.
-
-    Tuple matches are taken as independent and evenly spread.
-    """
-    tuple_selectivity = effective_selectivity(tuple_selectivity)
-    if tuple_selectivity >= 1:
-        probability = float(num_partners > 0)
-    else:
-        # log1p and expm1 keep a tiny match probability over many
-        # partners from rounding to zero
-        probability = -math.expm1(num_partners * math.log1p(-tuple_selectivity))
-    return num_documents * probability
-
-
-def thin(expected_rows: dict, spec: PricedJoin) -> None:
-    """Update live document counts after one join's selectivity.
-
-    A tuple matches when the equality conditions keep it and the model
-    accepts it.
-    """
-    sel = effective_selectivity(spec.selectivity) * spec.pair_fraction
-    aliases = spec.aliases
-
-    def others(x):
-        out = 1.0
-        for a in aliases:
-            if a != x:
-                out *= expected_rows[a]
-        return out
-
-    if spec.semantics == "full":
-        new = {a: surviving_documents(expected_rows[a], others(a), sel)
-               for a in aliases}
-        expected_rows.update(new)
-    else:
-        anchor = spec.anchor
-        matched = surviving_documents(expected_rows[anchor], others(anchor), sel)
-        expected_rows[anchor] = (matched if spec.semantics == "exists"
-                        else expected_rows[anchor] - matched)
-
-
-def cross_tuples(spec: PricedJoin, expected_rows: dict) -> float:
-    """Expected tuples of one join.
-
-    The live cross product, or the fraction of it the join's equality
-    conditions keep.
-    """
-    tuples = 1.0
-    for a in spec.aliases:
-        tuples *= expected_rows[a]
-    return tuples * spec.pair_fraction
-
-
-def pair_counts(expected_rows, aliases, fraction) -> tuple[float, float]:
-    """Return expected pairs and first documents with at least one pair."""
-    left, right = aliases
-    return (expected_rows[left] * expected_rows[right] * fraction,
-            surviving_documents(expected_rows[left], expected_rows[right], fraction))

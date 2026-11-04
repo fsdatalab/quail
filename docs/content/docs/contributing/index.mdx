@@ -43,7 +43,8 @@ Include the tests and documentation needed to check and use your change.
 | `quail/frontend/` | SQL parsing. |
 | `quail/catalog/` | Table providers and the tokenized inputs of a session. |
 | `quail/logical/`, `quail/physical/` | Logical and physical plan definitions. |
-| `quail/planner/`, `quail/cost/`, `quail/specs/` | Planning rules, cost estimates, and model and device specifications. |
+| `crates/` | The Rust planner, cost model, and DataFusion binder, built into the `_quail_native` module. |
+| `quail/planner/`, `quail/cost/`, `quail/specs/` | The bridge to the Rust planner, the Python cost model, and model and device specifications. |
 | `quail/execution/` | The runner and the CPU operators. |
 | `quail/backends/` | The Quail inference engine. |
 | `quail/baselines/` | The stock vLLM and SGLang backends the benchmark compares against. |
@@ -57,25 +58,20 @@ Each package imports only the packages below it in the list in
 `pyproject.toml` under `[tool.importlinter]`; `uv run lint-imports`
 checks that.
 
-`quail/planner/` has one subpackage per planning stage. The table runs
-from top to bottom, and `lint-imports` holds the planner to this order
-too:
+The planner runs in Rust. `quail/planner/` holds what Python needs
+around it:
 
 | Path | Contents |
 | --- | --- |
-| `pricing.py` | Helpers that price a logical plan through the same search as the query planner. |
-| `rules/` | `logical.py` changes query trees. `physical.py` changes executable graphs. |
-| `graph/` | `GraphBuilder`, which turns the planner's decisions into a physical graph, plus shards, retention, and result operators. |
-| `sol/` | The speed-of-light estimate and its plan search. |
-| `search/` | `operator_order.py` assembles the chosen filter order, join order, and anchors. `filter_order.py` and `join_order.py` implement the searches. |
-| `operators/` | One module per AI operator (`filter`, `join`, `score`, `classify`, `extract`) with its statistics, cost, spec, and `emit_*` functions that add its plan nodes. |
-| `statistics/` | Table length summaries and `pool_split`, the KV pool split every operator reads. |
-| `optimize.py` | Candidate generation, refinement, and final selection. |
-| `optimizer/` | `context.py` holds planning inputs. `candidates.py` defines candidate plans and the backend planner interface. `tree_rewrites.py` and `graph_refinement.py` apply the two rule interfaces in `rules.py`. |
-| `validation.py`, `prompt_lowering.py`, `plan.py` | Refusals, prompt tokenization, and `PhysicalPlan`. |
+| `native.py` | The bridge to `_quail_native`: logical alternatives, search, refinement, and the request backends' operator order. |
+| `optimize.py` | `plan_query` and `refine_plan`. |
+| `sol.py` | The speed-of-light estimate, searched in Rust over the caller's oracles. |
+| `stages.py` | The plan of a statement whose CTEs run as their own stages. |
+| `optimizer/` | `context.py` holds planning inputs, `candidates.py` the candidate plans, and `rules.py` the rule names a registry lists. |
+| `plan.py` | `PhysicalPlan`, `Refusal`, and `EngineConfig`. |
 
-To add an AI operator, add a module under `operators/` and call its
-`emit_*` function from `GraphBuilder` in `graph/builder.py`.
+To add an AI operator, add its planning to `crates/quail-planner` and
+its node to `quail/physical`.
 
 For module names, follow the [Google Python naming guidance](https://google.github.io/styleguide/pyguide.html#316-naming).
 Use descriptive `snake_case` names and avoid unfamiliar abbreviations.

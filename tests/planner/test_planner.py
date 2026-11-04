@@ -1,6 +1,5 @@
 """Planner ordering, anchor selection, sharding, break-evens, and refusals."""
 
-import itertools
 from dataclasses import replace
 
 import pyarrow as pa
@@ -10,13 +9,10 @@ from helpers.planning import _optimize, _plan, node_kinds
 
 from quail.catalog import Catalog, DocumentProvider
 from quail.common.sol import speed_of_light
-from quail.common.tokens import TokenLengths
 from quail.common.work import ask, scan, stream
-from quail.cost.filters import filter_cost
-from quail.cost.joins import PricedJoin
 from quail.explain import explain
 from quail.frontend.sql import compile_sql
-from quail.logical import ModelCall, SemanticJoin
+from quail.logical import SemanticJoin
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -25,21 +21,10 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.codec import encode_fields
-from quail.planner.operators.filter import prepare_filter_costs
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 from quail.planner.plan import Refusal
-from quail.planner.rules import (
-    ShouldEliminateDistinct,
-    ShouldPushDownLimit,
-    ShouldRetainKv,
-)
-from quail.planner.search.filter_order import order_filters_indexed
-from quail.planner.statistics.tables import AliasStats, summarize_alias
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
-
-def order_filters(predicates, rule, **kwargs):
-    costs = prepare_filter_costs(predicates, lower=lambda prompt: prompt, **kwargs)
-    return [predicates[i] for i in order_filters_indexed(costs, rule)]
 
 def filter_sequence(plan, alias=None):
     return next(n for n in plan.nodes if isinstance(n, AiFilter)
@@ -141,51 +126,6 @@ def test_filter_ordering_and_kv_writes(catalog):
             for node in as_written.graph.nodes_by_type(AiFilter.type_name)] \
         == list(sels)
 
-    class Predicate:
-        def __init__(self, tail, selectivity):
-            self.prompt = type("Prompt", (), {
-                "tail_tokens": tail, "preamble_tokens": 0})()
-            self.expression = ModelCall(self.prompt)
-            self.selectivity = selectivity
-
-    first, second = Predicate(10, 0.5), Predicate(10, 0.5)
-    kwargs = dict(mean_tokens=400, model=QWEN3_4B_FP8,
-                  device=H100_SXM, chunk_tokens=110_376)
-    assert order_filters([first, second], "by_cost", **kwargs) == \
-        [first, second]
-    never_kills = Predicate(1, 1.0)
-    assert order_filters([never_kills, first], "by_cost", **kwargs) == \
-        [first, never_kills]
-
-    predicates = [Predicate(12, 0.8), Predicate(50, 0.1), Predicate(8, 1.0),
-                  Predicate(25, 0.0)]
-    ask_costs = [filter_cost(predicate.prompt.tail_tokens, first=False, **kwargs)
-                 for predicate in predicates]
-    scan_costs = [filter_cost(predicate.prompt.tail_tokens, first=True, **kwargs)
-                  for predicate in predicates]
-
-    candidates = []
-    for first in range(len(predicates)):
-        def score(index):
-            rejected = 1.0 - predicates[index].selectivity
-            return ask_costs[index] / rejected if rejected else float("inf")
-
-        remaining = sorted(
-            (index for index in range(len(predicates)) if index != first),
-            key=score)
-        order = [first, *remaining]
-        expected = 0.0
-        expected_rows = 1.0
-        for position, index in enumerate(order):
-            expected += expected_rows * (scan_costs[index] if position == 0
-                                else ask_costs[index])
-            expected_rows *= predicates[index].selectivity
-        candidates.append((expected, order))
-
-    expected_order = min(candidates)[1]
-    actual = order_filters(predicates, "by_cost", **kwargs)
-    assert actual == [predicates[index] for index in expected_order]
-
     logical = compile_sql(
         "SELECT r.id FROM reviews r "
         f"WHERE AI_FILTER(PROMPT('{'long ' * 100}{{0}}', r.review), "
@@ -252,7 +192,8 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     assert _cell(physical, "Project: r.id") == ["25"]
     assert "KV: not stored" in physical
 
-    rules = (ShouldEliminateDistinct(), ShouldPushDownLimit(), ShouldRetainKv())
+    rules = (LogicalRule("should_eliminate_distinct"),
+             PhysicalRule("should_push_down_limit"), PhysicalRule("should_retain_kv"))
     assert "rules" not in explain(logical, plan, rules=rules)
     text = explain(logical, plan, verbose=True, rules=rules)
     assert "  logical: should_eliminate_distinct" in text
@@ -420,124 +361,3 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert groups[0].keep_kv is True
     assert groups[1].keep_kv is False
     assert groups[1].anchor_resident == "kept"
-
-
-
-
-def _join_search_spec(position, aliases, anchor):
-    return PricedJoin(
-        written_position=position, aliases=tuple(aliases), anchor=anchor,
-        anchor_free=False, semantics="full", selectivity=None,
-        frame_tokens={alias: 5 for alias in aliases},
-        label_tokens={alias: 4 for alias in aliases}, tail_tokens=6)
-
-
-
-
-def test_join_search_matches_enumeration_and_tracks_residency():
-    from quail.planner.search.join_order import (
-        anchor_fits,
-        search_joins,
-        walk,
-    )
-
-    specs = [PricedJoin(written_position=index, aliases=aliases, anchor=aliases[0],
-                        anchor_free=True, semantics="full",
-                        selectivity=selectivity,
-                        frame_tokens={alias: 8 for alias in aliases},
-                        label_tokens={alias: 4 for alias in aliases},
-                        tail_tokens=2)
-             for index, (aliases, selectivity) in enumerate([
-                 (("a", "b"), 0.01), (("b", "c"), 0.1),
-             ])]
-    lengths = {alias: summarize_alias(TokenLengths(tokens)) for alias, tokens in [
-        ("a", [800] * 20), ("b", [100] * 30), ("c", [400] * 10),
-    ]}
-    filtered = {"a", "c"}
-    expected_rows = {"a": 10.0, "b": 6.0, "c": 8.0}
-    result = search_joins(specs, expected_rows, lengths, filtered, 5, 8192,
-                          QWEN3_4B_FP8, H100_SXM)
-    costs = []
-    for order in itertools.permutations(specs):
-        for anchors in itertools.product(*(spec.aliases for spec in order)):
-            work, records = walk(list(zip(order, anchors)), expected_rows, lengths,
-                                 filtered, 5, QWEN3_4B_FP8, H100_SXM)
-            seen = set()
-            for record in records:
-                if record.anchor in seen:
-                    assert record.resident != "filter"
-                seen.add(record.anchor)
-            costs.append(speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 8192).seconds)
-    assert speed_of_light(
-        result.work, QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)
-
-    specs = [
-        _join_search_spec(0, ("a", "b"), "a"),
-        _join_search_spec(1, ("b", "c"), "b"),
-        _join_search_spec(2, ("a", "c"), "a"),
-    ]
-    expected_rows = {"a": 3.0, "b": 3.0, "c": 2.0}
-    lengths = {"a": TokenLengths([90, 100, 110]), "b": TokenLengths([400] * 3),
-               "c": TokenLengths([50] * 2)}
-    assert anchor_fits(specs[0], "a", lengths, 10, 100_000)
-    assert not anchor_fits(specs[0], "a", lengths, 10, 500)
-    current = search_joins(
-        specs, expected_rows, lengths, {"a"}, 10, 100_000,
-        QWEN3_4B_FP8, H100_SXM, fixed_order=True)
-    # a's filter computed its prefixes: its first anchor use pays no
-    # prefix, and neither does its later use (kept after group 0)
-    assert current.steps[0].resident == "filter"
-    assert current.steps[0].resident_documents == 3
-    assert current.steps[1].resident == "none"
-    assert current.steps[2].resident == "kept"
-    assert current.steps[2].resident_documents == 3
-
-    specs = [
-        _join_search_spec(0, ("a", "b"), "b"),
-        _join_search_spec(2, ("c", "d"), "c"),
-    ]
-    expected_rows = {alias: 2.0 for alias in "abcd"}
-    lengths = {alias: TokenLengths([100, 120]) for alias in "abcd"}
-
-    assert search_joins(specs, expected_rows, lengths, {}, 10, 100_000,
-                        QWEN3_4B_FP8, H100_SXM) is None
-    found = search_joins(specs, expected_rows, lengths, {}, 10, 100_000,
-                         QWEN3_4B_FP8, H100_SXM, already_joined={"b", "c"})
-    assert found is not None
-    assert {position for position, _ in found.seq} == {0, 2}
-
-    million = AliasStats(count=1_000_000, total=100_000_000,
-                         squared=10_000_000_000, maximum=100)
-    stats = {alias: million for alias in "abcd"}
-    expected_rows = {alias: 1_000_000.0 for alias in "abcd"}
-    specs = [
-        _join_search_spec(0, ("a", "b"), "a"),
-        _join_search_spec(1, ("b", "c"), "b"),
-        _join_search_spec(2, ("c", "d"), "c"),
-    ]
-    found = search_joins(specs, expected_rows, stats, {}, 10, 100_000,
-                         QWEN3_4B_FP8, H100_SXM)
-    assert found is not None
-    assert len(found.seq) == 3
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

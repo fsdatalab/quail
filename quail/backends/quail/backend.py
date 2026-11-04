@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
@@ -16,27 +15,15 @@ from quail.backends.quail.worker import (
 )
 from quail.specs import DEVICES, SupportResult
 
-if TYPE_CHECKING:
-    from quail.planner.optimizer.candidates import ModelRegion, PhysicalCandidate
-    from quail.planner.optimizer.context import PlanningContext
-
 
 class QuailBackend:
-    """Plan and start Quail model execution.
-
-    Args:
-        plan_region: The Quail planner, `quail.planner.lowering.plan_region`:
-            it lowers a model region into physical candidates.
-    """
+    """Start Quail model execution; the Rust planner plans its queries."""
 
     name = "quail"
     engine_name = "quail"
     runtime_package = "vllm==0.29.0"
     reads_document_text = False
     locates_answers_in_text = True
-
-    def __init__(self, plan_region: Callable) -> None:
-        self._plan_region = plan_region
 
     def supports(self, model, device, gpus: int) -> SupportResult:
         if device.name not in DEVICES:
@@ -62,10 +49,6 @@ class QuailBackend:
                 f"device {device.name!r} is not one; use triton or auto "
                 f"for {model.name!r}")
         return SupportResult.accept()
-
-    def plan(self, region: ModelRegion,
-             context: PlanningContext) -> tuple[PhysicalCandidate, ...]:
-        return self._plan_region(region, context)
 
     def start(self, context: GpuContext) -> QuailModelExecution:
         return QuailModelExecution(context)

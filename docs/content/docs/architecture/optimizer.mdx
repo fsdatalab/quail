@@ -124,9 +124,9 @@ built-in rules of the same kind, in registration order.
 | `choose_attention_path` | Physical | Choose unified or tree attention for filters and joins. | Yes |
 
 The implementations are in
-[`rules/logical.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/logical.py)
+[`rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/rules.rs)
 and
-[`rules/physical.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/physical.py).
+[`physical_rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/physical_rules.rs).
 
 The planner makes the cost-based choices described [below](#plan-choices).
 

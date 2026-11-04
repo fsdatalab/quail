@@ -16,7 +16,7 @@ from quail.logical import (
 from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
 from quail.physical.lowering import lower_prompt
 from quail.planner.plan import EngineConfig
-from quail.planner.sol.estimate import SpeedOfLightEstimate, speed_of_light_estimate
+from quail.planner.sol import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.remote.client import QueryRun
 from quail.remote.records import QueryFailedError, QueryStatus
 

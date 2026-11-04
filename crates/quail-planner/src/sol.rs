@@ -1517,6 +1517,19 @@ pub fn speed_of_light_estimate(
         "sliding_kv_read": work.sliding_kv_read.total(),
         "kv_written": work.kv_written.total(),
         "kv_read": work.kv_read.total(),
+        "work": {
+            "tokens": work.tokens.total(),
+            "pairs": work.pairs.total(),
+            "kv_written": work.kv_written.total(),
+            "kv_read": work.kv_read.total(),
+            "sliding_pairs": work.sliding_pairs.total(),
+            "sliding_kv_read": work.sliding_kv_read.total(),
+            "state_written": work.state_written.total(),
+            "state_read": work.state_read.total(),
+            "sae_encoded": work.sae_encoded.total(),
+        },
+        "answer_rows": estimate.latency_rows(&best),
+        "decode_passes": estimate.decode_passes,
         "usd_per_hour": device.usd_per_hour,
         "usd_per_query": seconds * device.usd_per_hour / 3600.0,
         "alias_columns": estimate.inputs.aliases.iter().map(|data| (data.alias.clone(), Value::from(data.column.clone()))).collect::<Map<String, Value>>(),
@@ -1835,4 +1848,40 @@ fn search_joins(
     }
     let count = finals.len();
     Ok((finals[best].clone(), states.len(), generated, count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relation(left: &str, right: &str, pairs: &[(i64, i64)]) -> PairRelation {
+        PairRelation {
+            left: left.to_string(),
+            right: right.to_string(),
+            pairs: pairs.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn survivors_of_a_tree_and_of_a_cycle_are_the_rows_some_assignment_keeps() {
+        let base: Vec<(String, Vec<i64>)> = ["a", "b", "c"]
+            .iter()
+            .map(|alias| (alias.to_string(), vec![0, 1]))
+            .collect();
+        let tree = [
+            relation("a", "b", &[(0, 0), (1, 1)]),
+            relation("b", "c", &[(0, 0)]),
+        ];
+        let cycle = [
+            relation("a", "b", &[(0, 0), (1, 1)]),
+            relation("b", "c", &[(0, 0), (1, 1)]),
+            relation("a", "c", &[(0, 1), (1, 0)]),
+        ];
+        for (relations, expected) in [(&tree[..], vec![0]), (&cycle[..], vec![])] {
+            let found = exact_survivors(&base, &relations.iter().collect::<Vec<_>>());
+            for alias in ["a", "b", "c"] {
+                assert_eq!(found[alias], expected, "{alias}");
+            }
+        }
+    }
 }

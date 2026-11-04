@@ -145,7 +145,7 @@ FEV9_RUNS = [
 def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
         monkeypatch):
     def unexpected_search(*args, **kwargs):
-        raise AssertionError("execution called the join optimizer")
+        raise AssertionError("execution planned the query again")
 
     for gpus, capacity, empty, estimate in FEV9_RUNS:
         case = f"gpus={gpus} capacity={capacity} empty={empty}"
@@ -156,7 +156,7 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
 
             def check(request, graph):
                 assert len(graph.nodes_by_type(AiJoin.type_name)) == 3
-                patch.setattr("quail.planner.search.join_order.search_joins",
+                patch.setattr("quail.planner.native.search_plan",
                               unexpected_search)
                 return {}
 

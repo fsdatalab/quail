@@ -104,7 +104,7 @@ def _tokenizer():
 def _prompts():
     """Per question, the lowered prompt and the text and ids of each review."""
     from quail.logical import bind_prompt
-    from quail.planner.prompt_lowering import (
+    from quail.physical.lowering import (
         lower_prompt,
         render_filter_prompt_ids,
     )
@@ -219,7 +219,7 @@ def prompts():
 
 @pytest.fixture(scope="module")
 def answer_ids():
-    from quail.planner.prompt_lowering import answer_ids as ids
+    from quail.physical.lowering import answer_ids as ids
 
     true_ids, false_ids = ids(_spec(), _tokenizer())
     return true_ids, false_ids
@@ -245,8 +245,7 @@ def _yes_no_questions(templates):
     """AI filter templates as the SetQuestions of one pass group."""
     from quail.backends.quail.executor.pass_groups import SetQuestion
     from quail.logical import bind_prompt
-    from quail.planner.lowering import set_question_parts
-    from quail.planner.prompt_lowering import lower_prompt
+    from quail.physical.lowering import lower_prompt, set_question_parts
 
     spec, ids = _spec(), _tokenizer()
     questions = []
@@ -313,7 +312,7 @@ def _join_passes():
     from quail.backends.quail.lowering import set_join_parts
     from quail.common.prompts import bind_join_prompt
     from quail.logical import ColumnRef
-    from quail.planner.prompt_lowering import lower_prompt
+    from quail.physical.lowering import lower_prompt
 
     spec, ids = _spec(), _tokenizer()
     prompt = bind_join_prompt(JOIN, (
@@ -516,7 +515,7 @@ def _choice_questions():
     from quail.backends.quail.executor.pass_groups import SetQuestion
     from quail.common.prompts import bind_classify_prompt
     from quail.logical import ColumnRef
-    from quail.planner.prompt_lowering import lower_prompt, option_spellings
+    from quail.physical.lowering import lower_prompt, option_spellings
 
     spec, ids = _spec(), _tokenizer()
     questions, prompts = [], []
@@ -539,7 +538,7 @@ def _read_questions():
     from quail.backends.quail.executor.pass_groups import SetQuestion
     from quail.common.prompts import PROMPT_LAYOUTS, bind_extract_prompt
     from quail.logical import ColumnRef
-    from quail.planner.prompt_lowering import lower_prompt, read_slot_offsets
+    from quail.physical.lowering import lower_prompt, read_slot_offsets
 
     spec, ids = _spec(), _tokenizer()
     layout = PROMPT_LAYOUTS[spec.prompt_layout]

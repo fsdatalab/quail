@@ -1,7 +1,7 @@
 """Extension registration, ordering, and rollback tests."""
 
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from types import ModuleType
 from typing import ClassVar
 
@@ -11,21 +11,7 @@ from quail.builtins import built_in_registry
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.runtimes import ScanRuntime
 from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
-from quail.planner.optimizer.graph_refinement import rewrite_graph
 from quail.planner.optimizer.rules import PhysicalRule
-
-
-@dataclass(frozen=True)
-class ChangeCount(PhysicalRule):
-    name: str
-    factor: int = 1
-    offset: int = 0
-
-    def rewrite(self, graph, context):
-        return PhysicalGraph(tuple(
-            replace(node, num_documents=node.num_documents * self.factor + self.offset)
-            for node in graph.nodes
-        ), graph.root)
 
 
 @dataclass(frozen=True)
@@ -41,42 +27,39 @@ def _module(monkeypatch, name, register):
     return module
 
 
-def _count(registry):
-    graph = PhysicalGraph(
-        (Scan(node_id="input", alias="d", input_id="d", num_documents=1),),
-        PortRef("input", "rows:d"),
-    )
-    rewritten, _ = rewrite_graph(
-        graph, tuple(registry.rules.values()), None)
-    return rewritten.nodes[0].num_documents
+def _added(registry):
+    built_in = list(built_in_registry().rules)
+    return [name for name in registry.rules if name not in built_in]
 
 
 def test_extension_order_nesting_and_rollback(monkeypatch):
     def register(registry):
         assert "double" in registry.rules
-        registry.register_physical_rule(ChangeCount("add_three", offset=3))
+        registry.register_physical_rule(PhysicalRule("add_three"))
 
     registry = (
         built_in_registry()
-        .register_physical_rule(ChangeCount("double", factor=2))
+        .register_physical_rule(PhysicalRule("double"))
         .load_extension(_module(monkeypatch, "test_order_extension", register))
-        .register_physical_rule(ChangeCount("double_again", factor=2))
+        .register_physical_rule(PhysicalRule("double_again"))
     )
-    assert _count(registry) == 10
+    assert _added(registry) == ["double", "add_three", "double_again"]
+    with pytest.raises(TypeError, match="registered by name"):
+        registry.register_physical_rule(object())
 
     calls = []
 
     def register_inner(registry):
         calls.append("inner")
-        registry.register_physical_rule(ChangeCount("inner"))
+        registry.register_physical_rule(PhysicalRule("inner"))
 
     inner = _module(monkeypatch, "test_inner_extension", register_inner)
 
     def register_outer(registry):
         calls.append("outer")
-        registry.register_physical_rule(ChangeCount("before"))
+        registry.register_physical_rule(PhysicalRule("before"))
         registry.load_extension(inner)
-        registry.register_physical_rule(ChangeCount("after"))
+        registry.register_physical_rule(PhysicalRule("after"))
 
     outer = _module(monkeypatch, "test_outer_extension", register_outer)
     registry = built_in_registry().load_extension(outer)
@@ -87,11 +70,11 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
     assert calls == ["outer", "inner"]
 
     # a failed registration rolls the registry back
-    registry = built_in_registry().register_physical_rule(ChangeCount("existing"))
+    registry = built_in_registry().register_physical_rule(PhysicalRule("existing"))
 
     def register(registry):
-        registry.register_physical_rule(ChangeCount("added"))
-        registry.register_physical_rule(ChangeCount("existing"))
+        registry.register_physical_rule(PhysicalRule("added"))
+        registry.register_physical_rule(PhysicalRule("existing"))
 
     module = _module(monkeypatch, "test_failed_extension", register)
     with pytest.raises(ValueError, match="duplicate physical_rule"):
@@ -102,13 +85,13 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
     assert registry.extension_modules == ()
 
     module.register_quail_extension = (
-        lambda registry: registry.register_physical_rule(ChangeCount("added")))
+        lambda registry: registry.register_physical_rule(PhysicalRule("added")))
     registry.load_extension(module)
     assert [name for name in registry.rules
             if name not in built_in] == ["existing", "added"]
 
     def recursive(registry):
-        registry.register_physical_rule(ChangeCount("added"))
+        registry.register_physical_rule(PhysicalRule("added"))
         registry.load_extension("test_recursive_extension")
 
     module = _module(monkeypatch, "test_recursive_extension", recursive)

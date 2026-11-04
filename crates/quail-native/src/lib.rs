@@ -513,6 +513,10 @@ fn prompt_lowering<'py>(
             &tokens,
         )),
         "answer_ids" => lowering_result(lower::answer_ids(&from_json(&get(0))?, &tokens)),
+        "option_aliases" => lowering_result(lower::option_aliases(
+            &from_json::<Vec<String>>(&get(0))?,
+            &tokens,
+        )),
         "option_spellings" => lowering_result(lower::option_spellings(
             &from_json::<Vec<String>>(&get(0))?,
             &tokens,

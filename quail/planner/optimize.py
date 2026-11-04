@@ -4,10 +4,8 @@ from dataclasses import replace
 
 from quail.logical import LogicalPlan
 from quail.planner import native
-from quail.planner.optimizer.candidates import ModelRegion, PhysicalCandidate
+from quail.planner.optimizer.candidates import ModelRegion
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.graph_refinement import apply_plan_rules
-from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import Refusal
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -96,80 +94,47 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         plan, context, registry, logical_candidates=logical_candidates)
 
 
-def search_candidates(
-    logical, context, registry, *, logical_candidates=None,
-) -> tuple[PhysicalCandidate, ...]:
-    """Lower and refine every logical alternative before comparing costs."""
+def search_plan(logical, context, registry, *, logical_candidates=None):
+    """Select the cheapest plan of the logical alternatives.
+
+    The Rust planner plans the Quail backend. Another backend lowers
+    each alternative with its own ``plan`` and runs no physical rules.
+
+    Raises:
+        ValueError: The context has no tokenizer.
+    """
+    if context.tokenizer is None:
+        raise ValueError("planning needs the model's tokenizer")
+    alternatives = (native.logical_alternatives(logical, registry, context)
+                    if logical_candidates is None else logical_candidates)
+    if context.backend == "quail":
+        return native.search_plan(alternatives, context, registry)
+    return _search_backend(alternatives, context, registry)
+
+
+def _search_backend(alternatives, context, registry):
+    """Select the cheapest of a request backend's candidates."""
     backend = registry.backend(context.backend)
-    planners = (backend, *registry.physical_planners.values())
-    rules = tuple(registry.physical_rules.values())
-    alternatives = (logical_alternatives(
-        logical, tuple(registry.logical_rules.values()), context)
-        if logical_candidates is None else logical_candidates)
     candidates = []
     for alternative in alternatives:
         candidate_context = replace(
             context, logical_plan=alternative.plan, settings={})
-        region = ModelRegion(alternative.plan)
-        for planner in planners:
-            for candidate in planner.plan(region, candidate_context):
-                candidate = replace(
-                    candidate,
-                    logical_plan=candidate.logical_plan or alternative.plan,
-                    rewrites=alternative.rules)
-                plan = candidate.plan
-                if not isinstance(plan, Refusal):
-                    if plan.backend != context.backend:
-                        raise ValueError(
-                            f"physical planner returned backend {plan.backend!r} "
-                            f"for selected backend {context.backend!r}")
-                    plan = apply_plan_rules(
-                        replace(plan, estimated_seconds=candidate.estimated_seconds),
-                        rules, replace(candidate_context,
-                                       logical_plan=candidate.logical_plan))
-                refused = isinstance(plan, Refusal)
-                candidates.append(replace(
-                    candidate, plan=plan,
-                    graph=None if refused else plan.graph,
-                    estimated_seconds=float("inf") if refused
-                    else plan.estimated_seconds))
-    return tuple(candidates)
-
-
-def _alternatives(logical, context, registry):
-    """The logical alternatives, from the Rust rules when they are the built-ins."""
-    found = native.logical_alternatives(logical, registry, context)
-    if found is not None:
-        return found
-    return logical_alternatives(
-        logical, tuple(registry.logical_rules.values()), context)
-
-
-def search_plan(logical, context, registry, *, logical_candidates=None):
-    """Select the cheapest refined candidate and record the comparison.
-
-    The Rust planner selects it when it covers the request
-    (quail.planner.native); the Python planner otherwise.
-    """
-    alternatives = (_alternatives(logical, context, registry)
-                    if logical_candidates is None else logical_candidates)
-    planned = native.search_plan(alternatives, context, registry)
-    if planned is not None:
-        return planned
-    return search_plan_in_python(
-        logical, context, registry, logical_candidates=alternatives)
-
-
-def search_plan_in_python(logical, context, registry, *, logical_candidates=None):
-    """Select the cheapest refined candidate with the Python planner."""
-    candidates = search_candidates(
-        logical, context, registry, logical_candidates=logical_candidates)
+        for candidate in backend.plan(ModelRegion(alternative.plan), candidate_context):
+            plan = candidate.plan
+            if not isinstance(plan, Refusal) and plan.backend != context.backend:
+                raise ValueError(
+                    f"backend {context.backend!r} returned a plan for "
+                    f"backend {plan.backend!r}")
+            candidates.append(replace(
+                candidate,
+                logical_plan=candidate.logical_plan or alternative.plan,
+                rewrites=alternative.rules))
     if not candidates:
         return Refusal(
             reasons=(f"backend {context.backend!r} could not produce a plan",),
             constraint="no_physical_plan",
             needed=1, available=0, unit="plans")
-    # Candidate order breaks cost ties; built-in rules return the original first.
+    # candidate order breaks cost ties; the first alternative is the input
     selected = min(range(len(candidates)),
                    key=lambda index: candidates[index].estimated_seconds)
     plan = candidates[selected].plan
@@ -194,11 +159,11 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
                 tokenizer=None, pair_fractions=None,
                 canvas_draws: int = 4,
                 attention: str | None = None):
-    """Refine an explicit physical plan without exploring other placements.
+    """Apply the physical rules again to a plan the caller edited.
 
-    Used for physical plans edited by the caller. Normal query plans use
-    plan_query again when exact token stores arrive, so all alternatives
-    can benefit from prefix sharing before selection.
+    Normal query plans use plan_query again when exact token stores
+    arrive, so all alternatives can benefit from prefix sharing before
+    selection. A plan another backend planned is returned unchanged.
     """
     if isinstance(plan, Refusal):
         return plan
@@ -214,8 +179,4 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )
-    refined = native.refine_plan(plan, context, registry)
-    if refined is not None:
-        return refined
-    return apply_plan_rules(
-        plan, tuple(registry.physical_rules.values()), context)
+    return native.refine_plan(plan, context, registry)

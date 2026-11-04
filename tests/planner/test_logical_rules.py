@@ -1,7 +1,6 @@
-"""The Rust logical rules rewrite plans as Python's do.
+"""The logical rules eliminate a DISTINCT and push a label filter below a join.
 
-tests/conftest.py repeats every logical_alternatives call in Rust. The
-test suite's queries make should_push_down_projection,
+The test suite's queries make should_push_down_projection,
 should_push_down_distinct, and should_lift_column_operators rewrite;
 these plans make the other two rules rewrite as well.
 """
@@ -10,26 +9,13 @@ from dataclasses import replace
 
 import pyarrow as pa
 import pytest
-from helpers import rust_builder
 from helpers.sessions import CONFIG, fake_tok
 
 import quail
 from quail.logical import Filter, LogicalPlan, Project, SemanticJoin
+from quail.planner import native
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import logical_alternatives
-from quail.planner.rules import (
-    ShouldEliminateDistinct,
-    ShouldLiftColumnOperators,
-    ShouldPushDownDistinct,
-    ShouldPushDownFilters,
-    ShouldPushDownProjection,
-)
 
-native = pytest.importorskip("_quail_native")
-
-RULES = (ShouldEliminateDistinct(), ShouldPushDownDistinct(),
-         ShouldPushDownProjection(), ShouldPushDownFilters(),
-         ShouldLiftColumnOperators())
 REVIEWS = pa.table({"id": ["r0", "r1"], "stars": [5, 2], "body": ["good", "slow"]})
 ASPECTS = pa.table({"id": ["a0", "a1"], "aspect": ["ending", "pacing"]})
 
@@ -44,9 +30,8 @@ def session():
 
 
 def _alternatives(session, plan):
-    """Python's alternatives, compared with the Rust rules'."""
-    check = rust_builder.shadow_logical_alternatives(native, logical_alternatives)
-    return check(plan, RULES, PlanningContext(catalog=session.catalog))
+    return native.logical_alternatives(
+        plan, session.registry, PlanningContext(catalog=session.catalog))
 
 
 @pytest.mark.parametrize("text", [
