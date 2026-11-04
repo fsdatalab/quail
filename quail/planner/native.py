@@ -29,6 +29,7 @@ from quail.physical.codec import (
     encode_graph,
     encode_value,
 )
+from quail.physical.lowering import Vocabulary
 from quail.planner.optimizer.candidates import LogicalAlternative
 from quail.planner.plan import PhysicalPlan, Refusal
 
@@ -54,10 +55,6 @@ _TOKEN_FIELDS = ("question_token_ids", "document_head", "question_header_token_i
                  "frame_token_ids", "tail_token_ids", "prompt_token_parts",
                  "join_layout")
 
-# interned word ids start here, above any vocabulary
-_WORDS = 1 << 40
-
-
 def _module():
     if os.environ.get("QUAIL_PLANNER") == "python":
         return None
@@ -66,44 +63,6 @@ def _module():
     except ImportError:
         return None
     return _quail_native
-
-
-class Vocabulary:
-    """A tokenizer's ids as Rust reads them, with words interned."""
-
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-        self.ids, self.words = {}, {}
-
-    def intern(self, token):
-        """The integer id of a token: itself, or an interned word's."""
-        if isinstance(token, (int, np.integer)) and not isinstance(token, bool):
-            return int(token)
-        if token not in self.ids:
-            self.ids[token] = _WORDS | len(self.ids)
-            self.words[self.ids[token]] = token
-        return self.ids[token]
-
-    def word(self, token):
-        """The token an id stands for."""
-        return self.words.get(token, token)
-
-    def tokens(self, text):
-        """Tokenize text into integer ids."""
-        return [self.intern(token) for token in self.tokenizer(text)]
-
-    def decoder(self):
-        """Decode a list of ids, or None for a tokenizer that cannot decode."""
-        decode = getattr(self.tokenizer, "decode", None)
-        if decode is None:
-            return None
-
-        def decoded(ids):
-            text = decode([self.word(token) for token in ids])
-            return (text.decode("utf-8", errors="replace")
-                    if isinstance(text, bytes) else str(text))
-
-        return decoded
 
 
 def _mapped(value, convert):
@@ -344,6 +303,39 @@ def relational_plan(logical, context, num_documents: int):
         raise ValueError(message)
     envelope = json.loads(found)
     return _plan_from({"envelope": envelope}, native, fields, vocabulary, logical)
+
+
+def request_order(logical, context) -> dict:
+    """The order a request backend runs a plan's filters and joins in.
+
+    Returns:
+        The order ``rule``; ``filter_orders``, each table's AI.IF filter
+        positions in run order; ``join_sequence``, the (written position,
+        anchor) of each join in run order; ``hash_joins``, the HashJoin
+        nodes; and ``tables``, each table's documents and tokens before
+        and after its scan's tests.
+
+    Raises:
+        CompileError: A prompt cannot be lowered, or a table has no tokens.
+    """
+    import _quail_native
+
+    vocabulary = Vocabulary(context.tokenizer)
+    fields = context_fields(context, vocabulary)
+    found, message = _quail_native.plan_operator(
+        "request_order", json.dumps(fields),
+        json.dumps({"plan": encode_value(logical)}),
+        vocabulary.tokens, vocabulary.decoder())
+    if message is not None:
+        raise CompileError(message)
+    found = json.loads(found)
+    codecs = {codec.type_name: codec for codec in built_in_codecs()}
+    found["hash_joins"] = tuple(codecs[node["type"]].decode(node)
+                                for node in found["hash_joins"])
+    found["filter_orders"] = {alias: tuple(positions)
+                              for alias, positions in found["filter_orders"].items()}
+    found["join_sequence"] = [tuple(step) for step in found["join_sequence"]]
+    return found
 
 
 def refine_plan(plan, context, registry):

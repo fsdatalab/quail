@@ -9,9 +9,9 @@ from quail.logical import (
 )
 from quail.physical import AiJoin, PortRef
 from quail.physical.base import input_ports
+from quail.physical.lowering import LoweredPrompt
 from quail.planner.operators.common import question_tokens
 from quail.planner.operators.score import ScoreJoinCost, score_statistics
-from quail.planner.prompt_lowering import LoweredPrompt
 
 
 def _priced_key(condition) -> tuple:

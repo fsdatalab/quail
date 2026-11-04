@@ -6,8 +6,6 @@ from quail.common.prompts import PROMPT_LAYOUTS, prompt_aliases
 from quail.cost.joins import PricedJoin, longest_join_input
 from quail.logical import (
     Alias,
-    SemanticClassify,
-    SemanticExtract,
     columns_above_joins,
     has_score,
     is_score,
@@ -173,16 +171,6 @@ def joined_classification_refusal(graph) -> Refusal | None:
             constraint="joined_classify_pipeline", needed=1, available=0,
             unit="supported join pipelines")
     return None
-
-
-def has_label(logical) -> bool:
-    """Return whether a logical plan classifies documents or joined rows."""
-    return any(isinstance(node, SemanticClassify) for node in logical.walk())
-
-
-def has_extract(logical) -> bool:
-    """Return whether a logical plan copies answers from documents."""
-    return any(isinstance(node, SemanticExtract) for node in logical.walk())
 
 
 def extraction_refusal(context, function: str = "AI.EXTRACT") -> Refusal | None:

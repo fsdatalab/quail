@@ -32,8 +32,8 @@ from quail.common.expressions import SPAN_SUFFIX
 from quail.common.prompts import bind_classify_prompt, bind_extract_prompt
 from quail.execution.result import answer_values
 from quail.physical import AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore
+from quail.physical.lowering import lower_prompt
 from quail.planner.plan import Refusal
-from quail.planner.prompt_lowering import lower_prompt
 from quail.progress import say
 from quail.specs import DEVICES, MODELS
 from quail_b.queries import (

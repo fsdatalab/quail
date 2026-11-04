@@ -331,6 +331,16 @@ def _producer(test: "Filter") -> SemanticColumn:
     return node
 
 
+def has_label(logical) -> bool:
+    """Return whether a logical plan classifies documents or joined rows."""
+    return any(isinstance(node, SemanticClassify) for node in logical.walk())
+
+
+def has_extract(logical) -> bool:
+    """Return whether a logical plan copies answers from documents."""
+    return any(isinstance(node, SemanticExtract) for node in logical.walk())
+
+
 def join_outer_input(join: "SemanticJoin") -> "LogicalNode":
     """The tree the join extends: everything before its new tables."""
     node = join.input

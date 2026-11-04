@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from quail.common.tokens import TokenLengths
-from quail.planner.prompt_lowering import LoweredPrompt, lower_prompt
+from quail.physical.lowering import LoweredPrompt, lower_prompt
 from quail.specs import DeviceSpec, ModelSpec
 
 

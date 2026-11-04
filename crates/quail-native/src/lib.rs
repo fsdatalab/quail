@@ -834,6 +834,10 @@ fn plan_operator<'py>(
                 serde_json::json!({"seconds": seconds, "estimates": estimates})
             }))
         }
+        "request_order" => {
+            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
+            lowering_result(quail_planner::request_order::request_order(&plan, &context))
+        }
         "relational_plan" => {
             let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
             let num_documents = get("num_documents").as_i64().unwrap_or_default();

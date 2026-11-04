@@ -14,15 +14,15 @@ from quail.baselines.nodes import (
     RequestExtractSpec,
     RequestMapSpec,
 )
-from quail.common import budgets
 from quail.common.expressions import aliased_call, packed_columns
-from quail.common.prompts import answer_row_offsets
+from quail.common.prompts import PROMPT_LAYOUTS, answer_row_offsets
 from quail.logical import (
     SPAN_SUFFIX,
     RegularPredicate,
     column_name,
     columns_above_joins,
-    effective_selectivity,
+    has_extract,
+    has_label,
 )
 from quail.logical import Aggregate as LogicalAggregate
 from quail.logical import Window as LogicalWindow
@@ -35,22 +35,10 @@ from quail.physical import (
     Sort,
 )
 from quail.physical.base import input_ports
-from quail.planner import (
-    default_order_rule,
-    hash_join_nodes,
-    order_filters_indexed,
-    preamble_tokens,
-)
-from quail.planner import (
-    join_specs as logical_join_specs,
-)
-from quail.planner.operators.filter import prepare_filter_costs
+from quail.physical.lowering import answer_ids
+from quail.planner.native import request_order
 from quail.planner.optimizer.candidates import PhysicalCandidate
-from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
-from quail.planner.prompt_lowering import answer_ids
-from quail.planner.search.join_order import search_joins
-from quail.planner.statistics.tables import summarize_alias
-from quail.planner.validation import extraction_refusal, has_extract, has_label
+from quail.planner.plan import PhysicalPlan, Refusal
 
 
 def plan_request_backend(
@@ -86,36 +74,34 @@ def plan_request_backend(
     operators = region.logical_plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     ask_filters = {alias: list(ps) for alias, ps in filters.items() if ps}
-    summaries, stats = _corpus_stats(context)
+    order = request_order(region.logical_plan, context)
+    rule, tables = order["rule"], order["tables"]
+    filter_orders, join_sequence = order["filter_orders"], order["join_sequence"]
     nodes = []
     input_refs = []
     aliases = tuple(scan.alias for scan in scans)
     for scan in scans:
-        if scan.alias not in stats:
-            raise ValueError(f"no document tokens for alias {scan.alias!r}")
-        summary = stats[scan.alias]
-        num_documents = summaries[scan.alias].count
+        table = tables[scan.alias]
+        num_documents = table["num_documents"]
         node = Scan(
             node_id=f"scan:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,
             num_documents=num_documents,
-            total_tokens=summaries[scan.alias].total,
+            total_tokens=table["total_tokens"],
             shard_ranges=((0, num_documents),),
-            shard_token_loads=(summary.total_tokens,),
+            shard_token_loads=(table["kept_tokens"],),
             predicates=tuple(scan.predicates),
-            expected_rows=float(summary.num_documents) if scan.predicates else None,
+            expected_rows=(float(table["kept_documents"]) if scan.predicates
+                           else None),
         )
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"rows:{scan.alias}"))
 
-    for node in hash_join_nodes(joins, context.pair_fractions, input_refs):
+    for node in order["hash_joins"]:
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"pairs:{node.written_position}"))
 
-    rule = context.order or default_order_rule(ask_filters, joins)[0]
-    filter_orders, join_sequence = _order_filters_and_joins(
-        context, operators, ask_filters, stats, summaries, rule)
     first_anchor = join_sequence[0][1] if join_sequence else None
     filter_specs = lower_filters(
         context, aliases, filters, ask_filters, filter_orders, first_anchor)
@@ -181,6 +167,27 @@ def plan_request_backend(
     ),)
 
 
+def _extraction_refusal(context, function: str) -> Refusal | None:
+    """Return why the model cannot write AI.EXTRACT or AI.MAP answers, or None."""
+    model = context.model
+    if context.tokenizer is None:
+        reason = f"{function} planning needs the model's tokenizer"
+    elif model.role in ("reranker", "decision") or model.canvas_tokens:
+        reason = (f"{function} decodes the model's next tokens, which "
+                  f"{model.name!r} does not give")
+    elif PROMPT_LAYOUTS[model.prompt_layout].read_end is not None:
+        # the model answers by scoring options and document positions
+        if function == "AI.EXTRACT":
+            return None
+        reason = (f"{function} writes text, and {model.name!r} answers only "
+                  f"by scoring options")
+    else:
+        return None
+    return Refusal(reasons=(reason,),
+                   constraint=f"unsupported_{function.removeprefix('AI.').lower()}_query",
+                   needed=1, available=0, unit="queries")
+
+
 def _refusal(region, context, *, backend_name: str, scores_labels: bool,
              decides: bool) -> Refusal | None:
     """Return why the request backends cannot run the region, or None."""
@@ -207,7 +214,7 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
                               ("AI.MAP", bool(operators.maps))):
         if not present:
             continue
-        refusal = extraction_refusal(context, function)
+        refusal = _extraction_refusal(context, function)
         if refusal is None and not (scores_labels
                                     and not context.model.canvas_tokens):
             refusal = Refusal(
@@ -256,85 +263,6 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
             constraint="classify_placement_not_supported",
             needed=1, available=0, unit="placements")
     return None
-
-
-def _corpus_stats(context) -> tuple[dict, dict]:
-    """Summarize each alias's corpus and the fraction its scan keeps.
-
-    Returns:
-        The token summary of each alias, and its CorpusStats after the
-        regular predicates.
-    """
-    # the regular predicates keep an estimated fraction of each table, as
-    # the Quail planner's statistics do
-    summaries = {
-        alias: summarize_alias(lengths, context.model.sliding_window, memo=context.memo)
-        for alias, lengths in context.document_tokens.items()
-    }
-    stats = {
-        alias: CorpusStats(
-            num_documents=round(summary.count * context.scan_fractions.get(alias, 1.0)),
-            total_tokens=round(summary.total
-                               * context.scan_fractions.get(alias, 1.0)),
-            max_document_tokens=summary.maximum,
-        )
-        for alias, summary in summaries.items()
-    }
-    return summaries, stats
-
-
-def _order_filters_and_joins(context, operators, ask_filters, stats,
-                             summaries, rule) -> tuple[dict, list]:
-    """Order each alias's AI.IF filters and search the join sequence.
-
-    Returns:
-        The written positions of each alias's filters in run order, and
-        the (written position, anchor) sequence of the joins.
-    """
-    joins = operators.joins
-    chunk_tokens = budgets.chunk_budget(context.model, context.device)
-    num_preamble_tokens = preamble_tokens(
-        context.lowered(prompt) for prompt in (
-            *(p.prompt for fs in ask_filters.values() for p in fs),
-            *(j.prompt for j in joins)))
-    filter_orders = {
-        alias: order_filters_indexed(prepare_filter_costs(
-            predicates,
-            mean_tokens=(
-                num_preamble_tokens + stats[alias].mean_document_tokens
-            ),
-            model=context.model,
-            device=context.device,
-            chunk_tokens=chunk_tokens,
-            context=context,
-        ), rule)
-        for alias, predicates in ask_filters.items()
-    }
-    expected_rows = {
-        alias: float(summary.num_documents) for alias, summary in stats.items()
-    }
-    for alias, predicates in operators.all_filters().items():
-        for predicate in predicates:
-            expected_rows[alias] *= effective_selectivity(predicate.selectivity)
-    search_specs = logical_join_specs(joins, context.pair_fractions, context=context)
-    join_search = search_joins(
-        search_specs,
-        expected_rows,
-        summaries,
-        {},
-        num_preamble_tokens,
-        chunk_tokens,
-        context.model,
-        context.device,
-        fixed_order=rule == "as_written",
-    )
-    join_sequence = (
-        list(join_search.seq) if join_search is not None else [
-            (position, spec.anchor or spec.aliases[0])
-            for position, spec in enumerate(search_specs)
-        ]
-    )
-    return filter_orders, join_sequence
 
 
 def _result_nodes(region, request_node, aliases, join_specs, answer_specs,

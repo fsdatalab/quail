@@ -10,7 +10,6 @@ lettered form when the tokenizer has a one-token letter per label.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
 from quail.common.expressions import Prompt
 from quail.common.prompts import (
@@ -28,80 +27,9 @@ from quail.common.prompts import (
     score_query_template,
     true_false_token_ids,
 )
+from quail.physical.lowering import LoweredPrompt
 
 _PLACEHOLDER = re.compile(r"\{\d+\}")
-
-
-@dataclass(frozen=True)
-class LoweredPrompt:
-    """A prompt's text with the token ids one tokenizer gives it.
-
-    Attributes:
-        prompt: The text prompt.
-        preamble_token_ids: The preamble before the document.
-        tail_token_ids: The text after the document, or after a join's
-            last partner.
-        frame_tokens: Tokens of the frame after the anchor document.
-        label_token_ids: Per placeholder of a join or a classification
-            of joined rows, (alias, its label's ids, its frame's ids).
-        lettered: The classification prompt lowered with one letter
-            per label, or None.
-    """
-
-    prompt: Prompt
-    preamble_token_ids: tuple
-    tail_token_ids: tuple
-    frame_tokens: int
-    label_token_ids: tuple = ()
-    lettered: "LoweredPrompt | None" = None
-
-    @property
-    def preamble_tokens(self) -> int | None:
-        """The preamble's token count; None for a score, laid out later."""
-        return None if self.prompt.kind == "score" else len(self.preamble_token_ids)
-
-    @property
-    def tail_tokens(self) -> int | None:
-        """The tail's token count; None for a score, laid out later."""
-        return None if self.prompt.kind == "score" else len(self.tail_token_ids)
-
-    @property
-    def labels(self) -> tuple:
-        """Per placeholder, (alias, label tokens, frame tokens)."""
-        return tuple((alias, len(label), len(frame))
-                     for alias, label, frame in self.label_token_ids)
-
-    @property
-    def template(self) -> str:
-        return self.prompt.template
-
-    @property
-    def args(self) -> tuple:
-        return self.prompt.args
-
-    @property
-    def preamble(self) -> str:
-        return self.prompt.preamble
-
-    @property
-    def tail(self) -> str:
-        return self.prompt.tail
-
-    @property
-    def layout(self) -> str:
-        return self.prompt.layout
-
-    @property
-    def tail_segments(self) -> tuple:
-        return self.prompt.tail_segments
-
-    @property
-    def label_prefix(self) -> str:
-        return self.prompt.label_prefix
-
-    @property
-    def letters(self) -> tuple:
-        return self.prompt.letters
 
 
 def tokenize_segments(segments, tokenizer) -> tuple:
