@@ -412,3 +412,97 @@ def shadow_lowering(native, name, original):
         return found
 
     return lowering
+
+
+def _untagged(value):
+    """Encoded data without the codec's class tags, as the Rust specs read it."""
+    if isinstance(value, dict):
+        return {key: _untagged(item) for key, item in value.items() if key != "type"}
+    if isinstance(value, list):
+        return [_untagged(item) for item in value]
+    return value
+
+
+def same_values(built, expected, path="") -> str | None:
+    """The path of the first difference, floats to 1e-12 relative; None if none."""
+    if isinstance(built, float) or isinstance(expected, float):
+        both = (built, expected)
+        if all(isinstance(value, (int, float)) for value in both):
+            scale = max(abs(built), abs(expected))
+            if abs(built - expected) <= 1e-12 * scale:
+                return None
+        return f"{path}: Rust {built!r}, Python {expected!r}"
+    if isinstance(built, dict) and isinstance(expected, dict):
+        if built.keys() != expected.keys():
+            return f"{path}: keys {sorted(built)} != {sorted(expected)}"
+        for key in built:
+            found = same_values(built[key], expected[key], f"{path}.{key}")
+            if found:
+                return found
+        return None
+    if isinstance(built, list) and isinstance(expected, list):
+        if len(built) != len(expected):
+            return f"{path}: {len(built)} items != {len(expected)}"
+        for index, (mine, theirs) in enumerate(zip(built, expected)):
+            found = same_values(mine, theirs, f"{path}[{index}]")
+            if found:
+                return found
+        return None
+    return None if built == expected else f"{path}: Rust {built!r}, Python {expected!r}"
+
+
+def _interning(tokenizer):
+    """(intern, tokens): a token's id, and the tokenizer with ids interned."""
+    table = {}
+
+    def intern(token):
+        if isinstance(token, int) and not isinstance(token, bool):
+            return token
+        return table.setdefault(token, 1 << 40 | len(table))
+
+    def tokens(text):
+        return [intern(token) for token in tokenizer(text)]
+
+    return intern, tokens
+
+
+def _token_fields(spec: dict, intern) -> dict:
+    """A spec's token id fields with their ids interned."""
+    out = dict(spec)
+    for key in ("prompt_token_parts", "label_token_ids", "question_header_token_ids"):
+        if key in out and out[key] is not None:
+            out[key] = _interned(out[key], intern)
+    return out
+
+
+def shadow_column_spec(native, original):
+    """Return a column planner's spec method, also building the spec in Rust."""
+    import numpy as np
+
+    from quail.planner.validation import SaeFeaturesRefusedError
+
+    def spec(self, context, node, expected_rows, resident=False):
+        if context.tokenizer is None:
+            return original(self, context, node, expected_rows, resident)
+        intern, tokens = _interning(context.tokenizer)
+        lengths = {alias: np.asarray(values).astype(int).tolist()
+                   for alias, values in context.document_tokens.items()}
+        plan = (None if context.logical_plan is None
+                else json.dumps(encode_value(context.logical_plan)))
+        rust, message = native.column_spec(
+            json.dumps(_untagged(encode_value(context.model))),
+            json.dumps(_untagged(encode_value(context.device))), context.gpus,
+            lengths, plan, json.dumps(encode_value(node)), float(expected_rows),
+            resident, tokens)
+        try:
+            found = original(self, context, node, expected_rows, resident)
+        except SaeFeaturesRefusedError:
+            assert message is not None, "Rust built a spec Python refused"
+            raise
+        assert message is None, f"Rust refused the spec: {message}"
+        expected = _token_fields(json.loads(json.dumps(encode_value(found))), intern)
+        difference = same_values(json.loads(rust), expected)
+        assert difference is None, f"Rust built another spec: {difference}"
+        return found
+
+    return spec

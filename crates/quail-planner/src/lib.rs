@@ -4,6 +4,8 @@
 //! |---|---|
 //! | `logical` | the node types of `quail/logical/nodes` and `LogicalPlan` |
 //! | `expressions` | the helpers of `quail/common/expressions.py` |
+//! | `context` | `PlanningContext` |
+//! | `columns` | the column planners of `quail/planner/operators` |
 //! | `builder` | `quail/logical/naive.py`, `placement.py`, `builder.py` |
 //! | `nodes` | the methods of the node classes in `quail/logical/nodes` |
 //! | `lowering` | `quail/planner/prompt_lowering.py`, with a tokenizer callback |
@@ -14,6 +16,8 @@
 
 pub mod arrow_functions;
 pub mod builder;
+pub mod columns;
+pub mod context;
 pub mod expressions;
 pub mod logical;
 pub mod lowering;

@@ -1,0 +1,57 @@
+//! What the planner reads while it plans one query, as `PlanningContext`.
+
+use std::collections::BTreeMap;
+
+use quail_cost::specs::{DeviceSpec, ModelSpec};
+
+use crate::expressions::CompileError;
+use crate::logical::LogicalPlan;
+use crate::lowering::{LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
+
+/// The model, device, table statistics, and tokenizer of one query's planning.
+pub struct PlanningContext<'a> {
+    pub model: ModelSpec,
+    pub device: DeviceSpec,
+    pub gpus: i64,
+    /// alias -> each document's token count.
+    pub document_tokens: BTreeMap<String, Vec<i64>>,
+    pub tokenizer: &'a Tokenizer<'a>,
+    /// The logical plan being planned, if any.
+    pub logical_plan: Option<LogicalPlan>,
+}
+
+impl PlanningContext<'_> {
+    /// The fields of the model that prompt lowering reads.
+    pub fn prompt_model(&self) -> PromptModel {
+        PromptModel {
+            role: self.model.role.clone(),
+            answer_spellings: self.model.answer_spellings.clone(),
+            turn: (
+                self.model.turn_prefix.clone(),
+                self.model.turn_suffix.clone(),
+            ),
+            prompt_layout: self.model.prompt_layout.clone(),
+        }
+    }
+
+    /// The prompt lowered with the context's tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// The tokenizer fails.
+    pub fn lowered(&self, prompt: &quail_physical::Prompt) -> Result<LoweredPrompt, CompileError> {
+        lower_prompt(prompt, self.tokenizer)
+    }
+
+    /// Each document's token count for one table alias.
+    ///
+    /// # Errors
+    ///
+    /// The planner has no token counts for the alias.
+    pub fn lengths(&self, alias: &str) -> Result<&[i64], CompileError> {
+        self.document_tokens
+            .get(alias)
+            .map(Vec::as_slice)
+            .ok_or_else(|| CompileError(format!("no document token counts for {alias:?}")))
+    }
+}

@@ -51,6 +51,15 @@ def _rust_builder(monkeypatch):
                        if key.startswith("quail.") and module is not None]:
             if getattr(module, name, None) is original:
                 monkeypatch.setattr(module, name, shadow)
+    from helpers.rust_builder import shadow_column_spec
+
+    from quail.planner.operators.extract import ExtractPlanner
+    from quail.planner.operators.map import MapPlanner
+    from quail.planner.operators.sae_features import SaeFeaturesPlanner
+
+    for planner in (ExtractPlanner, MapPlanner, SaeFeaturesPlanner):
+        monkeypatch.setattr(planner, "spec", shadow_column_spec(
+            _quail_native, planner.spec))
     for module in (query_module, optimize_module):
         monkeypatch.setattr(module, "logical_alternatives", shadow_logical_alternatives(
             _quail_native, module.logical_alternatives))

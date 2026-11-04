@@ -531,6 +531,45 @@ fn prompt_lowering<'py>(
     }
 }
 
+/// Build one column operator's spec, as its Python column planner's
+/// `spec` does.
+///
+/// `model` and `device` are the specs' fields as JSON;
+/// `document_tokens` maps each alias to its documents' token counts.
+/// Returns (the spec as JSON, None), or (None, the refusal's message).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (model, device, gpus, document_tokens, plan, node, expected_rows, resident, tokenizer))]
+fn column_spec<'py>(
+    py: Python<'py>,
+    model: &str,
+    device: &str,
+    gpus: i64,
+    document_tokens: std::collections::BTreeMap<String, Vec<i64>>,
+    plan: Option<&str>,
+    node: &str,
+    expected_rows: f64,
+    resident: bool,
+    tokenizer: Bound<'py, PyAny>,
+) -> PyResult<(Option<String>, Option<String>)> {
+    let tokens = python_tokenizer(py, &tokenizer);
+    let context = quail_planner::context::PlanningContext {
+        model: from_json(model)?,
+        device: from_json(device)?,
+        gpus,
+        document_tokens,
+        tokenizer: &tokens,
+        logical_plan: plan.map(from_json).transpose()?,
+    };
+    let node: quail_planner::LogicalNode = from_json(node)?;
+    lowering_result(quail_planner::columns::column_spec(
+        &context,
+        &node,
+        expected_rows,
+        resident,
+    ))
+}
+
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContext>()?;
@@ -541,5 +580,6 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;
     module.add_function(wrap_pyfunction!(logical_alternatives, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
+    module.add_function(wrap_pyfunction!(column_spec, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }
