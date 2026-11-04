@@ -1012,10 +1012,9 @@ class StageExecutor:
             replays, room = self._replays(max(0, room))
             if (self.answer_admission is not None
                     and (self.sched.pending or self.sched.waiting)):
-                stage = np.asarray(self.sched._stage)
                 started = time.perf_counter()
                 self.answer_admission.refresh(
-                    stage, replays, self._replay_pages(replays),
+                    self.sched._stage, replays, self._replay_pages(replays),
                     self.arena.free_pages if self.paged else None)
                 self.admission_s += time.perf_counter() - started
             started = time.perf_counter()

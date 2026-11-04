@@ -70,6 +70,8 @@ class MapDecoder:
         self.map = np.full(n, -1, dtype=np.int64)      # its map, -1 for none
         self.origin = np.zeros(n, dtype=np.int64)      # its first decode position
         self.fed = np.zeros(n, dtype=np.int64)         # decode rows packed
+        # when a list, each settle appends the slots whose answers ended
+        self.ended_log = None
         self.stopped = np.zeros(n, dtype=bool)         # read a stop token
         self.kv = FullAttentionGroup(n, page_tokens)
         self.device = head.device
@@ -308,9 +310,15 @@ class MapDecoder:
                                          out=np.zeros(len(running)), where=seconds > 0)
         return running[np.lexsort((running, written[running], -scores[running]))]
 
-    def running(self):
-        """Slots whose next decode row can choose another token."""
-        running = np.flatnonzero((self.map >= 0) & ~self.paused)
+    def running(self, writing=None):
+        """Slots whose next decode row can choose another token.
+
+        Args:
+            writing: Slots holding an answer (map >= 0), or None to find them.
+        """
+        if writing is None:
+            writing = np.flatnonzero(self.map >= 0)
+        running = writing[~self.paused[writing]]
         ready = (~self.constrained[self.map[running]]
                  | (self.inflight[running] == 0))
         return running[ready & ~self.stopped[running] & ~self.copy_pending[running]
@@ -600,6 +608,8 @@ class MapDecoder:
                 self._read_copy(q, documents[mine], indices[mine], values[mine])
         self.stopped[documents[stop]] = True
         self.map[documents[ended]] = -1
+        if self.ended_log is not None:
+            self.ended_log.append(documents[ended])
         self.copy_pending[documents[ended]] = False
         self.finished.extend(zip(documents[ended].tolist(), maps[ended].tolist()))
         for group in self.copy_groups:

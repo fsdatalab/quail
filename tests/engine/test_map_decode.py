@@ -652,6 +652,33 @@ def test_admitting_a_document_costs_the_rebuild_risk_it_pushes_onto_held_answers
     assert extra == 0.0
 
 
+def test_survival_curves_match_a_full_recount_after_answers_end_unseen():
+    decoder, admission = headroom_admission(num_documents=60, limit=32,
+                                            expected_tokens=8)
+    admission.bucket_answers = 1
+    stages = np.full(60, -1)
+    admission.refresh(stages, free_pages=1000)
+    rng = np.random.default_rng(5)
+    for a in range(40):
+        decoder.start(a, 0, 14, [4 * a, 4 * a + 1, 4 * a + 2, 4 * a + 3])
+        decoder.written[0][a] = rng.integers(0, 20)
+    admission.refresh(stages, free_pages=1000)
+    # half end as a settle ends them; slot 50 starts and ends between refreshes
+    for a in [*range(0, 40, 2), 50]:
+        decoder.lengths[0][a] = decoder.written[0][a] = rng.integers(1, 32)
+        decoder.map[a] = -1
+        decoder.ended_log.append(np.array([a]))
+    decoder.written[0][1] += 3
+    admission.refresh(stages, free_pages=1000)
+    recount = HeadroomAdmission(decoder, [8] * 60, 6, {}, [0] * 60,
+                                lambda tokens: pages_for(tokens, 4),
+                                admission.decode_cost, bucket_answers=1)
+    recount.refresh(stages, free_pages=1000)
+    assert np.array_equal(admission.map_counts, recount.map_counts)
+    assert np.allclose(admission.whole, recount.whole)
+    assert np.allclose(admission.curves, recount.curves)
+
+
 def test_eviction_takes_remaining_tokens_from_each_answers_length_bucket():
     # short prompts end after 3 tokens, long ones run to the limit; two
     # answers that wrote 2 tokens each differ only in their prompt length
