@@ -102,6 +102,14 @@ def test_a_region_plans_and_answers_as_the_written_query(context, name):
     assert _rows(table) == _rows(expected)
 
 
+@pytest.mark.parametrize("name", QUERIES)
+def test_rust_binds_each_region_to_the_plan_session_sql_compiles(context, name):
+    text = QUERIES[name]
+    (plan,) = context.logical_plans(text)
+    expected = context.session.sql(text).logical
+    assert plan == expected
+
+
 def test_operators_outside_a_region_run_in_datafusion(context):
     text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
             "UNION ALL SELECT a.id FROM aspects a ORDER BY id")

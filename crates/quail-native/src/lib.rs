@@ -28,8 +28,10 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use quail_datafusion::{
-    ModelRegion, RegionRunner, quail_column_names, quail_schema, region_sql, session_context, sql,
+    ModelRegion, RegionRunner, bind, quail_column_names, quail_schema, region_sql, session_context,
+    sql,
 };
+use quail_planner::prompts::Turn;
 use tokio::runtime::Runtime;
 
 /// Runs each model region by calling a Python function with the
@@ -37,14 +39,36 @@ use tokio::runtime::Runtime;
 #[derive(Debug)]
 struct PythonRunner {
     run_region: Py<PyAny>,
+    /// The session model's chat-turn text and prompt layout, to bind
+    /// regions in Rust; None sends each region's SQL instead.
+    prompting: Option<(Turn, String)>,
+}
+
+impl PythonRunner {
+    /// The request for one region: ("plan", its logical plan as JSON),
+    /// or ("sql", its SQL) for a region the Rust binder does not read.
+    fn request(&self, region: &ModelRegion) -> Result<(&'static str, String)> {
+        let Some((turn, layout)) = &self.prompting else {
+            return Ok(("sql", region_sql(region)?));
+        };
+        match bind::bind_region(&region.plan, turn, layout) {
+            Ok(plan) => Ok((
+                "plan",
+                quail_planner::write_logical_plan(&plan)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?,
+            )),
+            Err(error) if error.0.contains(bind::UNSUPPORTED) => Ok(("sql", region_sql(region)?)),
+            Err(error) => Err(DataFusionError::Plan(format!("CompileError: {}", error.0))),
+        }
+    }
 }
 
 impl RegionRunner for PythonRunner {
     fn run(&self, region: &ModelRegion) -> Result<Vec<RecordBatch>> {
-        let text = region_sql(region)?;
+        let (kind, payload) = self.request(region)?;
         let bytes: Vec<u8> = Python::attach(|py| {
             self.run_region
-                .call1(py, (text,))
+                .call1(py, (kind, payload))
                 .and_then(|answer| answer.extract::<Vec<u8>>(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
@@ -154,10 +178,25 @@ struct NativeContext {
 #[pymethods]
 impl NativeContext {
     /// Create a context whose model regions run through `run_region`.
+    ///
+    /// `run_region(kind, payload)` takes ("plan", a region's Quail
+    /// logical plan as JSON), bound in Rust with the model's chat-turn
+    /// text `turn` and prompt `layout`, or ("sql", the region's SQL)
+    /// for a region the Rust binder does not read, or for every region
+    /// when no turn and layout are given.
     #[new]
-    fn new(run_region: Py<PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (run_region, turn=None, layout=None))]
+    fn new(
+        run_region: Py<PyAny>,
+        turn: Option<(String, String)>,
+        layout: Option<String>,
+    ) -> PyResult<Self> {
         let runtime = Runtime::new()?;
-        let context = session_context(Arc::new(PythonRunner { run_region }));
+        let prompting = turn.zip(layout);
+        let context = session_context(Arc::new(PythonRunner {
+            run_region,
+            prompting,
+        }));
         Ok(Self { context, runtime })
     }
 

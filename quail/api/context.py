@@ -3,8 +3,10 @@
 DataFusion parses and binds the query. Its rule ``ClaimModelRegions``
 replaces each part of the plan that calls an AI function, together
 with the operators around it that Quail plans, with one model region.
-Quail plans and runs each region as ``Session.sql`` does; DataFusion
-runs every operator outside the regions.
+Rust binds each region into Quail's logical plan, as ``Session.sql``
+compiles SQL, and Quail plans and runs it; DataFusion runs every
+operator outside the regions. A region the Rust binder does not read,
+such as one with a subquery in FROM, reaches Quail as SQL text.
 
 For example, imagine a ``reviews`` table with review text in ``body``:
 
@@ -24,12 +26,16 @@ environment.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 import pyarrow as pa
 
 from quail.api.execute import execute_query
+from quail.api.query import Query
 from quail.catalog import ScanRequest, TableProvider
+from quail.logical import LogicalPlan
+from quail.physical.codec import decode_value
 
 
 def ipc_bytes(table: pa.Table) -> bytes:
@@ -64,7 +70,9 @@ class SessionContext:
 
         self.session = session
         self._physical_executor = physical_executor
-        self._native = NativeContext(self._run_region)
+        model = session.model
+        self._native = NativeContext(self._run_region, tuple(model.turn),
+                                     model.prompt_layout)
 
     def register(self, name: str, provider: TableProvider) -> None:
         """Register a table with the session and with DataFusion.
@@ -88,11 +96,30 @@ class SessionContext:
         """Return the SQL each model region of a query sends to Quail."""
         return self._native.region_sql(text)
 
+    def logical_plans(self, text: str) -> list[LogicalPlan]:
+        """Return the logical plan Rust binds for each model region of a query.
+
+        Raises:
+            CompileError: The Rust binder refuses a region.
+        """
+        from quail.common.expressions import CompileError
+
+        model = self.session.model
+        bound, _ = self._native.logical_plans(text, tuple(model.turn),
+                                              model.prompt_layout)
+        plans = []
+        for plan, message in bound:
+            if message is not None:
+                raise CompileError(message)
+            plans.append(decode_value(LogicalPlan, json.loads(plan)))
+        return plans
+
     def explain(self, text: str) -> str:
         """Return DataFusion's optimized logical plan for a query."""
         return self._native.explain(text)
 
-    def _run_region(self, text: str) -> bytes:
-        query = self.session.sql(text)
+    def _run_region(self, kind: str, payload: str) -> bytes:
+        query = (Query(self.session, decode_value(LogicalPlan, json.loads(payload)))
+                 if kind == "plan" else self.session.sql(payload))
         result = execute_query(query, physical_executor=self._physical_executor)
         return ipc_bytes(result.collect())

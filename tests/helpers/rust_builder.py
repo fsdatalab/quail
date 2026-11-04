@@ -210,7 +210,7 @@ def binder_outcome(native, sql, catalog, prompts, plan, message) -> str:
 KNOWN_GAPS = {
     "table function 'UNNEST' not found":
         "DataFusion's Snowflake dialect has no UNNEST in FROM",
-    "FROM must name one registered provider":
+    "a subquery in FROM is outside what Quail binds":
         "sqlglot merges a CTE into one SELECT; the Rust binder reads a table",
     "For SELECT DISTINCT, ORDER BY expressions":
         "DataFusion refuses DISTINCT with ORDER BY a struct field",

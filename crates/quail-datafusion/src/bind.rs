@@ -148,10 +148,12 @@ struct Select<'a> {
     outputs: Vec<(String, Expr)>,
 }
 
+/// The phrase every refusal of a query shape the binder does not read
+/// ends with; a caller may plan such a region another way.
+pub const UNSUPPORTED: &str = "is outside what Quail binds from DataFusion";
+
 fn unsupported<T>(what: &str) -> Result<T, CompileError> {
-    compile_error(format!(
-        "{what} is outside what Quail binds from DataFusion; run the query with Session.sql"
-    ))
+    compile_error(format!("{what} {UNSUPPORTED}"))
 }
 
 impl<'a> Select<'a> {
@@ -638,6 +640,9 @@ impl Binder {
                 }
                 other => {
                     let Some(table) = Self::table_of(other) else {
+                        if let LogicalPlan::SubqueryAlias(_) = other {
+                            return unsupported("a subquery in FROM");
+                        }
                         return compile_error("FROM must name one registered provider");
                     };
                     tables.push(table);
