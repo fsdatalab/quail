@@ -79,7 +79,13 @@ def _rust_builder(monkeypatch):
     for owner, name, replacement in shadow_classify(
             _quail_native, ClassifyPlanner, ClassifyScoring, ClassifyBuilder):
         monkeypatch.setattr(owner, name, replacement)
-    for owner, name, make in ((score_module, "score_spec", shadow_score_spec),
+    from helpers.rust_builder import shadow_operator_order
+
+    import quail.planner.search.operator_order as order_module
+
+    for owner, name, make in ((order_module, "choose_operator_order",
+                               shadow_operator_order),
+                              (score_module, "score_spec", shadow_score_spec),
                               (filter_module, "prepare_filter_costs",
                                shadow_filter_costs),
                               (join_module, "join_specs", shadow_join_specs)):

@@ -542,6 +542,12 @@ struct ContextFields {
     document_tokens: std::collections::BTreeMap<String, Vec<i64>>,
     plan: Option<serde_json::Value>,
     attention: Option<String>,
+    #[serde(default)]
+    pair_fractions: std::collections::BTreeMap<String, f64>,
+    #[serde(default)]
+    scan_fractions: std::collections::BTreeMap<String, f64>,
+    #[serde(default)]
+    order: Option<String>,
 }
 
 /// Run one operator planning function of `quail/planner/operators` in Rust.
@@ -582,6 +588,13 @@ fn plan_operator<'py>(
         tokenizer: &tokens,
         decode: decoder_ref,
         attention: fields.attention,
+        pair_fractions: fields
+            .pair_fractions
+            .into_iter()
+            .map(|(key, fraction)| (key.parse().unwrap_or(usize::MAX), fraction))
+            .collect(),
+        scan_fractions: fields.scan_fractions,
+        order: fields.order,
         logical_plan: fields.plan.map(json_value).transpose()?,
     };
     let arguments: serde_json::Value = from_json(arguments)?;
@@ -723,6 +736,13 @@ fn plan_operator<'py>(
                     .map(|(spec, work)| (spec, work_fields(&work))),
             )
         }
+        "operator_order" => {
+            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
+            lowering_result(
+                quail_planner::search::choose_operator_order(&plan, &context)
+                    .map(|found| operator_order_fields(&found)),
+            )
+        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "no operator planning function {other}"
         ))),
@@ -732,6 +752,53 @@ fn plan_operator<'py>(
 fn json_value<T: serde::de::DeserializeOwned>(found: serde_json::Value) -> PyResult<T> {
     serde_json::from_value(found)
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+/// An operator order, or its refusal, as the test helpers compare it.
+fn operator_order_fields(
+    found: &Result<quail_planner::search::OperatorOrder, quail_planner::search::Refusal>,
+) -> serde_json::Value {
+    use quail_planner::search::StepKey;
+    let order = match found {
+        Err(refusal) => {
+            return serde_json::json!({"refusal": {
+                "reasons": refusal.reasons, "constraint": refusal.constraint,
+                "needed": refusal.needed, "available": refusal.available, "unit": refusal.unit,
+            }});
+        }
+        Ok(order) => order,
+    };
+    let statistics = &order.statistics;
+    let key = |key: &StepKey| match key {
+        StepKey::Position(position) => serde_json::json!(position),
+        StepKey::Name(name) => serde_json::json!(name),
+    };
+    serde_json::json!({
+        "statistics": {
+            "stats": statistics.stats.iter().map(|(alias, stats)| (alias.clone(), serde_json::json!([
+                stats.num_documents, stats.total_tokens, stats.max_document_tokens]))).collect::<serde_json::Map<_, _>>(),
+            "lengths": statistics.lengths.iter().map(|(alias, found)| (alias.clone(), serde_json::json!([
+                found.count, found.total, found.squared.to_string(), found.maximum, found.window, found.short_counts]))).collect::<serde_json::Map<_, _>>(),
+            "chunk": statistics.chunk, "arena_pages": [statistics.arena_pages.0, statistics.arena_pages.1],
+            "admission": statistics.admission, "cap_pages": statistics.cap_pages, "pre": statistics.pre,
+            "asks": statistics.asks.iter().map(|(alias, positions)| (alias.clone(), serde_json::json!(positions))).collect::<serde_json::Map<_, _>>(),
+            "specs": statistics.specs.iter().map(|spec| spec.written_position).collect::<Vec<_>>(),
+        },
+        "filter_orders": order.filter_orders.iter().map(|(alias, positions)| (alias.clone(), serde_json::json!(positions))).collect::<serde_json::Map<_, _>>(),
+        "step_orders": order.step_orders.iter().map(|(alias, steps)| (alias.clone(), serde_json::json!(steps.iter().map(|step| serde_json::json!({
+            "kind": step.kind, "key": key(&step.key), "selectivity": step.selectivity,
+            "reuse_key": step.reuse_key.is_some(), "document_head": step.document_head,
+        })).collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
+        "join_sequence": order.join_sequence.iter().map(|(spec, anchor)| serde_json::json!([spec.written_position, anchor])).collect::<Vec<_>>(),
+        "join_steps": order.join_steps.iter().map(|step| serde_json::json!({
+            "written_position": step.written_position, "anchor": step.anchor, "resident": step.resident,
+            "resident_documents": step.resident_documents, "anchor_documents": step.anchor_documents,
+            "tuples": step.tuples, "tokens": step.tokens, "work": work_fields(&step.work),
+        })).collect::<Vec<_>>(),
+        "expected_rows": order.expected_rows,
+        "filter_work": order.filter_work.iter().map(|(alias, work)| (alias.clone(), serde_json::json!(work_fields(work)))).collect::<serde_json::Map<_, _>>(),
+        "order_rule": order.order_rule, "order_source": order.order_source,
+    })
 }
 
 /// A Work record's fields, as a dict of floats.

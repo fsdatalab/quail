@@ -748,3 +748,89 @@ def shadow_classify(native, planner, scoring, builder):
     return ((planner, "spec", spec), (planner, "seconds", seconds),
             (scoring, "choose_scoring", choose_scoring),
             (builder, "classify_joined", classify_joined))
+
+
+def _operator_order_fields(found, intern) -> dict:
+    """An OperatorOrder, or its Refusal, as the Rust binding writes it."""
+    from quail.planner.plan import Refusal
+
+    if isinstance(found, Refusal):
+        return {"refusal": {"reasons": list(found.reasons),
+                            "constraint": found.constraint,
+                            "needed": float(found.needed),
+                            "available": float(found.available), "unit": found.unit}}
+    statistics = found.statistics
+    return {
+        "statistics": {
+            "stats": {alias: [s.num_documents, s.total_tokens, s.max_document_tokens]
+                      for alias, s in statistics.stats.items()},
+            "lengths": {alias: [s.count, s.total, str(s.squared), s.maximum, s.window,
+                                [list(pair) for pair in s.short_counts]]
+                        for alias, s in statistics.lengths.items()},
+            "chunk": statistics.chunk, "arena_pages": list(statistics.arena_pages),
+            "admission": statistics.admission, "cap_pages": statistics.cap_pages,
+            "pre": statistics.pre,
+            "asks": {alias: list(positions)
+                     for alias, positions in statistics.asks.items()},
+            "specs": [spec.written_position for spec in statistics.specs],
+        },
+        "filter_orders": {alias: list(positions)
+                          for alias, positions in found.filter_orders.items()},
+        "step_orders": {alias: [{
+            "kind": step.kind, "key": step.key, "selectivity": step.selectivity,
+            "reuse_key": step.reuse_key is not None,
+            "document_head": [intern(token) for token in step.document_head],
+        } for step in steps] for alias, steps in found.step_orders.items()},
+        "join_sequence": [[spec.written_position, anchor]
+                          for spec, anchor in found.join_sequence],
+        "join_steps": [{
+            "written_position": step.written_position, "anchor": step.anchor,
+            "resident": step.resident, "resident_documents": step.resident_documents,
+            "anchor_documents": float(step.anchor_documents),
+            "tuples": float(step.tuples), "tokens": float(step.tokens),
+            "work": _work_fields(step.work),
+        } for step in found.join_steps],
+        "expected_rows": {alias: float(rows)
+                          for alias, rows in found.expected_rows.items()},
+        "filter_work": {alias: _work_fields(work)
+                        for alias, work in found.filter_work.items()},
+        "order_rule": found.order_rule, "order_source": found.order_source,
+    }
+
+
+def shadow_operator_order(native, original):
+    """Return choose_operator_order, also searching in Rust."""
+    import numpy as np
+
+    def choose_operator_order(plan, operators, model, device, document_tokens, order,
+                              pair_fractions, context, scan_fractions):
+        found = original(plan, operators, model, device, document_tokens, order,
+                         pair_fractions, context, scan_fractions)
+        if (context is None or context.tokenizer is None
+                or model is not context.model or device is not context.device):
+            return found
+        fields = json.loads(_context_json(context))
+        fields.update(
+            document_tokens={alias: np.asarray(values).astype(int).tolist()
+                             for alias, values in document_tokens.items()},
+            order=order,
+            pair_fractions={str(key): float(value)
+                            for key, value in (pair_fractions or {}).items()},
+            scan_fractions={alias: float(value)
+                            for alias, value in (scan_fractions or {}).items()})
+        intern, tokens, decode = _interning(context.tokenizer)
+        if os.environ.get("QUAIL_RUST_OPERATOR_LOG"):
+            joins = getattr(found, "join_sequence", ())
+            with open(os.environ["QUAIL_RUST_OPERATOR_LOG"], "a") as log:
+                log.write(f"operator_order {len(joins)} joins "
+                          f"{type(found).__name__}\n")
+        rust, message = native.plan_operator(
+            "operator_order", json.dumps(fields),
+            json.dumps({"plan": encode_value(plan)}), tokens, decode)
+        assert message is None, f"Rust refused the operator order: {message}"
+        difference = same_values(json.loads(rust),
+                                 _operator_order_fields(found, intern))
+        assert difference is None, f"Rust ordered the operators otherwise: {difference}"
+        return found
+
+    return choose_operator_order

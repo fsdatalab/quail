@@ -12,6 +12,8 @@
 //! | `nodes` | the methods of the node classes in `quail/logical/nodes` |
 //! | `lowering` | `quail/planner/prompt_lowering.py`, with a tokenizer callback |
 //! | `operators` | `LogicalPlan.operators` in `quail/logical/plan.py` |
+//! | `plan_statistics` | `quail/planner/search/statistics.py` |
+//! | `search` | the step order, join order, and anchor search of `quail/planner/search` |
 //! | `scores` | `quail/planner/operators/score.py` |
 //! | `statistics` | `quail/planner/statistics` |
 //! | `rules` | the logical rules of `quail/planner/rules` and `logical_alternatives` |
@@ -29,9 +31,11 @@ pub mod logical;
 pub mod lowering;
 pub mod nodes;
 pub mod operators;
+pub mod plan_statistics;
 pub mod prompts;
 pub mod rules;
 pub mod scores;
+pub mod search;
 pub mod statistics;
 
 pub use expressions::CompileError;

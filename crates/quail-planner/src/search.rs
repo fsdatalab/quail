@@ -1,0 +1,1118 @@
+//! Choose each table's step order, the join order, and the anchors, as
+//! `quail/planner/search` does.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use quail_cost::budgets::parallel_copies;
+use quail_cost::joins::{
+    PricedJoin, longest_join_input, packed_join_work, stage_work as join_work,
+};
+use quail_cost::quantity::Quantity;
+use quail_cost::sol::speed_of_light;
+use quail_cost::statistics::AliasStats;
+use quail_cost::work::{Work, ask, scan};
+use quail_physical::Prompt;
+
+use crate::classify::classify_seconds;
+use crate::columns::{ColumnSpec, column_spec};
+use crate::context::PlanningContext;
+use crate::costs::{CostCurve, prepare_filter_costs, question_tokens};
+use crate::expressions::{CompileError, call_aliases, repr_str};
+use crate::logical::{LogicalNode, LogicalPlan};
+use crate::nodes::{asked_call, column_alias, column_call};
+use crate::operators::Operators;
+use crate::plan_statistics::{
+    PlanStatistics, expected_rows_after_filters, filtered_before_joins, plan_statistics,
+};
+use crate::scores::score_join_work;
+use crate::statistics::{
+    DEFAULT_SELECTIVITY, cross_tuples, effective_selectivity, surviving_documents, thin,
+};
+
+pub const ASK: &str = "ask";
+
+/// A step's key: an ask's written position, or a column operator's name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StepKey {
+    Position(usize),
+    Name(String),
+}
+
+/// How a step's seconds are found at a live count.
+#[derive(Debug, Clone)]
+pub enum StepCost {
+    Curve(CostCurve),
+    /// A column operator's planner prices it.
+    Column {
+        node: Box<LogicalNode>,
+        resident: bool,
+    },
+}
+
+impl StepCost {
+    fn seconds(&self, context: &PlanningContext, rows: f64) -> Result<f64, CompileError> {
+        match self {
+            StepCost::Curve(curve) => Ok(curve.seconds(rows)),
+            StepCost::Column { node, resident } => column_seconds(context, node, *resident, rows),
+        }
+    }
+}
+
+/// A column operator's seconds, as its planner's `seconds`.
+///
+/// # Errors
+///
+/// The tokenizer fails, or the model cannot run the operator.
+pub fn column_seconds(
+    context: &PlanningContext,
+    node: &LogicalNode,
+    resident: bool,
+    rows: f64,
+) -> Result<f64, CompileError> {
+    if let LogicalNode::SemanticClassify(column) = node {
+        return classify_seconds(
+            context,
+            column_call(column),
+            &column.name,
+            &column_alias(column),
+            resident,
+            rows,
+        );
+    }
+    Ok(match column_spec(context, node, rows, resident)? {
+        ColumnSpec::Extract(spec) => spec.estimated_seconds,
+        ColumnSpec::Map(spec) => spec.estimated_seconds,
+        ColumnSpec::SaeFeatures(spec) => spec.estimated_seconds,
+    })
+}
+
+/// One step of a table's sequence and its costs, as `TableStep`.
+#[derive(Debug, Clone)]
+pub struct TableStep {
+    pub kind: &'static str,
+    pub key: StepKey,
+    pub selectivity: f64,
+    pub first: StepCost,
+    pub later: StepCost,
+    pub reuse_key: Option<Prompt>,
+    pub document_head: Vec<i64>,
+}
+
+/// Whether a step reads the KV the step before it left.
+pub fn resident_after(previous: &TableStep, step: &TableStep) -> bool {
+    previous.document_head == step.document_head
+}
+
+fn column_step_kind(kind: &str) -> &'static str {
+    match kind {
+        "label" => "classify",
+        "extract" => "extract",
+        "features" => "features",
+        _ => "map",
+    }
+}
+
+/// A table's steps in written order, priced, as `table_steps`.
+///
+/// # Errors
+///
+/// The tokenizer fails, or the arena does not fit the device.
+pub fn table_steps(
+    found: &Operators,
+    alias: &str,
+    asks: &[usize],
+    statistics: &PlanStatistics,
+    context: &PlanningContext,
+) -> Result<Vec<TableStep>, CompileError> {
+    let mut steps = Vec::new();
+    let predicates = found
+        .filters
+        .iter()
+        .find(|(owner, _)| owner == alias)
+        .map(|(_, predicates)| predicates.clone())
+        .unwrap_or_default();
+    let stats = statistics.stats[alias];
+    let chosen: Vec<_> = asks
+        .iter()
+        .map(|position| predicates[*position].clone())
+        .collect();
+    let costs = prepare_filter_costs(
+        &chosen,
+        statistics.pre as f64 + stats.mean_document_tokens(),
+        statistics.chunk,
+        context,
+    )?;
+    for (position, cost) in asks.iter().zip(costs) {
+        let prompt = &asked_call(&predicates[*position].expression).prompt;
+        steps.push(TableStep {
+            kind: ASK,
+            key: StepKey::Position(*position),
+            selectivity: cost.selectivity,
+            first: StepCost::Curve(cost.first),
+            later: StepCost::Curve(cost.later),
+            reuse_key: cost.reuse_key,
+            document_head: context.lowered(prompt)?.preamble_token_ids,
+        });
+    }
+    let mut tests: Vec<(String, Vec<f64>)> = Vec::new();
+    if let Some((_, filters)) = found
+        .column_filters
+        .iter()
+        .find(|(owner, _)| owner == alias)
+    {
+        for test in filters {
+            match tests.iter_mut().find(|(name, _)| *name == test.name) {
+                Some((_, found)) => found.push(effective_selectivity(test.selectivity)),
+                None => tests.push((
+                    test.name.clone(),
+                    vec![effective_selectivity(test.selectivity)],
+                )),
+            }
+        }
+    }
+    let mut nodes: Vec<LogicalNode> = Vec::new();
+    for (call, owner) in label_calls(found) {
+        if owner != alias {
+            continue;
+        }
+        if let Some(node) = found
+            .classifies
+            .iter()
+            .find(|node| call_aliases(column_call(node)).len() == 1 && column_call(node) == &call)
+        {
+            nodes.push(LogicalNode::SemanticClassify(node.clone()));
+        }
+    }
+    for (variant, list) in [
+        ("extract", &found.extracts),
+        ("features", &found.sae_features),
+        ("map", &found.maps),
+    ] {
+        for node in list.iter().filter(|node| column_alias(node) == alias) {
+            nodes.push(match variant {
+                "extract" => LogicalNode::SemanticExtract(node.clone()),
+                "features" => LogicalNode::SemanticSaeFeatures(node.clone()),
+                _ => LogicalNode::SemanticMap(node.clone()),
+            });
+        }
+    }
+    for node in nodes {
+        let column = crate::nodes::as_column(&node).expect("a column operator");
+        let call = column_call(column);
+        let survival = tests
+            .iter()
+            .find(|(name, _)| *name == column.name)
+            .map(|(_, found)| found.iter().product::<f64>())
+            .unwrap_or(1.0);
+        steps.push(TableStep {
+            kind: column_step_kind(&call.kind),
+            key: StepKey::Name(column.name.clone()),
+            selectivity: survival,
+            first: StepCost::Column {
+                node: Box::new(node.clone()),
+                resident: false,
+            },
+            later: StepCost::Column {
+                node: Box::new(node.clone()),
+                resident: true,
+            },
+            reuse_key: None,
+            document_head: context.lowered(&call.prompt)?.preamble_token_ids,
+        });
+    }
+    Ok(steps)
+}
+
+/// The classification calls a filter tests or SELECT returns, as `LabelWork.calls`.
+fn label_calls(found: &Operators) -> Vec<(quail_physical::ModelCall, String)> {
+    let mut calls: Vec<(quail_physical::ModelCall, String)> = Vec::new();
+    for (alias, tests) in &found.column_filters {
+        for test in tests {
+            if test.call.kind == "label" && !calls.iter().any(|(call, _)| *call == test.call) {
+                calls.push((test.call.clone(), alias.clone()));
+            }
+        }
+    }
+    for column in &found.projections {
+        if let Some(call) = crate::expressions::aliased_call(column, &["label"])
+            && !calls.iter().any(|(found, _)| found == call)
+        {
+            calls.push((call.clone(), call_aliases(call)[0].clone()));
+        }
+    }
+    calls
+}
+
+/// Choose an order using costs at each expected survivor count, as
+/// `order_filters_indexed` with the steps' own residency rule.
+///
+/// # Errors
+///
+/// A step's cost fails.
+pub fn order_steps(
+    steps: &[TableStep],
+    rule: &str,
+    count: f64,
+    context: &PlanningContext,
+) -> Result<Vec<usize>, CompileError> {
+    let indices: Vec<usize> = (0..steps.len()).collect();
+    if rule == "as_written" || indices.len() < 2 {
+        return Ok(indices);
+    }
+    let mut cache: HashMap<(usize, u64, bool), f64> = HashMap::new();
+    let mut cost = |index: usize, rows: f64, first: bool| -> Result<f64, CompileError> {
+        let key = (index, rows.to_bits(), first);
+        if let Some(found) = cache.get(&key) {
+            return Ok(*found);
+        }
+        let step = &steps[index];
+        let seconds = if first { &step.first } else { &step.later }.seconds(context, rows)?;
+        cache.insert(key, seconds);
+        Ok(seconds)
+    };
+    let starters: Vec<usize> = indices
+        .iter()
+        .copied()
+        .filter(|index| steps[*index].selectivity < 1.0)
+        .collect();
+    if starters.is_empty() {
+        return Ok(indices);
+    }
+    let mut best: Option<(f64, usize, Vec<usize>)> = None;
+    for first in starters {
+        let mut ordered = vec![first];
+        let mut total = cost(first, count, true)?;
+        let mut expected = count * steps[first].selectivity;
+        let mut scored: Vec<Prompt> = steps[first].reuse_key.iter().cloned().collect();
+        let mut remaining: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|index| *index != first)
+            .collect();
+        let mut previous = first;
+        while !remaining.is_empty() {
+            let mut choice: Option<(f64, usize, f64)> = None;
+            for &index in &remaining {
+                let step = &steps[index];
+                let reused = step
+                    .reuse_key
+                    .as_ref()
+                    .is_some_and(|key| scored.contains(key));
+                let fresh = !resident_after(&steps[previous], step);
+                let seconds = if reused {
+                    0.0
+                } else {
+                    cost(index, if expected > 0.0 { expected } else { 1.0 }, fresh)?
+                };
+                let rejected = 1.0 - step.selectivity;
+                let rank = if rejected > 0.0 {
+                    seconds / rejected
+                } else if seconds == 0.0 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                };
+                let candidate = (rank, index, if expected > 0.0 { seconds } else { 0.0 });
+                if choice
+                    .as_ref()
+                    .is_none_or(|found| (candidate.0, candidate.1) < (found.0, found.1))
+                {
+                    choice = Some(candidate);
+                }
+            }
+            let (_, selected, seconds) = choice.expect("a remaining step");
+            total += seconds;
+            ordered.push(selected);
+            previous = selected;
+            expected *= steps[selected].selectivity;
+            if let Some(key) = &steps[selected].reuse_key {
+                scored.push(key.clone());
+            }
+            remaining.retain(|index| *index != selected);
+        }
+        if best
+            .as_ref()
+            .is_none_or(|found| (total, first) < (found.0, found.1))
+        {
+            best = Some((total, first, ordered));
+        }
+    }
+    Ok(best.expect("a starter").2)
+}
+
+// ---------------------------------------------------------------- joins
+
+/// The small physical state needed for guaranteed group reuse.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct KvState {
+    pub pending_anchor: Option<String>,
+    pub group_open: bool,
+    pub used_anchors: BTreeSet<String>,
+}
+
+/// One join as the search priced it in its place in the sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinStep {
+    pub written_position: usize,
+    pub anchor: String,
+    /// "filter", "kept", or "none".
+    pub resident: &'static str,
+    pub resident_documents: i64,
+    pub anchor_documents: f64,
+    pub tuples: f64,
+    pub tokens: f64,
+    pub work: Work,
+}
+
+impl JoinStep {
+    /// One model copy's share when the anchors are spread evenly.
+    pub fn copy_work(&self, gpus: i64) -> Work {
+        &self.work * (1.0 / parallel_copies(gpus, self.anchor_documents))
+    }
+}
+
+/// The cheapest join sequence the search found.
+#[derive(Debug, Clone)]
+pub struct JoinSearch {
+    pub seq: Vec<(usize, String)>,
+    pub steps: Vec<JoinStep>,
+    pub work: Work,
+}
+
+/// Candidate anchors for one join, as `anchor_candidates`.
+pub fn anchor_candidates(spec: &PricedJoin, honor_forced: bool) -> Vec<String> {
+    if spec.semantics != "full" || (honor_forced && !spec.anchor_free) {
+        return vec![spec.anchor.clone().unwrap_or_default()];
+    }
+    spec.aliases.clone()
+}
+
+/// Tokens of the longest input under one join orientation.
+pub fn join_input_tokens(
+    spec: &PricedJoin,
+    anchor: &str,
+    maximum: &BTreeMap<String, i64>,
+    pre: i64,
+) -> i64 {
+    let partners: Vec<(i64, i64)> = spec
+        .aliases
+        .iter()
+        .filter(|partner| *partner != anchor)
+        .map(|partner| (spec.label_tokens[partner], maximum[partner]))
+        .collect();
+    longest_join_input(
+        pre,
+        maximum[anchor],
+        spec.frame_tokens[anchor],
+        spec.tail_tokens,
+        &partners,
+    )
+}
+
+fn anchor_fits(
+    spec: &PricedJoin,
+    anchor: &str,
+    lengths: &BTreeMap<String, AliasStats>,
+    pre: i64,
+    chunk: i64,
+) -> bool {
+    if spec.aliases.iter().any(|alias| lengths[alias].count == 0) {
+        return true;
+    }
+    let maximum: BTreeMap<String, i64> = spec
+        .aliases
+        .iter()
+        .map(|alias| (alias.clone(), lengths[alias].maximum))
+        .collect();
+    join_input_tokens(spec, anchor, &maximum, pre) <= chunk
+}
+
+fn feasible_anchors(
+    spec: &PricedJoin,
+    honor_forced: bool,
+    lengths: &BTreeMap<String, AliasStats>,
+    pre: i64,
+    chunk: i64,
+) -> Vec<String> {
+    let candidates = anchor_candidates(spec, honor_forced);
+    let fits: Vec<String> = candidates
+        .iter()
+        .filter(|anchor| anchor_fits(spec, anchor, lengths, pre, chunk))
+        .cloned()
+        .collect();
+    if fits.is_empty() { candidates } else { fits }
+}
+
+fn residency(
+    anchor: &str,
+    state: &KvState,
+    resident: &BTreeSet<String>,
+    same_group: bool,
+) -> &'static str {
+    if same_group || state.used_anchors.contains(anchor) {
+        "kept"
+    } else if resident.contains(anchor) {
+        "filter"
+    } else {
+        "none"
+    }
+}
+
+/// Expected anchors the join reads: those with a candidate partner.
+pub fn anchor_documents(spec: &PricedJoin, anchor: &str, expected: &BTreeMap<String, f64>) -> f64 {
+    let partners: f64 = spec
+        .aliases
+        .iter()
+        .filter(|alias| *alias != anchor)
+        .map(|alias| expected[alias])
+        .product();
+    surviving_documents(expected[anchor], partners, Some(spec.pair_fraction))
+}
+
+/// A prepared join's work at the current survivor counts, as `stage_work`.
+///
+/// # Errors
+///
+/// The anchor's length summary uses another window.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_work(
+    spec: &PricedJoin,
+    anchor: &str,
+    expected: &BTreeMap<String, f64>,
+    lengths: &BTreeMap<String, AliasStats>,
+    pre: i64,
+    resident: bool,
+    window: i64,
+    set_size: i64,
+) -> Result<Work, CompileError> {
+    if let Some(cost) = &spec.score {
+        return Ok(score_join_work(
+            cost,
+            &spec.aliases,
+            spec.pair_fraction,
+            expected,
+        ));
+    }
+    let documents = anchor_documents(spec, anchor, expected);
+    let tuples = cross_tuples(spec, expected);
+    if set_size != 0 {
+        return packed_join_work(
+            spec, anchor, documents, tuples, lengths, pre, window, set_size,
+        )
+        .map_err(CompileError);
+    }
+    join_work(
+        spec, anchor, documents, tuples, lengths, pre, resident, window,
+    )
+    .map_err(CompileError)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_step(
+    spec: &PricedJoin,
+    anchor: &str,
+    expected: &BTreeMap<String, f64>,
+    lengths: &BTreeMap<String, AliasStats>,
+    resident: &BTreeSet<String>,
+    pre: i64,
+    state: &KvState,
+    context: &PlanningContext,
+) -> Result<(Work, JoinStep, KvState), CompileError> {
+    let model = &context.model;
+    let same_group = state.group_open
+        && state.pending_anchor.as_deref() == Some(anchor)
+        && spec.semantics == "full";
+    let set_size = if model.attention_mask == "set" {
+        model.set_size
+    } else {
+        0
+    };
+    let kind = if model.reuses_kv() {
+        residency(anchor, state, resident, same_group)
+    } else {
+        "none"
+    };
+    let work = stage_work(
+        spec,
+        anchor,
+        expected,
+        lengths,
+        pre,
+        kind != "none",
+        model.sliding_window,
+        set_size,
+    )?;
+    let step = JoinStep {
+        written_position: spec.written_position,
+        anchor: anchor.to_string(),
+        resident: kind,
+        resident_documents: if kind != "none" {
+            lengths[anchor].count
+        } else {
+            0
+        },
+        anchor_documents: anchor_documents(spec, anchor, expected),
+        tuples: cross_tuples(spec, expected),
+        tokens: work.tokens.total(),
+        work: work.clone(),
+    };
+    let mut used = state.used_anchors.clone();
+    used.insert(anchor.to_string());
+    let next = KvState {
+        pending_anchor: Some(anchor.to_string()),
+        group_open: spec.semantics == "full",
+        used_anchors: used,
+    };
+    Ok((work, step, next))
+}
+
+/// Cost one sequence of (join, anchor), as `walk`.
+///
+/// # Errors
+///
+/// A join cannot be priced.
+pub fn walk(
+    seq: &[(PricedJoin, String)],
+    live: &BTreeMap<String, f64>,
+    lengths: &BTreeMap<String, AliasStats>,
+    resident: &BTreeSet<String>,
+    pre: i64,
+    context: &PlanningContext,
+) -> Result<(Work, Vec<JoinStep>), CompileError> {
+    let mut state = KvState::default();
+    let mut total = Work::default();
+    let mut records = Vec::new();
+    let mut applied: Vec<&PricedJoin> = Vec::new();
+    for (spec, anchor) in seq {
+        let mut expected = live.clone();
+        let mut done = applied.clone();
+        done.sort_by_key(|found| found.written_position);
+        for found in done {
+            thin(&mut expected, found);
+        }
+        let (work, step, next) = join_step(
+            spec, anchor, &expected, lengths, resident, pre, &state, context,
+        )?;
+        state = next;
+        records.push(step);
+        total = &total + &work;
+        applied.push(spec);
+    }
+    Ok((total, records))
+}
+
+/// A search candidate's ranking: seconds, then the work's leading fields.
+type Rank = (f64, f64, f64, f64, f64);
+
+/// The best fixed-order assignment so far: its rank, work, steps, and sequence.
+type FixedBest = (Rank, Work, Vec<JoinStep>, Vec<(PricedJoin, String)>);
+
+fn rank(base: &Work, work: &Work, context: &PlanningContext, chunk: i64) -> Rank {
+    let seconds = speed_of_light(
+        &(base + work),
+        &context.model,
+        &context.device,
+        chunk,
+        0.0,
+        0,
+    )
+    .seconds();
+    (
+        seconds,
+        work.tokens.total(),
+        work.pairs.total(),
+        work.kv_written.total(),
+        work.kv_read.total(),
+    )
+}
+
+fn sum_work<'a>(works: impl IntoIterator<Item = &'a Work>) -> Work {
+    let mut total = Work::default();
+    for work in works {
+        total = &total + work;
+    }
+    total
+}
+
+#[derive(Clone)]
+struct Candidate {
+    work: Work,
+    relation_order: Vec<String>,
+    steps: Vec<JoinStep>,
+}
+
+fn insert_nondominated(frontier: &mut Vec<Candidate>, candidate: Candidate) {
+    if frontier
+        .iter()
+        .any(|existing| existing.work.dominates(&candidate.work))
+    {
+        return;
+    }
+    frontier.retain(|existing| !candidate.work.dominates(&existing.work));
+    frontier.push(candidate);
+}
+
+type StateKey = (BTreeSet<String>, BTreeSet<usize>, KvState);
+
+/// Search stage order and anchor choice, as `search_joins`; None when
+/// the joins have no connected left-deep order.
+///
+/// # Errors
+///
+/// A join cannot be priced.
+#[allow(clippy::too_many_arguments)]
+pub fn search_joins(
+    specs: &[PricedJoin],
+    expected: &BTreeMap<String, f64>,
+    lengths: &BTreeMap<String, AliasStats>,
+    resident: &BTreeSet<String>,
+    pre: i64,
+    chunk: i64,
+    context: &PlanningContext,
+    base: &Work,
+    fixed_order: bool,
+) -> Result<Option<JoinSearch>, CompileError> {
+    let gpus = context.gpus;
+    if specs.is_empty() {
+        return Ok(Some(JoinSearch {
+            seq: Vec::new(),
+            steps: Vec::new(),
+            work: Work::default(),
+        }));
+    }
+    let copy_work = |steps: &[JoinStep]| {
+        let works: Vec<Work> = steps.iter().map(|step| step.copy_work(gpus)).collect();
+        sum_work(&works)
+    };
+    if fixed_order || specs.len() == 1 {
+        let choices: Vec<Vec<String>> = specs
+            .iter()
+            .map(|spec| feasible_anchors(spec, true, lengths, pre, chunk))
+            .collect();
+        let mut best: Option<FixedBest> = None;
+        let mut assignment = vec![0usize; specs.len()];
+        loop {
+            let seq: Vec<(PricedJoin, String)> = specs
+                .iter()
+                .zip(&assignment)
+                .zip(&choices)
+                .map(|((spec, index), options)| (spec.clone(), options[*index].clone()))
+                .collect();
+            let (work, records) = walk(&seq, expected, lengths, resident, pre, context)?;
+            let key = rank(base, &copy_work(&records), context, chunk);
+            if best.as_ref().is_none_or(|found| key < found.0) {
+                best = Some((key, work, records, seq));
+            }
+            // the next assignment, last join fastest, as itertools.product
+            let mut position = specs.len();
+            loop {
+                if position == 0 {
+                    let (_, work, steps, seq) = best.expect("an assignment");
+                    return Ok(Some(JoinSearch {
+                        seq: seq
+                            .into_iter()
+                            .map(|(spec, anchor)| (spec.written_position, anchor))
+                            .collect(),
+                        steps,
+                        work,
+                    }));
+                }
+                position -= 1;
+                assignment[position] += 1;
+                if assignment[position] < choices[position].len() {
+                    break;
+                }
+                assignment[position] = 0;
+            }
+        }
+    }
+    let mut aliases: Vec<String> = Vec::new();
+    for spec in specs {
+        for alias in &spec.aliases {
+            if !aliases.contains(alias) {
+                aliases.push(alias.clone());
+            }
+        }
+    }
+    let edges: Vec<BTreeSet<String>> = specs
+        .iter()
+        .map(|spec| spec.aliases.iter().cloned().collect())
+        .collect();
+    let mut live_cache: HashMap<BTreeSet<usize>, BTreeMap<String, f64>> = HashMap::new();
+    let mut states: Vec<(StateKey, Vec<Candidate>)> = Vec::new();
+    let mut index_of: HashMap<StateKey, usize> = HashMap::new();
+    for alias in &aliases {
+        let relations: BTreeSet<String> = [alias.clone()].into_iter().collect();
+        let key = (relations, BTreeSet::new(), KvState::default());
+        index_of.insert(key.clone(), states.len());
+        states.push((
+            key,
+            vec![Candidate {
+                work: Work::default(),
+                relation_order: vec![alias.clone()],
+                steps: Vec::new(),
+            }],
+        ));
+    }
+    for num_applied in 0..edges.len() {
+        let current: Vec<(StateKey, Vec<Candidate>)> = states
+            .iter()
+            .filter(|(key, _)| key.1.len() == num_applied)
+            .cloned()
+            .collect();
+        for ((relations, applied, state), frontier) in current {
+            let available: Vec<usize> = (0..edges.len())
+                .filter(|index| !applied.contains(index))
+                .filter(|index| {
+                    let ends = &edges[*index];
+                    ends.is_subset(&relations)
+                        || (!ends.is_disjoint(&relations)
+                            && ends.difference(&relations).count() == 1)
+                })
+                .collect();
+            for index in available {
+                let spec = &specs[index];
+                let added: Vec<String> = edges[index].difference(&relations).cloned().collect();
+                let next_relations: BTreeSet<String> =
+                    relations.union(&edges[index]).cloned().collect();
+                let mut next_applied = applied.clone();
+                next_applied.insert(index);
+                let now = live_cache
+                    .entry(applied.clone())
+                    .or_insert_with(|| {
+                        let mut rows = expected.clone();
+                        for done in &applied {
+                            thin(&mut rows, &specs[*done]);
+                        }
+                        rows
+                    })
+                    .clone();
+                for anchor in feasible_anchors(spec, true, lengths, pre, chunk) {
+                    let (_, step, next_state) =
+                        join_step(spec, &anchor, &now, lengths, resident, pre, &state, context)?;
+                    let work = step.copy_work(gpus);
+                    let key = (next_relations.clone(), next_applied.clone(), next_state);
+                    let position = match index_of.get(&key) {
+                        Some(position) => *position,
+                        None => {
+                            index_of.insert(key.clone(), states.len());
+                            states.push((key, Vec::new()));
+                            states.len() - 1
+                        }
+                    };
+                    for old in &frontier {
+                        let mut relation_order = old.relation_order.clone();
+                        relation_order.extend(added.iter().cloned());
+                        let mut steps = old.steps.clone();
+                        steps.push(step.clone());
+                        insert_nondominated(
+                            &mut states[position].1,
+                            Candidate {
+                                work: &old.work + &work,
+                                relation_order,
+                                steps,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let all_aliases: BTreeSet<String> = aliases.iter().cloned().collect();
+    let finals: Vec<&Candidate> = states
+        .iter()
+        .filter(|((relations, applied, _), _)| {
+            applied.len() == edges.len() && all_aliases.is_subset(relations)
+        })
+        .flat_map(|(_, frontier)| frontier.iter())
+        .collect();
+    let mut best: Option<(Rank, &Candidate)> = None;
+    for candidate in finals {
+        let key = rank(base, &candidate.work, context, chunk);
+        let better = match &best {
+            None => true,
+            Some((found, other)) => match key.partial_cmp(found) {
+                Some(std::cmp::Ordering::Less) => true,
+                Some(std::cmp::Ordering::Equal) => {
+                    let mine = (
+                        &candidate.relation_order,
+                        candidate
+                            .steps
+                            .iter()
+                            .map(|s| (s.written_position, &s.anchor))
+                            .collect::<Vec<_>>(),
+                    );
+                    let theirs = (
+                        &other.relation_order,
+                        other
+                            .steps
+                            .iter()
+                            .map(|s| (s.written_position, &s.anchor))
+                            .collect::<Vec<_>>(),
+                    );
+                    mine < theirs
+                }
+                _ => false,
+            },
+        };
+        if better {
+            best = Some((key, candidate));
+        }
+    }
+    let Some((_, best)) = best else {
+        return Ok(None);
+    };
+    let works: Vec<Work> = best.steps.iter().map(|step| step.work.clone()).collect();
+    Ok(Some(JoinSearch {
+        seq: best
+            .steps
+            .iter()
+            .map(|step| (step.written_position, step.anchor.clone()))
+            .collect(),
+        steps: best.steps.clone(),
+        work: sum_work(&works),
+    }))
+}
+
+// ---------------------------------------------------------------- operator order
+
+/// Operator order, statistics, and work estimates, as `OperatorOrder`.
+#[derive(Debug, Clone)]
+pub struct OperatorOrder {
+    pub statistics: PlanStatistics,
+    /// alias -> its asks' written positions in run order.
+    pub filter_orders: Vec<(String, Vec<usize>)>,
+    /// alias -> its steps in run order.
+    pub step_orders: Vec<(String, Vec<TableStep>)>,
+    pub join_sequence: Vec<(PricedJoin, String)>,
+    pub join_steps: Vec<JoinStep>,
+    pub expected_rows: BTreeMap<String, f64>,
+    pub filter_work: Vec<(String, Work)>,
+    pub order_rule: String,
+    pub order_source: String,
+}
+
+/// A plan the planner cannot run within the configuration's limits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refusal {
+    pub reasons: Vec<String>,
+    pub constraint: String,
+    pub needed: f64,
+    pub available: f64,
+    pub unit: String,
+}
+
+/// The default stage order rule, as `default_order_rule`: (rule, source).
+pub fn default_order_rule(found: &Operators) -> (String, String) {
+    let missing = found
+        .filters
+        .iter()
+        .any(|(_, predicates)| predicates.iter().any(|p| p.selectivity.is_none()))
+        || found
+            .column_filters
+            .iter()
+            .any(|(_, tests)| tests.iter().any(|t| t.selectivity.is_none()))
+        || found.joins.iter().any(|join| join.selectivity.is_none());
+    if missing {
+        return (
+            "by_cost".to_string(),
+            format!(
+                "default: by cost, with selectivity {DEFAULT_SELECTIVITY} for predicates without one"
+            ),
+        );
+    }
+    ("by_cost".to_string(), "default: by cost".to_string())
+}
+
+/// Each table's asks' work in run order, as `filter_works`.
+///
+/// # Errors
+///
+/// A prompt has no question tail.
+pub fn filter_works(
+    found: &Operators,
+    statistics: &PlanStatistics,
+    context: &PlanningContext,
+    step_orders: &[(String, Vec<TableStep>)],
+) -> Result<Vec<(String, Work)>, CompileError> {
+    let model = &context.model;
+    let mut works = Vec::new();
+    for (alias, predicates) in &found.filters {
+        let stats = statistics.stats[alias];
+        let prefix = Quantity::Scalar(statistics.pre as f64 + stats.mean_document_tokens());
+        let mut count = stats.num_documents as f64;
+        let mut total = Work::default();
+        let mut previous: Option<&TableStep> = None;
+        let steps = step_orders
+            .iter()
+            .find(|(owner, _)| owner == alias)
+            .map(|(_, steps)| steps.as_slice())
+            .unwrap_or(&[]);
+        for step in steps {
+            if step.kind == ASK
+                && let StepKey::Position(position) = step.key
+                && statistics.asks_of(alias).contains(&position)
+            {
+                let question = question_tokens(
+                    statistics.lowered(&asked_call(&predicates[position].expression).prompt),
+                    model.canvas_tokens,
+                )?;
+                let question = Quantity::Scalar(question as f64);
+                let resident = previous.is_some_and(|before| resident_after(before, step));
+                let operation = if resident {
+                    ask(&prefix, &question, model.sliding_window)
+                } else {
+                    scan(&prefix, &question, model.sliding_window)
+                };
+                total = &total + &(&operation * count);
+            }
+            count *= step.selectivity;
+            previous = Some(step);
+        }
+        works.push((alias.clone(), total));
+    }
+    Ok(works)
+}
+
+/// Choose operator order and estimate work, as `choose_operator_order`.
+///
+/// # Errors
+///
+/// A cost cannot be computed; a join pair too long for a forward pass
+/// is a Refusal instead.
+pub fn choose_operator_order(
+    plan: &LogicalPlan,
+    context: &PlanningContext,
+) -> Result<Result<OperatorOrder, Refusal>, CompileError> {
+    let found = crate::operators::operators(plan);
+    let statistics = plan_statistics(plan, context)?;
+    let (rule, source) = match &context.order {
+        Some(order) => (order.clone(), format!("user: order={}", repr_str(order))),
+        None => default_order_rule(&found),
+    };
+    let mut step_orders: Vec<(String, Vec<TableStep>)> = Vec::new();
+    for table in &found.scans {
+        let count = found
+            .filters
+            .iter()
+            .find(|(alias, _)| *alias == table.alias)
+            .map(|(_, p)| p.len())
+            .unwrap_or(0);
+        let positions: Vec<usize> = (0..count).collect();
+        let steps = table_steps(&found, &table.alias, &positions, &statistics, context)?;
+        if steps.is_empty() {
+            continue;
+        }
+        let ordered = order_steps(
+            &steps,
+            &rule,
+            statistics.stats[&table.alias].num_documents as f64,
+            context,
+        )?;
+        step_orders.push((
+            table.alias.clone(),
+            ordered
+                .into_iter()
+                .map(|index| steps[index].clone())
+                .collect(),
+        ));
+    }
+    let filter_orders: Vec<(String, Vec<usize>)> = step_orders
+        .iter()
+        .map(|(alias, steps)| {
+            (
+                alias.clone(),
+                steps
+                    .iter()
+                    .filter(|step| step.kind == ASK)
+                    .filter_map(|step| match step.key {
+                        StepKey::Position(position) => Some(position),
+                        StepKey::Name(_) => None,
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let live = expected_rows_after_filters(plan, &statistics);
+    let works = filter_works(&found, &statistics, context, &step_orders)?;
+    let resident = filtered_before_joins(plan);
+    let mut sequence = Vec::new();
+    if !found.joins.is_empty() {
+        let mut base = Work::default();
+        for (_, work) in &works {
+            base = &base + work;
+        }
+        let base = &base * (1.0 / context.gpus as f64);
+        let search = |fixed: bool| {
+            search_joins(
+                &statistics.specs,
+                &live,
+                &statistics.lengths,
+                &resident,
+                statistics.pre,
+                statistics.chunk,
+                context,
+                &base,
+                fixed,
+            )
+        };
+        let result = match search(rule == "as_written")? {
+            Some(found) => found,
+            None => search(true)?.expect("a fixed order"),
+        };
+        sequence = result.seq;
+    }
+    let seq: Vec<(PricedJoin, String)> = sequence
+        .iter()
+        .map(|(position, anchor)| (statistics.specs[*position].clone(), anchor.clone()))
+        .collect();
+    let (_, join_steps) = walk(
+        &seq,
+        &live,
+        &statistics.lengths,
+        &resident,
+        statistics.pre,
+        context,
+    )?;
+    for spec in &statistics.specs {
+        if spec.score.is_some() {
+            continue;
+        }
+        let anchor = &sequence
+            .iter()
+            .rev()
+            .find(|(position, _)| *position == spec.written_position)
+            .expect("an anchor")
+            .1;
+        let maximum: BTreeMap<String, i64> = spec
+            .aliases
+            .iter()
+            .map(|alias| (alias.clone(), statistics.stats[alias].max_document_tokens))
+            .collect();
+        let need = join_input_tokens(spec, anchor, &maximum, statistics.pre);
+        if need > statistics.chunk {
+            return Ok(Err(Refusal {
+                reasons: vec![format!(
+                    "one join pair anchored on {} needs {need} tokens, but the forward pass budget is {} tokens",
+                    repr_str(anchor),
+                    statistics.chunk
+                )],
+                constraint: "suffix_over_chunk".to_string(),
+                needed: need as f64,
+                available: statistics.chunk as f64,
+                unit: "tokens".to_string(),
+            }));
+        }
+    }
+    Ok(Ok(OperatorOrder {
+        statistics,
+        filter_orders,
+        step_orders,
+        join_sequence: seq,
+        join_steps,
+        expected_rows: live,
+        filter_work: works,
+        order_rule: rule,
+        order_source: source,
+    }))
+}
