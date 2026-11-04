@@ -40,10 +40,9 @@ Include the tests and documentation needed to check and use your change.
 | Path | Contents |
 | --- | --- |
 | `quail/api/` | `Session`, `Query`, and running a query in this process. |
-| `quail/frontend/` | SQL parsing. |
 | `quail/catalog/` | Table providers and the tokenized inputs of a session. |
 | `quail/logical/`, `quail/physical/` | Logical and physical plan definitions. |
-| `crates/` | The Rust planner, cost model, and DataFusion binder, built into the `_quail_native` module. |
+| `crates/` | SQL parsing and binding on DataFusion, the Rust planner, and the cost model, built into the `_quail_native` module. |
 | `quail/planner/`, `quail/cost/`, `quail/specs/` | The bridge to the Rust planner, the Python cost model, and model and device specifications. |
 | `quail/execution/` | The runner and the CPU operators. |
 | `quail/backends/` | The Quail inference engine. |

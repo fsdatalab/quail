@@ -7,7 +7,6 @@ license = "MIT"
 # The Modal image and tested vLLM build use Python 3.12
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "sqlglot==30.17.0",
     "transformers==5.15.0",
     "huggingface-hub==1.28.0",
     "pyarrow==25.0.1",
@@ -148,7 +147,6 @@ layers = [
     "quail.explain",
     "quail.planner",
     "quail.physical",
-    "quail.frontend",
     "quail.catalog",
     "quail.logical",
     "quail.cost",

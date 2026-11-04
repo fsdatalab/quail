@@ -9,8 +9,6 @@ aggregate, having, sort, and fetch steps are the clauses that follow.
 
 from __future__ import annotations
 
-from sqlglot import exp
-
 from quail.common.prompts import map_instruction
 from quail_b.substrait import (
     Aggregate,
@@ -44,9 +42,17 @@ def build_query(session, info: PlanInfo, selectivity=None,
     return session.sql(query_sql(info, selectivity), order=order)
 
 
+# Snowflake string literal escapes, backslash first
+_ESCAPES = (("\\", "\\\\"), ("'", "\\'"), ("\n", "\\n"), ("\t", "\\t"),
+            ("\f", "\\f"), ("\b", "\\b"),
+            ("\r", "\\r"))
+
+
 def sql_string(text: str) -> str:
-    """Return text as a SQL string literal in the Snowflake dialect."""
-    return exp.Literal.string(text).sql(dialect="snowflake")
+    """Quote text as a Snowflake string literal."""
+    for character, escaped in _ESCAPES:
+        text = text.replace(character, escaped)
+    return f"'{text}'"
 
 
 def _literal(value) -> str:

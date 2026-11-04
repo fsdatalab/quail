@@ -20,6 +20,7 @@ pub mod bind;
 mod claim;
 mod exec;
 mod functions;
+mod joins;
 mod region;
 pub mod semantic;
 mod unnest;
@@ -126,6 +127,7 @@ pub async fn sql_in_dialect(
     }
     let mut statement = state.sql_to_statement(&text, &dialect)?;
     if let Statement::Statement(inner) = &mut statement {
+        joins::flatten_joins(inner);
         take_unnests(inner);
         positional_ai_arguments(inner);
         add_extract_spans(inner);

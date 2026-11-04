@@ -32,7 +32,7 @@ image = (
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
     .pip_install("vllm==0.29.0", "huggingface_hub", "numpy", "pyarrow",
-                 "sqlglot>=27.0", "gigatoken>=0.10.0", "datasets>=5.0.1")
+                 "gigatoken>=0.10.0", "datasets>=5.0.1")
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",

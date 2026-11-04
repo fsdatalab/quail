@@ -151,7 +151,7 @@ Built on:
 - **Apache Arrow and Acero**: tables, streams, and the relational
   operators in query plans.
 - **Substrait**: the plan format quail-b queries are written in.
-- **sqlglot**: SQL parsing.
+- **DataFusion and sqlparser**: SQL parsing and binding.
 - **Hugging Face** (`transformers`, `huggingface_hub`, `datasets`):
   tokenizers, checkpoints, and benchmark data.
 - **Modal**: every GPU run and the result volumes.

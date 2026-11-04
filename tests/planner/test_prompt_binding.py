@@ -1,16 +1,18 @@
-"""The Rust prompt binder writes the same prompt text as Python's, for every layout.
-
-tests/conftest.py binds every prompt a second time in Rust and fails
-where the two differ; these calls reach each layout and refusal.
-"""
+"""Each prompt binder binds its operator's prompt in every layout, or refuses."""
 
 import pytest
 
 from quail.common.expressions import ColumnRef, CompileError, GetField
-from quail.frontend.prompts import PromptBinder
+from quail.common.prompts import (
+    bind_classify_prompt,
+    bind_extract_prompt,
+    bind_join_prompt,
+    bind_map_prompt,
+    bind_prompt,
+    bind_sae_features_prompt,
+    bind_score_prompt,
+)
 from quail.specs import MODELS
-
-pytest.importorskip("_quail_native")
 
 REVIEW = ColumnRef("r", "reviews", "body")
 ASPECT = ColumnRef("a", "aspects", "aspect")
@@ -42,20 +44,37 @@ REFUSED = {
     "a map instruction with a brace": ("map", "Use {x}", (REVIEW,), {}),
 }
 
+def _bind(model, kind, template, args, *, labels=(), descriptions=(),
+          task_description=""):
+    turn, layout = model.turn, model.prompt_layout
+    if kind == "extract":
+        return bind_extract_prompt(args, template, turn, layout)
+    if kind == "map":
+        return bind_map_prompt(args, template, turn)
+    if kind == "features":
+        return bind_sae_features_prompt(template, args, turn)
+    if kind == "label":
+        return bind_classify_prompt(template, args, labels, descriptions, turn,
+                                    task_description=task_description, layout=layout)
+    binder = {"filter": bind_prompt, "join": bind_join_prompt,
+              "score": bind_score_prompt}[kind]
+    return binder(template, args, turn=turn, layout=layout)
+
+
 LAYOUT_MODELS = ("qwen3.8-27b-fp8", "decision-2.0-kai-0.6b-bf16", "d1-2b-fp8")
 
 
 @pytest.mark.parametrize("model", LAYOUT_MODELS)
 @pytest.mark.parametrize("name", CALLS)
-def test_each_prompt_binds_the_same_in_rust(model, name):
+def test_each_prompt_binds_in_each_layout(model, name):
     kind, template, args, options = CALLS[name]
-    prompt = PromptBinder(model=MODELS[model]).bind(kind, template, args, **options)
+    prompt = _bind(MODELS[model], kind, template, args, **options)
     assert prompt.args == args
 
 
 @pytest.mark.parametrize("model", LAYOUT_MODELS)
 @pytest.mark.parametrize("name", REFUSED)
-def test_each_prompt_refusal_reads_the_same_in_rust(model, name):
+def test_a_malformed_prompt_is_refused_in_each_layout(model, name):
     kind, template, args, options = REFUSED[name]
     with pytest.raises(CompileError):
-        PromptBinder(model=MODELS[model]).bind(kind, template, args, **options)
+        _bind(MODELS[model], kind, template, args, **options)

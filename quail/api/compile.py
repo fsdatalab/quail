@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from enum import StrEnum
 
 import pyarrow as pa
 
@@ -17,7 +18,15 @@ from quail.common.expressions import CompileError
 from quail.logical import LogicalPlan
 from quail.physical.codec import decode_value
 
-# a front end dialect -> DataFusion's name for it
+
+class SQLDialect(StrEnum):
+    """The SQL dialects Quail accepts."""
+
+    SNOWFLAKE = "snowflake"
+    BQ = "bq"
+
+
+# a dialect -> DataFusion's name for it
 DATAFUSION_DIALECTS = {"snowflake": "Snowflake", "bq": "BigQuery"}
 
 # the start of a DataFusion error, which names its kind
@@ -72,14 +81,15 @@ def _message(error: Exception, sql: str) -> str:
     return text
 
 
-def compile_with_datafusion(sql: str, catalog, prompts, dialect: str = "snowflake"):
-    """Compile AI SQL text into one logical plan, as compile_sql does.
+def compile_with_datafusion(sql: str, catalog, model,
+                            dialect: str = "snowflake"):
+    """Compile AI SQL text into one logical plan.
 
     Args:
         sql: The statement.
         catalog: Registered tables and their schemas.
-        prompts: The model-aware prompt binder: its model's turn and
-            prompt layout.
+        model: The model whose chat turn and prompt layout the prompts
+            are bound in.
         dialect: "snowflake" or "bq".
 
     Raises:
@@ -96,12 +106,10 @@ def compile_with_datafusion(sql: str, catalog, prompts, dialect: str = "snowflak
     context = _quail_native.NativeContext(run_region)
     for name, provider in catalog.providers.items():
         context.register(name, _schema_bytes(provider.schema()), refuse)
-    model = prompts.model
-    turn = prompts.turn if model is None else model.turn
-    layout = prompts.layout if model is None else model.prompt_layout
     try:
         regions, whole = context.logical_plans(
-            sql, tuple(turn), layout, DATAFUSION_DIALECTS[str(dialect).lower()])
+            sql, tuple(model.turn), model.prompt_layout,
+            DATAFUSION_DIALECTS[str(dialect).lower()])
     except RuntimeError as error:
         raise CompileError(_message(error, sql)) from None
     if not regions:

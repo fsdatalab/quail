@@ -5,13 +5,12 @@ from dataclasses import replace
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.planning import _optimize, _plan, node_kinds
+from helpers.planning import _optimize, _plan, compile_sql, node_kinds
 
 from quail.catalog import Catalog, DocumentProvider
 from quail.common.sol import speed_of_light
 from quail.common.work import ask, scan, stream
 from quail.explain import explain
-from quail.frontend.sql import compile_sql
 from quail.logical import SemanticJoin
 from quail.physical import (
     AiFilter,

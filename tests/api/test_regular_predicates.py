@@ -227,8 +227,8 @@ def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
 
 
 SQL_CALLS = {
-    # sqlglot parses each to a node of its own; Quail calls Arrow with
-    # SQL's meaning. r0, r1, r3, and r4 pass q1
+    # DataFusion parses each to a function of its own; Quail calls Arrow
+    # with SQL's meaning. r0, r1, r3, and r4 pass q1
     "LOG10(r.stars * 20) > 1.7": [True, False, None, True],
     "SUBSTRING(r.lang, 2, 1)": ["n", "n", "n", "n"],
     "CONCAT(r.lang, '-', r.lang)": ["en-en", "en-en", "en-en", "en-en"],
@@ -244,7 +244,7 @@ SQL_CALLS = {
 
 
 @pytest.mark.parametrize("dialect", ["bq", "snowflake"])
-def test_sql_functions_sqlglot_names_call_arrow_with_sqls_meaning(session, dialect):
+def test_sql_functions_call_arrow_with_sqls_meaning(session, dialect):
     for expression, expected in SQL_CALLS.items():
         query = session.sql(
             f"SELECT r.id, {expression} AS v FROM reviews r "

@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from quail.api.compile import compile_with_datafusion
+from quail.api.compile import SQLDialect, compile_with_datafusion
 from quail.api.query import Query, QueryLike
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, TableProvider
 from quail.common.tokens import GigatokenEncoder
 from quail.extensions import ExtensionRegistry
-from quail.frontend.prompts import PromptBinder
-from quail.frontend.sql import SQLDialect
 from quail.planner.plan import EngineConfig, Refusal, RefusalError, resolve_model
 from quail.specs.files import resolve_model_path
 
@@ -129,7 +127,7 @@ class Session:
             return RemoteQuery(self, text, order=order,
                                dialect=SQLDialect(dialect).value)
         logical = compile_with_datafusion(
-            text, self.catalog, PromptBinder(model=self.model),
+            text, self.catalog, self.model,
             dialect=SQLDialect(dialect).value)
         return Query(self, logical, order=order)
 

@@ -6,10 +6,10 @@ import pyarrow.parquet as pq
 import pytest
 from helpers.fakes import letter_tokens
 from helpers.oracle import Oracle, finish
+from helpers.planning import compile_sql
 
 import quail
 from quail.catalog import Catalog, DocumentProvider
-from quail.frontend.sql import compile_sql
 from quail.logical import ColumnRef, RegularPredicate, SemanticJoin
 from quail.physical import (
     AiClassify,

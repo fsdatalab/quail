@@ -47,9 +47,11 @@ Filter: AI.IF('Review {0} discusses product {1}') AND AI.IF('This review is nega
 ```
 
 The `Filter` holds every ON and WHERE part as written, the ON parts first.
-`quail.frontend.sql.bind_relation` returns this tree for one SELECT.
+DataFusion parses and binds the SELECT, and the Rust binder
+(`crates/quail-datafusion/src/bind.rs`) reads it into this tree.
 
-`place_relation` in `quail/logical/naive.py` then places each part:
+`place_relation` in `crates/quail-planner/src/builder.rs` then places
+each part:
 
 - A test of source columns of one table goes into that table's `Scan`.
 - An AI.IF or AI.SCORE test of one table goes into its `SemanticFilter`.

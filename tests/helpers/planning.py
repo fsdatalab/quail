@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+from quail.api.compile import compile_with_datafusion
 from quail.builtins import built_in_registry
 from quail.common.tokens import TokenLengths
 from quail.planner import native
@@ -59,3 +60,8 @@ def token_lengths(document_tokens) -> dict:
     return {alias: lengths if isinstance(lengths, TokenLengths)
             else TokenLengths(lengths)
             for alias, lengths in document_tokens.items()}
+
+
+def compile_sql(sql, catalog, dialect="snowflake", model=QWEN3_4B_FP8):
+    """Compile SQL against a catalog, as a session on the model does."""
+    return compile_with_datafusion(sql, catalog, model, dialect=dialect)
