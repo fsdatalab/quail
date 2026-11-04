@@ -198,7 +198,8 @@ fn parse_expr(text: &str) -> Result<ast::Expr> {
 /// alias, as Quail's front end expects.
 pub fn region_sql(region: &ModelRegion) -> Result<String> {
     let dialect = QuailDialect;
-    let mut statement = Unparser::new(&dialect).plan_to_sql(&region.plan)?;
+    let raised = crate::lower::raise_ai_calls(region.plan.clone())?;
+    let mut statement = Unparser::new(&dialect).plan_to_sql(&raised)?;
     restore_select_aliases(&mut statement);
     remove_select_calls(&mut statement, EXTRACT_SPAN);
     let count_all = parse_expr("COUNT(*)")?;

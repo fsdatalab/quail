@@ -6,7 +6,7 @@ use datafusion::common::{Result, exec_err};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use quail_datafusion::{ModelRegion, RegionRunner, session_context, sql};
+use quail_datafusion::{ModelRegion, RegionRunner, raise_ai_calls, session_context, sql};
 
 /// A runner for planning tests, which never run a region. Execution is
 /// covered end to end in `tests/api/test_session_context.py`.
@@ -155,6 +155,81 @@ async fn an_exists_gate_stays_a_subquery_inside_the_region() -> Result<()> {
             .contains("EXISTS"),
         "{}",
         found[0].plan.display_indent()
+    );
+    Ok(())
+}
+
+fn lines(plan: &LogicalPlan) -> Vec<String> {
+    plan.display_indent()
+        .to_string()
+        .lines()
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_where_clause_keeps_its_plain_terms_and_asks_the_model_above_them() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('Kind? {0}', r.body)) \
+        AND r.id <> 'r9' AND AI.IF(PROMPT('Long? {0}', r.body))";
+    let (region,) = <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?))
+        .map(|[region]| (region,))
+        .unwrap();
+    let lowered = lines(&region.plan);
+    assert!(
+        lowered[1].starts_with("SemanticFilter: ai_filter"),
+        "{lowered:?}"
+    );
+    assert!(
+        lowered[2].starts_with("Filter: r.id != Utf8(\"r9\")"),
+        "{lowered:?}"
+    );
+    // raised, the terms are back in written order
+    let raised = lines(&raise_ai_calls(region.plan.clone())?);
+    let terms: Vec<&str> = raised[1].split(" AND ").collect();
+    assert!(terms[0].contains("Kind?") && terms[1].contains("r9") && terms[2].contains("Long?"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_ai_join_asks_the_model_above_datafusions_join() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT r.id, a.aspect FROM reviews r JOIN aspects a \
+        ON AI.IF(PROMPT('Does {0} discuss {1}?', r.body, a.aspect))";
+    let [region] =
+        <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
+    let lowered = lines(&region.plan);
+    assert!(
+        lowered[1].starts_with("SemanticJoin: full ai_filter"),
+        "{lowered:?}"
+    );
+    // the ON has no other term, so DataFusion's join pairs every row
+    assert_eq!(lowered[2], "Cross Join:", "{lowered:?}");
+    let raised = lines(&raise_ai_calls(region.plan.clone())?);
+    assert!(
+        raised[1].starts_with("Inner Join:  Filter: ai_filter"),
+        "{raised:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_classification_is_a_column_the_projection_reads() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT r.id, AI.CLASSIFY(PROMPT('Tone of {0}?', r.body), ['good', 'bad']) \
+        AS tone FROM reviews r";
+    let [region] =
+        <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
+    let lowered = lines(&region.plan);
+    assert_eq!(lowered[0], "Projection: r.id, tone");
+    assert!(
+        lowered[1].starts_with("SemanticColumn: tone = ai_classify"),
+        "{lowered:?}"
+    );
+    let raised = lines(&raise_ai_calls(region.plan.clone())?);
+    assert!(
+        raised[0].contains("ai_classify") && raised[0].ends_with("AS tone"),
+        "{raised:?}"
     );
     Ok(())
 }

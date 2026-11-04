@@ -53,6 +53,9 @@ pub fn bind_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
+    let raised = crate::lower::raise_ai_calls(plan.clone())
+        .map_err(|error| CompileError::new(error.to_string()))?;
+    let plan = &raised;
     let (place, project, stages) = bind_with_stages(plan, turn, layout)?;
     let built = build_select(place, &project)?;
     if has_subqueries(plan) {

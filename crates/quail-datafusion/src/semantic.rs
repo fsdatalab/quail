@@ -19,106 +19,61 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Field;
 use datafusion::common::{DFSchema, DFSchemaRef, Result, plan_err};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 
-/// A selectivity hint, compared and hashed by its bits.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct Selectivity(pub f64);
-
-impl Eq for Selectivity {}
-
-impl Hash for Selectivity {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
-    }
-}
-
-/// One model call: what it asks of each row, and the columns it reads.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
-pub struct AiCall {
-    /// "boolean" for `AI.IF`, or "score", "label", "extract", "map", "features".
-    pub kind: String,
-    /// The prompt text, with `{0}`, `{1}`, ... where the arguments go.
-    pub template: String,
-    /// The columns the prompt reads, in placeholder order.
-    pub args: Vec<Expr>,
-    /// The call's other options as JSON: labels, descriptions,
-    /// probabilities, the question, pooling, and the answer token limit.
-    pub options: String,
-}
-
-impl AiCall {
-    fn fmt_call(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let args: Vec<String> = self.args.iter().map(ToString::to_string).collect();
-        write!(
-            f,
-            "{}({:?}, [{}])",
-            self.kind,
-            self.template,
-            args.join(", ")
-        )
-    }
-}
-
-/// One predicate of a [`SemanticFilter`] or a [`SemanticJoin`]: a call,
-/// and for a score, the comparison it passes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
-pub struct Asked {
-    pub call: AiCall,
-    /// For `AI.SCORE`, the comparison and the constant, such as (">", 0.5).
-    pub comparison: Option<(String, String)>,
-    /// The fraction of rows the query says pass, if it says.
-    pub selectivity: Option<Selectivity>,
-}
-
-impl Asked {
-    fn fmt_asked(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.call.fmt_call(f)?;
-        if let Some((comparison, value)) = &self.comparison {
-            write!(f, " {comparison} {value}")?;
-        }
-        if let Some(selectivity) = self.selectivity {
-            write!(f, " (selectivity {})", selectivity.0)?;
-        }
-        Ok(())
-    }
-}
-
 /// The rows of one table that pass every predicate, as `SemanticFilter`.
+///
+/// Each predicate is the query's own term: an `AI.IF` call, or a
+/// comparison of an `AI.SCORE` call, either inside a `HINT`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticFilter {
     pub input: Arc<LogicalPlan>,
-    pub predicates: Vec<Asked>,
+    pub predicates: Vec<Expr>,
     /// The columns a DISTINCT keys the table's rows by: the executor
     /// stops a key at its first survivor.
     pub stop_key: Vec<String>,
+    /// Where each predicate was written among the terms of its WHERE.
+    pub written: Written,
+}
+
+/// Where a node's terms were written among the terms of one WHERE or
+/// ON: each term's position, and how many terms it has.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct Written {
+    pub positions: Vec<usize>,
+    pub num_terms: usize,
 }
 
 /// The pairs of the input join that pass one predicate, as `SemanticJoin`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticJoin {
     pub input: Arc<LogicalPlan>,
-    pub predicate: Asked,
+    /// The query's own term: an `AI.IF` call over a row of each table.
+    pub predicate: Expr,
     /// "full", or a gate: "semi" or "anti".
     pub semantics: String,
-    /// The table a query asked to anchor the join on, if any.
-    pub anchor: Option<String>,
+    /// Whether the query wrote the predicate in the join's ON rather
+    /// than in WHERE.
+    pub in_on: bool,
+    /// Where the predicate was written among the terms of its WHERE or ON.
+    pub written: Written,
 }
 
 /// Each row of the input with the answer of one call, as `SemanticColumn`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticColumn {
     pub input: Arc<LogicalPlan>,
-    pub call: AiCall,
+    /// The query's own call: `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP`, or
+    /// `AI.SAE_FEATURES`.
+    pub call: Expr,
     /// The answer column's name.
     pub name: String,
-    /// The columns the call adds, the answer first: a classification's
-    /// probabilities, an extraction's spans.
+    /// The columns the call adds, the answer first.
     pub fields: Vec<Field>,
     schema: DFSchemaRef,
 }
@@ -131,7 +86,7 @@ impl SemanticColumn {
     /// A field's name is already a column of the input.
     pub fn try_new(
         input: Arc<LogicalPlan>,
-        call: AiCall,
+        call: Expr,
         name: String,
         fields: Vec<Field>,
     ) -> Result<Self> {
@@ -152,11 +107,11 @@ impl SemanticColumn {
 }
 
 /// The positions in `input` of the output columns asked for and of the
-/// columns the calls read: what a node needs of its input.
+/// columns the terms read: what a node needs of its input.
 fn needed_columns(
     input: &LogicalPlan,
     output_columns: &[usize],
-    calls: &[&AiCall],
+    terms: &[&Expr],
 ) -> Option<Vec<usize>> {
     let width = input.schema().fields().len();
     let mut needed: Vec<usize> = output_columns
@@ -164,16 +119,22 @@ fn needed_columns(
         .copied()
         .filter(|index| *index < width)
         .collect();
-    for call in calls {
-        for arg in &call.args {
-            for column in arg.column_refs() {
-                needed.push(input.schema().index_of_column(column).ok()?);
-            }
+    for term in terms {
+        for column in term.column_refs() {
+            needed.push(input.schema().index_of_column(column).ok()?);
         }
     }
     needed.sort_unstable();
     needed.dedup();
     Some(needed)
+}
+
+fn joined(terms: &[Expr]) -> String {
+    terms
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 macro_rules! ordered_by_name {
@@ -204,10 +165,7 @@ impl UserDefinedLogicalNodeCore for SemanticFilter {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        self.predicates
-            .iter()
-            .flat_map(|predicate| predicate.call.args.iter().cloned())
-            .collect()
+        self.predicates.clone()
     }
 
     // a test of the table's own columns runs before the model's
@@ -216,22 +174,12 @@ impl UserDefinedLogicalNodeCore for SemanticFilter {
     }
 
     fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
-        let calls: Vec<&AiCall> = self
-            .predicates
-            .iter()
-            .map(|predicate| &predicate.call)
-            .collect();
-        Some(vec![needed_columns(&self.input, output_columns, &calls)?])
+        let terms: Vec<&Expr> = self.predicates.iter().collect();
+        Some(vec![needed_columns(&self.input, output_columns, &terms)?])
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SemanticFilter: ")?;
-        for (index, predicate) in self.predicates.iter().enumerate() {
-            if index > 0 {
-                write!(f, ", ")?;
-            }
-            predicate.fmt_asked(f)?;
-        }
+        write!(f, "SemanticFilter: {}", joined(&self.predicates))?;
         if !self.stop_key.is_empty() {
             write!(f, " stop key [{}]", self.stop_key.join(", "))?;
         }
@@ -243,17 +191,11 @@ impl UserDefinedLogicalNodeCore for SemanticFilter {
         exprs: Vec<Expr>,
         mut inputs: Vec<LogicalPlan>,
     ) -> Result<Self> {
-        let mut exprs = exprs.into_iter();
-        let mut predicates = self.predicates.clone();
-        for predicate in &mut predicates {
-            for arg in &mut predicate.call.args {
-                *arg = exprs.next().expect("an expression per argument");
-            }
-        }
         Ok(Self {
             input: Arc::new(inputs.remove(0)),
-            predicates,
+            predicates: exprs,
             stop_key: self.stop_key.clone(),
+            written: self.written.clone(),
         })
     }
 }
@@ -272,7 +214,7 @@ impl UserDefinedLogicalNodeCore for SemanticJoin {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        self.predicate.call.args.clone()
+        vec![self.predicate.clone()]
     }
 
     fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
@@ -283,17 +225,12 @@ impl UserDefinedLogicalNodeCore for SemanticJoin {
         Some(vec![needed_columns(
             &self.input,
             output_columns,
-            &[&self.predicate.call],
+            &[&self.predicate],
         )?])
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SemanticJoin: {} ", self.semantics)?;
-        self.predicate.fmt_asked(f)?;
-        if let Some(anchor) = &self.anchor {
-            write!(f, " anchor {anchor}")?;
-        }
-        Ok(())
+        write!(f, "SemanticJoin: {} {}", self.semantics, self.predicate)
     }
 
     fn with_exprs_and_inputs(
@@ -301,13 +238,12 @@ impl UserDefinedLogicalNodeCore for SemanticJoin {
         exprs: Vec<Expr>,
         mut inputs: Vec<LogicalPlan>,
     ) -> Result<Self> {
-        let mut predicate = self.predicate.clone();
-        predicate.call.args = exprs;
         Ok(Self {
             input: Arc::new(inputs.remove(0)),
-            predicate,
+            predicate: exprs.into_iter().next().expect("the join's predicate"),
             semantics: self.semantics.clone(),
-            anchor: self.anchor.clone(),
+            in_on: self.in_on,
+            written: self.written.clone(),
         })
     }
 }
@@ -326,7 +262,7 @@ impl UserDefinedLogicalNodeCore for SemanticColumn {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        self.call.args.clone()
+        vec![self.call.clone()]
     }
 
     // a test of the answer waits for it; any other runs first
@@ -351,8 +287,7 @@ impl UserDefinedLogicalNodeCore for SemanticColumn {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SemanticColumn: {} = ", self.name)?;
-        self.call.fmt_call(f)
+        write!(f, "SemanticColumn: {} = {}", self.name, self.call)
     }
 
     fn with_exprs_and_inputs(
@@ -360,11 +295,9 @@ impl UserDefinedLogicalNodeCore for SemanticColumn {
         exprs: Vec<Expr>,
         mut inputs: Vec<LogicalPlan>,
     ) -> Result<Self> {
-        let mut call = self.call.clone();
-        call.args = exprs;
         Self::try_new(
             Arc::new(inputs.remove(0)),
-            call,
+            exprs.into_iter().next().expect("the column's call"),
             self.name.clone(),
             self.fields.clone(),
         )
@@ -399,17 +332,14 @@ mod tests {
         .unwrap()
     }
 
-    fn ask(template: &str) -> Asked {
-        Asked {
-            call: AiCall {
-                kind: "boolean".into(),
-                template: template.into(),
-                args: vec![col("r.body")],
-                options: "{}".into(),
-            },
-            comparison: None,
-            selectivity: Some(Selectivity(0.4)),
-        }
+    fn ask(template: &str) -> Expr {
+        Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+            crate::functions::quail_functions()
+                .into_iter()
+                .find(|function| function.name() == "ai_filter")
+                .unwrap(),
+            vec![lit(template), col("r.body")],
+        ))
     }
 
     #[test]
@@ -418,9 +348,10 @@ mod tests {
             input: Arc::new(reviews()),
             predicates: vec![ask("Is {0} kind?")],
             stop_key: Vec::new(),
+            written: Written::default(),
         };
         assert_eq!(node.schema(), reviews().schema());
-        assert_eq!(node.expressions(), vec![col("r.body")]);
+        assert_eq!(node.expressions(), vec![ask("Is {0} kind?")]);
         let rebuilt = node
             .with_exprs_and_inputs(node.expressions(), vec![reviews()])
             .unwrap();
@@ -429,12 +360,7 @@ mod tests {
 
     #[test]
     fn a_semantic_column_adds_its_answer_after_the_input_columns() {
-        let call = AiCall {
-            kind: "label".into(),
-            template: "Tone of {0}?".into(),
-            args: vec![col("r.body")],
-            options: r#"{"labels": ["good", "bad"]}"#.into(),
-        };
+        let call = ask("Tone of {0}?");
         let node = SemanticColumn::try_new(
             Arc::new(reviews()),
             call,
@@ -458,6 +384,7 @@ mod tests {
                 input: Arc::new(reviews()),
                 predicates: vec![ask("Is {0} kind?")],
                 stop_key: Vec::new(),
+                written: Written::default(),
             }),
         });
         let plan = LogicalPlanBuilder::from(filter)

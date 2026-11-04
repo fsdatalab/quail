@@ -21,6 +21,7 @@ mod claim;
 mod exec;
 mod functions;
 mod joins;
+mod lower;
 mod region;
 pub mod semantic;
 mod unnest;
@@ -46,11 +47,13 @@ pub use functions::{
     AI_FUNCTION_NAMES, arrow_functions, brace_structs, is_ai_call, normalize_ai_calls,
     quail_functions,
 };
+pub use lower::{LowerAiCalls, lower_ai_calls, raise_ai_calls};
 pub use region::ModelRegion;
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 pub use unparse::region_sql;
 
-/// Return DataFusion's analyzer rules with `ClaimModelRegions` first.
+/// Return DataFusion's analyzer rules with `ClaimModelRegions` and
+/// `LowerAiCalls` first.
 ///
 /// A region then holds the plan as DataFusion's SQL planner bound it,
 /// before type coercion adds casts: its conditions as written, its ON
@@ -58,7 +61,7 @@ pub use unparse::region_sql;
 /// front end binds them.
 pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> =
-        vec![Arc::new(ClaimModelRegions::new())];
+        vec![Arc::new(ClaimModelRegions::new()), Arc::new(LowerAiCalls)];
     rules.extend(Analyzer::new().rules);
     rules
 }
