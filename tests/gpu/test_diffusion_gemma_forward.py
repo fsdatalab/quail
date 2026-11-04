@@ -215,7 +215,7 @@ def quail(prompts, stock_layers):
 def test_answers_agree_with_stock_vllm(stock_layers, quail):
     from gigatoken import Tokenizer
 
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.prompts import true_false_ids
     from quail.specs import MODELS
 
     quail_layers, model = quail

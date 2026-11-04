@@ -17,7 +17,7 @@ import numpy as np
 
 from quail.backends.quail.executor.model_loading import answer_weights
 from quail.common.budgets import READOUT_BLOCK_ROWS
-from quail.planner.prompt_lowering import true_false_ids
+from quail.common.prompts import true_false_ids
 
 
 class AnswerRows:

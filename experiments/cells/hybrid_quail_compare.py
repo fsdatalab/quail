@@ -87,7 +87,7 @@ def reference(model: str) -> dict:
     from transformers import AutoTokenizer
 
     from quail.baselines.vllm import VLLMEngine
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.prompts import true_false_ids
     from quail.specs import MODELS
 
     spec = MODELS[model]

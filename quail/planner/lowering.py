@@ -2,8 +2,8 @@
 
 from dataclasses import replace
 
+from quail.common.prompts import PROMPT_LAYOUTS
 from quail.logical import has_score
-from quail.logical.prompts import PROMPT_LAYOUTS
 from quail.physical import AiFilter, AiJoin
 from quail.planner.graph.builder import build_physical_plan
 from quail.planner.optimizer.candidates import PhysicalCandidate

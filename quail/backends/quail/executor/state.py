@@ -18,7 +18,7 @@ if TYPE_CHECKING:
         AsyncScores,
     )
     from quail.backends.quail.executor.tokenizer import ModelTokenizer
-    from quail.cost.decode import DecodeCost
+    from quail.common.decode import DecodeCost
     from quail.specs.base import ModelSpec
 
 

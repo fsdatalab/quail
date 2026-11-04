@@ -11,9 +11,9 @@ later prompt over the same rows encodes only its question tokens.
 from dataclasses import dataclass, replace
 
 from quail.common.budgets import parallel_copies
+from quail.common.sol import speed_of_light
 from quail.common.work import Work
 from quail.cost.score import score_work
-from quail.cost.sol import speed_of_light
 from quail.specs import DeviceSpec, ModelSpec
 
 

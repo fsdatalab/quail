@@ -12,8 +12,8 @@ import math
 from dataclasses import dataclass
 
 from quail.common import work as _workload
-from quail.cost.dense_decoder_cost import dense_decoder_components
-from quail.cost.roofline import ComponentLatency, component_latencies
+from quail.common.dense_decoder_cost import dense_decoder_components
+from quail.common.roofline import ComponentLatency, component_latencies
 from quail.specs import DeviceSpec, ModelSpec
 
 

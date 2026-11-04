@@ -3,9 +3,9 @@
 from dataclasses import dataclass, field
 
 from quail.common.budgets import checkpoint_pages, execution_pages
+from quail.common.dense_decoder_cost import attention_pair_flops
+from quail.common.sol import compute_seconds
 from quail.common.work import Work, triangle
-from quail.cost.dense_decoder_cost import attention_pair_flops
-from quail.cost.sol import compute_seconds
 
 
 @dataclass(frozen=True)

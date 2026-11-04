@@ -2,6 +2,7 @@
 
 from quail.common import budgets
 from quail.common.expressions import aliased_call
+from quail.common.prompts import PROMPT_LAYOUTS, prompt_aliases
 from quail.cost.joins import PricedJoin, longest_join_input
 from quail.logical import (
     Alias,
@@ -11,7 +12,6 @@ from quail.logical import (
     has_score,
     is_score,
 )
-from quail.logical.prompts import PROMPT_LAYOUTS, prompt_aliases
 from quail.physical import AiClassify, AiJoin
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import Refusal

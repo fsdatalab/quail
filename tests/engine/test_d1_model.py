@@ -78,7 +78,7 @@ def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
 
 
 def test_an_option_whose_code_is_two_tokens_takes_d1s_first_free_fallback():
-    from quail.logical.prompts import option_codes
+    from quail.common.prompts import option_codes
     from quail.planner.prompt_lowering import option_aliases
 
     def tokenizer(text):

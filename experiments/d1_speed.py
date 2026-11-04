@@ -155,8 +155,8 @@ def _quail_state():
 
 def _classify_spec(encoder):
     """IMDB-11's classification as a ClassifySpec over the reviews."""
+    from quail.common.prompts import bind_classify_prompt
     from quail.logical import ColumnRef
-    from quail.logical.prompts import bind_classify_prompt
     from quail.physical import ClassifySpec
     from quail.planner.prompt_lowering import lower_prompt, option_spellings
     from quail.specs import D1_2B_BF16
@@ -182,8 +182,8 @@ def _mixed_questions(encoder, choice):
     """A yes/no, IMDB-11's choice, and a read, as one pass group's SetQuestions."""
     from quail.backends.quail.executor.pass_groups import SetQuestion, node_question
     from quail.backends.quail.lowering import set_question_parts
+    from quail.common.prompts import PROMPT_LAYOUTS, bind_extract_prompt
     from quail.logical import ColumnRef, bind_prompt
-    from quail.logical.prompts import PROMPT_LAYOUTS, bind_extract_prompt
     from quail.physical import AiClassify
     from quail.planner.prompt_lowering import lower_prompt, read_slot_offsets
     from quail.specs import D1_2B_BF16

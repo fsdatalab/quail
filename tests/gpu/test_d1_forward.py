@@ -311,8 +311,8 @@ def _join_passes():
     from quail.backends.quail.executor.operators.join import join_pass_stage
     from quail.backends.quail.executor.stages import question_ends
     from quail.backends.quail.lowering import set_join_parts
+    from quail.common.prompts import bind_join_prompt
     from quail.logical import ColumnRef
-    from quail.logical.prompts import bind_join_prompt
     from quail.planner.prompt_lowering import lower_prompt
 
     spec, ids = _spec(), _tokenizer()
@@ -514,8 +514,8 @@ def quail_joins(join_passes, answer_ids, loaded):
 def _choice_questions():
     """The CHOICES as SetQuestions, and each one's lone prompt."""
     from quail.backends.quail.executor.pass_groups import SetQuestion
+    from quail.common.prompts import bind_classify_prompt
     from quail.logical import ColumnRef
-    from quail.logical.prompts import bind_classify_prompt
     from quail.planner.prompt_lowering import lower_prompt, option_spellings
 
     spec, ids = _spec(), _tokenizer()
@@ -537,8 +537,8 @@ def _choice_questions():
 def _read_questions():
     """The READS as SetQuestions."""
     from quail.backends.quail.executor.pass_groups import SetQuestion
+    from quail.common.prompts import PROMPT_LAYOUTS, bind_extract_prompt
     from quail.logical import ColumnRef
-    from quail.logical.prompts import PROMPT_LAYOUTS, bind_extract_prompt
     from quail.planner.prompt_lowering import lower_prompt, read_slot_offsets
 
     spec, ids = _spec(), _tokenizer()

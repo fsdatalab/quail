@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from quail.common.expressions import Prompt
-from quail.logical.prompts import (
+from quail.common.prompts import (
     bind_classify_prompt,
     bind_extract_prompt,
     bind_join_prompt,

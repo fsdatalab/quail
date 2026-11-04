@@ -924,3 +924,48 @@ def render_qwen3_reranker_input(query: str, document: str) -> str:
         f'<Query>: {query}\n<Document>: {document}<|im_end|>\n'
         '<|im_start|>assistant\n<think>\n\n</think>\n\n'
     )
+
+
+def true_false_ids(tokenizer):
+    """Return TRUE and FALSE token sets from a Hugging Face tokenizer."""
+    true, false = true_false_token_ids(
+        lambda text: tokenizer(text, add_special_tokens=False)["input_ids"])
+    return set(true), set(false)
+
+
+def true_false_token_ids(tokenizer) -> tuple[list[int], list[int]]:
+    """The sorted token ids that mean TRUE and FALSE.
+
+    Args:
+        tokenizer: Callable text -> token ids, without special tokens.
+    """
+    true, false = set(), set()
+    for words, ids in (
+            (("TRUE", " TRUE", "True", " True"), true),
+            (("FALSE", " FALSE", "False", " False"), false)):
+        for word in words:
+            tokens = tokenizer(word)
+            if tokens:
+                ids.add(tokens[0])
+    return sorted(true), sorted(false)
+
+
+def answer_row_offsets(layout: str, tokenizer,
+                       turn_suffix: str = "") -> tuple[int, ...]:
+    """Per row a readout reads, its distance before the prompt's last row.
+
+    Args:
+        layout: A PROMPT_LAYOUTS name.
+        tokenizer: Callable text -> token ids, without special tokens.
+        turn_suffix: The model's chat-turn text after the prompt.
+
+    Returns:
+        The offsets of the answer_rows segment ends, in order, then 0.
+    """
+    spec = PROMPT_LAYOUTS[layout]
+    segments = list(spec.answer_segments)
+    if not segments:
+        return (0,)
+    segments[-1] += turn_suffix
+    lengths = [len(tokenizer(segment)) for segment in segments]
+    return tuple(sum(lengths[i + 1:]) for i in spec.answer_rows) + (0,)

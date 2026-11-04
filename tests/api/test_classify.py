@@ -11,13 +11,13 @@ from helpers.oracle import Oracle, finish
 
 import quail
 from quail.catalog import DocumentProvider
+from quail.common.prompts import join_anchor_note
 from quail.logical import (
     Alias,
     ColumnRef,
     CompileError,
     RegularPredicate,
 )
-from quail.logical.prompts import join_anchor_note
 from quail.physical import (
     AiClassify,
     AiJoin,

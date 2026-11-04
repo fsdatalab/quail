@@ -16,6 +16,7 @@ from quail.baselines.nodes import (
 )
 from quail.common import budgets
 from quail.common.expressions import aliased_call, packed_columns
+from quail.common.prompts import answer_row_offsets
 from quail.logical import (
     SPAN_SUFFIX,
     RegularPredicate,
@@ -46,7 +47,7 @@ from quail.planner import (
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.optimizer.candidates import PhysicalCandidate
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
-from quail.planner.prompt_lowering import answer_ids, answer_row_offsets
+from quail.planner.prompt_lowering import answer_ids
 from quail.planner.search.join_order import search_joins
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import extraction_refusal, has_extract, has_label

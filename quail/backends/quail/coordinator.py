@@ -6,11 +6,11 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from quail.common.shards import balanced_shards
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows, rows_of
 from quail.physical import ValueType
-from quail.planner import balanced_shards
 
 
 def keyed_shards(groups, document_tokens, gpus: int) -> tuple:

@@ -2,6 +2,7 @@
 
 from quail.api import Query, RefusalError, Session, SessionContext
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
+from quail.common.prompts import true_false_ids
 from quail.execution.result import QueryResult
 from quail.extensions import ExtensionRegistry
 from quail.frontend.sql import SQLDialect
@@ -14,7 +15,7 @@ from quail.logical import (
 )
 from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
 from quail.planner.plan import EngineConfig
-from quail.planner.prompt_lowering import lower_prompt, true_false_ids
+from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.sol.estimate import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.remote.client import QueryRun
 from quail.remote.records import QueryFailedError, QueryStatus

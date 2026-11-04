@@ -85,9 +85,8 @@ python-preference = "only-managed"
 testpaths = ["tests"]
 pythonpath = ["tests"]
 
-# Phase 2 of the DataFusion plan moves planning to Rust, so the executor
-# must not import planning code. ignore_imports lists the imports still
-# to remove; delete an entry when its import goes, and add none.
+# Planning moves to Rust, so the executor imports no planning code.
+# Code both use lives in quail.common.
 [[tool.importlinter.contracts]]
 name = "The executor imports no planning code"
 type = "forbidden"
@@ -98,16 +97,9 @@ forbidden_modules = [
     "quail.logical",
     "quail.catalog",
 ]
-allow_indirect_imports = true
-ignore_imports = [
-    "quail.backends.quail.coordinator -> quail.planner",
-    "quail.backends.quail.distributed -> quail.planner",
-    "quail.backends.quail.executor.model_loading -> quail.planner.prompt_lowering",
-    "quail.backends.quail.executor.readout -> quail.planner.prompt_lowering",
-    "quail.backends.quail.executor.runtime -> quail.cost.decode",
-    "quail.backends.quail.retention -> quail.cost.retention",
-    "quail.backends.quail.worker -> quail.planner.prompt_lowering",
-]
+allow_indirect_imports = false
+# QueryResult.explain() prints the logical plan beside the executed one
+ignore_imports = ["quail.execution.result -> quail.explain"]
 
 [tool.ruff]
 line-length = 88

@@ -3,6 +3,11 @@
 from dataclasses import dataclass
 
 from quail.common import budgets
+from quail.common.prompts import (
+    PROMPT_LAYOUTS,
+    prompt_aliases,
+    score_query_template,
+)
 from quail.common.work import Work
 from quail.cost.score import ScoreCost
 from quail.logical import (
@@ -10,11 +15,6 @@ from quail.logical import (
     RegularPredicate,
     bind_prompt,
     effective_selectivity,
-)
-from quail.logical.prompts import (
-    PROMPT_LAYOUTS,
-    prompt_aliases,
-    score_query_template,
 )
 from quail.physical import (
     AiScore,

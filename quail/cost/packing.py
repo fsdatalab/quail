@@ -10,8 +10,8 @@ keeps the cheapest.
 
 from math import inf
 
+from quail.common.sol import unrounded_seconds
 from quail.common.work import packed
-from quail.cost.sol import unrounded_seconds
 from quail.specs import DeviceSpec, ModelSpec
 
 

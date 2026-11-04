@@ -177,7 +177,7 @@ def quail(model: str, backend: str = "flashinfer",
     from quail.backends.quail.executor.stages import filter_stages, run_stages
     from quail.backends.quail.worker import checkpoint_arena_args
     from quail.common import budgets
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.prompts import true_false_ids
     from quail.specs import H100_SXM, MODELS
 
     spec = MODELS[model]
@@ -241,7 +241,7 @@ def vllm(model: str) -> dict:
     from transformers import AutoTokenizer
 
     from quail.baselines.vllm import VLLMEngine
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.prompts import true_false_ids
     from quail.specs import MODELS
 
     spec = MODELS[model]

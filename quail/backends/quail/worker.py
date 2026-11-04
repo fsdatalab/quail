@@ -220,7 +220,7 @@ def decision_offsets(spec, path) -> tuple[int, ...]:
     """The rows a decision readout reads, as distances before the last row."""
     from gigatoken import Tokenizer
 
-    from quail.planner.prompt_lowering import answer_row_offsets
+    from quail.common.prompts import answer_row_offsets
 
     tokenizer = Tokenizer(path).as_hf()
     offsets = answer_row_offsets(

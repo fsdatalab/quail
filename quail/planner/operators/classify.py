@@ -5,9 +5,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from quail.common import budgets
+from quail.common.prompts import PROMPT_LAYOUTS
+from quail.common.sol import unrounded_seconds
 from quail.common.work import Work, packed
 from quail.cost import classify as classify_cost
-from quail.cost.sol import unrounded_seconds
 from quail.labels import (
     DECISION_SCORING,
     DECODE_SCORING,
@@ -18,7 +19,6 @@ from quail.labels import (
     word_starts,
 )
 from quail.logical import LabelWork, effective_selectivity
-from quail.logical.prompts import PROMPT_LAYOUTS
 from quail.physical import (
     AiClassify,
     ClassifySpec,

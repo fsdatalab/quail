@@ -4,7 +4,7 @@
 from helpers.fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena, PageArena
-from quail.cost.retention import RetentionPolicy
+from quail.common.retention import RetentionPolicy
 
 
 def checkpoint_arena(slots, pages=16):

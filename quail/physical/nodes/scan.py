@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
-from quail.logical import And, Not, Or, RegularPredicate
+from quail.common.expressions import And, Not, Or, RegularPredicate
 
 from ..base import (
     ExecutionLocation,

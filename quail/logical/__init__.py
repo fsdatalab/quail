@@ -37,6 +37,23 @@ from quail.common.expressions import (
     normalize,
     packed_columns,
 )
+from quail.common.prompts import (
+    ANSWER_CUE,
+    SHARED_PRE,
+    bind_classify_prompt,
+    bind_join_prompt,
+    bind_prompt,
+    canonicalize_template,
+    filter_question_text,
+    join_label,
+    label_text,
+    render_join_frame,
+    render_join_prompt_text,
+    render_join_question,
+    shared_preamble,
+    split_frame,
+    without_bos,
+)
 from quail.logical.builder import (
     JoinSpec,
     LogicalPlanBuilder,
@@ -72,23 +89,6 @@ from quail.logical.plan import (
     join_conditions,
     join_outer_input,
     oriented_join_conditions,
-)
-from quail.logical.prompts import (
-    ANSWER_CUE,
-    SHARED_PRE,
-    bind_classify_prompt,
-    bind_join_prompt,
-    bind_prompt,
-    canonicalize_template,
-    filter_question_text,
-    join_label,
-    label_text,
-    render_join_frame,
-    render_join_prompt_text,
-    render_join_question,
-    shared_preamble,
-    split_frame,
-    without_bos,
 )
 
 __all__ = [

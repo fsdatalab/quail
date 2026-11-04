@@ -243,7 +243,7 @@ def load_model(model_name: str, revision: str | None = None, *,
     if answer_token_ids is None:
         from gigatoken import Tokenizer
 
-        from quail.planner.prompt_lowering import true_false_ids
+        from quail.common.prompts import true_false_ids
 
         tokenizer = Tokenizer(model_path).as_hf()
         true_ids, false_ids = true_false_ids(tokenizer)

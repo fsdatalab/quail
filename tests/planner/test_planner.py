@@ -9,11 +9,11 @@ import pytest
 from helpers.planning import _optimize, _plan, node_kinds
 
 from quail.catalog import Catalog, DocumentProvider
+from quail.common.sol import speed_of_light
 from quail.common.tokens import TokenLengths
 from quail.common.work import ask, scan, stream
 from quail.cost.filters import filter_cost
 from quail.cost.joins import PricedJoin
-from quail.cost.sol import speed_of_light
 from quail.explain import explain
 from quail.frontend.sql import compile_sql
 from quail.logical import ModelCall, SemanticJoin
@@ -90,7 +90,7 @@ def _five_filter_plan(catalog, sels):
 
 
 def test_gpu_copies_and_memory_refusals(catalog):
-    from quail.planner.graph.shards import contiguous_shards
+    from quail.common.shards import contiguous_shards
 
     assert contiguous_shards([2, 2, 2], 2) == (((0, 1), (1, 3)), [2, 4])
     assert contiguous_shards([1, 0, 9], 2) == (((0, 1), (1, 3)), [1, 9])
@@ -268,7 +268,7 @@ def mask_pairs(prefix, suffix, window):
 
 
 def test_work_matches_attention_masks_and_component_costs():
-    from quail.cost.dense_decoder_cost import (
+    from quail.common.dense_decoder_cost import (
         dense_decoder_components,
         dense_params,
     )

@@ -11,14 +11,14 @@ from typing import Callable, Mapping
 
 import pyarrow as pa
 
+from quail.common.decode import DecodeCost
 from quail.common.expressions import column_name, evaluate_expression
 from quail.common.pairs import RowGroups, pair_table, partner_map
+from quail.common.sol import SpeedOfLight, speed_of_light
 from quail.common.work import Work, ask, scan
-from quail.cost.decode import DecodeCost
 from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sae_features import sae_encoded_tokens
-from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.logical import (
     RegularPredicate,
     condition_columns,

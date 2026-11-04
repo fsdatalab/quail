@@ -4,7 +4,7 @@ The estimate sums each document's work (quail/common/work.py) over every
 document, weights each label's greedy decode rounds by its share of
 the labels, and prices the total with the component roofline at ideal
 packing: forward passes are tokens divided by the chunk, as in
-quail/cost/sol.py. KV capacity, the two-pass round delay, and admission
+quail/common/sol.py. KV capacity, the two-pass round delay, and admission
 order do not enter, just as they do not enter filter and join costs.
 """
 
@@ -14,8 +14,8 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from quail.common.budgets import parallel_copies
+from quail.common.sol import unrounded_seconds
 from quail.common.work import Work, ask, decode, stream
-from quail.cost.sol import unrounded_seconds
 from quail.labels import (
     DECODE_SCORING,
     LETTERS_SCORING,

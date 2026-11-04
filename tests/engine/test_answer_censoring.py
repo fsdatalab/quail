@@ -8,9 +8,9 @@ import pytest
 from quail.common.answers import (
     remaining_tokens,
 )
+from quail.common.decode import DecodeCost
+from quail.common.dense_decoder_cost import dense_decoder_components
 from quail.common.work import Work
-from quail.cost.decode import DecodeCost
-from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.specs import DEVICES, MODELS
 
 

@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from quail.common.work import Work
-from quail.cost.dense_decoder_cost import (
+from quail.common.dense_decoder_cost import (
     dense_decoder_components,
     mlp_params,
 )
-from quail.cost.sol import speed_of_light
+from quail.common.sol import speed_of_light
+from quail.common.work import Work
 from quail.specs import (
     H100_SXM,
     MODELS,
@@ -51,7 +51,7 @@ def test_spec_matches_the_config(name):
         assert spec.experts_active == config["num_experts_per_tok"]
         assert spec.expert_intermediate == config["moe_intermediate_size"]
         from quail.common import budgets
-        from quail.cost.dense_decoder_cost import mlp_weight_params
+        from quail.common.dense_decoder_cost import mlp_weight_params
         from quail.specs import H100_SXM
 
         assert mlp_params(spec) == 40 * 3 * 2048 * (512 + 8 * 512)

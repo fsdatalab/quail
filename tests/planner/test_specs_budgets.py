@@ -83,7 +83,7 @@ def test_device_memory_budgets():
 def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
         tokens, expected_slots):
     from quail.backends.quail.worker import checkpoint_arena_args
-    from quail.cost.retention import retention_pages
+    from quail.common.retention import retention_pages
 
     model = replace(QWEN3_5_4B_BF16, w_mem_bytes=8_411_152_384)
     chunk = budgets.chunk_budget(model, H100_SXM)

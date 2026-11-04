@@ -20,8 +20,8 @@ import numpy as np
 
 from quail.common.budgets import parallel_copies
 from quail.common.draft_policy import DraftPolicy, draft_lengths
+from quail.common.sol import unrounded_seconds
 from quail.common.work import Work, ask, scan, triangle
-from quail.cost.sol import unrounded_seconds
 
 # a larger table is priced from this many evenly spaced documents, so
 # planning time stays flat as the table grows

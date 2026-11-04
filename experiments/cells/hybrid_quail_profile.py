@@ -65,7 +65,7 @@ def profile(model: str, backend: str = "triton") -> dict:
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import checkpoint_arena_args
     from quail.common import budgets
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.prompts import true_false_ids
     from quail.specs import H100_SXM, MODELS
 
     spec = MODELS[model]

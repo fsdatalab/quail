@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 from itertools import groupby
 
 from quail.common.expressions import aliased_call
+from quail.common.shards import contiguous_shards
 from quail.logical import (
     PROBABILITIES_SUFFIX,
     SPAN_SUFFIX,
@@ -32,7 +33,6 @@ from quail.physical.base import input_ports
 from quail.planner.graph import retention
 from quail.planner.graph.pricing import PlanPricer
 from quail.planner.graph.results import result_nodes
-from quail.planner.graph.shards import contiguous_shards
 from quail.planner.operators.classify import emit_joined_classify
 from quail.planner.operators.columns import column_planner
 from quail.planner.operators.filter import emit_filter

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
-from quail.logical.prompts import map_instruction
+from quail.common.prompts import map_instruction
 from quail_b.substrait import (
     Aggregate,
     Classify,

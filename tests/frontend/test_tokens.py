@@ -5,6 +5,7 @@ import pickle
 import pyarrow as pa
 import pytest
 
+from quail.common.shards import contiguous_shards
 from quail.common.tokens import (
     ArrowTokenDocuments,
     TokenLengths,
@@ -13,7 +14,6 @@ from quail.common.tokens import (
     decode_token_documents,
     prefix_tree,
 )
-from quail.planner.graph.shards import contiguous_shards
 from quail.planner.statistics.tables import AliasStats, summarize_alias
 
 

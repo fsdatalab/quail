@@ -13,8 +13,8 @@ them back.
 from __future__ import annotations
 
 from quail.common import budgets
+from quail.common.prompts import PROMPT_LAYOUTS
 from quail.cost.packing import choose_pass_groups
-from quail.logical.prompts import PROMPT_LAYOUTS
 from quail.physical import (
     AiClassify,
     AiExtract,

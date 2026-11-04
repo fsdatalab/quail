@@ -51,7 +51,7 @@ def check(model: str) -> dict:
 
     from quail.backends.quail.executor.attention import Engine
     from quail.backends.quail.executor.model import load_model
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.prompts import true_false_ids
     from quail.specs import MODELS
 
     spec = MODELS[model]
