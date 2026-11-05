@@ -197,3 +197,28 @@ def test_a_failed_boot_releases_the_gpu_and_the_next_boot_loads_again(
     again, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
     assert again is gpu and boot["kind"] == "warm"
     assert calls == [("release", ["gpu"])]
+
+
+def test_a_query_runs_with_earlier_objects_frozen_and_unfreezes_them(
+        booted, monkeypatch):
+    import gc
+
+    registry = built_in_registry()
+    backend = registry.backend("quail")
+    runtime_state = {}
+    seen = []
+
+    def run(gpu, *a, **k):
+        seen.append(gc.get_freeze_count())
+        if len(seen) == 2:
+            raise RuntimeError("query failed")
+        return {"_outputs": {}, "wall_s": 1.0, **memory_report(gpu)}
+
+    monkeypatch.setattr(worker, "execute_single", run)
+    worker.execute_quail_payload(PAYLOAD, registry, object(), backend,
+                                 runtime_state)
+    assert seen[0] > gc.get_freeze_count() == 0
+    with pytest.raises(RuntimeError, match="query failed"):
+        worker.execute_quail_payload(PAYLOAD, registry, object(), backend,
+                                     runtime_state)
+    assert gc.get_freeze_count() == 0

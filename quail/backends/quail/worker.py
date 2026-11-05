@@ -5,8 +5,9 @@ per GPU, each with its own CUDA context and arena.
 """
 
 import atexit
+import gc
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -375,6 +376,22 @@ def release_quail_request(state: dict) -> None:
     release_models(state)
 
 
+@contextmanager
+def heap_frozen():
+    """Freeze the objects tracked before a query while the query runs.
+
+    The garbage collector skips frozen objects; objects made during the
+    query are collected as usual. When the query ends, even if it
+    raised, every frozen object is unfrozen and collectable again,
+    including any a library froze earlier.
+    """
+    gc.freeze()
+    try:
+        yield
+    finally:
+        gc.unfreeze()
+
+
 def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     """Execute one Quail payload on the worker's own GPU."""
     gpu_context = _single_gpu_context(registry, payload["physical_plan"])
@@ -391,7 +408,8 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
             payload.get("arena_pages"))
     say("running the query")
 
-    report = execute_single(gpu, payload, registry, graph)
+    with heap_frozen():
+        report = execute_single(gpu, payload, registry, graph)
     outputs = report.pop("_outputs")
     report.pop("filters", None)
     report.pop("joins", None)
