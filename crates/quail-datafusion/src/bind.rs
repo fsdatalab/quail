@@ -41,10 +41,9 @@ const DEFAULT_MAP_ANSWER_TOKENS: i64 = 256;
 
 /// Bind a model region into Quail's logical plan.
 ///
-/// The region's bound plan decides whether the query is refused; the
-/// plan comes from the region after DataFusion's rules when the binder
-/// reads it, and from the bound plan otherwise. `turn` and `layout` are
-/// the session model's chat-turn text and prompt layout.
+/// The binder reads the region's plan as DataFusion's SQL planner bound
+/// it. `turn` and `layout` are the session model's chat-turn text and
+/// prompt layout.
 ///
 /// # Errors
 ///
@@ -55,14 +54,7 @@ pub fn bind_model_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
-    let bound = bind_region(&region.plan, turn, layout)?;
-    let Some(optimized) = &region.optimized else {
-        return Ok(bound);
-    };
-    match crate::as_bound(optimized) {
-        Ok(read) => Ok(bind_region(&read, turn, layout).unwrap_or(bound)),
-        Err(_) => Ok(bound),
-    }
+    bind_region(&region.bound, turn, layout)
 }
 
 /// Bind a model region's plan, as DataFusion's SQL planner bound it,
@@ -76,9 +68,6 @@ pub fn bind_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
-    let raised = crate::lower::raise_ai_calls(plan.clone())
-        .map_err(|error| CompileError::new(error.to_string()))?;
-    let plan = &raised;
     let (place, project, stages) = bind_with_stages(plan, turn, layout)?;
     let built = build_select(place, &project)?;
     if has_subqueries(plan) {

@@ -15,8 +15,7 @@
 //!   [`SemanticColumn`] below it adds.
 //!
 //! An EXISTS subquery, a label test, and a call anywhere else stay as
-//! DataFusion bound them. [`raise_ai_calls`] writes the nodes back as
-//! the terms and calls DataFusion bound, for the binder.
+//! DataFusion bound them.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -50,8 +49,9 @@ impl AnalyzerRule for LowerAiCalls {
                 if let LogicalPlan::Extension(extension) = &node
                     && let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>()
                 {
-                    let lowered = lower_ai_calls(region.plan.clone())?;
-                    return Ok(Transformed::yes(extension_node(ModelRegion::new(lowered))));
+                    let mut region = region.clone();
+                    region.plan = lower_ai_calls(region.bound.clone())?;
+                    return Ok(Transformed::yes(extension_node(region)));
                 }
                 Ok(Transformed::no(node))
             })?
@@ -269,210 +269,6 @@ pub fn lower_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
             LogicalPlan::Join(join) => lower_join(join),
             LogicalPlan::Projection(projection) => lower_projection(projection),
             _ => Ok(Transformed::no(node)),
-        })?
-        .data)
-}
-
-fn as_node<T: 'static>(plan: &LogicalPlan) -> Option<&T> {
-    match plan {
-        LogicalPlan::Extension(extension) => extension.node.as_any().downcast_ref::<T>(),
-        _ => None,
-    }
-}
-
-/// The terms of one WHERE or ON that a chain of nodes holds, by written
-/// position; the plan below the chain; how many terms the WHERE or ON
-/// has; and whether it is an ON.
-struct Chain<'a> {
-    asked: Vec<(usize, Expr)>,
-    below: &'a LogicalPlan,
-    num_terms: usize,
-    in_on: bool,
-}
-
-/// The chain of `SemanticFilter` and `SemanticJoin` nodes split from
-/// one WHERE or ON that starts at `node`, if one does.
-fn chain(node: &LogicalPlan) -> Option<Chain<'_>> {
-    let mut terms = Vec::new();
-    let mut below = node;
-    let mut shape: Option<(usize, bool)> = None;
-    loop {
-        let (written, in_on, next, found): (&Written, bool, &LogicalPlan, Vec<Expr>) =
-            if let Some(filter) = as_node::<SemanticFilter>(below) {
-                (
-                    &filter.written,
-                    false,
-                    &filter.input,
-                    filter.predicates.clone(),
-                )
-            } else if let Some(join) = as_node::<SemanticJoin>(below) {
-                (
-                    &join.written,
-                    join.in_on,
-                    &join.input,
-                    vec![join.predicate.clone()],
-                )
-            } else {
-                break;
-            };
-        match shape {
-            None => shape = Some((written.num_terms, in_on)),
-            Some(seen) if seen == (written.num_terms, in_on) => {}
-            Some(_) => break,
-        }
-        terms.extend(written.positions.iter().copied().zip(found));
-        below = next;
-    }
-    let (num_terms, in_on) = shape?;
-    Some(Chain {
-        asked: terms,
-        below,
-        num_terms,
-        in_on,
-    })
-}
-
-/// The terms of one WHERE or ON in written order: the asked terms at
-/// their positions and the others, in order, in the gaps.
-fn written_order(mut asked: Vec<(usize, Expr)>, rest: Vec<Expr>) -> Vec<Expr> {
-    asked.sort_by_key(|(position, _)| *position);
-    let mut rest = rest.into_iter();
-    let mut asked = asked.into_iter().peekable();
-    let mut terms = Vec::new();
-    while let Some(next) = asked.peek() {
-        if next.0 == terms.len() {
-            terms.push(asked.next().expect("a term").1);
-        } else if let Some(term) = rest.next() {
-            terms.push(term);
-        } else {
-            terms.push(asked.next().expect("a term").1);
-        }
-    }
-    terms.extend(rest);
-    terms
-}
-
-fn raise_chain(node: &LogicalPlan) -> Result<Option<LogicalPlan>> {
-    let Some(Chain {
-        asked,
-        below,
-        num_terms,
-        in_on,
-    }) = chain(node)
-    else {
-        return Ok(None);
-    };
-    let split_rest = asked.len() < num_terms;
-    if in_on {
-        let LogicalPlan::Join(join) = below else {
-            return Ok(None);
-        };
-        let rest = join
-            .filter
-            .iter()
-            .flat_map(|filter| split_conjunction(filter).into_iter().cloned())
-            .collect();
-        let mut raised = join.clone();
-        raised.filter = conjunction(written_order(asked, rest));
-        return Ok(Some(LogicalPlan::Join(raised)));
-    }
-    let (input, rest) = match below {
-        LogicalPlan::Filter(filter) if split_rest => (
-            Arc::clone(&filter.input),
-            split_conjunction(&filter.predicate)
-                .into_iter()
-                .cloned()
-                .collect(),
-        ),
-        other => (Arc::new(other.clone()), Vec::new()),
-    };
-    let predicate = conjunction(written_order(asked, rest)).expect("a term");
-    Ok(Some(LogicalPlan::Filter(Filter::try_new(
-        predicate, input,
-    )?)))
-}
-
-/// Whether a chain of filters and `SemanticColumn` nodes holds a
-/// `SemanticColumn`.
-fn reaches_column(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Filter(filter) => reaches_column(&filter.input),
-        other => as_node::<SemanticColumn>(other).is_some(),
-    }
-}
-
-fn raise_projection(projection: &Projection) -> Result<Transformed<LogicalPlan>> {
-    // a filter DataFusion pushed between the SELECT list and the
-    // columns may test them
-    let mut input = projection.input.as_ref();
-    let mut filters: Vec<Expr> = Vec::new();
-    let mut calls: Vec<(String, Expr)> = Vec::new();
-    loop {
-        if let Some(column) = as_node::<SemanticColumn>(input) {
-            calls.push((column.name.clone(), column.call.clone()));
-            input = column.input.as_ref();
-        } else if let LogicalPlan::Filter(filter) = input
-            && reaches_column(&filter.input)
-        {
-            filters.push(filter.predicate.clone());
-            input = filter.input.as_ref();
-        } else {
-            break;
-        }
-    }
-    if calls.is_empty() {
-        return Ok(Transformed::no(LogicalPlan::Projection(projection.clone())));
-    }
-    let call_of = |column: &Column| {
-        calls
-            .iter()
-            .find(|(name, _)| column.relation.is_none() && *name == column.name)
-            .map(|(_, call)| call.clone())
-    };
-    let exprs = projection
-        .expr
-        .iter()
-        .map(|expr| match expr {
-            Expr::Column(column) => call_of(column)
-                .map(|call| call.alias(column.name.clone()))
-                .unwrap_or_else(|| expr.clone()),
-            _ => expr.clone(),
-        })
-        .collect();
-    let mut below = input.clone();
-    for predicate in filters.into_iter().rev() {
-        let predicate = predicate
-            .transform_up(|expr| match &expr {
-                Expr::Column(column) => match call_of(column) {
-                    Some(call) => Ok(Transformed::yes(call)),
-                    None => Ok(Transformed::no(expr)),
-                },
-                _ => Ok(Transformed::no(expr)),
-            })?
-            .data;
-        below = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(below))?);
-    }
-    Ok(Transformed::yes(LogicalPlan::Projection(
-        Projection::try_new(exprs, Arc::new(below))?,
-    )))
-}
-
-/// Write Quail's plan nodes back as the terms and calls DataFusion
-/// bound, the inverse of [`lower_ai_calls`].
-///
-/// # Errors
-///
-/// A rewritten operator's schema does not fit DataFusion's rules.
-pub fn raise_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
-    Ok(plan
-        .transform_down(|node| {
-            if let Some(raised) = raise_chain(&node)? {
-                return Ok(Transformed::yes(raised));
-            }
-            match &node {
-                LogicalPlan::Projection(projection) => raise_projection(projection),
-                _ => Ok(Transformed::no(node)),
-            }
         })?
         .data)
 }

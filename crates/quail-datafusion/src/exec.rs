@@ -47,7 +47,7 @@ pub struct ModelRegionExec {
 impl ModelRegionExec {
     /// Create the operator for a region, run by the given runner.
     pub fn new(region: ModelRegion, runner: Arc<dyn RegionRunner>) -> Self {
-        let schema = Arc::clone(region.plan.schema().inner());
+        let schema = Arc::clone(region.bound.schema().inner());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),

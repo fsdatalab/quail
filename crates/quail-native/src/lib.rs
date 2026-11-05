@@ -72,7 +72,7 @@ impl RegionRunner for PythonRunner {
                 .and_then(|answer| answer.extract::<Vec<u8>>(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let schema = region.plan.schema();
+        let schema = region.bound.schema();
         let names = quail_column_names(schema);
         read_ipc(&bytes)?
             .into_iter()

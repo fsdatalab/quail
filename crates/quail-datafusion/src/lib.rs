@@ -22,7 +22,7 @@ mod exec;
 mod functions;
 mod joins;
 mod lower;
-mod read;
+mod optimize;
 mod region;
 pub mod semantic;
 mod unnest;
@@ -48,8 +48,8 @@ pub use functions::{
     AI_FUNCTION_NAMES, arrow_functions, brace_structs, is_ai_call, normalize_ai_calls,
     quail_functions,
 };
-pub use lower::{LowerAiCalls, lower_ai_calls, raise_ai_calls};
-pub use read::{OptimizeModelRegions, as_bound, optimize_region};
+pub use lower::{LowerAiCalls, lower_ai_calls};
+pub use optimize::{OptimizeModelRegions, optimize_region};
 pub use region::ModelRegion;
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 pub use unparse::region_sql;

@@ -6,7 +6,7 @@ use datafusion::common::{Result, exec_err};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use quail_datafusion::{ModelRegion, RegionRunner, raise_ai_calls, session_context, sql};
+use quail_datafusion::{ModelRegion, RegionRunner, session_context, sql};
 
 /// A runner for planning tests, which never run a region. Execution is
 /// covered end to end in `tests/api/test_session_context.py`.
@@ -168,26 +168,25 @@ fn lines(plan: &LogicalPlan) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_where_clause_keeps_its_plain_terms_and_asks_the_model_above_them() -> Result<()> {
+async fn a_where_clause_asks_the_model_above_its_plain_terms() -> Result<()> {
     let context = context()?;
     let query = "SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('Kind? {0}', r.body)) \
         AND r.id <> 'r9' AND AI.IF(PROMPT('Long? {0}', r.body))";
-    let (region,) = <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?))
-        .map(|[region]| (region,))
+    let [region] =
+        <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
+    let plan = lines(&region.plan);
+    assert!(plan[1].starts_with("SemanticFilter: ai_filter"), "{plan:?}");
+    assert!(
+        plan[1].contains("Kind?") && plan[1].contains("Long?"),
+        "{plan:?}"
+    );
+    // DataFusion pushed the plain test below the model's and the alias
+    let alias = plan
+        .iter()
+        .position(|line| line == "SubqueryAlias: r")
         .unwrap();
-    let lowered = lines(&region.plan);
-    assert!(
-        lowered[1].starts_with("SemanticFilter: ai_filter"),
-        "{lowered:?}"
-    );
-    assert!(
-        lowered[2].starts_with("Filter: r.id != Utf8(\"r9\")"),
-        "{lowered:?}"
-    );
-    // raised, the terms are back in written order
-    let raised = lines(&raise_ai_calls(region.plan.clone())?);
-    let terms: Vec<&str> = raised[1].split(" AND ").collect();
-    assert!(terms[0].contains("Kind?") && terms[1].contains("r9") && terms[2].contains("Long?"));
+    let test = plan.iter().position(|line| line.contains("r9")).unwrap();
+    assert!(test > alias, "{plan:?}");
     Ok(())
 }
 
@@ -198,18 +197,13 @@ async fn an_ai_join_asks_the_model_above_datafusions_join() -> Result<()> {
         ON AI.IF(PROMPT('Does {0} discuss {1}?', r.body, a.aspect))";
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
-    let lowered = lines(&region.plan);
+    let plan = lines(&region.plan);
     assert!(
-        lowered[1].starts_with("SemanticJoin: full ai_filter"),
-        "{lowered:?}"
+        plan[1].starts_with("SemanticJoin: full ai_filter"),
+        "{plan:?}"
     );
     // the ON has no other term, so DataFusion's join pairs every row
-    assert_eq!(lowered[2], "Cross Join:", "{lowered:?}");
-    let raised = lines(&raise_ai_calls(region.plan.clone())?);
-    assert!(
-        raised[1].starts_with("Inner Join:  Filter: ai_filter"),
-        "{raised:?}"
-    );
+    assert_eq!(plan[2], "Cross Join:", "{plan:?}");
     Ok(())
 }
 
@@ -220,44 +214,13 @@ async fn a_classification_is_a_column_the_projection_reads() -> Result<()> {
         AS tone FROM reviews r";
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
-    let lowered = lines(&region.plan);
-    assert_eq!(lowered[0], "Projection: r.id, tone");
+    let plan = lines(&region.plan);
+    assert_eq!(plan[0], "Projection: r.id, tone");
     assert!(
-        lowered[1].starts_with("SemanticColumn: tone = ai_classify"),
-        "{lowered:?}"
+        plan[1].starts_with("SemanticColumn: tone = ai_classify"),
+        "{plan:?}"
     );
-    let raised = lines(&raise_ai_calls(region.plan.clone())?);
-    assert!(
-        raised[0].contains("ai_classify") && raised[0].ends_with("AS tone"),
-        "{raised:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_region_reads_back_after_datafusion_pushes_its_filters_into_the_scan() -> Result<()> {
-    let context = context()?;
-    let query = "SELECT r.id FROM reviews r \
-        WHERE AI.IF(PROMPT('Kind? {0}', r.body)) AND r.id <> 'r9'";
-    let [region] =
-        <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
-    let optimized = lines(region.optimized.as_ref().expect("an optimized region"));
-    // DataFusion moved the plain test below the alias
-    assert!(
-        !optimized
-            .iter()
-            .any(|line| line.starts_with("Filter: r.id")),
-        "{optimized:?}"
-    );
-    let read = lines(&quail_datafusion::as_bound(
-        region.optimized.as_ref().unwrap(),
-    )?);
-    assert_eq!(read[0], "Projection: r.id");
-    assert!(read[1].starts_with("Filter: "), "{read:?}");
-    assert!(
-        read[1].contains("Kind?") && read[1].contains("r.id != Utf8(\"r9\")"),
-        "{read:?}"
-    );
-    assert_eq!(read[2], "SubqueryAlias: r");
+    // the binder reads the SELECT list as DataFusion bound it
+    assert!(lines(&region.bound)[0].contains("AS tone"));
     Ok(())
 }

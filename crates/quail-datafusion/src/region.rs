@@ -12,19 +12,24 @@ use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 /// Quail's planner reads `plan` when the node is planned physically.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 pub struct ModelRegion {
-    /// The claimed operators, from the region's root down to its scans.
+    /// The claimed operators as DataFusion's SQL planner bound them, from
+    /// the region's root down to its scans.
+    pub bound: LogicalPlan,
+    /// The same operators with the AI calls as Quail's plan nodes
+    /// ([`crate::LowerAiCalls`]) and, once [`crate::OptimizeModelRegions`]
+    /// has run, after DataFusion's rules inside the region.
     pub plan: LogicalPlan,
-    /// `plan` after DataFusion's rules inside the region, once
-    /// [`crate::OptimizeModelRegions`] has run.
-    pub optimized: Option<LogicalPlan>,
+    /// Whether `plan` has been through DataFusion's rules.
+    pub optimized: bool,
 }
 
 impl ModelRegion {
     /// Create a model region over the given operators.
     pub fn new(plan: LogicalPlan) -> Self {
         Self {
+            bound: plan.clone(),
             plan,
-            optimized: None,
+            optimized: false,
         }
     }
 }
@@ -39,7 +44,7 @@ impl UserDefinedLogicalNodeCore for ModelRegion {
     }
 
     fn schema(&self) -> &DFSchemaRef {
-        self.plan.schema()
+        self.bound.schema()
     }
 
     fn expressions(&self) -> Vec<Expr> {
