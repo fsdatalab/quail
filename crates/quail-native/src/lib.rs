@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use std::ffi::CStr;
 
-use datafusion::arrow::array::{ArrayRef, RecordBatch, RecordBatchIterator};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use datafusion::arrow::array::{ArrayRef, RecordBatch, RecordBatchIterator};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
