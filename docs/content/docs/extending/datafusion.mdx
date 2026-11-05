@@ -1,0 +1,73 @@
+---
+title: Quail in a DataFusion Session
+---
+
+`QuailExtension` adds Quail to a DataFusion `SessionState` you already
+have. Your session's `sql()` then runs the AI functions. DataFusion
+runs every other operator, and Quail runs the model.
+
+```rust
+use std::sync::Arc;
+
+use datafusion::execution::SessionStateBuilder;
+use datafusion::prelude::SessionContext;
+use quail_datafusion::QuailExtension;
+
+let state = SessionStateBuilder::new().with_default_features().build();
+let state = QuailExtension::new(runner).register(state)?;
+let context = SessionContext::new_with_state(state);
+context.register_table("reviews", reviews)?;
+let negative = context
+    .sql("SELECT COUNT(*) AS n FROM reviews r \
+          WHERE AI.IF(PROMPT('Is this review negative? {0}', r.body))")
+    .await?
+    .collect()
+    .await?;
+```
+
+`runner` implements `RegionRunner`: it takes one model region, the rows
+of the region's inputs, and an optional row limit, and returns the
+region's rows as a stream of Arrow batches. Quail's Python package
+passes a runner that plans and runs the region on the GPU.
+
+## What `register` adds
+
+- The AI functions, under their internal names (`ai_filter`,
+  `ai_classify`, ...) and their SQL names (`AI.IF`, `AI.CLASSIFY`,
+  `ai.classify`, ...).
+- Two analyzer rules, ahead of the session's own:
+  `claim_model_regions` gathers the AI calls and the operators that
+  change what the model is asked into `ModelRegion` nodes, and
+  `lower_ai_calls` turns each call into a `SemanticFilter`,
+  `SemanticJoin`, or `SemanticColumn` node.
+- One optimizer rule, `optimize_model_regions`, that runs Quail's
+  region rules inside each region. `with_region_rules` picks them by
+  name.
+- A query planner that plans each `ModelRegion` as a
+  `ModelRegionExec`.
+
+A session with its own `QueryPlanner` calls `register_rules` instead,
+and adds `extension_planner()` to the extension planners its planner
+passes to `DefaultPhysicalPlanner`.
+
+## What needs Quail's `sql()`
+
+`quail_datafusion::sql` rewrites the parsed statement before
+DataFusion plans it. A plain `context.sql` skips these rewrites, so the
+following need Quail's `sql()`:
+
+- A `WHERE` that reads a `SELECT` alias of an AI call, such as `WHERE
+  sentiment = 'negative'`.
+- The `<name>_span` column next to each `AI.EXTRACT(...) AS <name>`.
+- `UNNEST` of a list an AI function returns.
+- Named arguments, such as `pooling => 'last'`.
+- BigQuery `{'key': value}` struct literals.
+
+## From datafusion-python
+
+datafusion-python can load UDFs and table providers from another
+library, and a query planner through `datafusion-ffi`'s
+`FFI_QueryPlanner`. It cannot load analyzer or logical optimizer
+rules. A Quail planner for datafusion-python would claim and lower the
+regions inside its query planner, after the session's own optimizer
+has run. That is not built yet.

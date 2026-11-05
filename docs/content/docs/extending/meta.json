@@ -6,6 +6,7 @@
     "models",
     "operators",
     "rules",
+    "datafusion",
     "observers"
   ],
   "defaultOpen": false
