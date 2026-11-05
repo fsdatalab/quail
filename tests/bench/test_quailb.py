@@ -11,7 +11,6 @@ from bench.quailb import (
     register_tables,
 )
 from quail.api.config import EngineConfig
-from quail.logical import Aggregate
 from quail.physical.plan import Refusal
 from quail_b.queries import QUERY_ORDER
 
@@ -68,8 +67,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                            for s in selectivities), case
                 plan = query.plan()
                 root = query.logical.result
-                sorts = bool(root.order or root.distinct or root.offset
-                             or isinstance(root.input, Aggregate))
+                sorts = bool(root.order or root.distinct or root.offset)
                 assert sorts <= (qid in relational), case
                 # SGLang's engine returns no decoded answer text
                 if backend == "pipelined_sglang" and operators.classifies:
@@ -81,12 +79,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                     assert plan.constraint == "extract_needs_quail_backend", case
                     continue
                 if backend != "quail" and sorts:
-                    # a request backend sorts returned rows on the
-                    # coordinator, but runs no GROUP BY or window
-                    if isinstance(root.input, Aggregate):
-                        assert isinstance(plan, Refusal), case
-                        assert plan.constraint == "sort_needs_quail_backend", case
-                        continue
+                    # a request backend sorts returned rows on the coordinator
                     if isinstance(plan, Refusal):
                         # refused for its AI functions, not its sort
                         assert plan.constraint != "sort_needs_quail_backend", case

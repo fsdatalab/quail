@@ -12,10 +12,9 @@ mod tagged;
 mod topology;
 
 pub use expressions::{
-    AggregateCall, Alias, Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct,
-    FilterPredicate, GetField, HavingTest, Literal, ModelCall, Not, Projected, Prompt,
-    RegularPredicate, ScalarFunction, SortExpression, SortKey, TaggedModelCall, ValueExpression,
-    WindowCall,
+    Alias, Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct, FilterPredicate,
+    GetField, Literal, ModelCall, Not, Projected, Prompt, RegularPredicate, ScalarFunction,
+    SortExpression, SortKey, TaggedModelCall, ValueExpression,
 };
 pub use graph::{InputPort, NestedGraph, PhysicalGraph, PlanEnvelope, PortRef, ValueType};
 pub use nodes::*;

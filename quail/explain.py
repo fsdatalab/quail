@@ -11,7 +11,6 @@ from quail.logical import (
     effective_selectivity,
 )
 from quail.physical import (
-    Aggregate,
     AiClassify,
     AiExtract,
     AiFilter,
@@ -28,7 +27,6 @@ from quail.physical import (
     Scan,
     Sort,
     Unnest,
-    Window,
 )
 from quail.physical.pipelines import build_pipelines
 from quail.physical.plan import Refusal
@@ -84,11 +82,7 @@ def logical_tree(logical):
                 depth += 1
             visit(node.input, depth)
             return
-        if isinstance(node, logical_nodes.Aggregate):
-            title = f"Aggregate: {node.specification()}"
-        elif isinstance(node, logical_nodes.Window):
-            title = "Window: " + "; ".join(str(call) for call in node.calls)
-        elif isinstance(node, logical_nodes.Project):
+        if isinstance(node, logical_nodes.Project):
             fields = node.explain_fields()
             title = f"Project: {', '.join(fields['columns'])}"
             details = [f"{name} = struct({', '.join(members)})"
@@ -295,7 +289,7 @@ def _estimated_rows(graph):
             value = inputs[0] if inputs else None
             if value is not None:
                 value *= effective_selectivity(node.selectivity)
-        elif isinstance(node, (Project, Limit, Sort, Window, Exchange)) \
+        elif isinstance(node, (Project, Limit, Sort, Exchange)) \
                 and len(inputs) == 1:
             value = inputs[0]
             if isinstance(node, Limit) and value is not None:
@@ -304,9 +298,6 @@ def _estimated_rows(graph):
                 value = max(value - node.offset, 0)
                 if node.fetch is not None:
                     value = min(value, node.fetch)
-        elif isinstance(node, Aggregate):
-            # the group count is not estimated
-            value = None
         # Join nodes expose both document ids and predicate answers.
         # Their evaluated tuple counts are not output row estimates.
         for output in node.outputs:
@@ -379,20 +370,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 for name, members in node.structs)
         elif isinstance(node, Limit):
             title += f": {node.count:,}"
-        elif isinstance(node, Aggregate):
-            title += ": " + ", ".join(node.columns)
-            if node.keys:
-                details.append("group by " + ", ".join(node.keys))
-            details.append(", ".join(
-                f"{name} = {function}({argument or '*'})"
-                for name, function, argument in node.aggregates))
-            if node.having:
-                details.append("having " + " and ".join(
-                    f"{name} {comparison} {value!r}"
-                    for name, comparison, value in node.having))
-        elif isinstance(node, Window):
-            title += ": " + ", ".join(node.columns)
-            details.extend(str(call) for call in node.calls)
         elif isinstance(node, Unnest):
             title += ": " + ", ".join(node.lists)
             details.append("returns " + ", ".join(node.columns))

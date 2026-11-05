@@ -39,7 +39,6 @@ LOGICAL_RULES = (
 )
 # the built-in physical rules, in the order they apply
 PHYSICAL_RULES = (
-    "should_eliminate_window_sort", "should_push_down_limit_through_window",
     "should_push_down_limit", "choose_classify_implementation", "pack_set_passes",
     "join_document_ends", "should_retain_kv", "should_share_prefixes",
     "choose_attention_path", "should_deduplicate",

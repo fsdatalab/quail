@@ -275,11 +275,6 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                 Some(with_input(&input, below)?)
             }
         }
-        // a window keeps its input's rows and columns
-        LogicalPlan::Window(window) if !moving.pairs && !reads_added(&input) => {
-            let below = with_input(&node, window.input.as_ref().clone())?;
-            Some(with_input(&input, below)?)
-        }
         LogicalPlan::Projection(projection)
             if projection
                 .expr

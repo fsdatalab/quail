@@ -8,9 +8,7 @@ use quail_cost::budgets::{cheaper_attention_path, chunk_budget, tree_attention_a
 use quail_cost::packing::choose_pass_groups;
 use quail_cost::retention::coefficients;
 use quail_cost::statistics::AliasStats;
-use quail_physical::{
-    PhysicalNode, PortRef, SortAttributes, build_pipelines, input_ports, port, topological_nodes,
-};
+use quail_physical::{PhysicalNode, PortRef, build_pipelines, topological_nodes};
 use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;
@@ -24,9 +22,7 @@ use crate::pricing::{expected_documents, head_tokens, pass_question_tokens, set_
 use crate::retention::schedule;
 
 /// The built-in physical rules, in the order the registry applies them.
-pub const PHYSICAL_RULES: [&str; 10] = [
-    "should_eliminate_window_sort",
-    "should_push_down_limit_through_window",
+pub const PHYSICAL_RULES: [&str; 8] = [
     "should_push_down_limit",
     "choose_classify_implementation",
     "pack_set_passes",
@@ -45,10 +41,6 @@ pub struct Graph {
 }
 
 impl Graph {
-    fn node(&self, node_id: &str) -> Option<&PhysicalNode> {
-        self.nodes.iter().find(|node| node.id() == node_id)
-    }
-
     fn with_nodes(&self, nodes: Vec<PhysicalNode>) -> Graph {
         Graph {
             nodes,
@@ -66,15 +58,10 @@ fn should_push_down_limit(graph: &Graph, settings: &mut Map<String, Value>) -> R
     });
     let pipelines = build_pipelines(&graph.nodes, &[]);
     let blocked = pipelines.members.len() > 1
-        || graph.nodes.iter().any(|node| {
-            matches!(
-                node,
-                PhysicalNode::Sort(_)
-                    | PhysicalNode::Aggregate(_)
-                    | PhysicalNode::Window(_)
-                    | PhysicalNode::AiJoin(_)
-            )
-        });
+        || graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node, PhysicalNode::Sort(_) | PhysicalNode::AiJoin(_)));
     match limit {
         Some(count) if !blocked => {
             settings.insert("filter_limit".into(), Value::from(count));
@@ -84,120 +71,6 @@ fn should_push_down_limit(graph: &Graph, settings: &mut Map<String, Value>) -> R
         }
     }
     Ok(None)
-}
-
-fn window_sort_keys(call: &quail_physical::WindowCall) -> Vec<(String, bool, bool)> {
-    call.partition
-        .iter()
-        .map(|name| (name.clone(), false, false))
-        .chain(call.order.iter().cloned())
-        .collect()
-}
-
-fn should_eliminate_window_sort(graph: &Graph) -> Rewrite {
-    let Some(PhysicalNode::Sort(sort)) = graph
-        .nodes
-        .iter()
-        .find(|node| matches!(node, PhysicalNode::Sort(_)))
-    else {
-        return Ok(None);
-    };
-    let attributes = &sort.attributes;
-    if attributes.distinct || attributes.offset != 0 || attributes.fetch.is_some() {
-        return Ok(None);
-    }
-    let below = &sort.inputs[0].source;
-    let Some(PhysicalNode::Window(window)) = graph.node(&below.node_id) else {
-        return Ok(None);
-    };
-    if graph.root.node_id != sort.id
-        || attributes.keys != window_sort_keys(window.attributes.calls.last().expect("a call"))
-    {
-        return Ok(None);
-    }
-    let window_id = window.id.clone();
-    let nodes = graph
-        .nodes
-        .iter()
-        .filter(|node| node.id() != sort.id)
-        .map(|node| match node {
-            PhysicalNode::Window(found) if found.id == window_id => {
-                let mut found = found.clone();
-                found.attributes.columns = attributes.columns.clone();
-                PhysicalNode::Window(found)
-            }
-            other => other.clone(),
-        })
-        .collect();
-    Ok(Some(Graph {
-        nodes,
-        root: below.clone(),
-    }))
-}
-
-fn should_push_down_limit_through_window(graph: &Graph) -> Rewrite {
-    let Some(PhysicalNode::Limit(limit)) = graph
-        .nodes
-        .iter()
-        .find(|node| matches!(node, PhysicalNode::Limit(_)))
-    else {
-        return Ok(None);
-    };
-    if graph.root.node_id != limit.id {
-        return Ok(None);
-    }
-    let Some(PhysicalNode::Window(window)) = graph.node(&limit.inputs[0].source.node_id) else {
-        return Ok(None);
-    };
-    let calls = &window.attributes.calls;
-    let mut orders: Vec<&Vec<(String, bool, bool)>> = Vec::new();
-    for call in calls {
-        if !orders.contains(&&call.order) {
-            orders.push(&call.order);
-        }
-    }
-    if orders.len() != 1
-        || orders[0].is_empty()
-        || calls
-            .iter()
-            .any(|call| !call.partition.is_empty() || call.function == "lead")
-    {
-        return Ok(None);
-    }
-    let below = window.inputs[0].source.clone();
-    let columns = graph
-        .node(&below.node_id)
-        .map(PhysicalNode::output_schema)
-        .unwrap_or_default();
-    let top = PhysicalNode::Sort(quail_physical::Node {
-        id: "top".into(),
-        inputs: input_ports(std::slice::from_ref(&below)),
-        attributes: SortAttributes {
-            keys: orders[0].clone(),
-            columns,
-            distinct: false,
-            offset: 0,
-            fetch: Some(limit.attributes.count),
-        },
-    });
-    let mut nodes = Vec::new();
-    for node in &graph.nodes {
-        if node.id() == limit.id {
-            continue;
-        }
-        if node.id() == window.id {
-            nodes.push(top.clone());
-            let mut moved = node.clone();
-            *moved.inputs_mut() = input_ports(&[port("top", "rows")]);
-            nodes.push(moved);
-            continue;
-        }
-        nodes.push(node.clone());
-    }
-    Ok(Some(Graph {
-        nodes,
-        root: limit.inputs[0].source.clone(),
-    }))
 }
 
 fn choose_classify_implementation(
@@ -1164,8 +1037,6 @@ pub fn apply_rule(
     settings: &mut Map<String, Value>,
 ) -> Rewrite {
     match name {
-        "should_eliminate_window_sort" => should_eliminate_window_sort(graph),
-        "should_push_down_limit_through_window" => should_push_down_limit_through_window(graph),
         "should_push_down_limit" => should_push_down_limit(graph, settings),
         "choose_classify_implementation" => {
             choose_classify_implementation(graph, context, settings)

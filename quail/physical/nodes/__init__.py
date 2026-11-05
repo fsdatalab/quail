@@ -7,21 +7,18 @@ from .inference import AiInference, AiScore, InferenceSpec, ScoreSpec
 from .join import AiJoin, Barrier, HashJoin
 from .map import AiMap, MapSpec
 from .relational import (
-    Aggregate,
     Exchange,
     Limit,
     Project,
     Recombine,
     Sort,
     Unnest,
-    Window,
 )
 from .sae_features import AiSaeFeatures, SaeFeaturesSpec
 from .scan import Scan
 from .stage import QueryStage
 
 __all__ = [
-    "Aggregate",
     "AiClassify",
     "AiExtract",
     "AiFilter",
@@ -47,6 +44,5 @@ __all__ = [
     "QueryStage",
     "ScoreSpec",
     "Sort",
-    "Window",
     "predicate_from_mapping",
 ]

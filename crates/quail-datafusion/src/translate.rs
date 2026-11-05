@@ -69,18 +69,13 @@ fn column_kind(call: &Expr) -> Option<&'static str> {
 }
 
 /// The relation below a SELECT: the operators under its LIMIT, ORDER BY,
-/// DISTINCT, SELECT list, windows, HAVING, and grouping.
+/// DISTINCT, and SELECT list.
 fn relation_root(plan: &LogicalPlan) -> &LogicalPlan {
     match plan {
         LogicalPlan::Limit(found) => relation_root(&found.input),
         LogicalPlan::Sort(found) => relation_root(&found.input),
         LogicalPlan::Distinct(found) => relation_root(found.input()),
         LogicalPlan::Projection(found) => relation_root(&found.input),
-        LogicalPlan::Window(found) => relation_root(&found.input),
-        LogicalPlan::Aggregate(found) => relation_root(&found.input),
-        LogicalPlan::Filter(found) if matches!(found.input.as_ref(), LogicalPlan::Aggregate(_)) => {
-            relation_root(&found.input)
-        }
         other => other,
     }
 }

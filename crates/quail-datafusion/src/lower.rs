@@ -35,8 +35,8 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
-    Aggregate, Expr, ExprSchemable, Extension, Filter, Join, JoinType, LogicalPlan, Operator,
-    Projection, UserDefinedLogicalNode, Window,
+    Expr, ExprSchemable, Extension, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
+    UserDefinedLogicalNode,
 };
 use datafusion::optimizer::AnalyzerRule;
 
@@ -496,95 +496,6 @@ fn lower_join(join: &Join) -> Result<Transformed<LogicalPlan>> {
     )))
 }
 
-fn lower_aggregate(
-    aggregate: &Aggregate,
-    columns: &mut Columns,
-) -> Result<Transformed<LogicalPlan>> {
-    let calls: Vec<Expr> = aggregate
-        .group_expr
-        .iter()
-        .chain(&aggregate.aggr_expr)
-        .flat_map(column_calls)
-        .collect();
-    if calls.is_empty() {
-        return Ok(Transformed::no(LogicalPlan::Aggregate(aggregate.clone())));
-    }
-    let mut input = aggregate.input.as_ref().clone();
-    let mut added: Vec<(Expr, String)> = Vec::new();
-    for call in calls {
-        if added.iter().any(|(found, _)| *found == call) {
-            continue;
-        }
-        let name = match added_column(&input, &call) {
-            Some(name) => name,
-            None => {
-                let name = columns.name_for(&call);
-                input = add_column(input, call.clone(), &name)?;
-                name
-            }
-        };
-        added.push((call, name));
-    }
-    // the operators above read each output by its original name
-    let read = |exprs: &[Expr]| -> Result<Vec<Expr>> {
-        exprs
-            .iter()
-            .map(|expr| {
-                read_columns(expr.clone(), &added)?.alias_if_changed(expr.schema_name().to_string())
-            })
-            .collect()
-    };
-    Ok(Transformed::yes(LogicalPlan::Aggregate(
-        Aggregate::try_new(
-            Arc::new(input),
-            read(&aggregate.group_expr)?,
-            read(&aggregate.aggr_expr)?,
-        )?,
-    )))
-}
-
-fn lower_window(window: &Window, columns: &mut Columns) -> Result<Transformed<LogicalPlan>> {
-    let calls: Vec<Expr> = window.window_expr.iter().flat_map(column_calls).collect();
-    if calls.is_empty() {
-        return Ok(Transformed::no(LogicalPlan::Window(window.clone())));
-    }
-    let mut input = window.input.as_ref().clone();
-    let mut added: Vec<(Expr, String)> = Vec::new();
-    for call in calls {
-        if added.iter().any(|(found, _)| *found == call) {
-            continue;
-        }
-        let name = match added_column(&input, &call) {
-            Some(name) => name,
-            None => {
-                let name = columns.name_for(&call);
-                input = add_column(input, call.clone(), &name)?;
-                name
-            }
-        };
-        added.push((call, name));
-    }
-    let exprs = window
-        .window_expr
-        .iter()
-        .map(|expr| {
-            let read = read_columns(expr.clone(), &added)?;
-            // a window's output column keeps the name SELECT reads it by
-            Ok(
-                if read.schema_name().to_string() == expr.schema_name().to_string() {
-                    read
-                } else {
-                    read.alias(expr.schema_name().to_string())
-                },
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Transformed::yes(LogicalPlan::Window(Window::try_new(
-        exprs,
-        Arc::new(input),
-    )?)))
-}
-
 fn lower_projection(
     projection: &Projection,
     columns: &mut Columns,
@@ -669,8 +580,6 @@ pub fn lower_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
             LogicalPlan::Filter(filter) => lower_filter(filter, &mut columns),
             LogicalPlan::Join(join) => lower_join(join),
             LogicalPlan::Projection(projection) => lower_projection(projection, &mut columns),
-            LogicalPlan::Aggregate(aggregate) => lower_aggregate(aggregate, &mut columns),
-            LogicalPlan::Window(window) => lower_window(window, &mut columns),
             _ => Ok(Transformed::no(node)),
         })?
         .data)

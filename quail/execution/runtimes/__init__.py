@@ -10,17 +10,14 @@ from quail.execution.runtimes.dataflow import (
 )
 from quail.execution.runtimes.filter import FilterRuntime
 from quail.execution.runtimes.relational import (
-    AggregateRuntime,
     LimitRuntime,
     ProjectRuntime,
     ScanRuntime,
     SortRuntime,
-    WindowRuntime,
 )
 from quail.execution.runtimes.stage import QueryStageRuntime
 from quail.execution.runtimes.unnest import UnnestRuntime
 from quail.physical import (
-    Aggregate,
     Barrier,
     Exchange,
     Filter,
@@ -32,11 +29,9 @@ from quail.physical import (
     Scan,
     Sort,
     Unnest,
-    Window,
 )
 
 __all__ = [
-    "AggregateRuntime",
     "BarrierRuntime",
     "ExchangeRuntime",
     "FilterRuntime",
@@ -48,7 +43,6 @@ __all__ = [
     "RecombineRuntime",
     "ScanRuntime",
     "SortRuntime",
-    "WindowRuntime",
     "built_in_runtimes",
 ]
 
@@ -63,9 +57,7 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
         HashJoin.runtime_key: HashJoinRuntime(),
         Recombine.runtime_key: RecombineRuntime(),
         Project.runtime_key: ProjectRuntime(),
-        Aggregate.runtime_key: AggregateRuntime(),
         Sort.runtime_key: SortRuntime(),
-        Window.runtime_key: WindowRuntime(),
         Limit.runtime_key: LimitRuntime(),
         Unnest.runtime_key: UnnestRuntime(),
         Filter.runtime_key: FilterRuntime(),

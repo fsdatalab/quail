@@ -7,8 +7,8 @@
 use std::fmt;
 
 use quail_physical::{
-    AggregateCall, Alias, ColumnRef, Condition, Connective, ModelCall, Not, Projected,
-    RegularPredicate, SortExpression, ValueExpression,
+    Alias, ColumnRef, Condition, Connective, ModelCall, Not, Projected, RegularPredicate,
+    SortExpression, ValueExpression,
 };
 use serde_json::Value;
 
@@ -292,7 +292,6 @@ pub fn projected_name(column: &Projected) -> String {
 pub fn sort_name(expression: &SortExpression) -> String {
     match expression {
         SortExpression::Value(value) => column_name(value, true),
-        SortExpression::Aggregate(aggregate) => aggregate.name.clone(),
     }
 }
 
@@ -864,40 +863,6 @@ pub fn validate_condition(condition: &Condition) -> Result<(), CompileError> {
         validate_condition(operand)?;
     }
     Ok(())
-}
-
-/// Check an aggregate call.
-pub fn validate_aggregate(aggregate: &AggregateCall) -> Result<(), CompileError> {
-    const FUNCTIONS: [&str; 6] = ["count", "count_distinct", "sum", "avg", "min", "max"];
-    if !FUNCTIONS.contains(&aggregate.function.as_str()) {
-        return compile_error(format!(
-            "unsupported aggregate {}; supported: {}",
-            repr_str(&aggregate.function),
-            FUNCTIONS.join(", ")
-        ));
-    }
-    if aggregate.argument.is_none() && aggregate.function != "count" {
-        return compile_error(format!("{}(*) is not an aggregate", aggregate.function));
-    }
-    if aggregate.name.is_empty() {
-        return compile_error("an aggregate needs a name");
-    }
-    Ok(())
-}
-
-/// The text of an aggregate call, as `str(AggregateCall)`.
-pub fn aggregate_text(aggregate: &AggregateCall) -> String {
-    let function = if aggregate.function == "count_distinct" {
-        "count(distinct ".to_string()
-    } else {
-        format!("{}(", aggregate.function)
-    };
-    format!(
-        "{} = {}{})",
-        aggregate.name,
-        function,
-        aggregate.argument.as_deref().unwrap_or("*")
-    )
 }
 
 /// Whether a literal is a number, as Python's `isinstance(value, (int, float))`.

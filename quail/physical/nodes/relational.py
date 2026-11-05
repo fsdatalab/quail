@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.common.expressions import Expression, WindowCall, packed_columns
+from quail.common.expressions import Expression, packed_columns
 
 from ..base import (
     ExecutionLocation,
@@ -90,30 +90,6 @@ class Project(PhysicalNode):
         ),)
 
 @dataclass(frozen=True)
-class Aggregate(PhysicalNode):
-    """Group the result rows and compute aggregates on the coordinator.
-
-    ``keys`` name input columns. ``aggregates`` are (name, function,
-    argument) triples, the argument an input column or None for
-    ``count(*)``. ``having`` are (name, comparison, value) tests over
-    the aggregates. ``columns`` are the output columns, keys and
-    aggregate names in result order.
-    """
-
-    keys: tuple[str, ...] = ()
-    aggregates: tuple[tuple[str, str, str | None], ...] = ()
-    having: tuple[tuple[str, str, int | float], ...] = ()
-    columns: tuple[str, ...] = ()
-
-    type_name: ClassVar[str] = "quail.aggregate"
-    runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
-
-    @property
-    def outputs(self) -> tuple[OutputPort, ...]:
-        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
-
-@dataclass(frozen=True)
 class Sort(PhysicalNode):
     """Order, deduplicate, and bound the result rows on the coordinator.
 
@@ -136,27 +112,6 @@ class Sort(PhysicalNode):
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
-
-@dataclass(frozen=True)
-class Window(PhysicalNode):
-    """Compute window functions over the result rows on the coordinator.
-
-    ``calls`` read input columns and append one column each. ``columns``
-    are the output columns, input columns and window names in result
-    order. The rows come out in the last call's partition and order.
-    """
-
-    calls: tuple[WindowCall, ...] = ()
-    columns: tuple[str, ...] = ()
-
-    type_name: ClassVar[str] = "quail.window"
-    runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
-
-    @property
-    def outputs(self) -> tuple[OutputPort, ...]:
-        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
-
 
 @dataclass(frozen=True)
 class Unnest(PhysicalNode):

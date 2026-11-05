@@ -9,15 +9,13 @@ use quail_physical::{
 };
 
 use crate::expressions::{
-    CompileError, PROBABILITIES_SUFFIX, SPAN_SUFFIX, aggregate_text, call_aliases, column_name,
-    column_references, compile_error, condition_aliases, condition_references, condition_text,
-    projected_call, projected_name, reference_name, repr_list, repr_str, repr_value, sort_name,
-    tests, validate_aggregate, validate_call, validate_condition, validate_expression,
-    validate_tree,
+    CompileError, PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_name, column_references,
+    compile_error, condition_aliases, condition_references, condition_text, projected_call,
+    projected_name, reference_name, repr_list, repr_str, sort_name, tests, validate_call,
+    validate_condition, validate_expression, validate_tree,
 };
 use crate::logical::{
-    Aggregate, Join, LogicalNode, LogicalPlan, Project, ResultNode, Scan, ScanColumn,
-    SemanticColumn, Unnest, Window,
+    Join, LogicalNode, LogicalPlan, Project, ResultNode, Scan, ScanColumn, SemanticColumn, Unnest,
 };
 
 /// The struct fields of one feature list, as `FEATURE_LIST` holds them.
@@ -105,8 +103,6 @@ pub fn input(node: &LogicalNode) -> &LogicalNode {
         LogicalNode::Filter(found) => &found.input,
         LogicalNode::SemanticJoin(found) => &found.input,
         LogicalNode::Project(found) => &found.input,
-        LogicalNode::Aggregate(found) => &found.input,
-        LogicalNode::Window(found) => &found.input,
         LogicalNode::Result(found) => &found.input,
         LogicalNode::Unnest(found) => &found.input,
         LogicalNode::WithCte(found) => &found.input,
@@ -217,8 +213,6 @@ pub fn output_schema(node: &LogicalNode) -> Vec<ColumnRef> {
                 })
                 .collect()
         }
-        LogicalNode::Aggregate(Aggregate { input, output, .. })
-        | LogicalNode::Window(Window { input, output, .. }) => named_schema(input, output),
         LogicalNode::Unnest(unnest) => {
             let types = list_types(&unnest.input);
             let mut fields = Vec::new();
@@ -248,21 +242,6 @@ pub fn output_schema(node: &LogicalNode) -> Vec<ColumnRef> {
         }
         other => output_schema(input(other)),
     }
-}
-
-fn named_schema(input: &LogicalNode, output: &[String]) -> Vec<ColumnRef> {
-    let fields = output_schema(input);
-    output
-        .iter()
-        .map(|name| {
-            fields
-                .iter()
-                .rev()
-                .find(|field| reference_name(field, true) == *name)
-                .cloned()
-                .unwrap_or_else(|| reference("", "", name))
-        })
-        .collect()
 }
 
 /// The table alias a column operator's answer columns belong to.
@@ -328,8 +307,6 @@ pub fn result_columns(node: &LogicalNode) -> Vec<String> {
         ),
         LogicalNode::Filter(filter) => result_columns(&filter.input),
         LogicalNode::Result(result) => result_columns(&result.input),
-        LogicalNode::Aggregate(aggregate) => aggregate.output.clone(),
-        LogicalNode::Window(window) => window.output.clone(),
         LogicalNode::Unnest(unnest) => {
             let fields = unnest_fields(unnest);
             result_columns(&unnest.input)
@@ -840,146 +817,10 @@ fn validate_extract_struct(found: &ExtractStruct) -> Result<(), CompileError> {
     Ok(())
 }
 
-fn validate_aggregate_node(aggregate: &Aggregate) -> Result<(), CompileError> {
-    if !reads_projection(&aggregate.input) {
-        return compile_error("Aggregate needs projected input columns");
-    }
-    let projected = result_columns(&aggregate.input);
-    for key in &aggregate.keys {
-        if !projected.contains(key) {
-            return compile_error(format!(
-                "GROUP BY {} is not a projected column",
-                repr_str(key)
-            ));
-        }
-    }
-    let mut names = aggregate.keys.clone();
-    for call in &aggregate.aggregates {
-        validate_aggregate(call)?;
-        if let Some(argument) = &call.argument
-            && !projected.contains(argument)
-        {
-            return compile_error(format!(
-                "{} reads a column the projection does not have",
-                aggregate_text(call)
-            ));
-        }
-        names.push(call.name.clone());
-    }
-    if names.iter().collect::<BTreeSet<_>>().len() != names.len() {
-        return compile_error(format!(
-            "GROUP BY keys and aggregate names must be unique, got {}",
-            repr_list(&names)
-        ));
-    }
-    if aggregate.output.is_empty() {
-        return compile_error("an aggregation returns at least one column");
-    }
-    for name in &aggregate.output {
-        if !names.contains(name) {
-            return compile_error(format!(
-                "{} is neither a GROUP BY key nor an aggregate",
-                repr_str(name)
-            ));
-        }
-    }
-    if aggregate.output.iter().collect::<BTreeSet<_>>().len() != aggregate.output.len() {
-        let listed: Vec<String> = aggregate.output.iter().map(|name| repr_str(name)).collect();
-        return compile_error(format!(
-            "output names must be unique, got ({})",
-            listed.join(", ")
-        ));
-    }
-    const HAVING: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
-    for test in &aggregate.having {
-        validate_aggregate(&test.aggregate)?;
-        if !HAVING.contains(&test.comparison.as_str()) {
-            return compile_error(format!(
-                "HAVING compares with one of ('=', '<>', '<', '<=', '>', '>='), got {}",
-                repr_str(&test.comparison)
-            ));
-        }
-        if !matches!(test.value, serde_json::Value::Number(_)) {
-            return compile_error("HAVING compares an aggregate with a number");
-        }
-        if !aggregate.aggregates.contains(&test.aggregate) {
-            return compile_error(format!(
-                "HAVING {} {} {} tests an aggregate the aggregation does not compute",
-                test.aggregate.name,
-                test.comparison,
-                repr_value(&test.value)
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_window(window: &Window) -> Result<(), CompileError> {
-    if !(reads_projection(&window.input) || matches!(*window.input, LogicalNode::Aggregate(_))) {
-        return compile_error("Window needs projected or aggregated input columns");
-    }
-    let projected = result_columns(&window.input);
-    let mut names = projected.clone();
-    const FUNCTIONS: [&str; 5] = ["row_number", "lag", "lead", "sum", "count"];
-    for call in &window.calls {
-        if !FUNCTIONS.contains(&call.function.as_str()) {
-            return compile_error(format!(
-                "unsupported window function {}; supported: {}",
-                repr_str(&call.function),
-                FUNCTIONS.join(", ")
-            ));
-        }
-        if call.function == "row_number" && call.argument.is_some() {
-            return compile_error("row_number() takes no column");
-        }
-        if ["lag", "lead", "sum"].contains(&call.function.as_str()) && call.argument.is_none() {
-            return compile_error(format!("{}() needs a column", call.function));
-        }
-        if ["lag", "lead"].contains(&call.function.as_str()) && call.order.is_empty() {
-            return compile_error(format!(
-                "{}() needs an ORDER BY in its window",
-                call.function
-            ));
-        }
-        let read = call
-            .argument
-            .iter()
-            .chain(call.partition.iter())
-            .chain(call.order.iter().map(|(name, _, _)| name));
-        for column in read {
-            if !projected.contains(column) {
-                return compile_error(format!(
-                    "the window {} reads {}, which is not a projected column",
-                    repr_str(&call.name),
-                    repr_str(column)
-                ));
-            }
-        }
-        names.push(call.name.clone());
-    }
-    if names.iter().collect::<BTreeSet<_>>().len() != names.len() {
-        return compile_error(format!(
-            "window names must be unique, got {}",
-            repr_list(&names)
-        ));
-    }
-    for name in &window.output {
-        if !names.contains(name) {
-            return compile_error(format!(
-                "the window output {} is neither a column nor a window",
-                repr_str(name)
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_result(result: &ResultNode) -> Result<(), CompileError> {
     let input = result.input.as_ref();
-    if !(reads_projection(input)
-        || matches!(input, LogicalNode::Aggregate(_) | LogicalNode::Window(_)))
-    {
-        return compile_error("Result needs a projection, aggregation, or window");
+    if !reads_projection(input) {
+        return compile_error("Result needs a projection");
     }
     if result.limit.is_some_and(|limit| limit <= 0) {
         return compile_error("LIMIT must be a positive integer");
@@ -989,14 +830,9 @@ fn validate_result(result: &ResultNode) -> Result<(), CompileError> {
     }
     let projected: BTreeSet<String> = result_columns(input).into_iter().collect();
     let projection = projection_below(input);
-    let grouped = matches!(input, LogicalNode::Aggregate(_))
-        || matches!(input, LogicalNode::Window(window)
-            if matches!(*window.input, LogicalNode::Aggregate(_)));
     for key in &result.order {
-        match &key.expression {
-            SortExpression::Aggregate(aggregate) => validate_aggregate(aggregate)?,
-            SortExpression::Value(value) => validate_tree(value)?,
-        }
+        let SortExpression::Value(value) = &key.expression;
+        validate_tree(value)?;
         let name = sort_name(&key.expression);
         if let SortExpression::Value(value @ ValueExpression::Alias(_)) = &key.expression
             && !projection
@@ -1006,12 +842,6 @@ fn validate_result(result: &ResultNode) -> Result<(), CompileError> {
         {
             return compile_error(format!(
                 "ORDER BY {} names an expression the projection does not return",
-                repr_str(&name)
-            ));
-        }
-        if grouped && !projected.contains(&name) {
-            return compile_error(format!(
-                "ORDER BY {} with GROUP BY names a key or an aggregate in the SELECT list",
                 repr_str(&name)
             ));
         }
@@ -1101,8 +931,6 @@ pub fn validate_node(node: &LogicalNode) -> Result<(), CompileError> {
             Ok(())
         }
         LogicalNode::Project(project) => validate_project(node, project),
-        LogicalNode::Aggregate(aggregate) => validate_aggregate_node(aggregate),
-        LogicalNode::Window(window) => validate_window(window),
         LogicalNode::Result(result) => validate_result(result),
         LogicalNode::Unnest(unnest) => validate_unnest(unnest),
         LogicalNode::WithCte(with) => {

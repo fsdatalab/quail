@@ -13,19 +13,17 @@ use std::collections::BTreeMap;
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{Column, ScalarValue};
-use datafusion::logical_expr::expr::{
-    AggregateFunction, Exists, InList, Like, ScalarFunction, WindowFunction,
-};
+use datafusion::logical_expr::expr::{Exists, InList, Like, ScalarFunction};
 use datafusion::logical_expr::{
     BinaryExpr, Distinct, Expr, Join, JoinType, LogicalPlan, Operator, SortExpr,
 };
 use quail_physical::{
-    AggregateCall, Alias, ColumnRef, Condition, Connective, Equality, ExtractStruct, GetField,
-    HavingTest, Literal, ModelCall, Not, RegularPredicate, ScalarFunction as QuailFunction,
-    SortExpression, SortKey, TaggedModelCall, ValueExpression, WindowCall,
+    Alias, ColumnRef, Condition, Connective, Equality, ExtractStruct, GetField, Literal, ModelCall,
+    Not, RegularPredicate, ScalarFunction as QuailFunction, SortExpression, SortKey,
+    TaggedModelCall, ValueExpression,
 };
 use quail_planner::builder::{
-    Aggregation, Exists as ExistsGate, Hint, Part, PlaceRelationArguments, ProjectArguments,
+    Exists as ExistsGate, Hint, Part, PlaceRelationArguments, ProjectArguments,
 };
 use quail_planner::expressions::{
     CompileError, SPAN_SUFFIX, aliased_call, call_aliases, column_name, column_references,
@@ -239,12 +237,11 @@ fn bind_with_stages(
         binder.bind_where(condition)?;
     }
     let mut selection = SelectBinder::new(&mut binder);
-    selection.bind_projection(&select.projection, &select.windows)?;
-    let aggregation = selection.bind_grouping(&select)?;
+    selection.bind_projection(&select.projection)?;
+    selection.check_output_names()?;
     let SelectBinder {
         mut columns,
         structs,
-        windows,
         output,
         ..
     } = selection;
@@ -257,13 +254,7 @@ fn bind_with_stages(
             }));
         }
     }
-    let order = binder.bind_order(
-        &select.order,
-        &columns,
-        aggregation.as_ref(),
-        &structs,
-        &windows,
-    )?;
+    let order = binder.bind_order(&select.order, &columns, &structs)?;
     binder.validate_query(&columns, &structs)?;
     let place = binder.place_arguments(scans, &columns);
     let project = ProjectArguments {
@@ -272,9 +263,7 @@ fn bind_with_stages(
         order,
         offset: select.offset,
         distinct: select.distinct,
-        aggregation,
         structs,
-        windows,
         output,
         unnests: unnests
             .iter()
@@ -294,13 +283,9 @@ struct Select<'a> {
     distinct: bool,
     order: Vec<SortExpr>,
     projection: Vec<Expr>,
-    /// The window function calls, by their output column name.
-    windows: Vec<(String, Expr)>,
-    group: Option<Vec<Expr>>,
-    having: Option<Expr>,
     condition: Option<Expr>,
     relation: &'a LogicalPlan,
-    /// Output column name -> the group, aggregate, or window expression.
+    /// Output column name -> the SELECT list's expression.
     outputs: Vec<(String, Expr)>,
 }
 
@@ -376,29 +361,16 @@ impl<'a> Select<'a> {
                 .collect();
         }
         let mut node = projection.input.as_ref();
-        let mut windows = Vec::new();
         let mut outputs = Vec::new();
-        while let LogicalPlan::Window(window) = node {
-            for expr in &window.window_expr {
-                let name = expr.schema_name().to_string();
-                windows.push((name.clone(), expr.clone()));
-                outputs.push((name, expr.clone()));
-            }
-            node = &window.input;
-        }
-        let (mut group, mut having) = (None, None);
-        if let LogicalPlan::Filter(filter) = node
-            && let LogicalPlan::Aggregate(_) = filter.input.as_ref()
-        {
-            having = Some(filter.predicate.clone());
-            node = &filter.input;
-        }
-        if let LogicalPlan::Aggregate(aggregate) = node {
-            for expr in aggregate.group_expr.iter().chain(&aggregate.aggr_expr) {
-                outputs.push((expr.schema_name().to_string(), expr.clone()));
-            }
-            group = Some(aggregate.group_expr.clone());
-            node = &aggregate.input;
+        // DataFusion runs a GROUP BY or window above the region, or as an
+        // input it computes for the region
+        let groups =
+            |plan: &LogicalPlan| matches!(plan, LogicalPlan::Aggregate(_) | LogicalPlan::Window(_));
+        if groups(node) || matches!(node, LogicalPlan::Filter(filter) if groups(&filter.input)) {
+            return compile_error(
+                "a model call that reads the result of a GROUP BY or a window is not \
+                 supported; read it from a CTE or FROM subquery instead",
+            );
         }
         for item in &expressions {
             let (inner, _) = unalias(item);
@@ -419,9 +391,6 @@ impl<'a> Select<'a> {
             distinct,
             order,
             projection: expressions,
-            windows,
-            group,
-            having,
             condition,
             relation: node,
             outputs,
@@ -479,19 +448,10 @@ impl<'a> Select<'a> {
         };
         self.projection = self.projection.iter().map(field).collect();
         self.condition = self.condition.as_ref().map(field);
-        if let Some(having) = &mut self.having {
-            *having = field(having);
-        }
-        if let Some(group) = &mut self.group {
-            *group = group.iter().map(field).collect();
-        }
         for key in &mut self.order {
             key.expr = field(&key.expr);
         }
         for (_, expr) in &mut self.outputs {
-            *expr = field(expr);
-        }
-        for (_, expr) in &mut self.windows {
             *expr = field(expr);
         }
         unnests
@@ -511,9 +471,6 @@ impl<'a> Select<'a> {
         let LogicalPlan::Projection(inner) = alias.input.as_ref() else {
             return;
         };
-        if self.group.is_some() || !self.windows.is_empty() {
-            return;
-        }
         let (mut input, mut inner_condition) = (inner.input.as_ref(), None);
         if let LogicalPlan::Filter(filter) = input {
             inner_condition = Some(filter.predicate.clone());
@@ -608,9 +565,6 @@ impl<'a> Select<'a> {
         for key in &mut self.order {
             key.expr = substitute(&key.expr);
         }
-        if let Some(having) = &mut self.having {
-            *having = substitute(having);
-        }
         let outer = self.condition.as_ref().map(substitute);
         self.condition = match (inner_condition, outer) {
             (Some(first), Some(second)) => Some(first.and(second)),
@@ -654,33 +608,6 @@ fn unalias(expr: &Expr) -> (&Expr, Option<&str>) {
             None
         },
     )
-}
-
-/// An aggregate call as SQL writes it, such as `COUNT(*)`.
-fn aggregate_text(expr: &Expr) -> String {
-    match expr {
-        Expr::AggregateFunction(AggregateFunction { func, params }) => {
-            let star = matches!(
-                params.args.as_slice(),
-                [] | [Expr::Literal(ScalarValue::Int64(Some(1)), _)]
-            );
-            let arguments = if star {
-                "*".to_string()
-            } else {
-                params
-                    .args
-                    .iter()
-                    .map(|argument| match argument {
-                        Expr::Column(column) => column.flat_name(),
-                        other => other.to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            format!("{}({arguments})", func.name().to_uppercase())
-        }
-        other => other.to_string(),
-    }
 }
 
 // ---------------------------------------------------------------- calls
@@ -2308,11 +2235,9 @@ impl Binder {
         &mut self,
         order: &[SortExpr],
         columns: &[ValueExpression],
-        aggregation: Option<&Aggregation>,
         structs: &[ExtractStruct],
-        windows: &[WindowCall],
     ) -> Result<Vec<SortKey>, CompileError> {
-        let mut named: Vec<(String, SortExpression)> = columns
+        let named: Vec<(String, SortExpression)> = columns
             .iter()
             .map(|column| {
                 (
@@ -2321,15 +2246,6 @@ impl Binder {
                 )
             })
             .collect();
-        if let Some(aggregation) = aggregation {
-            for aggregate in &aggregation.aggregates {
-                named.push((
-                    aggregate.name.clone(),
-                    SortExpression::Aggregate(aggregate.clone()),
-                ));
-            }
-        }
-        let window_names: Vec<String> = windows.iter().map(|window| window.name.clone()).collect();
         let mut keys = Vec::new();
         for sort in order {
             let target = &sort.expr;
@@ -2342,9 +2258,6 @@ impl Binder {
                          field as its own column",
                         repr_str(&column.name)
                     ));
-                }
-                if window_names.contains(&column.name) {
-                    return unsupported("ORDER BY a window function");
                 }
                 if let Some((_, found)) = named.iter().rev().find(|(name, _)| *name == column.name)
                 {
@@ -2521,9 +2434,7 @@ struct SelectBinder<'a> {
     columns: Vec<ValueExpression>,
     plain: Vec<String>,
     output: Vec<String>,
-    aggregates: Vec<AggregateCall>,
     structs: Vec<ExtractStruct>,
-    windows: Vec<WindowCall>,
 }
 
 impl<'a> SelectBinder<'a> {
@@ -2533,9 +2444,7 @@ impl<'a> SelectBinder<'a> {
             columns: Vec::new(),
             plain: Vec::new(),
             output: Vec::new(),
-            aggregates: Vec::new(),
             structs: Vec::new(),
-            windows: Vec::new(),
         }
     }
 
@@ -2550,178 +2459,9 @@ impl<'a> SelectBinder<'a> {
             .map(|(_, found)| found.clone())
     }
 
-    /// Bind an aggregate's or key's expression to a projected column name.
-    fn register_argument(&mut self, node: &Expr, hidden: &str) -> Result<String, CompileError> {
-        let node = self.output_of(node).unwrap_or_else(|| node.clone());
-        let (node, _) = unalias(&node);
-        if is_call(node, "ai_score") || is_call(node, "ai_classify") {
-            let call = self.binder.bind_ai_value(node)?;
-            for column in &self.columns {
-                if aliased_call(column, &[]) == Some(&call) {
-                    return Ok(column_name(column, true));
-                }
-            }
-            self.columns.push(ValueExpression::Alias(Alias {
-                expression: Box::new(ValueExpression::ModelCall(call)),
-                name: hidden.to_string(),
-            }));
-            return Ok(hidden.to_string());
-        }
-        if has_ai_call(node) || column_call(node).is_some() {
-            return compile_error(format!(
-                "{node} is not a column, an expression of columns, or an AI expression"
-            ));
-        }
-        let column = self.binder.bind_value(node)?;
-        if let Some(named) = self.columns.iter().find(
-            |found| matches!(found, ValueExpression::Alias(alias) if *alias.expression == column),
-        ) {
-            return Ok(column_name(named, true));
-        }
-        if !self.columns.contains(&column) {
-            self.columns.push(column.clone());
-        }
-        Ok(column_name(&column, true))
-    }
-
-    fn bind_aggregate(
-        &mut self,
-        node: &Expr,
-        name: &str,
-        hidden: &str,
-    ) -> Result<AggregateCall, CompileError> {
-        let Expr::AggregateFunction(AggregateFunction { func, params }) = node else {
-            return compile_error(format!(
-                "an aggregate in SELECT is a direct COUNT, SUM, AVG, MIN, or MAX call with an AS \
-                 name, got {node}"
-            ));
-        };
-        let mut function = match func.name().to_lowercase().as_str() {
-            "count" => "count",
-            "sum" => "sum",
-            "avg" | "mean" => "avg",
-            "min" => "min",
-            "max" => "max",
-            other => return unsupported(&format!("the aggregate {other}")),
-        };
-        let star = params.args.is_empty()
-            || matches!(
-                params.args.as_slice(),
-                [Expr::Literal(ScalarValue::Int64(Some(1)), _)]
-            ) && function == "count"
-                && !params.distinct;
-        if star {
-            if function != "count" {
-                return compile_error(format!("{node} needs a column"));
-            }
-            return Ok(AggregateCall {
-                function: "count".to_string(),
-                argument: None,
-                name: name.to_string(),
-            });
-        }
-        if params.distinct {
-            if function != "count" || params.args.len() != 1 {
-                return compile_error("DISTINCT inside an aggregate is COUNT(DISTINCT column)");
-            }
-            function = "count_distinct";
-        }
-        let argument = self.register_argument(&params.args[0], hidden)?;
-        Ok(AggregateCall {
-            function: function.to_string(),
-            argument: Some(argument),
-            name: name.to_string(),
-        })
-    }
-
-    fn bind_window(
-        &mut self,
-        node: &Expr,
-        name: &str,
-        hidden: &str,
-    ) -> Result<WindowCall, CompileError> {
-        let Expr::WindowFunction(window) = node else {
-            return unsupported("this window");
-        };
-        let WindowFunction { fun, params } = window.as_ref();
-        let function = match fun.name().to_lowercase().as_str() {
-            "row_number" => "row_number",
-            "lag" => "lag",
-            "lead" => "lead",
-            "sum" => "sum",
-            "count" => "count",
-            _ => {
-                return compile_error(format!(
-                    "{node} is not supported; a window is ROW_NUMBER, LAG, LEAD, SUM, or COUNT \
-                     over the partition's rows so far"
-                ));
-            }
-        };
-        if function != "row_number" && params.args.len() > 1 {
-            return compile_error(format!("{node} reads the row before or after only"));
-        }
-        let mut argument = None;
-        let counts_rows = matches!(
-            params.args.as_slice(),
-            [] | [Expr::Literal(ScalarValue::Int64(Some(1)), _)]
-        );
-        if function != "row_number" && !(function == "count" && counts_rows) {
-            argument =
-                Some(self.register_argument(&params.args[0], &format!("{hidden}_argument"))?);
-        }
-        let mut partition = Vec::new();
-        for (index, term) in params.partition_by.iter().enumerate() {
-            partition.push(self.register_argument(term, &format!("{hidden}_partition_{index}"))?);
-        }
-        let mut order = Vec::new();
-        for (index, term) in params.order_by.iter().enumerate() {
-            order.push((
-                self.register_argument(&term.expr, &format!("{hidden}_order_{index}"))?,
-                !term.asc,
-                term.nulls_first,
-            ));
-        }
-        Ok(WindowCall {
-            function: function.to_string(),
-            argument,
-            partition,
-            order,
-            name: name.to_string(),
-        })
-    }
-
-    fn bind_projection(
-        &mut self,
-        projection: &[Expr],
-        windows: &[(String, Expr)],
-    ) -> Result<(), CompileError> {
-        let _ = windows;
-        for (index, item) in projection.iter().enumerate() {
+    fn bind_projection(&mut self, projection: &[Expr]) -> Result<(), CompileError> {
+        for item in projection {
             let (node, alias) = unalias(item);
-            if let Some(output) = self.output_of(node) {
-                if let Expr::WindowFunction(_) = output {
-                    let Some(alias) = alias else {
-                        return compile_error(format!("{output} needs an AS name in SELECT"));
-                    };
-                    let window = self.bind_window(&output, alias, &format!("__window_{index}"))?;
-                    self.output.push(window.name.clone());
-                    self.windows.push(window);
-                    continue;
-                }
-                if let Expr::AggregateFunction(_) = output {
-                    let Some(alias) = alias else {
-                        return compile_error(format!(
-                            "{} needs an AS name in SELECT",
-                            aggregate_text(&output)
-                        ));
-                    };
-                    let aggregate =
-                        self.bind_aggregate(&output, alias, &format!("__agg_{index}"))?;
-                    self.output.push(aggregate.name.clone());
-                    self.aggregates.push(aggregate);
-                    continue;
-                }
-            }
             let node = self.output_of(node).unwrap_or_else(|| node.clone());
             if is_call(&node, "ai_extract_span") {
                 continue;
@@ -2803,91 +2543,18 @@ impl<'a> SelectBinder<'a> {
         }])
     }
 
-    fn bind_grouping(&mut self, select: &Select<'_>) -> Result<Option<Aggregation>, CompileError> {
-        let Some(group) = &select.group else {
-            if !self.aggregates.is_empty() {
-                return unsupported("an aggregate without an Aggregate node");
-            }
-            let mut unique = self.output.clone();
-            unique.sort();
-            unique.dedup();
-            if unique.len() != self.output.len() {
-                return compile_error(format!(
-                    "projection names must be unique, got {}",
-                    quail_planner::expressions::repr_list(&self.output)
-                ));
-            }
-            return Ok(None);
-        };
-        if !self.structs.is_empty() {
-            return compile_error(
-                "GROUP BY does not read AI.EXTRACT struct columns; extract each field as its own \
-                 column",
-            );
+    /// Refuse a SELECT list that names two columns alike.
+    fn check_output_names(&self) -> Result<(), CompileError> {
+        let mut unique = self.output.clone();
+        unique.sort();
+        unique.dedup();
+        if unique.len() != self.output.len() {
+            return compile_error(format!(
+                "projection names must be unique, got {}",
+                quail_planner::expressions::repr_list(&self.output)
+            ));
         }
-        let mut keys = Vec::new();
-        for (index, node) in group.iter().enumerate() {
-            keys.push(self.register_argument(node, &format!("__key_{index}"))?);
-        }
-        let mut tests = Vec::new();
-        if let Some(having) = &select.having {
-            for (index, term) in conjuncts(having).into_iter().enumerate() {
-                let Expr::BinaryExpr(BinaryExpr { left, op, right }) = &term else {
-                    return compile_error(format!(
-                        "HAVING compares an aggregate with a number, got {term}"
-                    ));
-                };
-                let Some(mut comparison) = plain_comparison(*op) else {
-                    return compile_error(format!(
-                        "HAVING compares an aggregate with a number, got {term}"
-                    ));
-                };
-                let (mut left, mut right) = (left.as_ref(), right.as_ref());
-                if literal_value(right).is_none() {
-                    std::mem::swap(&mut left, &mut right);
-                    comparison = flipped(comparison);
-                }
-                let left = self.output_of(left).unwrap_or_else(|| left.clone());
-                let candidate = self.bind_aggregate(
-                    &left,
-                    &format!("__having_{index}"),
-                    &format!("__agg_having_{index}"),
-                )?;
-                let same = match self.aggregates.iter().find(|found| {
-                    (&found.function, &found.argument) == (&candidate.function, &candidate.argument)
-                }) {
-                    Some(found) => found.clone(),
-                    None => {
-                        self.aggregates.push(candidate.clone());
-                        candidate
-                    }
-                };
-                let Some(value) = literal_value(right).filter(Value::is_number) else {
-                    return compile_error(format!("HAVING compares with a number, got {right}"));
-                };
-                tests.push(HavingTest {
-                    aggregate: same,
-                    comparison: comparison.to_string(),
-                    value,
-                });
-            }
-        }
-        if !self.windows.is_empty() {
-            return compile_error("a window function and GROUP BY in one SELECT are not supported");
-        }
-        for name in &self.plain {
-            if !keys.contains(name) {
-                return compile_error(format!(
-                    "{name} is in SELECT but not in GROUP BY and not aggregated"
-                ));
-            }
-        }
-        Ok(Some(Aggregation {
-            keys,
-            aggregates: self.aggregates.clone(),
-            output: self.output.clone(),
-            having: tests,
-        }))
+        Ok(())
     }
 }
 

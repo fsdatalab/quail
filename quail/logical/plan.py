@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import pyarrow as pa
-from pyarrow import compute as pc
 
 from quail.common.expressions import (
     PROBABILITIES_SUFFIX,
@@ -24,7 +23,6 @@ from quail.common.expressions import (
 )
 from quail.logical.nodes import (
     FEATURE_LIST,
-    Aggregate,
     Filter,
     Join,
     LogicalNode,
@@ -38,7 +36,6 @@ from quail.logical.nodes import (
     SemanticMap,
     SemanticSaeFeatures,
     Unnest,
-    Window,
     WithCTE,
 )
 from quail.logical.nodes.column import SemanticColumn
@@ -189,10 +186,6 @@ class LogicalPlan:
                     column, table, qualified=True).type for column in node.columns}
             elif isinstance(node, Unnest):
                 fields = _unnested_fields(node, fields)
-            elif isinstance(node, Aggregate):
-                fields = _aggregated_fields(node, fields)
-            elif isinstance(node, Window):
-                fields = _windowed_fields(node, fields)
         return pa.schema(fields)
 
     def operators(self) -> "Operators":
@@ -392,7 +385,6 @@ SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])
 PROBABILITIES_TYPE = pa.map_(pa.string(), pa.float64())
 
 # the Arrow kernel each aggregate runs, which fixes its output type
-_AGGREGATE_KERNELS = {"sum": pc.sum, "avg": pc.mean, "min": pc.min, "max": pc.max}
 
 
 def _projected_fields(project: Project, scans: dict) -> dict:
@@ -442,32 +434,6 @@ def _unnested_fields(node: Unnest, fields: dict) -> dict:
         else:
             types[name] = value_type
     return types
-
-
-def _aggregated_fields(node: Aggregate, fields: dict) -> dict:
-    """Return name -> Arrow type of an Aggregate's output columns."""
-    types = dict(fields)
-    for call in node.aggregates:
-        if call.function in ("count", "count_distinct"):
-            types[call.name] = pa.int64()
-        else:
-            empty = pa.array([], fields[call.argument])
-            types[call.name] = _AGGREGATE_KERNELS[call.function](empty).type
-    return {name: types[name] for name in node.output}
-
-
-def _windowed_fields(node: Window, fields: dict) -> dict:
-    """Return name -> Arrow type of a Window's output columns."""
-    types = dict(fields)
-    for call in node.calls:
-        if call.function in ("row_number", "count"):
-            types[call.name] = pa.int64()
-        elif call.function in ("lag", "lead"):
-            types[call.name] = fields[call.argument]
-        else:
-            empty = pa.array([], fields[call.argument])
-            types[call.name] = pc.cumulative_sum(pc.fill_null(empty, 0)).type
-    return {name: types[name] for name in node.output}
 
 
 def cte_schema(plan: LogicalPlan) -> pa.Schema:

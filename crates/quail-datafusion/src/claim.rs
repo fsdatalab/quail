@@ -5,7 +5,10 @@ use std::sync::Arc;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
-use datafusion::logical_expr::{Aggregate, Expr, Extension, LogicalPlan, Projection, Window};
+use datafusion::datasource::{MemTable, provider_as_source};
+use datafusion::logical_expr::{
+    Aggregate, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Projection, Window,
+};
 use datafusion::optimizer::AnalyzerRule;
 
 use crate::functions::is_ai_call;
@@ -254,8 +257,14 @@ impl Extracted {
             return plan.with_new_exprs(plan.expressions(), claimed);
         }
         if quail_plans(&plan)? {
+            let (bound, inputs) = split_inputs(select_list(plan, needed)?)?;
+            let mut region = ModelRegion::new(bound);
+            for (name, input) in inputs {
+                region.inputs.push(self.claim(input, None, false)?);
+                region.input_names.push(name);
+            }
             return Ok(LogicalPlan::Extension(Extension {
-                node: Arc::new(ModelRegion::new(select_list(plan, needed)?)),
+                node: Arc::new(region),
             }));
         }
         plan.map_children(|child| {
@@ -381,6 +390,47 @@ fn read_from(
             .filter(|column| input.schema().has_column(column))
             .collect(),
     )
+}
+
+/// Take each CTE or FROM subquery that groups or windows rows out of a
+/// region's plan: the plan reads it as a table of the same name, and
+/// DataFusion computes it as the region's input.
+///
+/// Returns the plan and each input's table name and plan.
+fn split_inputs(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<(String, LogicalPlan)>)> {
+    let mut inputs: Vec<(String, LogicalPlan)> = Vec::new();
+    let plan = plan
+        .transform_down(|node| {
+            let LogicalPlan::SubqueryAlias(alias) = &node else {
+                return Ok(Transformed::no(node));
+            };
+            let groups = alias.input.exists(|inner| {
+                Ok(matches!(
+                    inner,
+                    LogicalPlan::Aggregate(_) | LogicalPlan::Window(_)
+                ))
+            })?;
+            if !groups {
+                return Ok(Transformed::no(node));
+            }
+            let body = alias.input.as_ref().clone();
+            let mut name = alias.alias.table().to_string();
+            if inputs.iter().any(|(found, _)| *found == name) {
+                name = format!("{name}_{}", inputs.len());
+            }
+            let schema = Arc::new(body.schema().as_arrow().clone());
+            let Ok(table) = MemTable::try_new(schema, vec![vec![]]) else {
+                return Ok(Transformed::no(node));
+            };
+            let read =
+                LogicalPlanBuilder::scan(name.as_str(), provider_as_source(Arc::new(table)), None)?
+                    .alias(alias.alias.clone())?
+                    .build()?;
+            inputs.push((name, body));
+            Ok(Transformed::new(read, true, TreeNodeRecursion::Jump))
+        })?
+        .data;
+    Ok((plan, inputs))
 }
 
 /// A region's plan with a SELECT list at its root: the plan itself when

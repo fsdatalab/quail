@@ -47,7 +47,7 @@ pub use aliases::{
 };
 pub use claim::ClaimModelRegions;
 pub use distinct::{EliminateDistinct, PushDownDistinct};
-pub use exec::{ModelRegionExec, ModelRegionPlanner, RegionRunner};
+pub use exec::{InputRows, ModelRegionExec, ModelRegionPlanner, RegionRunner};
 pub use functions::{
     AI_FUNCTION_NAMES, arrow_functions, brace_structs, is_ai_call, normalize_ai_calls,
     quail_functions,

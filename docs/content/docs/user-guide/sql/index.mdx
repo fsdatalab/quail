@@ -72,5 +72,6 @@ a `DataFusionQuery`. It has the methods of a `Query`. `plan()` gives
 each region's physical plan, and `explain()` gives DataFusion's plan,
 then each region's.
 
-A CTE whose body groups or windows rows that a later model call reads
-runs as its own stage, and Quail runs that body.
+A CTE or FROM subquery whose body groups or windows rows that a later
+model call reads is computed by DataFusion between two model regions:
+the second region reads its rows as a table named by the CTE.

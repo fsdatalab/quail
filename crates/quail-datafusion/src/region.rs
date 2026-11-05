@@ -7,8 +7,11 @@ use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 
 /// Connected logical model work that Quail plans as one unit.
 ///
-/// The node is a leaf: the claimed operators are held in `plan`, not
-/// as inputs, so DataFusion's optimizer rules never rewrite them.
+/// The claimed operators are held in `plan`, not as inputs, so
+/// DataFusion's optimizer rules never rewrite them. The node's inputs
+/// are the relations DataFusion computes for the region: a CTE or FROM
+/// subquery that groups or windows rows, which `bound` reads as a table
+/// named in `input_names`.
 /// Quail's planner reads `plan` when the node is planned physically.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 pub struct ModelRegion {
@@ -24,6 +27,10 @@ pub struct ModelRegion {
     /// The names of the rules [`crate::OptimizeModelRegions`] ran, which
     /// the binder also runs on each CTE stage's body.
     pub rules: Vec<String>,
+    /// The relations DataFusion computes for the region, in order.
+    pub inputs: Vec<LogicalPlan>,
+    /// The table name `bound` reads each input by.
+    pub input_names: Vec<String>,
 }
 
 impl ModelRegion {
@@ -34,6 +41,8 @@ impl ModelRegion {
             plan,
             optimized: false,
             rules: Vec::new(),
+            inputs: Vec::new(),
+            input_names: Vec::new(),
         }
     }
 }
@@ -44,7 +53,7 @@ impl UserDefinedLogicalNodeCore for ModelRegion {
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
-        vec![]
+        self.inputs.iter().collect()
     }
 
     fn schema(&self) -> &DFSchemaRef {
@@ -60,7 +69,10 @@ impl UserDefinedLogicalNodeCore for ModelRegion {
         write!(f, "ModelRegion")
     }
 
-    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, _inputs: Vec<LogicalPlan>) -> Result<Self> {
-        Ok(self.clone())
+    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
+        Ok(Self {
+            inputs,
+            ..self.clone()
+        })
     }
 }

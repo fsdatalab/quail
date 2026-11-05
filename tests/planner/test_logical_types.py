@@ -54,14 +54,7 @@ TABLES = {
 }
 
 # Queries whose logical plans hold the node types quail-b's plans do not.
-# DataFusion runs a window over a model region's rows; a CTE's window
-# that a later AI operator reads runs in Quail.
 NODE_CASES = {
-    "Window": ("qwen3-4b-fp8",
-               "WITH w AS (SELECT r.id, r.body, ROW_NUMBER() OVER "
-               "(ORDER BY r.stars DESC) AS n FROM reviews r "
-               "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))) SELECT w.id FROM w "
-               "WHERE AI_FILTER(PROMPT('q2: {0}', w.body)) AND w.n <= 2"),
     "WithCTE": ("qwen3-4b-fp8",
                 "WITH clauses AS (SELECT c.id, AI.EXTRACT(c.text, "
                 "{'terms': 'What is the termination clause?'}) AS clause "

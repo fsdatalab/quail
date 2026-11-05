@@ -8,9 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use quail_physical::{
-    AggregateCall, Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct,
-    FilterPredicate, GetField, HavingTest, ModelCall, Not, Projected, RegularPredicate,
-    ScalarFunction, SortExpression, SortKey, TaggedModelCall, ValueExpression, WindowCall,
+    Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct, FilterPredicate, GetField,
+    ModelCall, Not, Projected, RegularPredicate, ScalarFunction, SortExpression, SortKey,
+    TaggedModelCall, ValueExpression,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,8 +21,8 @@ use crate::expressions::{
     tests, validate_condition,
 };
 use crate::logical::{
-    Aggregate, Filter, LogicalNode, LogicalPlan, Project, ResultNode, Scan, ScanColumn, Schema,
-    SemanticColumn, Unnest, Window,
+    Filter, LogicalNode, LogicalPlan, Project, ResultNode, Scan, ScanColumn, Schema,
+    SemanticColumn, Unnest,
 };
 use crate::nodes::{
     asked_call, equality_text, readable_columns, result_columns, validate_node, validate_plan,
@@ -94,15 +94,6 @@ pub struct PlaceRelationArguments {
     pub allow_relational: bool,
 }
 
-/// GROUP BY keys, the aggregates over each group, and the HAVING tests.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Aggregation {
-    pub keys: Vec<String>,
-    pub aggregates: Vec<AggregateCall>,
-    pub output: Vec<String>,
-    pub having: Vec<HavingTest>,
-}
-
 /// The arguments of `LogicalPlanBuilder.project`, other than the row tests.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,9 +103,7 @@ pub struct ProjectArguments {
     pub order: Vec<SortKey>,
     pub offset: i64,
     pub distinct: bool,
-    pub aggregation: Option<Aggregation>,
     pub structs: Vec<ExtractStruct>,
-    pub windows: Vec<WindowCall>,
     pub output: Vec<String>,
     pub unnests: Vec<Vec<String>>,
     pub unnest_outer: Vec<bool>,
@@ -418,15 +407,8 @@ impl LogicalPlanBuilder {
     ) -> Result<LogicalPlan, CompileError> {
         let root = self.root.clone();
         let columns = &arguments.columns;
-        let aggregation = arguments.aggregation.as_ref();
-        if columns.is_empty() && aggregation.is_none() {
+        if columns.is_empty() {
             return compile_error("Project needs at least one column");
-        }
-        if !arguments.structs.is_empty() && aggregation.is_some() {
-            return compile_error(
-                "GROUP BY does not read AI.EXTRACT struct columns; extract each field as its \
-                 own column",
-            );
         }
         if !arguments.structs.is_empty() && arguments.distinct {
             return compile_error(
@@ -435,13 +417,7 @@ impl LogicalPlanBuilder {
             );
         }
         let unnested: BTreeSet<String> = arguments.unnests.iter().flatten().cloned().collect();
-        check_feature_lists(
-            columns,
-            &arguments.order,
-            arguments.distinct,
-            aggregation,
-            &unnested,
-        )?;
+        check_feature_lists(columns, &arguments.order, arguments.distinct, &unnested)?;
         let reads_unnested = |expression: &ValueExpression| {
             column_references(expression)
                 .iter()
@@ -480,7 +456,7 @@ impl LogicalPlanBuilder {
             .map(|test| result_row_condition(test, &packing))
             .collect();
         let has_rows = !arguments.unnests.is_empty() || !row_tests.is_empty();
-        if has_rows && aggregation.is_none() {
+        if has_rows {
             for key in &arguments.order {
                 if let SortExpression::Value(expression) = &key.expression
                     && !column_references(expression).is_empty()
@@ -504,13 +480,7 @@ impl LogicalPlanBuilder {
             &outer,
         )?;
         if has_rows {
-            let selected: Vec<String> = if aggregation.is_some() || !arguments.windows.is_empty() {
-                columns
-                    .iter()
-                    .map(|column| column_name(column, true))
-                    .filter(|name| !unnested.contains(name))
-                    .collect()
-            } else if !arguments.unnests.is_empty() {
+            let selected: Vec<String> = if !arguments.unnests.is_empty() {
                 arguments.output.clone()
             } else {
                 returned
@@ -527,22 +497,6 @@ impl LogicalPlanBuilder {
                     )
                     .collect(),
                 structs: Vec::new(),
-            });
-        }
-        if let Some(aggregation) = aggregation {
-            node = LogicalNode::Aggregate(Aggregate {
-                input: Box::new(node),
-                keys: aggregation.keys.clone(),
-                aggregates: aggregation.aggregates.clone(),
-                output: aggregation.output.clone(),
-                having: aggregation.having.clone(),
-            });
-        }
-        if !arguments.windows.is_empty() {
-            node = LogicalNode::Window(Window {
-                input: Box::new(node),
-                calls: arguments.windows.clone(),
-                output: arguments.output.clone(),
             });
         }
         if arguments.limit.is_some()
@@ -651,7 +605,6 @@ fn check_feature_lists(
     columns: &[ValueExpression],
     order: &[SortKey],
     distinct: bool,
-    aggregation: Option<&Aggregation>,
     unnested: &BTreeSet<String>,
 ) -> Result<(), CompileError> {
     let names: BTreeSet<String> = columns
@@ -663,12 +616,11 @@ fn check_feature_lists(
     if names.is_empty() {
         return Ok(());
     }
-    if aggregation.is_some() || distinct {
-        return compile_error("GROUP BY and DISTINCT do not compare AI.SAE_FEATURES list columns");
+    if distinct {
+        return compile_error("DISTINCT does not compare AI.SAE_FEATURES list columns");
     }
     for key in order {
         let refused = match &key.expression {
-            SortExpression::Aggregate(aggregate) => names.contains(&aggregate.name),
             SortExpression::Value(expression) => {
                 let named = matches!(expression, ValueExpression::Alias(alias)
                     if names.contains(&alias.name));

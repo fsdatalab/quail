@@ -6,8 +6,7 @@
 //!
 //! - `EliminateDistinct` removes a `DISTINCT` that removes no row: the
 //!   SELECT list returns every table's id column, which each table
-//!   declares as its primary key, or every grouping key of an
-//!   aggregate.
+//!   declares as its primary key.
 //! - `PushDownDistinct` gives a one-table query's `SemanticFilter` the
 //!   selected columns as its stop key: the executor stops asking the
 //!   model about a document once a row with the same key has passed.
@@ -128,36 +127,14 @@ fn returned_columns(projection: &Projection) -> BTreeSet<(String, String)> {
 }
 
 fn removes_no_row(input: &LogicalPlan) -> bool {
-    match input {
-        LogicalPlan::Aggregate(aggregate) => true_for_keys(aggregate, None),
-        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
-            LogicalPlan::Aggregate(aggregate) => true_for_keys(aggregate, Some(projection)),
-            _ => {
-                let returned = returned_columns(projection);
-                match table_keys(&projection.input) {
-                    Some(keys) if !keys.is_empty() => keys.iter().all(|key| returned.contains(key)),
-                    _ => false,
-                }
-            }
-        },
-        _ => false,
-    }
-}
-
-/// Whether the SELECT list, if any, returns every grouping key.
-fn true_for_keys(
-    aggregate: &datafusion::logical_expr::Aggregate,
-    projection: Option<&Projection>,
-) -> bool {
-    let Some(projection) = projection else {
-        return true;
+    let LogicalPlan::Projection(projection) = input else {
+        return false;
     };
     let returned = returned_columns(projection);
-    (0..aggregate.group_expr.len()).all(|index| {
-        let (qualifier, field) = aggregate.schema.qualified_field(index);
-        let qualifier = qualifier.map(|q| q.table().to_string()).unwrap_or_default();
-        returned.contains(&(qualifier, field.name().clone()))
-    })
+    match table_keys(&projection.input) {
+        Some(keys) if !keys.is_empty() => keys.iter().all(|key| returned.contains(key)),
+        _ => false,
+    }
 }
 
 /// (alias, id column) of each table the plan scans, or None when a

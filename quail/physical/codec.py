@@ -22,7 +22,6 @@ import pyarrow as pa
 
 from .base import PhysicalGraph, PhysicalNode, PortRef
 from .nodes import (
-    Aggregate,
     AiClassify,
     AiExtract,
     AiFilter,
@@ -41,7 +40,6 @@ from .nodes import (
     Scan,
     Sort,
     Unnest,
-    Window,
 )
 
 TYPE_KEY = "type"
@@ -275,9 +273,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         AiJoin,
         Recombine,
         Project,
-        Aggregate,
         Sort,
-        Window,
         Limit,
         Unnest,
     ))

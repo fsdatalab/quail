@@ -26,9 +26,9 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{IntoPyDict, PyBytes};
 use quail_datafusion::{
-    ModelRegion, RegionRunner, bind, quail_column_names, quail_schema, region_sql, sql,
+    InputRows, ModelRegion, RegionRunner, bind, quail_column_names, quail_schema, region_sql, sql,
 };
 use quail_planner::prompts::Turn;
 use tokio::runtime::Runtime;
@@ -63,11 +63,22 @@ impl PythonRunner {
 }
 
 impl RegionRunner for PythonRunner {
-    fn run(&self, region: &ModelRegion) -> Result<Vec<RecordBatch>> {
+    fn run(&self, region: &ModelRegion, inputs: &[InputRows]) -> Result<Vec<RecordBatch>> {
         let (kind, payload) = self.request(region)?;
+        // each input as IPC stream bytes, by the table name the region reads
+        let mut tables: Vec<(String, Vec<u8>)> = Vec::new();
+        for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
+            let schema = Arc::new(input.schema().as_arrow().clone());
+            tables.push((name.clone(), write_ipc(&schema, batches)?));
+        }
         let bytes: Vec<u8> = Python::attach(|py| {
+            let tables: Vec<(String, Bound<'_, PyBytes>)> = tables
+                .iter()
+                .map(|(name, bytes)| (name.clone(), PyBytes::new(py, bytes)))
+                .collect();
+            let tables = tables.into_py_dict(py)?;
             self.run_region
-                .call1(py, (kind, payload))
+                .call1(py, (kind, payload, tables))
                 .and_then(|answer| answer.extract::<Vec<u8>>(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;

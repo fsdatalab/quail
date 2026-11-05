@@ -71,3 +71,19 @@ def test_windows_run_in_datafusion_on_the_model_regions_rows(session):
     stock.register("steps", session.catalog.get("steps"))
     with stock:
         assert not isinstance(stock.sql(NUMBERED).plan(), Refusal)
+
+
+def test_a_window_a_later_model_call_reads_runs_in_datafusion_between_regions(session):
+    query = session.sql(
+        "WITH w AS (SELECT s.id, s.text, "
+        "ROW_NUMBER() OVER (ORDER BY s.step_index, s.id) AS n FROM steps s "
+        "WHERE AI_FILTER(PROMPT('q: {0}', s.text))) "
+        "SELECT w.id, w.n FROM w WHERE AI_FILTER(PROMPT('later: {0}', w.text)) "
+        "AND w.n <= 2 ORDER BY w.n")
+    # the inner filter's region feeds DataFusion's window, whose rows the
+    # outer region reads as the table w
+    assert "WindowAggr:" in query.explain()
+    # 'q:' drops "one"; the window numbers the rest by step_index
+    rows = _run(query, oracle_executor(Oracle(
+        filters=lambda alias, document, position: document != 0 or alias != "s")))
+    assert rows.to_rows() == [("s1", 1), ("s2", 2)]

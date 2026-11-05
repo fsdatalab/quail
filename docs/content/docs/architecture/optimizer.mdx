@@ -114,13 +114,11 @@ physical rules rewrite Quail's executable graphs.
 
 | Rule | Kind | Decision | Uses cost estimates |
 | --- | --- | --- | --- |
-| `eliminate_distinct` | Logical | Remove DISTINCT when the SELECT list returns every table's id column or every grouping key. | No |
+| `eliminate_distinct` | Logical | Remove DISTINCT when the SELECT list returns every table's id column. | No |
 | `place_semantic_nodes` | Logical | Move each model operator to the tables it reads and order each table's operators. | No |
 | `push_down_distinct` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `push_down_filter` | Logical | DataFusion's rule: move plain filters to the scans. | No |
 | `optimize_projections` | Logical | DataFusion's rule: drop columns no operator reads. | No |
-| `should_eliminate_window_sort` | Physical | Remove a final sort when the window already returns rows in that order. | No |
-| `should_push_down_limit_through_window` | Physical | Select the first requested rows before computing an eligible window. | No |
 | `should_push_down_limit` | Physical | Stop an eligible filter sequence after enough documents pass. | No |
 | `choose_classify_implementation` | Physical | Choose a classification's label scoring method. | Yes |
 | `should_retain_kv` | Physical | Keep selected document KV for later operators. | No |
@@ -236,63 +234,16 @@ the planner preserves join order and chooses only the unspecified anchors.
 ## Physical rules
 
 Physical rules rewrite the execution graph and choose its settings.
-Window rules remove work without comparing costs. GPU settings also
-depend on the model, device, and available memory.
-
-### Window rules
-
-Window functions compute values from related result rows after AI
-operators finish. See [Window functions](/docs/user-guide/sql/sql-functions#window-functions)
-for the supported functions and syntax.
-
-#### Remove a repeated sort
-
-`should_eliminate_window_sort` removes a final `Sort` when the preceding
-`Window` already returns rows in exactly the requested order.
-
-For example, imagine a query that numbers reviews with
-`ROW_NUMBER() OVER (ORDER BY r.id)` and ends with `ORDER BY r.id`.
-The window sorts the reviews by ID, so the final sort can be removed.
-
-- The sort keys must match the last window call's partition keys followed
-  by its order keys, including direction and null placement. Partition
-  keys are sorted ascending with nulls last.
-- The `Sort` must directly follow the `Window` and be the graph's final
-  node. A sort that also applies `DISTINCT`, `OFFSET`, or `LIMIT` remains.
-
-Window calls with the same partition and order share one sort during
-execution. The window runtime handles that reuse; it is not a separate
-optimizer rule.
-
-#### Apply a limit before window computation
-
-`should_push_down_limit_through_window` moves a final `Limit` before an
-eligible `Window`. It first sorts the input and selects the requested
-number of rows, then computes window values for those rows.
-
-For example, imagine a query that filters reviews with `AI.IF`, numbers
-them by ID with `ROW_NUMBER`, and requests ten rows. Quail can select
-the first ten passing reviews by ID before assigning their row numbers.
-
-- Every window call must use the same nonempty order and have no
-  partition keys.
-- No call may use `LEAD`, because its last returned row may need a value
-  from a row beyond the limit.
-- The graph must end in a `Limit` directly after the `Window`. A query
-  with an outer `ORDER BY`, `DISTINCT`, or `OFFSET` ends in a `Sort`
-  instead and does not qualify for this rule.
-
-The limit reduces the rows used in window computation. It does not
-stop the AI operators early; they still evaluate the input needed to
-find the first rows in the window's order.
+GPU settings also depend on the model, device, and available memory.
+DataFusion runs windows and aggregates on a region's rows, so no
+physical rule handles them.
 
 ### Stop filters after enough rows pass
 
 `should_push_down_limit` lets the executor stop admitting documents once
 enough rows pass the query's AI filters. The rule requires a single
-pipeline and a final `Limit`. Joins, sorts, aggregates, and windows
-prevent this optimization because they need more than the first
-passing documents.
+pipeline and a final `Limit`. Joins and sorts prevent this
+optimization because they need more than the first passing documents.
 
 ### Execution limits
 

@@ -14,7 +14,11 @@ use quail_datafusion::{ModelRegion, RegionRunner, session_context, sql};
 struct NotRun;
 
 impl RegionRunner for NotRun {
-    fn run(&self, _region: &ModelRegion) -> Result<Vec<RecordBatch>> {
+    fn run(
+        &self,
+        _region: &ModelRegion,
+        _inputs: &[quail_datafusion::InputRows],
+    ) -> Result<Vec<RecordBatch>> {
         exec_err!("planning tests do not run model regions")
     }
 }

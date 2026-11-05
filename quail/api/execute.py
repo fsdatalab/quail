@@ -139,10 +139,20 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
 
     results = []
 
-    def run_region(kind, _payload):
+    def run_region(kind, _payload, tables=None):
         if kind != "plan" or results:
             raise RuntimeError("the query's one model region runs once, as a plan")
-        result = _execute_region(query, physical_executor, plan,
+        region = query
+        if tables:
+            from quail.api.region_inputs import region_query
+
+            if plan is not None:
+                raise RuntimeError("a region that reads DataFusion's rows is "
+                                   "planned when they exist; it takes no edited plan")
+            # plan the region again over the rows DataFusion produced
+            region = region_query(query.session, query._logical_input,
+                                  order=query.order, tables=tables)
+        result = _execute_region(region, physical_executor, plan,
                                  on_backend_ready, on_execution_ready)
         results.append(result)
         return ipc_bytes(result.collect())

@@ -119,13 +119,7 @@ fn refuse_unpriced(plan: &LogicalPlan, found: &Operators) -> Result<(), CompileE
             }
             LogicalNode::Result(result)
                 if result.limit.is_some()
-                    && !(!result.order.is_empty()
-                        || result.distinct
-                        || result.offset != 0
-                        || matches!(
-                            result.input.as_ref(),
-                            LogicalNode::Aggregate(_) | LogicalNode::Window(_)
-                        )) =>
+                    && !(!result.order.is_empty() || result.distinct || result.offset != 0) =>
             {
                 return not_priced("the speed of light estimate does not price LIMIT");
             }

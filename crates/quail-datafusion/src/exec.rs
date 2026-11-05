@@ -25,13 +25,17 @@ use futures::stream;
 
 use crate::region::ModelRegion;
 
+/// The rows of one region input: its table name and its batches.
+pub type InputRows = (String, Vec<RecordBatch>);
+
 /// Plans and runs one model region, returning its rows.
 ///
 /// Quail's executor implements this trait. The call blocks until the
-/// region's rows are ready, so it runs on a blocking thread.
+/// region's rows are ready.
 pub trait RegionRunner: fmt::Debug + Send + Sync {
-    /// Plan and run the region, returning rows in the region's schema.
-    fn run(&self, region: &ModelRegion) -> Result<Vec<RecordBatch>>;
+    /// Plan and run the region over its inputs' rows, returning rows in
+    /// the region's schema.
+    fn run(&self, region: &ModelRegion, inputs: &[InputRows]) -> Result<Vec<RecordBatch>>;
 }
 
 /// The physical operator for one model region.
@@ -39,13 +43,20 @@ pub trait RegionRunner: fmt::Debug + Send + Sync {
 pub struct ModelRegionExec {
     region: ModelRegion,
     runner: Arc<dyn RegionRunner>,
+    /// The physical plans of the region's inputs, in order.
+    inputs: Vec<Arc<dyn ExecutionPlan>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
 
 impl ModelRegionExec {
-    /// Create the operator for a region, run by the given runner.
-    pub fn new(region: ModelRegion, runner: Arc<dyn RegionRunner>) -> Self {
+    /// Create the operator for a region, run by the given runner over the
+    /// rows of `inputs`, the physical plans of the region's inputs.
+    pub fn new(
+        region: ModelRegion,
+        runner: Arc<dyn RegionRunner>,
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Self {
         let schema = Arc::clone(region.bound.schema().inner());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -56,6 +67,7 @@ impl ModelRegionExec {
         Self {
             region,
             runner,
+            inputs,
             schema,
             properties: Arc::new(properties),
         }
@@ -88,7 +100,7 @@ impl ExecutionPlan for ModelRegionExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        self.inputs.iter().collect()
     }
 
     fn apply_expressions(
@@ -100,10 +112,14 @@ impl ExecutionPlan for ModelRegionExec {
 
     fn replace_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
         _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
+        Ok(Arc::new(Self::new(
+            self.region.clone(),
+            Arc::clone(&self.runner),
+            children,
+        )))
     }
 
     fn with_new_children(
@@ -119,18 +135,25 @@ impl ExecutionPlan for ModelRegionExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
             return internal_err!("ModelRegionExec has one partition, got {partition}");
         }
         let region = self.region.clone();
         let runner = Arc::clone(&self.runner);
+        let inputs = self.inputs.clone();
         // the region runs on the thread that polls the stream: under a
         // current-thread runtime, the thread that called DataFusion, so a
         // runner's per-thread state (Python's, the GPU process's) is reused
         let rows = async move {
-            let batches = runner.run(&region)?;
+            let mut rows: Vec<InputRows> = Vec::new();
+            for (name, input) in region.input_names.iter().zip(inputs) {
+                let batches =
+                    datafusion::physical_plan::collect(input, Arc::clone(&context)).await?;
+                rows.push((name.clone(), batches));
+            }
+            let batches = runner.run(&region, &rows)?;
             Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
         };
         let batches = futures::TryStreamExt::try_flatten(stream::once(rows));
@@ -162,7 +185,7 @@ impl ExtensionPlanner for ModelRegionPlanner {
         _planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
-        _physical_inputs: &[Arc<dyn ExecutionPlan>],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
         _session: &dyn Session,
         _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
@@ -172,6 +195,7 @@ impl ExtensionPlanner for ModelRegionPlanner {
         Ok(Some(Arc::new(ModelRegionExec::new(
             region.clone(),
             Arc::clone(&self.runner),
+            physical_inputs.to_vec(),
         ))))
     }
 }

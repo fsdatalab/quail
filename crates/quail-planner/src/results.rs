@@ -2,9 +2,8 @@
 //! `quail/planner/graph/results.py` builds them.
 
 use quail_physical::{
-    AggregateAttributes, FilterAttributes, LimitAttributes, Node, PhysicalNode, PortRef,
-    ProjectAttributes, Projected, SortAttributes, SortExpression, UnnestAttributes,
-    WindowAttributes, input_ports, port,
+    FilterAttributes, LimitAttributes, Node, PhysicalNode, PortRef, ProjectAttributes, Projected,
+    SortAttributes, SortExpression, UnnestAttributes, input_ports, port,
 };
 use serde_json::Value;
 
@@ -49,31 +48,15 @@ fn node<A>(id: &str, inputs: &[PortRef], attributes: A) -> Node<A> {
 ///
 /// # Panics
 ///
-/// The root's input is not a projection, an aggregation, or a window
-/// over one.
+/// The root's input is not a projection.
 pub fn result_nodes(
     root: &ResultNode,
     inputs: &[PortRef],
     columns: &[String],
     structs: &[(String, Vec<(String, String)>)],
 ) -> Vec<PhysicalNode> {
-    let window = match root.input.as_ref() {
-        LogicalNode::Window(window) => Some(window),
-        _ => None,
-    };
-    let below: &LogicalNode = match window {
-        Some(window) => &window.input,
-        None => &root.input,
-    };
-    let aggregation = match below {
-        LogicalNode::Aggregate(aggregate) => Some(aggregate),
-        _ => None,
-    };
     let mut chain: Vec<&LogicalNode> = Vec::new();
-    let mut walked: &LogicalNode = match aggregation {
-        Some(aggregate) => &aggregate.input,
-        None => below,
-    };
+    let mut walked: &LogicalNode = &root.input;
     loop {
         let next = match walked {
             LogicalNode::Unnest(unnest) => &unnest.input,
@@ -89,9 +72,8 @@ pub fn result_nodes(
         chain.insert(0, walked);
         walked = next;
     }
-    // with an aggregation the sort keys name its outputs, not inputs
     let mut hidden: Vec<String> = Vec::new();
-    if chain.is_empty() && aggregation.is_none() {
+    if chain.is_empty() {
         for key in &root.order {
             let name = sort_name(&key.expression);
             if !columns.contains(&name) && !hidden.contains(&name) {
@@ -134,27 +116,18 @@ pub fn result_nodes(
             LogicalNode::Project(project) => {
                 let node_id = format!("project_{index}");
                 let mut expressions = project.columns.clone();
-                if aggregation.is_none() {
-                    let available = result_columns(&project.input);
-                    let window_names: Vec<&String> = window
-                        .map(|window| window.calls.iter().map(|call| &call.name).collect())
-                        .unwrap_or_default();
-                    for key in &root.order {
-                        let name = sort_name(&key.expression);
-                        if result.contains(&name) || window_names.contains(&&name) {
-                            continue;
-                        }
-                        expressions.push(if available.contains(&name) {
-                            Projected::Name(name)
-                        } else {
-                            match &key.expression {
-                                SortExpression::Value(value) => {
-                                    Projected::Expression(value.clone())
-                                }
-                                SortExpression::Aggregate(_) => Projected::Name(name),
-                            }
-                        });
+                let available = result_columns(&project.input);
+                for key in &root.order {
+                    let name = sort_name(&key.expression);
+                    if result.contains(&name) {
+                        continue;
                     }
+                    expressions.push(if available.contains(&name) {
+                        Projected::Name(name)
+                    } else {
+                        let SortExpression::Value(value) = &key.expression;
+                        Projected::Expression(value.clone())
+                    });
                 }
                 nodes.push(PhysicalNode::Project(node(
                     &node_id,
@@ -185,54 +158,6 @@ pub fn result_nodes(
             _ => unreachable!("the chain holds unnests, filters, and projects"),
         };
         rows = port(&node_id, "rows");
-    }
-    if let Some(aggregation) = aggregation {
-        nodes.push(PhysicalNode::Aggregate(node(
-            "aggregate",
-            std::slice::from_ref(&rows),
-            AggregateAttributes {
-                keys: aggregation.keys.clone(),
-                aggregates: aggregation
-                    .aggregates
-                    .iter()
-                    .map(|a| (a.name.clone(), a.function.clone(), a.argument.clone()))
-                    .collect(),
-                having: aggregation
-                    .having
-                    .iter()
-                    .map(|test| {
-                        (
-                            test.aggregate.name.clone(),
-                            test.comparison.clone(),
-                            test.value.clone(),
-                        )
-                    })
-                    .collect(),
-                columns: aggregation.output.clone(),
-            },
-        )));
-        rows = port("aggregate", "rows");
-        result = aggregation.output.clone();
-    }
-    if let Some(window) = window {
-        // the sort keys no window output names pass through to the Sort
-        let mut columns = window.output.clone();
-        for key in &root.order {
-            let name = sort_name(&key.expression);
-            if !window.output.contains(&name) {
-                columns.push(name);
-            }
-        }
-        nodes.push(PhysicalNode::Window(node(
-            "window",
-            std::slice::from_ref(&rows),
-            WindowAttributes {
-                calls: window.calls.clone(),
-                columns,
-            },
-        )));
-        rows = port("window", "rows");
-        result = window.output.clone();
     }
     if !root.order.is_empty() || root.distinct || root.offset != 0 {
         nodes.push(PhysicalNode::Sort(node(

@@ -4,8 +4,8 @@
 //! its inputs nested in its fields.
 
 use quail_physical::{
-    AggregateCall, Asked, Condition, Equality, ExtractStruct, FilterPredicate, HavingTest,
-    Projected, SortKey, TaggedModelCall, ValueExpression, WindowCall, tagged_struct,
+    Asked, Condition, Equality, ExtractStruct, FilterPredicate, Projected, SortKey,
+    TaggedModelCall, ValueExpression, tagged_struct,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,12 +47,6 @@ pub enum LogicalNode {
     /// The query's returned columns.
     #[serde(rename = "quail.logical.nodes.relational.Project")]
     Project(Project),
-    /// A `GROUP BY`.
-    #[serde(rename = "quail.logical.nodes.relational.Aggregate")]
-    Aggregate(Aggregate),
-    /// Window function calls.
-    #[serde(rename = "quail.logical.nodes.relational.Window")]
-    Window(Window),
     /// `ORDER BY`, `DISTINCT`, `OFFSET`, and `LIMIT`.
     #[serde(rename = "quail.logical.nodes.relational.Result")]
     Result(ResultNode),
@@ -130,24 +124,6 @@ pub struct Project {
     /// Value expressions, Aliases, and the names of columns an unnest adds.
     pub columns: Vec<Projected>,
     pub structs: Vec<ExtractStruct>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Aggregate {
-    pub input: Box<LogicalNode>,
-    pub keys: Vec<String>,
-    pub aggregates: Vec<AggregateCall>,
-    pub output: Vec<String>,
-    pub having: Vec<HavingTest>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Window {
-    pub input: Box<LogicalNode>,
-    pub calls: Vec<WindowCall>,
-    pub output: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

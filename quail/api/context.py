@@ -126,9 +126,12 @@ class SessionContext:
         """Return DataFusion's optimized logical plan for a query."""
         return self._native.explain(text, DATAFUSION_DIALECTS[dialect])
 
-    def _run_region(self, kind: str, payload: str) -> bytes:
-        query = (Query(self.session, decode_value(LogicalPlan, json.loads(payload)),
-                       order=self._order)
+    def _run_region(self, kind: str, payload: str, tables: dict | None = None) -> bytes:
+        from quail.api.region_inputs import region_query
+
+        query = (region_query(self.session,
+                              decode_value(LogicalPlan, json.loads(payload)),
+                              order=self._order, tables=tables)
                  if kind == "plan" else self.session.sql(payload, order=self._order))
         result = execute_query(query, physical_executor=self._physical_executor)
         return ipc_bytes(result.collect())
@@ -163,8 +166,10 @@ class DataFusionQuery:
         bound, _ = self._context()._native.logical_plans(
             self.text, tuple(model.turn), model.prompt_layout,
             DATAFUSION_DIALECTS[self.dialect])
-        return [Query(self.session, decode_value(LogicalPlan, json.loads(plan)),
-                      order=self.order)
+        from quail.api.region_inputs import region_query
+
+        return [region_query(self.session, decode_value(LogicalPlan, json.loads(plan)),
+                             order=self.order)
                 for plan, message in bound if message is None]
 
     def plan(self) -> tuple:

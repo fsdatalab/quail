@@ -58,11 +58,6 @@ TABLES = {
 
 # Queries whose plans hold the node types quail-b's plans do not.
 NODE_CASES = {
-    "quail.window": ("qwen3-4b-fp8", 1,
-                     "WITH w AS (SELECT r.id, r.body, ROW_NUMBER() OVER "
-                     "(ORDER BY r.stars DESC) AS n FROM reviews r "
-                     "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))) SELECT w.id FROM w "
-                     "WHERE AI_FILTER(PROMPT('q2: {0}', w.body)) AND w.n <= 2"),
     "quail.limit": ("qwen3-4b-fp8", 1,
                     "SELECT r.id FROM reviews r "
                     "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) LIMIT 2"),

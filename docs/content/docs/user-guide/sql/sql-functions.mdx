@@ -404,9 +404,12 @@ that Quail classifies.
 
 ### Aggregate functions
 
-Functions that take a column ignore null values. The column can contain
-stored values or AI outputs. An aggregate can also take an
-`AI.SCORE` call directly. Without `GROUP BY`, aggregates operate on all
+DataFusion runs `GROUP BY`, `HAVING`, and the aggregates on the rows
+the model region returns, so every DataFusion aggregate function works.
+The entries below are the common ones. Functions that take a column
+ignore null values. The column can contain stored values or AI outputs.
+An aggregate can also take an AI call directly, such as
+`AVG(AI.SCORE(...))`. Without `GROUP BY`, aggregates operate on all
 rows that pass `WHERE`.
 
 For example, the aggregate entries below use a group of four reviews
@@ -495,9 +498,11 @@ AI output defined earlier in `SELECT`.
 
 ### Supported functions
 
-`SUM` treats null values as zero, including when every value so far is
-null. `LAG` and `LEAD` preserve null values in the neighboring row.
-Rows with null partition keys belong to the same partition.
+DataFusion runs windows on the rows the model region returns, so every
+DataFusion window function and frame works. The entries below are the
+common ones. `SUM` returns null while every value so far is null. `LAG`
+and `LEAD` preserve null values in the neighboring row. Rows with null
+partition keys belong to the same partition.
 
 For example, the window entries below use one run with `s.cost` values
 `2`, `NULL`, and `5`, in `s.step_index` order. Each expression uses
@@ -542,26 +547,14 @@ Counts non-null values through the current row.
 
 ### Window limits
 
-- Windows require the Quail backend. They run after AI functions, so
-  adding `LIMIT` does not stop model evaluation early.
-- `LAG` and `LEAD` require `ORDER BY` inside `OVER`. They read only the
-  immediately preceding or following row. Offset and default arguments
-  are unsupported.
-- Each window call must be a separate `SELECT` item with an `AS` name.
-  Arithmetic around a window call is unsupported.
-- `SUM` and `COUNT` accumulate one row at a time. Explicit `ROWS` or
-  `RANGE` frames are unsupported.
-- A query cannot combine windows with `GROUP BY` or ordinary aggregates.
-  `QUALIFY` and window functions other than those listed above are
-  unsupported.
-
-See [Window rules](/docs/architecture/optimizer#window-rules) for sort
-reuse and limit placement.
+- A window runs after the AI functions it reads, so a `LIMIT` above it
+  does not stop model evaluation early.
+- A window whose result a later AI function reads goes in a CTE or
+  FROM subquery. DataFusion computes it between the two model regions.
 
 ## Unsupported SQL
 
-- `QUALIFY` and window functions outside the [supported list](#supported-functions)
-- `UNION`, `EXCEPT`, `INTERSECT`
+- `QUALIFY`
 - `WITH RECURSIVE`
 - `OR` between conditions
 - `BETWEEN` and arithmetic in column comparisons

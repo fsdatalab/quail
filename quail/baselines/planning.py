@@ -24,8 +24,6 @@ from quail.logical import (
     has_extract,
     has_label,
 )
-from quail.logical import Aggregate as LogicalAggregate
-from quail.logical import Window as LogicalWindow
 from quail.physical import (
     Limit,
     PortRef,
@@ -194,11 +192,10 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
     root = region.logical_plan.result
     projected = {column_name(column)
                  for column in region.logical_plan.projection.columns}
-    if any(key.name not in projected for key in root.order) \
-            or isinstance(root.input, (LogicalAggregate, LogicalWindow)):
+    if any(key.name not in projected for key in root.order):
         return Refusal(
-            reasons=("GROUP BY, window functions, and ORDER BY on a column "
-                     "the query does not return run on the Quail backend only",),
+            reasons=("ORDER BY on a column the query does not return runs on "
+                     "the Quail backend only",),
             constraint="sort_needs_quail_backend",
             needed=1, available=0, unit="backends")
     operators = region.logical_plan.operators()

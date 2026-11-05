@@ -142,18 +142,18 @@ Nodes are frozen dataclasses. Rewrites use `with_children()`,
 | `Filter(input, condition, selectivity)` | Keep rows that satisfy a condition on a label, extracted answer, or answer position. |
 | `Apply(input, function, kind, ids, columns, aliases)` | Run a registered Python function on input rows or pairs. |
 | `Project(input, columns, structs)` | Select values and assemble extraction structs. |
-| `Aggregate(input, keys, aggregates, output, having)` | Group projected rows and compute aggregate values. |
-| `Window(input, calls, output)` | Add window values to projected rows, preserving individual rows. |
 | `Result(input, limit, order, offset, distinct)` | Set result order, remove duplicates, and apply an offset and limit. This is the root node. |
 
 A query joining three or more tables uses one `SemanticJoin` for each
 binary join. A classification may read one document or both documents
 of a joined pair. Conditions on labels of joined pairs are unsupported.
 
-A window query places `Window` between `Project` and `Result`. The
-projection supplies source columns and AI outputs used by the window.
-The window adds values such as a previous row's label or a running
-sum. `Result` specifies the final row order and limit.
+GROUP BY, HAVING, and windows have no node here: DataFusion runs them
+on the rows a model region returns, or computes them as a region's
+input. For example, a CTE that numbers a filter's survivors with
+`ROW_NUMBER()`, read by a second AI filter, becomes two regions: the
+first filter, then DataFusion's window, then the second filter, which
+reads the window's rows as a table named by the CTE.
 
 ## Expressions
 
@@ -170,7 +170,6 @@ operation.
 | `RegularPredicate(expression, comparison, value)` | A condition on a value, such as `length(r.body) < 40`. |
 | `ModelCall(prompt, kind, labels, descriptions)` | An AI operation. The kind is `boolean`, `score`, `label`, or `extract`. |
 | `Alias(expression, name)` | An expression returned under a specified column name. |
-| `WindowCall(function, argument, partition, order, name)` | A window function with its input column, partition keys, order keys, and output name. |
 
 For example, `LENGTH(r.details.body)` reads the `details` column,
 selects its `body` field, and computes the text length. Its expression is:

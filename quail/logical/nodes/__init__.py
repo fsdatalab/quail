@@ -13,10 +13,8 @@ from quail.logical.nodes.filter import Filter, SemanticFilter, above_projection
 from quail.logical.nodes.join import Join, SemanticJoin
 from quail.logical.nodes.map import SemanticMap
 from quail.logical.nodes.relational import (
-    Aggregate,
     Project,
     Result,
-    Window,
     reads_projection,
 )
 from quail.logical.nodes.sae_features import (
@@ -29,8 +27,6 @@ from quail.logical.nodes.with_cte import WithCTE
 
 __all__ = [
     "FEATURE_LIST",
-    "Aggregate",
-    "Window",
     "above_projection",
     "reads_projection",
     "Filter",

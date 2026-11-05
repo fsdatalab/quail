@@ -20,7 +20,6 @@ from .codec import (
     plan_envelope,
 )
 from .nodes import (
-    Aggregate,
     AiClassify,
     AiExtract,
     AiFilter,
@@ -46,12 +45,10 @@ from .nodes import (
     ScoreSpec,
     Sort,
     Unnest,
-    Window,
 )
 
 __all__ = [
     "AnswerOutput",
-    "Aggregate",
     "AiClassify",
     "AiExtract",
     "AiInference",
@@ -78,7 +75,6 @@ __all__ = [
     "MapSpec",
     "Unnest",
     "Sort",
-    "Window",
     "NodeCodec",
     "OutputPort",
     "AiFilter",

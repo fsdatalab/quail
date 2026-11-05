@@ -172,18 +172,6 @@ pub struct Connective {
     pub operands: Vec<Condition>,
 }
 
-tagged_struct! {
-    /// One window function call.
-    WindowCall(WindowCallFields, WindowCallTagged) = "quail.common.expressions.WindowCall" | "quail.logical.expressions.WindowCall" {
-        function: String,
-        argument: Option<String>,
-        partition: Vec<String>,
-        /// Sort keys: column, descending, nulls first.
-        order: Vec<(String, bool, bool)>,
-        name: String,
-    }
-}
-
 /// A value expression or a column name, as a projection lists them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -237,30 +225,11 @@ tagged_struct! {
     }
 }
 
-tagged_struct! {
-    /// One aggregate function call.
-    AggregateCall(AggregateCallFields, AggregateCallTagged) = "quail.common.expressions.AggregateCall" | "quail.logical.expressions.AggregateCall" {
-        function: String,
-        argument: Option<String>,
-        name: String,
-    }
-}
-
-tagged_struct! {
-    /// One `HAVING` comparison of an aggregate with a constant.
-    HavingTest(HavingTestFields, HavingTestTagged) = "quail.common.expressions.HavingTest" | "quail.logical.expressions.HavingTest" {
-        aggregate: AggregateCall,
-        comparison: String,
-        value: Value,
-    }
-}
-
 /// What a sort key orders by.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SortExpression {
     Value(ValueExpression),
-    Aggregate(AggregateCall),
 }
 
 tagged_struct! {

@@ -111,8 +111,6 @@ fn input_mut(node: &mut LogicalNode) -> &mut LogicalNode {
         LogicalNode::Filter(found) => &mut found.input,
         LogicalNode::SemanticJoin(found) => &mut found.input,
         LogicalNode::Project(found) => &mut found.input,
-        LogicalNode::Aggregate(found) => &mut found.input,
-        LogicalNode::Window(found) => &mut found.input,
         LogicalNode::Result(found) => &mut found.input,
         LogicalNode::Unnest(found) => &mut found.input,
         LogicalNode::WithCte(found) => &mut found.input,
@@ -189,7 +187,6 @@ fn equality_refs(equality: &Equality) -> Vec<ColumnRef> {
 fn sort_refs(key: &SortKey) -> Vec<ColumnRef> {
     match &key.expression {
         SortExpression::Value(value) => value_refs(value),
-        SortExpression::Aggregate(_) => Vec::new(),
     }
 }
 
@@ -381,12 +378,7 @@ fn column_sequence(node: &LogicalNode) -> (LogicalNode, Vec<LogicalNode>) {
 pub fn lift_column_operators(root: &LogicalNode) -> Option<LogicalNode> {
     let is_project_over_rows =
         matches!(root, LogicalNode::Project(project) if above_projection(&project.input));
-    if matches!(
-        root,
-        LogicalNode::Result(_) | LogicalNode::Aggregate(_) | LogicalNode::Window(_)
-    ) || above_projection(root)
-        || is_project_over_rows
-    {
+    if matches!(root, LogicalNode::Result(_)) || above_projection(root) || is_project_over_rows {
         let rewritten = lift_column_operators(input(root))?;
         return Some(with_children(root, vec![rewritten]));
     }

@@ -1,4 +1,4 @@
-"""The Project, Aggregate, Window, and Result nodes."""
+"""The Project and Result nodes."""
 
 from __future__ import annotations
 
@@ -7,15 +7,11 @@ from typing import ClassVar
 
 from quail.common.expressions import (
     FEATURE_LIST,
-    AggregateCall,
-    Aggregation,
     Alias,
     ColumnRef,
     CompileError,
     ExtractStruct,
-    HavingTest,
     SortKey,
-    WindowCall,
     _explain,
     aliased_call,
     column_name,
@@ -137,114 +133,6 @@ class Project:
 
 
 @dataclass(frozen=True)
-class Aggregate:
-    """Group projected or unnested rows and compute aggregate outputs."""
-
-    input: LogicalNode
-    keys: tuple[str, ...]
-    aggregates: tuple[AggregateCall, ...]
-    output: tuple[str, ...]
-    having: tuple[HavingTest, ...] = ()
-    type_name: ClassVar[str] = "quail.logical_aggregate"
-
-    def children(self) -> tuple[LogicalNode, ...]:
-        return (self.input,)
-
-    def expressions(self) -> tuple:
-        return (*self.keys, *self.aggregates, *self.having)
-
-    def output_schema(self) -> tuple[ColumnRef, ...]:
-        return _named_schema(self.input, self.output)
-
-    def validate(self) -> None:
-        if not reads_projection(self.input):
-            raise CompileError("Aggregate needs projected input columns")
-        self.specification().validate(self.input.result_columns())
-
-    def specification(self) -> Aggregation:
-        """Return the grouping expressions and requested outputs."""
-        return Aggregation(self.keys, self.aggregates, self.output, self.having)
-
-    def result_columns(self) -> tuple[str, ...]:
-        """Return the group keys and aggregate names in output order."""
-        return self.output
-
-    def with_children(self, children: tuple[LogicalNode, ...]) -> "Aggregate":
-        if len(children) != 1:
-            raise CompileError("Aggregate needs one child")
-        return replace(self, input=children[0])
-
-    def with_expressions(self, expressions: tuple) -> "Aggregate":
-        if len(expressions) != len(self.expressions()):
-            raise CompileError("Aggregate expression count must stay the same")
-        keys_end = len(self.keys)
-        aggregates_end = keys_end + len(self.aggregates)
-        return replace(
-            self,
-            keys=expressions[:keys_end],
-            aggregates=expressions[keys_end:aggregates_end],
-            having=expressions[aggregates_end:],
-        )
-
-    def explain_fields(self) -> dict:
-        return {"aggregation": str(self.specification())}
-
-
-@dataclass(frozen=True)
-class Window:
-    """Compute window functions over projected or aggregated rows.
-
-    ``output`` lists the result columns in SELECT order: input columns
-    and window names. An input column no window output names is read
-    by a window only.
-    """
-
-    input: LogicalNode
-    calls: tuple[WindowCall, ...]
-    output: tuple[str, ...]
-    type_name: ClassVar[str] = "quail.logical_window"
-
-    def children(self) -> tuple[LogicalNode, ...]:
-        return (self.input,)
-
-    def expressions(self) -> tuple:
-        return self.calls
-
-    def output_schema(self) -> tuple[ColumnRef, ...]:
-        return _named_schema(self.input, self.output)
-
-    def validate(self) -> None:
-        if not (reads_projection(self.input) or isinstance(self.input, Aggregate)):
-            raise CompileError("Window needs projected or aggregated input columns")
-        projected = self.input.result_columns()
-        names = list(projected)
-        for call in self.calls:
-            call.validate(projected)
-            names.append(call.name)
-        if len(names) != len(set(names)):
-            raise CompileError(f"window names must be unique, got {names}")
-        for name in self.output:
-            if name not in names:
-                raise CompileError(
-                    f"the window output {name!r} is neither a column nor a window")
-
-    def result_columns(self) -> tuple[str, ...]:
-        """Return the input columns and window names in output order."""
-        return self.output
-
-    def with_children(self, children: tuple[LogicalNode, ...]) -> "Window":
-        if len(children) != 1:
-            raise CompileError("Window needs one child")
-        return replace(self, input=children[0])
-
-    def with_expressions(self, expressions: tuple) -> "Window":
-        return replace(self, calls=expressions)
-
-    def explain_fields(self) -> dict:
-        return {"windows": [str(call) for call in self.calls]}
-
-
-@dataclass(frozen=True)
 class Result:
     """Order result rows, remove duplicates, and apply an offset and limit."""
 
@@ -265,13 +153,12 @@ class Result:
         return self.input.output_schema()
 
     def result_columns(self) -> tuple[str, ...]:
-        """Return column names after projection or aggregation."""
+        """Return column names after projection."""
         return self.input.result_columns()
 
     def validate(self) -> None:
-        if not (reads_projection(self.input)
-                or isinstance(self.input, (Aggregate, Window))):
-            raise CompileError("Result needs a projection, aggregation, or window")
+        if not reads_projection(self.input):
+            raise CompileError("Result needs a projection")
         if self.limit is not None and self.limit <= 0:
             raise CompileError("LIMIT must be a positive integer")
         if self.offset < 0:
@@ -280,9 +167,6 @@ class Result:
         projection = self.input
         while not isinstance(projection, Project):
             projection = projection.input
-        grouped = isinstance(self.input, Aggregate) or (
-            isinstance(self.input, Window)
-            and isinstance(self.input.input, Aggregate))
         for key in self.order:
             if not isinstance(key, SortKey):
                 raise CompileError(
@@ -297,11 +181,6 @@ class Result:
                 raise CompileError(
                     f"ORDER BY {key.name!r} names an expression the "
                     f"projection does not return"
-                )
-            if grouped and key.name not in projected:
-                raise CompileError(
-                    f"ORDER BY {key.name!r} with GROUP BY names a key or "
-                    f"an aggregate in the SELECT list"
                 )
             if self.distinct and key.name not in projected:
                 raise CompileError(

@@ -1,4 +1,4 @@
-"""GROUP BY, aggregates, and HAVING: the Aggregate node, its runtime, the plan."""
+"""GROUP BY, aggregates, and HAVING run in DataFusion on a model region's rows."""
 
 
 import pyarrow as pa
@@ -6,14 +6,7 @@ import pytest
 from helpers.sessions import CONFIG, _run, fake_tok, make_executor
 
 import quail
-from quail.execution.runtimes.relational import aggregate_table
 from quail.logical import CompileError
-from quail.physical import Aggregate
-from quail.physical.base import input_ports
-
-
-def _node(**fields):
-    return Aggregate(node_id="aggregate", inputs=input_ports(()), **fields)
 
 
 @pytest.fixture()
@@ -72,13 +65,3 @@ def test_group_by_runs_on_the_result(session):
     with pytest.raises(CompileError, match="not in GROUP BY"):
         session.sql("SELECT r.lang, COUNT(*) AS n FROM reviews r WHERE AI_FILTER("
                     "PROMPT('q: {0}', r.review))")
-
-
-@pytest.mark.parametrize("grouped", [True])
-@pytest.mark.parametrize("dtype,values", [(pa.int64(), [2**63 - 1, 1])])
-def test_an_integer_sum_raises_instead_of_wrapping(dtype, values, grouped):
-    table = pa.table({"group": ["a"] * len(values), "value": pa.array(values, dtype)})
-    node = _node(keys=("group",) if grouped else (),
-                 aggregates=(("total", "sum", "value"),), columns=("total",))
-    with pytest.raises(pa.ArrowInvalid):
-        aggregate_table(table, node)

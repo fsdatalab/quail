@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::expressions::{Condition, Projected, ValueExpression, WindowCall};
+use crate::expressions::{Condition, Projected, ValueExpression};
 use crate::graph::{InputPort, NestedGraph};
 use crate::specs::{ClassifySpec, ExtractSpec, MapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds};
 
@@ -254,14 +254,6 @@ physical_nodes! {
         structs: Value,
         expressions: Option<Vec<Projected>>,
     }
-    /// A `GROUP BY` with its aggregates and `HAVING` tests.
-    Aggregate(AggregateAttributes, FlatAggregate) =
-        "quail.aggregate", "quail.physical.nodes.relational.Aggregate" {
-        keys: Vec<String>,
-        aggregates: Vec<(String, String, Option<String>)>,
-        having: Vec<(String, String, Value)>,
-        columns: Vec<String>,
-    }
     /// An `ORDER BY`, with `DISTINCT`, `OFFSET`, and `FETCH`.
     Sort(SortAttributes, FlatSort) = "quail.sort", "quail.physical.nodes.relational.Sort" {
         keys: Vec<(String, bool, bool)>,
@@ -269,12 +261,6 @@ physical_nodes! {
         distinct: bool,
         offset: i64,
         fetch: Option<i64>,
-    }
-    /// Window function calls.
-    Window(WindowAttributes, FlatWindow) =
-        "quail.window", "quail.physical.nodes.relational.Window" {
-        calls: Vec<WindowCall>,
-        columns: Vec<String>,
     }
     /// A `LIMIT`.
     Limit(LimitAttributes, FlatLimit) = "quail.limit", "quail.physical.nodes.relational.Limit" {

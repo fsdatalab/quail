@@ -67,15 +67,13 @@ can pass batches to each other before they finish processing all rows.
 See [Execution](/docs/architecture/execution#pipelines-and-batches) for
 how Quail groups and schedules these operators.
 
-## Window execution
+## Windows and aggregates
 
-[Window functions](/docs/user-guide/sql/sql-functions#window-functions)
-run on the CPU and reuse computed AI outputs. They do not call the model
-again, even when several windows read the same row.
-
-Note that using `LIMIT` can reduce the number of rows processed by window
-functions. It does not reduce the number of rows evaluated by AI functions.
-See [Window rules](/docs/architecture/optimizer#window-rules) for details.
+DataFusion runs [window functions](/docs/user-guide/sql/sql-functions#window-functions)
+and `GROUP BY` on the rows a model region returns, so they are not in
+Quail's physical plan. They reuse the region's AI outputs and do not
+call the model again. A `LIMIT` above a window reduces the rows
+DataFusion returns, not the rows the model evaluates.
 
 ## Inspect the plan
 

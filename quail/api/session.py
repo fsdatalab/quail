@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from quail.api.compile import SQLDialect, compile_region
 from quail.api.config import EngineConfig, resolve_model
-from quail.api.query import Query, QueryLike
+from quail.api.query import QueryLike
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, TableProvider
 from quail.common.tokens import GigatokenEncoder
@@ -137,9 +137,11 @@ class Session:
             from quail.api.context import DataFusionQuery
 
             return DataFusionQuery(self, text, SQLDialect(dialect).value, order=order)
+        from quail.api.region_inputs import region_query
+
         logical, whole = compiled
-        return Query(self, logical, order=order, text=text,
-                     dialect=SQLDialect(dialect).value, whole=whole)
+        return region_query(self, logical, order=order, text=text,
+                            dialect=SQLDialect(dialect).value, whole=whole)
 
     def get_run(self, query_id: str):
         """Reattach to a query the server already accepted.
