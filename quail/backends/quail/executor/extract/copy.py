@@ -1,9 +1,10 @@
 """Document continuations and the GPU constraint for copy decoding."""
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from quail.backends.quail.executor.extract.candidates import (
-    CandidateIndex,
     TextWindows,
 )
 from quail.backends.quail.executor.extract.trace import TRACE_WIDTH, trace_path
@@ -63,6 +64,86 @@ def _padded(values, dtype=np.int64):
     return out
 
 
+def _ranges(starts, counts):
+    """Return one row per range, start to start + count, padded with -1."""
+    width = max(1, int(counts.max(initial=0)))
+    columns = np.arange(width)
+    out = np.full((len(counts), width), -1, dtype=np.int64)
+    inside = columns < counts[:, None]
+    out[inside] = (starts[:, None] + columns)[inside]
+    return out
+
+
+def copy_tables(documents) -> SimpleNamespace:
+    """Return the host arrays a CopyConstraint reads, for all documents at once.
+
+    A key is one distinct word key id within one document; keys are
+    numbered by document, then by key id. Each key's options are the
+    vocabulary's spellings of its word.
+
+    Args:
+        documents: The extraction inputs, with each document's token scan.
+
+    Returns:
+        The document positions, their keys and options, and the lookup
+        from (key, token) to option, as numpy arrays.
+    """
+    vocabulary = documents.vocabulary
+    scans = [document.scan for document in documents.documents]
+    lengths = np.array([len(scan.tokens) for scan in scans], dtype=np.int64)
+    num_documents, num_positions = len(scans), int(lengths.sum())
+    position_starts = np.r_[0, np.cumsum(lengths)]
+    zero = np.array([0])
+    if not num_positions:
+        return SimpleNamespace(
+            num_keys=1, characters=zero, position_ends=zero,
+            position_documents=zero, option_tokens=zero, filler_tokens=zero,
+            filler_chars=zero, option_rows=_ranges(lengths, lengths),
+            position_keys=zero, option_order=zero, option_lookup=zero,
+            position_offsets=position_starts, max_positions=1,
+            positions=_ranges(position_starts[:-1], lengths),
+            position_local_keys=zero, option_local_keys=zero)
+    kids = np.concatenate([scan.kids for scan in scans]).astype(np.int64)
+    tokens = np.concatenate([scan.tokens for scan in scans]).astype(np.int64)
+    position_documents = np.repeat(np.arange(num_documents), lengths)
+    width = int(kids.max()) + 1
+    keys, first, position_keys = np.unique(
+        position_documents * width + kids, return_index=True, return_inverse=True)
+    key_documents, key_kids = np.divmod(keys, width)
+    key_starts = np.searchsorted(key_documents, np.arange(num_documents))
+    num_keys = np.bincount(key_documents, minlength=num_documents)
+    offsets, table_tokens, table_lengths = vocabulary.option_table(key_kids)
+    counts = offsets[key_kids + 1] - offsets[key_kids]
+    option_keys = np.repeat(np.arange(len(keys)), counts)
+    indices = (np.repeat(offsets[key_kids] - (np.cumsum(counts) - counts), counts)
+               + np.arange(counts.sum()))
+    num_options = int(counts.sum())
+    option_tokens = table_tokens[indices] if num_options else zero
+    option_counts = np.bincount(key_documents[option_keys], minlength=num_documents)
+    lookup = ((option_keys if num_options else zero) * len(vocabulary.vocab)
+              + option_tokens)
+    order = np.argsort(lookup)
+    return SimpleNamespace(
+        num_keys=max(1, int(num_keys.max(initial=0))),
+        characters=np.concatenate([scan.starts for scan in scans]),
+        position_ends=np.concatenate([scan.ends for scan in scans]),
+        position_documents=position_documents,
+        option_tokens=option_tokens,
+        filler_tokens=tokens[first[option_keys]] if num_options else zero,
+        filler_chars=table_lengths[indices] if num_options else zero,
+        option_rows=_ranges(np.r_[0, np.cumsum(option_counts)][:-1], option_counts),
+        position_keys=position_keys,
+        option_order=order,
+        option_lookup=lookup[order],
+        position_offsets=position_starts,
+        max_positions=max(1, int(lengths.max(initial=0))),
+        positions=_ranges(position_starts[:-1], lengths),
+        position_local_keys=position_keys - key_starts[position_documents],
+        option_local_keys=(option_keys - key_starts[key_documents[option_keys]]
+                           if num_options else zero),
+    )
+
+
 class CopyConstraint:
     """Tokenized document positions shared by a pipeline's extraction fields.
 
@@ -76,59 +157,23 @@ class CopyConstraint:
         self.trace = trace_path()
         self.trace_width = TRACE_WIDTH if self.trace is not None else 0
         vocabulary = self.vocabulary = documents.vocabulary
-        options, filler_tokens, filler_chars = [], [], []
-        position_keys, option_keys = [], []
-        position_local_keys, option_local_keys = [], []
-        key0 = 0
-        characters, ends, position_tokens, position_documents = [], [], [], []
-        streams, keys, option_rows = [], [], []
-        option0 = position0 = 0
-        kids = [document.scan.kids for document in documents.documents]
-        option_table = vocabulary.option_table(np.concatenate(kids) if kids else [])
-        for d, document in enumerate(documents.documents):
-            scan = document.scan
-            index = scan.candidates = CandidateIndex.of(scan, vocabulary, option_table)
-            options.append(index.token)
-            position_keys.append(index.inverse + key0)
-            option_keys.append(index.segment + key0)
-            position_local_keys.append(index.inverse)
-            option_local_keys.append(index.segment)
-            key0 += len(index.kids)
-            filler_tokens.append(scan.tokens[index.anchor[index.segment]])
-            filler_chars.append(index.length)
-            characters.append(scan.starts)
-            ends.append(scan.ends)
-            position_tokens.append(scan.tokens)
-            position_documents.append(np.full(len(scan.tokens), d, dtype=np.int64))
-            streams.append(np.arange(position0, position0 + len(scan.tokens)))
-            keys.append(len(index.kids))
-            option_rows.append(np.arange(option0, option0 + len(index.token)))
-            option0 += len(index.token)
-            position0 += len(scan.tokens)
-        self.num_keys = max(1, max(keys, default=0))
-        self.characters = np.concatenate(characters) if position0 else np.array([0])
-        self.position_ends = np.concatenate(ends) if position0 else np.array([0])
-        self.position_documents = (
-            np.concatenate(position_documents) if position0 else np.array([0])
-        )
-        self.option_tokens = np.concatenate(options) if option0 else np.array([0])
-        self.filler_tokens = np.concatenate(filler_tokens) if option0 else np.array([0])
-        self.filler_chars = np.concatenate(filler_chars) if option0 else np.array([0])
-        self.option_rows = _padded(option_rows)
-        self.position_keys = (
-            np.concatenate(position_keys) if position0 else np.array([0])
-        )
-        lookup = (np.concatenate(option_keys) if option0 else np.array([0])) * len(
-            vocabulary.vocab
-        ) + self.option_tokens
-        self.option_order = np.argsort(lookup)
-        self.option_lookup = lookup[self.option_order]
+        tables = copy_tables(documents)
+        self.num_keys = tables.num_keys
+        self.characters = tables.characters
+        self.position_ends = tables.position_ends
+        self.position_documents = tables.position_documents
+        self.option_tokens = tables.option_tokens
+        self.filler_tokens = tables.filler_tokens
+        self.filler_chars = tables.filler_chars
+        self.option_rows = tables.option_rows
+        self.position_keys = tables.position_keys
+        self.option_order = tables.option_order
+        self.option_lookup = tables.option_lookup
         self.filler_lengths = np.full(len(self.option_tokens), -1, dtype=np.int64)
         self.position_lengths = np.zeros(len(self.characters), dtype=np.int64)
         self.position_rows = np.full(len(self.characters), -1, dtype=np.int64)
-        counts = np.array(list(map(len, position_tokens)), dtype=np.int64)
-        self.position_offsets = np.r_[0, np.cumsum(counts)]
-        self.max_positions = max(1, int(counts.max(initial=0)))
+        self.position_offsets = tables.position_offsets
+        self.max_positions = tables.max_positions
         self.mask_words = -(-self.max_positions // 64)
         self.position_offsets_device = self.tensor(self.position_offsets)
         self.windows = None
@@ -138,16 +183,12 @@ class CopyConstraint:
         self.prepared = np.empty(0, dtype=np.int64)
         self.num_positions = 0
         self.num_options = len(self.option_tokens)
-        positions = _padded(streams)
-        self.streams = np.where(positions >= 0, positions * self.num_options, -1)
+        self.streams = np.where(tables.positions >= 0,
+                                tables.positions * self.num_options, -1)
         self.stream_ids = self.tensor(self.streams)
         self.option_rows_device = self.tensor(self.option_rows)
-        self.key_ids = self.tensor(
-            np.concatenate(position_local_keys) if position0 else np.array([0])
-        )
-        self.option_key_ids = self.tensor(
-            np.concatenate(option_local_keys) if option0 else np.array([0])
-        )
+        self.key_ids = self.tensor(tables.position_local_keys)
+        self.option_key_ids = self.tensor(tables.option_local_keys)
         self.first_tokens = self.tensor(self.option_tokens)
         self.filler_rows = np.full(self.num_options, -1, dtype=np.int64)
         self.filler_rows_device = self.tensor(self.filler_rows.copy())
