@@ -715,3 +715,18 @@ def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():
     # a later suffix of document 1 follows its 10 prompt tokens: keys 11 and 12
     StageExecutor._count_pass(executor, [(1, 1, 0, 1, False)], 2, None, ())
     assert executor.pass_work["pairs"] == sum(range(5, 13)) + 11 + 12
+
+
+def test_fit_drafts_caps_drafts_to_the_row_budget():
+    import numpy as np
+
+    from quail.backends.quail.executor.map_decoder import fit_drafts
+
+    counts = np.array([64, 64, 3, 1])
+    assert fit_drafts(counts, None).tolist() == counts.tolist()
+    assert fit_drafts(counts, 200).tolist() == counts.tolist()
+    fitted = fit_drafts(counts, 40)
+    assert fitted.sum() <= 40
+    assert fitted.tolist() == [18, 18, 3, 1]
+    # chosen-token rows alone stay, even past the budget
+    assert fit_drafts(counts, 2).tolist() == [1, 1, 1, 1]

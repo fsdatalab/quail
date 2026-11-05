@@ -49,8 +49,10 @@ class MapDecoder:
     """
 
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
-                 page_tokens: int, expected_tokens=None, *, workspace_bytes=0):
+                 page_tokens: int, expected_tokens=None, *, workspace_bytes=0,
+                 row_budget=None):
         self.workspace_bytes = workspace_bytes
+        self.row_budget = row_budget
         self.torch = torch
         self.head = head
         self.limits = np.asarray(limits, dtype=np.int64)
@@ -198,6 +200,7 @@ class MapDecoder:
             remaining = (1 + constraint.filler_lengths[option]
                          + constraint.position_lengths[position] - written[mine])
             counts[mine] += np.minimum(sizes[mine], np.maximum(0, remaining))
+        counts = fit_drafts(counts, self.row_budget)
         self.drafts[running] = counts - 1
         return counts
 
@@ -663,6 +666,27 @@ class MapDecoder:
                 for document in documents]
 
 
+def fit_drafts(counts, budget):
+    """Cap every answer's draft rows alike so the pass fits the row budget.
+
+    Each answer keeps its chosen-token row. When the drafts would take
+    the pass past the budget, the largest cap that fits applies to
+    every answer's drafts; a pass of chosen-token rows alone is left
+    as it is.
+    """
+    if budget is None or counts.sum() <= budget:
+        return counts
+    drafts = counts - 1
+    low, high = 0, int(drafts.max())
+    while low < high:
+        cap = (low + high + 1) // 2
+        if len(counts) + np.minimum(drafts, cap).sum() <= budget:
+            low = cap
+        else:
+            high = cap - 1
+    return 1 + np.minimum(drafts, low)
+
+
 def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapDecoder:
     """Return a decoder for a pipeline's maps on the loaded model."""
     from quail.backends.quail.executor.model_loading import full_output_head
@@ -673,4 +697,5 @@ def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapD
         limits, state.loaded_model.tokenizer.stop_ids,
         state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens,
         workspace_bytes=copy_verification_workspace_bytes(
-            state.loaded_model.model_spec, state.chunk_tokens))
+            state.loaded_model.model_spec, state.chunk_tokens),
+        row_budget=state.chunk_tokens)
