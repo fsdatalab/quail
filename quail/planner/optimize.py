@@ -45,7 +45,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             as its statistics, for the physical planner to reuse.
         catalog: Catalog available to tree rewrites during search.
         engine_config: Session configuration available to tree rewrites.
-        logical_candidates: Already rewritten trees, or None to run logical rules.
+        logical_candidates: The column placements already found, or None to
+            find them.
 
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
@@ -105,7 +106,7 @@ def search_plan(logical, context, registry, *, logical_candidates=None):
     """
     if context.tokenizer is None:
         raise ValueError("planning needs the model's tokenizer")
-    alternatives = (native.logical_alternatives(logical, registry, context)
+    alternatives = (native.column_placements(logical)
                     if logical_candidates is None else logical_candidates)
     if context.backend == "quail":
         return native.search_plan(alternatives, context, registry)

@@ -31,10 +31,11 @@ from quail.physical.lowering import Vocabulary
 from quail.physical.plan import PhysicalPlan, Refusal
 from quail.planner.candidates import LogicalAlternative
 
-# the built-in logical rules, in the order they apply
+# the optimizer rules each model region runs, in order, as
+# quail_datafusion::REGION_RULES names them
 LOGICAL_RULES = (
-    "should_push_down_projection",
-    "should_lift_column_operators",
+    "eliminate_distinct", "place_semantic_nodes", "push_down_distinct",
+    "push_down_filter", "optimize_projections",
 )
 # the built-in physical rules, in the order they apply
 PHYSICAL_RULES = (
@@ -168,7 +169,7 @@ def search_plan(alternatives, context, registry):
     """Select the cheapest refined Quail plan of the logical alternatives.
 
     Args:
-        alternatives: The logical alternatives, each with its plan and rules.
+        alternatives: The column placements, each with its plan and rewrites.
         context: The planning context.
         registry: The session extension registry, whose physical rules
             the planner applies in order.
@@ -213,24 +214,21 @@ def search_plan(alternatives, context, registry):
         logical_plan=alternatives[found["alternative"]].plan)
 
 
-def logical_alternatives(plan, registry, context):
-    """Apply the registry's logical rules in order.
+def column_placements(plan):
+    """The placements of a plan's column operators that planning prices.
 
     Args:
-        plan: The input logical plan.
-        registry: The session extension registry.
-        context: The planning context.
+        plan: The bound logical plan.
 
     Returns:
-        The alternatives in order, each with its plan and the rules that
-        made it.
+        The plan, then each plan with a classification, extraction, or
+        map moved above a join, each with the rewrites that made it.
 
     Raises:
-        CompileError: A rule refuses the plan.
+        CompileError: A moved plan is not valid.
     """
-    names = tuple(rule.name for rule in registry.logical_rules.values())
-    found, message = _quail_native.logical_alternatives(
-        json.dumps(encode_value(plan)), list(names))
+    found, message = _quail_native.column_placements(
+        json.dumps(encode_value(plan)))
     if message is not None:
         raise CompileError(message)
     return tuple(LogicalAlternative(decode_value(LogicalPlan, json.loads(text)),

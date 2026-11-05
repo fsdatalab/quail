@@ -6,7 +6,6 @@ import pytest
 from helpers.planning import compile_sql
 
 from quail.api.compile import SQLDialect
-from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (
     ColumnRef,
@@ -20,7 +19,6 @@ from quail.logical import (
     join_outer_input,
 )
 from quail.planner import native
-from quail.planner.context import PlanningContext
 
 
 @pytest.fixture()
@@ -208,8 +206,7 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
     assert pairs.on[0].left == ColumnRef("r", "reviews", "id")
     assert pairs.on[0].right == ColumnRef("p", "products", "asin")
     # the equality columns are loaded as values for the pair table
-    candidate, = native.logical_alternatives(
-        plan, built_in_registry(), PlanningContext(catalog=catalog))
+    candidate, = native.column_placements(plan)
     optimized, _ = candidate.plan, candidate.rules
     scans = {node.alias: node for node in optimized.walk()
              if isinstance(node, Scan)}

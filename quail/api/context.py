@@ -73,8 +73,9 @@ class SessionContext:
         self._physical_executor = physical_executor
         self._order = order
         model = session.model
+        rules = [rule.name for rule in session.registry.logical_rules.values()]
         self._native = NativeContext(self._run_region, tuple(model.turn),
-                                     model.prompt_layout)
+                                     model.prompt_layout, rules)
         for name, provider in session.catalog.providers.items():
             self._register_table(name, provider)
 

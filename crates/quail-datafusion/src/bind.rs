@@ -56,8 +56,17 @@ pub fn bind_model_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
-    let optimized = region.optimized.then_some(&region.plan);
-    bind_plans(&region.bound, optimized, turn, layout)
+    if region.optimized {
+        bind_plans(
+            &region.bound,
+            Some(&region.plan),
+            &region.rules,
+            turn,
+            layout,
+        )
+    } else {
+        bind_plans(&region.bound, None, &default_rules(), turn, layout)
+    }
 }
 
 /// Place a SELECT's relation as DataFusion's rules order it, then add
@@ -77,6 +86,7 @@ pub fn bind_model_region(
 fn place_select(
     plan: &LogicalPlan,
     optimized: Option<&LogicalPlan>,
+    rules: &[String],
     place: PlaceRelationArguments,
     project: &ProjectArguments,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
@@ -84,7 +94,7 @@ fn place_select(
     let optimized = match optimized {
         Some(optimized) => optimized.clone(),
         None => crate::lower_ai_calls(plan.clone())
-            .and_then(|lowered| crate::optimize_region(&lowered))
+            .and_then(|lowered| crate::optimize_region(&lowered, rules))
             .map_err(|error| CompileError::new(error.to_string()))?,
     };
     let Some(relation) = crate::translate_relation(&optimized, &content) else {
@@ -128,17 +138,25 @@ pub fn bind_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
-    bind_plans(plan, None, turn, layout)
+    bind_plans(plan, None, &default_rules(), turn, layout)
+}
+
+fn default_rules() -> Vec<String> {
+    crate::REGION_RULES
+        .iter()
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn bind_plans(
     plan: &LogicalPlan,
     optimized: Option<&LogicalPlan>,
+    rules: &[String],
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
-    let (place, project, stages) = bind_with_stages(plan, turn, layout)?;
-    let built = place_select(plan, optimized, place, &project)?;
+    let (place, project, stages) = bind_with_stages(plan, turn, layout, rules)?;
+    let built = place_select(plan, optimized, rules, place, &project)?;
     if has_subqueries(plan) {
         let asks = |root: &LogicalNode| {
             let stage = quail_planner::LogicalPlan { root: root.clone() };
@@ -151,32 +169,18 @@ fn bind_plans(
             return compile_error("the query has no AI predicate");
         }
     }
-    if stages.is_empty() {
-        return Ok(built);
-    }
-    Ok(quail_planner::LogicalPlan {
-        root: LogicalNode::WithCte(quail_planner::logical::WithCte {
+    let root = if stages.is_empty() {
+        built.root
+    } else {
+        LogicalNode::WithCte(quail_planner::logical::WithCte {
             input: Box::new(built.root),
             ctes: stages,
-        }),
+        })
+    };
+    // each scan loads the column values the plan reads
+    Ok(quail_planner::LogicalPlan {
+        root: quail_planner::rules::push_down_projection(&root),
     })
-}
-
-/// Bind a region's plan into the logical plan builder's arguments.
-///
-/// # Errors
-///
-/// The region uses SQL outside Quail's language.
-pub fn bind_select(
-    plan: &LogicalPlan,
-    turn: &Turn,
-    layout: &str,
-) -> Result<(PlaceRelationArguments, ProjectArguments), CompileError> {
-    let (place, project, stages) = bind_with_stages(plan, turn, layout)?;
-    if !stages.is_empty() {
-        return unsupported("a CTE that runs as its own stage");
-    }
-    Ok((place, project))
 }
 
 /// A CTE or FROM subquery that runs as its own stage: its name and plan.
@@ -186,6 +190,7 @@ fn bind_with_stages(
     plan: &LogicalPlan,
     turn: &Turn,
     layout: &str,
+    rules: &[String],
 ) -> Result<(PlaceRelationArguments, ProjectArguments, Vec<Stage>), CompileError> {
     let staged_query = has_subqueries(plan);
     let (merged, lifted) = merge_join_subqueries(plan)?;
@@ -212,6 +217,7 @@ fn bind_with_stages(
         stages: Vec::new(),
         stage_schemas: Vec::new(),
         allow_relational: staged_query,
+        rules: rules.to_vec(),
     };
     binder.selected = select
         .projection
@@ -900,6 +906,8 @@ struct Binder {
     stages: Vec<Stage>,
     /// Each stage's result schema, by its name.
     stage_schemas: Vec<(String, SchemaRef)>,
+    /// The model region rules each stage's body runs.
+    rules: Vec<String>,
     /// Whether a SELECT with no model call is allowed: in a statement
     /// with a CTE or FROM subquery, as the front end allows it.
     allow_relational: bool,
@@ -983,8 +991,9 @@ impl Binder {
                 repr_str(&name)
             ));
         }
-        let (place, project, inner) = bind_with_stages(body, &self.turn, &self.layout)?;
-        let built = place_select(body, None, place, &project)?;
+        let (place, project, inner) =
+            bind_with_stages(body, &self.turn, &self.layout, &self.rules)?;
+        let built = place_select(body, None, &self.rules, place, &project)?;
         let schema = stage_schema(body)?;
         self.stages.extend(inner);
         self.stages.push((name.clone(), built.root));

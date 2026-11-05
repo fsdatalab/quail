@@ -161,8 +161,7 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions)
-            candidates = native.logical_alternatives(
-                self._logical_input, self.session.registry, context)
+            candidates = native.column_placements(self._logical_input)
             self.logical = candidates[0].plan
             scans = {}
             offset_aliases = set()

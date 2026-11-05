@@ -93,7 +93,7 @@ def test_a_malformed_map_is_refused(session, sql, message):
 
 
 def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
-    from helpers.planning import rewrite
+    from helpers.planning import placements
 
     from quail.logical import LogicalPlan
 
@@ -108,8 +108,7 @@ def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
     # placement rule also offers it above the join, like a classification
     written = [type(node).__name__ for node in LogicalPlan(root).walk()]
     assert written.index("SemanticMap") < written.index("SemanticJoin")
-    *_, placed = rewrite(query.logical, "should_lift_column_operators",
-                         catalog=session.catalog)
+    *_, placed = placements(query.logical)
     moved = placed.plan
     assert "should_lift_column_operators" in placed.rules
     lifted = [type(node).__name__ for node in moved.walk()]

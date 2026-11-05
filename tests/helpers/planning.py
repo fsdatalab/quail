@@ -1,13 +1,9 @@
-"""Plan as a session would: the tree rewrites, then the physical planner."""
-
-from types import SimpleNamespace
+"""Plan as a session would: the column placements, then the physical planner."""
 
 from quail.api.compile import compile_with_datafusion
 from quail.builtins import built_in_registry
 from quail.common.tokens import TokenLengths
-from quail.extensions import LogicalRule
 from quail.planner import native
-from quail.planner.context import PlanningContext
 from quail.planner.optimize import plan_query
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -21,30 +17,14 @@ def tokenizer(text):
 
 
 def _optimize(logical, document_tokens, model=QWEN3_4B_FP8, **kwargs):
-    """Run the built in tree rewrites as a session would.
-
-    Returns:
-        The optimized plan and the names of the rules that changed it.
-    """
-    context = PlanningContext(
-        model=model, device=H100_SXM,
-        gpus=kwargs.get("gpus", 1), document_tokens=token_lengths(document_tokens),
-        order=kwargs.get("order"), tokenizer=tokenizer,
-        pair_fractions=kwargs.get("pair_fractions") or {})
-    candidate, = native.logical_alternatives(logical, built_in_registry(), context)
+    """Return a plan with one column placement and its rewrites."""
+    candidate, = native.column_placements(logical)
     return candidate.plan, candidate.rules
 
 
-def rewrite(logical, *rules, catalog=None):
-    """Apply the named logical rules, in order, as the planner does.
-
-    Returns:
-        The alternatives, each with its plan and the rules that changed it.
-    """
-    named = {name: LogicalRule(name) for name in rules}
-    registry = SimpleNamespace(logical_rules=named)
-    return native.logical_alternatives(
-        logical, registry, PlanningContext(catalog=catalog))
+def placements(logical):
+    """The column placements the planner prices, each with its rewrites."""
+    return native.column_placements(logical)
 
 
 def _plan(logical, document_tokens, model=QWEN3_4B_FP8, **kwargs):

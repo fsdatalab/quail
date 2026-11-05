@@ -46,15 +46,13 @@ def alternative_plans(query):
     context = context_for(query)
     registry = query.session.registry
     return [native.search_plan((alternative,), context, registry)
-            for alternative in native.logical_alternatives(
-                query._logical_input, registry, context)]
+            for alternative in native.column_placements(query._logical_input)]
 
 
 def test_search_compares_both_extraction_placements_and_keeps_the_cheaper(query):
     context = context_for(query)
     registry = query.session.registry
-    original, lifted = native.logical_alternatives(
-        query._logical_input, registry, context)
+    original, lifted = native.column_placements(query._logical_input)
     assert not columns_above_joins(original.plan.root)
     assert "should_lift_column_operators" not in original.rules
     assert "should_lift_column_operators" in lifted.rules

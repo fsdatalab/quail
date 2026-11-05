@@ -53,7 +53,7 @@ pub use functions::{
     quail_functions,
 };
 pub use lower::{LowerAiCalls, lower_ai_calls};
-pub use optimize::{OptimizeModelRegions, optimize_region};
+pub use optimize::{OptimizeModelRegions, REGION_RULES, optimize_region, region_rule};
 pub use placement::PlaceSemanticNodes;
 pub use region::ModelRegion;
 pub use translate::translate_relation;
@@ -79,19 +79,37 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
 /// SQL is read in the Snowflake dialect, as Quail's `Session.sql`
 /// reads it; `SET datafusion.sql_parser.dialect` changes it.
 pub fn session_state(runner: Arc<dyn RegionRunner>) -> SessionState {
+    session_state_with_rules(runner, OptimizeModelRegions::default())
+}
+
+/// Build a DataFusion session state with Quail registered, whose model
+/// regions run `regions`' rules.
+pub fn session_state_with_rules(
+    runner: Arc<dyn RegionRunner>,
+    regions: OptimizeModelRegions,
+) -> SessionState {
     let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Snowflake");
     SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()
         .with_analyzer_rules(analyzer_rules())
-        .with_optimizer_rule(Arc::new(OptimizeModelRegions))
+        .with_optimizer_rule(Arc::new(regions))
         .with_query_planner(Arc::new(exec::QuailQueryPlanner::new(runner)))
         .build()
 }
 
 /// Build a DataFusion session context with Quail registered.
 pub fn session_context(runner: Arc<dyn RegionRunner>) -> SessionContext {
-    let context = SessionContext::new_with_state(session_state(runner));
+    session_context_with_rules(runner, OptimizeModelRegions::default())
+}
+
+/// Build a DataFusion session context with Quail registered, whose model
+/// regions run `regions`' rules.
+pub fn session_context_with_rules(
+    runner: Arc<dyn RegionRunner>,
+    regions: OptimizeModelRegions,
+) -> SessionContext {
+    let context = SessionContext::new_with_state(session_state_with_rules(runner, regions));
     for function in quail_functions() {
         context.register_udf(function.as_ref().clone());
     }

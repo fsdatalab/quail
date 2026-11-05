@@ -131,7 +131,8 @@ class Session:
                                dialect=SQLDialect(dialect).value)
         logical = compile_with_datafusion(
             text, self.catalog, self.model,
-            dialect=SQLDialect(dialect).value)
+            dialect=SQLDialect(dialect).value,
+            rules=[rule.name for rule in self.registry.logical_rules.values()])
         if logical is None:
             from quail.api.context import DataFusionQuery
 

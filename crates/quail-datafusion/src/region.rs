@@ -21,6 +21,9 @@ pub struct ModelRegion {
     pub plan: LogicalPlan,
     /// Whether `plan` has been through DataFusion's rules.
     pub optimized: bool,
+    /// The names of the rules [`crate::OptimizeModelRegions`] ran, which
+    /// the binder also runs on each CTE stage's body.
+    pub rules: Vec<String>,
 }
 
 impl ModelRegion {
@@ -30,6 +33,7 @@ impl ModelRegion {
             bound: plan.clone(),
             plan,
             optimized: false,
+            rules: Vec::new(),
         }
     }
 }

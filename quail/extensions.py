@@ -18,11 +18,11 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class LogicalRule:
-    """A logical rule of the Rust planner, which rewrites a logical plan.
+    """An optimizer rule that DataFusion runs inside each model region.
 
-    The Rust planner implements every rule, the logical ones in
-    ``crates/quail-planner/src/rules.rs``; a registry lists the rules a
-    session applies, by name, in the order they apply.
+    The name is the rule's ``OptimizerRule::name()``; the rules are
+    listed in ``quail_datafusion::region_rule``. A registry lists the
+    rules a session applies, by name, in the order they apply.
     """
 
     name: str

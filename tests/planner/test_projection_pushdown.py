@@ -3,7 +3,7 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from helpers.planning import rewrite
+from helpers.planning import placements
 from helpers.sessions import _run, fake_tok, make_executor
 
 import quail
@@ -13,8 +13,6 @@ from quail.logical import (
     SemanticJoin,
 )
 from quail.physical import Recombine
-from quail.planner import native
-from quail.planner.context import PlanningContext
 
 
 def _scans(plan):
@@ -61,8 +59,6 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     assert sorted(result.to_rows()) == [(3, "r2"), (5, "r0")]
     scan = _scans(query.logical)["r"]
     assert scan.columns == ("stars", "id")
-    (unchanged,) = rewrite(query.logical, "should_push_down_projection")
-    assert unchanged.rules == ()
     store = query._token_inputs["r"]
     assert store.projected_columns == ("stars", "id")
     tokenized = len(calls)
@@ -140,20 +136,17 @@ LABELLED_JOIN_SQL = """
 
 def test_projection_pushdown_is_the_only_rewrite_of_a_join():
     session = _pair_session()
-    catalog = session.catalog
     plan = session.sql(JOIN_SQL).logical
     assert isinstance(plan.root.input, SemanticJoin)
 
     # only the projection moves
-    candidate, = native.logical_alternatives(
-        plan, session.registry, PlanningContext(catalog=catalog))
-    assert candidate.rules == ("should_push_down_projection",)
-    (projected,) = rewrite(plan, "should_push_down_projection", catalog=catalog)
-    assert candidate.plan.root == projected.plan.root
+    candidate, = placements(plan)
+    assert candidate.rules == ()
+    assert candidate.plan.root == plan.root
 
     labelled = session.sql(LABELLED_JOIN_SQL).logical
     # the placement rule offers the lifted plan for a full join
-    *_, placed = rewrite(labelled, "should_lift_column_operators", catalog=catalog)
+    *_, placed = placements(labelled)
     assert [type(node).__name__ for node in placed.plan.walk()][-4:] == [
         "SemanticJoin", "SemanticClassify", "Filter", "Project"]
     session.close()

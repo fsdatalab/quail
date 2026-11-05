@@ -28,8 +28,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use quail_datafusion::{
-    ModelRegion, RegionRunner, bind, quail_column_names, quail_schema, region_sql, session_context,
-    sql,
+    ModelRegion, RegionRunner, bind, quail_column_names, quail_schema, region_sql, sql,
 };
 use quail_planner::prompts::Turn;
 use tokio::runtime::Runtime;
@@ -189,20 +188,35 @@ impl NativeContext {
     /// logical plan as JSON), bound in Rust with the model's chat-turn
     /// text `turn` and prompt `layout`, or ("sql", the region's SQL)
     /// for a region the Rust binder does not read, or for every region
-    /// when no turn and layout are given.
+    /// when no turn and layout are given. `rules` names the optimizer
+    /// rules each model region runs, in order; by default
+    /// `quail_datafusion::REGION_RULES`.
     #[new]
-    #[pyo3(signature = (run_region, turn=None, layout=None))]
+    #[pyo3(signature = (run_region, turn=None, layout=None, rules=None))]
     fn new(
         run_region: Py<PyAny>,
         turn: Option<(String, String)>,
         layout: Option<String>,
+        rules: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let runtime = Runtime::new()?;
         let prompting = turn.zip(layout);
-        let context = session_context(Arc::new(PythonRunner {
-            run_region,
-            prompting,
-        }));
+        let regions = match rules {
+            Some(rules) => {
+                for name in &rules {
+                    quail_datafusion::region_rule(name).map_err(python_error)?;
+                }
+                quail_datafusion::OptimizeModelRegions::new(rules)
+            }
+            None => quail_datafusion::OptimizeModelRegions::default(),
+        };
+        let context = quail_datafusion::session_context_with_rules(
+            Arc::new(PythonRunner {
+                run_region,
+                prompting,
+            }),
+            regions,
+        );
         Ok(Self { context, runtime })
     }
 
@@ -431,20 +445,18 @@ fn bind_prompt(
     }
 }
 
-/// Apply the built-in logical rules, as `logical_alternatives` does.
+/// The placements of a plan's column operators that physical planning
+/// prices, as `quail_planner::rules::column_placements` returns them.
 ///
-/// Returns ([(plan JSON, rule names), ...], None), or ([], the
+/// Returns ([(plan JSON, rewrite names), ...], None), or ([], the
 /// CompileError's message).
 #[pyfunction]
 #[allow(clippy::type_complexity)]
-fn logical_alternatives(
-    plan: &str,
-    rules: Vec<String>,
-) -> PyResult<(Vec<(String, Vec<String>)>, Option<String>)> {
+fn column_placements(plan: &str) -> PyResult<(Vec<(String, Vec<String>)>, Option<String>)> {
     let invalid =
         |error: serde_json::Error| pyo3::exceptions::PyValueError::new_err(error.to_string());
     let plan = quail_planner::read_logical_plan(plan).map_err(invalid)?;
-    match quail_planner::rules::logical_alternatives(plan, &rules) {
+    match quail_planner::rules::column_placements(plan) {
         Ok(found) => Ok((
             found
                 .into_iter()
@@ -1004,7 +1016,7 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;
-    module.add_function(wrap_pyfunction!(logical_alternatives, module)?)?;
+    module.add_function(wrap_pyfunction!(column_placements, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)

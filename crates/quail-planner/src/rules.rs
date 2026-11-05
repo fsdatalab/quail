@@ -18,78 +18,58 @@ use crate::nodes::{
     input, output_schema, source_columns, subtree, validate_plan,
 };
 
-/// Rules that undo each other must not loop forever.
+/// Lifting stops after this many passes over the candidates.
 pub const MAX_PASSES: usize = 4;
 
-/// The names of the built-in logical rules, in the order they run.
-pub const LOGICAL_RULES: [&str; 2] = [
-    "should_push_down_projection",
-    "should_lift_column_operators",
-];
+/// The name shown for a candidate whose column operators run above a join.
+pub const LIFT: &str = "should_lift_column_operators";
 
-/// A logical plan and the rules that produced it.
+/// A logical plan and the rewrites that produced it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalAlternative {
     pub plan: LogicalPlan,
     pub rules: Vec<String>,
 }
 
-/// Rewrite each candidate with each rule and deduplicate the trees in order.
+/// The placements of a plan's column operators that physical planning
+/// prices: the plan as bound, then each plan with a classification,
+/// extraction, or map moved above a join, each scan loading the columns
+/// its plan reads.
 ///
 /// # Errors
 ///
-/// A rule's rewrite is not a valid plan, or a rule name is unknown.
-pub fn logical_alternatives(
-    plan: LogicalPlan,
-    rules: &[String],
-) -> Result<Vec<LogicalAlternative>, CompileError> {
+/// A moved plan is not valid.
+pub fn column_placements(plan: LogicalPlan) -> Result<Vec<LogicalAlternative>, CompileError> {
     let mut candidates = vec![LogicalAlternative {
         plan,
         rules: Vec::new(),
     }];
     for _ in 0..MAX_PASSES {
-        let before: Vec<LogicalNode> = candidates.iter().map(|c| c.plan.root.clone()).collect();
-        for rule in rules {
-            let mut rewritten: Vec<LogicalAlternative> = Vec::new();
-            for candidate in &candidates {
-                let root = &candidate.plan.root;
-                for replacement in rewrites(rule, root)? {
-                    if rewritten.iter().any(|other| other.plan.root == replacement) {
-                        continue;
-                    }
-                    if replacement == *root {
-                        rewritten.push(candidate.clone());
-                        continue;
-                    }
-                    let plan = LogicalPlan { root: replacement };
-                    validate_plan(&plan)?;
-                    let mut names = candidate.rules.clone();
-                    names.push(rule.clone());
-                    rewritten.push(LogicalAlternative { plan, rules: names });
-                }
+        let mut added: Vec<LogicalAlternative> = Vec::new();
+        for candidate in &candidates {
+            let Some(lifted) = lift_column_operators(&candidate.plan.root) else {
+                continue;
+            };
+            let root = push_down_projection(&lifted);
+            if candidates
+                .iter()
+                .chain(&added)
+                .any(|other| other.plan.root == root)
+            {
+                continue;
             }
-            candidates = rewritten;
+            let plan = LogicalPlan { root };
+            validate_plan(&plan)?;
+            let mut rules = candidate.rules.clone();
+            rules.push(LIFT.to_string());
+            added.push(LogicalAlternative { plan, rules });
         }
-        let after: Vec<LogicalNode> = candidates.iter().map(|c| c.plan.root.clone()).collect();
-        if after == before {
+        if added.is_empty() {
             break;
         }
+        candidates.extend(added);
     }
     Ok(candidates)
-}
-
-/// The roots one rule rewrites a root into.
-fn rewrites(rule: &str, root: &LogicalNode) -> Result<Vec<LogicalNode>, CompileError> {
-    Ok(match rule {
-        "should_push_down_projection" => vec![push_down_projection(root)],
-        "should_lift_column_operators" => match lift_column_operators(root) {
-            Some(lifted) => vec![root.clone(), lifted],
-            None => vec![root.clone()],
-        },
-        other => {
-            return Err(CompileError::new(format!("unknown logical rule {other:?}")));
-        }
-    })
 }
 
 // ---------------------------------------------------------------- tree editing

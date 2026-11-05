@@ -89,7 +89,8 @@ def _message(error: Exception, sql: str) -> str:
 
 
 def compile_with_datafusion(sql: str, catalog, model,
-                            dialect: str = "snowflake") -> LogicalPlan | None:
+                            dialect: str = "snowflake",
+                            rules=None) -> LogicalPlan | None:
     """Compile AI SQL text into one logical plan.
 
     Args:
@@ -98,6 +99,8 @@ def compile_with_datafusion(sql: str, catalog, model,
         model: The model whose chat turn and prompt layout the prompts
             are bound in.
         dialect: "snowflake" or "bq".
+        rules: The names of the optimizer rules each model region runs,
+            in order, or None for the built-in rules.
 
     Returns:
         The query's logical plan, or None when DataFusion runs SQL
@@ -114,7 +117,8 @@ def compile_with_datafusion(sql: str, catalog, model,
     def run_region(kind, payload):
         raise RuntimeError("compiling a query runs no model region")
 
-    context = _quail_native.NativeContext(run_region)
+    context = _quail_native.NativeContext(
+        run_region, rules=None if rules is None else list(rules))
     for name, provider in catalog.providers.items():
         context.register(name, _schema_bytes(provider.schema()), refuse,
                          getattr(provider, "id_col", None) or None)
