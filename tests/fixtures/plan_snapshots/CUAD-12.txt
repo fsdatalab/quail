@@ -3,15 +3,15 @@ Sort: contracts DESC NULLS LAST, governing_law_state ASC NULLS LAST
   Projection: ai_classify(prompt(Utf8("Judge strictly from the contract above which state's or country's law governs its interpretation.
 
 {0}"),c.text),make_array(struct(Utf8("New York"),Utf8("")),struct(Utf8("California"),Utf8("")),struct(Utf8("Delaware"),Utf8("")),struct(Utf8("Texas"),Utf8("")),struct(Utf8("Florida"),Utf8("")),struct(Utf8("another state or country"),Utf8("a governing law other than those five")),struct(Utf8("not stated"),Utf8("the contract names no governing law")))) AS governing_law_state, count(Int64(1)) AS count(*) AS contracts
-    Aggregate: groupBy=[[__quail_call_1 AS ai_classify(prompt(Utf8("Judge strictly from the contract above which state's or country's law governs its interpretation.
+    Aggregate: groupBy=[[governing_law_state AS ai_classify(prompt(Utf8("Judge strictly from the contract above which state's or country's law governs its interpretation.
 
 {0}"),c.text),make_array(struct(Utf8("New York"),Utf8("")),struct(Utf8("California"),Utf8("")),struct(Utf8("Delaware"),Utf8("")),struct(Utf8("Texas"),Utf8("")),struct(Utf8("Florida"),Utf8("")),struct(Utf8("another state or country"),Utf8("a governing law other than those five")),struct(Utf8("not stated"),Utf8("the contract names no governing law"))))]], aggr=[[count(Int64(1))]]
       ModelRegion
 
 model region:
 logical:
-  Project: __quail_call_1
-    SemanticClassify: __quail_call_1
+  Project: governing_law_state
+    SemanticClassify: governing_law_state
       PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the contract above which state's or country's law governs its interpretation.", c.text) labels=['New York', 'California', 'Delaware', 'Texas', 'Florida', 'another state or country', 'not stated']
       SemanticFilter
         PROMPT('DOCUMENT:\n{0}\n\nIs there a requirement for insurance that must be maintained by one party for the benefit of the counterparty?', c.text) (selectivity=26.3%)
@@ -23,8 +23,8 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
                                                                       est. rows   est. pass   est. time
-  Project: __quail_call_1
-    AiClassify: __quail_call_1 over c                                                           3.06 ms
+  Project: governing_law_state
+    AiClassify: governing_law_state over c                                                      3.06 ms
       rule=trie_decode, labels=7, label tokens=72
       AiFilter: c                                                           1.6                 9.03 ms
         KV rewind=on

@@ -43,7 +43,26 @@ impl AnalyzerRule for ClaimModelRegions {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        Extracted::default().claim(plan, None, false)
+        let mut extracted = Extracted::default();
+        // a moved call keeps the name the SELECT list gives it
+        plan.apply(|node| {
+            if let LogicalPlan::Projection(projection) = node {
+                for expr in &projection.expr {
+                    // the call itself, or the column a GROUP BY makes of it
+                    let Expr::Alias(alias) = expr else { continue };
+                    let named = match alias.expr.as_ref() {
+                        Expr::Column(column) => Some(column.name.clone()),
+                        inner if is_ai_call(inner) => Some(inner.schema_name().to_string()),
+                        _ => None,
+                    };
+                    if let Some(named) = named {
+                        extracted.aliases.push((named, alias.name.clone()));
+                    }
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        extracted.claim(plan, None, false)
     }
 }
 
@@ -51,6 +70,11 @@ impl AnalyzerRule for ClaimModelRegions {
 #[derive(Debug, Default)]
 struct Extracted {
     num_calls: usize,
+    /// The SELECT list's names, by the name of the call or column each
+    /// one renames.
+    aliases: Vec<(String, String)>,
+    /// The names given to moved calls.
+    used: Vec<String>,
 }
 
 impl Extracted {
@@ -174,13 +198,24 @@ impl Extracted {
         )?))
     }
 
-    /// A new hidden column name for each call.
+    /// A column name for each call: the SELECT list's name for it, or a
+    /// new hidden one.
     fn name(&mut self, calls: Vec<Expr>) -> Vec<(Expr, String)> {
         calls
             .into_iter()
             .map(|call| {
-                self.num_calls += 1;
-                (call, format!("__quail_call_{}", self.num_calls))
+                let key = call.schema_name().to_string();
+                let named = self
+                    .aliases
+                    .iter()
+                    .find(|(found, name)| *found == key && !self.used.contains(name))
+                    .map(|(_, name)| name.clone());
+                let name = named.unwrap_or_else(|| {
+                    self.num_calls += 1;
+                    format!("__quail_call_{}", self.num_calls)
+                });
+                self.used.push(name.clone());
+                (call, name)
             })
             .collect()
     }

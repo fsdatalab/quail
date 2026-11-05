@@ -4,15 +4,15 @@ Sort: n DESC NULLS LAST, test_result ASC NULLS LAST
 
 {0}"),t.trace),make_array(struct(Utf8("bug fixed, tests pass"),Utf8("the reported bug no longer occurs and other tests pass")),struct(Utf8("bug still occurs"),Utf8("the reported bug still happens")),struct(Utf8("bug fixed, other tests fail"),Utf8("the reported bug no longer occurs but other tests fail")),struct(Utf8("run errored"),Utf8("the run crashed or errored before testing anything")))) AS test_result, count(Int64(1)) AS count(*) AS n, count(DISTINCT t.trajectory_id) AS trajectories
     Filter: count(Int64(1)) >= Int64(50)
-      Aggregate: groupBy=[[__quail_call_1 AS ai_classify(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
+      Aggregate: groupBy=[[test_result AS ai_classify(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
 
 {0}"),t.trace),make_array(struct(Utf8("bug fixed, tests pass"),Utf8("the reported bug no longer occurs and other tests pass")),struct(Utf8("bug still occurs"),Utf8("the reported bug still happens")),struct(Utf8("bug fixed, other tests fail"),Utf8("the reported bug no longer occurs but other tests fail")),struct(Utf8("run errored"),Utf8("the run crashed or errored before testing anything"))))]], aggr=[[count(Int64(1)), count(DISTINCT t.trajectory_id)]]
         ModelRegion
 
 model region:
 logical:
-  Project: t.trajectory_id, __quail_call_1
-    SemanticClassify: __quail_call_1
+  Project: t.trajectory_id, test_result
+    SemanticClassify: test_result
       PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above what the most recent test or reproduction run showed.', t.trace) labels=['bug fixed, tests pass', 'bug still occurs', 'bug fixed, other tests fail', 'run errored']
       Filter: t.__label_t_0 IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails') (selectivity=36.1%)
         SemanticClassify: __label_t_0
@@ -25,8 +25,8 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
                                                                                                                                       est. rows   est. time
-  Project: t.trajectory_id, __quail_call_1
-    AiClassify: __quail_call_1 over t                                                                                                               5.43 ms
+  Project: t.trajectory_id, test_result
+    AiClassify: test_result over t                                                                                                                  5.43 ms
       rule=trie_decode, labels=4, label tokens=75
       Filter: t.__label_t_0 IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails')
         AiClassify: __label_t_0 over t                                                                                                                23 ms
