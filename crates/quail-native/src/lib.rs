@@ -10,11 +10,13 @@ use std::io::Cursor;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, RecordBatch};
+use std::ffi::CStr;
+
+use datafusion::arrow::array::{ArrayRef, RecordBatch, RecordBatchIterator};
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
-use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{
     DataFusionError, Result, tree_node::TreeNode, tree_node::TreeNodeRecursion,
@@ -26,7 +28,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBytes};
+use pyo3::types::{IntoPyDict, PyCapsule, PyCapsuleMethods};
 use quail_datafusion::{
     InputRows, ModelRegion, RegionRunner, bind, quail_column_names, quail_schema, region_sql, sql,
 };
@@ -65,26 +67,21 @@ impl PythonRunner {
 impl RegionRunner for PythonRunner {
     fn run(&self, region: &ModelRegion, inputs: &[InputRows]) -> Result<Vec<RecordBatch>> {
         let (kind, payload) = self.request(region)?;
-        // each input as IPC stream bytes, by the table name the region reads
-        let mut tables: Vec<(String, Vec<u8>)> = Vec::new();
-        for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
-            let schema = Arc::new(input.schema().as_arrow().clone());
-            tables.push((name.clone(), write_ipc(&schema, batches)?));
-        }
-        let bytes: Vec<u8> = Python::attach(|py| {
-            let tables: Vec<(String, Bound<'_, PyBytes>)> = tables
-                .iter()
-                .map(|(name, bytes)| (name.clone(), PyBytes::new(py, bytes)))
-                .collect();
+        let batches = Python::attach(|py| {
+            // each input as a pyarrow Table, by the table name the region reads
+            let mut tables = Vec::new();
+            for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
+                let schema = Arc::new(input.schema().as_arrow().clone());
+                tables.push((name.clone(), to_pyarrow(py, schema, batches.clone())?));
+            }
             let tables = tables.into_py_dict(py)?;
-            self.run_region
-                .call1(py, (kind, payload, tables))
-                .and_then(|answer| answer.extract::<Vec<u8>>(py))
+            let answer = self.run_region.call1(py, (kind, payload, tables))?;
+            from_pyarrow(answer.bind(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let schema = region.bound.schema();
         let names = quail_column_names(schema);
-        read_ipc(&bytes)?
+        batches
             .into_iter()
             .map(|batch| conform(batch, &names, schema.inner()))
             .collect()
@@ -162,31 +159,48 @@ impl TableProvider for PythonTable {
             None => Arc::clone(&self.schema),
         };
         let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let bytes: Vec<u8> = Python::attach(|py| {
-            self.scan
-                .call1(py, (columns,))
-                .and_then(|answer| answer.extract::<Vec<u8>>(py))
+        let batches = Python::attach(|py| {
+            let answer = self.scan.call1(py, (columns,))?;
+            from_pyarrow(answer.bind(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let batches = read_ipc(&bytes)?;
         Ok(MemorySourceConfig::try_new_exec(&[batches], schema, None)?)
     }
 }
 
-fn read_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
-    let reader = StreamReader::try_new(Cursor::new(bytes), None)?;
-    Ok(reader.collect::<std::result::Result<Vec<_>, _>>()?)
+/// The capsule name of the Arrow C stream interface.
+const ARROW_STREAM: &CStr = c"arrow_array_stream";
+
+/// Hand batches to Python as a pyarrow Table over the same buffers,
+/// through the Arrow C stream interface.
+fn to_pyarrow<'py>(
+    py: Python<'py>,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let stream = FFI_ArrowArrayStream::new(Box::new(reader));
+    // pyarrow takes the stream; the capsule's destructor releases it
+    // only when pyarrow did not
+    let capsule = PyCapsule::new_with_value(py, stream, ARROW_STREAM)?;
+    py.import("pyarrow")?
+        .getattr("RecordBatchReader")?
+        .call_method1("_import_from_c_capsule", (capsule,))?
+        .call_method0("read_all")
 }
 
-fn write_ipc(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut bytes, schema)?;
-    for batch in batches {
-        writer.write(batch)?;
-    }
-    writer.finish()?;
-    drop(writer);
-    Ok(bytes)
+/// Read a Python object's Arrow stream, such as a pyarrow Table's,
+/// into batches over the same buffers.
+fn from_pyarrow(value: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    let capsule = value.call_method0("__arrow_c_stream__")?;
+    let capsule = capsule.cast::<PyCapsule>()?;
+    let pointer = capsule.pointer_checked(Some(ARROW_STREAM))?;
+    // the reader takes the stream and leaves the capsule's released
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(pointer.as_ptr().cast()) }
+        .map_err(|error| python_error(error.into()))?;
+    reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| python_error(error.into()))
 }
 
 fn python_error(error: DataFusionError) -> PyErr {
@@ -289,14 +303,15 @@ impl NativeContext {
         py: Python<'py>,
         query: &str,
         dialect: Option<String>,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = py
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (schema, batches) = py
             .detach(|| {
                 self.runtime.block_on(async {
                     let frame =
                         quail_datafusion::sql_in_dialect(&self.context, query, dialect.as_deref())
                             .await?;
                     let schema = quail_schema(frame.schema());
+                    // renaming the columns keeps each column's buffers
                     let batches = frame
                         .collect()
                         .await?
@@ -305,11 +320,11 @@ impl NativeContext {
                             RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
                         })
                         .collect::<std::result::Result<Vec<_>, _>>()?;
-                    write_ipc(&schema, &batches)
+                    Ok::<_, DataFusionError>((schema, batches))
                 })
             })
             .map_err(python_error)?;
-        Ok(PyBytes::new(py, &bytes))
+        to_pyarrow(py, schema, batches)
     }
 
     /// Return the SQL each model region of a query sends to Quail.

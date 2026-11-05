@@ -37,14 +37,13 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
     Args:
         session: The session whose tables and model the region uses.
         logical: The region's logical plan.
-        tables: Each input's rows as Arrow IPC stream bytes, by name, or
-            None to plan before the inputs exist.
+        tables: Each input's rows as a pyarrow Table, by name, or None
+            to plan before the inputs exist.
         **options: Passed to Query.
 
     Returns:
         A Query whose catalog holds the session's tables and the inputs.
     """
-    from quail.api.context import ipc_table
     from quail.api.query import Query
 
     scans = input_scans(logical, session.catalog)
@@ -54,7 +53,7 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
     assumed = {}
     for name, scan in scans.items():
         if tables is not None and name in tables:
-            table = ipc_table(tables[name])
+            table = tables[name]
         else:
             table = scan.schema.empty_table()
             assumed[name] = lambda _column: TokenLengths(

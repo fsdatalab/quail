@@ -46,12 +46,6 @@ def ipc_bytes(table: pa.Table) -> bytes:
     return sink.getvalue().to_pybytes()
 
 
-def ipc_table(data: bytes) -> pa.Table:
-    """Return the table held in Arrow IPC stream bytes."""
-    with pa.ipc.open_stream(data) as reader:
-        return reader.read_all()
-
-
 class SessionContext:
     """A DataFusion session context with Quail registered.
 
@@ -89,16 +83,17 @@ class SessionContext:
         self._register_table(name, provider)
 
     def _register_table(self, name: str, provider: TableProvider) -> None:
-        def scan(columns: list[str]) -> bytes:
+        def scan(columns: list[str]) -> pa.Table:
             reader = provider.scan(ScanRequest(columns=tuple(columns)))
-            return ipc_bytes(reader.read_all())
+            return reader.read_all()
 
         self._native.register(name, ipc_bytes(provider.schema().empty_table()), scan,
                               getattr(provider, "id_col", None) or None)
 
     def sql(self, text: str, dialect: str = "snowflake") -> pa.Table:
         """Run a query and return its rows."""
-        return ipc_table(self._native.sql(text, DATAFUSION_DIALECTS[dialect]))
+        # DataFusion's batches, shared through the Arrow C stream interface
+        return self._native.sql(text, DATAFUSION_DIALECTS[dialect])
 
     def region_sql(self, text: str) -> list[str]:
         """Return the SQL each model region of a query sends to Quail."""
@@ -126,7 +121,8 @@ class SessionContext:
         """Return DataFusion's optimized logical plan for a query."""
         return self._native.explain(text, DATAFUSION_DIALECTS[dialect])
 
-    def _run_region(self, kind: str, payload: str, tables: dict | None = None) -> bytes:
+    def _run_region(self, kind: str, payload: str,
+                    tables: dict | None = None) -> pa.Table:
         from quail.api.region_inputs import region_query
 
         query = (region_query(self.session,
@@ -134,7 +130,7 @@ class SessionContext:
                               order=self._order, tables=tables)
                  if kind == "plan" else self.session.sql(payload, order=self._order))
         result = execute_query(query, physical_executor=self._physical_executor)
-        return ipc_bytes(result.collect())
+        return result.collect()
 
 
 class DataFusionQuery:

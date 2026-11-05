@@ -14,6 +14,8 @@ crate-type = ["cdylib"]
 quail-cost = { path = "../quail-cost" }
 async-trait = "0.1"
 datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
+# the Arrow C stream interface, to share buffers with pyarrow
+arrow = { version = "59.3.2", default-features = false, features = ["ffi"] }
 pyo3 = { version = "0.30", features = ["extension-module", "abi3-py312"] }
 quail-datafusion = { path = "../quail-datafusion" }
 quail-physical = { path = "../quail-physical" }

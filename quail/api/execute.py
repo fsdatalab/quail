@@ -135,7 +135,7 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     the result; otherwise the result holds DataFusion's rows with the
     region's plan, metrics, and answers.
     """
-    from quail.api.context import SessionContext, ipc_bytes
+    from quail.api.context import SessionContext
 
     results = []
 
@@ -155,7 +155,7 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
         result = _execute_region(region, physical_executor, plan,
                                  on_backend_ready, on_execution_ready)
         results.append(result)
-        return ipc_bytes(result.collect())
+        return result.collect()
 
     context = SessionContext(query.session, run_region=run_region)
     table = context.sql(query.text, query.dialect)
