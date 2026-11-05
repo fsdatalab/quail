@@ -497,3 +497,23 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         model.shared_reads > 0
     )
     assert not arena.accounting.owned
+
+
+def test_a_failure_building_copy_tables_surfaces_when_the_decoder_needs_them(
+        monkeypatch):
+    from quail.backends.quail.executor.extract import copy
+
+    def broken(documents):
+        raise RuntimeError("no word index")
+
+    monkeypatch.setattr(copy, "copy_tables", broken)
+    spec, vocabulary = make_spec("five years", "five", "years")
+    state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
+    documents = ExtractionInputs(state, [spec], vocabulary, np.arange(1), None,
+                                 ["five years"])
+    decoder = MapDecoder(events_torch(0), torch.eye(len(vocabulary.vocab)), 1, [4],
+                         vocabulary.tokenizer.stop_ids, 16,
+                         workspace_bytes=2**20)
+    decoder.configure_copy(0, np.array([[0]]), documents, [spec])
+    with pytest.raises(RuntimeError, match="no word index"):
+        decoder.prepare()
