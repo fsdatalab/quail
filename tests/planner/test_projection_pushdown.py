@@ -1,6 +1,5 @@
-"""Projection and filter pushdown rule tests."""
+"""Projection pushdown rule tests."""
 
-from dataclasses import replace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -10,10 +9,7 @@ from helpers.sessions import _run, fake_tok, make_executor
 import quail
 from quail.api.config import EngineConfig
 from quail.logical import (
-    Filter,
-    LogicalPlan,
     Scan,
-    SemanticClassify,
     SemanticJoin,
 )
 from quail.physical import Recombine
@@ -142,36 +138,20 @@ LABELLED_JOIN_SQL = """
 """
 
 
-def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
+def test_projection_pushdown_is_the_only_rewrite_of_a_join():
     session = _pair_session()
     catalog = session.catalog
     plan = session.sql(JOIN_SQL).logical
     assert isinstance(plan.root.input, SemanticJoin)
 
-    # the front end places the filter on its table, so the rule leaves
-    # the plan alone and only the projection moves
-    (unchanged,) = rewrite(plan, "should_push_down_filters", catalog=catalog)
-    assert unchanged.rules == ()
+    # only the projection moves
     candidate, = native.logical_alternatives(
         plan, session.registry, PlanningContext(catalog=catalog))
     assert candidate.rules == ("should_push_down_projection",)
     (projected,) = rewrite(plan, "should_push_down_projection", catalog=catalog)
     assert candidate.plan.root == projected.plan.root
 
-    # a filter on a label returns to its table, above the
-    # classification that computes the label
     labelled = session.sql(LABELLED_JOIN_SQL).logical
-    joined = labelled.root.input
-    label_filter = joined.input.left
-    assert isinstance(label_filter, Filter)
-    assert isinstance(label_filter.input, SemanticClassify)
-    lifted = replace(labelled.root, input=replace(
-        label_filter, input=replace(joined, input=replace(
-            joined.input, left=label_filter.input))))
-    LogicalPlan(lifted).validate()
-    (pushed,) = rewrite(LogicalPlan(lifted), "should_push_down_filters",
-                        catalog=catalog)
-    assert pushed.plan.root == labelled.root
     # the placement rule offers the lifted plan for a full join
     *_, placed = rewrite(labelled, "should_lift_column_operators", catalog=catalog)
     assert [type(node).__name__ for node in placed.plan.walk()][-4:] == [

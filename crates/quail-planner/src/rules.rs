@@ -5,17 +5,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use quail_physical::{
-    Asked, ColumnRef, Condition, Equality, FilterPredicate, ModelCall, Projected, SortExpression,
-    SortKey, ValueExpression,
+    Asked, ColumnRef, Condition, Equality, ModelCall, Projected, SortExpression, SortKey,
+    ValueExpression,
 };
 
 use crate::expressions::{
     CompileError, aliased_call, call_aliases, column_references, condition_aliases, tests,
 };
-use crate::logical::{Filter, Join, LogicalNode, LogicalPlan, ResultNode, Scan};
+use crate::logical::{Filter, LogicalNode, LogicalPlan, ResultNode, Scan};
 use crate::nodes::{
     above_projection, added_columns, as_column, asked_call, children, column_alias, column_call,
-    input, output_schema, reads_projection, source_columns, subtree, validate_plan,
+    input, output_schema, source_columns, subtree, validate_plan,
 };
 use crate::operators::operators;
 
@@ -23,11 +23,10 @@ use crate::operators::operators;
 pub const MAX_PASSES: usize = 4;
 
 /// The names of the built-in logical rules, in the order they run.
-pub const LOGICAL_RULES: [&str; 5] = [
+pub const LOGICAL_RULES: [&str; 4] = [
     "should_eliminate_distinct",
     "should_push_down_distinct",
     "should_push_down_projection",
-    "should_push_down_filters",
     "should_lift_column_operators",
 ];
 
@@ -100,7 +99,6 @@ fn rewrites(
         "should_eliminate_distinct" => vec![eliminate_distinct(root, context)],
         "should_push_down_distinct" => vec![push_down_distinct(root)],
         "should_push_down_projection" => vec![push_down_projection(root)],
-        "should_push_down_filters" => vec![push_down_filters(root).unwrap_or_else(|| root.clone())],
         "should_lift_column_operators" => match lift_column_operators(root) {
             Some(lifted) => vec![root.clone(), lifted],
             None => vec![root.clone()],
@@ -492,83 +490,6 @@ pub fn push_down_projection(root: &LogicalNode) -> LogicalNode {
     }
 
     descend(root, &BTreeMap::new(), &valued)
-}
-
-// ---------------------------------------------------------------- filters
-
-fn lets_through(node: &LogicalNode, alias: &str) -> bool {
-    match node {
-        LogicalNode::Join(_) => true,
-        LogicalNode::SemanticJoin(join) => join.semantics == "full",
-        LogicalNode::Filter(filter) => filter_alias(filter) != alias,
-        LogicalNode::SemanticFilter(filter) => {
-            filter.predicates.iter().all(|predicate: &FilterPredicate| {
-                call_aliases(asked_call(&predicate.expression))[0] != alias
-            })
-        }
-        column if as_column(column).is_some() => {
-            let found = as_column(column).expect("a column operator");
-            call_aliases(column_call(found)).len() == 2 || column_alias(found) != alias
-        }
-        _ => false,
-    }
-}
-
-fn place_filter(filter: &LogicalNode, node: &LogicalNode, alias: &str) -> Option<LogicalNode> {
-    if let LogicalNode::Join(join) = node {
-        let left: BTreeSet<String> = output_schema(&join.left)
-            .into_iter()
-            .map(|field| field.alias)
-            .collect();
-        let on_left = left.contains(alias);
-        let child = if on_left { &join.left } else { &join.right };
-        let placed = place_filter(filter, child, alias)
-            .unwrap_or_else(|| with_children(filter, vec![(**child).clone()]));
-        let mut moved: Join = join.clone();
-        if on_left {
-            moved.left = Box::new(placed);
-        } else {
-            moved.right = Box::new(placed);
-        }
-        return Some(LogicalNode::Join(moved));
-    }
-    if lets_through(node, alias) {
-        let child = input(node);
-        let placed = place_filter(filter, child, alias)?;
-        return Some(with_children(node, vec![placed]));
-    }
-    None
-}
-
-/// Move every Filter on one table below the joins above its table; None
-/// when no filter moved.
-pub fn push_down_filters(root: &LogicalNode) -> Option<LogicalNode> {
-    fn visit(node: &LogicalNode, moved: &mut bool) -> LogicalNode {
-        let old = children(node);
-        let new: Vec<LogicalNode> = old.iter().map(|child| visit(child, moved)).collect();
-        let node = if new.iter().zip(&old).all(|(a, b)| a == *b) {
-            node.clone()
-        } else {
-            with_children(node, new)
-        };
-        let LogicalNode::Filter(filter) = &node else {
-            return node;
-        };
-        if reads_projection(&filter.input) {
-            return node;
-        }
-        let alias = filter_alias(filter);
-        match place_filter(&node, &filter.input, &alias) {
-            Some(placed) => {
-                *moved = true;
-                placed
-            }
-            None => node,
-        }
-    }
-    let mut moved = false;
-    let rewritten = visit(root, &mut moved);
-    moved.then_some(rewritten)
 }
 
 // ---------------------------------------------------------------- lifting

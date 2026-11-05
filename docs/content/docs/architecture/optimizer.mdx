@@ -113,7 +113,6 @@ built-in rules of the same kind, in registration order.
 | `should_eliminate_distinct` | Logical | Remove DISTINCT when the returned keys are unique. | No |
 | `should_push_down_distinct` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `should_push_down_projection` | Logical | Load only columns the query uses. | No |
-| `should_push_down_filters` | Logical | Move conditions on labels and extracted answers before joins. | No |
 | `should_lift_column_operators` | Logical | Offer classification, extraction, and AI.MAP before and after joins. | Yes |
 | `should_eliminate_window_sort` | Physical | Remove a final sort when the window already returns rows in that order. | No |
 | `should_push_down_limit_through_window` | Physical | Select the first requested rows before computing an eligible window. | No |

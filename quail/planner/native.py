@@ -34,7 +34,7 @@ from quail.planner.candidates import LogicalAlternative
 # the built-in logical rules, in the order they apply
 LOGICAL_RULES = (
     "should_eliminate_distinct", "should_push_down_distinct",
-    "should_push_down_projection", "should_push_down_filters",
+    "should_push_down_projection",
     "should_lift_column_operators",
 )
 # the built-in physical rules, in the order they apply
