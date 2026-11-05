@@ -82,12 +82,21 @@ impl RegionRunner for PythonRunner {
 
 /// Give a batch of Quail's rows the region's schema: each region
 /// column is the Quail column of the same name, cast to its type.
+///
+/// A column Quail names differently, such as `r.details.body` for
+/// DataFusion's `r.details[body]`, is the one in the same position when
+/// both list the same number of columns, as both follow the SELECT list.
 fn conform(batch: RecordBatch, names: &[String], schema: &SchemaRef) -> Result<RecordBatch> {
+    let positional = batch.num_columns() == names.len();
     let columns = names
         .iter()
         .zip(schema.fields())
-        .map(|(name, field)| {
-            let column = batch.column_by_name(name).ok_or_else(|| {
+        .enumerate()
+        .map(|(index, (name, field))| {
+            let found = batch
+                .column_by_name(name)
+                .or_else(|| positional.then(|| batch.column(index)));
+            let column = found.ok_or_else(|| {
                 let returned: Vec<_> = batch
                     .schema()
                     .fields()
@@ -199,7 +208,11 @@ impl NativeContext {
         layout: Option<String>,
         rules: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        let runtime = Runtime::new()?;
+        // one thread: each model region runs on the Python thread that
+        // called DataFusion, as it would without DataFusion
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         let prompting = turn.zip(layout);
         let regions = match rules {
             Some(rules) => {

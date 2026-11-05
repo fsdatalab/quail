@@ -118,6 +118,46 @@ def execute_query(query, physical_executor=None, plan=None,
     if not hasattr(query, "logical"):
         # a query DataFusion runs plans each model region as it runs
         return query.run(plan, physical_executor=physical_executor)
+    if getattr(query, "text", None) is not None:
+        return _execute_in_datafusion(query, physical_executor, plan,
+                                      on_backend_ready, on_execution_ready)
+    return _execute_region(query, physical_executor, plan,
+                           on_backend_ready, on_execution_ready)
+
+
+def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
+                           on_execution_ready):
+    """Run a query's SQL in DataFusion, whose model region runs this query.
+
+    DataFusion's ModelRegionExec calls back once, for the query's one
+    model region; the region's QueryResult, with its plan and metrics,
+    is the result.
+    """
+    from quail.api.context import SessionContext, ipc_bytes
+
+    results = []
+
+    def run_region(kind, _payload):
+        if kind != "plan" or results:
+            raise RuntimeError("the query's one model region runs once, as a plan")
+        result = _execute_region(query, physical_executor, plan,
+                                 on_backend_ready, on_execution_ready)
+        results.append(result)
+        return ipc_bytes(result.collect())
+
+    table = SessionContext(query.session, run_region=run_region).sql(
+        query.text, query.dialect)
+    (result,) = results
+    if table.num_rows != result.count():
+        raise RuntimeError(
+            f"DataFusion returned {table.num_rows} rows; the model region "
+            f"returned {result.count()}")
+    return result
+
+
+def _execute_region(query, physical_executor, plan, on_backend_ready,
+                    on_execution_ready):
+    """Execute one model region's Query in its session's process."""
     if isinstance(query.logical.root, WithCTE):
         from quail.api.stages import execute_stages
 

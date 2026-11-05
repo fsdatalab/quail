@@ -71,8 +71,12 @@ class Query:
     """A compiled query that plans and executes in the current process."""
 
     def __init__(self, session: "Session", logical: LogicalPlan,
-                 order: str | None = None, *, catalog=None, inputs=None):
+                 order: str | None = None, *, catalog=None, inputs=None,
+                 text: str | None = None, dialect: str = "snowflake"):
         self.session = session
+        # the SQL the plan was compiled from, which DataFusion runs
+        self.text = text
+        self.dialect = dialect
         self.catalog = session.catalog if catalog is None else catalog
         self.inputs = session.inputs if inputs is None else inputs
         self.logical = logical

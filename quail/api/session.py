@@ -137,7 +137,8 @@ class Session:
             from quail.api.context import DataFusionQuery
 
             return DataFusionQuery(self, text, SQLDialect(dialect).value, order=order)
-        return Query(self, logical, order=order)
+        return Query(self, logical, order=order, text=text,
+                     dialect=SQLDialect(dialect).value)
 
     def get_run(self, query_id: str):
         """Reattach to a query the server already accepted.

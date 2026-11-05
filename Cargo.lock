@@ -1939,7 +1939,6 @@ dependencies = [
  "async-trait",
  "base64",
  "datafusion",
- "datafusion-common-runtime",
  "futures",
  "quail-physical",
  "quail-planner",

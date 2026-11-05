@@ -21,7 +21,6 @@ use datafusion::physical_plan::{
     PlanProperties, ReplaceChildrenOptions,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use datafusion_common_runtime::SpawnedTask;
 use futures::stream;
 
 use crate::region::ModelRegion;
@@ -127,12 +126,11 @@ impl ExecutionPlan for ModelRegionExec {
         }
         let region = self.region.clone();
         let runner = Arc::clone(&self.runner);
+        // the region runs on the thread that polls the stream: under a
+        // current-thread runtime, the thread that called DataFusion, so a
+        // runner's per-thread state (Python's, the GPU process's) is reused
         let rows = async move {
-            let task = SpawnedTask::spawn_blocking(move || runner.run(&region));
-            let batches = task
-                .join_unwind()
-                .await
-                .map_err(|error| DataFusionError::External(Box::new(error)))??;
+            let batches = runner.run(&region)?;
             Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
         };
         let batches = futures::TryStreamExt::try_flatten(stream::once(rows));
