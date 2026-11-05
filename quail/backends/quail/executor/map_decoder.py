@@ -10,7 +10,7 @@ their previous result before laying out rows at the accepted prefix's end.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import numpy as np
@@ -32,6 +32,9 @@ class _Copy:
     documents: np.ndarray
     indices: np.ndarray     # each token's position in its answer
     maps: np.ndarray        # each token's map, when it was chosen
+    # copy continuations to prepare for these answers' next rows, run while
+    # a later forward pass is on the GPU and before the tokens are read
+    lookahead: list = field(default_factory=list)
 
 
 class MapDecoder:
@@ -473,19 +476,20 @@ class MapDecoder:
         host.copy_(values, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
-        self.copies.append(_Copy(event, host, documents, indices,
-                                 self.map[documents].copy()))
-        np.add.at(self.inflight, documents, 1)
+        lookahead = []
         for group in self.copy_groups:
             mine = np.isin(self.map[documents], group.questions)
             if (mine & (indices == 0)).any():
-                group.constraint.prepare_documents()
+                lookahead.append((group, None))
             mine &= indices > 0
             slots, first = np.unique(documents[mine], return_index=True)
             if len(slots):
-                group.lookahead[group.index[slots]] = group.constraint.prepare_ahead(
-                    self.copy_document[slots], group.masks[group.index[slots]],
-                    indices[mine][first])
+                lookahead.append((group, (
+                    slots, self.copy_document[slots], group.masks[group.index[slots]],
+                    indices[mine][first])))
+        self.copies.append(_Copy(event, host, documents, indices,
+                                 self.map[documents].copy(), lookahead))
+        np.add.at(self.inflight, documents, 1)
         while len(self.copies) > IN_FLIGHT:
             self._read(self.copies.popleft())
 
@@ -597,6 +601,8 @@ class MapDecoder:
     def prepare(self):
         """Prepare pending copy rows while a forward pass runs, or when none fits."""
         self._initialize()
+        for copy in self.copies:
+            self._look_ahead(copy)
         for group in self.copy_groups:
             slots = np.flatnonzero(self.copy_pending & (self.inflight == 0)
                                    & np.isin(self.map, group.questions))
@@ -610,7 +616,19 @@ class MapDecoder:
             self._prepare_copy(group, slots, written, drafts)
             self.copy_pending[slots] = False
 
+    def _look_ahead(self, copy: _Copy) -> None:
+        """Prepare the copy continuations a copy's answers read next."""
+        work, copy.lookahead = copy.lookahead, []
+        for group, ahead in work:
+            if ahead is None:
+                group.constraint.prepare_documents()
+                continue
+            slots, documents, masks, written = ahead
+            group.lookahead[group.index[slots]] = group.constraint.prepare_ahead(
+                documents, masks, written)
+
     def _read(self, copy: _Copy) -> None:
+        self._look_ahead(copy)
         copy.event.synchronize()
         values = copy.host.numpy()
         documents, indices, maps = copy.documents, copy.indices, copy.maps
