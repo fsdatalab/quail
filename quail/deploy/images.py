@@ -84,7 +84,11 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
             .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True)
             .uv_pip_install(MATURIN, uv_version=UV_VERSION)
             .run_commands(
+                # an image builds once: Cargo's default release settings,
+                # not the workspace's fast-rebuild ones
                 f"cd {NATIVE_SOURCE} && PATH=$HOME/.cargo/bin:$PATH "
+                "CARGO_PROFILE_RELEASE_INCREMENTAL=false "
+                "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 "
                 f"maturin build --release -m crates/quail-native/Cargo.toml "
                 f"-o {NATIVE_SOURCE}/wheels",
                 # the image's environment has no pip; a wheel is a zip archive

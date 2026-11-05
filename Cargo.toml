@@ -8,6 +8,22 @@ members = [
     "crates/quail-planner",
 ]
 
-# Full debug info for DataFusion's dependency tree takes many gigabytes.
+# Full debug info for DataFusion's dependency tree takes many gigabytes,
+# and linking it dominates a rebuild; dependencies get none.
 [profile.dev]
 debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
+# Rebuilding the Python module after an edit recompiles only Quail's
+# crates: incrementally, in many codegen units. Dependencies, compiled
+# once, keep the default units.
+[profile.release]
+incremental = true
+codegen-units = 64
+
+[profile.release.package."*"]
+codegen-units = 16
+incremental = false
