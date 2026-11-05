@@ -66,7 +66,7 @@ class SessionContext:
     """
 
     def __init__(self, session, physical_executor: Callable | None = None, *,
-                 order: str | None = None, run_region: Callable | None = None):
+                 order: str | None = None):
         from _quail_native import NativeContext
 
         self.session = session
@@ -74,7 +74,7 @@ class SessionContext:
         self._order = order
         model = session.model
         rules = [rule.name for rule in session.registry.logical_rules.values()]
-        self._native = NativeContext(run_region or self._run_region, tuple(model.turn),
+        self._native = NativeContext(self._run_region, tuple(model.turn),
                                      model.prompt_layout, rules)
         for name, provider in session.catalog.providers.items():
             self._register_table(name, provider)

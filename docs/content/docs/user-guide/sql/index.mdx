@@ -59,8 +59,3 @@ The filter is one model region; DataFusion runs the union and the sort.
 `session.sql` returns a `DataFusionQuery` for such a query. It has the
 methods of a `Query`. `plan()` gives each region's physical plan, and
 `explain()` gives DataFusion's plan, then each region's.
-
-A query that is one model region, with no SQL around it, is a `Query`.
-DataFusion runs it too, through its `ModelRegionExec` operator, and the
-region's result keeps the plan and metrics that `explain(analyze=True)`
-reads.
