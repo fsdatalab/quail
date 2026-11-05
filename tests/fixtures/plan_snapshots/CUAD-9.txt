@@ -17,16 +17,16 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   Project: c.id, contract, contract_span
     contract = struct(contract.license_grant)
     contract_span = struct(contract.license_grant_span)
-    AiExtract: contract.license_grant over c                                                                                                       1.27 ms
+    AiExtract: contract.license_grant over c                                                                                                         <1 ms
       question='Does the contract contain a license granted by one party to its counterparty?', up to 64 answer tokens
-      AiFilter: c                                                                                                            0.672                 1.22 ms
+      AiFilter: c                                                                                                            0.672                  1.1 ms
         KV rewind=on
         predicate 1  PROMPT('DOCUMENT:\n{0}\n\nDoes the contract…')                                                            1.4       46.5%
-        AiFilter: c                                                                                                            1.4                  8.8 ms
+        AiFilter: c                                                                                                            1.4                 6.83 ms
           KV rewind=on
           predicate 2  PROMPT('DOCUMENT:\n{0}\n\nDoes the contract…')                                                            6       24.1%
           Scan contracts as c                                                                                                    6
-            tokens=96, mean_document_tokens=16
+            tokens=78, mean_document_tokens=13
   Pipeline on c: ai_filter:c -> ai_filter:c:0 -> ai-extract:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

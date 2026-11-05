@@ -2361,7 +2361,6 @@ dependencies = [
  "pyo3",
  "pyo3-build-config",
  "quail-datafusion",
- "quail-inputs",
  "quail-planner",
  "tokio",
 ]

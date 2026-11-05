@@ -1,7 +1,7 @@
 """PackSetPasses: the pass groups a set-attention plan prices and explains."""
 
-
-
+from helpers.oracle import question_text
+from helpers.sessions import TOKENIZER, encoder
 
 
 def test_two_ai_filters_on_d1_2b_share_one_pass(tmp_path):
@@ -18,7 +18,7 @@ def test_two_ai_filters_on_d1_2b_share_one_pass(tmp_path):
     pq.write_table(pa.table({"id": [1, 2, 3], "body": [body] * 3}),
                    tmp_path / "reviews.parquet")
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
+                            tokenizer=TOKENIZER)
     session.register("reviews", DocumentProvider.from_parquet(
         str(tmp_path / "reviews.parquet"), id_col="id"))
 
@@ -28,8 +28,11 @@ def test_two_ai_filters_on_d1_2b_share_one_pass(tmp_path):
 
     filters = [node for node in plan.nodes if isinstance(node, AiFilter)]
     assert [node.pass_group for node in filters] == [0, 0]
-    assert all(node.state_tail_tokens == 1 for node in filters)
-    assert all(node.question_header_token_ids == ("QUESTION:",) for node in filters)
+    assert all(question_text(node.question_header_token_ids) == "QUESTION:\n"
+               for node in filters)
+    # the filters of one pass read the same state tail after the document
+    assert len({node.state_tail_tokens for node in filters}) == 1
+    assert filters[0].state_tail_tokens >= len(filters[0].question_header_token_ids)
     session.close()
 
 
@@ -46,7 +49,7 @@ def test_a_d1_plan_prices_and_explains_the_passes_its_operators_share(tmp_path):
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
                    tmp_path / "reviews.parquet")
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
+                            tokenizer=TOKENIZER)
     session.register("reviews", DocumentProvider.from_parquet(
         str(tmp_path / "reviews.parquet"), id_col="id"))
     query = session.sql(
@@ -81,7 +84,7 @@ def test_two_d1_classifications_share_a_pass_across_a_condition_between_them(
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
                    tmp_path / "reviews.parquet")
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
+                            tokenizer=TOKENIZER)
     session.register("reviews", DocumentProvider.from_parquet(
         str(tmp_path / "reviews.parquet"), id_col="id"))
 
@@ -115,7 +118,7 @@ def test_a_d1_filter_and_classification_on_one_table_share_a_pass(tmp_path):
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
                    tmp_path / "reviews.parquet")
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
+                            tokenizer=TOKENIZER)
     session.register("reviews", DocumentProvider.from_parquet(
         str(tmp_path / "reviews.parquet"), id_col="id"))
     query = session.sql(
@@ -150,7 +153,7 @@ def test_a_d1_score_and_a_classification_of_one_table_share_a_pass(tmp_path):
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
                    tmp_path / "reviews.parquet")
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
+                            tokenizer=TOKENIZER)
     session.register("reviews", DocumentProvider.from_parquet(
         str(tmp_path / "reviews.parquet"), id_col="id"))
     query = session.sql(
@@ -170,25 +173,6 @@ def test_a_d1_score_and_a_classification_of_one_table_share_a_pass(tmp_path):
     session.close()
 
 
-class _Vocabulary:
-    """Split on spaces into integer ids, and decode them back."""
-
-    def __init__(self):
-        self.ids, self.words = {}, []
-
-    def __call__(self, text):
-        out = []
-        for word in text.split():
-            if word not in self.ids:
-                self.ids[word] = len(self.words)
-                self.words.append(word)
-            out.append(self.ids[word])
-        return out
-
-    def decode(self, ids):
-        return " ".join(self.words[token] for token in ids)
-
-
 def test_a_d1_filter_ends_each_document_joined_with_its_question(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -200,9 +184,8 @@ def test_a_d1_filter_ends_each_document_joined_with_its_question(tmp_path):
 
     pq.write_table(pa.table({"id": [1, 2], "body": ["a kind note", "a short one"]}),
                    tmp_path / "reviews.parquet")
-    vocabulary = _Vocabulary()
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=vocabulary)
+                            tokenizer=TOKENIZER)
     session.register("reviews", DocumentProvider.from_parquet(
         str(tmp_path / "reviews.parquet"), id_col="id"))
 
@@ -217,6 +200,9 @@ def test_a_d1_filter_ends_each_document_joined_with_its_question(tmp_path):
     ((alias, tail, joins),) = node.document_ends
     ends = dict(joins)
     assert alias == "r"
-    assert {vocabulary.ids["note"], vocabulary.ids["one"]} <= set(ends)
-    assert ends[vocabulary.ids["note"]] == (vocabulary.ids["note"], *tail)
+    last = {encoder()(text)[-1] for text in ("a kind note", "a short one")}
+    assert last <= set(ends)
+    for token in last:
+        # a last token read with the tail as one text keeps its own tokens
+        assert ends[token] == tuple(encoder()(question_text([token, *tail])))
     session.close()

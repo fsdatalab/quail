@@ -18,16 +18,16 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                                                                                              est. rows   est. pass   est. time
   Project: c.id, e.id
-    AiJoin: anchor=e                                                                                                    6.5 ms
+    AiJoin: anchor=e                                                                                                   5.72 ms
       KV: anchor=from filters, retain after join=no
       join 1 full (e, c)  PROMPT('Does the Wikipedia passage in DO…')                             11.8      0.217%
-      AiFilter: e                                                                                  3.3                 11.3 ms
+      AiFilter: e                                                                                  3.3                 8.35 ms
         KV rewind=on
         expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
         predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       55.4%
         Scan evidence as e                                                                           6
-          tokens=114, mean_document_tokens=19
-      AiFilter: c                                                                                  3.6                 11.8 ms
+          tokens=102, mean_document_tokens=17
+      AiFilter: c                                                                                  3.6                 8.94 ms
         KV: not stored
         predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       59.2%
         Scan claims as c                                                                             6

@@ -3,7 +3,7 @@
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, oracle_executor
-from helpers.sessions import CONFIG, _run, fake_tok
+from helpers.sessions import CONFIG, TOKENIZER, _run
 
 import quail
 from quail.api.config import EngineConfig
@@ -27,7 +27,7 @@ NUMBERED = (f"SELECT s.id, ROW_NUMBER() {OVER} AS n FROM steps s "
 
 @pytest.fixture
 def session():
-    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         session.register("steps", quail.DocumentProvider.from_table(
             STEPS, id_col="id"))
         yield session
@@ -67,7 +67,7 @@ def test_windows_run_in_datafusion_on_the_model_regions_rows(session):
                               ("s3", "good", "good", 3, 5.0)]
     # stock vLLM runs the region, a filter, and DataFusion the window
     stock = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
-                                       backend="stock_vllm"), tokenizer=fake_tok)
+                                       backend="stock_vllm"), tokenizer=TOKENIZER)
     stock.register("steps", session.catalog.get("steps"))
     with stock:
         assert not isinstance(stock.sql(NUMBERED).plan(), Refusal)

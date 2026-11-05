@@ -19,11 +19,11 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                                                                     est. rows   est. pass   est. time
   Project: m.trace_id                                                   0.295
-    AiFilter: m                                                         0.295                 1.54 ms
+    AiFilter: m                                                         0.295                 1.12 ms
       KV rewind=on
       predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           1       29.5%
       Scan issue_messages as m                                              1
-        tokens=144, mean_document_tokens=24
+        tokens=132, mean_document_tokens=22
         where m.role = 'assistant'
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

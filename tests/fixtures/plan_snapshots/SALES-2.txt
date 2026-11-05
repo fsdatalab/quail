@@ -20,11 +20,11 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                     est. rows   est. time
+                                                    est. rows   est. time
   Project: concern
-    AiClassify: concern over c                                     21.8 ms
-      rule=trie_decode, labels=7, label tokens=103
-      Scan sales_calls as c                                  6
-        tokens=144, mean_document_tokens=24
+    AiClassify: concern over c                                      16 ms
+      rule=trie_decode, labels=7, label tokens=84
+      Scan sales_calls as c                                 6
+        tokens=132, mean_document_tokens=22
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

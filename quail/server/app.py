@@ -150,7 +150,6 @@ class Server:
                     else ChildProcessExecutor(settings.hooks_reference))
         self.scheduler = Scheduler(self.store, executor, self.data_dir)
         self.registry = built_in_registry()
-        self._tokenizers = {}
         self._syncs = []
         self._closers = []
 
@@ -228,19 +227,15 @@ class Server:
             paths[content_id] = record.path
         return paths
 
-    def _tokenizer(self, engine: EngineConfig):
+    def _tokenizer(self) -> str | None:
+        """The test hooks' tokenizer directory, or None for the model's."""
         hooks = self.settings.hooks
-        if hooks is not None and hooks.tokenizer is not None:
-            return hooks.tokenizer
-        if engine.model not in self._tokenizers:
-            with Session(engine, registry=self.registry) as session:
-                self._tokenizers[engine.model] = session.tokenizer
-        return self._tokenizers[engine.model]
+        return None if hooks is None else hooks.tokenizer
 
     def compile(self, spec: dict, engine: EngineConfig, inputs: dict,
                 snapshot_paths: dict) -> None:
         """Compile the SQL against the inputs so bad queries fail now."""
-        session = Session(engine, tokenizer=self._tokenizer(engine),
+        session = Session(engine, tokenizer=self._tokenizer(),
                           registry=self.registry)
         try:
             for name, input_spec in inputs.items():

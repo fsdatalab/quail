@@ -4,9 +4,9 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.fakes import letter_tokens
 from helpers.oracle import Oracle, finish
 from helpers.planning import compile_sql
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
@@ -62,7 +62,7 @@ def catalog(tmp_path):
 
 
 def _session(
-    catalog, *, model="qwen3-reranker-0.6b-bf16", gpus=1, tokenizer=_tokens
+    catalog, *, model="qwen3-reranker-0.6b-bf16", gpus=1, tokenizer=TOKENIZER
 ):
     session = quail.Session(
         EngineConfig(model=model, device="h100-sxm", gpus=gpus),
@@ -123,7 +123,7 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
     def mixed():
         return Oracle(labels=lambda spec, ids: spec.labels[ids[0] % 2])
 
-    session = _session(catalog, model="qwen3-4b-fp8", tokenizer=letter_tokens)
+    session = _session(catalog, model="qwen3-4b-fp8", tokenizer=TOKENIZER)
     score = "AI.SCORE(PROMPT('Refund? {0}', d.body))"
     label = "AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise'])"
     for columns in (f"{score} AS s, {label} AS topic",

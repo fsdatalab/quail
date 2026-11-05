@@ -13,8 +13,8 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
                                                        est. rows   est. time
   Project: c.id, topic
     Filter: c.topic IN ('politics', 'history')
-      AiClassify: topic over c [1]                                     12 ms
-        rule=trie_decode, labels=11, label tokens=92
+      AiClassify: topic over c [1]                                   9.65 ms
+        rule=trie_decode, labels=11, label tokens=88
         Scan claims as c                                       6
           tokens=42, mean_document_tokens=7
     Reuse [1]

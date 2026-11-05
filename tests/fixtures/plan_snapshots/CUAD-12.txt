@@ -24,13 +24,13 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                                                                       est. rows   est. pass   est. time
   Project: governing_law_state
-    AiClassify: governing_law_state over c                                                      3.06 ms
-      rule=trie_decode, labels=7, label tokens=72
-      AiFilter: c                                                           1.6                 9.03 ms
+    AiClassify: governing_law_state over c                                                      2.28 ms
+      rule=trie_decode, labels=7, label tokens=59
+      AiFilter: c                                                           1.6                 7.05 ms
         KV rewind=on
         predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs there a requir…')           6       26.3%
         Scan contracts as c                                                   6
-          tokens=96, mean_document_tokens=16
+          tokens=78, mean_document_tokens=13
   Pipeline on c: ai_filter:c -> ai-classify:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

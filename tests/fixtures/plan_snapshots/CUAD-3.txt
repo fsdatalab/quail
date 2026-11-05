@@ -14,9 +14,9 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   Project: c.id, contract, contract_span
     contract = struct(contract.liability_cap)
     contract_span = struct(contract.liability_cap_span)
-    AiExtract: contract.liability_cap over c                                                                                                                                                                                                      17.4 ms
+    AiExtract: contract.liability_cap over c                                                                                                                                                                                                      13.2 ms
       question='Does the contract include a cap on liability upon the breach of a party’s obligation? This includes time limitation for the counterparty to bring claims or maximum amount for recovery.', up to 64 answer tokens
       Scan contracts as c                                                                                                                                                                                                                   6
-        tokens=96, mean_document_tokens=16
+        tokens=78, mean_document_tokens=13
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

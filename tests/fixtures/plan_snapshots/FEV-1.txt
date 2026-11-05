@@ -11,7 +11,7 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                                                                     est. rows   est. pass   est. time
   Project: c.id                                                           3.6
-    AiFilter: c                                                           3.6                 11.8 ms
+    AiFilter: c                                                           3.6                 8.94 ms
       KV: not stored
       predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       59.2%
       Scan claims as c                                                      6

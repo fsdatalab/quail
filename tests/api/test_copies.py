@@ -7,7 +7,7 @@ same rows and answers, and the deduplicated run asks only key documents.
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, finish
-from helpers.sessions import CONFIG, fake_tok
+from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 import quail.builtins
@@ -24,7 +24,7 @@ TOPIC = {"noisy room": "noise", "cold room": "cold", "slow lift": "lift"}
 
 
 def _session(bodies=BODIES, hotels=HOTELS):
-    session = quail.Session(CONFIG, tokenizer=fake_tok)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     for name, prefix, texts, places in (("reviews", "r", bodies, hotels),
                                         ("notes", "n", NOTES, NOTE_HOTELS)):
         session.register(name, quail.DocumentProvider.from_table(pa.table({

@@ -4,6 +4,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from helpers import server_fakes
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api import Query, QueryLike
@@ -121,7 +122,7 @@ def test_submit_close_reattach_watch_collect_and_stream_answers(endpoint, tmp_pa
 
 
 def test_bad_queries_cancel_and_timeout_fail_clearly(endpoint, tmp_path):
-    with quail.Session(CONFIG, tokenizer=server_fakes.fake_tok) as session:
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         assert session.endpoint is None
         register_reviews(session, tmp_path)
         with pytest.raises(RuntimeError, match="needs a Session with an endpoint"):

@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pytest
+from helpers.sessions import TOKENIZER, encoder
 
 from quail.common.document_ends import last_tokens
 from quail.common.tokens import TokenStore, prefix_tree
@@ -15,14 +16,7 @@ native = pytest.importorskip("_quail_native")
 # another document
 TEXTS = ["a b c d e f", "a b c d x", "a b c d e f", "", "a b", "z y x w",
          "a b c d e f g h", "z y"]
-
-
-def ids(text: str) -> list[int]:
-    return [ord(word[0]) for word in text.split()]
-
-
-def words(text: str) -> list[str]:
-    return text.split()
+TOKENIZER_FILE = str(TOKENIZER / "tokenizer.json")
 
 
 def python_statistics(store: TokenStore, page_tokens: int, columns=()):
@@ -30,17 +24,13 @@ def python_statistics(store: TokenStore, page_tokens: int, columns=()):
     shared, count, rows = tree.reader_groups(store.lengths)
     first = (store.first_documents_with(list(columns)) if columns
              else store.first_documents)
-    try:
-        ends = last_tokens(store.arrow_array).tolist()
-    except (TypeError, ValueError):
-        ends = None
     return {
         "order": list(tree.order),
         "parent": list(tree.parent),
         "shared": [int(value) for value in tree.shared],
         "reader_groups": sorted(zip(shared.tolist(), count.tolist(), rows.tolist())),
         "first_documents": first.to_pylist(),
-        "last_tokens": ends,
+        "last_tokens": last_tokens(store.arrow_array).tolist(),
     }
 
 
@@ -50,17 +40,15 @@ def rust_statistics(path, page_tokens: int, columns=None):
     return found
 
 
-@pytest.mark.parametrize("tokenizer", [ids, words])
 @pytest.mark.parametrize("page_tokens", [1, 2])
 def test_a_rust_token_store_reads_in_python_with_the_same_statistics(
-        tmp_path, tokenizer, page_tokens):
+        tmp_path, page_tokens):
     path = tmp_path / "tokens.arrow"
-    native.write_token_store(str(path), pa.table({"text": TEXTS}), tokenizer=tokenizer)
+    native.write_token_store(str(path), pa.table({"text": TEXTS}), TOKENIZER_FILE)
     store = TokenStore(str(path))
     try:
         assert [list(store[index]) for index in range(len(store))] == [
-            tokenizer(text) for text in TEXTS]
-        assert list(store.lengths) == [len(tokenizer(text)) for text in TEXTS]
+            encoder()(text) for text in TEXTS]
         assert rust_statistics(path, page_tokens) == python_statistics(
             store, page_tokens)
     finally:
@@ -69,7 +57,7 @@ def test_a_rust_token_store_reads_in_python_with_the_same_statistics(
 
 def test_documents_with_equal_tokens_but_other_values_have_their_own_first(tmp_path):
     path = tmp_path / "tokens.arrow"
-    native.write_token_store(str(path), pa.table({"text": TEXTS}), tokenizer=ids)
+    native.write_token_store(str(path), pa.table({"text": TEXTS}), TOKENIZER_FILE)
     stars = pa.array([5, 4, 1, 3, 2, 1, 1, 3])
     store = TokenStore(str(path))
     try:
@@ -96,7 +84,7 @@ def test_a_model_tokenizer_in_rust_gives_gigatokens_ids(tmp_path):
     texts = ["Lease ends in 2027.", "A moving ending — and a café.", "", "  spaced  "]
     path = tmp_path / "tokens.arrow"
     native.write_token_store(str(path), pa.table({"text": texts}),
-                             tokenizer_file=str(Path(directory) / "tokenizer.json"))
+                             str(Path(directory) / "tokenizer.json"))
     store = TokenStore(str(path))
     try:
         expected = GigatokenEncoder(directory).batch_arrow(pa.array(texts))

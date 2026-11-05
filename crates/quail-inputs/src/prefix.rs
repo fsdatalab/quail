@@ -28,25 +28,19 @@ fn common_prefix<T: PartialEq>(left: &[T], right: &[T]) -> usize {
         .unwrap_or_else(|| left.len().min(right.len()))
 }
 
-fn index_of<T: Ord + PartialEq>(documents: &[impl AsRef<[T]>]) -> PrefixIndex {
-    let mut order: Vec<usize> = (0..documents.len()).collect();
-    order.sort_by(|&a, &b| documents[a].as_ref().cmp(documents[b].as_ref()));
-    let mut shared = vec![0i64; documents.len()];
-    for pair in order.windows(2) {
-        let (previous, index) = (documents[pair[0]].as_ref(), documents[pair[1]].as_ref());
-        let common = common_prefix(previous, index);
-        shared[pair[1]] = common.min(index.len().saturating_sub(1)) as i64;
-    }
-    PrefixIndex { order, shared }
-}
-
 impl PrefixIndex {
     /// Sort `documents` and measure what each shares with its predecessor.
     pub fn new(documents: &Documents<'_>) -> Self {
-        match documents {
-            Documents::Ids(found) => index_of(found),
-            Documents::Words(found) => index_of(found),
+        let documents = documents.ids();
+        let mut order: Vec<usize> = (0..documents.len()).collect();
+        order.sort_by(|&a, &b| documents[a].cmp(documents[b]));
+        let mut shared = vec![0i64; documents.len()];
+        for pair in order.windows(2) {
+            let (previous, index) = (documents[pair[0]], documents[pair[1]]);
+            let common = common_prefix(previous, index);
+            shared[pair[1]] = common.min(index.len().saturating_sub(1)) as i64;
         }
+        PrefixIndex { order, shared }
     }
 
     /// The prefix tree whose shares round down to `page_tokens`.
@@ -147,43 +141,25 @@ pub fn first_documents(
             .collect();
         Some(RowConverter::new(fields)?.convert_columns(columns)?)
     };
-    let mut seen: HashMap<(DocumentKey<'_>, Vec<u8>), usize> = HashMap::new();
+    let mut seen: HashMap<(&[i32], Vec<u8>), usize> = HashMap::new();
     let mut first = Vec::with_capacity(documents.len());
-    for index in 0..documents.len() {
+    for (index, tokens) in documents.ids().iter().enumerate() {
         let values = rows
             .as_ref()
             .map(|rows| rows.row(index).as_ref().to_vec())
             .unwrap_or_default();
-        let key = (DocumentKey::of(documents, index), values);
+        let key = (*tokens, values);
         first.push(*seen.entry(key).or_insert(index));
     }
     Ok(first)
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-enum DocumentKey<'a> {
-    Ids(&'a [i32]),
-    Words(&'a [&'a str]),
-}
-
-impl<'a> DocumentKey<'a> {
-    fn of(documents: &'a Documents<'a>, index: usize) -> Self {
-        match documents {
-            Documents::Ids(found) => DocumentKey::Ids(found[index]),
-            Documents::Words(found) => DocumentKey::Words(&found[index]),
-        }
-    }
-}
-
-/// The distinct last tokens of the documents that have tokens, in
-/// order, or None for a test tokenizer's words.
-pub fn last_tokens(documents: &Documents<'_>) -> Option<Vec<i32>> {
-    let Documents::Ids(found) = documents else {
-        return None;
-    };
-    let ends: BTreeSet<i32> = found
+/// The distinct last tokens of the documents that have tokens, in order.
+pub fn last_tokens(documents: &Documents<'_>) -> Vec<i32> {
+    let ends: BTreeSet<i32> = documents
+        .ids()
         .iter()
         .filter_map(|tokens| tokens.last().copied())
         .collect();
-    Some(ends.into_iter().collect())
+    ends.into_iter().collect()
 }

@@ -9,7 +9,7 @@ import time
 
 import pyarrow as pa
 
-from helpers.sessions import fake_tok, make_executor
+from helpers.sessions import TOKENIZER, make_executor
 from quail.server.executor import Hooks
 
 TRUTH = {"r": {"q1:": [1, 1, 0, 1, 1, 0],
@@ -60,7 +60,7 @@ def _executor_with_progress(request):
     return make_executor(TRUTH, JOIN_TRUTH)(request)
 
 
-hooks = Hooks(physical_executor=_executor_with_progress, tokenizer=fake_tok)
+hooks = Hooks(physical_executor=_executor_with_progress, tokenizer=str(TOKENIZER))
 
 
 def _sleeping_executor(request):
@@ -69,14 +69,14 @@ def _sleeping_executor(request):
 
 
 sleeping_hooks = Hooks(physical_executor=_sleeping_executor,
-                       tokenizer=fake_tok)
+                       tokenizer=str(TOKENIZER))
 
 
 def _failing_executor(request):
     raise RuntimeError("the model refused to start")
 
 
-failing_hooks = Hooks(physical_executor=_failing_executor, tokenizer=fake_tok)
+failing_hooks = Hooks(physical_executor=_failing_executor, tokenizer=str(TOKENIZER))
 
 
 def start_server(app):

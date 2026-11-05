@@ -16,12 +16,12 @@ use quail::Session;
 /// and r3 for the question `q1:`.
 const ENGINE: &std::ffi::CStr = c"
 from helpers.oracle import Oracle, oracle_executor
-from helpers.sessions import CONFIG, fake_tok
+from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 from quail.api.engine import Engine
 
-session = quail.Session(CONFIG, tokenizer=fake_tok)
+session = quail.Session(CONFIG, tokenizer=TOKENIZER)
 engine = Engine(session, oracle_executor(Oracle(filters={'r': {'q1:': [1, 0, 1, 1]}})))
 ";
 

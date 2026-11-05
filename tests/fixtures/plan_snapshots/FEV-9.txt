@@ -33,16 +33,16 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
                                                                                                est. rows   est. pass   est. time
   Project: c1.id, e1.id, c2.id, e2.id
     Recombine: c1, e1, c2, e2
-      AiJoin: anchor=e1 [3]                                                                                               6.5 ms
+      AiJoin: anchor=e1 [3]                                                                                              5.72 ms
         KV: anchor=from filters, retain after join=yes
         join 1 full (e1, c1)  PROMPT('Does the Wikipedia passage in DO…')                           11.8      0.217%
-        AiFilter: e1                                                                                 3.3                 11.3 ms
+        AiFilter: e1                                                                                 3.3                 8.35 ms
           KV rewind=on
           expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
           predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       55.4%
           Scan evidence as e1                                                                          6
-            tokens=114, mean_document_tokens=19
-        AiFilter: c1 [1]                                                                             3.6                 11.8 ms
+            tokens=102, mean_document_tokens=17
+        AiFilter: c1 [1]                                                                             3.6                 8.94 ms
           KV: not stored
           predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       59.2%
           Scan claims as c1                                                                            6
@@ -51,7 +51,7 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
         KV: anchor=from an earlier join, retain after join=no
         join 2 full (e1, c2)  PROMPT('Does the Wikipedia passage in DO…')                            0.1      0.332%
         Reuse [3]
-        AiFilter: c2 [2]                                                                             3.6                 11.8 ms
+        AiFilter: c2 [2]                                                                             3.6                 8.94 ms
           KV rewind=on, retain KV for later joins
           expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
           predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       59.2%
@@ -65,11 +65,11 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
           Reuse [4]
           Reuse [1]
           Reuse [2]
-          AiFilter: e2                                                                               3.3                 11.3 ms
+          AiFilter: e2                                                                               3.3                 8.35 ms
             KV rewind=on
             predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                6       55.4%
             Scan evidence as e2                                                                        6
-              tokens=114, mean_document_tokens=19
+              tokens=102, mean_document_tokens=17
       Reuse [5]
   Pipeline on e1: ai_filter:e1 -> ai_join:e1 -> ai_join:e1:predicate:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate

@@ -8,7 +8,7 @@ DataFusion runs works with AI functions in it.
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, finish
-from helpers.sessions import CONFIG, fake_tok
+from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 from quail.logical import CompileError
@@ -21,7 +21,7 @@ ORACLE = Oracle(filters=lambda alias, document, position: document != 1,
 
 @pytest.fixture
 def session():
-    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         session.register("reviews", quail.DocumentProvider.from_table(pa.table({
             "id": ["r0", "r1", "r2"], "body": ["a", "b", "c"],
             "stars": [5, 2, 4], "pid": ["p0", "p1", "p9"]}), id_col="id"))

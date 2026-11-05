@@ -27,31 +27,31 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
                                                                                                  est. rows   est. pass   est. time
   Project: r1.id, a1.id, r2.id, a2.id
     Recombine: r2, a2, a1, r1
-      AiJoin: anchor=r2 [3]                                                                                                66.5 ms
+      AiJoin: anchor=r2 [3]                                                                                                60.6 ms
         KV: anchor=not resident, retain after join=yes
         join 3 full (r2, a2)  PROMPT('Does the review in DOCUMENT {0} …')                              144       16.1%
         Scan reviews as r2                                                                              12
-          tokens=158, mean_document_tokens=13.2
+          tokens=134, mean_document_tokens=11.2
         Scan aspects as a2 [2]                                                                          12
-          tokens=164, mean_document_tokens=13.7
-      AiJoin: anchor=r2 [4]                                                                                                  52 ms
+          tokens=135, mean_document_tokens=11.2
+      AiJoin: anchor=r2 [4]                                                                                                47.9 ms
         KV: anchor=from an earlier join, retain after join=no
         join 2 full (r2, a1)  PROMPT('Does the review in DOCUMENT {0} …')                            126.4       29.5%
         Reuse [3]
         Scan aspects as a1 [1]                                                                          12
-          tokens=164, mean_document_tokens=13.7
-      AiJoin: anchor=r1                                                                                                    46.9 ms
+          tokens=135, mean_document_tokens=11.2
+      AiJoin: anchor=r1                                                                                                    43.1 ms
         KV: anchor=from filters, retain after join=no
         join 1 full (r1, a1)  PROMPT('Does the review in DOCUMENT {0} …')                            113.6       29.5%
         Barrier: next_anchor=r1 [5]
           Reuse [3]
           Reuse [4]
-          AiFilter: r1                                                                                 9.6                 23.4 ms
+          AiFilter: r1                                                                                 9.6                 17.5 ms
             KV rewind=on, retain KV for later joins
             expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
             predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                 12       80.1%
             Scan reviews as r1                                                                          12
-              tokens=158, mean_document_tokens=13.2
+              tokens=134, mean_document_tokens=11.2
           Reuse [1]
           Reuse [2]
       Reuse [5]

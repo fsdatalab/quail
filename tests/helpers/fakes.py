@@ -61,14 +61,6 @@ def bare_arena(arena, pages):
     return arena
 
 
-def letter_tokens(text):
-    """Tokenize text as bytes, treating short answer letters as one token."""
-    import re
-    if re.fullmatch(r" [A-Za-z]{1,2}", text):
-        return [10_000 * (len(text) - 1) + sum(map(ord, text[1:]))]
-    return list(text.encode())
-
-
 def cpu_staging(monkeypatch):
     """Stage packed chunks as plain CPU tensors; returns torch."""
     import torch

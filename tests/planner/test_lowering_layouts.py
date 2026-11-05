@@ -8,7 +8,7 @@ lowers, and classify joined rows on it.
 
 import pyarrow as pa
 import pytest
-from helpers.sessions import fake_tok
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
@@ -36,7 +36,7 @@ QUERIES = (
 @pytest.mark.parametrize("text", QUERIES)
 def test_each_layout_plans_with_the_rust_lowering(model, text):
     config = EngineConfig(model=model, device="h100-sxm")
-    with quail.Session(config, tokenizer=fake_tok) as session:
+    with quail.Session(config, tokenizer=TOKENIZER) as session:
         session.register("reviews",
                          quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
         session.register("aspects",

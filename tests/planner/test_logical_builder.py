@@ -2,7 +2,7 @@
 
 import pyarrow as pa
 import pytest
-from helpers.sessions import CONFIG, fake_tok
+from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 from quail.common.expressions import CompileError
@@ -35,7 +35,7 @@ REFUSED = {
 @pytest.mark.parametrize("name", REFUSED)
 def test_a_query_the_builder_cannot_plan_is_refused_with_its_reason(name):
     sql, reason = REFUSED[name]
-    session = quail.Session(CONFIG, tokenizer=fake_tok)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     for table_name, table in TABLES.items():
         session.register(table_name,
                          quail.DocumentProvider.from_table(table, id_col="id"))

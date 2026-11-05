@@ -4,6 +4,7 @@ from threading import Lock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from helpers.sessions import TOKENIZER
 from modal._serialization import deserialize, serialize
 
 import quail
@@ -32,7 +33,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
     session = quail.Session(
         quail.EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="quail",
                            device="h100-sxm"),
-        tokenizer=_tokens,
+        tokenizer=TOKENIZER,
     )
     monkeypatch.setattr(Session, "tokenizer", property(lambda self: _tokens))
     calls = ["initialize"]

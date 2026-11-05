@@ -3,7 +3,7 @@
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, finish, oracle_executor
-from helpers.sessions import CONFIG, check_table, fake_tok
+from helpers.sessions import CONFIG, TOKENIZER, check_table
 
 import quail
 from quail.physical import encode_graph
@@ -73,7 +73,7 @@ QUERIES = {
 
 @pytest.fixture()
 def context():
-    session = quail.Session(CONFIG, tokenizer=fake_tok)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     value = quail.SessionContext(session, physical_executor=oracle_executor(ORACLE))
     value.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     value.register("aspects", quail.DocumentProvider.from_table(ASPECTS, id_col="id"))
@@ -153,7 +153,7 @@ def test_every_check_query_plans_the_same_graph_through_datafusion():
     from tools.dump_check_queries import check_query_entries
 
     for entry in check_query_entries():
-        session = quail.Session(CONFIG, tokenizer=fake_tok)
+        session = quail.Session(CONFIG, tokenizer=TOKENIZER)
         context = quail.SessionContext(session)
         for name, columns in entry["tables"].items():
             context.register(name, quail.DocumentProvider.from_table(

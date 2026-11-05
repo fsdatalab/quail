@@ -3,7 +3,7 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.fakes import letter_tokens
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
@@ -18,7 +18,7 @@ from quail.planner.optimize import search_plan
 def query(tmp_path):
     session = quail.Session(
         EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-        tokenizer=letter_tokens)
+        tokenizer=TOKENIZER)
     shared = "The following agreement is made between the parties. " * 4
     for name, texts in (("documents", [shared + "The lease ends in June."] * 20),
                         ("questions", ["leases"])):

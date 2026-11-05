@@ -39,6 +39,14 @@ from quail.physical import (
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
+def question_text(token_ids) -> str:
+    """Return the text of a question's token ids in the tests' tokenizer."""
+    from helpers.sessions import encoder
+
+    found = encoder().decode([int(token) for token in token_ids])
+    return found.decode() if isinstance(found, bytes) else found
+
+
 class Oracle:
     """A model execution whose answers come from planted truth.
 
@@ -221,11 +229,11 @@ class Oracle:
         if callable(self.filters):
             return bool(self.filters(node.alias, document, node.written_position))
         truth = self.filters[node.alias]
-        question = node.question_token_ids
+        question = question_text(node.question_token_ids)
         for key, bits in truth.items():
-            if any(token.startswith(key) for token in question):
+            if key in question:
                 return bool(bits[document])
-        raise KeyError(f"no filter truth for {node.alias!r} matches {question[:5]}")
+        raise KeyError(f"no filter truth for {node.alias!r} matches {question[:40]!r}")
 
     def _join_answer(self, node, anchor_id, partner_ids) -> bool:
         if callable(self.joins):

@@ -1,4 +1,7 @@
-"""Sessions for the end-to-end tests: a fake tokenizer and a planted executor."""
+"""Sessions for the end-to-end tests: the test tokenizer and a planted executor."""
+
+from functools import cache
+from pathlib import Path
 
 import pyarrow as pa
 
@@ -10,8 +13,17 @@ CONFIG = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 TRUTH = {"r": {"q1:": [1, 1, 0, 1, 1, 0], "q2:": [1, 0, 1, 1, 0, 1]}}
 
 
-def fake_tok(text):
-    return text.split()
+# the tests' tokenizer: one token per byte, and one per space and one or
+# two letters; see make_tokenizer.py
+TOKENIZER = Path(__file__).resolve().parents[1] / "fixtures" / "tokenizer"
+
+
+@cache
+def encoder():
+    """Return an encoder over the tests' tokenizer, as a session loads it."""
+    from quail.common.tokens import GigatokenEncoder
+
+    return GigatokenEncoder(TOKENIZER)
 
 
 def _run(query, execute):

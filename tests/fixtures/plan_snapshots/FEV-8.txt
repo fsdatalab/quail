@@ -25,11 +25,11 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
                                                                             est. rows   est. pass   est. time
   Project: c1.id, e1.id, c2.id, e2.id
     Recombine: c1, e1, c2, e2
-      AiJoin: anchor=e1 [3]                                                                           19.3 ms
+      AiJoin: anchor=e1 [3]                                                                           17.4 ms
         KV: anchor=not resident, retain after join=yes
         join 1 full (e1, c1)  PROMPT('Does the Wikipedia passage in DO…')          36      0.217%
         Scan evidence as e1                                                         6
-          tokens=114, mean_document_tokens=19
+          tokens=102, mean_document_tokens=17
         Scan claims as c1 [1]                                                       6
           tokens=42, mean_document_tokens=7
       AiJoin: anchor=e1 [4]                                                                           1.09 ms
@@ -47,7 +47,7 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
           Reuse [1]
           Reuse [2]
           Scan evidence as e2                                                       6
-            tokens=114, mean_document_tokens=19
+            tokens=102, mean_document_tokens=17
       Reuse [5]
   Pipeline on e1: ai_join:e1 -> ai_join:e1:predicate:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate

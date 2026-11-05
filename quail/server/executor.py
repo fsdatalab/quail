@@ -41,10 +41,10 @@ class Job:
 
 @dataclass(frozen=True)
 class Hooks:
-    """Test seams: a fake model executor and a fake tokenizer."""
+    """Test seams: a fake model executor and a tokenizer directory."""
 
     physical_executor: Callable | None = None
-    tokenizer: Callable | None = None
+    tokenizer: str | None = None
 
 
 def load_hooks(reference: str | None) -> Hooks | None:

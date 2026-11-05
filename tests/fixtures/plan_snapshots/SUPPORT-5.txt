@@ -14,13 +14,13 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                                                                                                           est. rows   est. pass   est. time
   Project: r1.id, r2.id
-    AiJoin: anchor=r1                                                                                                               11.8 ms
+    AiJoin: anchor=r1                                                                                                               9.03 ms
       KV: anchor=not resident, retain after join=no
       join 1 full (r1, r2) over pairs from hash_join:r1-r2  PROMPT('Do the two conversations in DOCU…')           6         35%
       Scan support_traces as r1 [1]                                                                               6
-        tokens=162, mean_document_tokens=27
+        tokens=144, mean_document_tokens=24
       Scan support_traces as r2 [2]                                                                               6
-        tokens=162, mean_document_tokens=27
+        tokens=144, mean_document_tokens=24
       HashJoin: r1.task_id = r2.task_id
         pairs kept: 0.1667 of the cross product
         Reuse [1]

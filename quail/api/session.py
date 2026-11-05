@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from quail.api.compile import SQLDialect, compile_region
 from quail.api.config import EngineConfig, resolve_model
 from quail.api.query import QueryLike
@@ -23,7 +25,7 @@ class Session:
     """
 
     def __init__(self, config: EngineConfig, *,
-                 tokenizer=None,
+                 tokenizer: str | os.PathLike | None = None,
                  registry: ExtensionRegistry | None = None,
                  endpoint: str | None = None):
         self.registry = registry or built_in_registry()
@@ -54,16 +56,17 @@ class Session:
                 unit="configurations",
             ))
         self.catalog = Catalog()
-        self._tokenizer = tokenizer      # injectable for tests
+        self._tokenizer_directory = tokenizer
+        self._tokenizer = None
         self.inputs = InputStore(
             self.catalog, tokenizer=lambda: self.tokenizer,
-            tokenizer_name="configured tokenizer" if tokenizer else "Gigatoken")
+            tokenizer_name="Gigatoken")
         self._remote = None
         if endpoint is not None:
             from quail.remote.client import RemoteConnection
 
             self._remote = RemoteConnection(endpoint, self.registry.codecs)
-        elif tokenizer is None:
+        else:
             _ = self.tokenizer
             self.inputs.warm_tokenizer()
 
@@ -159,11 +162,13 @@ class Session:
     def tokenizer(self):
         """Return Gigatoken's encoder, loading it when first used.
 
-        The encoder's ``decode`` attribute returns a token id list's text
-        as bytes; the planner uses it to find the word each label token
-        starts.
+        It reads the ``tokenizer.json`` in the directory the session was
+        given, or else the model's. The encoder's ``decode`` attribute
+        returns a token id list's text as bytes; the planner uses it to
+        find the word each label token starts.
         """
         if self._tokenizer is None:
-            self._tokenizer = GigatokenEncoder(resolve_model_path(
-                self.model.hf_name, self.model.revision, include_weights=False))
+            directory = self._tokenizer_directory or resolve_model_path(
+                self.model.hf_name, self.model.revision, include_weights=False)
+            self._tokenizer = GigatokenEncoder(directory)
         return self._tokenizer

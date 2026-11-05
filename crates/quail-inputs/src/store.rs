@@ -23,13 +23,13 @@ pub const TOKEN_COLUMN: &str = "__quail_token_ids";
 /// The column of each document's token count.
 pub const COUNT_COLUMN: &str = "__quail_token_count";
 
-fn store_schema(token_type: &DataType) -> SchemaRef {
+fn store_schema() -> SchemaRef {
     let metadata = HashMap::from([("quail.kind".to_string(), "token_store".to_string())]);
     Arc::new(
         Schema::new(vec![
             Field::new(
                 TOKEN_COLUMN,
-                DataType::LargeList(Arc::new(Field::new_list_field(token_type.clone(), true))),
+                DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int32, true))),
                 false,
             ),
             Field::new(COUNT_COLUMN, DataType::Int64, false),
@@ -45,26 +45,25 @@ pub struct TokenStoreWriter {
 }
 
 impl TokenStoreWriter {
-    /// Start a token store at `path` whose tokens are `token_type`:
-    /// int32 ids, or strings for a tokenizer that returns words.
+    /// Start a token store at `path`.
     ///
     /// # Errors
     ///
     /// The file cannot be created.
-    pub fn create(path: &Path, token_type: &DataType) -> Result<Self, ArrowError> {
+    pub fn create(path: &Path) -> Result<Self, ArrowError> {
         let file = File::create(path)?;
-        let writer = FileWriter::try_new(file, &store_schema(token_type))?;
+        let writer = FileWriter::try_new(file, &store_schema())?;
         Ok(Self {
             path: path.to_path_buf(),
             writer: Some(writer),
         })
     }
 
-    /// Append the tokens of some documents.
+    /// Append the tokens of some documents, int32 ids.
     ///
     /// # Errors
     ///
-    /// The tokens are not of the store's type, or the write fails.
+    /// The tokens are not int32 ids, or the write fails.
     pub fn write(&mut self, tokens: LargeListArray) -> Result<(), ArrowError> {
         let writer = self
             .writer
@@ -181,56 +180,33 @@ impl TokenStore {
     }
 }
 
-/// The documents of a token store, by position.
-pub enum Documents<'a> {
-    /// Integer token ids.
-    Ids(Vec<&'a [i32]>),
-    /// The words of a test tokenizer.
-    Words(Vec<Vec<&'a str>>),
-}
+/// Each document's token ids, by document position.
+pub struct Documents<'a>(Vec<&'a [i32]>);
 
 impl<'a> Documents<'a> {
     fn new(batches: &'a [LargeListArray]) -> Self {
-        let words = batches.first().is_some_and(|batch| {
-            matches!(batch.value_type(), DataType::Utf8 | DataType::LargeUtf8)
-        });
-        if !words {
-            let mut documents = Vec::new();
-            for batch in batches {
-                let values = batch.values().as_primitive::<Int32Type>().values();
-                for pair in batch.offsets().windows(2) {
-                    documents.push(&values[pair[0] as usize..pair[1] as usize]);
-                }
-            }
-            return Documents::Ids(documents);
-        }
         let mut documents = Vec::new();
         for batch in batches {
-            let values = batch.values();
+            let values = batch.values().as_primitive::<Int32Type>().values();
             for pair in batch.offsets().windows(2) {
-                let range = pair[0] as usize..pair[1] as usize;
-                documents.push(match values.as_string_opt::<i64>() {
-                    Some(strings) => range.map(|index| strings.value(index)).collect(),
-                    None => {
-                        let strings = values.as_string::<i32>();
-                        range.map(|index| strings.value(index)).collect()
-                    }
-                });
+                documents.push(&values[pair[0] as usize..pair[1] as usize]);
             }
         }
-        Documents::Words(documents)
+        Documents(documents)
+    }
+
+    /// The token ids of each document.
+    pub fn ids(&self) -> &[&'a [i32]] {
+        &self.0
     }
 
     /// The number of documents.
     pub fn len(&self) -> usize {
-        match self {
-            Documents::Ids(found) => found.len(),
-            Documents::Words(found) => found.len(),
-        }
+        self.0.len()
     }
 
     /// Whether there is no document.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.0.is_empty()
     }
 }

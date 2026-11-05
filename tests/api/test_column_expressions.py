@@ -3,7 +3,7 @@
 
 import pyarrow as pa
 import pytest
-from helpers.sessions import CONFIG, _run, fake_tok, make_executor
+from helpers.sessions import CONFIG, TOKENIZER, _run, encoder, make_executor
 
 import quail
 from quail.logical import Scan
@@ -11,7 +11,7 @@ from quail.logical import Scan
 
 @pytest.fixture
 def session():
-    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         session.register("docs", quail.DocumentProvider.from_table(pa.table({
             "id": ["d0", "d1", "d2"],
             "details": [{"body": "one", "url": "u1", "kind": "a"},
@@ -34,7 +34,9 @@ def test_a_prompt_reads_a_struct_field_as_the_document(session):
     result = _run(query, make_executor({"r": {"q:": [1, 0, 1]}}))
     assert result.to_rows() == [("d0",), ("d2",)]
     # the field's text was tokenized, not the struct's
-    assert list(session.inputs.token_lengths("docs", scan.column)) == [1, 2, 3]
+    bodies = ("one", "two words", "three words here")
+    assert list(session.inputs.token_lengths("docs", scan.column)) == [
+        len(encoder()(text)) for text in bodies]
     assert "details.body" in query.explain()
 
 

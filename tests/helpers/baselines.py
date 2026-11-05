@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pyarrow as pa
 
 import quail
+from helpers.sessions import TOKENIZER, encoder
 from quail.api.config import EngineConfig
 from quail.backends.base import BackendExecutionContext, GpuContext
 from quail.baselines.execution import RequestModelExecution
@@ -14,14 +15,14 @@ CAPACITY = {"kv_cache_size_tokens": 1_000, "block_size": 1, "max_num_seqs": 16}
 
 
 def _tokens(text):
-    return [byte + 1 for byte in text.encode("utf-8")]
+    return encoder()(text)
 
 
 def _session(backend, **tables):
     session = quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
                      device="h100-sxm"),
-        tokenizer=_tokens,
+        tokenizer=TOKENIZER,
     )
     for name, columns in tables.items():
         session.register(name, quail.DocumentProvider.from_table(

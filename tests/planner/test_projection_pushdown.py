@@ -4,7 +4,7 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 from helpers.planning import placements
-from helpers.sessions import _run, fake_tok, make_executor
+from helpers.sessions import TOKENIZER, _run, make_executor
 
 import quail
 from quail.api.config import EngineConfig
@@ -20,7 +20,7 @@ def _scans(plan):
             if isinstance(node, Scan)}
 
 
-def _session(tmp_path, tokenizer=fake_tok):
+def _session(tmp_path, tokenizer=TOKENIZER):
     session = quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="quail",
                      device="h100-sxm"),
@@ -39,16 +39,7 @@ def _session(tmp_path, tokenizer=fake_tok):
 
 
 def test_projected_results_token_reuse_and_join_projection(tmp_path):
-    reviews = ["good one", "bad one", "fine one"]
-    calls = []
-
-    def counting_tok(text):
-        # Prompts are tokenized on every query; count documents only.
-        if text in reviews:
-            calls.append(text)
-        return fake_tok(text)
-
-    session = _session(tmp_path, tokenizer=counting_tok)
+    session = _session(tmp_path)
     truth = {"r": {"q:": [1, 0, 1]}}
     query = session.sql(
         "SELECT r.stars, r.id FROM reviews r WHERE "
@@ -61,15 +52,15 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     assert scan.columns == ("stars", "id")
     store = query._token_inputs["r"]
     assert store.projected_columns == ("stars", "id")
-    tokenized = len(calls)
-    assert tokenized > 0
+    # later queries read the same token store instead of tokenizing again
+    tokenized = dict(session.inputs._token_stores)
+    assert len(tokenized) == 1
 
     second = _run(session.sql(
         "SELECT r.stars, r.review FROM reviews r WHERE "
         "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
     assert sorted(second.to_rows()) == [(3, "fine one"), (5, "good one")]
-    assert len(calls) == tokenized
-    assert len(session.inputs._token_stores) == 1
+    assert session.inputs._token_stores == tokenized
     assert sorted(name for _, name in session.inputs._column_stores) == [
         "id", "review", "stars"]
 
@@ -85,7 +76,7 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
         "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
     assert star.columns == ["r.id", "r.review", "r.stars", "r.wide"]
     assert star.to_rows() == [("r1", "bad one", 1, "y" * 50)]
-    assert len(calls) == tokenized
+    assert session.inputs._token_stores == tokenized
     session.close()
 
     session = _session(tmp_path)
@@ -110,7 +101,7 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
 def _pair_session():
     session = quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", device="h100-sxm"),
-        tokenizer=fake_tok)
+        tokenizer=TOKENIZER)
     session.register("reviews", quail.DocumentProvider.from_table(
         pa.table({"id": ["r0", "r1"], "review": ["good one", "bad one"],
                   "stars": [5, 1]}), id_col="id"))

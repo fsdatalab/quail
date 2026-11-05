@@ -763,39 +763,17 @@ fn work_fields(work: &quail_cost::work::Work) -> std::collections::BTreeMap<&'st
 }
 
 /// Tokenize the texts of `table`'s first column into a token store at
-/// `path`, with the `tokenizer.json` at `tokenizer_file` or else the
-/// Python callable `tokenizer`.
+/// `path`, with the `tokenizer.json` at `tokenizer_file`.
 #[pyfunction]
-#[pyo3(signature = (path, table, tokenizer=None, tokenizer_file=None))]
-fn write_token_store(
-    path: &str,
-    table: &Bound<'_, PyAny>,
-    tokenizer: Option<Py<PyAny>>,
-    tokenizer_file: Option<&str>,
-) -> PyResult<()> {
-    let tokenizer: Box<dyn quail_inputs::Tokenizer> = match (tokenizer_file, tokenizer) {
-        (Some(file), _) => Box::new(
-            quail_inputs::HfTokenizer::from_file(std::path::Path::new(file))
-                .map_err(|error| python_error(error.into()))?,
-        ),
-        (None, Some(callable)) => Box::new(quail::PythonTokenizer::new(callable, "Python")),
-        (None, None) => return Err(PyRuntimeError::new_err("no tokenizer")),
-    };
+fn write_token_store(path: &str, table: &Bound<'_, PyAny>, tokenizer_file: &str) -> PyResult<()> {
+    let tokenizer = quail_inputs::HfTokenizer::from_file(std::path::Path::new(tokenizer_file))
+        .map_err(|error| python_error(error.into()))?;
     let batches = quail::pyarrow::from_pyarrow(table)?;
-    let token_type = if batches.is_empty() {
-        datafusion::arrow::datatypes::DataType::Int32
-    } else {
-        let first = tokenizer
-            .encode_batch(batches[0].column(0).as_string::<i32>())
-            .map_err(|error| python_error(error.into()))?;
-        first.value_type()
-    };
     let py = table.py();
     py.detach(|| {
-        let mut writer =
-            quail_inputs::TokenStoreWriter::create(std::path::Path::new(path), &token_type)?;
+        let mut writer = quail_inputs::TokenStoreWriter::create(std::path::Path::new(path))?;
         for batch in &batches {
-            writer.write_texts(tokenizer.as_ref(), batch.column(0).as_string::<i32>())?;
+            writer.write_texts(&tokenizer, batch.column(0).as_string::<i32>())?;
         }
         writer.finish().map(|_| ())
     })

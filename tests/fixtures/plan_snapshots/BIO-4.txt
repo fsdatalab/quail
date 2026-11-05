@@ -26,28 +26,28 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
                                                                                                est. rows   est. pass   est. time
   Project: r.id, n.id, c.id
     Recombine: r, c, n
-      AiJoin: anchor=c [2]                                                                                               5.95 ms
+      AiJoin: anchor=c [2]                                                                                               5.24 ms
         KV: anchor=from filters, retain after join=no
         join 2 full (c, r)  PROMPT('Does the medical report in DOCUM…')                             10.7        3.4%
-        AiFilter: c                                                                                  2.1                 7.75 ms
+        AiFilter: c                                                                                  2.1                 6.33 ms
           KV rewind=on
           expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
           predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs this reaction …')                                  6         35%
           Scan terms as c                                                                              6
             tokens=60, mean_document_tokens=10
-        AiFilter: r [1]                                                                              5.1                 15.9 ms
+        AiFilter: r [1]                                                                              5.1                 12.3 ms
           KV rewind=on, retain KV for later joins
           expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
           predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  8       63.8%
           Scan reports as r                                                                            8
-            tokens=128, mean_document_tokens=16
-      AiJoin: anchor=r                                                                                                   1.11 ms
+            tokens=112, mean_document_tokens=14
+      AiJoin: anchor=r                                                                                                    1.1 ms
         KV: anchor=from filters, retain after join=no
         join 1 full (r, n)  PROMPT('Does the medical report in DOCUM…')                                1        3.4%
         Barrier: next_anchor=r [3]
           Reuse [2]
           Reuse [1]
-          AiFilter: n                                                                                2.7                 7.47 ms
+          AiFilter: n                                                                                2.7                 6.17 ms
             KV: not stored
             predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs this reaction …')                                6       44.8%
             Scan terms as n                                                                            6

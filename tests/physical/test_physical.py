@@ -8,6 +8,7 @@ from typing import ClassVar
 
 import pyarrow as pa
 import pytest
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
@@ -157,7 +158,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     session = quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
                      device="h100-sxm"),
-        tokenizer=str.split,
+        tokenizer=TOKENIZER,
         registry=registry,
     )
     session.register("documents", DocumentProvider.from_table(

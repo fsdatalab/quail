@@ -3,7 +3,7 @@
 
 import pyarrow as pa
 import pytest
-from helpers.sessions import CONFIG, _run, fake_tok, make_executor
+from helpers.sessions import CONFIG, TOKENIZER, _run, make_executor
 
 import quail
 from quail.logical import CompileError
@@ -11,7 +11,7 @@ from quail.logical import CompileError
 
 @pytest.fixture()
 def session():
-    session = quail.Session(CONFIG, tokenizer=fake_tok)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     session.register("reviews", quail.DocumentProvider.from_table(pa.table({
         "id": [f"r{i}" for i in range(6)],
         "review": [f"review {i} " + "pad " * 20 for i in range(6)],

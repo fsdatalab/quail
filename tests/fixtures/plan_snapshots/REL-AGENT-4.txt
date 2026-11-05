@@ -13,7 +13,7 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   Sort: recovered_score DESC NULLS LAST, t.id ASC NULLS LAST
     fetch=20
     Project: t.id, recovered_score
-      quail.ai_score                                                         14.5 ms
+      quail.ai_score                                                         10.4 ms
         backend=quail
         keep_kv=False
         model=qwen3-4b-fp8
@@ -21,9 +21,9 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
         output=recovered_score
         aliases=['t']
         expected_rows=6.0
-        estimated_seconds=0.014459260708688434
+        estimated_seconds=0.010408741336956675
         share_prefixes=False
         Scan agent_traces as t                                         6
-          tokens=78, mean_document_tokens=13
+          tokens=66, mean_document_tokens=11
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

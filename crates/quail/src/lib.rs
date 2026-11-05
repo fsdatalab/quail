@@ -19,9 +19,6 @@
 
 mod engine;
 pub mod pyarrow;
-mod tokenize;
-
-pub use tokenize::PythonTokenizer;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

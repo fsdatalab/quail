@@ -5,7 +5,7 @@ import zlib
 
 import pyarrow as pa
 import pytest
-from helpers.sessions import CONFIG, check_table
+from helpers.sessions import CONFIG, TOKENIZER, check_table
 
 import quail
 from quail.api.config import EngineConfig
@@ -31,7 +31,7 @@ def test_every_quail_b_logical_plan_reads_into_the_rust_types_unchanged():
 
     changed, decoded_differently, planned = [], [], 0
     for entry in check_query_entries(list(queries(include_draft=True))):
-        with quail.Session(CONFIG, tokenizer=token_ids) as session:
+        with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
             for name, columns in entry["tables"].items():
                 session.register(name, quail.DocumentProvider.from_table(
                     check_table(columns), id_col="id"))
@@ -70,7 +70,7 @@ NODE_CASES = {
 def test_a_logical_plan_with_each_node_type_reads_into_the_rust_types(node_type):
     model, text = NODE_CASES[node_type]
     config = EngineConfig(model=model, device="h100-sxm")
-    with quail.Session(config, tokenizer=token_ids) as session:
+    with quail.Session(config, tokenizer=TOKENIZER) as session:
         for name, table in TABLES.items():
             session.register(
                 name, quail.DocumentProvider.from_table(table, id_col="id"))
@@ -82,7 +82,7 @@ def test_a_logical_plan_with_each_node_type_reads_into_the_rust_types(node_type)
 
 
 def test_a_logical_plan_with_an_unknown_field_is_refused():
-    with quail.Session(CONFIG, tokenizer=token_ids) as session:
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         session.register("reviews", quail.DocumentProvider.from_table(
             TABLES["reviews"], id_col="id"))
         plan = session.sql(
@@ -100,7 +100,7 @@ def test_every_quail_b_logical_plan_is_valid_in_rust():
 
     refused = {}
     for entry in check_query_entries(list(queries(include_draft=True))):
-        with quail.Session(CONFIG, tokenizer=token_ids) as session:
+        with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
             for name, columns in entry["tables"].items():
                 session.register(name, quail.DocumentProvider.from_table(
                     check_table(columns), id_col="id"))

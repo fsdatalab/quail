@@ -16,14 +16,14 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                                                                                                       est. rows   est. pass   est. time
   Project: u.id, a.id, disagreement
-    AiJoin: anchor=u [3]                                                                                                         1.1 ms
+    AiJoin: anchor=u [3]                                                                                                        1.09 ms
       KV: anchor=not resident, retain after join=no
       join 1 full (u, a) over pairs from hash_join:a-u  PROMPT("Does the customer's reply in DOC…")         0.2       5.26%
       Scan support_messages as u [2]                                                                          1
-        tokens=156, mean_document_tokens=26
+        tokens=144, mean_document_tokens=24
         where u.role = 'user'
       Scan support_messages as a [1]                                                                          6
-        tokens=156, mean_document_tokens=26
+        tokens=144, mean_document_tokens=24
       HashJoin: a.id = u.prev_assistant_id
         pairs kept: 0.02778 of the cross product
         Reuse [1]

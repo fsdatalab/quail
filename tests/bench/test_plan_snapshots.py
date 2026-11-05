@@ -12,8 +12,8 @@ import os
 import re
 from pathlib import Path
 
-from helpers.fakes import letter_tokens
 from helpers.quailb_data import standin_sets
+from helpers.sessions import TOKENIZER
 
 import quail
 from bench.quailb import queries, register_tables
@@ -34,7 +34,7 @@ def test_every_quailb_query_plans_as_its_snapshot(tmp_path):
     changed = []
     with quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", device="h100-sxm"),
-        tokenizer=letter_tokens,
+        tokenizer=TOKENIZER,
     ) as session:
         register_tables(session, tmp_path)
         for query_id, (_, build) in sorted(queries(session).items()):

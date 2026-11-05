@@ -14,9 +14,9 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   Project: c.id, contract, contract_span
     contract = struct(contract.parties)
     contract_span = struct(contract.parties_span)
-    AiExtract: contract.parties over c                                                                   13.3 ms
+    AiExtract: contract.parties over c                                                                   10.4 ms
       question='The two or more parties who signed the contract', up to 64 answer tokens
       Scan contracts as c                                                                          6
-        tokens=96, mean_document_tokens=16
+        tokens=78, mean_document_tokens=13
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

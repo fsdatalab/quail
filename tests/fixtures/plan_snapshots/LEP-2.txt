@@ -14,12 +14,12 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                                                                         est. rows   est. pass   est. time
   Project: d.id, s.id
-    AiJoin: anchor=d                                                                              20.5 ms
+    AiJoin: anchor=d                                                                              18.3 ms
       KV: anchor=not resident, retain after join=no
       join 1 full (d, s)  PROMPT('Is the passage in DOCUMENT {1} c…')          36      0.231%
       Scan citation_contexts as d                                               6
-        tokens=108, mean_document_tokens=18
+        tokens=96, mean_document_tokens=16
       Scan citation_passages as s                                               6
-        tokens=90, mean_document_tokens=15
+        tokens=78, mean_document_tokens=13
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

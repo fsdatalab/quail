@@ -4,10 +4,8 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.fakes import (
-    letter_tokens,
-)
 from helpers.oracle import Oracle, finish
+from helpers.sessions import TOKENIZER
 
 import quail
 
@@ -44,7 +42,7 @@ def session(tmp_path):
     }), path)
     value = quail.Session(
         EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-        tokenizer=letter_tokens)
+        tokenizer=TOKENIZER)
     value.register("documents",
                    DocumentProvider.from_parquet(str(path), id_col="id"))
     yield value
@@ -236,7 +234,7 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     assert "standalone pair classification" in refused.reasons[0]
     distributed = quail.Session(
         EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=2),
-        tokenizer=letter_tokens)
+        tokenizer=TOKENIZER)
     for name in ("documents", "aspects"):
         distributed.register(name, session.catalog.get(name))
     # every worker runs the join and the classification as one pipeline

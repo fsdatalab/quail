@@ -12,14 +12,14 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                                                                       est. rows   est. pass   est. time
   Project: c.id                                                          0.0212
-    AiFilter: c                                                          0.0212                  1.1 ms
+    AiFilter: c                                                          0.0212                 1.09 ms
       KV rewind=on
       predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           0.2       10.6%
-      AiFilter: c                                                         0.201                 12.6 ms
+      AiFilter: c                                                         0.201                 8.94 ms
         KV rewind=on
         predicate 2  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       3.35%
         Scan sales_calls as c                                                 6
-          tokens=144, mean_document_tokens=24
+          tokens=132, mean_document_tokens=22
   Pipeline on c: ai_filter:c -> ai_filter:c:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

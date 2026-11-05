@@ -2,7 +2,8 @@
 
 import pyarrow as pa
 import pytest
-from helpers.oracle import Oracle, finish
+from helpers.oracle import Oracle, finish, question_text
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
@@ -19,7 +20,7 @@ SUMMARY = "Summarize the review in one sentence."
 @pytest.fixture()
 def session():
     value = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-                          tokenizer=str.split)
+                          tokenizer=TOKENIZER)
     value.register("reviews", DocumentProvider.from_table(REVIEWS, id_col="id"))
     yield value
     value.close()
@@ -41,8 +42,9 @@ def test_a_map_writes_one_answer_per_document(session):
     # the prompt is the document, then the instruction and the answer cue
     head, tail = node.spec.prompt_token_parts
     turn = session.model.turn
-    assert list(head) == (turn[0] + quail.SHARED_PRE).split()
-    assert list(tail) == (SUMMARY + turn[1] + "ANSWER:").split()
+    assert question_text(head) == turn[0] + quail.SHARED_PRE
+    # the tail opens with the separator after the document
+    assert question_text(tail).endswith(SUMMARY + turn[1] + "ANSWER:")
 
 
 def test_a_map_without_a_limit_writes_up_to_256_tokens(session):
@@ -161,7 +163,7 @@ def test_every_column_operator_supports_a_plain_result_test(session, kind, call,
         "label", "extract", "map", "features"}
     model = "qwen3.5-2b-sae-bf16" if kind == "features" else "qwen3-4b-fp8"
     with quail.Session(EngineConfig(model=model, device="h100-sxm"),
-                       tokenizer=lambda text: list(text.encode())) as value:
+                       tokenizer=TOKENIZER) as value:
         value.register("reviews", session.catalog.get("reviews"))
         query = value.sql(f"SELECT r.id, {call} AS value FROM reviews r "
                           f"WHERE HINT({operand} IS NOT NULL, {{'selectivity': 0.4}})")

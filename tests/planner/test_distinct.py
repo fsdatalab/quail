@@ -7,7 +7,7 @@ gives a one-table SemanticFilter the selected columns as its stop key.
 
 import pyarrow as pa
 import pytest
-from helpers.sessions import CONFIG, fake_tok
+from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 from quail.logical import SemanticFilter
@@ -17,7 +17,7 @@ REVIEWS = pa.table({"id": ["r0", "r1"], "stars": [5, 2], "body": ["good", "slow"
 
 @pytest.fixture()
 def session():
-    value = quail.Session(CONFIG, tokenizer=fake_tok)
+    value = quail.Session(CONFIG, tokenizer=TOKENIZER)
     value.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     yield value
     value.close()

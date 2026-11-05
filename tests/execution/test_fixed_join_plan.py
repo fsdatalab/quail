@@ -1,8 +1,9 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
 import pyarrow as pa
-from helpers.fakes import graph_state, letter_tokens
+from helpers.fakes import graph_state
 from helpers.oracle import Oracle
+from helpers.sessions import TOKENIZER
 
 import quail
 from bench import quailb
@@ -31,7 +32,7 @@ def _session(gpus=1, backend="quail"):
     session = quail.Session(
         EngineConfig(gpus=gpus, model="qwen3-4b-fp8", backend=backend,
                      device="h100-sxm"),
-        tokenizer=letter_tokens)
+        tokenizer=TOKENIZER)
     register_fever(session)
     return session
 

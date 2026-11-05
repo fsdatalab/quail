@@ -13,7 +13,7 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   Sort: exploit_score DESC NULLS LAST, w.id ASC NULLS LAST
     fetch=100
     Project: w.id, exploit_score
-      quail.ai_score                                                       13.5 ms
+      quail.ai_score                                                       9.56 ms
         backend=quail
         keep_kv=False
         model=qwen3-4b-fp8
@@ -21,9 +21,9 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
         output=exploit_score
         aliases=['w']
         expected_rows=6.0
-        estimated_seconds=0.013853413744263673
+        estimated_seconds=0.009870787100508845
         share_prefixes=True
         Scan wrench_runs as w                                        6
-          tokens=144, mean_document_tokens=24
+          tokens=132, mean_document_tokens=22
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

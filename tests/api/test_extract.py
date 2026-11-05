@@ -7,8 +7,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from helpers import baselines as request_tests
-from helpers.fakes import letter_tokens
-from helpers.oracle import Oracle, finish, oracle_executor
+from helpers.oracle import Oracle, finish, oracle_executor, question_text
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
@@ -37,7 +37,7 @@ def session(tmp_path):
     }), path)
     value = quail.Session(
         EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-        tokenizer=letter_tokens)
+        tokenizer=TOKENIZER)
     value.register("contracts",
                    DocumentProvider.from_parquet(str(path), id_col="id"))
     yield value
@@ -81,8 +81,7 @@ class _PhraseClient(request_tests._Client):
         outputs = []
         for prompt in prompts:
             ids = prompt["prompt_token_ids"]
-            spelled = bytes(token - 1 for token in ids if 1 <= token <= 256)
-            text = spelled.decode("utf-8", errors="ignore")
+            text = question_text(ids)
             if "March" in text:
                 answer, tokens = "March 3, 2027", [1, 2, 3, 4]
             elif "five" in text:

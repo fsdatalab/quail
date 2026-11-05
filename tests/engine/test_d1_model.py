@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 
 import pytest
+from helpers.oracle import question_text
+from helpers.sessions import TOKENIZER
 
 from quail.baselines.request import RequestBackend
 from quail.logical import ColumnRef
@@ -44,7 +46,7 @@ def test_d1_2b_extracts_but_refuses_map_with_a_reason(tmp_path):
     from quail.physical.plan import Refusal
 
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
+                            tokenizer=TOKENIZER)
     session.register("reviews", DocumentProvider.from_table(
         pa.table({"id": [0, 1], "body": ["good food", "slow service"]}), id_col="id"))
     extracted = session.sql(
@@ -75,7 +77,7 @@ def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
     pq.write_table(pa.table({"id": list(range(12)), "aspect": ["acting"] * 12}),
                    tmp_path / "aspects.parquet")
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
+                            tokenizer=TOKENIZER)
     for name in ("reviews", "aspects"):
         session.register(name, DocumentProvider.from_parquet(
             str(tmp_path / f"{name}.parquet"), id_col="id"))
@@ -86,9 +88,10 @@ def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
 
     (join,) = [node for node in plan.nodes if isinstance(node, AiJoin)]
     assert join.anchor == "r"
-    assert join.document_head[-2:] == ("reviews", "record:")
-    assert join.label_token_ids == (("a", ("aspects", "record:")),)
-    assert join.question_header_token_ids == ("QUESTION:",)
+    assert question_text(join.document_head).endswith("\nreviews record:\n")
+    ((alias, label),) = join.label_token_ids
+    assert (alias, question_text(label)) == ("a", "aspects record:\n")
+    assert question_text(join.question_header_token_ids) == "QUESTION:\n"
     assert not join.keep_kv
     session.close()
 
@@ -139,7 +142,7 @@ def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
     pq.write_table(pa.table({"id": list(range(12)), "aspect": ["acting"] * 12}),
                    tmp_path / "aspects.parquet")
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
+                            tokenizer=TOKENIZER)
     for name in ("reviews", "aspects"):
         session.register(name, DocumentProvider.from_parquet(
             str(tmp_path / f"{name}.parquet"), id_col="id"))
@@ -154,8 +157,9 @@ def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
     (label,) = [node for node in plan.nodes if isinstance(node, AiClassify)]
     spec = label.spec
     assert spec.scoring == "set_choice" and spec.aliases == ("r", "a")
-    assert spec.join_layout == (("QUESTION:",), ("aspects", "record:"))
-    assert spec.prompt_token_parts[0][-2:] == ("reviews", "record:")
+    assert [question_text(part).strip() for part in spec.join_layout] == [
+        "QUESTION:", "aspects record:"]
+    assert question_text(spec.prompt_token_parts[0]).endswith("\nreviews record:\n")
     assert build_pipelines(plan.graph)[join.node_id] == (join, label)
     # priced by its own estimate over each anchor's kept pairs, not as a
     # pass group of one question for each pair

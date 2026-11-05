@@ -4,6 +4,7 @@
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, oracle_executor
+from helpers.sessions import TOKENIZER, encoder
 
 import quail
 from quail.api import execute as execution
@@ -36,14 +37,10 @@ FROM clauses x
 """
 
 
-def words(text):
-    return text.split()
-
-
 @pytest.fixture()
 def session():
     with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-                       tokenizer=words) as value:
+                       tokenizer=TOKENIZER) as value:
         value.register("contracts",
                        DocumentProvider.from_table(CONTRACTS, id_col="id"))
         yield value
@@ -91,7 +88,8 @@ def test_extraction_then_score_sends_the_extracted_text_to_the_scorer(session):
     # the scorer read the extracted clauses, not the contracts; a null
     # answer reaches it as empty text
     (scored,) = recorder.documents["x"]
-    assert scored == [words(CLAUSES[0]), [], words(CLAUSES[2])]
+    assert [[int(token) for token in tokens] for tokens in scored] == [
+        encoder()(CLAUSES[0]), [], encoder()(CLAUSES[2])]
     assert len(recorder.requests) == 2
     # every stage counts in the totals; each CTE keeps its own report
     assert result.report["wall_s"] == 2.0

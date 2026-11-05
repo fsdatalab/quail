@@ -3,7 +3,8 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.oracle import Oracle, oracle_executor
+from helpers.oracle import Oracle, oracle_executor, question_text
+from helpers.sessions import TOKENIZER, encoder
 
 import quail
 from bench.quailb import (
@@ -63,7 +64,7 @@ def _truth():
 
 
 def _token_ids(text):
-    return [byte + 1 for byte in text.encode("utf-8")]
+    return encoder()(text)
 
 
 def _config(backend):
@@ -74,8 +75,7 @@ def _config(backend):
 def _session(tmp_path, backend="quail"):
     for name, table in CORPUS.items():
         pq.write_table(table, tmp_path / f"{name}.parquet")
-    tokenizer = str.split if backend == "quail" else _token_ids
-    sess = quail.Session(_config(backend), tokenizer=tokenizer)
+    sess = quail.Session(_config(backend), tokenizer=TOKENIZER)
     for name in CORPUS:
         sess.register(name, DocumentProvider.from_parquet(
             str(tmp_path / f"{name}.parquet"), id_col="id"))
@@ -160,7 +160,7 @@ TRACES = pa.table({
 
 def test_relational_plans_build_and_run(tmp_path):
     pq.write_table(TRACES, tmp_path / "agent_traces.parquet")
-    with quail.Session(_config("quail"), tokenizer=str.split) as sess:
+    with quail.Session(_config("quail"), tokenizer=TOKENIZER) as sess:
         sess.register("agent_traces", DocumentProvider.from_parquet(
             str(tmp_path / "agent_traces.parquet"), id_col="id"))
         # DataFusion groups, filters, sorts, and limits the AI filter's rows
@@ -247,10 +247,11 @@ def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path, query_id):
         assert output.rows.column(operator.output).to_pylist() == answers["answer"]
     # every map shows the document under the shared preamble, so a
     # filter or classification before it in the pipeline leaves its KV
-    assert pieces["preamble"] == (turn[0] + quail.SHARED_PRE).split()
+    assert pieces["preamble"] == _token_ids(turn[0] + quail.SHARED_PRE)
     assert [piece["id"] for piece in pieces["maps"]] == [
         m.id for m in spec.info.maps]
-    assert all(piece["tail"][-1] == "ANSWER:" for piece in pieces["maps"])
+    assert all(question_text(piece["tail"]).endswith("ANSWER:")
+               for piece in pieces["maps"])
 
 
 def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
@@ -370,7 +371,7 @@ def test_sec_queries_read_their_own_directory_as_engines_see_the_filings(tmp_pat
         "id": ["0001"], "text": ["cafe\u0301 agreement"],
         "filing_date": ["2024-01-02"], "filing_month": ["2024-01"]}),
         tmp_path / "sec_filings.parquet")
-    with quail.Session(_config("quail"), tokenizer=str.split) as sess:
+    with quail.Session(_config("quail"), tokenizer=TOKENIZER) as sess:
         register_tables(sess, tmp_path)
         query = sess.sql("SELECT f.id FROM sec_filings f WHERE f.text_chars = 14 "
                          "AND AI_FILTER(PROMPT('Is {0} a contract?', f.text))")

@@ -17,16 +17,16 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   Project: c.id, contract, contract_span
     contract = struct(contract.liability_cap)
     contract_span = struct(contract.liability_cap_span)
-    AiExtract: contract.liability_cap over c                                                                                                                                                                                                                  1.86 ms
+    AiExtract: contract.liability_cap over c                                                                                                                                                                                                                  1.38 ms
       question='Does the contract include a cap on liability upon the breach of a party’s obligation? This includes time limitation for the counterparty to bring claims or maximum amount for recovery.', up to 64 answer tokens
-      AiFilter: c                                                                                                                                                                                                                       0.773                 2.21 ms
+      AiFilter: c                                                                                                                                                                                                                       0.773                 1.62 ms
         KV rewind=on
         predicate 1  PROMPT('DOCUMENT:\n{0}\n\nDoes the contract…')                                                                                                                                                                       1.6         49%
-        AiFilter: c                                                                                                                                                                                                                       1.6                 9.03 ms
+        AiFilter: c                                                                                                                                                                                                                       1.6                 7.05 ms
           KV rewind=on
           predicate 2  PROMPT('DOCUMENT:\n{0}\n\nIs there a requir…')                                                                                                                                                                       6       26.3%
           Scan contracts as c                                                                                                                                                                                                               6
-            tokens=96, mean_document_tokens=16
+            tokens=78, mean_document_tokens=13
   Pipeline on c: ai_filter:c -> ai_filter:c:0 -> ai-extract:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

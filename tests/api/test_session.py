@@ -8,7 +8,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
+from helpers.sessions import CONFIG, TOKENIZER, TRUTH, _run, make_executor
 
 import quail
 from quail.api import execute as execution
@@ -23,7 +23,7 @@ from quail.execution.result import (
 
 @pytest.fixture()
 def sess(tmp_path):
-    s = quail.Session(CONFIG, tokenizer=fake_tok)
+    s = quail.Session(CONFIG, tokenizer=TOKENIZER)
     pq.write_table(pa.table({
         "id": [f"r{i}" for i in range(6)],
         "review": [f"review {i} " + "pad " * 20 for i in range(6)],
@@ -157,7 +157,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
 
     registry = quail.ExtensionRegistry.with_built_ins().register_observer(
         NodeTypes)
-    session = quail.Session(CONFIG, tokenizer=fake_tok, registry=registry)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER, registry=registry)
     session.register("reviews", quail.DocumentProvider.from_table(
         pa.table({"id": ["r0", "r1"], "review": ["first", "second"]}), id_col="id"))
     result = _run(session.sql(
@@ -230,7 +230,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
 def test_order_by_offset_and_distinct_run_on_the_result():
     registry = quail.ExtensionRegistry.with_built_ins().register_observer(
         NodeTypes)
-    session = quail.Session(CONFIG, tokenizer=fake_tok, registry=registry)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER, registry=registry)
     session.register("reviews", quail.DocumentProvider.from_table(
         pa.table({"id": [f"r{i}" for i in range(6)],
                   "review": [f"review {i} " + "pad " * 20 for i in range(6)],

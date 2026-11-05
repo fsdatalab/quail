@@ -1,8 +1,8 @@
 """CPU checks that every QUAIL-B query builds and plans on Quail."""
 
 
-from helpers.fakes import letter_tokens
 from helpers.quailb_data import standin_sets
+from helpers.sessions import TOKENIZER
 
 import quail
 from bench.quailb import (
@@ -46,7 +46,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
         with quail.Session(
             EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
                          device="h100-sxm"),
-            tokenizer=letter_tokens,
+            tokenizer=TOKENIZER,
         ) as sess:
             register_tables(sess, tmp_path)
             qdefs = queries(sess)

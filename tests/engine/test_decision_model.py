@@ -7,6 +7,7 @@ from dataclasses import replace
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
@@ -103,7 +104,7 @@ def session(tmp_path):
         catalog.register(name, DocumentProvider.from_parquet(str(path), id_col="id"))
     value = quail.Session(
         EngineConfig(model=DECISION_2_KAI_0_6B_BF16.name, device="h100-sxm"),
-        tokenizer=_tokens)
+        tokenizer=TOKENIZER)
     for name in ("documents", "queries"):
         value.register(name, catalog.get(name))
     yield value

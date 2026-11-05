@@ -3,6 +3,7 @@
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, finish
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
@@ -22,7 +23,7 @@ def _tokenize(text):
 def session():
     value = quail.Session(
         EngineConfig(model="qwen3.5-2b-sae-bf16", device="h100-sxm"),
-        tokenizer=_tokenize)
+        tokenizer=TOKENIZER)
     value.register("reviews", DocumentProvider.from_table(
         pa.table({"id": [7, 9, 11], "body": REVIEWS}), id_col="id"))
     yield value

@@ -22,9 +22,9 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                                                     est. rows   est. time
   Project: r.resolved, strategy
-    AiClassify: strategy over r                                   19.3 ms
-      rule=trie_decode, labels=6, label tokens=77
+    AiClassify: strategy over r                                   13.6 ms
+      rule=trie_decode, labels=6, label tokens=60
       Scan issue_runs as r                                  6
-        tokens=138, mean_document_tokens=23
+        tokens=126, mean_document_tokens=21
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

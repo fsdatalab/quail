@@ -2,7 +2,7 @@
 
 import pyarrow as pa
 import pytest
-from helpers.fakes import letter_tokens
+from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
@@ -24,7 +24,7 @@ TEXTS = ["No date", "June", "No date", "August"]
 def session(request):
     with quail.Session(
         EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=request.param),
-        tokenizer=letter_tokens,
+        tokenizer=TOKENIZER,
     ) as session:
         session.register("contracts", quail.DocumentProvider.from_table(
             pa.table({"id": range(len(TEXTS)), "text": TEXTS,
