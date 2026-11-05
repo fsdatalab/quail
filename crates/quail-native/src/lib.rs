@@ -11,6 +11,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use std::ffi::CStr;
+use std::sync::Mutex;
+use std::thread::ThreadId;
 
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use datafusion::arrow::array::{ArrayRef, RecordBatch, RecordBatchIterator};
@@ -34,15 +36,28 @@ use quail_datafusion::{
 };
 use quail_planner::prompts::Turn;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 /// Runs each model region by calling a Python function with the
-/// region's SQL; the function returns the rows as IPC stream bytes.
+/// region's plan or SQL; the function returns the rows as a pyarrow
+/// Table.
 #[derive(Debug)]
 struct PythonRunner {
     run_region: Py<PyAny>,
     /// The session model's chat-turn text and prompt layout, to bind
     /// regions in Rust; None sends each region's SQL instead.
     prompting: Option<(Turn, String)>,
+    /// While a query runs: the thread that called DataFusion, and where
+    /// a worker sends it a region to run.
+    caller: Mutex<Option<(ThreadId, UnboundedSender<RegionCall>)>>,
+}
+
+/// A region a DataFusion worker hands to the calling thread to run.
+#[derive(Debug)]
+struct RegionCall {
+    region: ModelRegion,
+    inputs: Vec<InputRows>,
+    rows: std::sync::mpsc::Sender<Result<Vec<RecordBatch>>>,
 }
 
 impl PythonRunner {
@@ -65,7 +80,33 @@ impl PythonRunner {
 }
 
 impl RegionRunner for PythonRunner {
+    /// Run the region on the thread that called DataFusion, so the GPU
+    /// process's per-thread state is set up once, not on each worker.
     fn run(&self, region: &ModelRegion, inputs: &[InputRows]) -> Result<Vec<RecordBatch>> {
+        let caller = self.caller.lock().expect("the caller lock").clone();
+        match caller {
+            Some((thread, sender)) if thread != std::thread::current().id() => {
+                let (rows, answer) = std::sync::mpsc::channel();
+                let call = RegionCall {
+                    region: region.clone(),
+                    inputs: inputs.to_vec(),
+                    rows,
+                };
+                sender
+                    .send(call)
+                    .map_err(|_| DataFusionError::Execution("the query ended".into()))?;
+                answer
+                    .recv()
+                    .map_err(|_| DataFusionError::Execution("the region did not run".into()))?
+            }
+            _ => self.run_here(region, inputs),
+        }
+    }
+}
+
+impl PythonRunner {
+    /// Run the region on this thread.
+    fn run_here(&self, region: &ModelRegion, inputs: &[InputRows]) -> Result<Vec<RecordBatch>> {
         let (kind, payload) = self.request(region)?;
         let batches = Python::attach(|py| {
             // each input as a pyarrow Table, by the table name the region reads
@@ -212,6 +253,7 @@ fn python_error(error: DataFusionError) -> PyErr {
 struct NativeContext {
     context: SessionContext,
     runtime: Runtime,
+    runner: Arc<PythonRunner>,
 }
 
 #[pymethods]
@@ -233,11 +275,7 @@ impl NativeContext {
         layout: Option<String>,
         rules: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        // one thread: each model region runs on the Python thread that
-        // called DataFusion, as it would without DataFusion
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        let runtime = Runtime::new()?;
         let prompting = turn.zip(layout);
         let regions = match rules {
             Some(rules) => {
@@ -248,14 +286,20 @@ impl NativeContext {
             }
             None => quail_datafusion::OptimizeModelRegions::default(),
         };
+        let runner = Arc::new(PythonRunner {
+            run_region,
+            prompting,
+            caller: Mutex::new(None),
+        });
         let context = quail_datafusion::session_context_with_rules(
-            Arc::new(PythonRunner {
-                run_region,
-                prompting,
-            }),
+            Arc::clone(&runner) as Arc<dyn RegionRunner>,
             regions,
         );
-        Ok(Self { context, runtime })
+        Ok(Self {
+            context,
+            runtime,
+            runner,
+        })
     }
 
     /// Register a table by its schema, given as the IPC stream bytes of
@@ -304,23 +348,46 @@ impl NativeContext {
         query: &str,
         dialect: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let runner = Arc::clone(&self.runner);
         let (schema, batches) = py
             .detach(|| {
                 self.runtime.block_on(async {
-                    let frame =
-                        quail_datafusion::sql_in_dialect(&self.context, query, dialect.as_deref())
-                            .await?;
-                    let schema = quail_schema(frame.schema());
-                    // renaming the columns keeps each column's buffers
-                    let batches = frame
-                        .collect()
-                        .await?
-                        .into_iter()
-                        .map(|batch| {
-                            RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
-                        })
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    Ok::<_, DataFusionError>((schema, batches))
+                    let (sender, mut calls) = unbounded_channel::<RegionCall>();
+                    *runner.caller.lock().expect("the caller lock") =
+                        Some((std::thread::current().id(), sender));
+                    let query = async {
+                        let frame = quail_datafusion::sql_in_dialect(
+                            &self.context,
+                            query,
+                            dialect.as_deref(),
+                        )
+                        .await?;
+                        let schema = quail_schema(frame.schema());
+                        // renaming the columns keeps each column's buffers
+                        let batches = frame
+                            .collect()
+                            .await?
+                            .into_iter()
+                            .map(|batch| {
+                                RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
+                            })
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        Ok::<_, DataFusionError>((schema, batches))
+                    };
+                    tokio::pin!(query);
+                    // DataFusion's workers run the operators; this thread
+                    // runs each model region they hand it
+                    let done = loop {
+                        tokio::select! {
+                            done = &mut query => break done,
+                            Some(call) = calls.recv() => {
+                                let rows = runner.run_here(&call.region, &call.inputs);
+                                let _ = call.rows.send(rows);
+                            }
+                        }
+                    };
+                    *runner.caller.lock().expect("the caller lock") = None;
+                    done
                 })
             })
             .map_err(python_error)?;

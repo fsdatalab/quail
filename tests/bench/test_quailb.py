@@ -103,3 +103,8 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     assert _submission_to_answer_s(
         "pipelined_vllm", report, frontend_s=1.0, answer_prepare_s=0.75
     ) == 11.25
+    # DataFusion's time around the model region counts for every backend
+    report["datafusion_s"] = 0.5
+    assert _submission_to_answer_s(
+        "quail", report, frontend_s=1.0, answer_prepare_s=0.75
+    ) == 15.0

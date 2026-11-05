@@ -143,9 +143,8 @@ impl ExecutionPlan for ModelRegionExec {
         let region = self.region.clone();
         let runner = Arc::clone(&self.runner);
         let inputs = self.inputs.clone();
-        // the region runs on the thread that polls the stream: under a
-        // current-thread runtime, the thread that called DataFusion, so a
-        // runner's per-thread state (Python's, the GPU process's) is reused
+        // the runner decides which thread runs the region; Quail's runs
+        // it on the thread that called DataFusion
         let rows = async move {
             let mut rows: Vec<InputRows> = Vec::new();
             for (name, input) in region.input_names.iter().zip(inputs) {

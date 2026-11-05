@@ -131,13 +131,14 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     """Run a query's SQL in DataFusion, whose model region runs this query.
 
     DataFusion's ModelRegionExec calls back once, for the query's one
-    model region. When the region is the whole query, its QueryResult is
-    the result; otherwise the result holds DataFusion's rows with the
-    region's plan, metrics, and answers.
+    model region. The result holds DataFusion's rows with the region's
+    plan, metrics, and answers.
     """
     from quail.api.context import SessionContext
 
     results = []
+    started = time.perf_counter()
+    region_s, region_tables = [], []
 
     def run_region(kind, _payload, tables=None):
         if kind != "plan" or results:
@@ -152,28 +153,36 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
             # plan the region again over the rows DataFusion produced
             region = region_query(query.session, query._logical_input,
                                   order=query.order, tables=tables)
+        region_started = time.perf_counter()
         result = _execute_region(region, physical_executor, plan,
                                  on_backend_ready, on_execution_ready)
+        region_s.append(time.perf_counter() - region_started)
         results.append(result)
-        return result.collect()
+        table = result.collect()
+        region_tables.append(table)
+        return table
 
     context = SessionContext(query.session, run_region=run_region)
     table = context.sql(query.text, query.dialect)
     (region,) = results
-    if query.whole:
-        if table.num_rows != region.count():
-            raise RuntimeError(
-                f"DataFusion returned {table.num_rows} rows; the model region "
-                f"returned {region.count()}")
-        return region
-    result = QueryResult.from_table(table, report=region.report)
+    # the time outside the region: building the context, planning the
+    # SQL, gathering the region's rows, and the operators around it
+    region.report["datafusion_s"] = round(
+        time.perf_counter() - started - region_s[0], 4)
+    # the result is the rows already gathered, with the region's plan,
+    # metrics, and answers: the region's own when it is the whole query,
+    # which keep Quail's added columns such as a label's probabilities,
+    # or DataFusion's
+    returned = region_tables[0] if query.whole else table
+    result = QueryResult.from_table(returned, report=region.report)
     result.plan = region.plan
     result.node_metrics = region.node_metrics
     result.answer_tables = region.answer_tables
     result.survivor_indices = region.survivor_indices
     result.true_join_tables = region.true_join_tables
-    result.datafusion_plan = context.explain(query.text, query.dialect)
-    result.region_rows = region.count()
+    result.region_rows = region_tables[0].num_rows
+    if not query.whole:
+        result.datafusion_plan = context.explain(query.text, query.dialect)
     return result
 
 

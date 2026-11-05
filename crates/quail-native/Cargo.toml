@@ -22,4 +22,4 @@ quail-physical = { path = "../quail-physical" }
 quail-planner = { path = "../quail-planner" }
 serde = "1"
 serde_json = { version = "1", features = ["float_roundtrip"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

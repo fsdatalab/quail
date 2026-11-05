@@ -406,6 +406,8 @@ def _submission_to_answer_s(
         report["model_wall_s"]
         + report["finish_s"]
         + answer_prepare_s
+        # DataFusion's planning and operators around the model region
+        + report.get("datafusion_s", 0.0)
     )
     if backend == "quail":
         runtime_s += (
