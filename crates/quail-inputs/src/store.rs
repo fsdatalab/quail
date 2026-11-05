@@ -1,0 +1,236 @@
+//! Token stores: a document column's tokens in one Arrow IPC file.
+//!
+//! The file is the one Python's `quail.common.tokens.TokenStore` opens:
+//! a `__quail_token_ids` column of token lists and a
+//! `__quail_token_count` column of their lengths, with the schema
+//! metadata `quail.kind = token_store`.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use arrow::array::{AsArray, Int64Array, LargeListArray, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
+use arrow::error::ArrowError;
+use arrow::ipc::reader::FileReader;
+use arrow::ipc::writer::FileWriter;
+
+use crate::tokenizer::Tokenizer;
+
+/// The column of each document's tokens.
+pub const TOKEN_COLUMN: &str = "__quail_token_ids";
+/// The column of each document's token count.
+pub const COUNT_COLUMN: &str = "__quail_token_count";
+
+fn store_schema(token_type: &DataType) -> SchemaRef {
+    let metadata = HashMap::from([("quail.kind".to_string(), "token_store".to_string())]);
+    Arc::new(
+        Schema::new(vec![
+            Field::new(
+                TOKEN_COLUMN,
+                DataType::LargeList(Arc::new(Field::new_list_field(token_type.clone(), true))),
+                false,
+            ),
+            Field::new(COUNT_COLUMN, DataType::Int64, false),
+        ])
+        .with_metadata(metadata),
+    )
+}
+
+/// Writes a token store file batch by batch.
+pub struct TokenStoreWriter {
+    path: PathBuf,
+    writer: Option<FileWriter<File>>,
+}
+
+impl TokenStoreWriter {
+    /// Start a token store at `path` whose tokens are `token_type`:
+    /// int32 ids, or strings for a tokenizer that returns words.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be created.
+    pub fn create(path: &Path, token_type: &DataType) -> Result<Self, ArrowError> {
+        let file = File::create(path)?;
+        let writer = FileWriter::try_new(file, &store_schema(token_type))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            writer: Some(writer),
+        })
+    }
+
+    /// Append the tokens of some documents.
+    ///
+    /// # Errors
+    ///
+    /// The tokens are not of the store's type, or the write fails.
+    pub fn write(&mut self, tokens: LargeListArray) -> Result<(), ArrowError> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| ArrowError::InvalidArgumentError("the store is finished".into()))?;
+        let counts: Int64Array = tokens
+            .offsets()
+            .windows(2)
+            .map(|pair| Some(pair[1] - pair[0]))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(writer.schema()),
+            vec![Arc::new(tokens), Arc::new(counts)],
+        )?;
+        writer.write(&batch)
+    }
+
+    /// Tokenize `texts` and append their tokens.
+    ///
+    /// # Errors
+    ///
+    /// The tokenizer or the write fails.
+    pub fn write_texts(
+        &mut self,
+        tokenizer: &dyn Tokenizer,
+        texts: &StringArray,
+    ) -> Result<(), ArrowError> {
+        self.write(tokenizer.encode_batch(texts)?)
+    }
+
+    /// Close the file and open it as a token store.
+    ///
+    /// # Errors
+    ///
+    /// The file does not close or read back.
+    pub fn finish(mut self) -> Result<TokenStore, ArrowError> {
+        if let Some(mut writer) = self.writer.take() {
+            writer.finish()?;
+        }
+        TokenStore::open(&self.path)
+    }
+}
+
+impl Drop for TokenStoreWriter {
+    fn drop(&mut self) {
+        // a writer dropped before finish leaves no partial file behind
+        if self.writer.take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// A document column's tokens, read from a token store file.
+#[derive(Debug, Clone)]
+pub struct TokenStore {
+    path: PathBuf,
+    tokens: Vec<LargeListArray>,
+    lengths: Vec<i64>,
+}
+
+impl TokenStore {
+    /// Open the token store file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// The file is not a token store.
+    pub fn open(path: &Path) -> Result<Self, ArrowError> {
+        let reader = FileReader::try_new(File::open(path)?, None)?;
+        let schema = reader.schema();
+        let token_index = schema.index_of(TOKEN_COLUMN)?;
+        let mut tokens = Vec::new();
+        let mut lengths = Vec::new();
+        for batch in reader {
+            let batch = batch?;
+            let column = batch.column(token_index).as_list::<i64>().clone();
+            lengths.extend(column.offsets().windows(2).map(|pair| pair[1] - pair[0]));
+            tokens.push(column);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            tokens,
+            lengths,
+        })
+    }
+
+    /// The file the store reads.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Each document's token count.
+    pub fn lengths(&self) -> &[i64] {
+        &self.lengths
+    }
+
+    /// The number of documents.
+    pub fn len(&self) -> usize {
+        self.lengths.len()
+    }
+
+    /// Whether the store holds no document.
+    pub fn is_empty(&self) -> bool {
+        self.lengths.is_empty()
+    }
+
+    /// The token batches as the file holds them.
+    pub fn batches(&self) -> &[LargeListArray] {
+        &self.tokens
+    }
+
+    /// Each document's tokens, as one array per document position.
+    pub fn documents(&self) -> Documents<'_> {
+        Documents::new(&self.tokens)
+    }
+}
+
+/// The documents of a token store, by position.
+pub enum Documents<'a> {
+    /// Integer token ids.
+    Ids(Vec<&'a [i32]>),
+    /// The words of a test tokenizer.
+    Words(Vec<Vec<&'a str>>),
+}
+
+impl<'a> Documents<'a> {
+    fn new(batches: &'a [LargeListArray]) -> Self {
+        let words = batches.first().is_some_and(|batch| {
+            matches!(batch.value_type(), DataType::Utf8 | DataType::LargeUtf8)
+        });
+        if !words {
+            let mut documents = Vec::new();
+            for batch in batches {
+                let values = batch.values().as_primitive::<Int32Type>().values();
+                for pair in batch.offsets().windows(2) {
+                    documents.push(&values[pair[0] as usize..pair[1] as usize]);
+                }
+            }
+            return Documents::Ids(documents);
+        }
+        let mut documents = Vec::new();
+        for batch in batches {
+            let values = batch.values();
+            for pair in batch.offsets().windows(2) {
+                let range = pair[0] as usize..pair[1] as usize;
+                documents.push(match values.as_string_opt::<i64>() {
+                    Some(strings) => range.map(|index| strings.value(index)).collect(),
+                    None => {
+                        let strings = values.as_string::<i32>();
+                        range.map(|index| strings.value(index)).collect()
+                    }
+                });
+            }
+        }
+        Documents::Words(documents)
+    }
+
+    /// The number of documents.
+    pub fn len(&self) -> usize {
+        match self {
+            Documents::Ids(found) => found.len(),
+            Documents::Words(found) => found.len(),
+        }
+    }
+
+    /// Whether there is no document.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}

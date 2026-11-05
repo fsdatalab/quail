@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 quail = { path = "../quail" }
 quail-cost = { path = "../quail-cost" }
+quail-inputs = { path = "../quail-inputs" }
 datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
 # maturin sets PYO3_BUILD_EXTENSION_MODULE, so the module does not link libpython
 pyo3 = { version = "0.30", features = ["abi3-py312"] }

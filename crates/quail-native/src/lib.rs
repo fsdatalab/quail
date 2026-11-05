@@ -7,6 +7,7 @@ mod cost;
 
 use std::io::Cursor;
 
+use datafusion::arrow::array::AsArray;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlan;
@@ -761,6 +762,94 @@ fn work_fields(work: &quail_cost::work::Work) -> std::collections::BTreeMap<&'st
     ])
 }
 
+/// Tokenize the texts of `table`'s first column into a token store at
+/// `path`, with the `tokenizer.json` at `tokenizer_file` or else the
+/// Python callable `tokenizer`.
+#[pyfunction]
+#[pyo3(signature = (path, table, tokenizer=None, tokenizer_file=None))]
+fn write_token_store(
+    path: &str,
+    table: &Bound<'_, PyAny>,
+    tokenizer: Option<Py<PyAny>>,
+    tokenizer_file: Option<&str>,
+) -> PyResult<()> {
+    let tokenizer: Box<dyn quail_inputs::Tokenizer> = match (tokenizer_file, tokenizer) {
+        (Some(file), _) => Box::new(
+            quail_inputs::HfTokenizer::from_file(std::path::Path::new(file))
+                .map_err(|error| python_error(error.into()))?,
+        ),
+        (None, Some(callable)) => Box::new(quail::PythonTokenizer::new(callable, "Python")),
+        (None, None) => return Err(PyRuntimeError::new_err("no tokenizer")),
+    };
+    let batches = quail::pyarrow::from_pyarrow(table)?;
+    let token_type = if batches.is_empty() {
+        datafusion::arrow::datatypes::DataType::Int32
+    } else {
+        let first = tokenizer
+            .encode_batch(batches[0].column(0).as_string::<i32>())
+            .map_err(|error| python_error(error.into()))?;
+        first.value_type()
+    };
+    let py = table.py();
+    py.detach(|| {
+        let mut writer =
+            quail_inputs::TokenStoreWriter::create(std::path::Path::new(path), &token_type)?;
+        for batch in &batches {
+            writer.write_texts(tokenizer.as_ref(), batch.column(0).as_string::<i32>())?;
+        }
+        writer.finish().map(|_| ())
+    })
+    .map_err(|error| python_error(error.into()))
+}
+
+/// Return the planner's statistics of the token store at `path`: the
+/// prefix index order and parent and shared tokens of its tree at
+/// `page_tokens`, the reader groups, each document's first equal
+/// document (equal also in each column of `columns`, a pyarrow Table),
+/// and the distinct last tokens.
+#[pyfunction]
+#[pyo3(signature = (path, page_tokens, columns=None))]
+fn prefix_statistics<'py>(
+    py: Python<'py>,
+    path: &str,
+    page_tokens: i64,
+    columns: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let store = quail_inputs::TokenStore::open(std::path::Path::new(path))
+        .map_err(|error| python_error(error.into()))?;
+    let values: Vec<datafusion::arrow::array::ArrayRef> = match columns {
+        None => Vec::new(),
+        Some(table) => {
+            let batches = quail::pyarrow::from_pyarrow(table)?;
+            let schema = batches
+                .first()
+                .map(|batch| batch.schema())
+                .ok_or_else(|| PyRuntimeError::new_err("columns has no batch"))?;
+            let batch = datafusion::arrow::compute::concat_batches(&schema, &batches)
+                .map_err(|error| python_error(error.into()))?;
+            batch.columns().to_vec()
+        }
+    };
+    let documents = store.documents();
+    let index = quail_inputs::PrefixIndex::new(&documents);
+    let tree = index.tree(page_tokens);
+    let groups: Vec<(i64, i64, i64)> = tree
+        .reader_groups(store.lengths())
+        .iter()
+        .map(|group| (group.shared, group.count, group.rows))
+        .collect();
+    let first = quail_inputs::first_documents(&documents, &values)
+        .map_err(|error| python_error(error.into()))?;
+    let found = pyo3::types::PyDict::new(py);
+    found.set_item("order", &tree.order)?;
+    found.set_item("parent", &tree.parent)?;
+    found.set_item("shared", &tree.shared)?;
+    found.set_item("reader_groups", groups)?;
+    found.set_item("first_documents", first)?;
+    found.set_item("last_tokens", quail_inputs::last_tokens(&documents))?;
+    Ok(found)
+}
+
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSession>()?;
@@ -771,6 +860,8 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(column_placements, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
+    module.add_function(wrap_pyfunction!(write_token_store, module)?)?;
+    module.add_function(wrap_pyfunction!(prefix_statistics, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }
 
