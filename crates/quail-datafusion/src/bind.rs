@@ -42,8 +42,13 @@ const DEFAULT_MAP_ANSWER_TOKENS: i64 = 256;
 /// Bind a model region into Quail's logical plan.
 ///
 /// The binder reads the region's plan as DataFusion's SQL planner bound
-/// it. `turn` and `layout` are the session model's chat-turn text and
-/// prompt layout.
+/// it, for each operator's content and for whether the query is
+/// refused. The relation's operators are placed as DataFusion's rules
+/// left them in the region's optimized plan (`crate::translate_relation`);
+/// a region with an operator the translation does not read yet, such as
+/// an EXISTS gate, a window over a model call, or a CTE that runs as its
+/// own stage, is placed by the builder. `turn` and `layout` are the
+/// session model's chat-turn text and prompt layout.
 ///
 /// # Errors
 ///
@@ -54,7 +59,18 @@ pub fn bind_model_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
-    bind_region(&region.bound, turn, layout)
+    let bound = bind_region(&region.bound, turn, layout)?;
+    let (place, project, stages) = bind_with_stages(&region.bound, turn, layout)?;
+    if !stages.is_empty() || !region.optimized {
+        return Ok(bound);
+    }
+    let content = quail_planner::builder::relation_content(place)?;
+    let Some(relation) = crate::translate_relation(&region.plan, &content) else {
+        return Ok(bound);
+    };
+    Ok(quail_planner::builder::LogicalPlanBuilder::over(relation)
+        .project(&project, &content.rows)
+        .unwrap_or(bound))
 }
 
 /// Bind a model region's plan, as DataFusion's SQL planner bound it,

@@ -31,8 +31,8 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
-    Expr, ExprSchemable, Extension, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
-    UserDefinedLogicalNode,
+    Aggregate, Expr, ExprSchemable, Extension, Filter, Join, JoinType, LogicalPlan, Operator,
+    Projection, UserDefinedLogicalNode,
 };
 use datafusion::optimizer::AnalyzerRule;
 
@@ -169,7 +169,7 @@ fn stack_asked(
     };
     for (position, term) in asked {
         let read = tables(&term);
-        if !in_on && read.len() < 2 {
+        if read.len() < 2 {
             if run_table.as_ref() != Some(&read) {
                 input = close(input, &mut run);
                 run_table = Some(read);
@@ -238,18 +238,37 @@ fn quail_function(name: &str) -> Arc<datafusion::logical_expr::ScalarUDF> {
         .expect("a Quail function")
 }
 
-/// The call a column operator runs for `call`: an extraction for the
-/// spans of one.
-fn base_call(call: &Expr) -> Expr {
-    match call {
-        Expr::ScalarFunction(found) if found.name() == "ai_extract_span" => {
-            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                quail_function("ai_extract"),
-                found.args.clone(),
-            ))
+/// Whether an argument is a `{'selectivity': ...}` hint and nothing else.
+fn is_selectivity_hint(arg: &Expr) -> bool {
+    match arg {
+        Expr::ScalarFunction(call) if call.name() == "named_struct" => {
+            call.args.len() == 2
+                && matches!(&call.args[0], Expr::Literal(value, _)
+                    if value.try_as_str().flatten() == Some("selectivity"))
         }
-        other => other.clone(),
+        _ => false,
     }
+}
+
+/// The call a column operator runs for `call`: an extraction for the
+/// spans of one, and a test's call without its selectivity hint, which
+/// the test keeps.
+fn base_call(call: &Expr) -> Expr {
+    let Expr::ScalarFunction(found) = call else {
+        return call.clone();
+    };
+    let mut args = found.args.clone();
+    if args.last().is_some_and(is_selectivity_hint) {
+        args.pop();
+    }
+    let function = if found.name() == "ai_extract_span" {
+        quail_function("ai_extract")
+    } else {
+        Arc::clone(&found.func)
+    };
+    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+        function, args,
+    ))
 }
 
 fn is_span_call(expr: &Expr) -> bool {
@@ -408,6 +427,50 @@ fn lower_join(join: &Join) -> Result<Transformed<LogicalPlan>> {
     )))
 }
 
+fn lower_aggregate(
+    aggregate: &Aggregate,
+    columns: &mut Columns,
+) -> Result<Transformed<LogicalPlan>> {
+    let calls: Vec<Expr> = aggregate
+        .group_expr
+        .iter()
+        .chain(&aggregate.aggr_expr)
+        .flat_map(column_calls)
+        .collect();
+    if calls.is_empty() {
+        return Ok(Transformed::no(LogicalPlan::Aggregate(aggregate.clone())));
+    }
+    let mut input = aggregate.input.as_ref().clone();
+    let mut added: Vec<(Expr, String)> = Vec::new();
+    for call in calls {
+        if added.iter().any(|(found, _)| *found == call) {
+            continue;
+        }
+        let name = match added_column(&input, &call) {
+            Some(name) => name,
+            None => {
+                let name = columns.name_for(&call);
+                input = add_column(input, call.clone(), &name)?;
+                name
+            }
+        };
+        added.push((call, name));
+    }
+    let read = |exprs: &[Expr]| -> Result<Vec<Expr>> {
+        exprs
+            .iter()
+            .map(|expr| read_columns(expr.clone(), &added))
+            .collect()
+    };
+    Ok(Transformed::yes(LogicalPlan::Aggregate(
+        Aggregate::try_new(
+            Arc::new(input),
+            read(&aggregate.group_expr)?,
+            read(&aggregate.aggr_expr)?,
+        )?,
+    )))
+}
+
 fn lower_projection(
     projection: &Projection,
     columns: &mut Columns,
@@ -492,6 +555,7 @@ pub fn lower_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
             LogicalPlan::Filter(filter) => lower_filter(filter, &mut columns),
             LogicalPlan::Join(join) => lower_join(join),
             LogicalPlan::Projection(projection) => lower_projection(projection, &mut columns),
+            LogicalPlan::Aggregate(aggregate) => lower_aggregate(aggregate, &mut columns),
             _ => Ok(Transformed::no(node)),
         })?
         .data)

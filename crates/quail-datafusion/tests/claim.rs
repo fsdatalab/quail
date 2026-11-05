@@ -233,11 +233,13 @@ async fn a_test_of_a_label_reads_the_column_its_classification_adds() -> Result<
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
     let plan = lines(&region.plan);
-    assert_eq!(plan[1], "Filter: tone = Utf8(\"good\")", "{plan:?}");
-    assert!(
-        plan[2].starts_with("SemanticColumn: tone = ai_classify"),
-        "{plan:?}"
-    );
+    let test = plan
+        .iter()
+        .position(|line| line == "Filter: tone = Utf8(\"good\")");
+    let column = plan
+        .iter()
+        .position(|line| line.starts_with("SemanticColumn: tone = ai_classify"));
+    assert!(test.unwrap() < column.unwrap(), "{plan:?}");
     // one classification serves the test and the SELECT list
     let columns = plan
         .iter()

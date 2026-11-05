@@ -23,8 +23,10 @@ mod functions;
 mod joins;
 mod lower;
 mod optimize;
+mod placement;
 mod region;
 pub mod semantic;
+mod translate;
 mod unnest;
 mod unparse;
 
@@ -50,7 +52,9 @@ pub use functions::{
 };
 pub use lower::{LowerAiCalls, lower_ai_calls};
 pub use optimize::{OptimizeModelRegions, optimize_region};
+pub use placement::PlaceSemanticNodes;
 pub use region::ModelRegion;
+pub use translate::translate_relation;
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 pub use unparse::region_sql;
 

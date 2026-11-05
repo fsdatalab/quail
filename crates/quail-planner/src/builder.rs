@@ -327,7 +327,7 @@ pub struct JoinSpec {
 }
 
 /// One table's operators, as `LogicalPlanBuilder.add_scan` takes them.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ScanOperators {
     pub predicates: Vec<FilterPredicate>,
     pub labels: Vec<(ModelCall, String)>,
@@ -349,7 +349,9 @@ fn tagged(call: &ModelCall) -> TaggedModelCall {
     TaggedModelCall::Call(call.clone())
 }
 
-fn column_node(kind: &str, input: LogicalNode, call: &ModelCall, name: &str) -> LogicalNode {
+/// A column operator of `kind` ("label", "extract", "features", or
+/// "map") adding `call`'s answer as `name` to each row of `input`.
+pub fn column_node(kind: &str, input: LogicalNode, call: &ModelCall, name: &str) -> LogicalNode {
     let column = SemanticColumn {
         input: Box::new(input),
         call: tagged(call),
@@ -405,6 +407,14 @@ fn check_labels(condition: &Condition, calls: &[(String, ModelCall)]) -> Result<
 }
 
 impl LogicalPlanBuilder {
+    /// A builder whose relation is `root`, for `project` to finish.
+    pub fn over(root: LogicalNode) -> Self {
+        Self {
+            nodes: Vec::new(),
+            root: Some(root),
+        }
+    }
+
     /// Add one table with its filters, classifications, and extractions.
     pub fn add_scan(
         &mut self,
@@ -1195,6 +1205,76 @@ fn is_score(asked: &Asked) -> bool {
 
 /// Place each part of a bound relation and build the logical plan below it.
 pub fn place_relation(arguments: PlaceRelationArguments) -> Result<PlacedRelation, CompileError> {
+    relation_content(arguments)?.assemble()
+}
+
+/// Each table's operators, the joins, and the row tests of one SELECT's
+/// relation, before they are put in order.
+#[derive(Debug, Clone)]
+pub struct RelationContent {
+    /// Each table with its operators, in FROM and JOIN order.
+    pub tables: Vec<TableContent>,
+    pub joins: Vec<JoinSpec>,
+    /// The tables joined without an AI predicate.
+    pub cross_joined: Vec<String>,
+    /// Classifications of joined rows, with their names.
+    pub joined_classifications: Vec<(ModelCall, String)>,
+    /// Tests of more than one table's columns, on the result rows.
+    pub rows: Vec<Condition>,
+}
+
+/// One table and its operators, as `LogicalPlanBuilder.add_scan` takes them.
+#[derive(Debug, Clone)]
+pub struct TableContent {
+    pub alias: String,
+    pub provider: String,
+    pub column: ScanColumn,
+    pub schema: Option<Schema>,
+    pub operators: ScanOperators,
+}
+
+impl RelationContent {
+    /// Put the operators in Quail's order: each table's, then the joins.
+    ///
+    /// # Errors
+    ///
+    /// A join or a classification does not fit the tables in scope.
+    pub fn assemble(self) -> Result<PlacedRelation, CompileError> {
+        let mut builder = LogicalPlanBuilder::default();
+        for table in self.tables {
+            builder.add_scan(
+                &table.alias,
+                &table.provider,
+                &table.column,
+                table.operators,
+                table.schema,
+            )?;
+        }
+        for join in &self.joins {
+            builder.add_join(join)?;
+        }
+        for alias in &self.cross_joined {
+            builder.add_cross_join(alias)?;
+        }
+        for (call, name) in &self.joined_classifications {
+            builder.add_classify(call, name)?;
+        }
+        Ok(PlacedRelation {
+            builder,
+            rows: self.rows,
+        })
+    }
+}
+
+/// Bind a relation's parts into each table's operators and the joins.
+///
+/// # Errors
+///
+/// A part does not fit the query's tables, or the query has no AI
+/// predicate where it needs one.
+pub fn relation_content(
+    arguments: PlaceRelationArguments,
+) -> Result<RelationContent, CompileError> {
     let mut scans: Vec<Scan> = arguments
         .scans
         .iter()
@@ -1379,42 +1459,41 @@ pub fn place_relation(arguments: PlaceRelationArguments) -> Result<PlacedRelatio
         }
     }
     let placed = place_conditions(conditions, &computed, &arguments.unnested)?;
-    let mut builder = LogicalPlanBuilder::default();
-    for scan in &scans {
-        let of = |kind: &str| -> Vec<(ModelCall, String)> {
-            lookup(&computing[kind], &scan.alias).to_vec()
-        };
-        builder.add_scan(
-            &scan.alias,
-            &scan.provider,
-            &scan.column,
-            ScanOperators {
-                predicates: lookup(&filters, &scan.alias).to_vec(),
-                labels: lookup(&labels, &scan.alias).to_vec(),
-                regular_predicates: lookup(&placed.scans, &scan.alias).to_vec(),
-                extracts: of("extract"),
-                computed_filters: lookup(&placed.computed, &scan.alias).to_vec(),
-                sae_features: of("features"),
-                maps: of("map"),
-            },
-            arguments.schemas.get(&scan.provider).cloned().flatten(),
-        )?;
-    }
-    for join in &joins {
-        builder.add_join(join)?;
-    }
-    for alias in &joined {
-        if !claimed.contains(alias) {
-            builder.add_cross_join(alias)?;
-        }
-    }
-    for (call, name) in &named {
-        if call_aliases(call).len() == 2 {
-            builder.add_classify(call, name)?;
-        }
-    }
-    Ok(PlacedRelation {
-        builder,
+    let tables = scans
+        .iter()
+        .map(|scan| {
+            let of = |kind: &str| -> Vec<(ModelCall, String)> {
+                lookup(&computing[kind], &scan.alias).to_vec()
+            };
+            TableContent {
+                alias: scan.alias.clone(),
+                provider: scan.provider.clone(),
+                column: scan.column.clone(),
+                schema: arguments.schemas.get(&scan.provider).cloned().flatten(),
+                operators: ScanOperators {
+                    predicates: lookup(&filters, &scan.alias).to_vec(),
+                    labels: lookup(&labels, &scan.alias).to_vec(),
+                    regular_predicates: lookup(&placed.scans, &scan.alias).to_vec(),
+                    extracts: of("extract"),
+                    computed_filters: lookup(&placed.computed, &scan.alias).to_vec(),
+                    sae_features: of("features"),
+                    maps: of("map"),
+                },
+            }
+        })
+        .collect();
+    Ok(RelationContent {
+        tables,
+        joins,
+        cross_joined: joined
+            .iter()
+            .filter(|alias| !claimed.contains(alias))
+            .cloned()
+            .collect(),
+        joined_classifications: named
+            .into_iter()
+            .filter(|(call, _)| call_aliases(call).len() == 2)
+            .collect(),
         rows: placed.rows,
     })
 }

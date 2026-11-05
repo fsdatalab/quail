@@ -63,8 +63,9 @@ impl OptimizerRule for OptimizeModelRegions {
 /// A DataFusion rule fails.
 pub fn optimize_region(plan: &LogicalPlan) -> Result<LogicalPlan> {
     let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
-        Arc::new(OptimizeProjections::new()),
+        Arc::new(crate::placement::PlaceSemanticNodes),
         Arc::new(PushDownFilter::new()),
+        Arc::new(OptimizeProjections::new()),
     ];
     Optimizer::with_rules(rules).optimize(plan.clone(), &OptimizerContext::new(), |_, _| {})
 }
