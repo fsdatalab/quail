@@ -497,3 +497,36 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         model.shared_reads > 0
     )
     assert not arena.accounting.owned
+
+
+def test_copy_tables_match_each_documents_candidate_index():
+    from quail.backends.quail.executor.extract.candidates import CandidateIndex
+    from quail.backends.quail.executor.extract.copy import copy_tables
+
+    texts = ["five years five days", "", "lease lease years", "days five foo"]
+    spec, vocabulary = make_spec(*texts, "foobarbaz barbaz")
+    state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
+    documents = ExtractionInputs(state, [spec], vocabulary, np.arange(len(texts)),
+                                 None, texts)
+    tables = copy_tables(documents)
+    key0 = 0
+    for d, document in enumerate(documents.documents):
+        scan = document.scan
+        index = CandidateIndex.of(scan, vocabulary)
+        start, end = tables.position_offsets[d:d + 2]
+        assert tables.position_local_keys[start:end].tolist() == index.inverse.tolist()
+        keys = tables.position_keys[start:end] - key0
+        assert keys.tolist() == index.inverse.tolist()
+        assert tables.positions[d][tables.positions[d] >= 0].tolist() == list(
+            range(start, end))
+        rows = tables.option_rows[d][tables.option_rows[d] >= 0]
+        assert tables.option_tokens[rows].tolist() == index.token.tolist()
+        assert tables.option_local_keys[rows].tolist() == index.segment.tolist()
+        assert tables.filler_chars[rows].tolist() == index.length.tolist()
+        assert tables.filler_tokens[rows].tolist() == scan.tokens[
+            index.anchor[index.segment]].tolist()
+        key0 += len(index.kids)
+    assert tables.num_keys == max(
+        len(CandidateIndex.of(document.scan, vocabulary).kids)
+        for document in documents.documents)
+    assert np.all(np.diff(tables.option_lookup) >= 0)
