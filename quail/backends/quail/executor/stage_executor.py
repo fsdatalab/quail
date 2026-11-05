@@ -284,7 +284,11 @@ class StageExecutor:
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         self.admission_mode = answer_admission_mode()
-        if self.answer_maps and self.paged:
+        if self.answer_maps and decoder.constrained.all():
+            # copy-constrained extraction answers stop at a few pages, so they
+            # grow on demand without headroom admission
+            self.admission_mode = "on demand"
+        elif self.answer_maps and self.paged:
             from quail.backends.quail.executor.answer_admission import (
                 HeadroomAdmission,
             )
