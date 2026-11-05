@@ -33,7 +33,6 @@ from quail.planner.candidates import LogicalAlternative
 
 # the built-in logical rules, in the order they apply
 LOGICAL_RULES = (
-    "should_eliminate_distinct", "should_push_down_distinct",
     "should_push_down_projection",
     "should_lift_column_operators",
 )
@@ -220,8 +219,7 @@ def logical_alternatives(plan, registry, context):
     Args:
         plan: The input logical plan.
         registry: The session extension registry.
-        context: The planning context, whose catalog names each table's
-            id column.
+        context: The planning context.
 
     Returns:
         The alternatives in order, each with its plan and the rules that
@@ -231,12 +229,8 @@ def logical_alternatives(plan, registry, context):
         CompileError: A rule refuses the plan.
     """
     names = tuple(rule.name for rule in registry.logical_rules.values())
-    catalog = context.catalog
-    id_columns = (None if catalog is None else {
-        name: provider.id_col for name, provider in catalog.providers.items()
-        if hasattr(provider, "id_col")})
     found, message = _quail_native.logical_alternatives(
-        json.dumps(encode_value(plan)), list(names), id_columns)
+        json.dumps(encode_value(plan)), list(names))
     if message is not None:
         raise CompileError(message)
     return tuple(LogicalAlternative(decode_value(LogicalPlan, json.loads(text)),

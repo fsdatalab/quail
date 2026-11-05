@@ -92,7 +92,8 @@ class SessionContext:
             reader = provider.scan(ScanRequest(columns=tuple(columns)))
             return ipc_bytes(reader.read_all())
 
-        self._native.register(name, ipc_bytes(provider.schema().empty_table()), scan)
+        self._native.register(name, ipc_bytes(provider.schema().empty_table()), scan,
+                              getattr(provider, "id_col", None) or None)
 
     def sql(self, text: str, dialect: str = "snowflake") -> pa.Table:
         """Run a query and return its rows."""

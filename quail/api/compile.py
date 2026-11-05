@@ -116,7 +116,8 @@ def compile_with_datafusion(sql: str, catalog, model,
 
     context = _quail_native.NativeContext(run_region)
     for name, provider in catalog.providers.items():
-        context.register(name, _schema_bytes(provider.schema()), refuse)
+        context.register(name, _schema_bytes(provider.schema()), refuse,
+                         getattr(provider, "id_col", None) or None)
     try:
         regions, whole = context.logical_plans(
             sql, tuple(model.turn), model.prompt_layout,

@@ -87,13 +87,33 @@ fn place_select(
             .and_then(|lowered| crate::optimize_region(&lowered))
             .map_err(|error| CompileError::new(error.to_string()))?,
     };
-    match crate::translate_relation(&optimized, &content) {
-        Some(relation) => quail_planner::builder::LogicalPlanBuilder::over(relation)
-            .project(project, &content.rows),
-        None => Err(CompileError::new(format!(
+    let Some(relation) = crate::translate_relation(&optimized, &content) else {
+        return Err(CompileError::new(format!(
             "Quail cannot place this plan's operators:\n{}",
             optimized.display_indent()
-        ))),
+        )));
+    };
+    let mut placed = quail_planner::builder::LogicalPlanBuilder::over(relation)
+        .project(project, &content.rows)?;
+    // crate::EliminateDistinct removed a DISTINCT that removes no row
+    if let LogicalNode::Result(result) = &mut placed.root
+        && result.distinct
+        && !has_distinct(&optimized)
+    {
+        result.distinct = false;
+    }
+    Ok(placed)
+}
+
+/// Whether a SELECT's plan keeps its DISTINCT, under its LIMIT, ORDER BY,
+/// and outer SELECT list.
+fn has_distinct(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Distinct(_) => true,
+        LogicalPlan::Limit(found) => has_distinct(&found.input),
+        LogicalPlan::Sort(found) => has_distinct(&found.input),
+        LogicalPlan::Projection(found) => has_distinct(&found.input),
+        _ => false,
     }
 }
 

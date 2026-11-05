@@ -113,6 +113,8 @@ fn conform(batch: RecordBatch, names: &[String], schema: &SchemaRef) -> Result<R
 struct PythonTable {
     schema: SchemaRef,
     scan: Py<PyAny>,
+    /// The id column as a primary key, which DataFusion's rules read.
+    constraints: datafusion::common::Constraints,
 }
 
 #[async_trait]
@@ -123,6 +125,10 @@ impl TableProvider for PythonTable {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        Some(&self.constraints)
     }
 
     async fn scan(
@@ -202,13 +208,34 @@ impl NativeContext {
 
     /// Register a table by its schema, given as the IPC stream bytes of
     /// an empty table, and a function `scan(columns)` that returns
-    /// those columns' rows as IPC stream bytes.
-    fn register(&self, name: &str, schema: &[u8], scan: Py<PyAny>) -> PyResult<()> {
+    /// those columns' rows as IPC stream bytes. `id_column` names the
+    /// column whose values are unique.
+    #[pyo3(signature = (name, schema, scan, id_column=None))]
+    fn register(
+        &self,
+        name: &str,
+        schema: &[u8],
+        scan: Py<PyAny>,
+        id_column: Option<&str>,
+    ) -> PyResult<()> {
         let reader = StreamReader::try_new(Cursor::new(schema), None)
             .map_err(|error| python_error(error.into()))?;
+        let schema = reader.schema();
+        let keys: Vec<usize> = id_column
+            .and_then(|column| schema.index_of(column).ok())
+            .into_iter()
+            .collect();
+        let constraints = if keys.is_empty() {
+            datafusion::common::Constraints::default()
+        } else {
+            datafusion::common::Constraints::new_unverified(vec![
+                datafusion::common::Constraint::PrimaryKey(keys),
+            ])
+        };
         let table = PythonTable {
-            schema: reader.schema(),
+            schema,
             scan,
+            constraints,
         };
         self.context
             .register_table(name, Arc::new(table))
@@ -407,21 +434,17 @@ fn bind_prompt(
 /// Apply the built-in logical rules, as `logical_alternatives` does.
 ///
 /// Returns ([(plan JSON, rule names), ...], None), or ([], the
-/// CompileError's message). `id_columns` maps each provider to its id
-/// column, or is None without a catalog.
+/// CompileError's message).
 #[pyfunction]
-#[pyo3(signature = (plan, rules, id_columns=None))]
 #[allow(clippy::type_complexity)]
 fn logical_alternatives(
     plan: &str,
     rules: Vec<String>,
-    id_columns: Option<std::collections::BTreeMap<String, String>>,
 ) -> PyResult<(Vec<(String, Vec<String>)>, Option<String>)> {
     let invalid =
         |error: serde_json::Error| pyo3::exceptions::PyValueError::new_err(error.to_string());
     let plan = quail_planner::read_logical_plan(plan).map_err(invalid)?;
-    let context = quail_planner::rules::RuleContext { id_columns };
-    match quail_planner::rules::logical_alternatives(plan, &rules, &context) {
+    match quail_planner::rules::logical_alternatives(plan, &rules) {
         Ok(found) => Ok((
             found
                 .into_iter()

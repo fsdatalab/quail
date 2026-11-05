@@ -110,8 +110,8 @@ built-in rules of the same kind, in registration order.
 
 | Rule | Kind | Decision | Uses cost estimates |
 | --- | --- | --- | --- |
-| `should_eliminate_distinct` | Logical | Remove DISTINCT when the returned keys are unique. | No |
-| `should_push_down_distinct` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
+| `eliminate_distinct` | DataFusion | Remove DISTINCT when the SELECT list returns every table's id column or every grouping key. | No |
+| `push_down_distinct` | DataFusion | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `should_push_down_projection` | Logical | Load only columns the query uses. | No |
 | `should_lift_column_operators` | Logical | Offer classification, extraction, and AI.MAP before and after joins. | Yes |
 | `should_eliminate_window_sort` | Physical | Remove a final sort when the window already returns rows in that order. | No |

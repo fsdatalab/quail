@@ -12,20 +12,17 @@ use quail_physical::{
 use crate::expressions::{
     CompileError, aliased_call, call_aliases, column_references, condition_aliases, tests,
 };
-use crate::logical::{Filter, LogicalNode, LogicalPlan, ResultNode, Scan};
+use crate::logical::{Filter, LogicalNode, LogicalPlan, Scan};
 use crate::nodes::{
     above_projection, added_columns, as_column, asked_call, children, column_alias, column_call,
     input, output_schema, source_columns, subtree, validate_plan,
 };
-use crate::operators::operators;
 
 /// Rules that undo each other must not loop forever.
 pub const MAX_PASSES: usize = 4;
 
 /// The names of the built-in logical rules, in the order they run.
-pub const LOGICAL_RULES: [&str; 4] = [
-    "should_eliminate_distinct",
-    "should_push_down_distinct",
+pub const LOGICAL_RULES: [&str; 2] = [
     "should_push_down_projection",
     "should_lift_column_operators",
 ];
@@ -37,13 +34,6 @@ pub struct LogicalAlternative {
     pub rules: Vec<String>,
 }
 
-/// What the logical rules read besides the plan: each provider's id column.
-#[derive(Debug, Clone, Default)]
-pub struct RuleContext {
-    /// provider -> its id column; None when there is no catalog.
-    pub id_columns: Option<BTreeMap<String, String>>,
-}
-
 /// Rewrite each candidate with each rule and deduplicate the trees in order.
 ///
 /// # Errors
@@ -52,7 +42,6 @@ pub struct RuleContext {
 pub fn logical_alternatives(
     plan: LogicalPlan,
     rules: &[String],
-    context: &RuleContext,
 ) -> Result<Vec<LogicalAlternative>, CompileError> {
     let mut candidates = vec![LogicalAlternative {
         plan,
@@ -64,7 +53,7 @@ pub fn logical_alternatives(
             let mut rewritten: Vec<LogicalAlternative> = Vec::new();
             for candidate in &candidates {
                 let root = &candidate.plan.root;
-                for replacement in rewrites(rule, root, context)? {
+                for replacement in rewrites(rule, root)? {
                     if rewritten.iter().any(|other| other.plan.root == replacement) {
                         continue;
                     }
@@ -90,14 +79,8 @@ pub fn logical_alternatives(
 }
 
 /// The roots one rule rewrites a root into.
-fn rewrites(
-    rule: &str,
-    root: &LogicalNode,
-    context: &RuleContext,
-) -> Result<Vec<LogicalNode>, CompileError> {
+fn rewrites(rule: &str, root: &LogicalNode) -> Result<Vec<LogicalNode>, CompileError> {
     Ok(match rule {
-        "should_eliminate_distinct" => vec![eliminate_distinct(root, context)],
-        "should_push_down_distinct" => vec![push_down_distinct(root)],
         "should_push_down_projection" => vec![push_down_projection(root)],
         "should_lift_column_operators" => match lift_column_operators(root) {
             Some(lifted) => vec![root.clone(), lifted],
@@ -271,113 +254,6 @@ fn node_refs(node: &LogicalNode) -> Vec<ColumnRef> {
         _ => {}
     }
     found
-}
-
-// ---------------------------------------------------------------- distinct
-
-fn eliminate_distinct(root: &LogicalNode, context: &RuleContext) -> LogicalNode {
-    let LogicalNode::Result(result) = root else {
-        return root.clone();
-    };
-    if !result.distinct {
-        return root.clone();
-    }
-    let without = || {
-        LogicalNode::Result(ResultNode {
-            distinct: false,
-            ..result.clone()
-        })
-    };
-    if let LogicalNode::Aggregate(aggregate) = result.input.as_ref() {
-        return if aggregate
-            .keys
-            .iter()
-            .all(|key| aggregate.output.contains(key))
-        {
-            without()
-        } else {
-            root.clone()
-        };
-    }
-    let (LogicalNode::Project(_), Some(id_columns)) = (result.input.as_ref(), &context.id_columns)
-    else {
-        return root.clone();
-    };
-    let returned: BTreeSet<(String, String)> = output_schema(&result.input)
-        .into_iter()
-        .map(|reference| (reference.alias, reference.column))
-        .collect();
-    let plan = LogicalPlan { root: root.clone() };
-    for scan in operators(&plan).scans {
-        let Some(id_column) = id_columns.get(&scan.provider) else {
-            return root.clone();
-        };
-        if !returned.contains(&(scan.alias.clone(), id_column.clone())) {
-            return root.clone();
-        }
-    }
-    without()
-}
-
-fn push_down_distinct(root: &LogicalNode) -> LogicalNode {
-    let LogicalNode::Result(result) = root else {
-        return root.clone();
-    };
-    let LogicalNode::Project(project) = result.input.as_ref() else {
-        return root.clone();
-    };
-    if !result.distinct {
-        return root.clone();
-    }
-    let plan = LogicalPlan { root: root.clone() };
-    let found = operators(&plan);
-    if !found.joins.is_empty()
-        || !found.classifies.is_empty()
-        || !found.projections.is_empty()
-        || !found.column_filters.is_empty()
-        || found.filters.len() != 1
-    {
-        return root.clone();
-    }
-    let (alias, predicates) = &found.filters[0];
-    if predicates
-        .iter()
-        .any(|predicate| asked_call(&predicate.expression).kind == "score")
-    {
-        return root.clone();
-    }
-    let mut key: Vec<String> = Vec::new();
-    for column in &project.columns {
-        let Projected::Expression(ValueExpression::ColumnRef(reference)) = column else {
-            return root.clone();
-        };
-        if reference.alias != *alias {
-            return root.clone();
-        }
-        if !key.contains(&reference.column) {
-            key.push(reference.column.clone());
-        }
-    }
-    if key.is_empty() {
-        return root.clone();
-    }
-    fn mark(node: &LogicalNode, key: &[String]) -> LogicalNode {
-        if let LogicalNode::SemanticFilter(filter) = node {
-            let mut marked = filter.clone();
-            marked.stop_key = key.to_vec();
-            return LogicalNode::SemanticFilter(marked);
-        }
-        let new: Vec<LogicalNode> = children(node)
-            .into_iter()
-            .map(|child| mark(child, key))
-            .collect();
-        if new.iter().collect::<Vec<_>>() == children(node) {
-            node.clone()
-        } else {
-            with_children(node, new)
-        }
-    }
-    mark(root, &key)
 }
 
 // ---------------------------------------------------------------- projection

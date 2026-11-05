@@ -18,6 +18,7 @@
 mod aliases;
 pub mod bind;
 mod claim;
+mod distinct;
 mod exec;
 mod functions;
 mod joins;
@@ -45,6 +46,7 @@ pub use aliases::{
     positional_ai_arguments, remove_select_calls, restore_select_aliases,
 };
 pub use claim::ClaimModelRegions;
+pub use distinct::{EliminateDistinct, PushDownDistinct};
 pub use exec::{ModelRegionExec, ModelRegionPlanner, RegionRunner};
 pub use functions::{
     AI_FUNCTION_NAMES, arrow_functions, brace_structs, is_ai_call, normalize_ai_calls,
