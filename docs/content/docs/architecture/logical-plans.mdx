@@ -3,11 +3,11 @@ title: Logical plans
 ---
 
 A logical plan describes the operations a query requests and the data they
-read. It does not specify GPU batches or attention settings. The SQL frontend
-binds a query, and a placement rule builds the plan from what it bound (see
+read. It does not specify GPU batches or attention settings. DataFusion
+binds a query, and its optimizer rules place Quail's operators (see
 [From SQL to a plan](#from-sql-to-a-plan)).
-The [optimizer](/docs/architecture/optimizer) then rewrites it before
-building a physical plan.
+The [optimizer](/docs/architecture/optimizer) then prices the physical
+choices and builds a physical plan.
 
 This page describes the plan representation for contributors working on
 query syntax, validation, or optimizer rules.
@@ -35,34 +35,65 @@ lets the planner reason about their placement and cost.
 
 ## From SQL to a plan
 
-The SQL frontend resolves each name to a table, a column, or a model call. It
-does not decide where anything runs. It writes the FROM, JOIN, and WHERE part
-of the query as one tree:
+DataFusion parses and binds the SQL. Its analyzer then claims each
+model region, the connected operators that call the model, and lowers
+the region's AI calls into three logical node types
+(`crates/quail-datafusion/src/lower.rs`):
+
+- `SemanticFilter`: the AI.IF and AI.SCORE tests of one table.
+- `SemanticJoin`: an AI.IF over two tables, or an EXISTS or NOT EXISTS
+  over a model call, as a semi or anti join.
+- `SemanticColumn`: a classification, extraction, SAE feature list, or
+  map, which adds an answer column. A test of that column becomes a
+  plain DataFusion `Filter` above it.
+
+For example, imagine a query that joins reviews to products on an
+AI.IF, keeps negative reviews with another AI.IF, and keeps reviews
+with more than 3 stars. DataFusion binds it with every test in one
+`Filter` above the join. Lowering turns the two model tests into
+Quail's nodes, still where the query wrote them:
 
 ```text
-Filter: AI.IF('Review {0} discusses product {1}') AND AI.IF('This review is negative') AND r.stars > 3
-  Join on r.asin = p.asin
-    Scan: reviews as r
-    Scan: products as p
+Filter: r.stars > 3
+  SemanticFilter: AI.IF('This review is negative', r.body)
+    SemanticJoin: full AI.IF('Review {0} discusses product {1}', r.body, p.text)
+      Inner Join: r.asin = p.asin
+        TableScan: reviews as r
+        TableScan: products as p
 ```
 
-The `Filter` holds every ON and WHERE part as written, the ON parts first.
-DataFusion parses and binds the SELECT, and the Rust binder
-(`crates/quail-datafusion/src/bind.rs`) reads it into this tree.
+DataFusion's optimizer then runs the model region's rules
+(`crates/quail-datafusion/src/optimize.rs`). `PlaceSemanticNodes`
+moves each node to the tables it reads, as `PushDownFilter` does for
+plain filters, and orders each table's operators the way the executor
+reads them. `PushDownFilter` and `OptimizeProjections` place the plain
+filters and prune unread columns:
 
-`place_relation` in `crates/quail-planner/src/builder.rs` then places
-each part:
+```text
+SemanticJoin: full AI.IF('Review {0} discusses product {1}', r.body, p.text)
+  Inner Join: r.asin = p.asin
+    SemanticFilter: AI.IF('This review is negative', r.body)
+      TableScan: reviews as r, filter r.stars > 3
+    TableScan: products as p
+```
 
-- A test of source columns of one table goes into that table's `Scan`.
-- An AI.IF or AI.SCORE test of one table goes into its `SemanticFilter`.
-- An AI.IF over two tables becomes a `SemanticJoin`, with the ON equalities of
-  the tables it brings in.
-- An EXISTS or NOT EXISTS over a model call becomes a gate join.
-- A test of a label or an answer goes right after the operator that computes
-  the column; any other part runs on the result rows.
+The DISTINCT rules run in the same place: `EliminateDistinct` removes
+a DISTINCT when the SELECT list returns each table's id column, and
+`PushDownDistinct` gives a one-table `SemanticFilter` a stop key.
 
-`LogicalPlanBuilder` then puts each table's operators in order, and its
-`project()` adds the result nodes.
+Finally, the Rust binder (`crates/quail-datafusion/src/bind.rs`) reads
+each operator's content, such as its prompt, labels, and selectivity
+hint, from the bound plan. The translator
+(`crates/quail-datafusion/src/translate.rs`) builds Quail's logical
+plan node by node, with each operator where the rules left it. A
+`SemanticColumn` becomes the node for its kind, such as
+`SemanticClassify`. A CTE that runs as its own stage goes through the
+same steps.
+
+Which implementation runs a node, such as a classification's label
+scoring method or whether a classification runs before or after a
+join, is a physical choice. The [optimizer](/docs/architecture/optimizer)
+prices those choices.
 
 ## The node protocol
 

@@ -3,10 +3,13 @@ title: Custom Rules
 ---
 
 An optimizer rule changes a plan while preserving the query's result.
-Quail's rules are written in Rust, in the planner crate:
+Quail's rules are written in Rust:
 
-- Logical rules rewrite query trees, or propose alternatives to compare,
-  in [`crates/quail-planner/src/rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/rules.rs).
+- Logical rules are DataFusion `OptimizerRule`s that run inside each
+  model region, over DataFusion's plan with Quail's `SemanticFilter`,
+  `SemanticJoin`, and `SemanticColumn` nodes. They are listed by name
+  in `region_rule` in
+  [`crates/quail-datafusion/src/optimize.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/optimize.rs).
 - Physical rules rewrite executable graphs and their settings, in
   [`crates/quail-planner/src/physical_rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/physical_rules.rs).
 
@@ -15,14 +18,17 @@ their order.
 
 ## Add a rule
 
-1. Write the rule in Rust. A logical rule returns its rewritten tree or
-   alternatives. A physical rule returns a replacement graph, or none
-   to keep the graph, and may add settings the executor reads.
-2. Add its name to the match in `logical_alternatives` or `apply_rule`.
+1. Write the rule in Rust. A logical rule implements DataFusion's
+   `OptimizerRule` and returns the rewritten plan, as `PushDownFilter`
+   does. A physical rule returns a replacement graph, or none to keep
+   the graph, and may add settings the executor reads.
+2. Add its name to the match in `region_rule` or `apply_rule`.
 3. Register the name.
 
-Give each rule a unique name, shown in `explain()`. Use `should_...` for
-yes/no decisions and `choose_...` to select an implementation.
+Give each rule a unique name, shown in `explain()`. A logical rule's
+name is its `OptimizerRule::name()`, such as `push_down_distinct`. A
+physical rule uses `should_...` for yes/no decisions and `choose_...`
+to select an implementation.
 
 For example, imagine a session that should run every built-in rule and
 then a rule `should_skip_empty_tables` added to `physical_rules.rs`:
@@ -43,9 +49,11 @@ raises `TypeError`.
 
 Rules run in registration order within each step:
 
-1. Apply the logical rules to every candidate tree. Remove duplicate
-   trees. Repeat until the trees stop changing.
-2. Build an executable graph for each tree.
+1. DataFusion applies the logical rules inside each model region, and
+   the binder reads the result into Quail's logical plan.
+2. Build an executable graph for each placement of the column
+   operators: the plan as placed, and each plan with a classification,
+   extraction, or map moved above a join.
 3. Apply the physical rules to each graph.
 4. Select the candidate with the lowest estimated time.
 
@@ -54,7 +62,7 @@ when exact tokens are available. See [Optimizer](/docs/architecture/optimizer)
 for the built-in rule order.
 
 A backend other than Quail's, such as the stock vLLM baseline, plans
-each logical alternative with its own `plan` method. The physical rules
+each placement with its own `plan` method. The physical rules
 do not run on its plans.
 
 ## Test a rule
