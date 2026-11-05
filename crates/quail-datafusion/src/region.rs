@@ -56,7 +56,8 @@ impl UserDefinedLogicalNodeCore for ModelRegion {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "ModelRegion\n{}", self.plan.display_indent())
+        // Quail's explain shows the region's plan
+        write!(f, "ModelRegion")
     }
 
     fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, _inputs: Vec<LogicalPlan>) -> Result<Self> {

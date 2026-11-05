@@ -398,6 +398,9 @@ class QueryResult:
         self.true_join_tables = true_join_tables or {}
         self._num_rows = num_rows
         self._materialized = None
+        # DataFusion's plan around the model region, when it ran one
+        self.datafusion_plan: str | None = None
+        self.region_rows: int | None = None
 
     @classmethod
     def from_table(cls, table: pa.Table,
@@ -418,6 +421,8 @@ class QueryResult:
         result.true_join_tables = {}
         result._num_rows = len(table)
         result._materialized = table
+        result.datafusion_plan = None
+        result.region_rows = None
         return result
 
     def execute_stream(self, batch_rows: int = DEFAULT_BATCH_ROWS,
@@ -497,9 +502,12 @@ class QueryResult:
 
         if self.plan is None:
             return "no physical plan was executed"
-        return physical_tree(self.plan, verbose=verbose,
+        tree = physical_tree(self.plan, verbose=verbose,
                              metrics=self.node_metrics,
                              stages=measured_stages(self.report))
+        if self.datafusion_plan is None:
+            return tree
+        return f"DataFusion:\n{self.datafusion_plan}\n\nmodel region:\n{tree}"
 
     def observer(self, observer) -> dict:
         """Return the report one execution observer attached.

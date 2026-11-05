@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from quail.api.compile import SQLDialect, compile_with_datafusion
+from quail.api.compile import SQLDialect, compile_region
 from quail.api.config import EngineConfig, resolve_model
 from quail.api.query import Query, QueryLike
 from quail.builtins import built_in_registry
@@ -129,16 +129,17 @@ class Session:
 
             return RemoteQuery(self, text, order=order,
                                dialect=SQLDialect(dialect).value)
-        logical = compile_with_datafusion(
+        compiled = compile_region(
             text, self.catalog, self.model,
             dialect=SQLDialect(dialect).value,
             rules=[rule.name for rule in self.registry.logical_rules.values()])
-        if logical is None:
+        if compiled is None:
             from quail.api.context import DataFusionQuery
 
             return DataFusionQuery(self, text, SQLDialect(dialect).value, order=order)
+        logical, whole = compiled
         return Query(self, logical, order=order, text=text,
-                     dialect=SQLDialect(dialect).value)
+                     dialect=SQLDialect(dialect).value, whole=whole)
 
     def get_run(self, query_id: str):
         """Reattach to a query the server already accepted.

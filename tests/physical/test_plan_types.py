@@ -2,6 +2,7 @@
 
 import json
 import zlib
+from contextlib import closing
 
 import pyarrow as pa
 import pytest
@@ -9,6 +10,8 @@ from helpers.sessions import CONFIG, check_table
 
 import quail
 from quail.api.config import EngineConfig
+from quail.api.stages import StageExecution
+from quail.logical import WithCTE
 from quail.physical.plan import Refusal
 
 native = pytest.importorskip("_quail_native")
@@ -56,8 +59,10 @@ TABLES = {
 # Queries whose plans hold the node types quail-b's plans do not.
 NODE_CASES = {
     "quail.window": ("qwen3-4b-fp8", 1,
-                     "SELECT r.id, ROW_NUMBER() OVER (ORDER BY r.stars DESC) AS n "
-                     "FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body))"),
+                     "WITH w AS (SELECT r.id, r.body, ROW_NUMBER() OVER "
+                     "(ORDER BY r.stars DESC) AS n FROM reviews r "
+                     "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))) SELECT w.id FROM w "
+                     "WHERE AI_FILTER(PROMPT('q2: {0}', w.body)) AND w.n <= 2"),
     "quail.limit": ("qwen3-4b-fp8", 1,
                     "SELECT r.id FROM reviews r "
                     "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) LIMIT 2"),
@@ -84,9 +89,18 @@ def test_a_plan_with_each_node_type_reads_into_the_rust_types_unchanged(node_typ
         for name, table in TABLES.items():
             session.register(
                 name, quail.DocumentProvider.from_table(table, id_col="id"))
-        written, read_back = _round_trip(session.sql(text).plan(), session)
-    assert node_type in {node["type"] for node in written["graph"]["nodes"]}
-    assert read_back == written
+        query = session.sql(text)
+        plans = [query.plan()]
+        if isinstance(query.logical.root, WithCTE):
+            # each CTE stage plans its own graph
+            with closing(StageExecution(query)) as stages:
+                stages.plan()
+                plans.extend(stages.plans.values())
+        trips = [_round_trip(plan, session) for plan in plans]
+    assert node_type in {node["type"] for written, _ in trips
+                         for node in written["graph"]["nodes"]}
+    for written, read_back in trips:
+        assert read_back == written
 
 
 def test_a_plan_with_an_unknown_field_is_refused():

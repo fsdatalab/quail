@@ -1,25 +1,30 @@
+DataFusion:
+Sort: n DESC NULLS LAST, concern ASC NULLS LAST
+  Projection: ai_classify(prompt(Utf8("Judge strictly from the sales call above which concern the customer raises most about the purchase.
+
+{0}"),c.transcript),make_array(struct(Utf8("price"),Utf8("the price, discounts, financing, or total cost")),struct(Utf8("security or compliance"),Utf8("data protection, security features, or regulatory compliance")),struct(Utf8("integration"),Utf8("working with the customer's existing systems, tools, or vehicles")),struct(Utf8("reliability or performance"),Utf8("whether the product scales, performs, or holds up over time")),struct(Utf8("support or service"),Utf8("support, maintenance, warranty, or after-sale service")),struct(Utf8("ease of use"),Utf8("how easy the product is to learn and use")),struct(Utf8("no concern"),Utf8("the customer raises no concern")))) AS concern, count(Int64(1)) AS count(*) AS n
+    Aggregate: groupBy=[[__quail_call_1 AS ai_classify(prompt(Utf8("Judge strictly from the sales call above which concern the customer raises most about the purchase.
+
+{0}"),c.transcript),make_array(struct(Utf8("price"),Utf8("the price, discounts, financing, or total cost")),struct(Utf8("security or compliance"),Utf8("data protection, security features, or regulatory compliance")),struct(Utf8("integration"),Utf8("working with the customer's existing systems, tools, or vehicles")),struct(Utf8("reliability or performance"),Utf8("whether the product scales, performs, or holds up over time")),struct(Utf8("support or service"),Utf8("support, maintenance, warranty, or after-sale service")),struct(Utf8("ease of use"),Utf8("how easy the product is to learn and use")),struct(Utf8("no concern"),Utf8("the customer raises no concern"))))]], aggr=[[count(Int64(1))]]
+      ModelRegion
+
+model region:
 logical:
-  Sort: n DESC NULLS LAST, concern ASC NULLS LAST
-    Aggregate: group by concern; n = count(*)
-      Project: concern
-        SemanticClassify: concern
-          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the sales call above which concern the customer raises most about the purchase.', c.transcript) labels=['price', 'security or compliance', 'integration', 'reliability or performance', 'support or service', 'ease of use', 'no concern']
-          Scan sales_calls as c [transcript]
+  Project: __quail_call_1
+    SemanticClassify: __quail_call_1
+      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the sales call above which concern the customer raises most about the purchase.', c.transcript) labels=['price', 'security or compliance', 'integration', 'reliability or performance', 'support or service', 'ease of use', 'no concern']
+      Scan sales_calls as c [transcript]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                         est. rows   est. time
-  Sort: n DESC NULLS LAST, concern ASC NULLS LAST
-    Aggregate: concern, n
-      group by concern
-      n = count(*)
-      Project: concern
-        AiClassify: concern over c                                     21.8 ms
-          rule=trie_decode, labels=7, label tokens=103
-          Scan sales_calls as c                                  6
-            tokens=144, mean_document_tokens=24
+                                                     est. rows   est. time
+  Project: __quail_call_1
+    AiClassify: __quail_call_1 over c                              21.8 ms
+      rule=trie_decode, labels=7, label tokens=103
+      Scan sales_calls as c                                  6
+        tokens=144, mean_document_tokens=24
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

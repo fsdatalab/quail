@@ -72,11 +72,14 @@ class Query:
 
     def __init__(self, session: "Session", logical: LogicalPlan,
                  order: str | None = None, *, catalog=None, inputs=None,
-                 text: str | None = None, dialect: str = "snowflake"):
+                 text: str | None = None, dialect: str = "snowflake",
+                 whole: bool = True):
         self.session = session
-        # the SQL the plan was compiled from, which DataFusion runs
+        # the SQL the plan was compiled from, which DataFusion runs; the
+        # plan is its one model region, the whole query or not
         self.text = text
         self.dialect = dialect
+        self.whole = whole
         self.catalog = session.catalog if catalog is None else catalog
         self.inputs = session.inputs if inputs is None else inputs
         self.logical = logical
@@ -329,7 +332,8 @@ class Query:
         if result is not None:
             physical = self._plan
             # the root relation is lazy, so its row count is taken here
-            rows = result.count()
+            rows = (result.region_rows if result.region_rows is not None
+                    else result.count())
             root = physical.graph.root.node_id
             result.node_metrics[root] = replace(
                 result.node_metrics.get(root, NodeMetrics()),
@@ -342,6 +346,14 @@ class Query:
                        rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
+        if not self.whole:
+            from quail.api.context import SessionContext
+
+            around = (result.datafusion_plan if result is not None
+                      and result.datafusion_plan is not None
+                      else SessionContext(self.session).explain(
+                          self.text, self.dialect))
+            text = f"DataFusion:\n{around}\n\nmodel region:\n{text}"
         if self._estimated:
             text += ("\n\n  note: token counts for "
                      + ", ".join(repr(a) for a in self._estimated)

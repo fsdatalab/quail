@@ -175,9 +175,44 @@ pub fn quail_column_names(schema: &DFSchema) -> Vec<String> {
         .iter()
         .map(|(qualifier, field)| match qualifier {
             Some(qualifier) => format!("{qualifier}.{}", field.name()),
-            None => field.name().clone(),
+            None => quail_name(field.name()),
         })
         .collect()
+}
+
+/// Quail's name for a column DataFusion names by its expression: a
+/// struct field `r.details[body]` is `r.details.body`, and an unnested
+/// field `quail_unnest_field(..., Utf8("f"), Utf8("feature"))` is
+/// `f.feature`. Any other name is unchanged.
+fn quail_name(name: &str) -> String {
+    let unnested = name
+        .strip_prefix(&format!("{UNNEST_FIELD}("))
+        .and_then(|rest| rest.strip_suffix("\"))"))
+        .and_then(|rest| {
+            let (rest, field) = rest.rsplit_once("\"),Utf8(\"")?;
+            let (_, list) = rest.rsplit_once(",Utf8(\"")?;
+            Some(format!("{list}.{field}"))
+        });
+    if let Some(found) = unnested {
+        return found;
+    }
+    let Some((column, fields)) = name.split_once('[') else {
+        return name.to_string();
+    };
+    let word = |text: &str| {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    };
+    let fields: Vec<&str> = fields
+        .strip_suffix(']')
+        .map(|inner| inner.split("][").collect())
+        .unwrap_or_default();
+    if !word(column) || fields.is_empty() || !fields.iter().all(|field| word(field)) {
+        return name.to_string();
+    }
+    format!("{column}.{}", fields.join("."))
 }
 
 /// An Arrow schema with Quail's column names and the schema's types.

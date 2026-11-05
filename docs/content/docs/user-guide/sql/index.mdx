@@ -39,28 +39,38 @@ The query above uses the BigQuery dialect (`dialect="bq"`).
 
 ## SQL around the model's work
 
-Quail plans the part of a query that calls the model, together with
-the operators around it that Quail runs itself, as one model region.
-DataFusion runs any SQL outside the regions. For example, this query
-unions the reviews about the ending with every aspect's id, and sorts
-the result:
+Quail runs the operators that call the model, and the operators that
+change how much the model reads: the filters and joins below a model
+call, and a LIMIT or DISTINCT that can stop the model early. Together
+they are one model region. DataFusion runs the rest of the query on
+the region's rows: GROUP BY, HAVING, windows, ORDER BY without a LIMIT,
+and anything else.
+
+For example, this query classifies the reviews that pass a filter and
+counts them by label:
 
 ```python
 query = session.sql("""
-    SELECT r.id FROM reviews r
-    WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
-    UNION ALL SELECT a.id FROM aspects a
-    ORDER BY id
-""", dialect="bq")
+    SELECT AI.CLASSIFY(PROMPT('Tone? {0}', r.body), ['good', 'bad']) AS tone,
+           COUNT(*) AS n
+    FROM reviews r
+    WHERE r.stars > 3
+    GROUP BY tone
+    ORDER BY n DESC
+""")
 query.collect()
 ```
 
-The filter is one model region; DataFusion runs the union and the sort.
-`session.sql` returns a `DataFusionQuery` for such a query. It has the
-methods of a `Query`. `plan()` gives each region's physical plan, and
-`explain()` gives DataFusion's plan, then each region's.
+The region scans `reviews` with `r.stars > 3` and classifies each
+review. DataFusion groups the labels, counts them, and sorts the
+groups. `query.explain()` shows DataFusion's plan, with the region as
+one `ModelRegion` node, and then the region's plan. `query.plan()` is
+the region's physical plan.
 
-A query that is one model region, with no SQL around it, is a `Query`.
-DataFusion runs it too, through its `ModelRegionExec` operator, and the
-region's result keeps the plan and metrics that `explain(analyze=True)`
-reads.
+A query with two model regions, such as a UNION of two AI filters, is
+a `DataFusionQuery`. It has the methods of a `Query`. `plan()` gives
+each region's physical plan, and `explain()` gives DataFusion's plan,
+then each region's.
+
+A CTE whose body groups or windows rows that a later model call reads
+runs as its own stage, and Quail runs that body.

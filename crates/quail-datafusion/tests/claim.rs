@@ -98,15 +98,26 @@ async fn a_query_without_ai_calls_has_no_model_region() -> Result<()> {
 }
 
 #[tokio::test]
-async fn an_aggregate_over_ai_answers_stays_in_the_region() -> Result<()> {
+async fn datafusion_groups_the_answers_a_region_returns() -> Result<()> {
     let context = context()?;
     let query = "SELECT AI.CLASSIFY(r.body, ['good', 'bad']) AS label, COUNT(*) AS n \
         FROM reviews r GROUP BY label";
     let plan = optimized(&context, query).await?;
+    let shape = lines(&plan);
     assert!(
-        matches!(plan, LogicalPlan::Extension(_)),
-        "{}",
-        plan.display_indent()
+        shape.iter().any(|line| line.starts_with("Aggregate:")),
+        "{shape:?}"
+    );
+    let found = regions(&plan);
+    assert_eq!(found.len(), 1, "{shape:?}");
+    let inner = lines(&found[0].plan);
+    assert!(
+        !inner.iter().any(|line| line.starts_with("Aggregate")),
+        "{inner:?}"
+    );
+    assert!(
+        inner.iter().any(|line| line.starts_with("SemanticColumn")),
+        "{inner:?}"
     );
     Ok(())
 }

@@ -44,7 +44,10 @@ def test_group_by_runs_on_the_result(session):
     assert result.columns == ["r.lang", "n", "mean", "total"]
     assert result.to_rows() == [("en", 3, 10 / 3, 10), ("de", 1, 5.0, 5),
                                 ("fr", 1, 4.0, 4)]
-    assert "Aggregate: r.lang, n, mean, total" in result.explain()
+    # DataFusion groups the rows the model region returns
+    explained = result.explain()
+    assert "Aggregate: groupBy=[[r.lang]]" in explained
+    assert explained.index("ModelRegion") < explained.index("model region:")
 
     whole = _run(session.sql("""
         SELECT COUNT(*) AS n, MAX(r.stars) AS top FROM reviews r
@@ -60,14 +63,15 @@ def test_group_by_runs_on_the_result(session):
     """)
     assert _run(having, make_executor(TRUTH)).to_rows() == [("en", 10)]
 
-    for sql, fragment in (
-        ("SELECT r.lang, COUNT(*) FROM reviews r WHERE AI_FILTER("
-         "PROMPT('q: {0}', r.review)) GROUP BY r.lang", "AS name"),
-        ("SELECT r.lang, COUNT(*) AS n FROM reviews r WHERE AI_FILTER("
-         "PROMPT('q: {0}', r.review))", "not in GROUP BY"),
-    ):
-        with pytest.raises(CompileError, match=fragment):
-            session.sql(sql)
+    # DataFusion names an aggregate the query leaves unnamed
+    unnamed = _run(session.sql(
+        "SELECT r.lang, COUNT(*) FROM reviews r WHERE AI_FILTER("
+        "PROMPT('q: {0}', r.review)) GROUP BY r.lang ORDER BY r.lang"),
+        make_executor(TRUTH))
+    assert unnamed.columns == ["r.lang", "count(*)"]
+    with pytest.raises(CompileError, match="not in GROUP BY"):
+        session.sql("SELECT r.lang, COUNT(*) AS n FROM reviews r WHERE AI_FILTER("
+                    "PROMPT('q: {0}', r.review))")
 
 
 @pytest.mark.parametrize("grouped", [True])

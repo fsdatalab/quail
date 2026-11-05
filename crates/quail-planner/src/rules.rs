@@ -9,9 +9,7 @@ use quail_physical::{
     ValueExpression,
 };
 
-use crate::expressions::{
-    CompileError, aliased_call, call_aliases, column_references, condition_aliases, tests,
-};
+use crate::expressions::{CompileError, call_aliases, column_references, condition_aliases, tests};
 use crate::logical::{Filter, LogicalNode, LogicalPlan, Scan};
 use crate::nodes::{
     above_projection, added_columns, as_column, asked_call, children, column_alias, column_call,
@@ -255,9 +253,7 @@ pub fn push_down_projection(root: &LogicalNode) -> LogicalNode {
             unreachable!("a Project")
         };
         for column in &found.columns {
-            if let Projected::Expression(expression) = column
-                && aliased_call(expression, &[]).is_some()
-            {
+            if let Projected::Expression(expression) = column {
                 for reference in value_refs(expression) {
                     valued.insert((reference.alias, reference.column));
                 }

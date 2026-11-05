@@ -36,8 +36,13 @@ lets the planner reason about their placement and cost.
 ## From SQL to a plan
 
 DataFusion parses and binds the SQL. Its analyzer then claims each
-model region, the connected operators that call the model, and lowers
-the region's AI calls into three logical node types
+model region: the operators that call the model, with the filters and
+joins below them and a LIMIT or DISTINCT that can stop the model early
+(`crates/quail-datafusion/src/claim.rs`). DataFusion keeps the
+operators above the region, such as GROUP BY, windows, and an ORDER BY
+without a LIMIT, and moves their AI calls into the region's SELECT
+list. The analyzer then lowers the region's AI calls into three logical
+node types
 (`crates/quail-datafusion/src/lower.rs`):
 
 - `SemanticFilter`: the AI.IF and AI.SCORE tests of one table.

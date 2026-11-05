@@ -71,6 +71,15 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                 sorts = bool(root.order or root.distinct or root.offset
                              or isinstance(root.input, Aggregate))
                 assert sorts <= (qid in relational), case
+                # SGLang's engine returns no decoded answer text
+                if backend == "pipelined_sglang" and operators.classifies:
+                    assert isinstance(plan, Refusal), case
+                    assert plan.constraint == "classify_needs_quail_backend", case
+                    continue
+                if backend == "pipelined_sglang" and operators.extracts:
+                    assert isinstance(plan, Refusal), case
+                    assert plan.constraint == "extract_needs_quail_backend", case
+                    continue
                 if backend != "quail" and sorts:
                     # a request backend sorts returned rows on the
                     # coordinator, but runs no GROUP BY or window
@@ -84,14 +93,6 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                     else:
                         assert any(node.type_name == "quail.sort"
                                    for node in plan.graph.nodes), case
-                    continue
-                if backend == "pipelined_sglang" and qid in classify:
-                    assert isinstance(plan, Refusal), case
-                    assert plan.constraint == "classify_needs_quail_backend", case
-                    continue
-                if backend == "pipelined_sglang" and qid in extract:
-                    assert isinstance(plan, Refusal), case
-                    assert plan.constraint == "extract_needs_quail_backend", case
                     continue
                 assert not isinstance(plan, Refusal), f"{case} refused: {plan}"
                 assert plan.settings["order_rule"] == "by_cost", case

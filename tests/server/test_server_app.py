@@ -164,6 +164,7 @@ def test_a_query_needing_sql_around_its_model_region_is_refused_at_submission(
     client = make_client()
     content_id = upload(client)
     text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) "
-            "UNION ALL SELECT r.id FROM reviews r")
+            "UNION ALL SELECT r.id FROM reviews r "
+            "WHERE AI_FILTER(PROMPT('q2: {0}', r.review))")
     response = client.post("/v1/queries", json=submission(content_id, sql=text))
     assert_error(response, 400, "needs SQL around its regions")

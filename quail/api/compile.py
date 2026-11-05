@@ -91,7 +91,22 @@ def _message(error: Exception, sql: str) -> str:
 def compile_with_datafusion(sql: str, catalog, model,
                             dialect: str = "snowflake",
                             rules=None) -> LogicalPlan | None:
-    """Compile AI SQL text into one logical plan.
+    """Compile AI SQL text into its model region's logical plan.
+
+    Returns:
+        The plan of the query's one model region, or None when the query
+        has more than one (see ``DataFusionQuery``).
+
+    Raises:
+        CompileError: The query is invalid or uses unsupported SQL.
+    """
+    compiled = compile_region(sql, catalog, model, dialect, rules)
+    return None if compiled is None else compiled[0]
+
+
+def compile_region(sql: str, catalog, model, dialect: str = "snowflake",
+                   rules=None) -> tuple[LogicalPlan, bool] | None:
+    """Compile AI SQL text into the logical plan of its one model region.
 
     Args:
         sql: The statement.
@@ -103,8 +118,8 @@ def compile_with_datafusion(sql: str, catalog, model,
             in order, or None for the built-in rules.
 
     Returns:
-        The query's logical plan, or None when DataFusion runs SQL
-        around the query's model regions (see ``DataFusionQuery``).
+        The region's plan and whether the region is the whole query, or
+        None when the query has more than one model region.
 
     Raises:
         CompileError: The query is invalid or uses unsupported SQL.
@@ -130,7 +145,7 @@ def compile_with_datafusion(sql: str, catalog, model,
         raise CompileError(_message(error, sql)) from None
     if not regions:
         raise CompileError("the query has no AI predicate")
-    if len(regions) != 1 or not whole:
+    if len(regions) != 1:
         for _, message in regions:
             # a region the binder does not read runs as SQL of its own
             if message is not None and READ_AS_SQL not in message:
@@ -138,5 +153,7 @@ def compile_with_datafusion(sql: str, catalog, model,
         return None
     plan, message = regions[0]
     if message is not None:
+        if not whole and READ_AS_SQL in message:
+            return None
         raise CompileError(message)
-    return decode_value(LogicalPlan, json.loads(plan))
+    return decode_value(LogicalPlan, json.loads(plan)), whole

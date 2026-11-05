@@ -5,6 +5,7 @@ import os
 import time
 
 from quail.backends import BackendExecutionContext
+from quail.execution.result import QueryResult
 from quail.execution.types import PhysicalRequest, PhysicalResponse
 from quail.logical import WithCTE
 from quail.physical import (
@@ -130,8 +131,9 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     """Run a query's SQL in DataFusion, whose model region runs this query.
 
     DataFusion's ModelRegionExec calls back once, for the query's one
-    model region; the region's QueryResult, with its plan and metrics,
-    is the result.
+    model region. When the region is the whole query, its QueryResult is
+    the result; otherwise the result holds DataFusion's rows with the
+    region's plan, metrics, and answers.
     """
     from quail.api.context import SessionContext, ipc_bytes
 
@@ -145,13 +147,23 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
         results.append(result)
         return ipc_bytes(result.collect())
 
-    table = SessionContext(query.session, run_region=run_region).sql(
-        query.text, query.dialect)
-    (result,) = results
-    if table.num_rows != result.count():
-        raise RuntimeError(
-            f"DataFusion returned {table.num_rows} rows; the model region "
-            f"returned {result.count()}")
+    context = SessionContext(query.session, run_region=run_region)
+    table = context.sql(query.text, query.dialect)
+    (region,) = results
+    if query.whole:
+        if table.num_rows != region.count():
+            raise RuntimeError(
+                f"DataFusion returned {table.num_rows} rows; the model region "
+                f"returned {region.count()}")
+        return region
+    result = QueryResult.from_table(table, report=region.report)
+    result.plan = region.plan
+    result.node_metrics = region.node_metrics
+    result.answer_tables = region.answer_tables
+    result.survivor_indices = region.survivor_indices
+    result.true_join_tables = region.true_join_tables
+    result.datafusion_plan = context.explain(query.text, query.dialect)
+    result.region_rows = region.count()
     return result
 
 

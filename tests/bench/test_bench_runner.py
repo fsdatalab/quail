@@ -163,16 +163,14 @@ def test_relational_plans_build_and_run(tmp_path):
     with quail.Session(_config("quail"), tokenizer=str.split) as sess:
         sess.register("agent_traces", DocumentProvider.from_parquet(
             str(tmp_path / "agent_traces.parquet"), id_col="id"))
-        logical = build_query(sess, get_query("REL-AGENT-6")).logical
-        root = logical.root
-        assert root.input.keys == ("t.trajectory_id",)
-        assert [str(a) for a in root.input.aggregates] == [
-            "fixes = count(*)", "first_fix = min(t.turn_index)",
-            "longest = max(t.token_count)"]
-        assert [str(t) for t in root.input.having] == ["fixes >= 2"]
-        assert [str(key) for key in root.order] == [
-            "first_fix ASC NULLS LAST", "t.trajectory_id ASC NULLS LAST"]
-        assert (root.limit, root.offset) == (50, 0)
+        # DataFusion groups, filters, sorts, and limits the AI filter's rows
+        grouped = build_query(sess, get_query("REL-AGENT-6"))
+        assert not grouped.whole
+        explained = grouped.explain()
+        assert "Aggregate: groupBy=[[t.trajectory_id]]" in explained
+        assert "Filter: count(Int64(1)) >= Int64(2)" in explained
+        assert "fetch=50" in explained
+        logical = grouped.logical
         scan = next(node for node in logical.walk()
                     if type(node).__name__ == "Scan")
         tested = build_query(sess, get_query("REL-AGENT-1")).logical

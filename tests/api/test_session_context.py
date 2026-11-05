@@ -124,12 +124,19 @@ def test_session_sql_runs_a_query_that_needs_sql_around_its_model_region(context
     text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
             "UNION ALL SELECT a.id FROM aspects a ORDER BY id")
     query = context.session.sql(text)
-    assert isinstance(query, quail.api.context.DataFusionQuery)
-    (plan,) = query.plan()
-    assert plan.graph.nodes
-    assert "model region 1:" in query.explain()
+    # one model region: a Query, with DataFusion's union and sort around it
+    assert isinstance(query, quail.api.query.Query) and not query.whole
+    assert query.plan().graph.nodes
+    assert "Union" in query.explain() and "model region:" in query.explain()
     table = finish(query, ORACLE).collect()
     assert _rows(table) == [("a0",), ("a1",), ("r0",), ("r2",), ("r3",)]
+    # two model regions: a DataFusionQuery
+    two = context.session.sql(
+        "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
+        "UNION ALL SELECT r.id FROM reviews r "
+        "WHERE AI_FILTER(PROMPT('q2: {0}', r.body)) ORDER BY id")
+    assert isinstance(two, quail.api.context.DataFusionQuery)
+    assert len(two.plan()) == 2
 
 
 def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
