@@ -1,342 +1,45 @@
 //! The `_quail_native` Python module: Quail's Rust crates for Python.
 //!
-//! Tables and results cross between Python and Rust as Arrow IPC
-//! stream bytes, so the module does not depend on pyarrow's version.
+//! `NativeSession` is `quail::Session`; Python's `quail.Session` runs
+//! queries through it, as a Rust program does.
 
 mod cost;
 
 use std::io::Cursor;
 
-use async_trait::async_trait;
-use std::sync::Arc;
-
-use std::ffi::CStr;
-use std::sync::Mutex;
-use std::thread::ThreadId;
-
-use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use datafusion::arrow::array::{ArrayRef, RecordBatch, RecordBatchIterator};
-use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
-use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{
-    DataFusionError, Result, tree_node::TreeNode, tree_node::TreeNodeRecursion,
-};
-use datafusion::datasource::TableType;
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::logical_expr::{Expr, LogicalPlan};
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
+use datafusion::common::{DataFusionError, Result};
+use datafusion::logical_expr::LogicalPlan;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyCapsule, PyCapsuleMethods};
-use quail_datafusion::{
-    InputRows, ModelRegion, RegionBatches, RegionRunner, bind, quail_column_names, quail_schema,
-    region_sql, sql,
-};
-use quail_planner::prompts::Turn;
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-
-/// Runs each model region by calling a Python function with the
-/// region's plan or SQL; the function returns the rows as a pyarrow
-/// Table.
-#[derive(Debug)]
-struct PythonRunner {
-    run_region: Py<PyAny>,
-    /// The session model's chat-turn text and prompt layout, to bind
-    /// regions in Rust; None sends each region's SQL instead.
-    prompting: Option<(Turn, String)>,
-    /// While a query runs: the thread that called DataFusion, and where
-    /// a worker sends it a region to run.
-    caller: Mutex<Option<(ThreadId, UnboundedSender<RegionCall>)>>,
-}
-
-/// A region a DataFusion worker hands to the calling thread to run.
-#[derive(Debug)]
-struct RegionCall {
-    region: ModelRegion,
-    inputs: Vec<InputRows>,
-    fetch: Option<usize>,
-    rows: std::sync::mpsc::Sender<Result<RegionBatches>>,
-}
-
-impl PythonRunner {
-    /// The request for one region: ("plan", its logical plan as JSON),
-    /// or ("sql", its SQL) for a region the Rust binder does not read.
-    fn request(&self, region: &ModelRegion) -> Result<(&'static str, String)> {
-        let Some((turn, layout)) = &self.prompting else {
-            return Ok(("sql", region_sql(region)?));
-        };
-        match bind::bind_model_region(region, turn, layout) {
-            Ok(plan) => Ok((
-                "plan",
-                quail_planner::write_logical_plan(&plan)
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?,
-            )),
-            Err(error) if error.0.contains(bind::UNSUPPORTED) => Ok(("sql", region_sql(region)?)),
-            Err(error) => Err(DataFusionError::Plan(format!("CompileError: {}", error.0))),
-        }
-    }
-}
-
-impl RegionRunner for PythonRunner {
-    /// Run the region on the thread that called DataFusion, so the GPU
-    /// process's per-thread state is set up once, not on each worker.
-    fn run(
-        &self,
-        region: &ModelRegion,
-        inputs: &[InputRows],
-        fetch: Option<usize>,
-    ) -> Result<RegionBatches> {
-        let caller = self.caller.lock().expect("the caller lock").clone();
-        match caller {
-            Some((thread, sender)) if thread != std::thread::current().id() => {
-                let (rows, answer) = std::sync::mpsc::channel();
-                let call = RegionCall {
-                    region: region.clone(),
-                    inputs: inputs.to_vec(),
-                    fetch,
-                    rows,
-                };
-                sender
-                    .send(call)
-                    .map_err(|_| DataFusionError::Execution("the query ended".into()))?;
-                answer
-                    .recv()
-                    .map_err(|_| DataFusionError::Execution("the region did not run".into()))?
-            }
-            _ => self.run_here(region, inputs, fetch),
-        }
-    }
-}
-
-impl PythonRunner {
-    /// Run the region on this thread.
-    fn run_here(
-        &self,
-        region: &ModelRegion,
-        inputs: &[InputRows],
-        fetch: Option<usize>,
-    ) -> Result<RegionBatches> {
-        let (kind, payload) = self.request(region)?;
-        let reader = Python::attach(|py| {
-            // each input as a pyarrow Table, by the table name the region reads
-            let mut tables = Vec::new();
-            for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
-                let schema = Arc::new(input.schema().as_arrow().clone());
-                tables.push((name.clone(), to_pyarrow(py, schema, batches.clone())?));
-            }
-            let tables = tables.into_py_dict(py)?;
-            let answer = self.run_region.call1(py, (kind, payload, tables, fetch))?;
-            stream_from_pyarrow(answer.bind(py))
-        })
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let schema = Arc::clone(region.bound.schema());
-        let names = quail_column_names(&schema);
-        // DataFusion reads each batch as the Python stream yields it
-        Ok(Box::new(
-            reader.map(move |batch| conform(batch?, &names, schema.inner())),
-        ))
-    }
-}
-
-/// Give a batch of Quail's rows the region's schema: each region
-/// column is the Quail column of the same name, cast to its type.
-///
-/// A column Quail names differently, such as `r.details.body` for
-/// DataFusion's `r.details[body]`, is the one in the same position when
-/// both list the same number of columns, as both follow the SELECT list.
-fn conform(batch: RecordBatch, names: &[String], schema: &SchemaRef) -> Result<RecordBatch> {
-    let positional = batch.num_columns() == names.len();
-    let columns = names
-        .iter()
-        .zip(schema.fields())
-        .enumerate()
-        .map(|(index, (name, field))| {
-            let found = batch
-                .column_by_name(name)
-                .or_else(|| positional.then(|| batch.column(index)));
-            let column = found.ok_or_else(|| {
-                let returned: Vec<_> = batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect();
-                DataFusionError::Execution(format!(
-                    "Quail returned columns {returned:?}, without the region's column {name}"
-                ))
-            })?;
-            Ok(cast(column, field.data_type())?)
-        })
-        .collect::<Result<Vec<ArrayRef>>>()?;
-    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
-}
-
-/// A table whose rows a Python function returns on each scan.
-///
-/// Model regions read their tables through Quail, so DataFusion scans
-/// a table only for operators outside every region.
-#[derive(Debug)]
-struct PythonTable {
-    schema: SchemaRef,
-    scan: Py<PyAny>,
-    /// The id column as a primary key, which DataFusion's rules read.
-    constraints: datafusion::common::Constraints,
-}
-
-#[async_trait]
-impl TableProvider for PythonTable {
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
-        Some(&self.constraints)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let schema = match projection {
-            Some(indices) => Arc::new(self.schema.project(indices)?),
-            None => Arc::clone(&self.schema),
-        };
-        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let batches = Python::attach(|py| {
-            let answer = self.scan.call1(py, (columns,))?;
-            from_pyarrow(answer.bind(py))
-        })
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        // one partition per thread DataFusion runs, each a slice of the
-        // rows, so the operators above read the table in parallel
-        let num_partitions = state.config().target_partitions().max(1);
-        let mut partitions: Vec<Vec<RecordBatch>> = vec![Vec::new(); num_partitions];
-        for batch in batches {
-            let size = batch.num_rows().div_ceil(num_partitions).max(1);
-            let mut offset = 0;
-            let mut index = 0;
-            while offset < batch.num_rows() {
-                let length = size.min(batch.num_rows() - offset);
-                partitions[index % num_partitions].push(batch.slice(offset, length));
-                offset += length;
-                index += 1;
-            }
-        }
-        Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
-    }
-}
-
-/// The capsule name of the Arrow C stream interface.
-const ARROW_STREAM: &CStr = c"arrow_array_stream";
-
-/// Hand batches to Python as a pyarrow Table over the same buffers,
-/// through the Arrow C stream interface.
-fn to_pyarrow<'py>(
-    py: Python<'py>,
-    schema: SchemaRef,
-    batches: Vec<RecordBatch>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-    let stream = FFI_ArrowArrayStream::new(Box::new(reader));
-    // pyarrow takes the stream; the capsule's destructor releases it
-    // only when pyarrow did not
-    let capsule = PyCapsule::new_with_value(py, stream, ARROW_STREAM)?;
-    py.import("pyarrow")?
-        .getattr("RecordBatchReader")?
-        .call_method1("_import_from_c_capsule", (capsule,))?
-        .call_method0("read_all")
-}
-
-/// Take a Python object's Arrow stream, such as a pyarrow Table's or
-/// RecordBatchReader's, as a reader over the same buffers.
-fn stream_from_pyarrow(value: &Bound<'_, PyAny>) -> PyResult<ArrowArrayStreamReader> {
-    let capsule = value.call_method0("__arrow_c_stream__")?;
-    let capsule = capsule.cast::<PyCapsule>()?;
-    let pointer = capsule.pointer_checked(Some(ARROW_STREAM))?;
-    // the reader takes the stream and leaves the capsule's released
-    unsafe { ArrowArrayStreamReader::from_raw(pointer.as_ptr().cast()) }
-        .map_err(|error| python_error(error.into()))
-}
-
-/// Read a Python object's Arrow stream into batches over the same buffers.
-fn from_pyarrow(value: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
-    stream_from_pyarrow(value)?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|error| python_error(error.into()))
-}
+use quail::pyarrow::to_pyarrow;
+use quail_datafusion::{bind, region_sql};
 
 fn python_error(error: DataFusionError) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
-/// A DataFusion session context with Quail registered.
-#[pyclass(name = "NativeContext", module = "_quail_native")]
-struct NativeContext {
-    context: SessionContext,
-    runtime: Runtime,
-    runner: Arc<PythonRunner>,
+/// Quail's Rust `Session`: DataFusion with Quail's AI functions, whose
+/// model regions run on a Python engine.
+#[pyclass(name = "NativeSession", module = "_quail_native")]
+struct NativeSession {
+    session: quail::Session,
 }
 
 #[pymethods]
-impl NativeContext {
-    /// Create a context whose model regions run through `run_region`.
-    ///
-    /// `run_region(kind, payload)` takes ("plan", a region's Quail
-    /// logical plan as JSON), bound in Rust with the model's chat-turn
-    /// text `turn` and prompt `layout`, or ("sql", the region's SQL)
-    /// for a region the Rust binder does not read, or for every region
-    /// when no turn and layout are given. `rules` names the optimizer
-    /// rules each model region runs, in order; by default
-    /// `quail_datafusion::REGION_RULES`.
+impl NativeSession {
+    /// Create a session whose model regions run on `engine`, as
+    /// `quail::Session::with_engine` describes.
     #[new]
-    #[pyo3(signature = (run_region, turn=None, layout=None, rules=None))]
-    fn new(
-        run_region: Py<PyAny>,
-        turn: Option<(String, String)>,
-        layout: Option<String>,
-        rules: Option<Vec<String>>,
-    ) -> PyResult<Self> {
-        let runtime = Runtime::new()?;
-        let prompting = turn.zip(layout);
-        let regions = match rules {
-            Some(rules) => {
-                for name in &rules {
-                    quail_datafusion::region_rule(name).map_err(python_error)?;
-                }
-                quail_datafusion::OptimizeModelRegions::new(rules)
-            }
-            None => quail_datafusion::OptimizeModelRegions::default(),
-        };
-        let runner = Arc::new(PythonRunner {
-            run_region,
-            prompting,
-            caller: Mutex::new(None),
-        });
-        let context = quail_datafusion::session_context_with_rules(
-            Arc::clone(&runner) as Arc<dyn RegionRunner>,
-            regions,
-        );
+    fn new(engine: Py<PyAny>) -> PyResult<Self> {
         Ok(Self {
-            context,
-            runtime,
-            runner,
+            session: quail::Session::with_engine(engine).map_err(python_error)?,
         })
     }
 
     /// Register a table by its schema, given as the IPC stream bytes of
     /// an empty table, and a function `scan(columns)` that returns
-    /// those columns' rows as IPC stream bytes. `id_column` names the
+    /// those columns' rows as a pyarrow Table. `id_column` names the
     /// column whose values are unique.
     #[pyo3(signature = (name, schema, scan, id_column=None))]
     fn register(
@@ -348,31 +51,13 @@ impl NativeContext {
     ) -> PyResult<()> {
         let reader = StreamReader::try_new(Cursor::new(schema), None)
             .map_err(|error| python_error(error.into()))?;
-        let schema = reader.schema();
-        let keys: Vec<usize> = id_column
-            .and_then(|column| schema.index_of(column).ok())
-            .into_iter()
-            .collect();
-        let constraints = if keys.is_empty() {
-            datafusion::common::Constraints::default()
-        } else {
-            datafusion::common::Constraints::new_unverified(vec![
-                datafusion::common::Constraint::PrimaryKey(keys),
-            ])
-        };
-        let table = PythonTable {
-            schema,
-            scan,
-            constraints,
-        };
-        self.context
-            .register_table(name, Arc::new(table))
-            .map_err(python_error)?;
-        Ok(())
+        self.session
+            .register_python_table(name, reader.schema(), scan, id_column)
+            .map_err(python_error)
     }
 
     /// Run a query, read in `dialect` ("Snowflake" by default), and
-    /// return its rows as IPC stream bytes.
+    /// return its rows as a pyarrow Table over DataFusion's buffers.
     #[pyo3(signature = (query, dialect=None))]
     fn sql<'py>(
         &self,
@@ -380,48 +65,8 @@ impl NativeContext {
         query: &str,
         dialect: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let runner = Arc::clone(&self.runner);
         let (schema, batches) = py
-            .detach(|| {
-                self.runtime.block_on(async {
-                    let (sender, mut calls) = unbounded_channel::<RegionCall>();
-                    *runner.caller.lock().expect("the caller lock") =
-                        Some((std::thread::current().id(), sender));
-                    let query = async {
-                        let frame = quail_datafusion::sql_in_dialect(
-                            &self.context,
-                            query,
-                            dialect.as_deref(),
-                        )
-                        .await?;
-                        let schema = quail_schema(frame.schema());
-                        // renaming the columns keeps each column's buffers
-                        let batches = frame
-                            .collect()
-                            .await?
-                            .into_iter()
-                            .map(|batch| {
-                                RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
-                            })
-                            .collect::<std::result::Result<Vec<_>, _>>()?;
-                        Ok::<_, DataFusionError>((schema, batches))
-                    };
-                    tokio::pin!(query);
-                    // DataFusion's workers run the operators; this thread
-                    // runs each model region they hand it
-                    let done = loop {
-                        tokio::select! {
-                            done = &mut query => break done,
-                            Some(call) = calls.recv() => {
-                                let rows = runner.run_here(&call.region, &call.inputs, call.fetch);
-                                let _ = call.rows.send(rows);
-                            }
-                        }
-                    };
-                    *runner.caller.lock().expect("the caller lock") = None;
-                    done
-                })
-            })
+            .detach(|| self.session.sql_in_dialect(query, dialect.as_deref()))
             .map_err(python_error)?;
         to_pyarrow(py, schema, batches)
     }
@@ -429,19 +74,11 @@ impl NativeContext {
     /// Return the SQL each model region of a query sends to Quail.
     fn region_sql(&self, py: Python<'_>, query: &str) -> PyResult<Vec<String>> {
         py.detach(|| {
-            self.runtime.block_on(async {
-                let plan = sql(&self.context, query).await?.into_optimized_plan()?;
-                let mut texts = Vec::new();
-                plan.apply(|node| {
-                    if let LogicalPlan::Extension(extension) = node
-                        && let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>()
-                    {
-                        texts.push(region_sql(region)?);
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })?;
-                Ok(texts)
-            })
+            self.session
+                .regions(query, None)?
+                .iter()
+                .map(region_sql)
+                .collect::<Result<Vec<_>>>()
         })
         .map_err(python_error)
     }
@@ -463,37 +100,22 @@ impl NativeContext {
         dialect: Option<String>,
     ) -> PyResult<(Vec<(Option<String>, Option<String>)>, bool)> {
         py.detach(|| {
-            self.runtime.block_on(async {
-                let plan =
-                    quail_datafusion::sql_in_dialect(&self.context, query, dialect.as_deref())
-                        .await?
-                        .into_optimized_plan()?;
-                let mut bound = Vec::new();
-                plan.apply(|node| {
-                    if let LogicalPlan::Extension(extension) = node
-                        && let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>()
-                    {
-                        bound.push(
-                            match quail_datafusion::bind::bind_model_region(region, &turn, layout) {
-                                Ok(found) => (
-                                    Some(quail_planner::write_logical_plan(&found).map_err(
-                                        |error| {
-                                            datafusion::error::DataFusionError::External(Box::new(
-                                                error,
-                                            ))
-                                        },
-                                    )?),
-                                    None,
-                                ),
-                                Err(error) => (None, Some(error.0)),
-                            },
-                        );
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })?;
-                let whole = matches!(&plan, LogicalPlan::Extension(_));
-                Ok((bound, whole))
-            })
+            let plan = self.session.optimized_plan(query, dialect.as_deref())?;
+            let whole = matches!(&plan, LogicalPlan::Extension(_));
+            let mut bound = Vec::new();
+            for region in self.session.regions(query, dialect.as_deref())? {
+                bound.push(match bind::bind_model_region(&region, &turn, layout) {
+                    Ok(found) => (
+                        Some(
+                            quail_planner::write_logical_plan(&found)
+                                .map_err(|error| DataFusionError::External(Box::new(error)))?,
+                        ),
+                        None,
+                    ),
+                    Err(error) => (None, Some(error.0)),
+                });
+            }
+            Ok::<_, DataFusionError>((bound, whole))
         })
         .map_err(python_error)
     }
@@ -502,16 +124,8 @@ impl NativeContext {
     /// `dialect` ("Snowflake" by default).
     #[pyo3(signature = (query, dialect=None))]
     fn explain(&self, py: Python<'_>, query: &str, dialect: Option<String>) -> PyResult<String> {
-        py.detach(|| {
-            self.runtime.block_on(async {
-                let plan =
-                    quail_datafusion::sql_in_dialect(&self.context, query, dialect.as_deref())
-                        .await?
-                        .into_optimized_plan()?;
-                Ok(plan.display_indent().to_string())
-            })
-        })
-        .map_err(python_error)
+        py.detach(|| self.session.explain(query, dialect.as_deref()))
+            .map_err(python_error)
     }
 }
 
@@ -1149,7 +763,7 @@ fn work_fields(work: &quail_cost::work::Work) -> std::collections::BTreeMap<&'st
 
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<NativeContext>()?;
+    module.add_class::<NativeSession>()?;
     module.add_class::<cost::CostModel>()?;
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;

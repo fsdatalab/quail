@@ -1927,6 +1927,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "quail"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "pyo3",
+ "pyo3-build-config",
+ "quail-datafusion",
+ "quail-planner",
+ "tokio",
+]
+
+[[package]]
 name = "quail-cost"
 version = "0.1.0"
 dependencies = [
@@ -1953,17 +1967,15 @@ dependencies = [
 name = "quail-native"
 version = "0.1.0"
 dependencies = [
- "arrow",
- "async-trait",
  "datafusion",
  "pyo3",
+ "quail",
  "quail-cost",
  "quail-datafusion",
  "quail-physical",
  "quail-planner",
  "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

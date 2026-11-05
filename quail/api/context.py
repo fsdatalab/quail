@@ -18,9 +18,9 @@ For example, imagine a ``reviews`` table with review text in ``body``:
         "WHERE AI_FILTER(PROMPT('Does the review discuss the ending? {0}', "
         "r.body))")
 
-The DataFusion side lives in the ``quail-datafusion`` crate. Its Python
-module, ``_quail_native``, is part of the quail-engine wheel, built by
-maturin from ``crates/quail-native``.
+The session is the ``quail`` crate's ``Session``, the one a Rust
+program runs queries with; ``_quail_native`` binds it for Python. Its
+model regions call ``quail.api.engine.Engine``.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from collections.abc import Callable
 import pyarrow as pa
 
 from quail.api.compile import DATAFUSION_DIALECTS
-from quail.api.execute import execute_query
+from quail.api.engine import Engine
 from quail.api.query import Query
 from quail.catalog import ScanRequest, TableProvider
 from quail.logical import LogicalPlan
@@ -47,7 +47,7 @@ def ipc_bytes(table: pa.Table) -> bytes:
 
 
 class SessionContext:
-    """A DataFusion session context with Quail registered.
+    """Quail's Rust ``Session``, over a Python session's tables and model.
 
     Args:
         session: The Quail session that plans and runs model regions;
@@ -61,15 +61,11 @@ class SessionContext:
 
     def __init__(self, session, physical_executor: Callable | None = None, *,
                  order: str | None = None, run_region: Callable | None = None):
-        from _quail_native import NativeContext
+        from _quail_native import NativeSession
 
         self.session = session
-        self._physical_executor = physical_executor
-        self._order = order
-        model = session.model
-        rules = [rule.name for rule in session.registry.logical_rules.values()]
-        self._native = NativeContext(run_region or self._run_region, tuple(model.turn),
-                                     model.prompt_layout, rules)
+        engine = Engine(session, physical_executor, order=order, run_region=run_region)
+        self._native = NativeSession(engine)
         for name, provider in session.catalog.providers.items():
             self._register_table(name, provider)
 
@@ -120,40 +116,6 @@ class SessionContext:
     def explain(self, text: str, dialect: str = "snowflake") -> str:
         """Return DataFusion's optimized logical plan for a query."""
         return self._native.explain(text, DATAFUSION_DIALECTS[dialect])
-
-    def _run_region(self, kind: str, payload: str, tables: dict | None = None,
-                    fetch: int | None = None) -> pa.Table:
-        from quail.api.region_inputs import region_query
-
-        if kind == "plan":
-            logical = decode_value(LogicalPlan, json.loads(payload))
-            if fetch is not None:
-                logical = with_limit(logical, fetch)
-            query = region_query(self.session, logical, order=self._order,
-                                 tables=tables)
-        else:
-            query = self.session.sql(payload, order=self._order)
-        result = execute_query(query, physical_executor=self._physical_executor)
-        return result.collect()
-
-
-def with_limit(logical: LogicalPlan, fetch: int) -> LogicalPlan:
-    """Return a region's plan that returns at most ``fetch`` rows.
-
-    DataFusion passes the limit when a LIMIT above the region reaches
-    it; Quail can then stop the model once enough rows pass.
-    """
-    from dataclasses import replace
-
-    from quail.logical import Result, WithCTE
-
-    root = logical.root
-    if isinstance(root, WithCTE):
-        return logical
-    if isinstance(root, Result):
-        limit = fetch if root.limit is None else min(root.limit, fetch)
-        return replace(logical, root=replace(root, limit=limit))
-    return replace(logical, root=Result(input=root, limit=fetch))
 
 
 class DataFusionQuery:

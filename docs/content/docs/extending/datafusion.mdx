@@ -1,34 +1,53 @@
 ---
-title: Quail in a DataFusion Session
+title: Quail from Rust
 ---
 
-`QuailExtension` adds Quail to a DataFusion `SessionState` you already
-have. Your session's `sql()` then runs the AI functions. DataFusion
-runs every other operator, and Quail runs the model.
+`quail::Session` runs SQL with AI functions from a Rust program. It is
+the same session Python's `quail.Session` runs queries with.
+DataFusion runs every operator outside the model regions. Quail's
+executor, the `quail` Python package, plans and runs each region in a
+Python interpreter embedded in your process.
 
 ```rust
 use std::sync::Arc;
 
-use datafusion::execution::SessionStateBuilder;
-use datafusion::prelude::SessionContext;
-use quail_datafusion::QuailExtension;
+let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
+let session = quail::Session::new(&config)?;
+session.register_table("reviews", Arc::new(reviews))?;
+let batches = session.sql(
+    "SELECT r.id FROM reviews r \
+     WHERE AI.IF(PROMPT('Is this review negative? {0}', r.body))",
+)?;
+```
 
+- `Session::new` starts Python and imports `quail` from the virtual
+  environment `VIRTUAL_ENV` names. Install the package there with
+  `uv pip install quail-engine`.
+- Your program links libpython. Set `PYO3_PYTHON` to the environment's
+  Python when you build, and put its library directory on
+  `LD_LIBRARY_PATH` or the binary's rpath.
+- `sql` blocks until the query finishes, and each model region runs on
+  the calling thread. Call it outside an async runtime, or from
+  `spawn_blocking`.
+- A model region reads a table you register as rows DataFusion scans.
+  Tables registered from Python stay with the Python provider, which
+  keeps their token counts between queries.
+
+## Quail in your own DataFusion session
+
+`QuailExtension` adds Quail to a DataFusion `SessionState` you already
+have, with a runner of your own for the model regions:
+
+```rust
 let state = SessionStateBuilder::new().with_default_features().build();
 let state = QuailExtension::new(runner).register(state)?;
 let context = SessionContext::new_with_state(state);
-context.register_table("reviews", reviews)?;
-let negative = context
-    .sql("SELECT COUNT(*) AS n FROM reviews r \
-          WHERE AI.IF(PROMPT('Is this review negative? {0}', r.body))")
-    .await?
-    .collect()
-    .await?;
 ```
 
 `runner` implements `RegionRunner`: it takes one model region, the rows
 of the region's inputs, and an optional row limit, and returns the
-region's rows as a stream of Arrow batches. Quail's Python package
-passes a runner that plans and runs the region on the GPU.
+region's rows as a stream of Arrow batches. `quail::Session` uses a
+runner that calls Quail's Python executor.
 
 ## What `register` adds
 

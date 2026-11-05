@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/quail",
     "crates/quail-cost",
     "crates/quail-datafusion",
     "crates/quail-native",

@@ -5,16 +5,18 @@ use std::sync::Arc;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DataFusionError, Result, plan_err};
-use datafusion::datasource::{MemTable, provider_as_source};
+use datafusion::datasource::{MemTable, provider_as_source, source_as_provider};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
-    Aggregate, Expr, Extension, Filter, LogicalPlan, LogicalPlanBuilder, Projection, Window,
+    Aggregate, Expr, Extension, Filter, LogicalPlan, LogicalPlanBuilder, Projection, TableScan,
+    Window,
 };
 use datafusion::optimizer::AnalyzerRule;
 
 use crate::bind::UNSUPPORTED;
 use crate::functions::is_ai_call;
 use crate::region::ModelRegion;
+use crate::table::RunnerTable;
 
 /// Replace each subtree of AI work that Quail can plan with one
 /// `ModelRegion`, and leave the relational operators above it to
@@ -631,6 +633,9 @@ fn split_inputs(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<(String, LogicalP
     let mut inputs: Vec<(String, LogicalPlan)> = Vec::new();
     let plan = plan
         .transform_down(|node| {
+            if let LogicalPlan::TableScan(scan) = &node {
+                return table_input(scan, &mut inputs);
+            }
             let LogicalPlan::SubqueryAlias(alias) = &node else {
                 return Ok(Transformed::no(node));
             };
@@ -661,6 +666,39 @@ fn split_inputs(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<(String, LogicalP
         })?
         .data;
     Ok((plan, inputs))
+}
+
+/// A scan of a table the runner does not read itself, as a scan of a
+/// region input of the table's name: DataFusion scans the table and
+/// passes its rows. A table read twice, as in a self join, is one input.
+fn table_input(
+    scan: &TableScan,
+    inputs: &mut Vec<(String, LogicalPlan)>,
+) -> Result<Transformed<LogicalPlan>> {
+    let provider = source_as_provider(&scan.source)?;
+    if provider.downcast_ref::<RunnerTable>().is_some() {
+        return Ok(Transformed::no(LogicalPlan::TableScan(scan.clone())));
+    }
+    let name = scan.table_name.table().to_string();
+    let schema = provider.schema();
+    let mut placeholder = MemTable::try_new(Arc::clone(&schema), vec![vec![]])?;
+    if let Some(constraints) = provider.constraints() {
+        placeholder = placeholder.with_constraints(constraints.clone());
+    }
+    let read = LogicalPlanBuilder::scan_with_filters(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(placeholder)),
+        scan.projection.clone(),
+        scan.filters.clone(),
+    )?
+    .build()?;
+    if !inputs.iter().any(|(found, _)| *found == name) {
+        let body =
+            LogicalPlanBuilder::scan(scan.table_name.clone(), Arc::clone(&scan.source), None)?
+                .build()?;
+        inputs.push((name, body));
+    }
+    Ok(Transformed::new(read, true, TreeNodeRecursion::Jump))
 }
 
 /// A region's plan with a SELECT list at its root: the plan itself when

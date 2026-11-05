@@ -1,0 +1,22 @@
+[package]
+name = "quail"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Quail: AI functions in SQL on DataFusion, with models run by Quail's executor"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
+# the Arrow C stream interface, to share buffers with pyarrow
+arrow = { version = "59.3.2", default-features = false, features = ["ffi"] }
+# a Rust program links libpython and starts the interpreter; the Python
+# module's build sets PYO3_BUILD_EXTENSION_MODULE instead
+pyo3 = "0.30"
+quail-datafusion = { path = "../quail-datafusion" }
+quail-planner = { path = "../quail-planner" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+[build-dependencies]
+pyo3-build-config = "0.30"

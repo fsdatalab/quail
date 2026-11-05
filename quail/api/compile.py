@@ -104,6 +104,18 @@ def compile_with_datafusion(sql: str, catalog, model,
     return None if compiled is None else compiled[0]
 
 
+class _CompilingEngine:
+    """The engine of a session that binds regions and runs none."""
+
+    def __init__(self, model, rules):
+        self.turn = tuple(model.turn)
+        self.layout = model.prompt_layout
+        self.rules = None if rules is None else list(rules)
+
+    def run_region(self, *_request):
+        raise RuntimeError("compiling a query runs no model region")
+
+
 def compile_region(sql: str, catalog, model, dialect: str = "snowflake",
                    rules=None) -> tuple[LogicalPlan, bool] | None:
     """Compile AI SQL text into the logical plan of its one model region.
@@ -130,11 +142,7 @@ def compile_region(sql: str, catalog, model, dialect: str = "snowflake",
     def refuse(columns):
         raise RuntimeError("compiling a query scans no table")
 
-    def run_region(kind, payload, tables=None, fetch=None):
-        raise RuntimeError("compiling a query runs no model region")
-
-    context = _quail_native.NativeContext(
-        run_region, rules=None if rules is None else list(rules))
+    context = _quail_native.NativeSession(_CompilingEngine(model, rules))
     for name, provider in catalog.providers.items():
         context.register(name, _schema_bytes(provider.schema()), refuse,
                          getattr(provider, "id_col", None) or None)
