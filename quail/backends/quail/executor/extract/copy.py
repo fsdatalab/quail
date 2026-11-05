@@ -1,7 +1,5 @@
 """Document continuations and the GPU constraint for copy decoding."""
 
-from types import SimpleNamespace
-
 import numpy as np
 
 from quail.backends.quail.executor.extract.candidates import (
@@ -65,78 +63,6 @@ def _padded(values, dtype=np.int64):
     return out
 
 
-def copy_tables(documents) -> SimpleNamespace:
-    """Return the host arrays a CopyConstraint reads, built from its documents.
-
-    It touches no GPU state, so it can run on another thread while the
-    first passes run.
-
-    Args:
-        documents: The extraction inputs, with each document's token scan.
-
-    Returns:
-        The document positions, their candidate options, and the lookup
-        from (key, token) to option, as numpy arrays.
-    """
-    vocabulary = documents.vocabulary
-    options, filler_tokens, filler_chars = [], [], []
-    position_keys, option_keys = [], []
-    position_local_keys, option_local_keys = [], []
-    key0 = 0
-    characters, ends, position_tokens, position_documents = [], [], [], []
-    streams, keys, option_rows = [], [], []
-    option0 = position0 = 0
-    kids = [document.scan.kids for document in documents.documents]
-    option_table = vocabulary.option_table(np.concatenate(kids) if kids else [])
-    for d, document in enumerate(documents.documents):
-        scan = document.scan
-        index = scan.candidates = CandidateIndex.of(scan, vocabulary, option_table)
-        options.append(index.token)
-        position_keys.append(index.inverse + key0)
-        option_keys.append(index.segment + key0)
-        position_local_keys.append(index.inverse)
-        option_local_keys.append(index.segment)
-        key0 += len(index.kids)
-        filler_tokens.append(scan.tokens[index.anchor[index.segment]])
-        filler_chars.append(index.length)
-        characters.append(scan.starts)
-        ends.append(scan.ends)
-        position_tokens.append(scan.tokens)
-        position_documents.append(np.full(len(scan.tokens), d, dtype=np.int64))
-        streams.append(np.arange(position0, position0 + len(scan.tokens)))
-        keys.append(len(index.kids))
-        option_rows.append(np.arange(option0, option0 + len(index.token)))
-        option0 += len(index.token)
-        position0 += len(scan.tokens)
-    option_tokens = np.concatenate(options) if option0 else np.array([0])
-    lookup = (np.concatenate(option_keys) if option0 else np.array([0])) * len(
-        vocabulary.vocab
-    ) + option_tokens
-    order = np.argsort(lookup)
-    counts = np.array(list(map(len, position_tokens)), dtype=np.int64)
-    return SimpleNamespace(
-        num_keys=max(1, max(keys, default=0)),
-        characters=np.concatenate(characters) if position0 else np.array([0]),
-        position_ends=np.concatenate(ends) if position0 else np.array([0]),
-        position_documents=(
-            np.concatenate(position_documents) if position0 else np.array([0])),
-        option_tokens=option_tokens,
-        filler_tokens=np.concatenate(filler_tokens) if option0 else np.array([0]),
-        filler_chars=np.concatenate(filler_chars) if option0 else np.array([0]),
-        option_rows=_padded(option_rows),
-        position_keys=np.concatenate(position_keys) if position0 else np.array([0]),
-        option_order=order,
-        option_lookup=lookup[order],
-        position_offsets=np.r_[0, np.cumsum(counts)],
-        max_positions=max(1, int(counts.max(initial=0))),
-        positions=_padded(streams),
-        position_local_keys=(
-            np.concatenate(position_local_keys) if position0 else np.array([0])),
-        option_local_keys=(
-            np.concatenate(option_local_keys) if option0 else np.array([0])),
-    )
-
-
 class CopyConstraint:
     """Tokenized document positions shared by a pipeline's extraction fields.
 
@@ -144,29 +70,65 @@ class CopyConstraint:
     it can reach. Fields and spellings share each prepared continuation.
     """
 
-    def __init__(self, torch, device, documents, spec, tables=None):
+    def __init__(self, torch, device, documents, spec):
         self.torch, self.device, self.spec = torch, torch.device(device), spec
         self.documents = documents
         self.trace = trace_path()
         self.trace_width = TRACE_WIDTH if self.trace is not None else 0
         vocabulary = self.vocabulary = documents.vocabulary
-        tables = copy_tables(documents) if tables is None else tables
-        self.num_keys = tables.num_keys
-        self.characters = tables.characters
-        self.position_ends = tables.position_ends
-        self.position_documents = tables.position_documents
-        self.option_tokens = tables.option_tokens
-        self.filler_tokens = tables.filler_tokens
-        self.filler_chars = tables.filler_chars
-        self.option_rows = tables.option_rows
-        self.position_keys = tables.position_keys
-        self.option_order = tables.option_order
-        self.option_lookup = tables.option_lookup
+        options, filler_tokens, filler_chars = [], [], []
+        position_keys, option_keys = [], []
+        position_local_keys, option_local_keys = [], []
+        key0 = 0
+        characters, ends, position_tokens, position_documents = [], [], [], []
+        streams, keys, option_rows = [], [], []
+        option0 = position0 = 0
+        kids = [document.scan.kids for document in documents.documents]
+        option_table = vocabulary.option_table(np.concatenate(kids) if kids else [])
+        for d, document in enumerate(documents.documents):
+            scan = document.scan
+            index = scan.candidates = CandidateIndex.of(scan, vocabulary, option_table)
+            options.append(index.token)
+            position_keys.append(index.inverse + key0)
+            option_keys.append(index.segment + key0)
+            position_local_keys.append(index.inverse)
+            option_local_keys.append(index.segment)
+            key0 += len(index.kids)
+            filler_tokens.append(scan.tokens[index.anchor[index.segment]])
+            filler_chars.append(index.length)
+            characters.append(scan.starts)
+            ends.append(scan.ends)
+            position_tokens.append(scan.tokens)
+            position_documents.append(np.full(len(scan.tokens), d, dtype=np.int64))
+            streams.append(np.arange(position0, position0 + len(scan.tokens)))
+            keys.append(len(index.kids))
+            option_rows.append(np.arange(option0, option0 + len(index.token)))
+            option0 += len(index.token)
+            position0 += len(scan.tokens)
+        self.num_keys = max(1, max(keys, default=0))
+        self.characters = np.concatenate(characters) if position0 else np.array([0])
+        self.position_ends = np.concatenate(ends) if position0 else np.array([0])
+        self.position_documents = (
+            np.concatenate(position_documents) if position0 else np.array([0])
+        )
+        self.option_tokens = np.concatenate(options) if option0 else np.array([0])
+        self.filler_tokens = np.concatenate(filler_tokens) if option0 else np.array([0])
+        self.filler_chars = np.concatenate(filler_chars) if option0 else np.array([0])
+        self.option_rows = _padded(option_rows)
+        self.position_keys = (
+            np.concatenate(position_keys) if position0 else np.array([0])
+        )
+        lookup = (np.concatenate(option_keys) if option0 else np.array([0])) * len(
+            vocabulary.vocab
+        ) + self.option_tokens
+        self.option_order = np.argsort(lookup)
+        self.option_lookup = lookup[self.option_order]
         self.filler_lengths = np.full(len(self.option_tokens), -1, dtype=np.int64)
         self.position_lengths = np.zeros(len(self.characters), dtype=np.int64)
         self.position_rows = np.full(len(self.characters), -1, dtype=np.int64)
-        self.position_offsets = tables.position_offsets
-        self.max_positions = tables.max_positions
+        counts = np.array(list(map(len, position_tokens)), dtype=np.int64)
+        self.position_offsets = np.r_[0, np.cumsum(counts)]
+        self.max_positions = max(1, int(counts.max(initial=0)))
         self.mask_words = -(-self.max_positions // 64)
         self.position_offsets_device = self.tensor(self.position_offsets)
         self.windows = None
@@ -176,12 +138,16 @@ class CopyConstraint:
         self.prepared = np.empty(0, dtype=np.int64)
         self.num_positions = 0
         self.num_options = len(self.option_tokens)
-        self.streams = np.where(tables.positions >= 0,
-                                tables.positions * self.num_options, -1)
+        positions = _padded(streams)
+        self.streams = np.where(positions >= 0, positions * self.num_options, -1)
         self.stream_ids = self.tensor(self.streams)
         self.option_rows_device = self.tensor(self.option_rows)
-        self.key_ids = self.tensor(tables.position_local_keys)
-        self.option_key_ids = self.tensor(tables.option_local_keys)
+        self.key_ids = self.tensor(
+            np.concatenate(position_local_keys) if position0 else np.array([0])
+        )
+        self.option_key_ids = self.tensor(
+            np.concatenate(option_local_keys) if option0 else np.array([0])
+        )
         self.first_tokens = self.tensor(self.option_tokens)
         self.filler_rows = np.full(self.num_options, -1, dtype=np.int64)
         self.filler_rows_device = self.tensor(self.filler_rows.copy())

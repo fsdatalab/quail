@@ -9,9 +9,7 @@ their previous result before laying out rows at the accepted prefix's end.
 
 from __future__ import annotations
 
-import threading
 from collections import deque
-from concurrent.futures import Future
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -110,26 +108,19 @@ class MapDecoder:
         self.drafts = np.zeros(n, dtype=np.int64)
 
     def configure_copy(self, first, slots, documents, specs):
-        """Register extraction fields and start building their host tables.
-
-        The tables are built on another thread while the first passes run;
-        the first answer token waits for them.
-        """
-        from quail.backends.quail.executor.extract.copy import copy_tables
-
+        """Register extraction fields for setup after the first forward launch."""
         self.constrained[first:first + len(specs)] = True
-        self.copy_inputs.append(
-            (first, slots, documents, specs, in_background(copy_tables, documents)))
+        self.copy_inputs.append((first, slots, documents, specs))
 
     def _initialize(self):
         if self.next_token is None:
             self.next_token = self.torch.zeros(
                 len(self.map), dtype=self.torch.int64, device=self.device)
         pending, self.copy_inputs = self.copy_inputs, []
-        for first, slots, documents, specs, tables in pending:
-            self._configure_copy(first, slots, documents, specs, tables.result())
+        for first, slots, documents, specs in pending:
+            self._configure_copy(first, slots, documents, specs)
 
-    def _configure_copy(self, first, slots, documents, specs, tables):
+    def _configure_copy(self, first, slots, documents, specs):
         from quail.backends.quail.executor.extract.copy import CopyConstraint
         from quail.backends.quail.executor.readout import AsyncTopLogprobs
         from quail.cost.draft_policy import LIVE_BUCKETS
@@ -140,8 +131,7 @@ class MapDecoder:
                 self.torch, self.torch.nn.functional, self.head, key[0], [key[1]]), [])
         _, questions = self.copy_readouts[key]
         questions.extend(range(first, first + len(specs)))
-        constraint = CopyConstraint(self.torch, self.device, documents, specs[0],
-                                    tables)
+        constraint = CopyConstraint(self.torch, self.device, documents, specs[0])
         self.copy_words = max(self.copy_words, constraint.mask_words)
         self.copy_trace_words = max(self.copy_trace_words, constraint.trace_width)
         self.copy_trace = constraint.trace or self.copy_trace
@@ -697,24 +687,6 @@ class MapDecoder:
         lengths = self.lengths[map_index]
         return [self.tokens[map_index][document, :max(0, lengths[document])]
                 for document in documents]
-
-
-def in_background(function, *args) -> Future:
-    """Run a function on a new daemon thread and return its future.
-
-    The result, or the exception the function raised, is read with
-    `Future.result()`.
-    """
-    future = Future()
-
-    def run():
-        try:
-            future.set_result(function(*args))
-        except BaseException as error:
-            future.set_exception(error)
-
-    threading.Thread(target=run, daemon=True, name=function.__name__).start()
-    return future
 
 
 def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapDecoder:
