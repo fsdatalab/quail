@@ -61,6 +61,46 @@ def saved_answers(run_dir: Path, spec, tables) -> dict:
     return answers
 
 
+def saved_labels(run_dir: Path, spec, tables) -> dict:
+    """Return each filter and classification's saved answers, by prompt key.
+
+    For queries without reference labels: prompt key -> row index ->
+    TRUE/FALSE or label, keyed as bench.quailb.canonical_templates
+    keys a bound prompt.
+    """
+    import pyarrow.parquet as pq
+
+    import quail
+    from bench.quailb import _prompt_key
+    from quail.logical.prompts import bind_classify_prompt
+
+    info = spec.info
+    record = json.loads((run_dir / "run.json").read_text())
+    (query,) = [item for item in record["queries"] if item["id"] == spec.id]
+    paths = {entry["key"]: entry["path"]
+             for kind in ("filters", "classifications")
+             for entry in query["files"].get(kind) or ()}
+    relations = {relation.alias: relation for relation in info.relations}
+    labels = {}
+    for operator in (*info.filters, *info.classifies):
+        relation = relations[operator.relation]
+        left = quail.ColumnRef("left", relation.table, relation.text_column)
+        if hasattr(operator, "labels"):
+            bound = bind_classify_prompt(operator.prompt, (left,), operator.labels)
+            column = "label"
+        else:
+            bound = quail.bind_prompt(operator.prompt, (left,))
+            column = "answer"
+        table = pq.read_table(run_dir / spec.id / paths[operator.id])
+        ids = tables[relation.table].column("id").to_pylist()
+        row_of = {str(row_id): row for row, row_id in enumerate(ids)}
+        labels[_prompt_key(bound)] = {
+            row_of[str(row_id)]: value for row_id, value in zip(
+                table.column(operator.relation).to_pylist(),
+                table.column(column).to_pylist())}
+    return labels
+
+
 @app.function(image=gpu_image(), cpu=8, memory=65536, timeout=3600,
               volumes=VOLUMES)
 def estimate_sol(query_id: str, scale_factor: float, collection_id: str,
@@ -71,17 +111,36 @@ def estimate_sol(query_id: str, scale_factor: float, collection_id: str,
         The saved record as JSON.
     """
     import quail
-    from bench.quailb import answer_oracle, build_query
+    from bench.quailb import answer_oracle, build_query, data_directory, labeled
     from quail_b.benchmark import load_benchmark
 
     suite = load_benchmark([query_id], scale_factor=scale_factor,
-                           data_dir=Path(DATA_DIR) / f"sf{scale_factor}",
-                           collection_id=collection_id or None)
+                           data_dir=data_directory(DATA_DIR, scale_factor, [query_id]),
+                           collection_id=collection_id or None,
+                           accuracy=labeled([query_id]))
     spec = suite.queries[0]
-    saved = saved_answers(Path(run_dir), spec, suite.tables)
+    tables = dict(suite.tables)
+    if suite.ground_truth is None:
+        # the estimate does not apply the query's relational WHERE: keep
+        # only the documents the run evaluated, as its rows file lists
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+
+        record = json.loads((Path(run_dir) / "run.json").read_text())
+        (query_record,) = [item for item in record["queries"]
+                           if item["id"] == spec.id]
+        files = query_record["files"]
+        first = (files.get("filters") or files.get("extracts"))[0]["path"]
+        (relation,) = spec.info.relations
+        evaluated = pq.read_table(Path(run_dir) / spec.id / first).column(
+            relation.alias)
+        table = tables[relation.table]
+        tables[relation.table] = table.filter(pc.is_in(
+            table.column("id").cast("string"), value_set=evaluated.cast("string")))
+    saved = saved_answers(Path(run_dir), spec, tables)
     config = quail.EngineConfig(model=model, device="h100-sxm")
     with quail.Session(config) as session:
-        for name, table in suite.tables.items():
+        for name, table in tables.items():
             session.register(name, quail.DocumentProvider.from_table(
                 table, id_col="id"))
         query = build_query(session, spec)
@@ -89,8 +148,17 @@ def estimate_sol(query_id: str, scale_factor: float, collection_id: str,
         saved_by_prompt = {node.call.prompt: saved[node.name]
                            for node in (*operators.maps, *operators.extracts)
                            if node.name in saved}
-        reference = answer_oracle(suite.ground_truth, suite.tables,
-                                  session.model.turn)
+        if suite.ground_truth is not None:
+            reference = answer_oracle(suite.ground_truth, suite.tables)
+        else:
+            from bench.quailb import _prompt_key
+
+            run_labels = saved_labels(Path(run_dir), spec, tables)
+
+            def reference(prompt, assignment):
+                (row,) = assignment.values()
+                # a filtered-out row has no saved label: it never ran
+                return run_labels[_prompt_key(prompt)].get(row, False)
         from_run = set()
 
         def answer(prompt, assignment):
@@ -109,7 +177,7 @@ def estimate_sol(query_id: str, scale_factor: float, collection_id: str,
         "device": "h100-sxm", "chunk_tokens": sol.chunk_tokens,
         "answers_from_run": run_dir,
         "num_prompts_answered_from_run": len(from_run),
-        "reference_model": suite.ground_truth.reference_model,
+        "reference_model": getattr(suite.ground_truth, "reference_model", None),
         "assumptions": ("unlimited KV; ideal packing; each distinct document "
                         "prefix computed once; one decode pass per fed map "
                         "token; the maps of one document read it once per "
