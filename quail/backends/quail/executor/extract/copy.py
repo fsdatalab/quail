@@ -64,29 +64,37 @@ def _padded(values, dtype=np.int64):
     return out
 
 
-def _ranges(starts, counts):
-    """Return one row per range, start to start + count, padded with -1."""
-    width = max(1, int(counts.max(initial=0)))
-    columns = np.arange(width)
-    out = np.full((len(counts), width), -1, dtype=np.int64)
-    inside = columns < counts[:, None]
-    out[inside] = (starts[:, None] + columns)[inside]
-    return out
+# A stream stores position * STREAM_STRIDE + option.
+STREAM_STRIDE = 1 << 24
+
+
+def _flat_ranges(starts, counts):
+    """Return the ranges start to start + count, concatenated."""
+    return (np.repeat(starts - (np.cumsum(counts) - counts), counts)
+            + np.arange(int(counts.sum())))
+
+
+def _concatenated(arrays):
+    return np.concatenate(arrays) if arrays else np.zeros(0, dtype=np.int64)
 
 
 def copy_tables(documents) -> SimpleNamespace:
     """Return the host arrays a CopyConstraint reads, for all documents at once.
 
     A key is one distinct word key id within one document; keys are
-    numbered by document, then by key id. Each key's options are the
-    vocabulary's spellings of its word.
+    numbered by document, then by key id. A key's anchor is the
+    document's token at the key's first position. Options are stored once
+    per distinct anchor token: the vocabulary's spellings of the anchor's
+    word, each followed by the rest of the anchor. A key reads its
+    anchor's options.
 
     Args:
         documents: The extraction inputs, with each document's token scan.
 
     Returns:
-        The document positions, their keys and options, and the lookup
-        from (key, token) to option, as numpy arrays.
+        The document positions and their keys, each document's range of
+        keys, each key's range of options, the options, and the lookup
+        from (anchor, token) to option, as numpy arrays.
     """
     vocabulary = documents.vocabulary
     scans = [document.scan for document in documents.documents]
@@ -95,52 +103,55 @@ def copy_tables(documents) -> SimpleNamespace:
     position_starts = np.r_[0, np.cumsum(lengths)]
     zero = np.array([0])
     if not num_positions:
+        empty = np.zeros(num_documents, dtype=np.int64)
         return SimpleNamespace(
-            num_keys=1, characters=zero, position_ends=zero,
-            position_documents=zero, option_tokens=zero, filler_tokens=zero,
-            filler_chars=zero, option_rows=_ranges(lengths, lengths),
-            position_keys=zero, option_order=zero, option_lookup=zero,
-            position_offsets=position_starts, max_positions=1,
-            positions=_ranges(position_starts[:-1], lengths),
-            position_local_keys=zero, option_local_keys=zero)
-    kids = np.concatenate([scan.kids for scan in scans]).astype(np.int64)
-    tokens = np.concatenate([scan.tokens for scan in scans]).astype(np.int64)
+            num_keys=1, max_options=1, characters=zero, position_ends=zero,
+            position_documents=zero, position_offsets=position_starts,
+            max_positions=1, position_keys=zero, position_local_keys=zero,
+            document_key_starts=empty, document_key_ends=empty, key_anchors=zero,
+            key_option_starts=zero, key_option_counts=zero, option_tokens=zero,
+            filler_tokens=zero, filler_chars=zero, option_order=zero,
+            option_lookup=zero)
+    kids = _concatenated([scan.kids for scan in scans]).astype(np.int64)
+    tokens = _concatenated([scan.tokens for scan in scans]).astype(np.int64)
     position_documents = np.repeat(np.arange(num_documents), lengths)
     width = int(kids.max()) + 1
     keys, first, position_keys = np.unique(
         position_documents * width + kids, return_index=True, return_inverse=True)
-    key_documents, key_kids = np.divmod(keys, width)
-    key_starts = np.searchsorted(key_documents, np.arange(num_documents))
-    num_keys = np.bincount(key_documents, minlength=num_documents)
-    offsets, table_tokens, table_lengths = vocabulary.option_table(key_kids)
-    counts = offsets[key_kids + 1] - offsets[key_kids]
-    option_keys = np.repeat(np.arange(len(keys)), counts)
-    indices = (np.repeat(offsets[key_kids] - (np.cumsum(counts) - counts), counts)
-               + np.arange(counts.sum()))
-    num_options = int(counts.sum())
-    option_tokens = table_tokens[indices] if num_options else zero
-    option_counts = np.bincount(key_documents[option_keys], minlength=num_documents)
-    lookup = ((option_keys if num_options else zero) * len(vocabulary.vocab)
-              + option_tokens)
+    key_documents = keys // width
+    key_starts = np.searchsorted(key_documents, np.arange(num_documents + 1))
+    anchors, key_anchors = np.unique(tokens[first], return_inverse=True)
+    anchor_kids = vocabulary.key_of[anchors]
+    offsets, table_tokens, table_lengths = vocabulary.option_table(anchor_kids)
+    anchor_counts = offsets[anchor_kids + 1] - offsets[anchor_kids]
+    indices = _flat_ranges(offsets[anchor_kids], anchor_counts)
+    option_tokens = table_tokens[indices]
+    lookup = (np.repeat(np.arange(len(anchors)), anchor_counts)
+              * len(vocabulary.vocab) + option_tokens)
     order = np.argsort(lookup)
+    key_option_counts = anchor_counts[key_anchors]
+    document_options = np.bincount(
+        key_documents, weights=key_option_counts, minlength=num_documents)
     return SimpleNamespace(
-        num_keys=max(1, int(num_keys.max(initial=0))),
-        characters=np.concatenate([scan.starts for scan in scans]),
-        position_ends=np.concatenate([scan.ends for scan in scans]),
+        num_keys=max(1, int(np.diff(key_starts).max(initial=0))),
+        max_options=max(1, int(document_options.max(initial=0))),
+        characters=_concatenated([scan.starts for scan in scans]),
+        position_ends=_concatenated([scan.ends for scan in scans]),
         position_documents=position_documents,
-        option_tokens=option_tokens,
-        filler_tokens=tokens[first[option_keys]] if num_options else zero,
-        filler_chars=table_lengths[indices] if num_options else zero,
-        option_rows=_ranges(np.r_[0, np.cumsum(option_counts)][:-1], option_counts),
-        position_keys=position_keys,
-        option_order=order,
-        option_lookup=lookup[order],
         position_offsets=position_starts,
         max_positions=max(1, int(lengths.max(initial=0))),
-        positions=_ranges(position_starts[:-1], lengths),
+        position_keys=position_keys,
         position_local_keys=position_keys - key_starts[position_documents],
-        option_local_keys=(option_keys - key_starts[key_documents[option_keys]]
-                           if num_options else zero),
+        document_key_starts=key_starts[:-1],
+        document_key_ends=key_starts[1:],
+        key_anchors=key_anchors,
+        key_option_starts=(np.cumsum(anchor_counts) - anchor_counts)[key_anchors],
+        key_option_counts=key_option_counts,
+        option_tokens=option_tokens,
+        filler_tokens=np.repeat(anchors, anchor_counts),
+        filler_chars=table_lengths[indices],
+        option_order=order,
+        option_lookup=lookup[order],
     )
 
 
@@ -159,17 +170,23 @@ class CopyConstraint:
         vocabulary = self.vocabulary = documents.vocabulary
         tables = copy_tables(documents)
         self.num_keys = tables.num_keys
+        self.max_options = tables.max_options
         self.characters = tables.characters
         self.position_ends = tables.position_ends
         self.position_documents = tables.position_documents
         self.option_tokens = tables.option_tokens
         self.filler_tokens = tables.filler_tokens
         self.filler_chars = tables.filler_chars
-        self.option_rows = tables.option_rows
         self.position_keys = tables.position_keys
+        self.document_key_starts = tables.document_key_starts
+        self.document_key_ends = tables.document_key_ends
+        self.key_anchors = tables.key_anchors
         self.option_order = tables.option_order
         self.option_lookup = tables.option_lookup
-        self.filler_lengths = np.full(len(self.option_tokens), -1, dtype=np.int64)
+        self.num_options = len(self.option_tokens)
+        if self.num_options >= STREAM_STRIDE:
+            raise ValueError("too many copy options for one stream stride")
+        self.filler_lengths = np.full(self.num_options, -1, dtype=np.int64)
         self.position_lengths = np.zeros(len(self.characters), dtype=np.int64)
         self.position_rows = np.full(len(self.characters), -1, dtype=np.int64)
         self.position_offsets = tables.position_offsets
@@ -182,13 +199,16 @@ class CopyConstraint:
         self.exhausted = np.zeros(len(self.characters), dtype=bool)
         self.prepared = np.empty(0, dtype=np.int64)
         self.num_positions = 0
-        self.num_options = len(self.option_tokens)
-        self.streams = np.where(tables.positions >= 0,
-                                tables.positions * self.num_options, -1)
-        self.stream_ids = self.tensor(self.streams)
-        self.option_rows_device = self.tensor(self.option_rows)
+        starts = self.position_offsets_device[:-1, None]
+        columns = torch.arange(self.max_positions, device=self.device)
+        self.stream_ids = torch.where(
+            columns < self.position_offsets_device[1:, None] - starts,
+            (starts + columns) * STREAM_STRIDE, -1)
+        self.document_key_starts_device = self.tensor(self.document_key_starts)
+        self.document_key_ends_device = self.tensor(self.document_key_ends)
+        self.key_option_starts = self.tensor(tables.key_option_starts)
+        self.key_option_counts = self.tensor(tables.key_option_counts)
         self.key_ids = self.tensor(tables.position_local_keys)
-        self.option_key_ids = self.tensor(tables.option_local_keys)
         self.first_tokens = self.tensor(self.option_tokens)
         self.filler_rows = np.full(self.num_options, -1, dtype=np.int64)
         self.filler_rows_device = self.tensor(self.filler_rows.copy())
@@ -217,11 +237,15 @@ class CopyConstraint:
             return
         self.prepared = np.union1d(self.prepared, pairs)
         documents, tokens = np.divmod(pairs, width)
-        options = self.option_rows[documents]
-        matches = (options >= 0) & (
-            self.option_tokens[np.maximum(options, 0)] == tokens[:, None]
-        )
-        options = np.unique(options[matches])
+        counts = (self.document_key_ends[documents]
+                  - self.document_key_starts[documents])
+        keys = _flat_ranges(self.document_key_starts[documents], counts)
+        lookup = (self.key_anchors[keys] * width
+                  + np.repeat(tokens, counts))
+        found = np.minimum(np.searchsorted(self.option_lookup, lookup),
+                           len(self.option_lookup) - 1)
+        options = np.unique(
+            self.option_order[found[self.option_lookup[found] == lookup]])
         missing = options[self.filler_lengths[options] < 0]
         fillers = [
             self.vocabulary.filler(
@@ -268,7 +292,7 @@ class CopyConstraint:
         """Pack surviving document positions into 64-bit words for the host copy."""
         torch = self.torch
         positions = (
-            (streams.clamp_min(0) // self.num_options)
+            (streams.clamp_min(0) // STREAM_STRIDE)
             - self.position_offsets_device[documents, None]
         ).clamp_min(0)
         mask = torch.zeros(
@@ -287,7 +311,7 @@ class CopyConstraint:
         if not len(documents):
             return
         self._prepare_fillers(documents, tokens)
-        source_positions, source_options = np.divmod(sources, self.num_options)
+        source_positions, source_options = np.divmod(sources, STREAM_STRIDE)
         self._extend(
             source_positions,
             np.maximum(0, written - 1 + drafts - self.filler_lengths[source_options]),
@@ -300,9 +324,8 @@ class CopyConstraint:
         )
         drafts = np.minimum(drafts, np.maximum(0, remaining))
         answers, positions = self.live_positions(documents, masks)
-        lookup = (
-            self.position_keys[positions] * len(self.vocabulary.vocab) + tokens[answers]
-        )
+        lookup = (self.key_anchors[self.position_keys[positions]]
+                  * len(self.vocabulary.vocab) + tokens[answers])
         options = self.option_order[np.searchsorted(self.option_lookup, lookup)]
         for step in range(int(drafts.max(initial=0)) + 1):
             at = written[answers] + step
@@ -462,7 +485,7 @@ class CopyConstraint:
         torch = self.torch
         valid = streams >= 0
         streams = streams.clamp_min(0)
-        position, option = streams // self.num_options, streams % self.num_options
+        position, option = streams // STREAM_STRIDE, streams % STREAM_STRIDE
         filler_row = self.filler_rows_device[option].clamp_min(0)
         size = self.num_fillers[filler_row]
         following = at - size - 1
@@ -500,6 +523,26 @@ class CopyConstraint:
         return self._choose(values[:, 1 + k:], values[:, 1:1 + k].to(self.torch.int64),
                             values[:, 0], streams, alive, at, documents, first)
 
+    def _document_options(self, documents):
+        """Return each row's document options, padded with -1, and their keys.
+
+        A key is the option's key index within its document.
+        """
+        torch = self.torch
+        keys = (self.document_key_starts_device[documents, None]
+                + torch.arange(self.num_keys, device=self.device))
+        inside = keys < self.document_key_ends_device[documents, None]
+        keys = torch.where(inside, keys, 0)
+        counts = torch.where(inside, self.key_option_counts[keys], 0)
+        ends = counts.cumsum(dim=1)
+        columns = torch.arange(self.max_options, device=self.device).expand(
+            len(documents), -1).contiguous()
+        key = torch.searchsorted(ends, columns, right=True).clamp_max(
+            self.num_keys - 1)
+        options = (self.key_option_starts[keys.gather(1, key)] + columns
+                   - (ends - counts).gather(1, key))
+        return torch.where(columns < ends[:, -1:], options, -1), key
+
     def _choose(self, top_values, top_ids, stop, streams, alive, at, documents, first):
         torch = self.torch
         sorted_ids, order = top_ids.sort(dim=1)
@@ -514,9 +557,8 @@ class CopyConstraint:
         top = top_ids[:, 0]
         possible = alive
         if first:
-            options = self.option_rows_device[documents]
+            options, key = self._document_options(documents)
             option = options.clamp_min(0)
-            key = self.option_key_ids[option]
             values = scores(self.first_tokens[option])
             values = torch.where(options >= 0, values, -float("inf"))
             if self.trace is not None:
@@ -526,8 +568,8 @@ class CopyConstraint:
             )
             maxima.scatter_reduce_(1, key, values, reduce="amax", include_self=True)
             ranked = torch.where(
-                values == maxima.gather(1, key), option, self.num_options
-            )
+                (values == maxima.gather(1, key)) & (options >= 0),
+                option, self.num_options)
             best_option = torch.full(
                 (len(at), self.num_keys),
                 self.num_options,
@@ -542,9 +584,9 @@ class CopyConstraint:
             first_token = self.first_tokens[
                 best_option.gather(1, first_key[:, None])
             ].squeeze(1)
-            position = streams.clamp_min(0) // self.num_options
+            position = streams.clamp_min(0) // STREAM_STRIDE
             keys = self.key_ids[position]
-            initial = position * self.num_options + best_option.gather(1, keys)
+            initial = position * STREAM_STRIDE + best_option.gather(1, keys)
             initial = torch.where(streams >= 0, initial, -1)
             streams.copy_(torch.where(at[:, None] == 0, initial, streams))
             possible = alive & ((at[:, None] > 0) | maxima.gather(1, keys).isfinite())
@@ -687,7 +729,7 @@ class CopyConstraint:
 
     def source(self, streams, alive):
         """Return the first surviving position in document order."""
-        chars = self.characters_device[(streams.clamp_min(0) // self.num_options)]
+        chars = self.characters_device[(streams.clamp_min(0) // STREAM_STRIDE)]
         chars = self.torch.where(alive, chars, np.iinfo(np.int64).max)
         return streams.gather(1, chars.argmin(dim=1)[:, None]).squeeze(1)
 
@@ -699,7 +741,7 @@ class CopyConstraint:
                 values.append(None)
                 spans.append(None)
                 continue
-            position, option = divmod(source, self.num_options)
+            position, option = divmod(source, STREAM_STRIDE)
             start = int(self.characters[position])
             index = max(0, length - 1 - max(0, self.filler_lengths[option]))
             end = int(
