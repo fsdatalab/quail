@@ -715,3 +715,4 @@ def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():
     # a later suffix of document 1 follows its 10 prompt tokens: keys 11 and 12
     StageExecutor._count_pass(executor, [(1, 1, 0, 1, False)], 2, None, ())
     assert executor.pass_work["pairs"] == sum(range(5, 13)) + 11 + 12
+

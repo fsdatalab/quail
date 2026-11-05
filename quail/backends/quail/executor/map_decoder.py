@@ -49,8 +49,10 @@ class MapDecoder:
     """
 
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
-                 page_tokens: int, expected_tokens=None, *, workspace_bytes=0):
+                 page_tokens: int, expected_tokens=None, *, workspace_bytes=0,
+                 row_budget=None):
         self.workspace_bytes = workspace_bytes
+        self.row_budget = row_budget
         self.torch = torch
         self.head = head
         self.limits = np.asarray(limits, dtype=np.int64)
@@ -165,6 +167,7 @@ class MapDecoder:
         counts = np.ones(len(running), dtype=np.int64)
         written = np.zeros(len(running), dtype=np.int64)
         sizes = np.zeros(len(running), dtype=np.int64)
+        curves = {}
         for q, state in self.copy_constraints.items():
             mine = self.map[running] == q
             slots = running[mine]
@@ -178,6 +181,7 @@ class MapDecoder:
             curve = answer_survival(self.lengths[q], self.written[q],
                                     spec.expected_answer_tokens,
                                     spec.max_answer_tokens)
+            curves[q] = curve
             sizes[mine] = draft_lengths(
                 spec.draft_tokens, spec.max_answer_tokens, curve, written[mine],
                 self.num_streams[slots], state.rho[self.copy_document[slots]],
@@ -198,8 +202,30 @@ class MapDecoder:
             remaining = (1 + constraint.filler_lengths[option]
                          + constraint.position_lengths[position] - written[mine])
             counts[mine] += np.minimum(sizes[mine], np.maximum(0, remaining))
+        if self.row_budget is not None and counts.sum() > self.row_budget:
+            counts = 1 + self._fit_drafts(running, written, counts - 1, curves)
         self.drafts[running] = counts - 1
         return counts
+
+    def _fit_drafts(self, running, written, drafts, curves):
+        """Keep the draft rows with the most expected writes in the row budget.
+
+        Each answer keeps its chosen-token row. A fixed-length field has
+        no odds, so its j-th draft token ranks as 1 / j and fixed drafts
+        shrink evenly.
+        """
+        from quail.cost.draft_policy import draft_gains, fit_drafts
+
+        width = int(drafts.max())
+        gains = np.zeros((len(running), width))
+        gains[:] = 1.0 / np.arange(1, width + 1)
+        for q, curve in curves.items():
+            mine = np.flatnonzero(self.map[running] == q)
+            state = self.copy_constraints[q]
+            gains[mine] = draft_gains(
+                width, state.spec.max_answer_tokens, curve, written[mine],
+                self.num_streams[running[mine]], state.trials, state.accepts)
+        return fit_drafts(gains, drafts, self.row_budget - len(running))
 
     def _prepare_copy(self, group, slots, written, drafts):
         local = group.index[slots]
@@ -673,4 +699,5 @@ def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapD
         limits, state.loaded_model.tokenizer.stop_ids,
         state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens,
         workspace_bytes=copy_verification_workspace_bytes(
-            state.loaded_model.model_spec, state.chunk_tokens))
+            state.loaded_model.model_spec, state.chunk_tokens),
+        row_budget=state.chunk_tokens)

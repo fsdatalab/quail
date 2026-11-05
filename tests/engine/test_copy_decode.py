@@ -15,16 +15,19 @@ from quail.backends.quail.executor.map_decoder import MapDecoder
 
 
 # a draft policy matters only with draft tokens, and drafts only past one token
+# a row budget below every draft trims drafts, never answers
 @pytest.mark.parametrize(
-    "draft_tokens,draft_policy,spellings,answer_limit",
+    "draft_tokens,draft_policy,spellings,answer_limit,row_budget",
     [
-        (0, "fixed", False, 1),
-        (4, "fixed", True, 8),
-        (4, "adaptive", False, 8),
+        (0, "fixed", False, 1, None),
+        (4, "fixed", True, 8, None),
+        (4, "adaptive", False, 8, None),
+        (4, "fixed", True, 8, 40),
+        (4, "adaptive", False, 8, 40),
     ],
 )
 def test_copy_answers_and_spans_match_the_recurrent_token_rule(
-    draft_tokens, draft_policy, spellings, answer_limit
+    draft_tokens, draft_policy, spellings, answer_limit, row_budget
 ):
     rng = np.random.default_rng(817)
     words = (
@@ -95,6 +98,7 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
         vocabulary.tokenizer.stop_ids,
         16,
         workspace_bytes=64 * 2**20,
+        row_budget=row_budget,
     )
     decoder.configure_copy(0, slots, documents, [spec] * num_questions)
     for q in range(num_questions):
@@ -108,6 +112,8 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
     while decoder.active:
         rows = decoder.rows()
         assert rows is not None
+        if row_budget is not None:
+            assert len(rows) <= max(row_budget, len(decoder.running()))
         chunk = SimpleNamespace(
             decode_rows=rows,
             tokens=len(rows),
