@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::functions::ai_function_name;
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{Column, ScalarValue};
@@ -583,8 +584,9 @@ fn output_name(expr: &Expr) -> String {
 /// An expression without the AS names on it, and the name the query
 /// wrote for it.
 ///
-/// DataFusion names `COUNT(*)` itself, as `count(Int64(1)) AS count(*)`;
-/// that name is not one the query wrote.
+/// DataFusion names `COUNT(*)` itself, as `count(Int64(1)) AS count(*)`,
+/// and a call written by a dotted name, as `ai_map(...) AS AI.MAP(...)`;
+/// those names are not ones the query wrote.
 fn unalias(expr: &Expr) -> (&Expr, Option<&str>) {
     let mut names = Vec::new();
     let mut node = expr;
@@ -592,7 +594,12 @@ fn unalias(expr: &Expr) -> (&Expr, Option<&str>) {
         names.push(alias.name.as_str());
         node = &alias.expr;
     }
-    let automatic = names.last() == Some(&"count(*)");
+    let automatic = names.last().is_some_and(|name| {
+        *name == "count(*)"
+            || name.split_once('(').is_some_and(|(function, _)| {
+                function.contains('.') && ai_function_name(function).is_some()
+            })
+    });
     let written = if automatic {
         names.len() > 1
     } else {

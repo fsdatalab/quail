@@ -1,11 +1,11 @@
 DataFusion:
 Sort: n DESC NULLS LAST, intent ASC NULLS LAST
-  Projection: ai_classify(prompt(Utf8("Judge strictly from the customer's opening message above what the customer wants the agent to do.
+  Projection: AI.CLASSIFY(prompt(Utf8("Judge strictly from the customer's opening message above what the customer wants the agent to do.
 
-{0}"),t.request),make_array(struct(Utf8("cancel"),Utf8("cancel an order, flight, or reservation")),struct(Utf8("change"),Utf8("modify an order or reservation, such as items, flights, seats, baggage, or address")),struct(Utf8("return or exchange"),Utf8("return delivered items or exchange them for others")),struct(Utf8("refund or compensation"),Utf8("get money back or compensation without changing the order")),struct(Utf8("information"),Utf8("ask about an order, reservation, product, or policy")),struct(Utf8("other"),Utf8("none of the above")))) AS intent, count(Int64(1)) AS count(*) AS n
-    Aggregate: groupBy=[[intent AS ai_classify(prompt(Utf8("Judge strictly from the customer's opening message above what the customer wants the agent to do.
+{0}"), t.request),make_array(struct(Utf8("cancel"), Utf8("cancel an order, flight, or reservation")), struct(Utf8("change"), Utf8("modify an order or reservation, such as items, flights, seats, baggage, or address")), struct(Utf8("return or exchange"), Utf8("return delivered items or exchange them for others")), struct(Utf8("refund or compensation"), Utf8("get money back or compensation without changing the order")), struct(Utf8("information"), Utf8("ask about an order, reservation, product, or policy")), struct(Utf8("other"), Utf8("none of the above")))) AS intent, count(Int64(1)) AS count(*) AS n
+    Aggregate: groupBy=[[intent AS AI.CLASSIFY(prompt(Utf8("Judge strictly from the customer's opening message above what the customer wants the agent to do.
 
-{0}"),t.request),make_array(struct(Utf8("cancel"),Utf8("cancel an order, flight, or reservation")),struct(Utf8("change"),Utf8("modify an order or reservation, such as items, flights, seats, baggage, or address")),struct(Utf8("return or exchange"),Utf8("return delivered items or exchange them for others")),struct(Utf8("refund or compensation"),Utf8("get money back or compensation without changing the order")),struct(Utf8("information"),Utf8("ask about an order, reservation, product, or policy")),struct(Utf8("other"),Utf8("none of the above"))))]], aggr=[[count(Int64(1))]]
+{0}"), t.request),make_array(struct(Utf8("cancel"), Utf8("cancel an order, flight, or reservation")), struct(Utf8("change"), Utf8("modify an order or reservation, such as items, flights, seats, baggage, or address")), struct(Utf8("return or exchange"), Utf8("return delivered items or exchange them for others")), struct(Utf8("refund or compensation"), Utf8("get money back or compensation without changing the order")), struct(Utf8("information"), Utf8("ask about an order, reservation, product, or policy")), struct(Utf8("other"), Utf8("none of the above"))))]], aggr=[[count(Int64(1))]]
       ModelRegion
 
 model region:

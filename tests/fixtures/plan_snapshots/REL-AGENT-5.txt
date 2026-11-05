@@ -1,12 +1,12 @@
 DataFusion:
 Sort: n DESC NULLS LAST, test_result ASC NULLS LAST
-  Projection: ai_classify(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
+  Projection: AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
 
-{0}"),t.trace),make_array(struct(Utf8("bug fixed, tests pass"),Utf8("the reported bug no longer occurs and other tests pass")),struct(Utf8("bug still occurs"),Utf8("the reported bug still happens")),struct(Utf8("bug fixed, other tests fail"),Utf8("the reported bug no longer occurs but other tests fail")),struct(Utf8("run errored"),Utf8("the run crashed or errored before testing anything")))) AS test_result, count(Int64(1)) AS count(*) AS n, count(DISTINCT t.trajectory_id) AS trajectories
+{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything")))) AS test_result, count(Int64(1)) AS count(*) AS n, count(DISTINCT t.trajectory_id) AS trajectories
     Filter: count(Int64(1)) >= Int64(50)
-      Aggregate: groupBy=[[test_result AS ai_classify(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
+      Aggregate: groupBy=[[test_result AS AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
 
-{0}"),t.trace),make_array(struct(Utf8("bug fixed, tests pass"),Utf8("the reported bug no longer occurs and other tests pass")),struct(Utf8("bug still occurs"),Utf8("the reported bug still happens")),struct(Utf8("bug fixed, other tests fail"),Utf8("the reported bug no longer occurs but other tests fail")),struct(Utf8("run errored"),Utf8("the run crashed or errored before testing anything"))))]], aggr=[[count(Int64(1)), count(DISTINCT t.trajectory_id)]]
+{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))]], aggr=[[count(Int64(1)), count(DISTINCT t.trajectory_id)]]
         ModelRegion
 
 model region:

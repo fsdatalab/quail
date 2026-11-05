@@ -20,6 +20,7 @@ pub mod bind;
 mod claim;
 mod distinct;
 mod exec;
+mod extension;
 mod functions;
 mod joins;
 mod lower;
@@ -38,7 +39,6 @@ use datafusion::common::{DFSchema, Result};
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
-use datafusion::optimizer::{Analyzer, AnalyzerRule};
 use datafusion::sql::parser::Statement;
 
 pub use aliases::{
@@ -48,9 +48,9 @@ pub use aliases::{
 pub use claim::ClaimModelRegions;
 pub use distinct::{EliminateDistinct, PushDownDistinct};
 pub use exec::{InputRows, ModelRegionExec, ModelRegionPlanner, RegionBatches, RegionRunner};
+pub use extension::QuailExtension;
 pub use functions::{
-    AI_FUNCTION_NAMES, arrow_functions, brace_structs, is_ai_call, normalize_ai_calls,
-    quail_functions,
+    AI_FUNCTION_NAMES, arrow_functions, brace_structs, is_ai_call, quail_functions,
 };
 pub use lower::{LowerAiCalls, lower_ai_calls};
 pub use optimize::{OptimizeModelRegions, REGION_RULES, optimize_region, region_rule};
@@ -59,20 +59,6 @@ pub use region::ModelRegion;
 pub use translate::translate_relation;
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 pub use unparse::region_sql;
-
-/// Return DataFusion's analyzer rules with `ClaimModelRegions` and
-/// `LowerAiCalls` first.
-///
-/// A region then holds the plan as DataFusion's SQL planner bound it,
-/// before type coercion adds casts: its conditions as written, its ON
-/// clauses whole, and an EXISTS gate as a subquery, as Quail's own SQL
-/// front end binds them.
-pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
-    let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> =
-        vec![Arc::new(ClaimModelRegions::new()), Arc::new(LowerAiCalls)];
-    rules.extend(Analyzer::new().rules);
-    rules
-}
 
 /// Build a DataFusion session state with Quail registered.
 ///
@@ -89,13 +75,14 @@ pub fn session_state_with_rules(
     regions: OptimizeModelRegions,
 ) -> SessionState {
     let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Snowflake");
-    SessionStateBuilder::new()
+    let state = SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()
-        .with_analyzer_rules(analyzer_rules())
-        .with_optimizer_rule(Arc::new(regions))
-        .with_query_planner(Arc::new(exec::QuailQueryPlanner::new(runner)))
-        .build()
+        .build();
+    QuailExtension::new(runner)
+        .with_region_rules(regions.rules().to_vec())
+        .and_then(|quail| quail.register(state))
+        .expect("Quail's rules and functions register on a new session")
 }
 
 /// Build a DataFusion session context with Quail registered.
@@ -110,9 +97,7 @@ pub fn session_context_with_rules(
     regions: OptimizeModelRegions,
 ) -> SessionContext {
     let context = SessionContext::new_with_state(session_state_with_rules(runner, regions));
-    for function in quail_functions() {
-        context.register_udf(function.as_ref().clone());
-    }
+    // Quail's own sessions also call Arrow compute functions by name
     let state = context.state();
     let taken = |name: &str| state.scalar_functions().contains_key(name);
     for function in arrow_functions(&taken) {
@@ -151,7 +136,7 @@ pub async fn sql_in_dialect(
             .sql_parser
             .default_null_ordering = "nulls_min".to_string();
     }
-    let mut text = normalize_ai_calls(query);
+    let mut text = query.to_string();
     if matches!(dialect, datafusion::config::Dialect::BigQuery) {
         text = brace_structs(&text);
     }

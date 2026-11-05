@@ -1,16 +1,16 @@
 DataFusion:
 Sort: mean_fix_score DESC NULLS LAST, t.trajectory_id ASC NULLS LAST, fetch=10
-  Projection: t.trajectory_id, avg(ai_score(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.
+  Projection: t.trajectory_id, avg(AI.SCORE(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.
 
 {0}
 
-Instruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."),t.trace))) AS mean_fix_score, count(Int64(1)) AS count(*) AS n
+Instruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace))) AS mean_fix_score, count(Int64(1)) AS count(*) AS n
     Filter: count(Int64(1)) >= Int64(5)
-      Aggregate: groupBy=[[t.trajectory_id]], aggr=[[avg(__quail_call_1) AS avg(ai_score(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.
+      Aggregate: groupBy=[[t.trajectory_id]], aggr=[[avg(__quail_call_1 AS AI.SCORE(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.
 
 {0}
 
-Instruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."),t.trace))), count(Int64(1))]]
+Instruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace))), count(Int64(1))]]
         ModelRegion
 
 model region:

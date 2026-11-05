@@ -42,13 +42,70 @@ impl ClaimModelRegions {
     }
 }
 
+/// Remove the name DataFusion gives an AI call written by a dotted
+/// name, such as `AI.IF(...)`, where a SELECT alias replaces it or
+/// where it names no column: inside a `WHERE` or `ON` test, or
+/// under the SELECT alias.
+fn drop_written_names(plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn written(expr: &Expr) -> Option<&Expr> {
+        match expr {
+            Expr::Alias(alias) if is_ai_call(&alias.expr) => Some(alias.expr.as_ref()),
+            _ => None,
+        }
+    }
+    fn unnamed(expr: Expr) -> Result<Transformed<Expr>> {
+        expr.transform_up(|inner| match written(&inner) {
+            Some(call) => Ok(Transformed::yes(call.clone())),
+            None => Ok(Transformed::no(inner)),
+        })
+    }
+    plan.transform_up(|node| {
+        let tests = matches!(node, LogicalPlan::Filter(_) | LogicalPlan::Join(_));
+        node.map_expressions(|expr| {
+            if tests {
+                return unnamed(expr);
+            }
+            match expr {
+                Expr::Alias(mut alias) => match written(&alias.expr) {
+                    Some(call) => {
+                        alias.expr = Box::new(call.clone());
+                        Ok(Transformed::yes(Expr::Alias(alias)))
+                    }
+                    None => Ok(Transformed::no(Expr::Alias(alias))),
+                },
+                other => Ok(Transformed::no(other)),
+            }
+        })
+    })
+    .map(|done| done.data)
+}
+
 impl AnalyzerRule for ClaimModelRegions {
     fn name(&self) -> &str {
         "claim_model_regions"
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        let plan = drop_written_names(plan)?;
         let mut extracted = Extracted::default();
+        // the call each written name, such as `AI.CLASSIFY(...)`, names
+        let mut written: Vec<(String, String)> = Vec::new();
+        plan.apply(|node| {
+            for expr in node.expressions() {
+                if let Expr::Alias(alias) = &expr
+                    && is_ai_call(&alias.expr)
+                {
+                    written.push((alias.name.clone(), alias.expr.schema_name().to_string()));
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let call_named = |name: &str| {
+            written
+                .iter()
+                .find(|(found, _)| found == name)
+                .map_or_else(|| name.to_string(), |(_, call)| call.clone())
+        };
         // a moved call keeps the name the SELECT list gives it
         plan.apply(|node| {
             if let LogicalPlan::Projection(projection) = node {
@@ -56,7 +113,7 @@ impl AnalyzerRule for ClaimModelRegions {
                     // the call itself, or the column a GROUP BY makes of it
                     let Expr::Alias(alias) = expr else { continue };
                     let named = match alias.expr.as_ref() {
-                        Expr::Column(column) => Some(column.name.clone()),
+                        Expr::Column(column) => Some(call_named(&column.name)),
                         inner if is_ai_call(inner) => Some(inner.schema_name().to_string()),
                         _ => None,
                     };

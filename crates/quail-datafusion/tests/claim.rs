@@ -105,8 +105,8 @@ async fn a_query_without_ai_calls_has_no_model_region() -> Result<()> {
 #[tokio::test]
 async fn datafusion_groups_the_answers_a_region_returns() -> Result<()> {
     let context = context()?;
-    let query = "SELECT AI.CLASSIFY(r.body, ['good', 'bad']) AS label, COUNT(*) AS n \
-        FROM reviews r GROUP BY label";
+    let query = "SELECT AI.CLASSIFY(PROMPT('Tone of {0}?', r.body), ['good', 'bad']) AS label, \
+        COUNT(*) AS n FROM reviews r GROUP BY label ORDER BY n DESC, label";
     let plan = optimized(&context, query).await?;
     let shape = lines(&plan);
     assert!(
@@ -120,8 +120,11 @@ async fn datafusion_groups_the_answers_a_region_returns() -> Result<()> {
         !inner.iter().any(|line| line.starts_with("Aggregate")),
         "{inner:?}"
     );
+    // the classification's column keeps the name SELECT gives it
     assert!(
-        inner.iter().any(|line| line.starts_with("SemanticColumn")),
+        inner
+            .iter()
+            .any(|line| line.starts_with("SemanticColumn: label = ai_classify")),
         "{inner:?}"
     );
     Ok(())

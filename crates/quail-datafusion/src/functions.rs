@@ -15,8 +15,8 @@ use datafusion::logical_expr::{
 
 /// The AI functions, by their internal names.
 ///
-/// `AI.IF` reaches DataFusion as `ai_filter`, and every other
-/// `AI.<name>` as `ai_<name>`; see [`normalize_ai_calls`].
+/// SQL may also write `AI.IF` for `ai_filter`, and `AI.<name>` or
+/// `ai.<name>` for every other `ai_<name>`; see [`ai_function_name`].
 /// `ai_extract_span` is the answer positions of an `ai_extract`; see
 /// [`crate::add_extract_spans`].
 pub const AI_FUNCTION_NAMES: [&str; 7] = [
@@ -28,6 +28,20 @@ pub const AI_FUNCTION_NAMES: [&str; 7] = [
     "ai_map",
     "ai_sae_features",
 ];
+
+/// The internal name of the AI function SQL writes as `name`, such as
+/// `ai_filter` for `AI.IF` or `ai.if`, or None for any other function.
+pub fn ai_function_name(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    let internal = match lower.strip_prefix("ai.") {
+        Some("if") => "ai_filter".to_string(),
+        Some(rest) => format!("ai_{rest}"),
+        None => lower,
+    };
+    AI_FUNCTION_NAMES
+        .into_iter()
+        .find(|known| *known == internal)
+}
 
 /// The kind of each Quail function, which decides its result type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,14 +67,25 @@ struct QuailFunction {
     name: &'static str,
     kind: FunctionKind,
     signature: Signature,
+    /// The names SQL writes the function by, such as `AI.IF` for
+    /// `ai_filter`: DataFusion looks a dotted name up as written.
+    aliases: Vec<String>,
 }
 
 impl QuailFunction {
     fn new(name: &'static str, kind: FunctionKind) -> Self {
+        let dotted = match name {
+            "ai_filter" => Some("if".to_string()),
+            _ => name.strip_prefix("ai_").map(str::to_string),
+        };
+        let aliases = dotted
+            .map(|rest| vec![format!("AI.{}", rest.to_uppercase()), format!("ai.{rest}")])
+            .unwrap_or_default();
         Self {
             name,
             kind,
             signature: Signature::variadic_any(Volatility::Volatile),
+            aliases,
         }
     }
 }
@@ -68,6 +93,10 @@ impl QuailFunction {
 impl ScalarUDFImpl for QuailFunction {
     fn name(&self) -> &str {
         self.name
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
     }
 
     fn signature(&self) -> &Signature {
@@ -244,92 +273,6 @@ pub fn arrow_functions(taken: &dyn Fn(&str) -> bool) -> Vec<Arc<ScalarUDF>> {
 /// Whether an expression is a call to an AI function.
 pub fn is_ai_call(expr: &Expr) -> bool {
     matches!(expr, Expr::ScalarFunction(call) if AI_FUNCTION_NAMES.contains(&call.name()))
-}
-
-/// Rewrite dotted AI calls to internal names: `AI.IF(` to
-/// `ai_filter(` and `AI.<name>(` to `ai_<name>(`.
-///
-/// DataFusion reads `AI.IF(...)` as a call to a function named `IF`
-/// in schema `AI`, so the dot must go before parsing. Text inside
-/// string literals and quoted identifiers is left alone.
-pub fn normalize_ai_calls(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.char_indices().peekable();
-    let mut quote: Option<char> = None;
-    while let Some((position, c)) = chars.next() {
-        if let Some(open) = quote {
-            out.push(c);
-            if c == '\\' && open == '\'' {
-                // Snowflake escapes a quote in a string as \'
-                if let Some((_, escaped)) = chars.next() {
-                    out.push(escaped);
-                }
-            } else if c == open {
-                quote = None;
-            }
-            continue;
-        }
-        if c == '\'' || c == '"' || c == '`' {
-            quote = Some(c);
-            out.push(c);
-            continue;
-        }
-        let rest = &sql[position..];
-        let starts_word = out
-            .chars()
-            .last()
-            .is_none_or(|previous| !(previous.is_alphanumeric() || previous == '_'));
-        if starts_word && is_dotted_ai_call(rest) {
-            let is_if = rest.len() > 5
-                && rest[3..5].eq_ignore_ascii_case("if")
-                && !rest[5..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
-            let (replacement, skipped) = if is_if { ("ai_filter", 4) } else { ("ai_", 2) };
-            out.push_str(replacement);
-            for _ in 0..skipped {
-                chars.next();
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Whether text starts with `AI.<name>(`, allowing spaces before `(`.
-fn is_dotted_ai_call(text: &str) -> bool {
-    if text.len() < 4 || !text[..3].eq_ignore_ascii_case("ai.") {
-        return false;
-    }
-    let after_dot = &text[3..];
-    let name_length = after_dot
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(after_dot.len());
-    name_length > 0 && after_dot[name_length..].trim_start().starts_with('(')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dotted_ai_calls_become_underscored_outside_strings() {
-        let sql = "SELECT AI.IF(PROMPT('Is AI.IF here?', r.body)) FROM r WHERE ai.score(x) > 0";
-        assert_eq!(
-            normalize_ai_calls(sql),
-            "SELECT ai_filter(PROMPT('Is AI.IF here?', r.body)) FROM r WHERE ai_score(x) > 0"
-        );
-    }
-
-    #[test]
-    fn a_column_ending_in_ai_is_not_rewritten() {
-        assert_eq!(normalize_ai_calls("SELECT t.thai.x"), "SELECT t.thai.x");
-    }
-
-    #[test]
-    fn a_table_aliased_ai_keeps_its_columns() {
-        let sql = "SELECT ai.body FROM reviews ai";
-        assert_eq!(normalize_ai_calls(sql), sql);
-    }
 }
 
 /// Write each `{'key': value, ...}` literal outside quotes as

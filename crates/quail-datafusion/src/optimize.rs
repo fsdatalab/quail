@@ -61,6 +61,13 @@ impl OptimizeModelRegions {
     }
 }
 
+impl OptimizeModelRegions {
+    /// The names of the rules each region runs, in order.
+    pub fn rules(&self) -> &[String] {
+        &self.rules
+    }
+}
+
 impl Default for OptimizeModelRegions {
     fn default() -> Self {
         Self::new(REGION_RULES.iter().map(ToString::to_string).collect())

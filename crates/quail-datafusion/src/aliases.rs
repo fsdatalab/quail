@@ -9,6 +9,8 @@ use sqlparser::ast::{
     Statement, Subscript, TableFactor, Value, visit_expressions_mut,
 };
 
+use crate::functions::ai_function_name;
+
 /// Replace each `SELECT` alias named in a `WHERE` clause with the
 /// expression it names.
 ///
@@ -61,11 +63,7 @@ pub fn distinct_order_ordinals(statement: &mut Statement) {
 pub fn positional_ai_arguments(statement: &mut Statement) {
     let _ = visit_expressions_mut(statement, |expr| {
         if let Expr::Function(call) = expr
-            && call
-                .name
-                .to_string()
-                .to_ascii_lowercase()
-                .starts_with("ai_")
+            && ai_function_name(&call.name.to_string()).is_some()
         {
             let template = call.clone();
             let FunctionArguments::List(list) = &mut call.args else {
@@ -130,7 +128,7 @@ pub fn add_extract_spans(statement: &mut Statement) {
                 SelectItem::ExprWithAlias {
                     expr: Expr::Function(call),
                     alias,
-                } if call.name.to_string().eq_ignore_ascii_case("ai_extract")
+                } if ai_function_name(&call.name.to_string()) == Some("ai_extract")
                     && !named.contains(&format!("{}{SPAN_SUFFIX}", key(alias))) =>
                 {
                     let mut span_call = call.clone();
