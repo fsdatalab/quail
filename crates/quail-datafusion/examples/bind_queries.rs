@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{Result, tree_node::TreeNode, tree_node::TreeNodeRecursion};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
@@ -21,8 +20,9 @@ impl RegionRunner for NoRows {
         &self,
         _region: &ModelRegion,
         _inputs: &[quail_datafusion::InputRows],
-    ) -> Result<Vec<RecordBatch>> {
-        Ok(vec![])
+        _fetch: Option<usize>,
+    ) -> Result<quail_datafusion::RegionBatches> {
+        Ok(Box::new(std::iter::empty()))
     }
 }
 

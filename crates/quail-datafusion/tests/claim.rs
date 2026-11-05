@@ -18,7 +18,8 @@ impl RegionRunner for NotRun {
         &self,
         _region: &ModelRegion,
         _inputs: &[quail_datafusion::InputRows],
-    ) -> Result<Vec<RecordBatch>> {
+        _fetch: Option<usize>,
+    ) -> Result<quail_datafusion::RegionBatches> {
         exec_err!("planning tests do not run model regions")
     }
 }

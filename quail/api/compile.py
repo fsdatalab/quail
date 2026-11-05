@@ -130,7 +130,7 @@ def compile_region(sql: str, catalog, model, dialect: str = "snowflake",
     def refuse(columns):
         raise RuntimeError("compiling a query scans no table")
 
-    def run_region(kind, payload, tables=None):
+    def run_region(kind, payload, tables=None, fetch=None):
         raise RuntimeError("compiling a query runs no model region")
 
     context = _quail_native.NativeContext(

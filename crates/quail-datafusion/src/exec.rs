@@ -28,14 +28,24 @@ use crate::region::ModelRegion;
 /// The rows of one region input: its table name and its batches.
 pub type InputRows = (String, Vec<RecordBatch>);
 
-/// Plans and runs one model region, returning its rows.
+/// A region's rows, in the region's schema, as the runner produces them.
+pub type RegionBatches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
+
+/// Plans and runs one model region, returning its rows as they come.
 ///
-/// Quail's executor implements this trait. The call blocks until the
-/// region's rows are ready.
+/// Quail's executor implements this trait, in the same process or
+/// behind Quail Server. The call blocks until the region starts
+/// returning rows; DataFusion reads them as the iterator yields them.
 pub trait RegionRunner: fmt::Debug + Send + Sync {
-    /// Plan and run the region over its inputs' rows, returning rows in
-    /// the region's schema.
-    fn run(&self, region: &ModelRegion, inputs: &[InputRows]) -> Result<Vec<RecordBatch>>;
+    /// Plan and run the region over its inputs' rows. `fetch` is the
+    /// most rows DataFusion reads, when a LIMIT above the region says
+    /// so; a runner may stop the model once it has that many.
+    fn run(
+        &self,
+        region: &ModelRegion,
+        inputs: &[InputRows],
+        fetch: Option<usize>,
+    ) -> Result<RegionBatches>;
 }
 
 /// The physical operator for one model region.
@@ -45,6 +55,8 @@ pub struct ModelRegionExec {
     runner: Arc<dyn RegionRunner>,
     /// The physical plans of the region's inputs, in order.
     inputs: Vec<Arc<dyn ExecutionPlan>>,
+    /// The most rows DataFusion reads, from its limit pushdown.
+    fetch: Option<usize>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -68,6 +80,7 @@ impl ModelRegionExec {
             region,
             runner,
             inputs,
+            fetch: None,
             schema,
             properties: Arc::new(properties),
         }
@@ -103,6 +116,20 @@ impl ExecutionPlan for ModelRegionExec {
         self.inputs.iter().collect()
     }
 
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let mut exec = Self::new(
+            self.region.clone(),
+            Arc::clone(&self.runner),
+            self.inputs.clone(),
+        );
+        exec.fetch = limit;
+        Some(Arc::new(exec))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
@@ -115,11 +142,9 @@ impl ExecutionPlan for ModelRegionExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
         _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
-            self.region.clone(),
-            Arc::clone(&self.runner),
-            children,
-        )))
+        let mut exec = Self::new(self.region.clone(), Arc::clone(&self.runner), children);
+        exec.fetch = self.fetch;
+        Ok(Arc::new(exec))
     }
 
     fn with_new_children(
@@ -143,6 +168,7 @@ impl ExecutionPlan for ModelRegionExec {
         let region = self.region.clone();
         let runner = Arc::clone(&self.runner);
         let inputs = self.inputs.clone();
+        let fetch = self.fetch;
         // the runner decides which thread runs the region; Quail's runs
         // it on the thread that called DataFusion
         let rows = async move {
@@ -152,14 +178,46 @@ impl ExecutionPlan for ModelRegionExec {
                     datafusion::physical_plan::collect(input, Arc::clone(&context)).await?;
                 rows.push((name.clone(), batches));
             }
-            let batches = runner.run(&region, &rows)?;
-            Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
+            let batches = runner.run(&region, &rows, fetch)?;
+            Ok::<_, DataFusionError>(stream::iter(Limited {
+                batches,
+                remaining: fetch,
+            }))
         };
         let batches = futures::TryStreamExt::try_flatten(stream::once(rows));
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
             batches,
         )))
+    }
+}
+
+/// A region's batches cut off after `remaining` rows, when DataFusion
+/// pushed a limit into the region.
+struct Limited {
+    batches: RegionBatches,
+    remaining: Option<usize>,
+}
+
+impl Iterator for Limited {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == Some(0) {
+            return None;
+        }
+        let batch = match self.batches.next()? {
+            Ok(batch) => batch,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(Ok(match &mut self.remaining {
+            Some(remaining) => {
+                let rows = batch.num_rows().min(*remaining);
+                *remaining -= rows;
+                batch.slice(0, rows)
+            }
+            None => batch,
+        }))
     }
 }
 

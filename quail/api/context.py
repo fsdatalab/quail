@@ -121,16 +121,39 @@ class SessionContext:
         """Return DataFusion's optimized logical plan for a query."""
         return self._native.explain(text, DATAFUSION_DIALECTS[dialect])
 
-    def _run_region(self, kind: str, payload: str,
-                    tables: dict | None = None) -> pa.Table:
+    def _run_region(self, kind: str, payload: str, tables: dict | None = None,
+                    fetch: int | None = None) -> pa.Table:
         from quail.api.region_inputs import region_query
 
-        query = (region_query(self.session,
-                              decode_value(LogicalPlan, json.loads(payload)),
-                              order=self._order, tables=tables)
-                 if kind == "plan" else self.session.sql(payload, order=self._order))
+        if kind == "plan":
+            logical = decode_value(LogicalPlan, json.loads(payload))
+            if fetch is not None:
+                logical = with_limit(logical, fetch)
+            query = region_query(self.session, logical, order=self._order,
+                                 tables=tables)
+        else:
+            query = self.session.sql(payload, order=self._order)
         result = execute_query(query, physical_executor=self._physical_executor)
         return result.collect()
+
+
+def with_limit(logical: LogicalPlan, fetch: int) -> LogicalPlan:
+    """Return a region's plan that returns at most ``fetch`` rows.
+
+    DataFusion passes the limit when a LIMIT above the region reaches
+    it; Quail can then stop the model once enough rows pass.
+    """
+    from dataclasses import replace
+
+    from quail.logical import Result, WithCTE
+
+    root = logical.root
+    if isinstance(root, WithCTE):
+        return logical
+    if isinstance(root, Result):
+        limit = fetch if root.limit is None else min(root.limit, fetch)
+        return replace(logical, root=replace(root, limit=limit))
+    return replace(logical, root=Result(input=root, limit=fetch))
 
 
 class DataFusionQuery:

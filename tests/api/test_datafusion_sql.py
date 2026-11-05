@@ -63,3 +63,11 @@ def test_sql_around_ai_functions_returns_what_datafusion_computes(session, sql, 
 def test_an_or_of_a_model_call_and_a_column_test_is_refused_with_its_reason(session):
     with pytest.raises(CompileError, match="an OR of a model call and other tests"):
         session.sql(f"SELECT r.id FROM reviews r WHERE {AI_IF} OR r.stars > 3")
+
+
+def test_a_limit_above_a_datafusion_projection_stops_at_its_rows(session):
+    # DataFusion runs the CASE, and pushes the LIMIT into the region below
+    query = session.sql(
+        "SELECT r.id, CASE WHEN AI.CLASSIFY(PROMPT('t: {0}', r.body), ['a', 'b']) "
+        "= 'a' THEN 1 ELSE 0 END AS f FROM reviews r LIMIT 2")
+    assert finish(query, ORACLE).collect().num_rows == 2

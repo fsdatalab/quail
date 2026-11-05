@@ -32,7 +32,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyCapsule, PyCapsuleMethods};
 use quail_datafusion::{
-    InputRows, ModelRegion, RegionRunner, bind, quail_column_names, quail_schema, region_sql, sql,
+    InputRows, ModelRegion, RegionBatches, RegionRunner, bind, quail_column_names, quail_schema,
+    region_sql, sql,
 };
 use quail_planner::prompts::Turn;
 use tokio::runtime::Runtime;
@@ -57,7 +58,8 @@ struct PythonRunner {
 struct RegionCall {
     region: ModelRegion,
     inputs: Vec<InputRows>,
-    rows: std::sync::mpsc::Sender<Result<Vec<RecordBatch>>>,
+    fetch: Option<usize>,
+    rows: std::sync::mpsc::Sender<Result<RegionBatches>>,
 }
 
 impl PythonRunner {
@@ -82,7 +84,12 @@ impl PythonRunner {
 impl RegionRunner for PythonRunner {
     /// Run the region on the thread that called DataFusion, so the GPU
     /// process's per-thread state is set up once, not on each worker.
-    fn run(&self, region: &ModelRegion, inputs: &[InputRows]) -> Result<Vec<RecordBatch>> {
+    fn run(
+        &self,
+        region: &ModelRegion,
+        inputs: &[InputRows],
+        fetch: Option<usize>,
+    ) -> Result<RegionBatches> {
         let caller = self.caller.lock().expect("the caller lock").clone();
         match caller {
             Some((thread, sender)) if thread != std::thread::current().id() => {
@@ -90,6 +97,7 @@ impl RegionRunner for PythonRunner {
                 let call = RegionCall {
                     region: region.clone(),
                     inputs: inputs.to_vec(),
+                    fetch,
                     rows,
                 };
                 sender
@@ -99,16 +107,21 @@ impl RegionRunner for PythonRunner {
                     .recv()
                     .map_err(|_| DataFusionError::Execution("the region did not run".into()))?
             }
-            _ => self.run_here(region, inputs),
+            _ => self.run_here(region, inputs, fetch),
         }
     }
 }
 
 impl PythonRunner {
     /// Run the region on this thread.
-    fn run_here(&self, region: &ModelRegion, inputs: &[InputRows]) -> Result<Vec<RecordBatch>> {
+    fn run_here(
+        &self,
+        region: &ModelRegion,
+        inputs: &[InputRows],
+        fetch: Option<usize>,
+    ) -> Result<RegionBatches> {
         let (kind, payload) = self.request(region)?;
-        let batches = Python::attach(|py| {
+        let reader = Python::attach(|py| {
             // each input as a pyarrow Table, by the table name the region reads
             let mut tables = Vec::new();
             for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
@@ -116,16 +129,16 @@ impl PythonRunner {
                 tables.push((name.clone(), to_pyarrow(py, schema, batches.clone())?));
             }
             let tables = tables.into_py_dict(py)?;
-            let answer = self.run_region.call1(py, (kind, payload, tables))?;
-            from_pyarrow(answer.bind(py))
+            let answer = self.run_region.call1(py, (kind, payload, tables, fetch))?;
+            stream_from_pyarrow(answer.bind(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let schema = region.bound.schema();
-        let names = quail_column_names(schema);
-        batches
-            .into_iter()
-            .map(|batch| conform(batch, &names, schema.inner()))
-            .collect()
+        let schema = Arc::clone(region.bound.schema());
+        let names = quail_column_names(&schema);
+        // DataFusion reads each batch as the Python stream yields it
+        Ok(Box::new(
+            reader.map(move |batch| conform(batch?, &names, schema.inner())),
+        ))
     }
 }
 
@@ -245,16 +258,20 @@ fn to_pyarrow<'py>(
         .call_method0("read_all")
 }
 
-/// Read a Python object's Arrow stream, such as a pyarrow Table's,
-/// into batches over the same buffers.
-fn from_pyarrow(value: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+/// Take a Python object's Arrow stream, such as a pyarrow Table's or
+/// RecordBatchReader's, as a reader over the same buffers.
+fn stream_from_pyarrow(value: &Bound<'_, PyAny>) -> PyResult<ArrowArrayStreamReader> {
     let capsule = value.call_method0("__arrow_c_stream__")?;
     let capsule = capsule.cast::<PyCapsule>()?;
     let pointer = capsule.pointer_checked(Some(ARROW_STREAM))?;
     // the reader takes the stream and leaves the capsule's released
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(pointer.as_ptr().cast()) }
-        .map_err(|error| python_error(error.into()))?;
-    reader
+    unsafe { ArrowArrayStreamReader::from_raw(pointer.as_ptr().cast()) }
+        .map_err(|error| python_error(error.into()))
+}
+
+/// Read a Python object's Arrow stream into batches over the same buffers.
+fn from_pyarrow(value: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    stream_from_pyarrow(value)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| python_error(error.into()))
 }
@@ -396,7 +413,7 @@ impl NativeContext {
                         tokio::select! {
                             done = &mut query => break done,
                             Some(call) = calls.recv() => {
-                                let rows = runner.run_here(&call.region, &call.inputs);
+                                let rows = runner.run_here(&call.region, &call.inputs, call.fetch);
                                 let _ = call.rows.send(rows);
                             }
                         }

@@ -140,7 +140,7 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     started = time.perf_counter()
     region_s, region_tables = [], []
 
-    def run_region(kind, _payload, tables=None):
+    def run_region(kind, _payload, tables=None, _fetch=None):
         if kind != "plan" or results:
             raise RuntimeError("the query's one model region runs once, as a plan")
         region = query
