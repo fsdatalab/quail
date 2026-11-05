@@ -190,7 +190,7 @@ impl TableProvider for PythonTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -205,7 +205,22 @@ impl TableProvider for PythonTable {
             from_pyarrow(answer.bind(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        Ok(MemorySourceConfig::try_new_exec(&[batches], schema, None)?)
+        // one partition per thread DataFusion runs, each a slice of the
+        // rows, so the operators above read the table in parallel
+        let num_partitions = state.config().target_partitions().max(1);
+        let mut partitions: Vec<Vec<RecordBatch>> = vec![Vec::new(); num_partitions];
+        for batch in batches {
+            let size = batch.num_rows().div_ceil(num_partitions).max(1);
+            let mut offset = 0;
+            let mut index = 0;
+            while offset < batch.num_rows() {
+                let length = size.min(batch.num_rows() - offset);
+                partitions[index % num_partitions].push(batch.slice(offset, length));
+                offset += length;
+                index += 1;
+            }
+        }
+        Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
     }
 }
 
