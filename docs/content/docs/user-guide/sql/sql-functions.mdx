@@ -554,12 +554,15 @@ Counts non-null values through the current row.
 
 ## Unsupported SQL
 
-- `QUALIFY`
-- `WITH RECURSIVE`
-- `OR` between conditions
-- `BETWEEN` and arithmetic in column comparisons
-- Queries with no AI function
-- `JOIN` with only relational predicates (no AI function)
-- Outer joins (`LEFT`, `RIGHT`, `FULL`)
+Quail runs the operators that call the model and those that change
+what the model reads; DataFusion runs the rest, so SQL that DataFusion
+runs also runs with AI functions in it. For example, a `LEFT JOIN`, an
+`INTERSECT`, a scalar subquery, or a query with no AI function at all
+runs in DataFusion around the model regions. These are refused:
+
+- `OR` between an AI function and another test. Put the disjunction
+  inside one prompt's text instead.
+- An AI function that reads the result of a `GROUP BY` or a window in
+  the same `SELECT`. Read it from a CTE instead.
 
 Using any of these raises `quail.logical.CompileError`.

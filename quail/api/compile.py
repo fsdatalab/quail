@@ -119,7 +119,8 @@ def compile_region(sql: str, catalog, model, dialect: str = "snowflake",
 
     Returns:
         The region's plan and whether the region is the whole query, or
-        None when the query has more than one model region.
+        None when the query has no model region, which DataFusion runs
+        alone, or more than one.
 
     Raises:
         CompileError: The query is invalid or uses unsupported SQL.
@@ -143,8 +144,6 @@ def compile_region(sql: str, catalog, model, dialect: str = "snowflake",
             DATAFUSION_DIALECTS[str(dialect).lower()])
     except RuntimeError as error:
         raise CompileError(_message(error, sql)) from None
-    if not regions:
-        raise CompileError("the query has no AI predicate")
     if len(regions) != 1:
         for _, message in regions:
             # a region the binder does not read runs as SQL of its own

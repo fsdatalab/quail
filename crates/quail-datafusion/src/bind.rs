@@ -97,7 +97,7 @@ fn place_select(
     };
     let Some(relation) = crate::translate_relation(&optimized, &content) else {
         return Err(CompileError::new(format!(
-            "Quail cannot place this plan's operators:\n{}",
+            "the placement of these operators {UNSUPPORTED}:\n{}",
             optimized.display_indent()
         )));
     };
@@ -289,9 +289,7 @@ struct Select<'a> {
     outputs: Vec<(String, Expr)>,
 }
 
-/// The phrase every refusal of a query shape the binder does not read
-/// ends with; a caller may plan such a region another way.
-pub const UNSUPPORTED: &str = "is outside what Quail binds from DataFusion";
+pub use quail_planner::expressions::UNSUPPORTED;
 
 fn unsupported<T>(what: &str) -> Result<T, CompileError> {
     compile_error(format!("{what} {UNSUPPORTED}"))
@@ -950,12 +948,10 @@ impl Binder {
                         ..
                     } = join;
                     if *join_type != JoinType::Inner {
-                        return compile_error(format!(
-                            "only plain JOIN is supported, got {join_type} JOIN"
-                        ));
+                        return unsupported(&format!("a {join_type} JOIN"));
                     }
                     let Some(table) = self.table_or_stage(right)? else {
-                        return compile_error("JOIN must name one registered provider");
+                        return unsupported("a JOIN of anything but one registered provider");
                     };
                     joins.push(JoinOn {
                         alias: table.0.clone(),
@@ -967,7 +963,7 @@ impl Binder {
                 }
                 other => {
                     let Some(table) = self.table_or_stage(other)? else {
-                        return compile_error("FROM must name one registered provider");
+                        return unsupported("a FROM of anything but one registered provider");
                     };
                     tables.push(table);
                     break;
@@ -1085,10 +1081,7 @@ impl Binder {
                     ..
                 })
             ) {
-                return compile_error(format!(
-                    "OR combines tests of source columns; {term} asks the model, so put the \
-                     disjunction inside one prompt's text"
-                ));
+                return unsupported(&format!("{term}, an OR of a model call and other tests,"));
             }
             let (node, anti) = match &term {
                 Expr::Not(inner) => (inner.as_ref(), true),
@@ -1232,6 +1225,26 @@ impl Binder {
     ) -> Result<Option<Condition>, CompileError> {
         match term {
             Expr::Not(inner) => Ok(Some(not(self.bind_operand(inner)?))),
+            // x BETWEEN low AND high reads as x >= low AND x <= high
+            Expr::Between(between) => {
+                let low = Expr::BinaryExpr(BinaryExpr::new(
+                    between.expr.clone(),
+                    Operator::GtEq,
+                    between.low.clone(),
+                ));
+                let high = Expr::BinaryExpr(BinaryExpr::new(
+                    between.expr.clone(),
+                    Operator::LtEq,
+                    between.high.clone(),
+                ));
+                let both = low.and(high);
+                let rewritten = if between.negated {
+                    Expr::Not(Box::new(both))
+                } else {
+                    both
+                };
+                self.bind_condition(&rewritten, join_keys)
+            }
             Expr::BinaryExpr(BinaryExpr {
                 op: op @ (Operator::And | Operator::Or),
                 ..
@@ -2487,7 +2500,7 @@ impl<'a> SelectBinder<'a> {
                      function: &str|
          -> Result<ValueExpression, CompileError> {
             let Some(alias) = alias else {
-                return compile_error(format!("{function} needs an AS name in SELECT"));
+                return unsupported(&format!("{function} without an AS name in SELECT"));
             };
             Ok(ValueExpression::Alias(Alias {
                 expression: Box::new(expression),
@@ -2510,7 +2523,7 @@ impl<'a> SelectBinder<'a> {
         }
         if is_call(node, "ai_extract") {
             let Some(alias) = alias else {
-                return compile_error("AI.EXTRACT needs an AS name in SELECT");
+                return unsupported("AI.EXTRACT without an AS name in SELECT");
             };
             let (found, members) = self.binder.bind_ai_extract(node, alias)?;
             self.structs.push(found);
@@ -2528,10 +2541,7 @@ impl<'a> SelectBinder<'a> {
             return Ok(vec![named(ValueExpression::ModelCall(call), "AI.MAP")?]);
         }
         if has_ai_call(node) || walk(node, &mut |inner| column_call(inner).is_some()) {
-            return compile_error(
-                "AI.SCORE, AI.CLASSIFY, AI.EXTRACT, AI.SAE_FEATURES, and AI.MAP in SELECT must be \
-                 direct expressions with an AS name",
-            );
+            return unsupported("a model call inside a SELECT expression");
         }
         let value = self.binder.bind_value(node)?;
         Ok(vec![match alias {

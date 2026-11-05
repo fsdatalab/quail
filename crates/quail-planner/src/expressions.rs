@@ -14,6 +14,11 @@ use serde_json::Value;
 
 use crate::arrow_functions::ARROW_FUNCTIONS;
 
+/// The phrase every refusal of a query shape the binder does not read
+/// ends with: DataFusion runs such operators itself, around the model
+/// regions it claims.
+pub const UNSUPPORTED: &str = "is outside what Quail binds from DataFusion";
+
 /// A query that is malformed or outside the language, or a plan the
 /// configuration cannot run, with its refusal.
 #[derive(Debug, Clone, PartialEq)]

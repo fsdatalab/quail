@@ -830,8 +830,8 @@ fn check_joins(
             ));
         }
         return compile_error(format!(
-            "JOIN {alias} ON {first} has no AI predicate over its pairs; a plain join belongs \
-             in the database the ids came from"
+            "JOIN {alias} ON {first} without an AI predicate over its pairs {}",
+            crate::expressions::UNSUPPORTED
         ));
     }
     if joined.is_empty() {
@@ -863,9 +863,9 @@ fn check_joins(
         .collect();
     if !uncovered.is_empty() {
         return compile_error(format!(
-            "JOINed tables {} appear in no join predicate: every JOINed table must appear in \
-             at least one AI predicate on a JOIN's ON or as a WHERE term",
-            repr_list(&uncovered)
+            "JOINed tables {} with no AI predicate over their pairs {}",
+            repr_list(&uncovered),
+            crate::expressions::UNSUPPORTED
         ));
     }
     let mut reached: BTreeSet<String> = [root.to_string()].into_iter().collect();

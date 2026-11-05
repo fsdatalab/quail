@@ -23,14 +23,6 @@ REFUSED = {
         "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
         "AND AI.SCORE(PROMPT('q2: {0}', r.body)) > 0.5",
         "AI.SCORE cannot be mixed with generative AI predicates"),
-    "an ON equality with no AI predicate": (
-        "SELECT r.id FROM reviews r JOIN aspects a ON r.id = a.id "
-        "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))",
-        "has no AI predicate over its pairs"),
-    "a joined table no predicate reads": (
-        "SELECT r.id FROM reviews r CROSS JOIN aspects a "
-        "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))",
-        r"JOINed tables \['a'\] appear in no join predicate"),
     "DISTINCT over an extraction": (
         f"SELECT DISTINCT {EXTRACT} FROM contracts c",
         "DISTINCT does not compare AI.EXTRACT struct columns"),

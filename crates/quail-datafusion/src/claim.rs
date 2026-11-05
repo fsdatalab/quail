@@ -4,13 +4,15 @@ use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, Result};
+use datafusion::common::{Column, DataFusionError, Result, plan_err};
 use datafusion::datasource::{MemTable, provider_as_source};
+use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
-    Aggregate, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Projection, Window,
+    Aggregate, Expr, Extension, Filter, LogicalPlan, LogicalPlanBuilder, Projection, Window,
 };
 use datafusion::optimizer::AnalyzerRule;
 
+use crate::bind::UNSUPPORTED;
 use crate::functions::is_ai_call;
 use crate::region::ModelRegion;
 
@@ -78,6 +80,8 @@ struct Extracted {
     aliases: Vec<(String, String)>,
     /// The names given to moved calls.
     used: Vec<String>,
+    /// Whether the plan being claimed has had its filters pushed down.
+    pushed: bool,
 }
 
 impl Extracted {
@@ -86,12 +90,23 @@ impl Extracted {
     fn extract(&mut self, node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         if !matches!(
             node,
-            LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Sort(_)
+            LogicalPlan::Aggregate(_)
+                | LogicalPlan::Window(_)
+                | LogicalPlan::Sort(_)
+                | LogicalPlan::Filter(_)
+                | LogicalPlan::Projection(_)
         ) {
             return Ok(Transformed::no(node));
         }
         let mut calls: Vec<Expr> = Vec::new();
         for expr in node.expressions() {
+            // a SELECT list item that is a model call already sits where
+            // a region reads it
+            if matches!(node, LogicalPlan::Projection(_))
+                && ai_calls(&expr)?.first() == Some(expr.clone().unalias_nested().data).as_ref()
+            {
+                continue;
+            }
             for call in ai_calls(&expr)? {
                 if !calls.contains(&call) {
                     calls.push(call);
@@ -146,6 +161,15 @@ impl Extracted {
                     .map(|expr| read(expr)?.alias_if_changed(expr.schema_name().to_string()))
                     .collect::<Result<Vec<_>>>()?;
                 LogicalPlan::Window(Window::try_new(keep, Arc::new(projection))?)
+            }
+            LogicalPlan::Projection(found) => {
+                // each output keeps its name
+                let keep = found
+                    .expr
+                    .iter()
+                    .map(|expr| read(expr)?.alias_if_changed(expr.schema_name().to_string()))
+                    .collect::<Result<Vec<_>>>()?;
+                LogicalPlan::Projection(Projection::try_new(keep, Arc::new(projection))?)
             }
             _ => node.with_new_exprs(exprs, vec![projection])?,
         };
@@ -257,21 +281,105 @@ impl Extracted {
             return plan.with_new_exprs(plan.expressions(), claimed);
         }
         if quail_plans(&plan)? {
-            let (bound, inputs) = split_inputs(select_list(plan, needed)?)?;
-            let mut region = ModelRegion::new(bound);
-            for (name, input) in inputs {
-                region.inputs.push(self.claim(input, None, false)?);
-                region.input_names.push(name);
+            let (bound, inputs) = split_inputs(select_list(plan.clone(), needed.clone())?)?;
+            match binder_refusal(&bound) {
+                None => {
+                    let mut region = ModelRegion::new(bound);
+                    for (name, input) in inputs {
+                        region.inputs.push(self.claim(input, None, false)?);
+                        region.input_names.push(name);
+                    }
+                    return Ok(LogicalPlan::Extension(Extension {
+                        node: Arc::new(region),
+                    }));
+                }
+                Some(refusal) => return self.hand_back(plan, needed, limited, Some(refusal)),
             }
-            return Ok(LogicalPlan::Extension(Extension {
-                node: Arc::new(region),
-            }));
         }
-        plan.map_children(|child| {
-            let read = child.schema().columns();
-            self.claim(child, Some(read), false).map(Transformed::yes)
-        })
-        .map(|claimed| claimed.data)
+        self.hand_back(plan, needed, limited, None)
+    }
+
+    /// Let DataFusion run the part of `plan` that Quail does not bind.
+    ///
+    /// First DataFusion's `PushDownFilter` moves each filter as far down
+    /// as SQL allows, such as a test of one table below a join, and the
+    /// result is claimed again. Then DataFusion keeps `plan`'s operator,
+    /// its AI calls moved into a projection below it, and its inputs are
+    /// claimed. `refusal` is the binder's reason Quail cannot run `plan`
+    /// whole; it is the error when a model call is still outside every
+    /// region.
+    fn hand_back(
+        &mut self,
+        plan: LogicalPlan,
+        needed: Option<Vec<Column>>,
+        limited: bool,
+        refusal: Option<String>,
+    ) -> Result<LogicalPlan> {
+        // the reason Quail cannot run this operator explains a failure
+        // better than one found below it
+        self.hand_back_parts(plan, needed, limited, refusal.clone())
+            .map_err(|error| match refusal {
+                Some(refusal) => DataFusionError::Plan(refusal),
+                None => error,
+            })
+    }
+
+    fn hand_back_parts(
+        &mut self,
+        plan: LogicalPlan,
+        needed: Option<Vec<Column>>,
+        limited: bool,
+        refusal: Option<String>,
+    ) -> Result<LogicalPlan> {
+        if !self.pushed {
+            let pushed = push_down_filters(&plan);
+            if pushed != plan {
+                self.pushed = true;
+                let claimed = self.claim(pushed, needed, limited);
+                self.pushed = false;
+                return claimed;
+            }
+        }
+        // a filter's terms with a subquery stay in DataFusion; the rest
+        // run below it, where a region can take them
+        if let LogicalPlan::Filter(filter) = &plan {
+            let (above, below): (Vec<Expr>, Vec<Expr>) = split_conjunction(&filter.predicate)
+                .into_iter()
+                .cloned()
+                .partition(|term| term.exists(|inner| Ok(is_subquery(inner))).unwrap_or(true));
+            if !above.is_empty() && !below.is_empty() {
+                let lower = LogicalPlan::Filter(Filter::try_new(
+                    conjunction(below).expect("a term"),
+                    Arc::clone(&filter.input),
+                )?);
+                let split = LogicalPlan::Filter(Filter::try_new(
+                    conjunction(above).expect("a term"),
+                    Arc::new(lower),
+                )?);
+                return self.claim(split, needed, limited);
+            }
+        }
+        let plan = self.extract(plan)?.data;
+        let inputs: Vec<LogicalPlan> = plan.inputs().into_iter().cloned().collect();
+        let limit = limits(&plan, limited);
+        let claimed = inputs
+            .into_iter()
+            .map(|input| {
+                let read = read_from(&plan, &input, needed.as_deref());
+                self.claim(input, read, limit)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let kept = plan.with_new_exprs(plan.expressions(), claimed)?;
+        if calls_ai(&kept)? {
+            return plan_err!(
+                "{}",
+                refusal.unwrap_or_else(|| format!(
+                    "a model call in this operator {UNSUPPORTED}:\n{}",
+                    plan.display()
+                ))
+            );
+        }
+        Ok(kept)
     }
 }
 
@@ -373,7 +481,10 @@ fn read_from(
         | LogicalPlan::Sort(_)
         | LogicalPlan::Limit(_)
         | LogicalPlan::Distinct(_)
-        | LogicalPlan::Window(_) => needed?.iter().cloned().for_each(&mut add),
+        | LogicalPlan::Window(_)
+        | LogicalPlan::Join(_) => needed?.iter().cloned().for_each(&mut add),
+        // a union's inputs line up by position, not by name
+        LogicalPlan::Union(_) => return None,
         LogicalPlan::SubqueryAlias(_) => {
             // the alias renames the qualifier; the input's columns keep their names
             let names: Vec<String> = needed?.iter().map(|column| column.name.clone()).collect();
@@ -390,6 +501,68 @@ fn read_from(
             .filter(|column| input.schema().has_column(column))
             .collect(),
     )
+}
+
+/// The binder's refusal of `plan` as a region, when the refusal is of a
+/// shape DataFusion can run instead; any other refusal is the query's
+/// error, reported when the region is bound.
+fn binder_refusal(plan: &LogicalPlan) -> Option<String> {
+    // the chat turn and layout change the prompts, not what binds
+    let turn: quail_planner::prompts::Turn = (String::new(), String::new());
+    match crate::bind::bind_region(plan, &turn, "ai-if") {
+        Err(error) if error.0.contains(UNSUPPORTED) => Some(error.0),
+        _ => None,
+    }
+}
+
+/// `plan` with DataFusion's `PushDownFilter` applied, or `plan` when the
+/// rule fails.
+///
+/// A filter the rule moves below a table's alias returns above it, its
+/// columns named by the alias: Quail reads a table as an alias over its
+/// scan.
+fn push_down_filters(plan: &LogicalPlan) -> LogicalPlan {
+    let rules: Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> = vec![Arc::new(
+        datafusion::optimizer::push_down_filter::PushDownFilter::new(),
+    )];
+    let Ok(pushed) = datafusion::optimizer::Optimizer::with_rules(rules).optimize(
+        plan.clone(),
+        &datafusion::optimizer::OptimizerContext::new(),
+        |_, _| {},
+    ) else {
+        return plan.clone();
+    };
+    pushed
+        .transform_up(|node| {
+            let LogicalPlan::SubqueryAlias(alias) = &node else {
+                return Ok(Transformed::no(node));
+            };
+            let LogicalPlan::Filter(filter) = alias.input.as_ref() else {
+                return Ok(Transformed::no(node));
+            };
+            if !matches!(filter.input.as_ref(), LogicalPlan::TableScan(_)) {
+                return Ok(Transformed::no(node));
+            }
+            let table = alias.alias.clone();
+            let predicate = filter
+                .predicate
+                .clone()
+                .transform_up(|expr| match expr {
+                    Expr::Column(column) => Ok(Transformed::yes(Expr::Column(Column::new(
+                        Some(table.clone()),
+                        column.name,
+                    )))),
+                    other => Ok(Transformed::no(other)),
+                })?
+                .data;
+            let read = LogicalPlanBuilder::from(filter.input.as_ref().clone())
+                .alias(table)?
+                .filter(predicate)?
+                .build()?;
+            Ok(Transformed::yes(read))
+        })
+        .map(|lifted| lifted.data)
+        .unwrap_or_else(|_| plan.clone())
 }
 
 /// Take each CTE or FROM subquery that groups or windows rows out of a
