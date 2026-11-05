@@ -140,21 +140,18 @@ async fn a_union_keeps_one_region_per_branch() -> Result<()> {
 }
 
 #[tokio::test]
-async fn an_exists_gate_stays_a_subquery_inside_the_region() -> Result<()> {
+async fn an_exists_gate_becomes_a_semi_join_inside_the_region() -> Result<()> {
     let context = context()?;
     let query = "SELECT r.id FROM reviews r WHERE EXISTS (SELECT 1 FROM aspects a \
         WHERE AI.IF(PROMPT('Does the review discuss {1}?\n\n{0}', r.body, a.aspect)))";
     let plan = optimized(&context, query).await?;
     let found = regions(&plan);
     assert_eq!(found.len(), 1, "{}", plan.display_indent());
-    assert!(
-        found[0]
-            .plan
-            .display_indent()
-            .to_string()
-            .contains("EXISTS"),
-        "{}",
-        found[0].plan.display_indent()
+    let shape = lines(&found[0].plan);
+    assert!(shape[1].starts_with("SemanticJoin: semi"), "{shape:?}");
+    assert_eq!(
+        shape.last().map(String::as_str),
+        Some("TableScan: aspects projection=[aspect]")
     );
     Ok(())
 }

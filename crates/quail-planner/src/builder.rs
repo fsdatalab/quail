@@ -17,16 +17,15 @@ use serde_json::Value;
 
 use crate::expressions::{
     CompileError, SPAN_SUFFIX, aliased_call, call_aliases, column_name, column_references,
-    compile_error, condition_columns, condition_text, conjuncts, normalize, reference_name,
-    repr_list, repr_str, tests, validate_condition,
+    compile_error, condition_text, conjuncts, normalize, reference_name, repr_list, repr_str,
+    tests, validate_condition,
 };
 use crate::logical::{
-    Aggregate, Filter, Join, LogicalNode, LogicalPlan, Project, ResultNode, Scan, ScanColumn,
-    Schema, SemanticColumn, SemanticFilter, SemanticJoin, Unnest, Window,
+    Aggregate, Filter, LogicalNode, LogicalPlan, Project, ResultNode, Scan, ScanColumn, Schema,
+    SemanticColumn, Unnest, Window,
 };
 use crate::nodes::{
-    asked_call, equality_text, output_schema, readable_columns, result_columns, validate_node,
-    validate_plan,
+    asked_call, equality_text, readable_columns, result_columns, validate_node, validate_plan,
 };
 
 // ---------------------------------------------------------------- input
@@ -338,11 +337,10 @@ pub struct ScanOperators {
     pub maps: Vec<(ModelCall, String)>,
 }
 
-/// Builds the logical nodes of one SELECT.
-#[derive(Debug, Default)]
+/// Builds the result nodes of one SELECT over its placed relation.
+#[derive(Debug)]
 pub struct LogicalPlanBuilder {
-    nodes: Vec<(String, LogicalNode)>,
-    root: Option<LogicalNode>,
+    root: LogicalNode,
 }
 
 fn tagged(call: &ModelCall) -> TaggedModelCall {
@@ -409,252 +407,7 @@ fn check_labels(condition: &Condition, calls: &[(String, ModelCall)]) -> Result<
 impl LogicalPlanBuilder {
     /// A builder whose relation is `root`, for `project` to finish.
     pub fn over(root: LogicalNode) -> Self {
-        Self {
-            nodes: Vec::new(),
-            root: Some(root),
-        }
-    }
-
-    /// Add one table with its filters, classifications, and extractions.
-    pub fn add_scan(
-        &mut self,
-        alias: &str,
-        provider: &str,
-        column: &ScanColumn,
-        operators: ScanOperators,
-        schema: Option<Schema>,
-    ) -> Result<(), CompileError> {
-        if self.nodes.iter().any(|(found, _)| found == alias) {
-            return compile_error(format!("duplicate table alias {}", repr_str(alias)));
-        }
-        let mut node = LogicalNode::Scan(Scan {
-            provider: provider.to_string(),
-            alias: alias.to_string(),
-            column: column.clone(),
-            columns: Vec::new(),
-            predicates: operators.regular_predicates,
-            schema,
-        });
-        if !operators.predicates.is_empty() {
-            node = LogicalNode::SemanticFilter(SemanticFilter {
-                input: Box::new(node),
-                predicates: operators.predicates,
-                stop_key: Vec::new(),
-            });
-        }
-        let calls: Vec<(String, ModelCall)> = operators
-            .labels
-            .iter()
-            .map(|(call, name)| (name.clone(), call.clone()))
-            .collect();
-        let call_names: BTreeSet<&String> = calls.iter().map(|(name, _)| name).collect();
-        let label_filters: Vec<(Condition, Option<f64>)> = operators
-            .computed_filters
-            .iter()
-            .filter(|(condition, _)| {
-                condition_columns(condition)
-                    .iter()
-                    .any(|name| call_names.contains(name))
-            })
-            .cloned()
-            .collect();
-        let mut classified: Vec<ModelCall> = Vec::new();
-        for (condition, selectivity) in &label_filters {
-            for name in condition_columns(condition) {
-                if let Some((_, call)) = calls.iter().find(|(found, _)| *found == name)
-                    && !classified.contains(call)
-                {
-                    node = column_node("label", node, call, &name);
-                    classified.push(call.clone());
-                }
-            }
-            check_labels(condition, &calls)?;
-            node = LogicalNode::Filter(Filter {
-                input: Box::new(node),
-                condition: condition.clone(),
-                selectivity: *selectivity,
-            });
-        }
-        for (call, name) in &operators.labels {
-            if !classified.contains(call) {
-                node = column_node("label", node, call, name);
-                classified.push(call.clone());
-            }
-        }
-        let mut remaining: Vec<(Condition, Option<f64>)> = operators
-            .computed_filters
-            .iter()
-            .filter(|test| !label_filters.contains(test))
-            .cloned()
-            .collect();
-        let answers: BTreeSet<String> = [
-            &operators.extracts,
-            &operators.sae_features,
-            &operators.maps,
-        ]
-        .iter()
-        .flat_map(|calls| calls.iter())
-        .flat_map(|(_, name)| [name.clone(), format!("{name}{SPAN_SUFFIX}")])
-        .collect();
-        let mut done: BTreeSet<String> = BTreeSet::new();
-        for (kind, calls_of_kind) in [
-            ("extract", &operators.extracts),
-            ("features", &operators.sae_features),
-            ("map", &operators.maps),
-        ] {
-            for (call, name) in calls_of_kind {
-                node = column_node(kind, node, call, name);
-                done.extend(crate::nodes::added_columns(&node));
-                let mut index = 0;
-                while index < remaining.len() {
-                    let read: BTreeSet<String> = condition_columns(&remaining[index].0)
-                        .into_iter()
-                        .filter(|column| answers.contains(column))
-                        .collect();
-                    if read.is_subset(&done) {
-                        let (predicate, selectivity) = remaining.remove(index);
-                        node = LogicalNode::Filter(Filter {
-                            input: Box::new(node),
-                            condition: predicate,
-                            selectivity,
-                        });
-                    } else {
-                        index += 1;
-                    }
-                }
-            }
-        }
-        if let Some((condition, _)) = remaining.first() {
-            return compile_error(format!(
-                "the filter {} tests a column the query does not return",
-                condition_text(condition)
-            ));
-        }
-        if self.root.is_none() {
-            self.root = Some(node.clone());
-        }
-        self.nodes.push((alias.to_string(), node));
-        Ok(())
-    }
-
-    fn table(&self, alias: &str) -> LogicalNode {
-        self.nodes
-            .iter()
-            .find(|(found, _)| found == alias)
-            .map(|(_, node)| node.clone())
-            .expect("a table added before its join")
-    }
-
-    /// Classify the rows of the join the call reads.
-    pub fn add_classify(&mut self, call: &ModelCall, name: &str) -> Result<(), CompileError> {
-        let aliases: BTreeSet<String> = call_aliases(call).into_iter().collect();
-        let Some(root) = self.root.take().filter(|_| aliases.len() == 2) else {
-            return compile_error(
-                "a classification of joined rows reads one document from each side of a join",
-            );
-        };
-        fn insert(
-            node: LogicalNode,
-            aliases: &BTreeSet<String>,
-            call: &ModelCall,
-            name: &str,
-        ) -> Result<LogicalNode, CompileError> {
-            match node {
-                LogicalNode::SemanticJoin(join)
-                    if call_aliases(asked_call(&join.predicate))
-                        .into_iter()
-                        .collect::<BTreeSet<_>>()
-                        == *aliases =>
-                {
-                    Ok(column_node(
-                        "label",
-                        LogicalNode::SemanticJoin(join),
-                        call,
-                        name,
-                    ))
-                }
-                LogicalNode::SemanticJoin(mut join) => {
-                    join.input = Box::new(insert(*join.input, aliases, call, name)?);
-                    Ok(LogicalNode::SemanticJoin(join))
-                }
-                LogicalNode::SemanticClassify(mut column) => {
-                    column.input = Box::new(insert(*column.input, aliases, call, name)?);
-                    Ok(LogicalNode::SemanticClassify(column))
-                }
-                LogicalNode::Join(mut join) => {
-                    join.left = Box::new(insert(*join.left, aliases, call, name)?);
-                    Ok(LogicalNode::Join(join))
-                }
-                _ => {
-                    let written = call_aliases(call);
-                    compile_error(format!(
-                        "the classification of {} x {} joined rows needs a join of the two",
-                        repr_str(&written[0]),
-                        repr_str(&written[1])
-                    ))
-                }
-            }
-        }
-        self.root = Some(insert(root, &aliases, call, name)?);
-        Ok(())
-    }
-
-    /// Join each new table onto the tree, then ask the prompt.
-    pub fn add_join(&mut self, join: &JoinSpec) -> Result<(), CompileError> {
-        let Some(mut root) = self.root.clone() else {
-            return compile_error("a logical join needs an input table");
-        };
-        for alias in &join.aliases {
-            root = LogicalNode::Join(Join {
-                left: Box::new(root),
-                right: Box::new(self.table(alias)),
-                on: Vec::new(),
-            });
-        }
-        let present: BTreeSet<String> = output_schema(&root)
-            .into_iter()
-            .map(|field| field.alias)
-            .collect();
-        for condition in &join.on {
-            let sides = [
-                crate::nodes::column_alias_of(&condition.left),
-                crate::nodes::column_alias_of(&condition.right),
-            ];
-            if !sides.iter().all(|side| present.contains(side)) {
-                return compile_error(format!(
-                    "join condition {} names a table this join does not bring in ({}); put \
-                     it on the JOIN that introduces the table",
-                    equality_text(condition),
-                    repr_list(&join.aliases)
-                ));
-            }
-        }
-        if !join.on.is_empty()
-            && let LogicalNode::Join(found) = &mut root
-        {
-            found.on = join.on.clone();
-        }
-        self.root = Some(LogicalNode::SemanticJoin(SemanticJoin {
-            input: Box::new(root),
-            predicate: join.predicate.clone(),
-            semantics: join.semantics.clone(),
-            selectivity: join.selectivity,
-            anchor: join.anchor.clone(),
-        }));
-        Ok(())
-    }
-
-    /// Add one relational cross join without an AI predicate.
-    pub fn add_cross_join(&mut self, alias: &str) -> Result<(), CompileError> {
-        let Some(root) = self.root.take() else {
-            return compile_error("a logical join needs an input table");
-        };
-        self.root = Some(LogicalNode::Join(Join {
-            left: Box::new(root),
-            right: Box::new(self.table(alias)),
-            on: Vec::new(),
-        }));
-        Ok(())
+        Self { root }
     }
 
     /// Build the plan's result nodes over the projected columns.
@@ -663,9 +416,7 @@ impl LogicalPlanBuilder {
         arguments: &ProjectArguments,
         row_tests: &[Condition],
     ) -> Result<LogicalPlan, CompileError> {
-        let Some(root) = self.root.clone() else {
-            return compile_error("a logical plan needs an input table");
-        };
+        let root = self.root.clone();
         let columns = &arguments.columns;
         let aggregation = arguments.aggregation.as_ref();
         if columns.is_empty() && aggregation.is_none() {
@@ -936,12 +687,6 @@ fn check_feature_lists(
 
 // ---------------------------------------------------------------- relation
 
-/// The placed tables and joins, and what the result rows still test.
-pub struct PlacedRelation {
-    pub builder: LogicalPlanBuilder,
-    pub rows: Vec<Condition>,
-}
-
 /// A part without its options: a model call, or a condition.
 enum Body {
     Exists(Box<Exists>),
@@ -1203,11 +948,6 @@ fn is_score(asked: &Asked) -> bool {
     asked_call(asked).kind == "score"
 }
 
-/// Place each part of a bound relation and build the logical plan below it.
-pub fn place_relation(arguments: PlaceRelationArguments) -> Result<PlacedRelation, CompileError> {
-    relation_content(arguments)?.assemble()
-}
-
 /// Each table's operators, the joins, and the row tests of one SELECT's
 /// relation, before they are put in order.
 #[derive(Debug, Clone)]
@@ -1231,39 +971,6 @@ pub struct TableContent {
     pub column: ScanColumn,
     pub schema: Option<Schema>,
     pub operators: ScanOperators,
-}
-
-impl RelationContent {
-    /// Put the operators in Quail's order: each table's, then the joins.
-    ///
-    /// # Errors
-    ///
-    /// A join or a classification does not fit the tables in scope.
-    pub fn assemble(self) -> Result<PlacedRelation, CompileError> {
-        let mut builder = LogicalPlanBuilder::default();
-        for table in self.tables {
-            builder.add_scan(
-                &table.alias,
-                &table.provider,
-                &table.column,
-                table.operators,
-                table.schema,
-            )?;
-        }
-        for join in &self.joins {
-            builder.add_join(join)?;
-        }
-        for alias in &self.cross_joined {
-            builder.add_cross_join(alias)?;
-        }
-        for (call, name) in &self.joined_classifications {
-            builder.add_classify(call, name)?;
-        }
-        Ok(PlacedRelation {
-            builder,
-            rows: self.rows,
-        })
-    }
 }
 
 /// Bind a relation's parts into each table's operators and the joins.
@@ -1481,7 +1188,18 @@ pub fn relation_content(
                 },
             }
         })
-        .collect();
+        .collect::<Vec<TableContent>>();
+    for table in &tables {
+        let calls: Vec<(String, ModelCall)> = table
+            .operators
+            .labels
+            .iter()
+            .map(|(call, name)| (name.clone(), call.clone()))
+            .collect();
+        for (condition, _) in &table.operators.computed_filters {
+            check_labels(condition, &calls)?;
+        }
+    }
     Ok(RelationContent {
         tables,
         joins,
@@ -1625,13 +1343,4 @@ fn check_calls(
         );
     }
     Ok(())
-}
-
-/// Place a bound SELECT's relation and build its logical plan.
-pub fn build_select(
-    place: PlaceRelationArguments,
-    project: &ProjectArguments,
-) -> Result<LogicalPlan, CompileError> {
-    let placed = place_relation(place)?;
-    placed.builder.project(project, &placed.rows)
 }

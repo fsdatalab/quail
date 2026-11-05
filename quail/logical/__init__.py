@@ -54,10 +54,6 @@ from quail.common.prompts import (
     split_frame,
     without_bos,
 )
-from quail.logical.builder import (
-    JoinSpec,
-    LogicalPlanBuilder,
-)
 from quail.logical.nodes import (
     FEATURE_LIST,
     Aggregate,
@@ -114,11 +110,9 @@ __all__ = [
     "HavingTest",
     "Unnest",
     "Join",
-    "JoinSpec",
     "LabelWork",
     "LogicalNode",
     "LogicalPlan",
-    "LogicalPlanBuilder",
     "WithCTE",
     "cte_schema",
     "ModelCall",

@@ -8,8 +8,8 @@
 //!
 //! - A `SemanticFilter` or `SemanticColumn` of one table, and a test of
 //!   one table's answers, move through joins, `SemanticJoin` nodes,
-//!   other filters, and projections that only pass columns, down to the
-//!   table.
+//!   other filters, windows, and projections that only pass columns,
+//!   down to the table.
 //! - A `SemanticJoin`, and a `SemanticColumn` of joined rows, move to
 //!   the lowest join whose inputs hold every table they read; a
 //!   classification of joined rows stays above the `SemanticJoin` of the
@@ -274,6 +274,11 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                 let below = with_input(&node, filter.input.as_ref().clone())?;
                 Some(with_input(&input, below)?)
             }
+        }
+        // a window keeps its input's rows and columns
+        LogicalPlan::Window(window) if !moving.pairs && !reads_added(&input) => {
+            let below = with_input(&node, window.input.as_ref().clone())?;
+            Some(with_input(&input, below)?)
         }
         LogicalPlan::Projection(projection)
             if projection

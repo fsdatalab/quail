@@ -44,6 +44,16 @@ fn tables(expr: &Expr) -> BTreeSet<String> {
         .collect()
 }
 
+/// Whether an expression calls a model: a call the lowering did not take.
+fn asks_model(expr: &Expr) -> bool {
+    let mut asks = false;
+    let _ = expr.apply(|found| {
+        asks |= crate::is_ai_call(found);
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    });
+    asks
+}
+
 /// The operator a column call's function runs as.
 fn column_kind(call: &Expr) -> Option<&'static str> {
     match call {
@@ -222,10 +232,32 @@ struct Translation<'a> {
     columns: Vec<(String, String, String)>,
     /// Whether each join is placed.
     joins: Vec<bool>,
+    /// (the reader's alias, the inner table's alias) of each derived
+    /// table the binder merged into its reader.
+    renames: Vec<(String, String)>,
 }
 
 impl<'a> Translation<'a> {
+    /// The alias the binder gave a table: a merged derived table's.
+    fn renamed(&self, alias: &str) -> String {
+        self.renames
+            .iter()
+            .rev()
+            .find(|(inner, _)| inner == alias)
+            .map(|(_, outer)| outer.clone())
+            .unwrap_or_else(|| alias.to_string())
+    }
+
+    /// The tables an expression reads, by the aliases the binder gave them.
+    fn tables(&self, expr: &Expr) -> BTreeSet<String> {
+        tables(expr)
+            .iter()
+            .map(|alias| self.renamed(alias))
+            .collect()
+    }
+
     fn table(&self, alias: &str) -> Option<&'a TableContent> {
+        let alias = self.renamed(alias);
         self.content
             .tables
             .iter()
@@ -260,29 +292,21 @@ impl<'a> Translation<'a> {
                 let mut below = alias.input.as_ref();
                 loop {
                     match below {
+                        LogicalPlan::Filter(filter) if asks_model(&filter.predicate) => {
+                            return None;
+                        }
                         LogicalPlan::Filter(filter) => below = &filter.input,
                         LogicalPlan::Projection(projection) => below = &projection.input,
-                        LogicalPlan::TableScan(_) => break,
-                        // a derived table runs as a stage of its own
-                        _ => return None,
+                        LogicalPlan::TableScan(_) => return self.scan(alias.alias.table()),
+                        _ => return self.derived_table(alias),
                     }
                 }
-                self.scan(alias.alias.table())
             }
             // a plain test is the scan's predicate or a row test; a test of
             // answers is placed with its table's other tests; a call left
             // in a filter is one the lowering did not take
-            LogicalPlan::Filter(filter) => {
-                let mut asks = false;
-                let _ = filter.predicate.apply(|expr| {
-                    asks |= crate::is_ai_call(expr);
-                    Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
-                });
-                if asks {
-                    return None;
-                }
-                self.relation(&filter.input)
-            }
+            LogicalPlan::Filter(filter) if asks_model(&filter.predicate) => None,
+            LogicalPlan::Filter(filter) => self.relation(&filter.input),
             LogicalPlan::Join(join) => {
                 if join.join_type != datafusion::logical_expr::JoinType::Inner {
                     return None;
@@ -297,8 +321,45 @@ impl<'a> Translation<'a> {
         }
     }
 
+    /// A derived table: a stage of its own, read as a scan of the stage,
+    /// or one the binder merged into its reader, read through.
+    fn derived_table(
+        &mut self,
+        alias: &datafusion::logical_expr::SubqueryAlias,
+    ) -> Option<LogicalNode> {
+        let outer = alias.alias.table().to_string();
+        let mut inner = None;
+        let _ = alias.input.apply(|node| {
+            if let LogicalPlan::SubqueryAlias(found) = node
+                && let LogicalPlan::TableScan(_) = found.input.as_ref()
+            {
+                inner = Some(found.alias.table().to_string());
+                return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        });
+        // a stage of its own: the content names it as a table
+        if let Some(table) = self.table(&outer)
+            && inner
+                .as_ref()
+                .is_none_or(|inner| self.table(inner).is_none())
+        {
+            return self.scan(&table.alias.clone());
+        }
+        // the binder merged the derived table into its reader, keeping
+        // the inner table's alias; the reader names its columns by `outer`
+        if let Some(inner) = inner {
+            self.renames.push((outer, inner));
+        }
+        self.relation(&alias.input)
+    }
+
     fn semantic_filter(&mut self, filter: &DataFusionSemanticFilter) -> Option<LogicalNode> {
-        let read: BTreeSet<String> = filter.predicates.iter().flat_map(tables).collect();
+        let read: BTreeSet<String> = filter
+            .predicates
+            .iter()
+            .flat_map(|predicate| self.tables(predicate))
+            .collect();
         let (alias,) = <[String; 1]>::try_from(read.into_iter().collect::<Vec<_>>())
             .ok()
             .map(|[alias]| (alias,))?;
@@ -316,14 +377,14 @@ impl<'a> Translation<'a> {
 
     fn column(&mut self, column: &SemanticColumn) -> Option<LogicalNode> {
         let kind = column_kind(&column.call)?;
-        let read: Vec<String> = tables(&column.call).into_iter().collect();
+        let read: Vec<String> = self.tables(&column.call).into_iter().collect();
         if read.len() == 2 {
             // a run of classifications of the same joined rows: the builder
             // puts each one right above the join, the first written on top
             let mut run = vec![column];
             let mut below = column.input.as_ref();
             while let Some(next) = as_node::<SemanticColumn>(below)
-                && tables(&next.call) == tables(&column.call)
+                && self.tables(&next.call) == self.tables(&column.call)
             {
                 run.push(next);
                 below = next.input.as_ref();
@@ -385,7 +446,7 @@ impl<'a> Translation<'a> {
                     .find(|(_, name)| !placed(name))
             })?
             .clone();
-        let read: Vec<String> = tables(&column.call).into_iter().collect();
+        let read: Vec<String> = self.tables(&column.call).into_iter().collect();
         self.columns
             .push((read.join(","), name.clone(), column.name.clone()));
         Some(column_node("label", input, &call, &name))
@@ -394,7 +455,7 @@ impl<'a> Translation<'a> {
     fn semantic_join(&mut self, join: &crate::semantic::SemanticJoin) -> Option<LogicalNode> {
         // the lowest join first: the content lists them in written order
         let mut input = self.relation(&join.input)?;
-        let read = tables(&join.predicate);
+        let read = self.tables(&join.predicate);
         let index = self
             .content
             .joins
@@ -430,6 +491,7 @@ pub fn translate_relation(plan: &LogicalPlan, content: &RelationContent) -> Opti
         content,
         columns: Vec::new(),
         joins: vec![false; content.joins.len()],
+        renames: Vec::new(),
     };
     let root = translation.relation(relation_root(plan))?;
     let root = place_tests(root, content);

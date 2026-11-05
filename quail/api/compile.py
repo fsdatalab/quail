@@ -61,7 +61,10 @@ def _sql_text(expression: str) -> str:
 
 def _message(error: Exception, sql: str) -> str:
     """A DataFusion error's message, in the front end's words where it has them."""
-    text = str(error).splitlines()[0]
+    lines = str(error).splitlines()
+    # an optimizer rule's error names the rule, then its cause
+    causes = [index for index, line in enumerate(lines) if line == "caused by"]
+    text = lines[causes[-1] + 1] if causes and causes[-1] + 1 < len(lines) else lines[0]
     for kind in _ERROR_KINDS:
         if kind in text:
             text = text.split(kind, 1)[1]

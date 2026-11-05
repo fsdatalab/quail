@@ -18,21 +18,25 @@
 //!   An extraction's column holds its answer, and `name` with the span
 //!   suffix its spans.
 //!
+//! - An `EXISTS` gate, `EXISTS (SELECT 1 FROM t s WHERE AI.IF(...))`,
+//!   joins the table and keeps the rows of the outer one: a
+//!   [`SemanticJoin`] of semi semantics, or anti for `NOT EXISTS`.
+//!
 //! A column takes its SELECT alias as its name, or a name of its own when
-//! only a test reads it. An EXISTS subquery and a call anywhere else
-//! stay as DataFusion bound them.
+//! only a test reads it. A call anywhere else stays as DataFusion bound
+//! it.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::Field;
+use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, Result};
+use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Aggregate, Expr, ExprSchemable, Extension, Filter, Join, JoinType, LogicalPlan, Operator,
-    Projection, UserDefinedLogicalNode,
+    Projection, UserDefinedLogicalNode, Window,
 };
 use datafusion::optimizer::AnalyzerRule;
 
@@ -179,16 +183,19 @@ fn stack_asked(
         }
         input = close(input, &mut run);
         run_table = None;
-        input = extension_node(SemanticJoin {
-            input: Arc::new(input),
-            predicate: term,
-            semantics: "full".to_string(),
-            in_on,
-            written: Written {
-                positions: vec![position],
-                num_terms,
-            },
-        });
+        input = extension_node(
+            SemanticJoin::try_new(
+                Arc::new(input),
+                term,
+                "full".to_string(),
+                in_on,
+                Written {
+                    positions: vec![position],
+                    num_terms,
+                },
+            )
+            .expect("a full join keeps its input's rows"),
+        );
     }
     close(input, &mut run)
 }
@@ -363,24 +370,70 @@ fn read_columns(term: Expr, columns: &[(Expr, String)]) -> Result<Expr> {
         .data)
 }
 
+/// An EXISTS gate the binder reads: `EXISTS (SELECT 1 FROM table alias
+/// WHERE <one AI.IF over a row of each table>)`, as the table's plan and
+/// the predicate with the outer row's columns as columns.
+fn exists_gate(term: &Expr) -> Option<(LogicalPlan, Expr, bool)> {
+    let Expr::Exists(exists) = hinted(term) else {
+        return None;
+    };
+    let LogicalPlan::Projection(projection) = exists.subquery.subquery.as_ref() else {
+        return None;
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        return None;
+    };
+    let LogicalPlan::SubqueryAlias(alias) = filter.input.as_ref() else {
+        return None;
+    };
+    if !matches!(alias.input.as_ref(), LogicalPlan::TableScan(_)) || !is_asked(&filter.predicate) {
+        return None;
+    }
+    let predicate = filter
+        .predicate
+        .clone()
+        .transform_up(|expr| match expr {
+            Expr::OuterReferenceColumn(_, column) => Ok(Transformed::yes(Expr::Column(column))),
+            other => Ok(Transformed::no(other)),
+        })
+        .ok()?
+        .data;
+    Some((filter.input.as_ref().clone(), predicate, exists.negated))
+}
+
 fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<LogicalPlan>> {
-    let unchanged = || Ok(Transformed::no(LogicalPlan::Filter(filter.clone())));
     let (asked, rest, num_terms) = split_asked(&filter.predicate);
+    let (gates, rest): (Vec<Expr>, Vec<Expr>) = rest
+        .into_iter()
+        .partition(|term| exists_gate(term).is_some());
     let (tested, plain): (Vec<Expr>, Vec<Expr>) = rest
         .into_iter()
         .partition(|term| !column_calls(term).is_empty());
-    if asked.is_empty() && tested.is_empty() {
-        return unchanged();
+    if asked.is_empty() && tested.is_empty() && gates.is_empty() {
+        return Ok(Transformed::no(LogicalPlan::Filter(filter.clone())));
     }
     let mut input = match conjunction(plain) {
-        // a term DataFusion refuses keeps its operator, for DataFusion to refuse
-        Some(predicate) => match Filter::try_new(predicate, Arc::clone(&filter.input)) {
-            Ok(kept) => LogicalPlan::Filter(kept),
-            Err(_) => return unchanged(),
+        // a term DataFusion cannot type keeps its operator, for the binder to refuse
+        Some(predicate) => match boolean_filter(predicate, &filter.input)? {
+            Some(kept) => LogicalPlan::Filter(kept),
+            None => return Ok(Transformed::no(LogicalPlan::Filter(filter.clone()))),
         },
         None => filter.input.as_ref().clone(),
     };
     input = stack_asked(input, asked, num_terms, false);
+    for gate in &gates {
+        let (table, predicate, negated) = exists_gate(gate).expect("a gate");
+        let joined = datafusion::logical_expr::LogicalPlanBuilder::from(input)
+            .cross_join(table)?
+            .build()?;
+        input = extension_node(SemanticJoin::try_new(
+            Arc::new(joined),
+            predicate,
+            if negated { "anti" } else { "semi" }.to_string(),
+            false,
+            Written::default(),
+        )?);
+    }
     if tested.is_empty() {
         return Ok(Transformed::yes(input));
     }
@@ -403,10 +456,26 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         .into_iter()
         .map(|term| read_columns(term, &added))
         .collect::<Result<Vec<_>>>()?;
-    match Filter::try_new(conjunction(tests).expect("a test"), Arc::new(input)) {
-        Ok(filter) => Ok(Transformed::yes(LogicalPlan::Filter(filter))),
-        Err(_) => unchanged(),
+    match boolean_filter(conjunction(tests).expect("a test"), &Arc::new(input))? {
+        Some(test) => Ok(Transformed::yes(LogicalPlan::Filter(test))),
+        None => Ok(Transformed::no(LogicalPlan::Filter(filter.clone()))),
     }
+}
+
+/// A filter over `input` that keeps the rows where `predicate` is true,
+/// or `None` when DataFusion cannot type the predicate.
+///
+/// # Errors
+///
+/// The predicate is not true or false.
+fn boolean_filter(predicate: Expr, input: &Arc<LogicalPlan>) -> Result<Option<Filter>> {
+    let Ok(data_type) = predicate.get_type(input.schema()) else {
+        return Ok(None);
+    };
+    if !matches!(data_type, DataType::Boolean | DataType::Null) {
+        return plan_err!("a test is true or false, got {data_type}");
+    }
+    Ok(Filter::try_new(predicate, Arc::clone(input)).ok())
 }
 
 fn lower_join(join: &Join) -> Result<Transformed<LogicalPlan>> {
@@ -456,10 +525,13 @@ fn lower_aggregate(
         };
         added.push((call, name));
     }
+    // the operators above read each output by its original name
     let read = |exprs: &[Expr]| -> Result<Vec<Expr>> {
         exprs
             .iter()
-            .map(|expr| read_columns(expr.clone(), &added))
+            .map(|expr| {
+                read_columns(expr.clone(), &added)?.alias_if_changed(expr.schema_name().to_string())
+            })
             .collect()
     };
     Ok(Transformed::yes(LogicalPlan::Aggregate(
@@ -469,6 +541,48 @@ fn lower_aggregate(
             read(&aggregate.aggr_expr)?,
         )?,
     )))
+}
+
+fn lower_window(window: &Window, columns: &mut Columns) -> Result<Transformed<LogicalPlan>> {
+    let calls: Vec<Expr> = window.window_expr.iter().flat_map(column_calls).collect();
+    if calls.is_empty() {
+        return Ok(Transformed::no(LogicalPlan::Window(window.clone())));
+    }
+    let mut input = window.input.as_ref().clone();
+    let mut added: Vec<(Expr, String)> = Vec::new();
+    for call in calls {
+        if added.iter().any(|(found, _)| *found == call) {
+            continue;
+        }
+        let name = match added_column(&input, &call) {
+            Some(name) => name,
+            None => {
+                let name = columns.name_for(&call);
+                input = add_column(input, call.clone(), &name)?;
+                name
+            }
+        };
+        added.push((call, name));
+    }
+    let exprs = window
+        .window_expr
+        .iter()
+        .map(|expr| {
+            let read = read_columns(expr.clone(), &added)?;
+            // a window's output column keeps the name SELECT reads it by
+            Ok(
+                if read.schema_name().to_string() == expr.schema_name().to_string() {
+                    read
+                } else {
+                    read.alias(expr.schema_name().to_string())
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Transformed::yes(LogicalPlan::Window(Window::try_new(
+        exprs,
+        Arc::new(input),
+    )?)))
 }
 
 fn lower_projection(
@@ -556,6 +670,7 @@ pub fn lower_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
             LogicalPlan::Join(join) => lower_join(join),
             LogicalPlan::Projection(projection) => lower_projection(projection, &mut columns),
             LogicalPlan::Aggregate(aggregate) => lower_aggregate(aggregate, &mut columns),
+            LogicalPlan::Window(window) => lower_window(window, &mut columns),
             _ => Ok(Transformed::no(node)),
         })?
         .data)

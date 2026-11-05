@@ -39,11 +39,13 @@ impl OptimizerRule for OptimizeModelRegions {
                 && let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>()
                 && !region.optimized
             {
+                // a region DataFusion's rules cannot optimize keeps its lowered
+                // plan, and the binder reports the rule's error
+                let Ok(optimized) = optimize_region(&region.plan) else {
+                    return Ok(Transformed::no(node));
+                };
                 let mut region = region.clone();
-                // a region DataFusion's rules cannot optimize keeps its lowered plan
-                if let Ok(optimized) = optimize_region(&region.plan) {
-                    region.plan = optimized;
-                }
+                region.plan = optimized;
                 region.optimized = true;
                 return Ok(Transformed::yes(LogicalPlan::Extension(
                     datafusion::logical_expr::Extension {

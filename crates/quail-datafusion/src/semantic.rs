@@ -62,6 +62,40 @@ pub struct SemanticJoin {
     pub in_on: bool,
     /// Where the predicate was written among the terms of its WHERE or ON.
     pub written: Written,
+    schema: DFSchemaRef,
+}
+
+impl SemanticJoin {
+    /// A join keeping the pairs of `input` that pass `predicate`; a gate
+    /// ("semi" or "anti") keeps the rows of the join's left input.
+    ///
+    /// # Errors
+    ///
+    /// A gate's input is not a join.
+    pub fn try_new(
+        input: Arc<LogicalPlan>,
+        predicate: Expr,
+        semantics: String,
+        in_on: bool,
+        written: Written,
+    ) -> Result<Self> {
+        let schema = if semantics == "full" {
+            Arc::clone(input.schema())
+        } else {
+            match input.as_ref() {
+                LogicalPlan::Join(join) => Arc::clone(join.left.schema()),
+                _ => return plan_err!("a {semantics} join gates a join's left rows"),
+            }
+        };
+        Ok(Self {
+            input,
+            predicate,
+            semantics,
+            in_on,
+            written,
+            schema,
+        })
+    }
 }
 
 /// Each row of the input with the answer of one call, as `SemanticColumn`.
@@ -210,7 +244,7 @@ impl UserDefinedLogicalNodeCore for SemanticJoin {
     }
 
     fn schema(&self) -> &DFSchemaRef {
-        self.input.schema()
+        &self.schema
     }
 
     fn expressions(&self) -> Vec<Expr> {
@@ -238,13 +272,13 @@ impl UserDefinedLogicalNodeCore for SemanticJoin {
         exprs: Vec<Expr>,
         mut inputs: Vec<LogicalPlan>,
     ) -> Result<Self> {
-        Ok(Self {
-            input: Arc::new(inputs.remove(0)),
-            predicate: exprs.into_iter().next().expect("the join's predicate"),
-            semantics: self.semantics.clone(),
-            in_on: self.in_on,
-            written: self.written.clone(),
-        })
+        Self::try_new(
+            Arc::new(inputs.remove(0)),
+            exprs.into_iter().next().expect("the join's predicate"),
+            self.semantics.clone(),
+            self.in_on,
+            self.written.clone(),
+        )
     }
 }
 

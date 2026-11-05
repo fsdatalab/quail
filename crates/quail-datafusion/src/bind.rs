@@ -26,7 +26,6 @@ use quail_physical::{
 };
 use quail_planner::builder::{
     Aggregation, Exists as ExistsGate, Hint, Part, PlaceRelationArguments, ProjectArguments,
-    build_select,
 };
 use quail_planner::expressions::{
     CompileError, SPAN_SUFFIX, aliased_call, call_aliases, column_name, column_references,
@@ -43,12 +42,10 @@ const DEFAULT_MAP_ANSWER_TOKENS: i64 = 256;
 ///
 /// The binder reads the region's plan as DataFusion's SQL planner bound
 /// it, for each operator's content and for whether the query is
-/// refused. The relation's operators are placed as DataFusion's rules
-/// left them in the region's optimized plan (`crate::translate_relation`);
-/// a region with an operator the translation does not read yet, such as
-/// an EXISTS gate, a window over a model call, or a CTE that runs as its
-/// own stage, is placed by the builder. `turn` and `layout` are the
-/// session model's chat-turn text and prompt layout.
+/// refused. Each SELECT's operators, the main query's and each CTE
+/// stage's, are placed where DataFusion's rules leave them (`place_select`).
+/// `turn` and `layout` are the session model's chat-turn text and
+/// prompt layout.
 ///
 /// # Errors
 ///
@@ -59,18 +56,45 @@ pub fn bind_model_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
-    let bound = bind_region(&region.bound, turn, layout)?;
-    let (place, project, stages) = bind_with_stages(&region.bound, turn, layout)?;
-    if !stages.is_empty() || !region.optimized {
-        return Ok(bound);
-    }
+    let optimized = region.optimized.then_some(&region.plan);
+    bind_plans(&region.bound, optimized, turn, layout)
+}
+
+/// Place a SELECT's relation as DataFusion's rules order it, then add
+/// its projection.
+///
+/// `plan` is the SELECT as DataFusion's SQL planner bound it; its AI
+/// calls are lowered ([`crate::lower_ai_calls`]), the plan goes through
+/// [`crate::optimize_region`], and [`crate::translate_relation`] reads
+/// the operators' places from the result. `optimized` is that result
+/// when the caller has it, such as a region after
+/// [`crate::OptimizeModelRegions`].
+///
+/// # Errors
+///
+/// A DataFusion rule fails, the translation does not read the plan, or
+/// the logical plan builder refuses the projection.
+fn place_select(
+    plan: &LogicalPlan,
+    optimized: Option<&LogicalPlan>,
+    place: PlaceRelationArguments,
+    project: &ProjectArguments,
+) -> Result<quail_planner::LogicalPlan, CompileError> {
     let content = quail_planner::builder::relation_content(place)?;
-    let Some(relation) = crate::translate_relation(&region.plan, &content) else {
-        return Ok(bound);
+    let optimized = match optimized {
+        Some(optimized) => optimized.clone(),
+        None => crate::lower_ai_calls(plan.clone())
+            .and_then(|lowered| crate::optimize_region(&lowered))
+            .map_err(|error| CompileError::new(error.to_string()))?,
     };
-    Ok(quail_planner::builder::LogicalPlanBuilder::over(relation)
-        .project(&project, &content.rows)
-        .unwrap_or(bound))
+    match crate::translate_relation(&optimized, &content) {
+        Some(relation) => quail_planner::builder::LogicalPlanBuilder::over(relation)
+            .project(project, &content.rows),
+        None => Err(CompileError::new(format!(
+            "Quail cannot place this plan's operators:\n{}",
+            optimized.display_indent()
+        ))),
+    }
 }
 
 /// Bind a model region's plan, as DataFusion's SQL planner bound it,
@@ -84,8 +108,17 @@ pub fn bind_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<quail_planner::LogicalPlan, CompileError> {
+    bind_plans(plan, None, turn, layout)
+}
+
+fn bind_plans(
+    plan: &LogicalPlan,
+    optimized: Option<&LogicalPlan>,
+    turn: &Turn,
+    layout: &str,
+) -> Result<quail_planner::LogicalPlan, CompileError> {
     let (place, project, stages) = bind_with_stages(plan, turn, layout)?;
-    let built = build_select(place, &project)?;
+    let built = place_select(plan, optimized, place, &project)?;
     if has_subqueries(plan) {
         let asks = |root: &LogicalNode| {
             let stage = quail_planner::LogicalPlan { root: root.clone() };
@@ -931,7 +964,7 @@ impl Binder {
             ));
         }
         let (place, project, inner) = bind_with_stages(body, &self.turn, &self.layout)?;
-        let built = build_select(place, &project)?;
+        let built = place_select(body, None, place, &project)?;
         let schema = stage_schema(body)?;
         self.stages.extend(inner);
         self.stages.push((name.clone(), built.root));
