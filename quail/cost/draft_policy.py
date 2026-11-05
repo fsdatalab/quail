@@ -50,6 +50,33 @@ def source_odds(num_streams, trials, accepts) -> np.ndarray:
     return np.where(num_streams <= 1, 1.0, seeded)
 
 
+def draft_gains(cap, limit, survival, written, num_streams, trials,
+                accepts) -> np.ndarray:
+    """Return each answer's expected written tokens from each draft token.
+
+    Column j - 1 is draft token j's: the chance the answer goes on past
+    j more tokens times the chance the position followed is its source.
+    It never rises with j. Draft tokens at or past the limit write none.
+
+    Args:
+        cap: The most draft tokens a round may feed.
+        limit: The answer token limit; drafts stop before it.
+        survival: The field's S(t), t = 0..limit.
+        written: Each answer's tokens so far.
+        num_streams: How many document positions each answer so far fits.
+        trials: Drafted rounds per range of live positions.
+        accepts: Of those, the rounds whose first draft token was written.
+    """
+    written = np.asarray(written)
+    columns = written[:, None] + np.arange(cap + 1)
+    tail = np.asarray(survival)[np.minimum(columns, limit)]
+    base = tail[:, :1]
+    tail = np.divide(tail, base, out=np.ones_like(tail), where=base > 0)
+    gains = source_odds(num_streams, trials, accepts)[:, None] * tail[:, 1:]
+    gains[columns[:, 1:] >= limit] = 0.0
+    return gains
+
+
 def draft_lengths(cap, limit, survival, written, num_streams, rho, trials,
                   accepts) -> np.ndarray:
     """Return each answer's draft length: the least cost per written token.
@@ -65,17 +92,38 @@ def draft_lengths(cap, limit, survival, written, num_streams, rho, trials,
         accepts: Of those, the rounds whose first draft token was written.
     """
     written = np.asarray(written)
-    columns = written[:, None] + np.arange(cap + 1)
-    tail = np.asarray(survival)[np.minimum(columns, limit)]
-    base = tail[:, :1]
-    tail = np.divide(tail, base, out=np.ones_like(tail), where=base > 0)
+    gains = draft_gains(cap, limit, survival, written, num_streams, trials, accepts)
     # the chosen token, then each draft token while the answer goes on
     # and the position followed is its source
-    writes = 1 + source_odds(num_streams, trials, accepts)[:, None] * np.cumsum(
-        np.c_[np.zeros(len(written)), tail[:, 1:]], axis=1)
+    writes = 1 + np.cumsum(np.c_[np.zeros(len(written)), gains], axis=1)
     costs = (1 + np.arange(cap + 1) + np.asarray(rho, dtype=float)[:, None]) / writes
-    costs[columns >= limit] = np.inf
+    costs[written[:, None] + np.arange(cap + 1) >= limit] = np.inf
     return costs.argmin(axis=1)
+
+
+def fit_drafts(gains, drafts, room) -> np.ndarray:
+    """Return the draft lengths that keep the most expected writes in room rows.
+
+    A pass holds at most room draft rows. Since an answer's gains never
+    rise along its draft, keeping the room largest gains keeps a prefix
+    of every draft; ties go to the earlier answers.
+
+    Args:
+        gains: Each answer's expected writes per draft token (draft_gains).
+        drafts: Each answer's draft length before the fit.
+        room: The draft rows the pass can hold.
+    """
+    drafts = np.asarray(drafts)
+    if drafts.sum() <= room:
+        return drafts
+    if room <= 0:
+        return np.zeros_like(drafts)
+    kept = np.where(np.arange(gains.shape[1]) < drafts[:, None], gains, -np.inf)
+    threshold = np.partition(kept.ravel(), -room)[-room]
+    above = (kept > threshold).sum(axis=1)
+    ties = (kept == threshold).sum(axis=1)
+    left = room - above.sum()
+    return above + np.clip(left - (np.cumsum(ties) - ties), 0, ties)
 
 
 class DraftPolicy:
