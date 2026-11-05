@@ -509,23 +509,21 @@ def test_copy_tables_match_each_documents_candidate_index():
     documents = ExtractionInputs(state, [spec], vocabulary, np.arange(len(texts)),
                                  None, texts)
     tables = copy_tables(documents)
-    key0 = 0
     for d, document in enumerate(documents.documents):
         scan = document.scan
         index = CandidateIndex.of(scan, vocabulary)
         start, end = tables.position_offsets[d:d + 2]
         assert tables.position_local_keys[start:end].tolist() == index.inverse.tolist()
-        keys = tables.position_keys[start:end] - key0
-        assert keys.tolist() == index.inverse.tolist()
-        assert tables.positions[d][tables.positions[d] >= 0].tolist() == list(
-            range(start, end))
-        rows = tables.option_rows[d][tables.option_rows[d] >= 0]
+        keys = np.arange(tables.document_key_starts[d], tables.document_key_ends[d])
+        assert tables.position_keys[start:end].tolist() == keys[index.inverse].tolist()
+        rows = np.concatenate([
+            np.arange(tables.key_option_starts[key],
+                      tables.key_option_starts[key] + tables.key_option_counts[key])
+            for key in keys] or [np.zeros(0, dtype=np.int64)])
         assert tables.option_tokens[rows].tolist() == index.token.tolist()
-        assert tables.option_local_keys[rows].tolist() == index.segment.tolist()
         assert tables.filler_chars[rows].tolist() == index.length.tolist()
         assert tables.filler_tokens[rows].tolist() == scan.tokens[
             index.anchor[index.segment]].tolist()
-        key0 += len(index.kids)
     assert tables.num_keys == max(
         len(CandidateIndex.of(document.scan, vocabulary).kids)
         for document in documents.documents)

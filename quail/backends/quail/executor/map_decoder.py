@@ -164,6 +164,7 @@ class MapDecoder:
 
     def row_counts(self, running):
         """Return one chosen-token row and each answer's copy draft rows."""
+        from quail.backends.quail.executor.extract.copy import STREAM_STRIDE
         from quail.cost.answers import answer_survival
         from quail.cost.draft_policy import draft_lengths
 
@@ -200,8 +201,7 @@ class MapDecoder:
                     (group.prepared_written[local] != written[mine])
                     | (group.prepared_drafts[local] < sizes[mine]))):
                 raise AssertionError("copy inputs were not prepared before packing")
-            position, option = np.divmod(self.copy_sources[slots],
-                                         constraint.num_options)
+            position, option = np.divmod(self.copy_sources[slots], STREAM_STRIDE)
             remaining = (1 + constraint.filler_lengths[option]
                          + constraint.position_lengths[position] - written[mine])
             counts[mine] += np.minimum(sizes[mine], np.maximum(0, remaining))
@@ -526,7 +526,7 @@ class MapDecoder:
         num_streams = np.maximum(1, np.where(indices[first] == 0, widths,
                                             self.num_streams[slots]))
         blocks = list(verification_blocks(
-            counts, widths, num_streams, constraint.option_rows.shape[1],
+            counts, widths, num_streams, constraint.max_options,
             constraint.num_keys, constraint.spec.top_tokens, self.copy_words,
             self.workspace_bytes))
         if out is None:
