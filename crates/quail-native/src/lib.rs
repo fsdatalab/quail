@@ -1018,6 +1018,14 @@ impl Tokenizer {
     }
 }
 
+/// The `explain()` text of a request, as JSON: see
+/// `quail_planner::explain::ExplainRequest`.
+#[pyfunction]
+fn explain_plan(request: &str) -> PyResult<String> {
+    let request: quail_planner::explain::ExplainRequest = from_json(request)?;
+    quail_planner::explain::explain_text(&request).map_err(PyRuntimeError::new_err)
+}
+
 /// A region's logical plan, its tables' rows, and the settings, read
 /// from what Python passes the planner.
 fn planning_inputs(
@@ -1134,6 +1142,7 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Tokenizer>()?;
     module.add_class::<NativePlanner>()?;
     module.add_class::<cost::CostModel>()?;
+    module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;

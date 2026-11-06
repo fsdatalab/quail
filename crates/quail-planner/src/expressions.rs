@@ -112,6 +112,46 @@ fn column_comparisons() -> Vec<&'static str> {
 // ---------------------------------------------------------------- Python text
 
 /// Python's `repr` of a string.
+/// Whether Python's `str.isprintable` holds for `c`: not a control,
+/// format, private use, line or paragraph separator, or space separator
+/// other than the ASCII space. Unassigned code points count as printable.
+fn python_printable(c: char) -> bool {
+    let code = c as u32;
+    let space_separator = matches!(
+        code,
+        0xa0 | 0x1680 | 0x2000..=0x200a | 0x202f | 0x205f | 0x3000
+    );
+    let format = matches!(
+        code,
+        0xad | 0x600..=0x605
+            | 0x61c
+            | 0x6dd
+            | 0x70f
+            | 0x890..=0x891
+            | 0x8e2
+            | 0x180e
+            | 0x200b..=0x200f
+            | 0x202a..=0x202e
+            | 0x2060..=0x2064
+            | 0x2066..=0x206f
+            | 0xfeff
+            | 0xfff9..=0xfffb
+            | 0x110bd
+            | 0x110cd
+            | 0x13430..=0x1343f
+            | 0x1bca0..=0x1bca3
+            | 0x1d173..=0x1d17a
+            | 0xe0001
+            | 0xe0020..=0xe007f
+    );
+    let private_use = matches!(
+        code,
+        0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd
+    );
+    let separator = matches!(code, 0x2028 | 0x2029);
+    !(c.is_control() || space_separator || format || private_use || separator)
+}
+
 pub fn repr_str(text: &str) -> String {
     let quote = if text.contains('\'') && !text.contains('"') {
         '"'
@@ -130,8 +170,15 @@ pub fn repr_str(text: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
+            c if !python_printable(c) => {
+                let code = c as u32;
+                if code < 0x100 {
+                    out.push_str(&format!("\\x{code:02x}"));
+                } else if code < 0x10000 {
+                    out.push_str(&format!("\\u{code:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{code:08x}"));
+                }
             }
             c => out.push(c),
         }

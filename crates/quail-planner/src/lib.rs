@@ -26,6 +26,7 @@ pub mod classify;
 pub mod columns;
 pub mod context;
 pub mod costs;
+pub mod explain;
 pub mod expressions;
 pub mod graph;
 pub mod logical;

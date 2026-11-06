@@ -498,13 +498,12 @@ class QueryResult:
 
     def explain(self, *, verbose: bool = False) -> str:
         """Return the executed operator tree with measured rows and time."""
-        from quail.explain import measured_stages, physical_tree
+        from quail.explain import physical_tree
 
         if self.plan is None:
             return "no physical plan was executed"
         tree = physical_tree(self.plan, verbose=verbose,
-                             metrics=self.node_metrics,
-                             stages=measured_stages(self.report))
+                             node_metrics=self.node_metrics, report=self.report)
         if self.datafusion_plan is None:
             return tree
         return f"DataFusion:\n{self.datafusion_plan}\n\nmodel region:\n{tree}"
