@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Bytes per element of a Gated DeltaNet layer's recurrent state.
 pub const GDN_STATE_ELEMENT_BYTES: i64 = 4;
@@ -18,7 +18,7 @@ pub const CONV_STATE_ELEMENT_BYTES: i64 = 2;
 pub const ACT_BYTES_PER_HIDDEN: i64 = 32;
 
 /// Token layout for a diffusion model's classification answer.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnswerCanvas {
     pub rows: i64,
@@ -27,7 +27,7 @@ pub struct AnswerCanvas {
 }
 
 /// A sparse autoencoder read beside a model, for `AI.SAE_FEATURES`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SaeSpec {
     pub hf_name: String,
@@ -72,7 +72,7 @@ fn sixteen() -> i64 {
 }
 
 /// One model's shape, weights, prompt format, and measured constants.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSpec {
     pub name: String,
@@ -389,7 +389,7 @@ impl ModelSpec {
 }
 
 /// One GPU's memory, bandwidth, and compute rates.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceSpec {
     pub name: String,

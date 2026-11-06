@@ -14,8 +14,8 @@ from quail.api.config import EngineConfig
 from quail.api.prompts import bind_prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.common.expressions import ColumnRef
-from quail.common.prompts import answer_row_offsets
-from quail.physical.lowering import lower_prompt, render_filter_prompt_ids
+from quail.common.tokens import model_answers
+from quail.physical.lowering import lower_prompt
 from quail.specs import DECISION_2_KAI_0_6B_BF16
 
 LAYOUT = "decision2-noul"
@@ -24,6 +24,19 @@ OPTIONS = ('\n<option>\n{"description":"No","key":"false"}\n</option>'
 CLOSING = ("\n\nSelect the single option best supported by the context "
            "and instructions.\nDecision:")
 REF = ColumnRef(alias="d", provider="documents", column="body")
+
+
+def render_filter_prompt_ids(lowered, document_ids):
+    return [*lowered.preamble_token_ids, *document_ids, *lowered.tail_token_ids]
+
+
+def answer_row_offsets(spec, tokenizer):
+    """The decision readout's row offsets, which depend on token counts only."""
+    return model_answers(spec, lambda text: [0] * len(tokenizer(text)))[2]
+
+
+NO_TURN = replace(DECISION_2_KAI_0_6B_BF16, prompt_layout=LAYOUT,
+                  turn_prefix="", turn_suffix="")
 
 
 def _tokens(text):
@@ -49,10 +62,10 @@ def test_filter_prompt_is_the_decision2_noul_format_tokenized_by_segment():
 
     ids = render_filter_prompt_ids(lowered, _tokens(document))
     last = len(ids) - 1
-    no, yes, query = (ids[last - o] for o in answer_row_offsets(LAYOUT, _tokens))
+    no, yes, query = (ids[last - o] for o in answer_row_offsets(NO_TURN, _tokens))
     assert (no, yes) == ("</option>", "</option>")
     assert query == "Decision:"
-    assert ids[last - answer_row_offsets(LAYOUT, _tokens)[0] - 1] == (
+    assert ids[last - answer_row_offsets(NO_TURN, _tokens)[0] - 1] == (
         '{"description":"No","key":"false"}\n')
 
 
@@ -82,8 +95,7 @@ def test_worker_answer_offsets_match_session_tokens(tmp_path):
                                           turn=spec.turn), session.tokenizer)
         ids = render_filter_prompt_ids(
             prompt, session.tokenizer("Please refund this."))
-        assert offsets == answer_row_offsets(
-            LAYOUT, session.tokenizer, spec.turn_suffix)
+        assert offsets == model_answers(spec, session.tokenizer)[2]
         tokenizer = Tokenizer(tmp_path)
         ends = [tokenizer.decode(ids[:len(ids) - offset]).decode()
                 for offset in offsets]

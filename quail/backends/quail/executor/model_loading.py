@@ -203,7 +203,7 @@ def keep_layers(torch, model, num_layers: int):
 
 
 def load_model(model_name: str, revision: str | None = None, *,
-               answer_token_ids=None, max_batched_tokens=None,
+               answer_token_ids, max_batched_tokens=None,
                moe_backend=None, text_only=False, num_layers=None,
                quantize_fp8=False):
     """Load model weights and retain the answer rows and the full output head.
@@ -240,12 +240,6 @@ def load_model(model_name: str, revision: str | None = None, *,
                                  text_only)
     if num_layers is not None:
         keep_layers(torch, model, num_layers)
-    if answer_token_ids is None:
-        from quail.common.prompts import true_false_token_ids
-        from quail.common.tokens import Tokenizer
-
-        true_ids, false_ids = true_false_token_ids(Tokenizer(model_path))
-        answer_token_ids = set(true_ids) | set(false_ids)
     retain_answer_head(torch, model, answer_token_ids)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()

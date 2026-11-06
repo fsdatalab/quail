@@ -172,7 +172,10 @@ pub fn request_plan(
         "order_rule": order.rule,
     });
     if decides {
-        plan_settings["decision_offsets"] = json!(answer_row_offsets(context)?);
+        plan_settings["decision_offsets"] = json!(crate::lowering::answer_row_offsets(
+            &context.prompt_model(),
+            context.tokenizer
+        )?);
     }
     Ok(json!({
         "graph": {"nodes": nodes, "root": serde_json::to_value(root).map_err(json_error)?},
@@ -692,28 +695,6 @@ fn request_preamble(
         .map_or(shared.clone(), |text| (*text).clone());
     // vLLM adds the model's beginning-of-text token to a text prompt
     Ok((preamble, without_bos(&text, &context.model.bos_text)))
-}
-
-/// Per row a decision readout reads, its distance before the prompt's
-/// last row, then 0.
-fn answer_row_offsets(context: &PlanningContext) -> Result<Vec<usize>, CompileError> {
-    let layout = prompt_layout(&context.model.prompt_layout)?;
-    let mut segments = layout.answer_segments.clone();
-    let Some(last) = segments.last_mut() else {
-        return Ok(vec![0]);
-    };
-    last.push_str(&context.model.turn_suffix);
-    let lengths = segments
-        .iter()
-        .map(|segment| (context.tokenizer)(segment).map(|ids| ids.len()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut offsets: Vec<usize> = layout
-        .answer_rows
-        .iter()
-        .map(|row| lengths[row + 1..].iter().sum())
-        .collect();
-    offsets.push(0);
-    Ok(offsets)
 }
 
 /// The nodes that turn the request node's answers into result rows, and

@@ -33,8 +33,8 @@ const EXTRACT_FORMAT: &str = "Answer in this format:";
 const EXTRACT_PHRASE_FORMAT: &str = "Phrase: <copied words>";
 const EXTRACT_PHRASE_CUE: &str = "Phrase:";
 
-/// The fixed text of an AI.IF filter or join prompt, as `PromptLayout`.
-#[derive(Debug, Clone)]
+/// The fixed text of an AI.IF filter or join prompt in one model's format.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PromptLayout {
     pub name: &'static str,
     pub document_label: &'static str,

@@ -137,7 +137,8 @@ fn extract_spec(
         let alias = argument_alias(&call.prompt.args[0]);
         let summary = AliasStats::summarize(context.lengths(&alias)?, model.sliding_window);
         let layout = prompt_layout(&model.prompt_layout)?;
-        let state_tail = (context.tokenizer)(&prompt.prompt.tail_segments[0])?.len() as i64;
+        let (state_tail, question_header) =
+            crate::lowering::set_question_parts(&prompt, &model.prompt_layout, context.tokenizer)?;
         let head = prompt.preamble_token_ids.len() as i64;
         let tail = prompt.tail_token_ids.len() as i64;
         let work = packed(
@@ -149,7 +150,7 @@ fn extract_spec(
             unrounded_seconds(&(&work * expected_rows), model, device, chunk, 0.0, 0);
         spec.max_answer_tokens = model.read_span_tokens;
         spec.state_tail_tokens = state_tail;
-        spec.question_header_token_ids = (context.tokenizer)(layout.question_label)?;
+        spec.question_header_token_ids = question_header;
         let names: Vec<String> = layout
             .read_slots
             .iter()

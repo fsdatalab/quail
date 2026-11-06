@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import bisect
+import json
 from collections.abc import Sequence
 from contextlib import ExitStack
+from dataclasses import asdict
 
 import _quail_native
 import numpy as np
@@ -605,3 +607,18 @@ def prefix_tree(documents, page_tokens: int) -> PrefixTree:
     index = (documents.prefix_index if isinstance(documents, TokenStore)
              else PrefixIndex(documents))
     return index.tree(page_tokens)
+
+
+def model_answers(spec, tokenizer) -> tuple[set, set, tuple[int, ...]]:
+    """Return a model's TRUE ids, FALSE ids, and decision readout offsets.
+
+    Rust's planner reads the same ids into every plan; the GPU worker
+    calls this while it loads the model, before any plan arrives.
+
+    Args:
+        spec: The model's ModelSpec.
+        tokenizer: Callable text -> token ids, without special tokens.
+    """
+    true_ids, false_ids, offsets = _quail_native.model_answers(
+        json.dumps(asdict(spec)), tokenizer)
+    return set(true_ids), set(false_ids), tuple(offsets)

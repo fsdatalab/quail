@@ -51,13 +51,14 @@ def check(model: str) -> dict:
 
     from quail.backends.quail.executor.attention import Engine
     from quail.backends.quail.executor.model import load_model
-    from quail.common.prompts import true_false_ids
+    from quail.common.tokens import model_answers
     from quail.specs import MODELS
 
     spec = MODELS[model]
     tokenizer = AutoTokenizer.from_pretrained(
         spec.hf_name, revision=spec.revision or None)
-    true_ids, false_ids = true_false_ids(tokenizer)
+    true_ids, false_ids, _ = model_answers(spec, lambda text: tokenizer(
+        text, add_special_tokens=False)["input_ids"])
     loaded = load_model(spec.hf_name, spec.revision or None,
                         answer_token_ids=true_ids | false_ids,
                         max_batched_tokens=8192,

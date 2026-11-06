@@ -183,20 +183,21 @@ def _mixed_questions(encoder, choice):
     from quail.api.prompts import bind_extract_prompt, bind_prompt
     from quail.backends.quail.executor.pass_groups import SetQuestion, node_question
     from quail.common.expressions import ColumnRef
-    from quail.common.prompts import PROMPT_LAYOUTS
     from quail.physical import AiClassify
     from quail.physical.lowering import (
         lower_prompt,
+        prompt_layout,
         read_slot_offsets,
         set_question_parts,
     )
     from quail.specs import D1_2B_BF16
 
     spec = D1_2B_BF16
-    lowered = lower_prompt(bind_prompt(
+    prompt = bind_prompt(
         "Does the review praise the acting? {0}", ("body",), turn=spec.turn,
-        layout=spec.prompt_layout), encoder)
-    parts = set_question_parts(lowered, spec, encoder)
+        layout=spec.prompt_layout)
+    lowered = lower_prompt(prompt, encoder)
+    parts = set_question_parts(prompt, encoder)
     tail, cut = tuple(lowered.tail_token_ids), parts["state_tail_tokens"]
     yes_no = SetQuestion("yes_no", tuple(lowered.preamble_token_ids), tail[:cut],
                          tail[cut:], parts["question_header_token_ids"])
@@ -209,7 +210,7 @@ def _mixed_questions(encoder, choice):
     read = SetQuestion(
         "read", tuple(lowered.preamble_token_ids), tail[:cut], tail[cut:],
         tuple(encoder("QUESTION:\n")), slots=read_slot_offsets(
-            segments[-1], PROMPT_LAYOUTS[spec.prompt_layout].read_slots, encoder))
+            segments[-1], prompt_layout(spec.prompt_layout)["read_slots"], encoder))
     return [yes_no, node_question(AiClassify(node_id="label", spec=choice)), read]
 
 

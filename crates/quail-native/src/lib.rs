@@ -309,6 +309,13 @@ fn prompt_lowering<'py>(
     match name {
         "lower_prompt" => lowering_result(lower::lower_prompt(&from_json(&get(0))?, &tokens)),
         "answer_ids" => lowering_result(lower::answer_ids(&from_json(&get(0))?, &tokens)),
+        "set_question_parts" => {
+            let layout: String = from_json(&get(1))?;
+            lowering_result(
+                lower::lower_prompt(&from_json(&get(0))?, &tokens)
+                    .and_then(|lowered| lower::set_question_parts(&lowered, &layout, &tokens)),
+            )
+        }
         "option_aliases" => lowering_result(lower::option_aliases(
             &from_json::<Vec<String>>(&get(0))?,
             &tokens,
@@ -326,6 +333,56 @@ fn prompt_lowering<'py>(
             "no prompt lowering function {other}"
         ))),
     }
+}
+
+/// The token ids a model's answer readout reads, from its spec as JSON:
+/// (TRUE ids, FALSE ids, the decision readout's row offsets).
+///
+/// The GPU worker calls this when it loads a model, before any plan.
+#[pyfunction]
+fn model_answers<'py>(
+    py: Python<'py>,
+    model: &str,
+    tokenizer: Bound<'py, PyAny>,
+) -> PyResult<(Vec<i64>, Vec<i64>, Vec<usize>)> {
+    let spec: quail_cost::specs::ModelSpec = from_json(model)?;
+    let model = quail_planner::lowering::PromptModel {
+        role: spec.role.clone(),
+        answer_spellings: spec.answer_spellings.clone(),
+        turn: (spec.turn_prefix.clone(), spec.turn_suffix.clone()),
+        prompt_layout: spec.prompt_layout.clone(),
+    };
+    let tokens = python_tokenizer(py, &tokenizer);
+    let failed = |error: quail_planner::CompileError| PyRuntimeError::new_err(error.0);
+    let (true_ids, false_ids) =
+        quail_planner::lowering::answer_ids(&model, &tokens).map_err(failed)?;
+    let offsets = quail_planner::lowering::answer_row_offsets(&model, &tokens).map_err(failed)?;
+    Ok((true_ids, false_ids, offsets))
+}
+
+/// Every model or device spec in a directory, by name, as JSON; each
+/// model's `base` is already applied. `kind` is "models" or "devices".
+#[pyfunction]
+fn read_specs(kind: &str, directory: &str) -> PyResult<String> {
+    let directory = std::path::Path::new(directory);
+    let failed =
+        |error: quail_cost::specs::SpecError| pyo3::exceptions::PyValueError::new_err(error.0);
+    let found = if kind == "models" {
+        serde_json::to_value(quail_cost::specs::read_models(directory).map_err(failed)?)
+    } else {
+        serde_json::to_value(quail_cost::specs::read_devices(directory).map_err(failed)?)
+    };
+    found
+        .map(|value| value.to_string())
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+}
+
+/// A prompt layout's fixed text, by layout name, as JSON.
+#[pyfunction]
+fn prompt_layout(name: &str) -> PyResult<String> {
+    let layout = quail_planner::prompts::prompt_layout(name)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.0))?;
+    serde_json::to_string(&layout).map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
 /// The planning context's fields, as `tests/helpers/planning.py` and
@@ -1035,6 +1092,10 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<cost::CostModel>()?;
     budgets::register(module)?;
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
+    module.add_function(wrap_pyfunction!(model_answers, module)?)?;
+    module.add_function(wrap_pyfunction!(prompt_layout, module)?)?;
+    module.add_function(wrap_pyfunction!(read_specs, module)?)?;
+    module.add("SHARED_PRE", quail_planner::prompts::SHARED_PRE)?;
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;

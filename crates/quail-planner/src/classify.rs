@@ -584,7 +584,8 @@ impl ClassifyTable {
     ) -> Result<(ClassifySpec, Work), CompileError> {
         let head = lowered.preamble_token_ids.clone();
         let tail = lowered.tail_token_ids.clone();
-        let state_tail = tokenizer(&lowered.prompt.tail_segments[0])?.len() as i64;
+        let (state_tail, question_header) =
+            crate::lowering::set_question_parts(lowered, &self.model.prompt_layout, tokenizer)?;
         let need = head.len() as i64 + self.longest + tail.len() as i64;
         if need > self.chunk {
             return over_budget(
@@ -599,7 +600,6 @@ impl ClassifyTable {
             &[(tail.len() as i64 - state_tail) as f64],
             self.model.sliding_window,
         ) * expected_rows;
-        let layout = prompt_layout(&self.model.prompt_layout)?;
         let mut spec = base_spec(
             &call.prompt,
             name,
@@ -614,7 +614,7 @@ impl ClassifyTable {
         spec.scoring = SET_CHOICE_SCORING.to_string();
         spec.probabilities = call.probabilities;
         spec.state_tail_tokens = state_tail;
-        spec.question_header_token_ids = tokenizer(layout.question_label)?;
+        spec.question_header_token_ids = question_header;
         Ok((spec, work))
     }
 

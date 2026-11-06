@@ -45,5 +45,5 @@ def test_a_misspelled_field_is_refused(tmp_path):
 
 def test_a_file_named_for_another_spec_is_refused(tmp_path):
     _write(tmp_path, "one", 'name = "two"\n')
-    with pytest.raises(ValueError, match="names spec 'two'"):
+    with pytest.raises(ValueError, match="names another spec"):
         read_models(tmp_path)

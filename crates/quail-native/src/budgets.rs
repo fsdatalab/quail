@@ -418,10 +418,43 @@ pub fn draft_policy_curve(
     le_bytes(py, &curve, f64::to_le_bytes)
 }
 
+/// A model's derived sizes, from its spec as JSON: layer sets, state and
+/// KV bytes, weight memory, and activation memory, by name, as JSON.
+#[pyfunction]
+pub fn model_properties(model: &str) -> PyResult<String> {
+    let model: ModelSpec =
+        serde_json::from_str(model).map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(serde_json::json!({
+        "reuses_kv": model.reuses_kv(),
+        "attention_layers": model.attention_layers(),
+        "gdn_layers": model.gdn_layers(),
+        "short_conv_layers": model.short_conv_layers(),
+        "state_layers": model.state_layers(),
+        "conv_state_channels": model.conv_state_channels(),
+        "conv_channels": model.conv_channels(),
+        "gdn_state_bytes": model.gdn_state_bytes(),
+        "conv_state_bytes": model.conv_state_bytes(),
+        "checkpoint_bytes": model.checkpoint_bytes(),
+        "kv_shapes": model.kv_shapes(),
+        "widest_projection": model.widest_projection(),
+        "kappa": model.kappa(),
+        "kv_elements_per_token": model.kv_elements_per_token(),
+        "kappa_sliding": model.kappa_sliding(),
+        "kappa_full": model.kappa_full(),
+        "W_mem": model.W_mem(),
+        "head_mem_bytes": model.head_mem_bytes(),
+        "W_resident": model.W_resident(),
+        "act_per_token": model.act_per_token(),
+        "intermediate": model.intermediate(),
+    })
+    .to_string())
+}
+
 /// Add the budget functions and constants to the native module.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Budgets>()?;
     for function in [
+        wrap_pyfunction!(model_properties, module)?,
         wrap_pyfunction!(execution_pages, module)?,
         wrap_pyfunction!(pages, module)?,
         wrap_pyfunction!(parallel_copies, module)?,

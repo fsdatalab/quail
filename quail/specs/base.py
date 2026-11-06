@@ -1,7 +1,10 @@
 """Model and device spec structs for the planner."""
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from typing import Literal, get_args
+
+import _quail_native
 
 Precision = Literal["fp8", "bf16", "fp32"]
 # What a model answers with: a generative model scores TRUE against
@@ -89,6 +92,13 @@ class SaeSpec:
     keep: int
 
 
+def _tuples(value):
+    """A JSON value with its lists as tuples, as the spec's fields hold them."""
+    if isinstance(value, list):
+        return tuple(_tuples(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
@@ -167,7 +177,7 @@ class ModelSpec:
     #                    filter, join, or score reads at the answer row;
     #                    empty reads TRUE against FALSE
     prompt_format: str = "raw-v1"    # names the turn layout in run records
-    prompt_layout: str = "ai-if"     # the PROMPT_LAYOUTS entry AI.IF
+    prompt_layout: str = "ai-if"     # the prompt layout AI.IF
     #                                  prompts are written in
     chunk_cap_tokens: int = 0    # upper bound on tokens per chunk; 0
     #                              leaves the memory and kernel bounds
@@ -220,6 +230,15 @@ class ModelSpec:
                 f"{self.name}: sliding_window needs layer_kinds to say which "
                 f"layers slide")
 
+    def _properties(self) -> dict:
+        """The derived sizes, computed once by Rust's spec."""
+        found = self.__dict__.get("_derived")
+        if found is None:
+            found = {key: _tuples(value) for key, value in json.loads(
+                _quail_native.model_properties(json.dumps(asdict(self)))).items()}
+            object.__setattr__(self, "_derived", found)
+        return found
+
     def layer_kind(self, layer: int) -> LayerKind:
         """Return the kind of one layer."""
         return self.layer_kinds[layer] if self.layer_kinds else "full_attention"
@@ -230,71 +249,53 @@ class ModelSpec:
 
     @property
     def reuses_kv(self) -> bool:
-        """Whether a document's KV can be kept and read again by later questions.
-
-        False under set attention, where a document reads its questions,
-        so each pass computes it afresh and no KV is kept or shared.
-        """
-        return self.attention_mask != "set"
+        """Whether a document's KV can be kept and read again by later questions."""
+        return self._properties()["reuses_kv"]
 
     @property
     def attention_layers(self) -> tuple[int, ...]:
         """The layers that store KV."""
-        return tuple(i for i in range(self.layers) if self.keeps_kv(i))
+        return self._properties()["attention_layers"]
 
     @property
     def gdn_layers(self) -> tuple[int, ...]:
         """The layers that keep a Gated DeltaNet state."""
-        return tuple(i for i in range(self.layers)
-                     if self.layer_kind(i) == "gated_delta_net")
+        return self._properties()["gdn_layers"]
 
     @property
     def short_conv_layers(self) -> tuple[int, ...]:
         """The layers that keep a short convolution's input columns."""
-        return tuple(i for i in range(self.layers)
-                     if self.layer_kind(i) == "short_conv")
+        return self._properties()["short_conv_layers"]
 
     @property
     def state_layers(self) -> tuple[int, ...]:
         """The layers that keep state between a document's tokens."""
-        return tuple(i for i in range(self.layers)
-                     if self.layer_kind(i) in ("gated_delta_net", "short_conv"))
+        return self._properties()["state_layers"]
 
     @property
     def conv_state_channels(self) -> int:
         """Channels of the convolution input a state layer keeps."""
-        return self.conv_channels if self.gdn_layers else self.hidden
+        return self._properties()["conv_state_channels"]
 
     @property
     def conv_channels(self) -> int:
         """Channels of a Gated DeltaNet layer's convolution: q, k, and v joined."""
-        return (2 * self.gdn_key_heads * self.gdn_key_dim
-                + self.gdn_value_heads * self.gdn_value_dim)
+        return self._properties()["conv_channels"]
 
     @property
     def gdn_state_bytes(self) -> int:
         """Bytes of one layer's recurrent state, a matrix per value head."""
-        return (self.gdn_value_heads * self.gdn_value_dim * self.gdn_key_dim
-                * GDN_STATE_ELEMENT_BYTES)
+        return self._properties()["gdn_state_bytes"]
 
     @property
     def conv_state_bytes(self) -> int:
         """Bytes of one layer's convolution input columns kept between tokens."""
-        return (self.conv_channels * (self.conv_width - 1)
-                * CONV_STATE_ELEMENT_BYTES)
+        return self._properties()["conv_state_bytes"]
 
     @property
     def checkpoint_bytes(self) -> int:
-        """Bytes of the state a sequence leaves in every state layer.
-
-        A Gated DeltaNet layer keeps its state matrix and convolution
-        columns; a short convolution layer keeps its input columns.
-        Zero for a model without either.
-        """
-        return (len(self.gdn_layers) * (self.gdn_state_bytes
-                                        + self.conv_state_bytes)
-                + len(self.short_conv_layers) * self.hidden
-                * (self.conv_width - 1) * CONV_STATE_ELEMENT_BYTES)
+        """Bytes of the state a sequence leaves in every state layer."""
+        return self._properties()["checkpoint_bytes"]
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""
@@ -303,33 +304,22 @@ class ModelSpec:
     @property
     def kv_shapes(self) -> tuple:
         """Per layer, the (KV heads, head dim) its KV stores."""
-        full = (self.full_num_kv_heads or self.num_kv_heads,
-                self.full_d_head or self.d_head)
-        return tuple(
-            (0, 0) if not self.keeps_kv(i)
-            else full if self.is_full_layer(i) else (self.num_kv_heads, self.d_head)
-            for i in range(self.layers))
+        return self._properties()["kv_shapes"]
 
     @property
     def widest_projection(self) -> int:
         """Output columns of the widest dense projection in any layer."""
-        query_width = 2 if self.attn_output_gate else 1
-        attention = max(
-            (query_width * self.num_q_heads + 2 * num_kv_heads) * head
-            for num_kv_heads, head in self.kv_shapes)
-        gdn = (2 * self.gdn_key_heads * self.gdn_key_dim
-               + 2 * self.gdn_value_heads * self.gdn_value_dim)
-        return max(self.ffn_width, attention, gdn)
+        return self._properties()["widest_projection"]
 
     @property
     def kappa(self) -> float:
         """KV bytes per cached token, summed over the layers."""
-        return self.kv_elements_per_token * self.kv_bytes
+        return self._properties()["kappa"]
 
     @property
     def kv_elements_per_token(self) -> int:
         """KV elements per token, dtype-free: 2 * sum of num_kv_heads * d_head."""
-        return 2 * sum(num_kv_heads * d_head for num_kv_heads, d_head in self.kv_shapes)
+        return self._properties()["kv_elements_per_token"]
 
     @property
     def sliding_layer_set(self) -> frozenset:
@@ -342,16 +332,12 @@ class ModelSpec:
     @property
     def kappa_sliding(self) -> float:
         """KV bytes per token on the sliding layers alone."""
-        sliding = self.sliding_layer_set
-        return 2 * self.kv_bytes * sum(
-            num_kv_heads * d_head
-            for i, (num_kv_heads, d_head) in enumerate(self.kv_shapes)
-            if i in sliding)
+        return self._properties()["kappa_sliding"]
 
     @property
     def kappa_full(self) -> float:
         """KV bytes per token on the layers that keep every token."""
-        return self.kappa - self.kappa_sliding
+        return self._properties()["kappa_full"]
 
     @property
     def turn(self) -> tuple[str, str]:
@@ -363,42 +349,27 @@ class ModelSpec:
     @property
     def W_mem(self) -> float:  # noqa: N802
         """Weight bytes as loaded, before the full untied head is discarded."""
-        return self.w_mem_bytes or self.params * self.w_bytes
+        return self._properties()["W_mem"]
 
     @property
     def head_mem_bytes(self) -> float:
-        """Return untied output-head memory in bytes, or zero for tied weights.
-
-        The executor keeps this matrix for AI.CLASSIFY, so it stays
-        resident beside the other weights. Both Qwen3 checkpoints store
-        the head in bf16, hence the 2 bytes per element.
-        """
-        if self.tied_head:
-            return 0.0
-        return self.vocab * self.hidden * 2.0
+        """Return untied output-head memory in bytes, or zero for tied weights."""
+        return self._properties()["head_mem_bytes"]
 
     @property
     def W_resident(self) -> float:  # noqa: N802
         """Return model weight bytes resident on the GPU, including the output head."""
-        return self.W_mem
+        return self._properties()["W_resident"]
 
     @property
     def act_per_token(self) -> float:
         """Reserved activation bytes per batched token."""
-        dense = ACT_BYTES_PER_HIDDEN * self.hidden
-        # Triton experts use two BF16 workspaces, plus activation quantization
-        # and routing buffers. They are reused across layers.
-        expert = 2 * self.experts_active * (
-            max(self.hidden, self.expert_intermediate)
-            + max(self.hidden, 2 * self.expert_intermediate)
-            + self.expert_intermediate)
-        routing = 4 * self.experts + 16 * self.experts_active
-        return dense + expert + routing
+        return self._properties()["act_per_token"]
 
     @property
     def intermediate(self) -> int:
         """MLP intermediate width; gate_up packs two of them."""
-        return self.ffn_width // 2
+        return self._properties()["intermediate"]
 
 @dataclass(frozen=True)
 class DeviceSpec:

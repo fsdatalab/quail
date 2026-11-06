@@ -102,10 +102,7 @@ def _tokenizer():
 def _prompts():
     """Per question, the lowered prompt and the text and ids of each review."""
     from quail.api.prompts import bind_prompt
-    from quail.physical.lowering import (
-        lower_prompt,
-        render_filter_prompt_ids,
-    )
+    from quail.physical.lowering import lower_prompt
 
     spec, ids = _spec(), _tokenizer()
     out = []
@@ -115,7 +112,8 @@ def _prompts():
         lowered = lower_prompt(prompt, ids)
         out.append((prompt, lowered, [
             (prompt.preamble + review + prompt.tail[len("{0}"):],
-             render_filter_prompt_ids(lowered, ids(review)))
+             [*lowered.preamble_token_ids, *ids(review),
+              *lowered.tail_token_ids])
             for review in REVIEWS]))
     return out
 
@@ -248,9 +246,10 @@ def _yes_no_questions(templates):
     spec, ids = _spec(), _tokenizer()
     questions = []
     for template in templates:
-        lowered = lower_prompt(bind_prompt(template, ("body",), turn=spec.turn,
-                                           layout=spec.prompt_layout), ids)
-        parts = set_question_parts(lowered, spec, ids)
+        prompt = bind_prompt(template, ("body",), turn=spec.turn,
+                             layout=spec.prompt_layout)
+        lowered = lower_prompt(prompt, ids)
+        parts = set_question_parts(prompt, ids)
         tail, cut = tuple(lowered.tail_token_ids), parts["state_tail_tokens"]
         questions.append(SetQuestion(
             "yes_no", tuple(lowered.preamble_token_ids), tail[:cut], tail[cut:],
@@ -536,11 +535,10 @@ def _read_questions():
     from quail.api.prompts import bind_extract_prompt
     from quail.backends.quail.executor.pass_groups import SetQuestion
     from quail.common.expressions import ColumnRef
-    from quail.common.prompts import PROMPT_LAYOUTS
-    from quail.physical.lowering import lower_prompt, read_slot_offsets
+    from quail.physical.lowering import lower_prompt, prompt_layout, read_slot_offsets
 
     spec, ids = _spec(), _tokenizer()
-    layout = PROMPT_LAYOUTS[spec.prompt_layout]
+    layout = prompt_layout(spec.prompt_layout)
     questions = []
     for question in READS:
         lowered = lower_prompt(bind_extract_prompt(
@@ -551,7 +549,7 @@ def _read_questions():
         questions.append(SetQuestion(
             "read", tuple(lowered.preamble_token_ids), tail[:cut], tail[cut:],
             tuple(ids("QUESTION:\n")),
-            slots=read_slot_offsets(segments[-1], layout.read_slots, ids)))
+            slots=read_slot_offsets(segments[-1], layout["read_slots"], ids)))
     return questions
 
 

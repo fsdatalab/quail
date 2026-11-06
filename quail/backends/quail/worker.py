@@ -234,11 +234,9 @@ def model_tokenizer(spec, model_path: str = ""):
 
 def decision_offsets(spec, path) -> tuple[int, ...]:
     """The rows a decision readout reads, as distances before the last row."""
-    from quail.common.prompts import answer_row_offsets
-    from quail.common.tokens import Tokenizer
+    from quail.common.tokens import Tokenizer, model_answers
 
-    offsets = answer_row_offsets(spec.prompt_layout, Tokenizer(path),
-                                 spec.turn_suffix)
+    _, _, offsets = model_answers(spec, Tokenizer(path))
     if len(offsets) != 3:
         raise ValueError(
             f"{spec.name}: the decision readout reads a no row, a yes row, "

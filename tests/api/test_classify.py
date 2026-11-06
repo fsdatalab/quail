@@ -20,7 +20,6 @@ from quail.common.expressions import (
     RegularPredicate,
     column_references,
 )
-from quail.common.prompts import join_anchor_note
 from quail.physical import (
     AiClassify,
     AiJoin,
@@ -214,7 +213,7 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     (call,) = [column.expression for column in root.columns
                if isinstance(column, Alias)]
     assert call.kind == "label" and call.aliases() == ("d", "a")
-    assert call.prompt.frame == join_anchor_note(0)
+    assert call.prompt.frame == "\n\n(The document above is DOCUMENT {0}.)"
     assert call.prompt.tail.startswith("\n\nAnswer with exactly one")
     # the classification sits above the join of the two tables
     assert kinds(query.logical) == [

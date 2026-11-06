@@ -87,10 +87,7 @@ pub fn set_score_parts(
         &bind_prompt(&prompt.template, &prompt.args, &turn, &layout)?,
         context.tokenizer,
     )?;
-    Ok((
-        (context.tokenizer)(&lowered.prompt.tail_segments[0])?.len() as i64,
-        (context.tokenizer)(layout.question_label)?,
-    ))
+    crate::lowering::set_question_parts(&lowered, &model.prompt_layout, context.tokenizer)
 }
 
 /// A score's spec and its work, as `score_spec`.

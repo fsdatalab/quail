@@ -9,7 +9,6 @@ aggregate, having, sort, and fetch steps are the clauses that follow.
 
 from __future__ import annotations
 
-from quail.common.prompts import map_instruction
 from quail_b.substrait import (
     Aggregate,
     Classify,
@@ -24,6 +23,9 @@ from quail_b.substrait import (
 
 AGGREGATE_SQL = {"count": "COUNT", "sum": "SUM", "avg": "AVG", "min": "MIN",
                  "max": "MAX"}
+
+# an AI.MAP prompt is the document, a blank line, then the instruction
+MAP_DOCUMENT = "{0}\n\n"
 
 
 def build_query(session, info: PlanInfo, selectivity=None,
@@ -102,7 +104,7 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
     for item in info.maps:
         outputs[item.output] = (
             f"AI.MAP({document(item.relation)}, "
-            f"{sql_string(map_instruction(item.prompt))}, {item.max_tokens})")
+            f"{sql_string(item.prompt.removeprefix(MAP_DOCUMENT))}, {item.max_tokens})")
     for struct in info.structs:
         extracts = [extract for extract in info.extracts
                     if info.struct_of(extract) == struct]

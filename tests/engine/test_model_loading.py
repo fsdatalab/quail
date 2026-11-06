@@ -70,12 +70,7 @@ def test_retained_answer_weights_ownership_and_answer_rows(torch):
     retain_answer_head(torch, model, [1, 3, 5])
     cpu_torch = SimpleNamespace(tensor=lambda values, **kwargs: torch.tensor(values))
 
-    def tokenizer(word, **kwargs):
-        return {"input_ids": [
-            5 if "false" in word.lower() else 3 if word.startswith(" ") else 1]}
-
-    first = AnswerRows.from_tokenizer(cpu_torch, torch.nn.functional, model,
-                                      tokenizer)
+    first = AnswerRows(cpu_torch, torch.nn.functional, model, [1, 3], [5])
     second = AnswerRows(cpu_torch, torch.nn.functional, model, [3, 1], [5])
     assert first.weights is second.weights is model.quail_answer_weights
     assert first(hidden) == second(hidden) == expected

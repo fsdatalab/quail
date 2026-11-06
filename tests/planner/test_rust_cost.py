@@ -28,22 +28,9 @@ def plain(value):
     return value
 
 
-PROPERTIES = (
-    "reuses_kv", "attention_layers", "gdn_layers", "short_conv_layers",
-    "state_layers", "conv_state_channels", "conv_channels", "gdn_state_bytes",
-    "conv_state_bytes", "checkpoint_bytes", "kv_shapes", "widest_projection",
-    "kappa", "kv_elements_per_token", "kappa_sliding", "kappa_full", "W_mem",
-    "head_mem_bytes", "W_resident", "act_per_token", "intermediate",
-)
-
-
-def test_every_model_reads_with_the_same_derived_properties(rust):
+def test_every_spec_file_is_read(rust):
     assert sorted(rust.model_names()) == sorted(MODELS)
     assert sorted(rust.device_names()) == sorted(DEVICES)
-    for name, model in MODELS.items():
-        expected = {key: plain(getattr(model, key)) for key in PROPERTIES}
-        found = plain(rust.model_properties(name))
-        assert {key: found[key] for key in PROPERTIES} == expected, name
 
 
 def test_every_device_has_the_same_gemm_rates(rust):

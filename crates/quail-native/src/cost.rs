@@ -14,7 +14,7 @@ use quail_cost::quantity::{Quantity, numpy_sum};
 use quail_cost::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
 use quail_cost::statistics::AliasStats;
 use quail_cost::work::Work;
-use quail_cost::{budgets, dense_decoder_cost, packing, sol};
+use quail_cost::{budgets, packing, sol};
 
 /// A number, or a list of numbers, from Python.
 fn quantity(value: &Bound<'_, PyAny>) -> PyResult<Quantity> {
@@ -127,47 +127,6 @@ impl CostModel {
     /// The names of the devices read.
     fn device_names(&self) -> Vec<String> {
         self.devices.keys().cloned().collect()
-    }
-
-    /// A model's derived properties, by the names ModelSpec gives them.
-    fn model_properties<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyDict>> {
-        let model = self.model(name)?;
-        let properties = PyDict::new(py);
-        properties.set_item("reuses_kv", model.reuses_kv())?;
-        properties.set_item("attention_layers", model.attention_layers())?;
-        properties.set_item("gdn_layers", model.gdn_layers())?;
-        properties.set_item("short_conv_layers", model.short_conv_layers())?;
-        properties.set_item("state_layers", model.state_layers())?;
-        properties.set_item("conv_state_channels", model.conv_state_channels())?;
-        properties.set_item("conv_channels", model.conv_channels())?;
-        properties.set_item("gdn_state_bytes", model.gdn_state_bytes())?;
-        properties.set_item("conv_state_bytes", model.conv_state_bytes())?;
-        properties.set_item("checkpoint_bytes", model.checkpoint_bytes())?;
-        properties.set_item("kv_shapes", model.kv_shapes())?;
-        properties.set_item("widest_projection", model.widest_projection())?;
-        properties.set_item("kappa", model.kappa())?;
-        properties.set_item("kv_elements_per_token", model.kv_elements_per_token())?;
-        properties.set_item("kappa_sliding", model.kappa_sliding())?;
-        properties.set_item("kappa_full", model.kappa_full())?;
-        properties.set_item("W_mem", model.W_mem())?;
-        properties.set_item("head_mem_bytes", model.head_mem_bytes())?;
-        properties.set_item("W_resident", model.W_resident())?;
-        properties.set_item("act_per_token", model.act_per_token())?;
-        properties.set_item("intermediate", model.intermediate())?;
-        properties.set_item("dense_params", dense_decoder_cost::dense_params(model))?;
-        properties.set_item(
-            "gdn_core_flops_per_token",
-            dense_decoder_cost::gdn_core_flops_per_token(model),
-        )?;
-        properties.set_item(
-            "conv_flops_per_token",
-            dense_decoder_cost::conv_flops_per_token(model),
-        )?;
-        properties.set_item(
-            "attention_pair_flops",
-            dense_decoder_cost::attention_pair_flops(model),
-        )?;
-        Ok(properties)
     }
 
     /// One device's GEMM rate for a precision.

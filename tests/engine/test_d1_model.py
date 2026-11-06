@@ -97,15 +97,13 @@ def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
 
 
 def test_an_option_whose_code_is_two_tokens_takes_d1s_first_free_fallback():
-    from quail.common.prompts import option_codes
     from quail.physical.lowering import option_aliases
 
     def tokenizer(text):
         return list(text) if text.isupper() else [text]
 
-    codes = option_codes([f"label {index}" for index in range(27)])
+    codes = (*(chr(ord("A") + index) for index in range(26)), "AA")
 
-    assert codes[-1] == "AA"
     assert option_aliases(codes, tokenizer)[-1] == "00"
 
 

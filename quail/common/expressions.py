@@ -297,7 +297,7 @@ class Prompt:
         frame_text: The text whose token count is the frame's; empty
             when the prompt has no frame.
         kind: filter, join, label, extract, or score.
-        layout: The PROMPT_LAYOUTS name the text was built with.
+        layout: The name of the prompt layout the text was built with.
         tail_segments: The tail after the placeholder, one entry per
             separately tokenized segment; empty means one segment.
         label_texts: Per placeholder of a join or a classification of

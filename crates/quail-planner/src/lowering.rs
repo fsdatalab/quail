@@ -21,6 +21,54 @@ pub type Decoder<'a> = dyn Fn(&[i64]) -> Result<String, CompileError> + 'a;
 /// AI.CLASSIFY's most labels; Jev's limit on one choice's options.
 pub const MAX_LETTERS: usize = 255;
 
+/// A set-attention question's state tail length and later-question header:
+/// the tokens of the tail's first segment, which the state keeps, and the
+/// ids of the layout's question label, which each later question starts with.
+///
+/// # Errors
+///
+/// The layout is unknown, or the tokenizer fails.
+pub fn set_question_parts(
+    lowered: &LoweredPrompt,
+    layout: &str,
+    tokenizer: &Tokenizer,
+) -> Result<(i64, Vec<i64>), CompileError> {
+    let layout = crate::prompts::prompt_layout(layout)?;
+    Ok((
+        tokenizer(&lowered.prompt.tail_segments[0])?.len() as i64,
+        tokenizer(layout.question_label)?,
+    ))
+}
+
+/// Per row a decision readout reads, its distance before the prompt's
+/// last row, then 0.
+///
+/// # Errors
+///
+/// The model's layout is unknown, or the tokenizer fails.
+pub fn answer_row_offsets(
+    model: &PromptModel,
+    tokenizer: &Tokenizer,
+) -> Result<Vec<usize>, CompileError> {
+    let layout = crate::prompts::prompt_layout(&model.prompt_layout)?;
+    let mut segments = layout.answer_segments.clone();
+    let Some(last) = segments.last_mut() else {
+        return Ok(vec![0]);
+    };
+    last.push_str(&model.turn.1);
+    let lengths = segments
+        .iter()
+        .map(|segment| tokenizer(segment).map(|ids| ids.len()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut offsets: Vec<usize> = layout
+        .answer_rows
+        .iter()
+        .map(|row| lengths[row + 1..].iter().sum())
+        .collect();
+    offsets.push(0);
+    Ok(offsets)
+}
+
 /// A classification's head, tail, and label token sequences.
 pub type ClassifyTokens = (Vec<i64>, Vec<i64>, Vec<Vec<i64>>);
 

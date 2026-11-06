@@ -98,13 +98,14 @@ def reference(model: str) -> dict:
     from transformers import AutoTokenizer
 
     from quail.baselines.vllm import VLLMEngine
-    from quail.common.prompts import true_false_ids
+    from quail.common.tokens import model_answers
     from quail.specs import MODELS
 
     spec = MODELS[model]
     tokenizer = AutoTokenizer.from_pretrained(
         spec.hf_name, revision=spec.revision or None)
-    true_ids, false_ids = true_false_ids(tokenizer)
+    true_ids, false_ids, _ = model_answers(spec, lambda text: tokenizer(
+        text, add_special_tokens=False)["input_ids"])
     allowed = sorted(true_ids | false_ids)
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 

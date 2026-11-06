@@ -17,7 +17,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from quail.common.expressions import CompileError, Prompt
-from quail.common.prompts import PROMPT_LAYOUTS
 from quail.physical.codec import decode_value, encode_value
 
 # interned word ids start here, above any vocabulary
@@ -220,22 +219,21 @@ def read_slot_offsets(segment: str, names, tokenizer) -> tuple[int, ...]:
     return tuple(found)
 
 
-def render_filter_prompt_ids(lowered: LoweredPrompt, document_ids) -> list:
-    """Return the complete token ids for one filter document."""
-    return (list(lowered.preamble_token_ids) + list(document_ids)
-            + list(lowered.tail_token_ids))
-
-
-def set_question_parts(lowered: LoweredPrompt, model, tokenizer) -> dict:
-    """A set-attention filter's state tail length and later-question header.
+def set_question_parts(prompt: Prompt, tokenizer) -> dict:
+    """A set-attention question's state tail length and later-question header.
 
     Raises:
-        ValueError: The model's layout does not tokenize the label alone.
+        CompileError: The prompt cannot be lowered for this tokenizer.
     """
-    layout = PROMPT_LAYOUTS[model.prompt_layout]
-    if not layout.label_segment:
-        raise ValueError(f"{model.name!r}: a set-attention layout tokenizes "
-                         f"its question label as its own segment")
-    first = lowered.prompt.tail_segments[0]
-    return dict(state_tail_tokens=len(tokenizer(first)),
-                question_header_token_ids=tuple(tokenizer(layout.question_label)))
+    (state_tail, header), vocabulary = _call(
+        "set_question_parts", [encode_value(prompt), prompt.layout], tokenizer)
+    return dict(state_tail_tokens=state_tail,
+                question_header_token_ids=tuple(
+                    vocabulary.word(token) for token in header))
+
+
+def prompt_layout(name: str) -> dict:
+    """A prompt layout's fixed text, as Rust's binder writes it."""
+    import _quail_native
+
+    return json.loads(_quail_native.prompt_layout(name))
