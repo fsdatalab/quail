@@ -10,7 +10,7 @@ their previous result before laying out rows at the accepted prefix's end.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import numpy as np
@@ -32,6 +32,9 @@ class _Copy:
     documents: np.ndarray
     indices: np.ndarray     # each token's position in its answer
     maps: np.ndarray        # each token's map, when it was chosen
+    # copy continuations to prepare for these answers' next rows, run while
+    # a later forward pass is on the GPU and before the tokens are read
+    lookahead: list = field(default_factory=list)
 
 
 class MapDecoder:
@@ -49,8 +52,10 @@ class MapDecoder:
     """
 
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
-                 page_tokens: int, expected_tokens=None, *, workspace_bytes=0):
+                 page_tokens: int, expected_tokens=None, *, workspace_bytes=0,
+                 row_budget=None):
         self.workspace_bytes = workspace_bytes
+        self.row_budget = row_budget
         self.torch = torch
         self.head = head
         self.limits = np.asarray(limits, dtype=np.int64)
@@ -70,6 +75,8 @@ class MapDecoder:
         self.map = np.full(n, -1, dtype=np.int64)      # its map, -1 for none
         self.origin = np.zeros(n, dtype=np.int64)      # its first decode position
         self.fed = np.zeros(n, dtype=np.int64)         # decode rows packed
+        # when a list, each settle appends the slots whose answers ended
+        self.ended_log = None
         self.stopped = np.zeros(n, dtype=bool)         # read a stop token
         self.kv = FullAttentionGroup(n, page_tokens)
         self.device = head.device
@@ -157,12 +164,14 @@ class MapDecoder:
 
     def row_counts(self, running):
         """Return one chosen-token row and each answer's copy draft rows."""
+        from quail.backends.quail.executor.extract.copy import STREAM_STRIDE
         from quail.common.answers import answer_survival
         from quail.common.draft_policy import draft_lengths
 
         counts = np.ones(len(running), dtype=np.int64)
         written = np.zeros(len(running), dtype=np.int64)
         sizes = np.zeros(len(running), dtype=np.int64)
+        curves = {}
         for q, state in self.copy_constraints.items():
             mine = self.map[running] == q
             slots = running[mine]
@@ -176,6 +185,7 @@ class MapDecoder:
             curve = answer_survival(self.lengths[q], self.written[q],
                                     spec.expected_answer_tokens,
                                     spec.max_answer_tokens)
+            curves[q] = curve
             sizes[mine] = draft_lengths(
                 spec.draft_tokens, spec.max_answer_tokens, curve, written[mine],
                 self.num_streams[slots], state.rho[self.copy_document[slots]],
@@ -191,13 +201,34 @@ class MapDecoder:
                     (group.prepared_written[local] != written[mine])
                     | (group.prepared_drafts[local] < sizes[mine]))):
                 raise AssertionError("copy inputs were not prepared before packing")
-            position, option = np.divmod(self.copy_sources[slots],
-                                         constraint.num_options)
+            position, option = np.divmod(self.copy_sources[slots], STREAM_STRIDE)
             remaining = (1 + constraint.filler_lengths[option]
                          + constraint.position_lengths[position] - written[mine])
             counts[mine] += np.minimum(sizes[mine], np.maximum(0, remaining))
+        if self.row_budget is not None and counts.sum() > self.row_budget:
+            counts = 1 + self._fit_drafts(running, written, counts - 1, curves)
         self.drafts[running] = counts - 1
         return counts
+
+    def _fit_drafts(self, running, written, drafts, curves):
+        """Keep the draft rows with the most expected writes in the row budget.
+
+        Each answer keeps its chosen-token row. A fixed-length field has
+        no odds, so its j-th draft token ranks as 1 / j and fixed drafts
+        shrink evenly.
+        """
+        from quail.common.draft_policy import draft_gains, fit_drafts
+
+        width = int(drafts.max())
+        gains = np.zeros((len(running), width))
+        gains[:] = 1.0 / np.arange(1, width + 1)
+        for q, curve in curves.items():
+            mine = np.flatnonzero(self.map[running] == q)
+            state = self.copy_constraints[q]
+            gains[mine] = draft_gains(
+                width, state.spec.max_answer_tokens, curve, written[mine],
+                self.num_streams[running[mine]], state.trials, state.accepts)
+        return fit_drafts(gains, drafts, self.row_budget - len(running))
 
     def _prepare_copy(self, group, slots, written, drafts):
         local = group.index[slots]
@@ -266,19 +297,34 @@ class MapDecoder:
         self.paused[document] = False
         self.drafts[document] = 0
 
-    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None):
-        """Order running slots by page-hold time saved per recomputation second."""
+    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None,
+                       remaining=None):
+        """Order running slots by page-hold time saved per recomputation second.
+
+        Args:
+            curves: Per map, the survival curve to estimate remaining
+                tokens from; each map's own answers by default.
+            recompute_cost: Prices rebuilding a slot's KV; without it,
+                slots are ordered by remaining tokens alone.
+            page_holds: How many slots hold each page; a page another
+                slot also holds is not freed.
+            remaining: Per slot, its expected remaining tokens; replaces
+                the estimate from curves.
+        """
         from quail.common.answers import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         scores = np.zeros(len(self.map))
         written = np.zeros(len(self.map), dtype=np.int64)
         for q in np.unique(self.map[running]):
+            mine = running[self.map[running] == q]
+            written[mine] = self.written[q][mine]
+            if remaining is not None:
+                scores[mine] = remaining[mine]
+                continue
             curve = remaining_tokens(
                 self.lengths[q], self.written[q], self.expected_tokens[q],
                 int(self.limits[q]), survival=None if curves is None else curves.get(q))
-            mine = running[self.map[running] == q]
-            written[mine] = self.written[q][mine]
             scores[mine] = curve[written[mine]]
         if recompute_cost is not None and len(running):
             num_pages = self.kv.num_pages[running]
@@ -293,9 +339,15 @@ class MapDecoder:
                                          out=np.zeros(len(running)), where=seconds > 0)
         return running[np.lexsort((running, written[running], -scores[running]))]
 
-    def running(self):
-        """Slots whose next decode row can choose another token."""
-        running = np.flatnonzero((self.map >= 0) & ~self.paused)
+    def running(self, writing=None):
+        """Slots whose next decode row can choose another token.
+
+        Args:
+            writing: Slots holding an answer (map >= 0), or None to find them.
+        """
+        if writing is None:
+            writing = np.flatnonzero(self.map >= 0)
+        running = writing[~self.paused[writing]]
         ready = (~self.constrained[self.map[running]]
                  | (self.inflight[running] == 0))
         return running[ready & ~self.stopped[running] & ~self.copy_pending[running]
@@ -424,19 +476,20 @@ class MapDecoder:
         host.copy_(values, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
-        self.copies.append(_Copy(event, host, documents, indices,
-                                 self.map[documents].copy()))
-        np.add.at(self.inflight, documents, 1)
+        lookahead = []
         for group in self.copy_groups:
             mine = np.isin(self.map[documents], group.questions)
             if (mine & (indices == 0)).any():
-                group.constraint.prepare_documents()
+                lookahead.append((group, None))
             mine &= indices > 0
             slots, first = np.unique(documents[mine], return_index=True)
             if len(slots):
-                group.lookahead[group.index[slots]] = group.constraint.prepare_ahead(
-                    self.copy_document[slots], group.masks[group.index[slots]],
-                    indices[mine][first])
+                lookahead.append((group, (
+                    slots, self.copy_document[slots], group.masks[group.index[slots]],
+                    indices[mine][first])))
+        self.copies.append(_Copy(event, host, documents, indices,
+                                 self.map[documents].copy(), lookahead))
+        np.add.at(self.inflight, documents, 1)
         while len(self.copies) > IN_FLIGHT:
             self._read(self.copies.popleft())
 
@@ -473,7 +526,7 @@ class MapDecoder:
         num_streams = np.maximum(1, np.where(indices[first] == 0, widths,
                                             self.num_streams[slots]))
         blocks = list(verification_blocks(
-            counts, widths, num_streams, constraint.option_rows.shape[1],
+            counts, widths, num_streams, constraint.max_options,
             constraint.num_keys, constraint.spec.top_tokens, self.copy_words,
             self.workspace_bytes))
         if out is None:
@@ -548,6 +601,8 @@ class MapDecoder:
     def prepare(self):
         """Prepare pending copy rows while a forward pass runs, or when none fits."""
         self._initialize()
+        for copy in self.copies:
+            self._look_ahead(copy)
         for group in self.copy_groups:
             slots = np.flatnonzero(self.copy_pending & (self.inflight == 0)
                                    & np.isin(self.map, group.questions))
@@ -561,7 +616,19 @@ class MapDecoder:
             self._prepare_copy(group, slots, written, drafts)
             self.copy_pending[slots] = False
 
+    def _look_ahead(self, copy: _Copy) -> None:
+        """Prepare the copy continuations a copy's answers read next."""
+        work, copy.lookahead = copy.lookahead, []
+        for group, ahead in work:
+            if ahead is None:
+                group.constraint.prepare_documents()
+                continue
+            slots, documents, masks, written = ahead
+            group.lookahead[group.index[slots]] = group.constraint.prepare_ahead(
+                documents, masks, written)
+
     def _read(self, copy: _Copy) -> None:
+        self._look_ahead(copy)
         copy.event.synchronize()
         values = copy.host.numpy()
         documents, indices, maps = copy.documents, copy.indices, copy.maps
@@ -585,6 +652,8 @@ class MapDecoder:
                 self._read_copy(q, documents[mine], indices[mine], values[mine])
         self.stopped[documents[stop]] = True
         self.map[documents[ended]] = -1
+        if self.ended_log is not None:
+            self.ended_log.append(documents[ended])
         self.copy_pending[documents[ended]] = False
         self.finished.extend(zip(documents[ended].tolist(), maps[ended].tolist()))
         for group in self.copy_groups:
@@ -648,4 +717,5 @@ def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapD
         limits, state.loaded_model.tokenizer.stop_ids,
         state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens,
         workspace_bytes=copy_verification_workspace_bytes(
-            state.loaded_model.model_spec, state.chunk_tokens))
+            state.loaded_model.model_spec, state.chunk_tokens),
+        row_budget=state.chunk_tokens)

@@ -57,3 +57,31 @@ def draft_lengths(cap, limit, survival, written, num_streams, rho, trials,
         int(cap), int(limit), _float64(survival), _int64(written),
         _int64(num_streams), _float64(rho), _int64(trials), _int64(accepts)),
         np.int64)
+
+
+def draft_gains(cap, limit, survival, written, num_streams, trials,
+                accepts) -> np.ndarray:
+    """Return each answer's expected written tokens from each draft token.
+
+    Column j - 1 is draft token j's: the chance the answer goes on past
+    j more tokens times the chance the position followed is its source.
+    Draft tokens at or past the limit write none.
+    """
+    written = _int64(written)
+    found = _quail_native.draft_gains(
+        int(cap), int(limit), _float64(survival), written, _int64(num_streams),
+        _int64(trials), _int64(accepts))
+    return _array(found, np.float64).reshape(len(written), int(cap))
+
+
+def fit_drafts(gains, drafts, room) -> np.ndarray:
+    """Return the draft lengths that keep the most expected writes in room rows.
+
+    Args:
+        gains: Each answer's expected writes per draft token (draft_gains).
+        drafts: Each answer's draft length before the fit.
+        room: The draft rows the pass can hold.
+    """
+    gains = _float64(gains)
+    return _array(_quail_native.fit_drafts(
+        gains.ravel(), gains.shape[1], _int64(drafts), int(room)), np.int64)

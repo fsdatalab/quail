@@ -20,7 +20,9 @@ READOUT_BLOCK_ROWS = _quail_native.READOUT_BLOCK_ROWS
 CHECKPOINT_PASS_QUESTIONS = _quail_native.CHECKPOINT_PASS_QUESTIONS
 GRAPH_TOKEN_BUCKETS = tuple(_quail_native.GRAPH_TOKEN_BUCKETS)
 
+KV_POOL_TOKENS_ENV = _quail_native.KV_POOL_TOKENS_ENV
 parallel_copies = _quail_native.parallel_copies
+kv_pool_cap_tokens = _quail_native.kv_pool_cap_tokens
 
 
 def _spec_json(spec) -> str:

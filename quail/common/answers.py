@@ -74,7 +74,11 @@ def answer_survival(lengths, written, expected_tokens, limit) -> np.ndarray:
 
 def remaining_tokens(lengths, written, expected_tokens, limit, *,
                      survival=None) -> np.ndarray:
-    """Return the expected tokens left after t tokens, t = 0..limit."""
+    """Return E[L - t | L > t], the expected tokens left after t, t = 0..limit.
+
+    With S(u) = P(L > u) and S(limit) = 0, this is the sum of S(u) / S(t)
+    over u = t..limit - 1.
+    """
     if survival is None:
         survival = answer_survival(lengths, written, expected_tokens, limit)
     return _array(_quail_native.remaining_tokens(_float64(survival)), np.float64)

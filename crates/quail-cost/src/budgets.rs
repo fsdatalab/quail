@@ -259,12 +259,44 @@ pub fn hybrid_arena_pages(
     Ok(kv_pages + execution_pages(chunk_tokens, device.page_tokens))
 }
 
+/// An experiment's cap on the every-token KV pool, in tokens, for both
+/// engines.
+pub const KV_POOL_TOKENS_ENV: &str = "QUAIL_KV_POOL_TOKENS";
+
+/// The KV pool cap `QUAIL_KV_POOL_TOKENS` sets, in tokens, if any.
+pub fn kv_pool_cap_tokens() -> Option<i64> {
+    std::env::var(KV_POOL_TOKENS_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse().ok())
+}
+
+/// Pages of the two KV pools, the every-token pool capped by
+/// `QUAIL_KV_POOL_TOKENS`; see [`device_arena_pages`] for the pools
+/// memory allows.
+///
+/// # Errors
+///
+/// As [`device_arena_pages`].
+pub fn arena_pages(
+    model: &ModelSpec,
+    device: &DeviceSpec,
+    chunk_tokens: Option<i64>,
+    mean_document_tokens: Option<f64>,
+) -> Result<(i64, i64), String> {
+    let (full, sliding) = device_arena_pages(model, device, chunk_tokens, mean_document_tokens)?;
+    Ok(match kv_pool_cap_tokens() {
+        Some(cap) => (full.min(cap / device.page_tokens), sliding),
+        None => (full, sliding),
+    })
+}
+
 /// Pages of the two KV pools: (every-token pool, sliding-layer pool).
 ///
 /// # Errors
 ///
 /// The arena cannot hold one chunk's KV.
-pub fn arena_pages(
+pub fn device_arena_pages(
     model: &ModelSpec,
     device: &DeviceSpec,
     chunk_tokens: Option<i64>,

@@ -40,7 +40,8 @@ def _filter_query(session):
 def test_request_backends_plan_validate_and_execute(monkeypatch):
     registry = built_in_registry()
     assert set(registry.backends) == {
-        "quail", "stock_vllm", "pipelined_vllm", "shuffled_vllm", "dumb_vllm"}
+        "quail", "stock_vllm", "pipelined_vllm", "shuffled_vllm", "ngram_vllm",
+        "dumb_vllm"}
 
     for backend_name in ("stock_vllm", "pipelined_vllm"):
         session = _session(backend_name, documents=DOCS)
@@ -257,3 +258,15 @@ def test_maps_write_each_answer_under_its_own_limit(submission):
     assert {step["submission"] for step in steps} == {submission}
 
 
+
+
+def test_ngram_vllm_drafts_from_the_prompt():
+    from quail.baselines.vllm import NgramVLLMEngine, VLLMEngine, ngram_vllm_backend
+
+    backend = ngram_vllm_backend()
+    assert backend.answer_submission == "operator-at-a-time"
+    assert backend.engine_name != VLLMEngine.kind
+    kwargs = NgramVLLMEngine().llm_kwargs(QWEN3_4B_FP8, H100_SXM)
+    assert kwargs["speculative_config"] == {
+        "method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 4}
+    assert "speculative_config" not in VLLMEngine().llm_kwargs(QWEN3_4B_FP8, H100_SXM)

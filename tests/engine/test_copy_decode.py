@@ -15,16 +15,19 @@ from quail.backends.quail.executor.map_decoder import MapDecoder
 
 
 # a draft policy matters only with draft tokens, and drafts only past one token
+# a row budget below every draft trims drafts, never answers
 @pytest.mark.parametrize(
-    "draft_tokens,draft_policy,spellings,answer_limit",
+    "draft_tokens,draft_policy,spellings,answer_limit,row_budget",
     [
-        (0, "fixed", False, 1),
-        (4, "fixed", True, 8),
-        (4, "adaptive", False, 8),
+        (0, "fixed", False, 1, None),
+        (4, "fixed", True, 8, None),
+        (4, "adaptive", False, 8, None),
+        (4, "fixed", True, 8, 40),
+        (4, "adaptive", False, 8, 40),
     ],
 )
 def test_copy_answers_and_spans_match_the_recurrent_token_rule(
-    draft_tokens, draft_policy, spellings, answer_limit
+    draft_tokens, draft_policy, spellings, answer_limit, row_budget
 ):
     rng = np.random.default_rng(817)
     words = (
@@ -95,6 +98,7 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
         vocabulary.tokenizer.stop_ids,
         16,
         workspace_bytes=64 * 2**20,
+        row_budget=row_budget,
     )
     decoder.configure_copy(0, slots, documents, [spec] * num_questions)
     for q in range(num_questions):
@@ -108,6 +112,8 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
     while decoder.active:
         rows = decoder.rows()
         assert rows is not None
+        if row_budget is not None:
+            assert len(rows) <= max(row_budget, len(decoder.running()))
         chunk = SimpleNamespace(
             decode_rows=rows,
             tokens=len(rows),
@@ -491,3 +497,34 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         model.shared_reads > 0
     )
     assert not arena.accounting.owned
+
+
+def test_copy_tables_match_each_documents_candidate_index():
+    from quail.backends.quail.executor.extract.candidates import CandidateIndex
+    from quail.backends.quail.executor.extract.copy import copy_tables
+
+    texts = ["five years five days", "", "lease lease years", "days five foo"]
+    spec, vocabulary = make_spec(*texts, "foobarbaz barbaz")
+    state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
+    documents = ExtractionInputs(state, [spec], vocabulary, np.arange(len(texts)),
+                                 None, texts)
+    tables = copy_tables(documents)
+    for d, document in enumerate(documents.documents):
+        scan = document.scan
+        index = CandidateIndex.of(scan, vocabulary)
+        start, end = tables.position_offsets[d:d + 2]
+        assert tables.position_local_keys[start:end].tolist() == index.inverse.tolist()
+        keys = np.arange(tables.document_key_starts[d], tables.document_key_ends[d])
+        assert tables.position_keys[start:end].tolist() == keys[index.inverse].tolist()
+        rows = np.concatenate([
+            np.arange(tables.key_option_starts[key],
+                      tables.key_option_starts[key] + tables.key_option_counts[key])
+            for key in keys] or [np.zeros(0, dtype=np.int64)])
+        assert tables.option_tokens[rows].tolist() == index.token.tolist()
+        assert tables.filler_chars[rows].tolist() == index.length.tolist()
+        assert tables.filler_tokens[rows].tolist() == scan.tokens[
+            index.anchor[index.segment]].tolist()
+    assert tables.num_keys == max(
+        len(CandidateIndex.of(document.scan, vocabulary).kids)
+        for document in documents.documents)
+    assert np.all(np.diff(tables.option_lookup) >= 0)

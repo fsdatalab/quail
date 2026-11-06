@@ -93,8 +93,8 @@ pub fn remaining_tokens(survival: &[f64]) -> Vec<f64> {
     let width = survival.len();
     let mut tail = vec![0.0; width];
     let mut running = 0.0;
-    for j in (0..width.saturating_sub(1)).rev() {
-        running += survival[j + 1];
+    for j in (0..width).rev() {
+        running += survival[j];
         tail[j] = running;
     }
     tail.iter()

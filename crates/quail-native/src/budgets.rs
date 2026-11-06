@@ -375,6 +375,52 @@ pub fn source_odds<'py>(
     Ok(le_bytes(py, &odds, f64::to_le_bytes))
 }
 
+/// Each answer's expected writes from each of `cap` draft tokens, as
+/// float64 bytes, one row per answer.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn draft_gains<'py>(
+    py: Python<'py>,
+    cap: usize,
+    limit: usize,
+    survival: PyBuffer<f64>,
+    written: PyBuffer<i64>,
+    num_streams: PyBuffer<i64>,
+    trials: PyBuffer<i64>,
+    accepts: PyBuffer<i64>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let gains = draft_policy::draft_gains(
+        cap,
+        limit,
+        &survival.to_vec(py)?,
+        &written.to_vec(py)?,
+        &num_streams.to_vec(py)?,
+        &trials.to_vec(py)?,
+        &accepts.to_vec(py)?,
+    );
+    Ok(le_bytes(py, &gains.concat(), f64::to_le_bytes))
+}
+
+/// The draft lengths that keep the most expected writes in `room` rows,
+/// from gains of `cap` columns per answer, as int64 bytes.
+#[pyfunction]
+pub fn fit_drafts<'py>(
+    py: Python<'py>,
+    gains: PyBuffer<f64>,
+    cap: usize,
+    drafts: PyBuffer<i64>,
+    room: i64,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let fitted = draft_policy::fit_drafts(&rows(gains.to_vec(py)?, cap), &drafts.to_vec(py)?, room);
+    Ok(le_bytes(py, &fitted, i64::to_le_bytes))
+}
+
+/// The KV pool cap `QUAIL_KV_POOL_TOKENS` sets, in tokens, if any.
+#[pyfunction]
+pub fn kv_pool_cap_tokens() -> Option<i64> {
+    budgets::kv_pool_cap_tokens()
+}
+
 /// Each answer's copy draft length, as int64 bytes.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
@@ -466,6 +512,9 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(live_buckets, module)?,
         wrap_pyfunction!(source_odds, module)?,
         wrap_pyfunction!(draft_lengths, module)?,
+        wrap_pyfunction!(draft_gains, module)?,
+        wrap_pyfunction!(fit_drafts, module)?,
+        wrap_pyfunction!(kv_pool_cap_tokens, module)?,
         wrap_pyfunction!(draft_policy_curve, module)?,
     ] {
         module.add_function(function)?;
@@ -473,6 +522,7 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("READOUT_BLOCK_ROWS", budgets::READOUT_BLOCK_ROWS)?;
     module.add("PAGE_TOKENS", budgets::PAGE_TOKENS)?;
     module.add("POOL_FRACTION", budgets::POOL_FRACTION)?;
+    module.add("KV_POOL_TOKENS_ENV", budgets::KV_POOL_TOKENS_ENV)?;
     module.add("ACT_RESERVE_CHUNKS", budgets::ACT_RESERVE_CHUNKS)?;
     module.add(
         "CHECKPOINT_PASS_QUESTIONS",

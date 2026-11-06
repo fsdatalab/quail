@@ -13,7 +13,7 @@ from quail.baselines.request_scheduling import (
     run_extract_fields,
     run_filter_sequence,
 )
-from quail.common.budgets import GRAPH_TOKEN_BUCKETS
+from quail.common.budgets import GRAPH_TOKEN_BUCKETS, kv_pool_cap_tokens
 from quail.specs.base import DeviceSpec, ModelSpec
 from quail.specs.files import resolve_model_path
 
@@ -60,6 +60,8 @@ DIFFUSION_LOGPROBS = -1
 # generated tokens a longer canvas gets; the answer word is read
 # from the text
 DIFFUSION_TEXT_TOKENS = 16
+# draft tokens of the n-gram baseline, as in vLLM's documented example
+NGRAM_SPECULATIVE_TOKENS = 5
 
 
 def register_gigatoken() -> None:
@@ -345,6 +347,9 @@ class VLLMEngine:
         kwargs.update(diffusion_kwargs(spec))
         if device is not None:
             kwargs["block_size"] = device.page_tokens
+        cap = kv_pool_cap_tokens()
+        if cap:
+            kwargs["num_gpu_blocks_override"] = cap // kwargs.get("block_size", 16)
         kwargs.update(text_only_kwargs(spec))
         return kwargs
 
@@ -425,6 +430,24 @@ class DefaultVLLMEngine(VLLMEngine):
         return {**diffusion_kwargs(spec), **text_only_kwargs(spec)}
 
 
+class NgramVLLMEngine(VLLMEngine):
+    """Boot tuned vLLM with n-gram speculation from the prompt.
+
+    vLLM drafts the next five tokens after a match of the last few
+    output tokens in the prompt, as in vLLM's documented example. The
+    engine kind differs from `VLLMEngine` so a speculative engine never
+    shares a loaded model with the other tuned vLLM backends.
+    """
+
+    kind = "ngram_vllm"
+    label = "vLLM with n-gram speculation"
+
+    def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
+        return {**super().llm_kwargs(spec, device),
+                "speculative_config": speculative_config(
+                    f"ngram:{NGRAM_SPECULATIVE_TOKENS}")}
+
+
 def speculative_config(value: str) -> dict:
     """Return the vLLM speculation an experiment turns on.
 
@@ -460,6 +483,15 @@ def pipelined_vllm_backend() -> RequestBackend:
         engine=VLLMEngine(),
         filter_submission="pipelined",
         answer_submission="pipelined",
+    )
+
+
+def ngram_vllm_backend() -> RequestBackend:
+    """Return stock vLLM with n-gram speculation, operator-at-a-time filters."""
+    return RequestBackend(
+        name="ngram_vllm",
+        engine=NgramVLLMEngine(),
+        filter_submission="operator-at-a-time",
     )
 
 

@@ -19,10 +19,18 @@ def test_censored_answers_leave_the_risk_set_after_their_written_length():
     curve = survival_rows(counts, events, np.zeros((1, 7)), [6])[0]
     remaining = remaining_tokens(None, None, 3, 6, survival=curve)
     survival = np.array([1, 1, .75, .75, .375, .375, 0])
-    expected = np.r_[np.cumsum(survival[:0:-1])[::-1], 0]
+    expected = np.cumsum(survival[::-1])[::-1]
     expected[:-1] /= survival[:-1]
     np.testing.assert_allclose(remaining, expected)
     assert remaining[2] > remaining[4] > remaining[5]
+
+
+def test_an_answer_of_known_length_has_that_length_minus_written_tokens_left():
+    # three answers end at 4; a zero prior adds no events or risk
+    counts = events = np.bincount([4, 4, 4], minlength=7)[None]
+    curve = survival_rows(counts, events, np.zeros((1, 7)), [6])[0]
+    remaining = remaining_tokens(None, None, 3, 6, survival=curve)
+    np.testing.assert_allclose(remaining[:5], [4, 3, 2, 1, 0])
 
 
 @pytest.mark.parametrize("model_name,device_name", [

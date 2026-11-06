@@ -149,3 +149,23 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
     assert result.metrics["boot_s"] == 5.0
     assert result.metrics["boot"]["model_files_s"] == 2.0
     assert result.metrics["wall_s"] == 7.0
+
+
+def test_a_base_model_without_a_turn_close_ends_answers_at_its_config_eos(
+        tmp_path):
+    import json
+
+    from helpers.sessions import TOKENIZER
+
+    from quail.common.tokens import Tokenizer
+
+    # a base checkpoint keeps its end of text as an added token
+    tokenizer = json.loads((TOKENIZER / "tokenizer.json").read_text())
+    eos = len(tokenizer["model"]["vocab"])
+    tokenizer["added_tokens"] = [{
+        "id": eos, "content": "<|endoftext|>", "single_word": False,
+        "lstrip": False, "rstrip": False, "normalized": False, "special": True}]
+    (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer))
+    (tmp_path / "tokenizer_config.json").write_text(
+        '{"eos_token": "<|endoftext|>"}')
+    assert list(Tokenizer(tmp_path).stop_ids) == [eos]

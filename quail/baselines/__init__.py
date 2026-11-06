@@ -14,13 +14,15 @@ def register_baselines(registry):
     from .request import request_runtimes
     from .vllm import (
         dumb_vllm_backend,
+        ngram_vllm_backend,
         pipelined_vllm_backend,
         shuffled_vllm_backend,
         stock_vllm_backend,
     )
 
     for backend in (stock_vllm_backend(), pipelined_vllm_backend(),
-                    shuffled_vllm_backend(), dumb_vllm_backend()):
+                    shuffled_vllm_backend(), ngram_vllm_backend(),
+                    dumb_vllm_backend()):
         registry.register_backend(backend)
     registry.register_codec(NodeCodec(RequestExecution))
     for runtime_key, runtime in request_runtimes().items():

@@ -392,6 +392,22 @@ def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
         assert all(entry[2] > 0 for entry in rounds)
 
 
+def test_extraction_answers_grow_on_demand_without_headroom_admission(monkeypatch):
+    from quail.backends.quail.executor import answer_admission
+
+    documents = [LEASE, LEASE, NOTHING]
+    _, _, reference, _ = _setup(monkeypatch, documents=documents)
+    expected, _ = reference()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("extraction answers need no headroom admission")
+
+    monkeypatch.setattr(answer_admission, "HeadroomAdmission", refuse)
+    _, _, run, _ = _setup(monkeypatch, documents=documents)
+    result, _ = run()
+    assert result.outputs["rows:c"].table().equals(expected.outputs["rows:c"].table())
+
+
 @pytest.mark.parametrize("gpu_timing,recurrent", [(True, True)])
 def test_a_pipeline_of_extractions_reads_each_document_once(
         monkeypatch, gpu_timing, recurrent):

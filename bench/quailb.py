@@ -57,6 +57,7 @@ SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES,
                **IN_LIST_SELECTIVITY_ESTIMATES}
 TEXT_VLLM_BACKENDS = frozenset({
     "dumb_vllm",
+    "ngram_vllm",
     "pipelined_vllm",
     "stock_vllm",
 })
