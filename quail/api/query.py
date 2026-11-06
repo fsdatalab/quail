@@ -8,8 +8,8 @@ from contextlib import closing
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+import _quail_native
 import pyarrow as pa
-from pyarrow import compute as pc
 
 from quail.api.execute import execute_query
 from quail.api.region_inputs import input_scans
@@ -24,8 +24,8 @@ from quail.common.pairs import FIRST_DOCUMENT, columns_key
 from quail.common.tokens import ColumnStore, ScanInput, TokenLengths, TokenStore
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
 from quail.execution.projection import projection_for
-from quail.execution.reporting import collect_answers, execution_report
 from quail.execution.result import QueryResult
+from quail.execution.rows import as_table
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
@@ -446,8 +446,9 @@ class Query:
         """Finish the physical graph and attach execution details."""
         plan = self.plan()
         out = response.metrics
-        report = execution_report(
-            plan, out, (), coordinator_wall)
+        report = json.loads(_quail_native.execution_report(
+            plan.backend, plan.estimated_seconds, plan.settings.get("order_rule"),
+            json.dumps(out, default=str), coordinator_wall))
         sources = {
             node.input_id: range(node.num_documents)
             for node in plan.nodes
@@ -490,38 +491,43 @@ class Query:
             report["observers"] = observer_reports
         result.report = report
 
-        (result.answer_tables, result.survivor_indices,
-         result.true_join_tables, report["stages"]) = collect_answers(
-             self.logical, plan, response.outputs, self._document_tokens)
-        self._to_source_rows(result)
+        self._collect_answers(result, plan, response.outputs)
         return result
 
-    def _to_source_rows(self, result) -> None:
-        """Number each document by its row in the registered table.
+    def _collect_answers(self, result, plan, outputs) -> None:
+        """Attach the answers, survivors, and stages Rust reads from outputs.
 
-        A filtered input holds some of a table's rows; answer tables and
-        survivors name its documents by their row in the table, as they
-        do for a table read whole.
+        Each model operator's answers, the surviving documents, and each
+        predicate's measured selectivity; documents are numbered by their
+        row in the registered table.
         """
-        rows = {scan.alias: self.source_rows[scan.provider]
-                for scan in self.logical.operators().scans
-                if scan.provider in self.source_rows}
-        if not rows:
-            return
-
-        def renumbered(table):
-            for alias, mapping in rows.items():
-                if alias in table.column_names:
-                    index = table.column_names.index(alias)
-                    table = table.set_column(index, alias, pc.take(
-                        mapping, table.column(alias)))
-            return table
-
-        result.answer_tables = {
-            kind: {name: renumbered(table) for name, table in tables.items()}
-            for kind, tables in result.answer_tables.items()}
-        result.survivor_indices = {
-            alias: (pc.take(rows[alias], survivors) if alias in rows else survivors)
-            for alias, survivors in result.survivor_indices.items()}
-        result.true_join_tables = {
-            name: renumbered(table) for name, table in result.true_join_tables.items()}
+        ports = [
+            {"node_type": node.type_name, "node": node.node_id,
+             "port": output.name, "value_type": output.value_type.value,
+             "answer": None if output.answer is None else {
+                 "kind": output.answer.kind, "name": output.answer.name,
+                 "columns": list(output.answer.columns)}}
+            for node in plan.graph.topological_nodes() for output in node.outputs]
+        source_rows = {scan.alias: self.source_rows[scan.provider].to_pylist()
+                       for scan in self.logical.operators().scans
+                       if scan.provider in self.source_rows}
+        request = {
+            "logical": json.dumps(encode_value(self.logical)), "ports": ports,
+            "num_documents": {alias: len(tokens)
+                              for alias, tokens in self._document_tokens.items()},
+            "source_rows": source_rows}
+        tables = {(ref.node_id, ref.port): as_table(value)
+                  for ref, value in outputs.items()
+                  if isinstance(as_table(value), pa.Table)}
+        answers, survivors, true_joins, stages = _quail_native.collect_answers(
+            json.dumps(request), tables)
+        result.answer_tables = {kind: {} for kind in (
+            "filters", "joins", "classifies", "scores", "extracts", "features",
+            "maps")}
+        for kind, key, table in answers:
+            key = tuple(key) if isinstance(key, list) else key
+            result.answer_tables[kind][key] = table
+        result.survivor_indices = {alias: table.column(0).combine_chunks()
+                                   for alias, table in survivors}
+        result.true_join_tables = dict(true_joins)
+        result.report["stages"] = json.loads(stages)

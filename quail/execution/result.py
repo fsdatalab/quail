@@ -108,11 +108,6 @@ def answer_values(table: pa.Table) -> pa.ChunkedArray:
     return table.column(table.num_columns - 1)
 
 
-def predicate_positions(table: pa.Table) -> pa.ChunkedArray:
-    """Return the written positions of a filter answer table: its second column."""
-    return table.column(1)
-
-
 def filter_answer_table(alias, documents, positions, answers) -> pa.Table:
     """Build filter answers: the ids, the predicate positions, then the answers."""
     predicate = free_name("predicate", (alias,))

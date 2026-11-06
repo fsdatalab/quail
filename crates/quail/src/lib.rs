@@ -20,6 +20,7 @@
 mod engine;
 pub mod planning;
 pub mod pyarrow;
+pub mod results;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

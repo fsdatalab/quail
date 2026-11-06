@@ -1026,6 +1026,98 @@ fn explain_plan(request: &str) -> PyResult<String> {
     quail_planner::explain::explain_text(&request).map_err(PyRuntimeError::new_err)
 }
 
+/// Collect a run's answers from its output relations, as
+/// `quail::results::collect_answers` does.
+///
+/// `request` is the AnswerRequest as JSON; `outputs` maps (node id,
+/// port) to a pyarrow Table. Returns (answer tables as (kind, key,
+/// table), survivors as alias -> one-column table, true join tables by
+/// written position, stages as JSON). A key is a name, an (alias,
+/// written position) pair, or a written position.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+fn collect_answers<'py>(
+    py: Python<'py>,
+    request: &str,
+    outputs: std::collections::HashMap<(String, String), Bound<'py, PyAny>>,
+) -> PyResult<(
+    Vec<(String, Py<PyAny>, Py<PyAny>)>,
+    Vec<(String, Py<PyAny>)>,
+    Vec<(i64, Py<PyAny>)>,
+    String,
+)> {
+    use pyo3::IntoPyObjectExt;
+    let request: quail::results::AnswerRequest = from_json(request)?;
+    let mut relations = std::collections::HashMap::new();
+    for (key, table) in outputs {
+        let reader = quail::pyarrow::stream_from_pyarrow(&table)?;
+        let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
+        let batches = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| python_error(error.into()))?;
+        let batch = datafusion::arrow::compute::concat_batches(&schema, &batches)
+            .map_err(|error| python_error(error.into()))?;
+        relations.insert(key, batch);
+    }
+    let found = quail::results::collect_answers(&request, &relations)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let table = |batch: datafusion::arrow::array::RecordBatch| -> PyResult<Py<PyAny>> {
+        Ok(quail::pyarrow::to_pyarrow(py, batch.schema(), vec![batch])?.unbind())
+    };
+    let mut tables = Vec::new();
+    for (kind, key, batch) in found.tables {
+        let key = match key {
+            quail::results::AnswerKey::Name(name) => name.into_py_any(py)?,
+            quail::results::AnswerKey::Filter(alias, position) => {
+                (alias, position).into_py_any(py)?
+            }
+            quail::results::AnswerKey::Join(position) => position.into_py_any(py)?,
+        };
+        tables.push((kind, key, table(batch)?));
+    }
+    let mut survivors = Vec::new();
+    for (alias, ids) in found.survivors {
+        let batch = datafusion::arrow::array::RecordBatch::try_from_iter([(
+            alias.clone(),
+            std::sync::Arc::new(ids) as datafusion::arrow::array::ArrayRef,
+        )])
+        .map_err(|error| python_error(error.into()))?;
+        survivors.push((alias, table(batch)?));
+    }
+    let mut true_joins = Vec::new();
+    for (position, batch) in found.true_joins {
+        true_joins.push((position, table(batch)?));
+    }
+    Ok((
+        tables,
+        survivors,
+        true_joins,
+        serde_json::Value::from(found.stages).to_string(),
+    ))
+}
+
+/// The report of one region's run, as `quail::results::execution_report`
+/// builds it; `metrics` is the backend's measurements as JSON.
+#[pyfunction]
+#[pyo3(signature = (backend, estimated_seconds, order_rule, metrics, coordinator_wall))]
+fn execution_report(
+    backend: &str,
+    estimated_seconds: f64,
+    order_rule: Option<&str>,
+    metrics: &str,
+    coordinator_wall: f64,
+) -> PyResult<String> {
+    let metrics: serde_json::Map<String, serde_json::Value> = from_json(metrics)?;
+    Ok(quail::results::execution_report(
+        backend,
+        estimated_seconds,
+        order_rule,
+        &metrics,
+        coordinator_wall,
+    )
+    .to_string())
+}
+
 /// A region's logical plan, its tables' rows, and the settings, read
 /// from what Python passes the planner.
 fn planning_inputs(
@@ -1150,6 +1242,8 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
     module.add_function(wrap_pyfunction!(write_token_store, module)?)?;
+    module.add_function(wrap_pyfunction!(collect_answers, module)?)?;
+    module.add_function(wrap_pyfunction!(execution_report, module)?)?;
     module.add_function(wrap_pyfunction!(prefix_statistics, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }
