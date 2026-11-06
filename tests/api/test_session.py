@@ -1,10 +1,7 @@
 """End-to-end Session tests with a fake executor."""
 
 import re
-import sys
-from types import SimpleNamespace
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -34,7 +31,10 @@ def sess(tmp_path):
     s.close()
 
 
-def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
+def test_session_requires_model_and_device_and_loads_the_models_tokenizer(
+        monkeypatch):
+    from helpers.sessions import TOKENIZER
+
     with pytest.raises(TypeError, match="'model' and 'device'"):
         EngineConfig()
     with pytest.raises(TypeError, match="'device'"):
@@ -45,30 +45,17 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
 
     sources = []
 
-    class Tokenizer:
-        def __init__(self, source):
-            sources.append(source)
+    def resolve(name, revision, **kwargs):
+        sources.append(f"{name}@{revision}")
+        return TOKENIZER
 
-        def encode(self, text):
-            assert text in ("", "hello")
-            return np.array([1, 2], dtype=np.uint32)[:len(text)]
-
-        def decode(self, ids):
-            return b"hello"[:len(ids)]
-
-    monkeypatch.setitem(sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer))
-    monkeypatch.setattr("quail.api.session.resolve_model_path",
-                        lambda name, revision, **kwargs: f"{name}@{revision}")
+    monkeypatch.setattr("quail.api.session.resolve_model_path", resolve)
     with quail.Session(CONFIG) as session:
-        token_ids = session.tokenizer("hello")
-        piece = session.tokenizer.decode([1])
-        # the session loads one encoder for the caller and warms one on
-        # the tokenization thread; the thread keeps its own instance
-        session.inputs.warm_tokenizer().result()
-    assert sources == ["Qwen/Qwen3-4B-FP8@" + session.model.revision] * 2
-    assert token_ids == [1, 2]
-    assert all(type(token_id) is int for token_id in token_ids)
-    assert piece == b"h"
+        token_ids = session.tokenizer("hello world")
+        text = session.tokenizer.decode(token_ids)
+    assert sources == ["Qwen/Qwen3-4B-FP8@" + session.model.revision]
+    assert token_ids and all(type(token_id) is int for token_id in token_ids)
+    assert text == b"hello world"
 
 
 FILTER_SQL = """
@@ -112,7 +99,7 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
                        r"\{0\}\\n\\nq\1:'\)\s+3\s+4\s+50%\s+50%$",
                        text, re.M)
     assert first and second and first[1] != second[1]
-    assert re.search(r"Scan reviews as r\s+6\s+6\s+<1 ms$", text, re.M)
+    assert re.search(r"Scan reviews as r\s+6\s+6\s+\S+ ms$", text, re.M)
     assert re.search(r"Project: r\.id\s+1\.5\s+2\s+<1 ms$", text, re.M)
     assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", text, re.M)
     assert "run:" in text

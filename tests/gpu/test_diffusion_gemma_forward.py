@@ -66,20 +66,17 @@ def _device():
 
 
 def _prompt_ids():
-    from gigatoken import Tokenizer
-
+    from quail.common.tokens import NativeEncoder
     from quail.logical import bind_prompt
     from quail.physical.lowering import (
         lower_prompt,
         render_filter_prompt_ids,
     )
     from quail.specs import MODELS
+    from quail.specs.files import resolve_model_path
 
     spec = MODELS[MODEL]
-    tokenizer = Tokenizer(spec.hf_name).as_hf()
-
-    def ids(text):
-        return tokenizer(text, add_special_tokens=False)["input_ids"]
+    ids = NativeEncoder(resolve_model_path(spec.hf_name, spec.revision))
 
     prompt = lower_prompt(bind_prompt(QUESTION, ("body",), turn=spec.turn), ids)
     return [render_filter_prompt_ids(prompt, ids(review))
@@ -213,17 +210,17 @@ def quail(prompts, stock_layers):
 
 
 def test_answers_agree_with_stock_vllm(stock_layers, quail):
-    from gigatoken import Tokenizer
-
-    from quail.common.prompts import true_false_ids
+    from quail.common.prompts import true_false_token_ids
+    from quail.common.tokens import NativeEncoder
     from quail.specs import MODELS
+    from quail.specs.files import resolve_model_path
 
     quail_layers, model = quail
     stock_rows = [rows[-1] for rows in stock_layers]
     rows = [rows[-1] for rows in quail_layers]
     spec = MODELS[MODEL]
-    true_ids, false_ids = true_false_ids(
-        Tokenizer(spec.hf_name).as_hf())
+    true_ids, false_ids = true_false_token_ids(
+        NativeEncoder(resolve_model_path(spec.hf_name, spec.revision)))
     columns = list(model.quail_answer_token_ids)
     weights = model.quail_answer_weights.float().cpu()
     norm = model.model.norm

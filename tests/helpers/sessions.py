@@ -21,9 +21,9 @@ TOKENIZER = Path(__file__).resolve().parents[1] / "fixtures" / "tokenizer"
 @cache
 def encoder():
     """Return an encoder over the tests' tokenizer, as a session loads it."""
-    from quail.common.tokens import GigatokenEncoder
+    from quail.common.tokens import NativeEncoder
 
-    return GigatokenEncoder(TOKENIZER)
+    return NativeEncoder(TOKENIZER)
 
 
 def _run(query, execute):

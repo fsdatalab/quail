@@ -241,13 +241,11 @@ def load_model(model_name: str, revision: str | None = None, *,
     if num_layers is not None:
         keep_layers(torch, model, num_layers)
     if answer_token_ids is None:
-        from gigatoken import Tokenizer
+        from quail.common.prompts import true_false_token_ids
+        from quail.common.tokens import NativeEncoder
 
-        from quail.common.prompts import true_false_ids
-
-        tokenizer = Tokenizer(model_path).as_hf()
-        true_ids, false_ids = true_false_ids(tokenizer)
-        answer_token_ids = true_ids | false_ids
+        true_ids, false_ids = true_false_token_ids(NativeEncoder(model_path))
+        answer_token_ids = set(true_ids) | set(false_ids)
     retain_answer_head(torch, model, answer_token_ids)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()

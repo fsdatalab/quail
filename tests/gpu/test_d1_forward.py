@@ -92,13 +92,11 @@ def _spec():
 
 
 def _tokenizer():
-    from gigatoken import Tokenizer
-
+    from quail.common.tokens import NativeEncoder
     from quail.specs.files import resolve_model_path
 
     spec = _spec()
-    hf = Tokenizer(resolve_model_path(spec.hf_name, spec.revision)).as_hf()
-    return lambda text: hf(text, add_special_tokens=False)["input_ids"]
+    return NativeEncoder(resolve_model_path(spec.hf_name, spec.revision))
 
 
 def _prompts():
@@ -226,11 +224,11 @@ def answer_ids():
 
 
 def _encoder():
-    from quail.common.tokens import GigatokenEncoder
+    from quail.common.tokens import NativeEncoder
     from quail.specs.files import resolve_model_path
 
     spec = _spec()
-    return GigatokenEncoder(resolve_model_path(spec.hf_name, spec.revision))
+    return NativeEncoder(resolve_model_path(spec.hf_name, spec.revision))
 
 
 def _ends(head, tail, documents):

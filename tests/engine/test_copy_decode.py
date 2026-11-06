@@ -371,7 +371,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     )
     texts = ["five days or five years", "five years", "lease for five days"]
     spec, vocabulary = make_spec(*texts, "five days years lease", "or", "for")
-    vocabulary.tokenizer.hf.batch_decode = batch_decode
+    vocabulary.tokenizer.encoder.decode_batch = batch_decode
     spec = replace(spec, max_answer_tokens=6, draft_tokens=3, top_tokens=4)
     setup = Setup(path="unified", pages=pages, page_tokens=4, budget=128)
     arena = make_arena(setup)

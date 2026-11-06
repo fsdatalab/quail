@@ -856,6 +856,95 @@ fn prefix_statistics<'py>(
     Ok(found)
 }
 
+/// A model's tokenizer, read from its `tokenizer.json`: the one the
+/// planner writes token stores with, for the GPU worker's extractions
+/// and answers.
+#[pyclass(name = "NativeTokenizer", module = "_quail_native", frozen)]
+struct NativeTokenizer {
+    inner: quail_inputs::HfTokenizer,
+}
+
+#[pymethods]
+impl NativeTokenizer {
+    /// The tokenizer in the `tokenizer.json` at `tokenizer_file`.
+    #[new]
+    fn new(tokenizer_file: &str) -> PyResult<Self> {
+        let inner = quail_inputs::HfTokenizer::from_file(std::path::Path::new(tokenizer_file))
+            .map_err(|error| python_error(error.into()))?;
+        Ok(Self { inner })
+    }
+
+    /// The tokens of each text in `table`'s first column, as a pyarrow
+    /// Table of one large list of int32 column, `tokens`.
+    fn encode<'py>(&self, table: &Bound<'py, PyAny>) -> PyResult<Py<PyAny>> {
+        use quail_inputs::Tokenizer;
+        let py = table.py();
+        let batches = quail::pyarrow::from_pyarrow(table)?;
+        let lists = py
+            .detach(|| {
+                batches
+                    .iter()
+                    .map(|batch| {
+                        let texts = batch.column(0).as_string::<i32>();
+                        let tokens: datafusion::arrow::array::ArrayRef =
+                            std::sync::Arc::new(self.inner.encode_batch(texts)?);
+                        Ok(tokens)
+                    })
+                    .collect::<Result<Vec<_>, datafusion::arrow::error::ArrowError>>()
+            })
+            .map_err(|error| python_error(error.into()))?;
+        let field = datafusion::arrow::datatypes::Field::new(
+            "tokens",
+            datafusion::arrow::datatypes::DataType::LargeList(std::sync::Arc::new(
+                datafusion::arrow::datatypes::Field::new_list_field(
+                    datafusion::arrow::datatypes::DataType::Int32,
+                    true,
+                ),
+            )),
+            true,
+        );
+        let schema = std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![field]));
+        let batches = lists
+            .into_iter()
+            .map(|tokens| {
+                datafusion::arrow::array::RecordBatch::try_new(
+                    std::sync::Arc::clone(&schema),
+                    vec![tokens],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| python_error(error.into()))?;
+        Ok(quail::pyarrow::to_pyarrow(py, schema, batches)?.unbind())
+    }
+
+    /// The bytes of each token id's text, or None for an id the
+    /// vocabulary does not hold.
+    fn token_bytes<'py>(&self, py: Python<'py>) -> Vec<Option<Bound<'py, pyo3::types::PyBytes>>> {
+        self.inner
+            .token_bytes()
+            .into_iter()
+            .map(|found| found.map(|bytes| pyo3::types::PyBytes::new(py, &bytes)))
+            .collect()
+    }
+
+    /// Each token id's text in the tokenizer's own spelling.
+    fn token_texts(&self) -> Vec<String> {
+        self.inner.token_texts()
+    }
+
+    /// The text of each token id list, without special tokens.
+    fn decode_batch(&self, lists: Vec<Vec<u32>>) -> PyResult<Vec<String>> {
+        self.inner
+            .decode_batch(&lists)
+            .map_err(|error| python_error(error.into()))
+    }
+
+    /// The id of an added token, such as `<|im_end|>`, or None.
+    fn added_token_id(&self, token: &str) -> Option<u32> {
+        self.inner.added_token_id(token)
+    }
+}
+
 /// Plans model regions in Rust for one session, with the session's
 /// tokenizer, keeping the token stores of tables read whole.
 #[pyclass(name = "NativePlanner", module = "_quail_native")]
@@ -928,6 +1017,7 @@ impl NativePlanner {
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSession>()?;
+    module.add_class::<NativeTokenizer>()?;
     module.add_class::<NativePlanner>()?;
     module.add_class::<cost::CostModel>()?;
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;

@@ -59,9 +59,8 @@ def test_filter_prompt_is_the_decision2_noul_format_tokenized_by_segment():
 
 
 def test_worker_answer_offsets_match_session_tokens(tmp_path):
-    from gigatoken import Tokenizer
-
     from quail.backends.quail.worker import decision_offsets
+    from quail.common.tokens import NativeEncoder
 
     visible = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
     missing = [byte for byte in range(256) if byte not in visible]
@@ -87,8 +86,9 @@ def test_worker_answer_offsets_match_session_tokens(tmp_path):
             prompt, session.tokenizer("Please refund this."))
         assert offsets == answer_row_offsets(
             LAYOUT, session.tokenizer, spec.turn_suffix)
-        tokenizer = Tokenizer(tmp_path).as_hf()
-        ends = [tokenizer.decode(ids[:len(ids) - offset]) for offset in offsets]
+        tokenizer = NativeEncoder(tmp_path)
+        ends = [tokenizer.decode(ids[:len(ids) - offset]).decode()
+                for offset in offsets]
         assert ends[0].endswith('"false"}\n</option>')
         assert ends[1].endswith('"true"}\n</option>')
         assert ends[2].endswith("Decision:\nEND")

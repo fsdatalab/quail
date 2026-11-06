@@ -2,6 +2,8 @@
 
 import re
 
+import numpy as np
+
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.backends.quail.executor.tokenizer import ModelTokenizer
 from quail.physical import ExtractSpec
@@ -21,9 +23,8 @@ NONE_HELD = "None of the parties may assign this Agreement."
 class FakeTokenizer:
     """Words, numbers, and punctuation as tokens, spaced like a byte-level BPE.
 
-    A token after a space starts with "Ġ", a line break is "Ċ", and the
-    offsets of a token include its leading space, as a Hugging Face
-    fast tokenizer reports them.
+    It has NativeEncoder's methods. A token after a space is spelled with
+    "Ġ" and a line break "Ċ", as a byte-level BPE spells them.
     """
 
     PIECES = re.compile(r"\n| ?[A-Za-z]+|[0-9]| ?[^\sA-Za-z0-9]| ")
@@ -53,33 +54,30 @@ class FakeTokenizer:
         if at != len(text):
             raise ValueError(f"cannot tokenize {text[at:]!r}")
 
-    def __call__(self, text, return_offsets_mapping=True, add_special_tokens=False):
-        if isinstance(text, list):
-            each = [self(one) for one in text]
-            return {"input_ids": [e["input_ids"] for e in each],
-                    "offset_mapping": [e["offset_mapping"] for e in each]}
-        ids, offsets = [], []
-        for piece, span in self._pieces(text):
-            ids.append(self.ids[piece])
-            offsets.append(span)
-        return {"input_ids": ids, "offset_mapping": offsets}
+    def __call__(self, text):
+        return [self.ids[piece] for piece, _ in self._pieces(text)]
 
-    def encode(self, text, add_special_tokens=False):
-        return self(text)["input_ids"]
+    def token_bytes(self):
+        return {index: token.encode() for index, token in enumerate(self.tokens)}
 
-    def convert_ids_to_tokens(self, ids):
-        return [self.spelled(index) for index in ids]
+    def token_texts(self):
+        return [self.spelled(index) for index in range(len(self.tokens))]
+
+    def decode_batch(self, tokens):
+        return ["".join(self.tokens[int(t)] for t in ids if int(t) != self.eos_token_id)
+                for ids in tokens]
+
+    def batch_numpy(self, texts):
+        lists = [self(text) for text in texts.to_pylist()]
+        boundaries = np.r_[0, np.cumsum([len(ids) for ids in lists])].astype(np.int64)
+        ids = np.array([t for ids in lists for t in ids], dtype=np.int64)
+        return ids, boundaries
 
     def spelled(self, index):
         token = self.tokens[index]
         if token == "\n":
             return "Ċ"
         return "Ġ" + token[1:] if token.startswith(" ") else token
-
-    def convert_tokens_to_ids(self, token):
-        text = ("\n" if token == "Ċ" else " " + token[1:]
-                if token.startswith("Ġ") else token)
-        return self.ids.get(text, -1)
 
 
 RANKED = "The lease ends on March 3. The rent is due."
@@ -94,7 +92,7 @@ def make_vocabulary(*extra):
                                *(squeezed(text)[0] for text in (LEASE, TERM,
                                                                 NOTHING)),
                                *extra])
-    return Vocabulary(ModelTokenizer(tokenizer))
+    return Vocabulary(ModelTokenizer(tokenizer, eos_token_id=tokenizer.eos_token_id))
 
 
 def make_spec(*extra):

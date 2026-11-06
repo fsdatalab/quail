@@ -218,15 +218,11 @@ def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages) -> dict:
 
 def decision_offsets(spec, path) -> tuple[int, ...]:
     """The rows a decision readout reads, as distances before the last row."""
-    from gigatoken import Tokenizer
-
     from quail.common.prompts import answer_row_offsets
+    from quail.common.tokens import NativeEncoder
 
-    tokenizer = Tokenizer(path).as_hf()
-    offsets = answer_row_offsets(
-        spec.prompt_layout,
-        lambda text: tokenizer(text, add_special_tokens=False)["input_ids"],
-        spec.turn_suffix)
+    offsets = answer_row_offsets(spec.prompt_layout, NativeEncoder(path),
+                                 spec.turn_suffix)
     if len(offsets) != 3:
         raise ValueError(
             f"{spec.name}: the decision readout reads a no row, a yes row, "

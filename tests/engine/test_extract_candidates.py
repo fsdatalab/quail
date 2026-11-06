@@ -64,7 +64,7 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(
                                     window_chars=window)[0])
         rest, ends = squeezed(text)
         ids, offsets = tables.tokenizer.encode(rest)
-        expected.append((ids, [ends[b - 1] for _, b in offsets]))
+        expected.append(([int(t) for t in ids], [int(ends[b - 1]) for _, b in offsets]))
     batches = []
     encode_batch = tables.tokenizer.encode_batch
 
@@ -84,7 +84,8 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(
     assert not streams[0].exhausted
     assert streams[1].exhausted and streams[2].exhausted
     ensure_tokens(streams, 10_000, tables)
-    assert [(stream.stream, stream.ends) for stream in streams] == expected
+    assert [([int(t) for t in stream.stream], [int(e) for e in stream.ends])
+            for stream in streams] == expected
     assert all(stream.exhausted for stream in streams)
     before = list(batches)
     ensure_tokens(streams, 10_000, tables)

@@ -65,6 +65,89 @@ impl HfTokenizer {
             .unwrap_or_default())
     }
 
+    /// The id of an added token, such as `<|im_end|>`, or None.
+    pub fn added_token_id(&self, token: &str) -> Option<u32> {
+        self.inner.get_added_vocabulary().token_to_id(token)
+    }
+
+    /// Each token id's text in the tokenizer's own spelling, such as
+    /// `Ġthe` in byte-level BPE, empty for an id the vocabulary does not
+    /// hold.
+    pub fn token_texts(&self) -> Vec<String> {
+        let size = self.token_bytes().len();
+        (0..size as u32)
+            .map(|id| {
+                self.inner
+                    .decode_tokens(&[id], false)
+                    .pop()
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// The text of each token id list, without special tokens.
+    ///
+    /// # Errors
+    ///
+    /// An id is outside the vocabulary.
+    pub fn decode_batch(&self, lists: &[Vec<u32>]) -> Result<Vec<String>, ArrowError> {
+        lists
+            .iter()
+            .map(|ids| self.inner.decode(ids, true).map_err(external))
+            .collect()
+    }
+
+    /// The bytes of each token id's text, None for an id the vocabulary
+    /// does not hold. An added token is its text; a model token has the
+    /// pre-tokenizer's spelling undone: byte-level BPE's characters for
+    /// bytes, or SentencePiece's `▁` for a space and `<0xHH>` for a byte.
+    pub fn token_bytes(&self) -> Vec<Option<Vec<u8>>> {
+        // ids past this many consecutive misses are past the vocabulary
+        const MISSES: u32 = 4096;
+        let added = self.inner.get_added_vocabulary();
+        let model = self.inner.get_model();
+        let mut texts: Vec<Option<(bool, String)>> = Vec::new();
+        let (mut id, mut misses) = (0u32, 0u32);
+        while misses < MISSES {
+            let found = match added.simple_id_to_token(id) {
+                Some(text) => Some((true, text)),
+                None => model.id_to_token(id).map(|text| (false, text)),
+            };
+            misses = if found.is_some() { 0 } else { misses + 1 };
+            texts.push(found);
+            id += 1;
+        }
+        let size = texts
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |last| last + 1);
+        texts.truncate(size);
+        let byte_level = texts
+            .iter()
+            .flatten()
+            .any(|(is_added, text)| !is_added && text.starts_with('\u{120}'));
+        let bytes = byte_level_bytes();
+        texts
+            .into_iter()
+            .map(|found| {
+                found.map(|(is_added, text)| {
+                    if is_added {
+                        text.into_bytes()
+                    } else if byte_level {
+                        text.chars()
+                            .flat_map(|c| match bytes.get(&c) {
+                                Some(&byte) => vec![byte],
+                                None => c.to_string().into_bytes(),
+                            })
+                            .collect()
+                    } else {
+                        sentencepiece_bytes(&text)
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// The text of token ids.
     ///
     /// # Errors
@@ -100,6 +183,38 @@ impl Tokenizer for HfTokenizer {
     }
 }
 
+/// Byte-level BPE's character for each byte, reversed: printable
+/// Latin-1 bytes stand for themselves, and the rest map to code points
+/// from 256 in byte order.
+fn byte_level_bytes() -> std::collections::HashMap<char, u8> {
+    let printable =
+        |byte: u8| (b'!'..=b'~').contains(&byte) || (0xA1..=0xAC).contains(&byte) || byte >= 0xAE;
+    let mut next = 256u32;
+    (0..=255u8)
+        .map(|byte| {
+            let c = if printable(byte) {
+                char::from(byte)
+            } else {
+                next += 1;
+                char::from_u32(next - 1).expect("a code point below 512")
+            };
+            (c, byte)
+        })
+        .collect()
+}
+
+/// A SentencePiece token's bytes: `<0xHH>` is the byte, and `▁` a space.
+fn sentencepiece_bytes(text: &str) -> Vec<u8> {
+    if let Some(hex) = text
+        .strip_prefix("<0x")
+        .and_then(|rest| rest.strip_suffix('>'))
+        && let Ok(byte) = u8::from_str_radix(hex, 16)
+    {
+        return vec![byte];
+    }
+    text.replace('\u{2581}', " ").into_bytes()
+}
+
 /// Each document's tokens as one array, for tests and callers that
 /// build token lists themselves.
 pub fn token_lists(lists: Vec<ArrayRef>) -> Result<LargeListArray, ArrowError> {
@@ -120,4 +235,24 @@ pub fn token_lists(lists: Vec<ArrayRef>) -> Result<LargeListArray, ArrowError> {
         arrow::compute::concat(&parts)?
     };
     LargeListArray::try_new(field, offsets, values, None)
+}
+
+#[cfg(test)]
+mod byte_tests {
+    use super::{byte_level_bytes, sentencepiece_bytes};
+
+    #[test]
+    fn byte_level_characters_map_back_to_bytes() {
+        let bytes = byte_level_bytes();
+        assert_eq!(bytes.len(), 256);
+        assert_eq!(bytes[&'\u{120}'], b' ');
+        assert_eq!(bytes[&'\u{10a}'], b'\n');
+        assert_eq!(bytes[&'a'], b'a');
+    }
+
+    #[test]
+    fn sentencepiece_spaces_and_byte_tokens_map_to_bytes() {
+        assert_eq!(sentencepiece_bytes("\u{2581}the"), b" the");
+        assert_eq!(sentencepiece_bytes("<0x0A>"), b"\n");
+    }
 }

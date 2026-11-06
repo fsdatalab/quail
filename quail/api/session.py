@@ -9,7 +9,7 @@ from quail.api.config import EngineConfig, resolve_model
 from quail.api.query import QueryLike
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, TableProvider
-from quail.common.tokens import GigatokenEncoder
+from quail.common.tokens import NativeEncoder
 from quail.extensions import ExtensionRegistry
 from quail.physical.plan import Refusal, RefusalError
 from quail.specs.files import resolve_model_path
@@ -60,7 +60,7 @@ class Session:
         self._tokenizer = None
         self.inputs = InputStore(
             self.catalog, tokenizer=lambda: self.tokenizer,
-            tokenizer_name="Gigatoken")
+            tokenizer_name="Hugging Face tokenizers")
         self._remote = None
         if endpoint is not None:
             from quail.remote.client import RemoteConnection
@@ -188,7 +188,7 @@ class Session:
 
     @property
     def tokenizer(self):
-        """Return Gigatoken's encoder, loading it when first used.
+        """Return the model's tokenizer, loading it when first used.
 
         It reads the ``tokenizer.json`` in the directory the session was
         given, or else the model's. The encoder's ``decode`` attribute
@@ -198,5 +198,5 @@ class Session:
         if self._tokenizer is None:
             directory = self._tokenizer_directory or resolve_model_path(
                 self.model.hf_name, self.model.revision, include_weights=False)
-            self._tokenizer = GigatokenEncoder(directory)
+            self._tokenizer = NativeEncoder(directory)
         return self._tokenizer

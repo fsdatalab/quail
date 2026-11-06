@@ -6,7 +6,6 @@ import bisect
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from pathlib import Path
-from threading import local
 
 import numpy as np
 import pyarrow as pa
@@ -233,49 +232,67 @@ class _StoreWriter:
             Path(self.path).unlink(missing_ok=True)
 
 
-class GigatokenEncoder:
-    """Encode texts and Arrow batches with a Gigatoken instance per thread."""
+class NativeEncoder:
+    """A model's tokenizer, run by Quail's Rust tokenizer.
+
+    Args:
+        source: A model directory holding ``tokenizer.json``, or the file.
+    """
 
     def __init__(self, source):
-        self._source = source
-        self._tokenizers = local()
-        _ = self.tokenizer
+        import _quail_native
 
-    @property
-    def tokenizer(self):
-        """Return the calling thread's tokenizer with the same vocabulary."""
-        from gigatoken import Tokenizer
+        path = Path(source)
+        self.path = path / "tokenizer.json" if path.is_dir() else path
+        self.tokenizer = _quail_native.NativeTokenizer(str(self.path))
+        self._token_bytes = None
 
-        # Gigatoken mutably borrows its backend while encoding a batch.
-        if not hasattr(self._tokenizers, "value"):
-            self._tokenizers.value = Tokenizer(self._source)
-        return self._tokenizers.value
+    def __call__(self, text: str) -> list[int]:
+        return self.batch_arrow(pa.array([text]))[0].values.to_pylist()
 
-    def __call__(self, text):
-        return [int(token) for token in self.tokenizer.encode(text)]
+    def __len__(self) -> int:
+        return len(self._bytes())
 
-    def decode(self, tokens):
-        return self.tokenizer.decode(tokens)
+    def _bytes(self) -> list:
+        if self._token_bytes is None:
+            self._token_bytes = self.tokenizer.token_bytes()
+        return self._token_bytes
 
-    def token_bytes(self):
-        return self.tokenizer.vocab
+    def decode(self, tokens) -> bytes:
+        """Return the bytes of a token id list's text."""
+        found = self._bytes()
+        return b"".join(found[int(token)] or b"" for token in tokens)
 
-    def batch_arrow(self, texts):
-        """Return token IDs in Arrow without constructing Python token lists."""
-        import awkward as ak
+    def token_bytes(self) -> dict[int, bytes]:
+        """Return the bytes of each token id's text."""
+        return {index: value for index, value in enumerate(self._bytes())
+                if value is not None}
 
-        source = ak.from_arrow(texts.cast(pa.large_string()))
-        return ak.to_arrow(self.tokenizer.encode_batch(source),
-                           extensionarray=False).cast(pa.large_list(pa.int32()))
+    def token_texts(self) -> list[str]:
+        """Return each token id's text in the tokenizer's own spelling."""
+        return self.tokenizer.token_texts()
+
+    def decode_batch(self, tokens: list) -> list[str]:
+        """Return the text of each token id list, without special tokens."""
+        return self.tokenizer.decode_batch([[int(t) for t in ids] for ids in tokens])
+
+    def added_token_id(self, token: str) -> int | None:
+        """Return the id of an added token, such as ``<|im_end|>``."""
+        return self.tokenizer.added_token_id(token)
+
+    def batch_arrow(self, texts) -> pa.LargeListArray:
+        """Return each text's token ids as a large list of int32."""
+        texts = pa.array(texts, type=pa.string()) if not isinstance(
+            texts, (pa.Array, pa.ChunkedArray)) else texts.cast(pa.string())
+        table = self.tokenizer.encode(pa.table({"text": texts}))
+        return table.column("tokens").combine_chunks()
 
     def batch_numpy(self, texts):
-        """Return flat token IDs and row boundaries for short continuation texts."""
-        if isinstance(texts, pa.Array):
-            import awkward as ak
-
-            texts = ak.from_arrow(texts)
-        encoded = self.tokenizer.encode_batch(texts, parallel=False).layout
-        return np.asarray(encoded.content.data), np.asarray(encoded.offsets.data)
+        """Return flat token ids and each text's boundaries in them."""
+        tokens = self.batch_arrow(texts)
+        offsets = tokens.offsets.to_numpy()
+        ids = tokens.values.to_numpy(zero_copy_only=False)[offsets[0]:offsets[-1]]
+        return ids.astype(np.int64), (offsets - offsets[0]).astype(np.int64)
 
 
 class TokenOffsets:
