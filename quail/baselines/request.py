@@ -11,7 +11,6 @@ from quail.backends.base import GpuContext
 from quail.backends.resources import release_models
 from quail.baselines.execution import RequestModelExecution
 from quail.baselines.nodes import RequestExecution
-from quail.baselines.planning import plan_request_backend
 from quail.execution.metrics import scalar_node_metrics
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph
 from quail.execution.runtimes import ModelNodeRuntime
@@ -195,15 +194,32 @@ class RequestBackend:
         return SupportResult.accept()
 
     def plan(self, region, context):
-        return plan_request_backend(
-            region,
-            context,
-            backend_name=self.name,
-            filter_submission=self.filter_submission,
-            join_submission=self.join_submission,
-            answer_submission=self.answer_submission,
-            scores_labels=getattr(self.engine, "scores_labels", False),
-        )
+        """Plan the region in Rust: one request node, its scans, and its result."""
+        from quail.physical.codec import NodeCodec, built_in_codecs, decode_graph
+        from quail.physical.plan import PhysicalPlan, Refusal
+        from quail.planner.candidates import PhysicalCandidate
+        from quail.planner.native import request_plan
+
+        found = request_plan(region.logical_plan, context, {
+            "backend_name": self.name,
+            "filter_submission": self.filter_submission,
+            "join_submission": self.join_submission,
+            "answer_submission": self.answer_submission,
+            "scores_labels": getattr(self.engine, "scores_labels", False),
+        })
+        if isinstance(found, Refusal):
+            return (PhysicalCandidate(
+                graph=None, plan=found, estimated_seconds=float("inf")),)
+        encoded, settings = found
+        codecs = {codec.type_name: codec
+                  for codec in (*built_in_codecs(), NodeCodec(RequestExecution))}
+        graph = decode_graph(encoded, codecs)
+        plan = PhysicalPlan(
+            model=context.model.name, device=context.device.name, gpus=1,
+            backend=self.name, estimated_seconds=0.0, nodes=graph.nodes,
+            root=graph.root, settings=settings)
+        return (PhysicalCandidate(
+            graph=plan.graph, plan=plan, estimated_seconds=plan.estimated_seconds),)
 
     def start(self, context):
         return RequestModelExecution(context)

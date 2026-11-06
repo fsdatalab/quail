@@ -334,35 +334,41 @@ def relational_plan(logical, context, num_documents: int):
     return _plan_from({"envelope": envelope}, native, fields, vocabulary, logical)
 
 
-def request_order(logical, context) -> dict:
-    """The order a request backend runs a plan's filters and joins in.
+def request_plan(logical, context, settings: dict):
+    """Plan a region for a request backend in Rust.
+
+    Args:
+        logical: The region's logical plan.
+        context: The planning context.
+        settings: The backend's ``backend_name``, ``filter_submission``,
+            ``join_submission``, ``answer_submission``, and
+            ``scores_labels``.
 
     Returns:
-        The order ``rule``; ``filter_orders``, each table's AI.IF filter
-        positions in run order; ``join_sequence``, the (written position,
-        anchor) of each join in run order; ``hash_joins``, the HashJoin
-        nodes; and ``tables``, each table's documents and tokens before
-        and after its scan's tests.
+        A Refusal, or (the graph as JSON, the plan's settings): the
+        request node is the backend's own type, which its codecs decode.
 
     Raises:
-        CompileError: A prompt cannot be lowered, or a table has no tokens.
+        CompileError: A prompt cannot be lowered, or the prompts do not
+            share a preamble.
     """
     vocabulary = Vocabulary(context.tokenizer)
-    fields = context_fields(context, vocabulary)
     found, message = _quail_native.plan_operator(
-        "request_order", json.dumps(fields),
-        json.dumps({"plan": encode_value(logical)}),
+        "request_plan", json.dumps(context_fields(context, vocabulary)),
+        json.dumps({"plan": encode_value(logical), "settings": settings}),
         vocabulary.tokens, vocabulary.decoder())
     if message is not None:
         raise CompileError(message)
     found = json.loads(found)
-    codecs = {codec.type_name: codec for codec in built_in_codecs()}
-    found["hash_joins"] = tuple(codecs[node["type"]].decode(node)
-                                for node in found["hash_joins"])
-    found["filter_orders"] = {alias: tuple(positions)
-                              for alias, positions in found["filter_orders"].items()}
-    found["join_sequence"] = [tuple(step) for step in found["join_sequence"]]
-    return found
+    if "refusal" in found:
+        refusal = found["refusal"]
+        return Refusal(reasons=tuple(refusal["reasons"]),
+                       constraint=refusal["constraint"], needed=refusal["needed"],
+                       available=refusal["available"], unit=refusal["unit"])
+    plan_settings = dict(found["settings"])
+    for key in ("true_ids", "false_ids"):
+        plan_settings[key] = [vocabulary.word(token) for token in plan_settings[key]]
+    return _tokens_mapped(found["graph"], vocabulary.word), plan_settings
 
 
 def refine_plan(plan, context, registry):

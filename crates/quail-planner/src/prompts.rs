@@ -150,7 +150,7 @@ fn marker(placeholder: usize) -> String {
     format!("{{{placeholder}}}")
 }
 
-fn join_label(placeholder: usize) -> String {
+pub(crate) fn join_label(placeholder: usize) -> String {
     format!("\n\nDOCUMENT {}:\n", marker(placeholder))
 }
 
@@ -161,7 +161,11 @@ fn join_anchor_note(placeholder: usize) -> String {
     )
 }
 
-fn render_join_frame(template: &str, placeholder: usize, layout: &PromptLayout) -> String {
+pub(crate) fn render_join_frame(
+    template: &str,
+    placeholder: usize,
+    layout: &PromptLayout,
+) -> String {
     format!(
         "{}{JOIN_QUESTION_SEP}{}{template}",
         join_anchor_note(placeholder),

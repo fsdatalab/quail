@@ -40,6 +40,7 @@ pub mod plan_statistics;
 pub mod pricing;
 pub mod prompts;
 pub mod request_order;
+pub mod request_plan;
 pub mod results;
 pub mod retention;
 pub mod rules;
