@@ -48,7 +48,6 @@ from quail.common.expressions import (
     evaluate_expression,
 )
 from quail.common.pairs import pair_table, partner_map
-from quail.common.sol import SpeedOfLight, speed_of_light
 from quail.common.tokens import prefix_tree
 from quail.common.work import Work
 from quail.physical.codec import decode_value, encode_value, untagged
@@ -71,6 +70,55 @@ EXTRACT = "AI.EXTRACT"
 
 # the exceptions a refused estimate raises, by the name Rust gives
 _ERRORS = {"NotImplementedError": NotImplementedError, "ValueError": ValueError}
+
+
+@dataclass(frozen=True)
+class ComponentLatency:
+    """One model component's share of the estimate, as Rust priced it."""
+
+    name: str
+    precision: str
+    flops: float
+    bytes_moved: float
+    compute_seconds: float
+    memory_seconds: float
+    seconds: float
+    bound_by: str
+
+
+@dataclass(frozen=True)
+class SpeedOfLight:
+    """The estimate's work, forward passes, and component breakdown."""
+
+    work: Work
+    passes: int
+    components: tuple[ComponentLatency, ...]
+
+    def component(self, name: str) -> ComponentLatency:
+        """Return one named component result."""
+        return next(component for component in self.components
+                    if component.name == name)
+
+    @property
+    def bytes_moved(self) -> float:
+        return sum(component.bytes_moved for component in self.components)
+
+    @property
+    def compute(self) -> float:
+        return sum(component.compute_seconds for component in self.components)
+
+    @property
+    def memory(self) -> float:
+        return sum(component.memory_seconds for component in self.components)
+
+    @property
+    def seconds(self) -> float:
+        return sum(component.seconds for component in self.components)
+
+    @property
+    def bound_by(self) -> str:
+        limits = {component.bound_by for component in self.components}
+        return limits.pop() if len(limits) == 1 else "mixed"
 
 
 @dataclass(frozen=True)
@@ -399,9 +447,14 @@ def speed_of_light_estimate(
         chunk_tokens=found["chunk_tokens"],
         credit_shared_prefixes=found["credit_shared_prefixes"],
         work=work,
-        latency=speed_of_light(work, model, device, chunk,
-                               rows=found["answer_rows"],
-                               min_passes=found["decode_passes"]),
+        latency=SpeedOfLight(work, found["passes"], tuple(
+            ComponentLatency(
+                name=component["name"], precision=component["precision"],
+                flops=component["flops"], bytes_moved=component["bytes_moved"],
+                compute_seconds=component["t_compute"],
+                memory_seconds=component["t_memory"],
+                seconds=component["seconds"], bound_by=component["bound_by"])
+            for component in found["components"])),
         seconds=found["sol_s"], usd_per_hour=found["usd_per_hour"],
         alias_columns=found["alias_columns"],
         documents_by_alias=found["documents_by_alias"],

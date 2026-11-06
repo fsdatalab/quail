@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from quail.common.dense_decoder_cost import dense_decoder_components
-from quail.common.retention import RetentionPolicy, coefficients
+from quail.common.budgets import budgets_of
+from quail.common.retention import RetentionPolicy
 from quail.common.work import Work, triangle
 
 
@@ -22,13 +22,9 @@ class DecodeCost:
     @classmethod
     def from_specs(cls, model, device):
         """Build coefficients from model shapes and hardware peak rates."""
-        weight_bytes = sum(component.bytes_moved for component in
-                           dense_decoder_components(Work(), model, passes=1))
-        return cls(RetentionPolicy(**coefficients(model, device, peak=True)),
-                   weight_bytes / device.hbm_bw,
-                   model.kappa_full / device.hbm_bw,
-                   model.kappa_sliding / device.hbm_bw,
-                   model.checkpoint_bytes / device.hbm_bw)
+        budgets = budgets_of(model, device)
+        return cls(RetentionPolicy(**budgets.coefficients(True)),
+                   *budgets.decode_seconds())
 
     def row_work(self, contexts, groups=None, shared=None):
         """Count per-row work, assigning each shared read to one group member."""

@@ -1502,6 +1502,22 @@ pub fn speed_of_light_estimate(
         "t_memory": latency.memory(),
         "passes": latency.passes,
         "bytes_moved": latency.bytes_moved(),
+        "components": latency.components.iter().map(|component| {
+            let (compute, memory) = (
+                component.compute_seconds.total(),
+                component.memory_seconds.total(),
+            );
+            json!({
+                "name": component.component.name,
+                "precision": component.component.precision,
+                "flops": component.component.flops.total(),
+                "bytes_moved": component.component.bytes_moved.total(),
+                "t_compute": compute,
+                "t_memory": memory,
+                "seconds": component.seconds(),
+                "bound_by": if compute >= memory { "compute" } else { "memory" },
+            })
+        }).collect::<Vec<_>>(),
         "tokens": work.tokens.total(),
         "pairs": work.pairs.total(),
         "sliding_pairs": work.sliding_pairs.total(),

@@ -6,6 +6,7 @@ GPU executor, so the two never disagree.
 """
 
 import json
+from dataclasses import asdict
 from functools import lru_cache
 
 import _quail_native
@@ -23,9 +24,7 @@ parallel_copies = _quail_native.parallel_copies
 
 
 def _spec_json(spec) -> str:
-    from quail.physical.codec import encode_value, untagged
-
-    return json.dumps(untagged(encode_value(spec)))
+    return json.dumps(asdict(spec))
 
 
 @lru_cache(maxsize=64)

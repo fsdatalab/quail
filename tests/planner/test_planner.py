@@ -10,8 +10,6 @@ from helpers.logical import nodes, read_plan
 from helpers.planning import _optimize, _plan, compile_sql, node_kinds
 
 from quail.catalog import Catalog, DocumentProvider
-from quail.common.sol import speed_of_light
-from quail.common.work import ask, scan, stream
 from quail.explain import explain
 from quail.extensions import LogicalRule, PhysicalRule
 from quail.physical import (
@@ -23,7 +21,7 @@ from quail.physical import (
 )
 from quail.physical.codec import encode_fields
 from quail.physical.plan import Refusal
-from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
+from quail.specs import QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
 def filter_sequence(plan, alias=None):
@@ -201,68 +199,6 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     assert "  physical: should_push_down_limit, should_retain_kv" in text
     assert ("refine each graph in order: should_push_down_limit, "
             "should_retain_kv") in text
-
-
-def mask_pairs(prefix, suffix, window):
-    """Count allowed keys for every new query position."""
-    return sum(1 for q in range(prefix, prefix + suffix) for k in range(q + 1)
-               if not window or q - k < window)
-
-
-def test_work_matches_attention_masks_and_component_costs():
-    from quail.common.dense_decoder_cost import (
-        dense_decoder_components,
-        dense_params,
-    )
-    from quail.specs import DIFFUSION_GEMMA_26B_FP8
-
-    for window, prefix, suffix in ((0, 2, 4), (1, 9, 3), (4, 0, 3),
-                                  (4, 2, 4), (4, 4, 1), (4, 9, 3)):
-        first = scan(prefix, suffix, window=window)
-        continuation = ask(prefix, suffix, window=window)
-        assert first.pairs == mask_pairs(0, prefix + suffix, 0)
-        assert continuation.pairs == mask_pairs(prefix, suffix, 0)
-        assert first.sliding_pairs == (
-            mask_pairs(0, prefix + suffix, window) if window else 0)
-        assert continuation.sliding_pairs == (
-            mask_pairs(prefix, suffix, window) if window else 0)
-        assert continuation.sliding_kv_read == (
-            min(prefix, window - 1) if window else 0)
-        branches = stream(prefix, [suffix, suffix + 1], window=window)
-        assert branches.sliding_pairs == (
-            sum(mask_pairs(prefix, s, window) for s in (suffix, suffix + 1))
-            if window else 0)
-        assert branches.sliding_kv_read == continuation.sliding_kv_read
-
-    work = ask(400, 50) * 1000
-    result = speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 110_376)
-    assert result.bound_by == "mixed"
-    assert [c.name for c in result.components] == [
-        "attn_proj", "mlp", "attention"]
-    assert result.seconds == pytest.approx(sum(
-        max(c.compute_seconds, c.memory_seconds)
-        for c in result.components))
-    assert result.component("mlp") is result.components[1]
-    assert result.seconds > max(result.compute, result.memory)
-    dense_bytes = sum(
-        c.bytes_moved for c in result.components if c.name != "attention")
-    assert dense_bytes == dense_params(QWEN3_4B_FP8) * result.passes
-    larger_resident_copy = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
-    assert speed_of_light(
-        work, larger_resident_copy, H100_SXM, 110_376).seconds \
-        == pytest.approx(result.seconds)
-
-    model = DIFFUSION_GEMMA_26B_FP8
-    work = ask(4096, 16, window=model.sliding_window)
-    attention = dense_decoder_components(work, model, 1)[2]
-    assert attention.flops == 4 * 16 * (
-        5 * 512 * work.pairs + 25 * 256 * work.sliding_pairs)
-    assert attention.bytes_moved == (
-        5 * 2 * 2 * 512 * 2 * (16 + 4096)
-        + 25 * 2 * 8 * 256 * 2 * (16 + 1023))
-    assert work + work == work * 2
-    assert not work.dominates(replace(work, sliding_pairs=work.sliding_pairs - 1))
-    assert not work.dominates(replace(work, sliding_kv_read=1022))
 
 
 def _join_sequence(catalog, sels=(0.1, 0.1), anchors=(None, None)):

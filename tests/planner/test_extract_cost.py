@@ -4,10 +4,11 @@ from dataclasses import fields, replace
 
 import numpy as np
 import pytest
+from helpers.draft_policy import DraftPolicy
 from helpers.rust_cost import Cost, cost_model, native
+from helpers.work import ask, decode, scan
 
-from quail.common.draft_policy import DraftPolicy
-from quail.common.work import Work, ask, decode, scan
+from quail.common.work import Work
 from quail.physical import ExtractSpec
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 

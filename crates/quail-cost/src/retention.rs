@@ -6,7 +6,7 @@ use crate::dense_decoder_cost::attention_pair_flops;
 use crate::quantity::Quantity;
 use crate::sol::compute_seconds;
 use crate::specs::{DeviceSpec, ModelSpec};
-use crate::work::{Work, triangle};
+use crate::work::Work;
 
 /// A model's ideal prefix computation coefficients.
 #[derive(Debug, Clone, PartialEq)]
@@ -18,18 +18,6 @@ pub struct Coefficients {
     /// Pages of the state a hybrid model's document keeps beside its
     /// KV; None for a model without state layers.
     pub checkpoint_pages: Option<f64>,
-}
-
-impl Coefficients {
-    /// Ideal compute time to rebuild a prefix of this length.
-    pub fn prefill_seconds(&self, tokens: f64) -> f64 {
-        let tokens = Quantity::Scalar(tokens);
-        let pairs = triangle(&tokens, 0).total();
-        let sliding_pairs = triangle(&tokens, self.sliding_window).total();
-        self.linear_seconds * tokens.total()
-            + self.pair_seconds * pairs
-            + self.sliding_pair_seconds * sliding_pairs
-    }
 }
 
 /// Retained pages, after two execution chunks are reserved.

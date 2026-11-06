@@ -3,13 +3,26 @@
 S(t) is the chance an answer is still being written after t tokens,
 so S(0) = 1 and S(limit) = 0. Before any answer has ended the curve is
 a prior: answer lengths geometric with the planner's expected length,
-cut off at the answer limit.
+cut off at the answer limit. The curves are computed by Rust's cost
+model (``crates/quail-cost/src/answers.rs``), which the planner prices
+extraction with.
 """
 
+import _quail_native
 import numpy as np
 
-# answers the prior counts as, until ended answers outweigh it
-PRIOR_WEIGHT = 20.0
+
+def _array(found: bytes, dtype) -> np.ndarray:
+    """A writable array over the little-endian bytes Rust returned."""
+    return np.frombuffer(bytearray(found), dtype)
+
+
+def _int64(values) -> np.ndarray:
+    return np.ascontiguousarray(values, dtype=np.int64)
+
+
+def _float64(values) -> np.ndarray:
+    return np.ascontiguousarray(values, dtype=np.float64)
 
 
 def prior_survival(expected_tokens: float, limit: int) -> np.ndarray:
@@ -19,19 +32,15 @@ def prior_survival(expected_tokens: float, limit: int) -> np.ndarray:
         expected_tokens: The mean answer length without the limit.
         limit: The most tokens an answer may have.
     """
-    keep = 1.0 - 1.0 / max(1.0, float(expected_tokens))
-    curve = keep ** np.arange(limit + 1, dtype=np.float64)
-    curve[limit] = 0.0
-    return curve
+    return _array(
+        _quail_native.prior_survival(float(expected_tokens), int(limit)), np.float64)
 
 
-def survival_rows(counts, events, prior, limits):
+def survival_rows(counts, events, prior, limits) -> np.ndarray:
     """Return Kaplan-Meier curves, one per row.
 
     Ended answers are events, including answers cut off at the limit.
     Answers still being written are censored at the tokens they have.
-    The prior adds PRIOR_WEIGHT answers' worth of events and risk, so a
-    curve starts from it and moves to the answers as they end.
 
     Args:
         counts: Answers observed last at each token, ended or censored,
@@ -43,18 +52,13 @@ def survival_rows(counts, events, prior, limits):
     Returns:
         S(t) per row, 0 from each row's limit on.
     """
-    risk = (np.cumsum(counts[:, ::-1], axis=1)[:, ::-1][:, 1:]
-            + PRIOR_WEIGHT * prior[:, :-1])
-    events = events[:, 1:] + PRIOR_WEIGHT * (prior[:, :-1] - prior[:, 1:])
-    hazard = np.divide(events, risk, out=np.zeros(risk.shape), where=risk > 0)
-    survival = np.empty(counts.shape)
-    survival[:, 0] = 1.0
-    np.cumprod(1.0 - hazard, axis=1, out=survival[:, 1:])
-    survival[np.arange(counts.shape[1]) >= np.asarray(limits)[:, None]] = 0.0
-    return survival
+    counts = _int64(counts)
+    found = _quail_native.survival_rows(
+        counts, _int64(events), _float64(prior), _int64(limits), counts.shape[1])
+    return _array(found, np.float64).reshape(counts.shape)
 
 
-def answer_survival(lengths, written, expected_tokens, limit, *, prior=None):
+def answer_survival(lengths, written, expected_tokens, limit) -> np.ndarray:
     """Return S(t), the chance an answer runs past t tokens, t = 0..limit.
 
     Args:
@@ -62,20 +66,15 @@ def answer_survival(lengths, written, expected_tokens, limit, *, prior=None):
         written: The tokens each answer has written.
         expected_tokens: The prior's mean answer length.
         limit: The answer token limit.
-        prior: The curve to start from; the geometric prior by default.
     """
-    lengths = np.asarray(lengths, dtype=np.int64)
-    observed = np.where(lengths >= 0, lengths, np.asarray(written, dtype=np.int64))
-    counts = np.bincount(observed, minlength=limit + 1)[None, :limit + 1]
-    events = np.bincount(lengths[lengths >= 0], minlength=limit + 1)[None, :limit + 1]
-    if prior is None:
-        prior = prior_survival(expected_tokens, limit)
-    return survival_rows(counts, events, np.asarray(prior)[None], [limit])[0]
+    return _array(_quail_native.answer_survival(
+        _int64(lengths), _int64(written), float(expected_tokens), int(limit)),
+        np.float64)
 
 
-def remaining_tokens(lengths, written, expected_tokens, limit, *, survival=None):
+def remaining_tokens(lengths, written, expected_tokens, limit, *,
+                     survival=None) -> np.ndarray:
     """Return the expected tokens left after t tokens, t = 0..limit."""
     if survival is None:
         survival = answer_survival(lengths, written, expected_tokens, limit)
-    tail = np.r_[np.cumsum(survival[:0:-1])[::-1], 0.0]
-    return np.divide(tail, survival, out=np.zeros(limit + 1), where=survival > 0)
+    return _array(_quail_native.remaining_tokens(_float64(survival)), np.float64)

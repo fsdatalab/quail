@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from helpers.draft_policy import DraftPolicy
 from quail.backends.quail.executor.extract.candidates import (
     NEG,
     ensure_tokens,
@@ -26,7 +27,6 @@ from quail.backends.quail.executor.extract.trace import (
     write_choices,
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.common.draft_policy import DraftPolicy
 from quail.physical import ExtractSpec
 
 

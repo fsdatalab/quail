@@ -5,9 +5,9 @@ from dataclasses import asdict, replace
 
 import pytest
 from helpers.rust_cost import classify_estimate, cost_model
+from helpers.work import scan, stream
 
-from quail.common.sol import unrounded_seconds
-from quail.common.work import Work, scan, stream
+from quail.common.work import Work
 from quail.labels import decode_round_tokens, label_trie
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -115,7 +115,8 @@ def test_one_round_rules_are_priced_like_filters(rust):
         assert cost.work == pytest.approx(asdict(work))
         assert cost.passes == pytest.approx(work.tokens / CHUNK)
         assert cost.seconds == pytest.approx(
-            unrounded_seconds(work, QWEN3_4B_FP8, H100_SXM, CHUNK)
+            rust.unrounded_seconds(asdict(work), QWEN3_4B_FP8.name, H100_SXM.name,
+                                   CHUNK, 0.0, 0)
             + _readout_seconds(len(lengths) * suffix, cost.passes))
         assert cost.suffix_tokens == len(lengths) * suffix
         assert cost.rounds == 1

@@ -2,10 +2,10 @@
 
 from dataclasses import dataclass, field
 
-from quail.common.budgets import checkpoint_pages, execution_pages
-from quail.common.dense_decoder_cost import attention_pair_flops
-from quail.common.sol import compute_seconds
-from quail.common.work import Work, triangle
+import _quail_native
+
+from quail.common.budgets import budgets_of
+from quail.common.work import triangle
 
 
 @dataclass(frozen=True)
@@ -35,22 +35,10 @@ class RetentionPolicy:
 
 
 def retention_pages(arena_tokens: int, chunk_tokens: int, page_tokens: int) -> int:
-    """Reserve two execution chunks before allocating retained pages."""
-    return max(0, arena_tokens // page_tokens
-               - execution_pages(chunk_tokens, page_tokens))
+    """Return the pages left for retained KV after two execution chunks."""
+    return _quail_native.retention_pages(arena_tokens, chunk_tokens, page_tokens)
 
 
 def coefficients(model, device, *, peak=False) -> dict:
     """Return the model's ideal prefix computation coefficients."""
-    full, sliding = attention_pair_flops(model)
-    bandwidth = device.arithmetic_bandwidth(model.attention_precision)
-    config = {
-        "linear_seconds": compute_seconds(
-            Work(tokens=1, pairs=0, kv_written=0, kv_read=0), model, device, peak=peak),
-        "pair_seconds": full / bandwidth,
-        "sliding_pair_seconds": sliding / bandwidth,
-        "sliding_window": model.sliding_window,
-    }
-    if model.state_layers:
-        config["checkpoint_pages"] = checkpoint_pages(model, device.page_tokens)
-    return config
+    return budgets_of(model, device).coefficients(peak)

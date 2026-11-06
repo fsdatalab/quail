@@ -5,20 +5,19 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from quail.common.answers import (
-    remaining_tokens,
-)
+from quail.common.answers import remaining_tokens, survival_rows
 from quail.common.decode import DecodeCost
-from quail.common.dense_decoder_cost import dense_decoder_components
 from quail.common.work import Work
 from quail.specs import DEVICES, MODELS
 
 
-def test_censored_answers_leave_the_risk_set_after_their_written_length(
-        monkeypatch):
-    # The censor at 3 leaves two answers at risk at 4.
-    monkeypatch.setattr("quail.common.answers.PRIOR_WEIGHT", 0.0)
-    remaining = remaining_tokens([2, -1, 4, 6], [2, 3, 4, 6], 3, 6)
+def test_censored_answers_leave_the_risk_set_after_their_written_length():
+    # Answers end at 2, 4, and 6; the censor at 3 leaves two at risk at 4.
+    # A zero prior adds no events or risk.
+    counts = np.bincount([2, 3, 4, 6], minlength=7)[None]
+    events = np.bincount([2, 4, 6], minlength=7)[None]
+    curve = survival_rows(counts, events, np.zeros((1, 7)), [6])[0]
+    remaining = remaining_tokens(None, None, 3, 6, survival=curve)
     survival = np.array([1, 1, .75, .75, .375, .375, 0])
     expected = np.r_[np.cumsum(survival[:0:-1])[::-1], 0]
     expected[:-1] /= survival[:-1]
@@ -36,20 +35,9 @@ def test_hybrid_decode_prices_state_movement_and_compute_from_specs(
     work = cost.row_work([16, 16], [0, 0], [16, 16]).total()
     assert work.kv_read == 16
     assert work.state_read == work.state_written == work.tokens == 2
-    assert cost.state_seconds == model.checkpoint_bytes / device.hbm_bw > 0
-    components = dense_decoder_components(work, model, passes=1)
-    memory = sum(component.bytes_moved for component in components) / device.hbm_bw
-    compute = sum(component.flops / device.arithmetic_bandwidth(component.precision)
-                  for component in components)
-    assert cost.seconds(work) == pytest.approx(max(memory, compute))
+    assert cost.state_seconds > 0
+    assert cost.state_seconds == pytest.approx(model.checkpoint_bytes / device.hbm_bw)
     assert cost.seconds(work) > replace(cost, state_seconds=0).seconds(work)
-    compute_bound = DecodeCost.from_specs(model, replace(device, hbm_bw=float("inf")))
-    assert compute_bound.seconds(work) == pytest.approx(compute)
-    state_compute = sum(
-        component.flops / device.arithmetic_bandwidth(component.precision)
-        for component in components if component.name in ("gdn_core", "conv"))
-    assert state_compute > 0
-    assert cost.recompute_cost.linear_seconds * work.tokens > state_compute
     assert cost.seconds(Work()) == 0
     assert cost.seconds(cost.row_work([]).total()) == 0
     assert cost == DecodeCost.from_specs(

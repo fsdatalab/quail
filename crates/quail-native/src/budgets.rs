@@ -1,9 +1,10 @@
 //! The cost model's budgets and run-time curves, as the GPU executor
 //! reads them: the same functions the planner prices plans with.
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use quail_cost::decode::DecodeCost;
 use quail_cost::specs::{DeviceSpec, ModelSpec};
 use quail_cost::{answers, budgets, draft_policy, retention};
@@ -259,77 +260,162 @@ pub fn retention_pages(arena_tokens: i64, chunk_tokens: i64, page_tokens: i64) -
     retention::retention_pages(arena_tokens, chunk_tokens, page_tokens)
 }
 
-/// The prior survival curve of an answer expected to run `expected_tokens`.
-#[pyfunction]
-pub fn prior_survival(expected_tokens: f64, limit: usize) -> Vec<f64> {
-    answers::prior_survival(expected_tokens, limit)
+/// Values as little-endian bytes, which Python reads with `np.frombuffer`.
+fn le_bytes<'py, T: Copy>(
+    py: Python<'py>,
+    values: &[T],
+    write: fn(T) -> [u8; 8],
+) -> Bound<'py, PyBytes> {
+    let bytes: Vec<u8> = values.iter().flat_map(|value| write(*value)).collect();
+    PyBytes::new(py, &bytes)
 }
 
-/// Kaplan-Meier survival curves, one per row, starting from each prior.
-#[pyfunction]
-pub fn survival_rows(
-    counts: Vec<Vec<i64>>,
-    events: Vec<Vec<i64>>,
-    prior: Vec<Vec<f64>>,
-    limits: Vec<usize>,
-) -> Vec<Vec<f64>> {
-    answers::survival_rows(&counts, &events, &prior, &limits)
+fn rows<T: Clone>(values: Vec<T>, width: usize) -> Vec<Vec<T>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    values.chunks(width).map(<[T]>::to_vec).collect()
 }
 
-/// The survival curve of one question's answers so far.
+/// The prior survival curve of an answer expected to run
+/// `expected_tokens`, as float64 bytes.
 #[pyfunction]
-#[pyo3(signature = (lengths, written, expected_tokens, limit, prior=None))]
-pub fn answer_survival(
-    lengths: Vec<i64>,
-    written: Vec<i64>,
+pub fn prior_survival(py: Python<'_>, expected_tokens: f64, limit: usize) -> Bound<'_, PyBytes> {
+    le_bytes(
+        py,
+        &answers::prior_survival(expected_tokens, limit),
+        f64::to_le_bytes,
+    )
+}
+
+/// Kaplan-Meier survival curves, one per row of `width` tokens, starting
+/// from each row's prior, as float64 bytes.
+#[pyfunction]
+pub fn survival_rows<'py>(
+    py: Python<'py>,
+    counts: PyBuffer<i64>,
+    events: PyBuffer<i64>,
+    prior: PyBuffer<f64>,
+    limits: PyBuffer<i64>,
+    width: usize,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let limits: Vec<usize> = limits
+        .to_vec(py)?
+        .into_iter()
+        .map(|limit| limit.max(0) as usize)
+        .collect();
+    let curves = answers::survival_rows(
+        &rows(counts.to_vec(py)?, width),
+        &rows(events.to_vec(py)?, width),
+        &rows(prior.to_vec(py)?, width),
+        &limits,
+    );
+    Ok(le_bytes(py, &curves.concat(), f64::to_le_bytes))
+}
+
+/// The survival curve of one question's answers so far, as float64 bytes.
+#[pyfunction]
+pub fn answer_survival<'py>(
+    py: Python<'py>,
+    lengths: PyBuffer<i64>,
+    written: PyBuffer<i64>,
     expected_tokens: f64,
     limit: usize,
-    prior: Option<Vec<f64>>,
-) -> Vec<f64> {
-    answers::answer_survival(&lengths, &written, expected_tokens, limit, prior)
+) -> PyResult<Bound<'py, PyBytes>> {
+    let curve = answers::answer_survival(
+        &lengths.to_vec(py)?,
+        &written.to_vec(py)?,
+        expected_tokens,
+        limit,
+        None,
+    );
+    Ok(le_bytes(py, &curve, f64::to_le_bytes))
 }
 
-/// The expected tokens still to write after each written length.
+/// The expected tokens still to write after each written length, as
+/// float64 bytes.
 #[pyfunction]
-pub fn remaining_tokens(survival: Vec<f64>) -> Vec<f64> {
-    answers::remaining_tokens(&survival)
+pub fn remaining_tokens<'py>(
+    py: Python<'py>,
+    survival: PyBuffer<f64>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let remaining = answers::remaining_tokens(&survival.to_vec(py)?);
+    Ok(le_bytes(py, &remaining, f64::to_le_bytes))
 }
 
-/// The live-stream bucket of one count of live positions.
+/// Each count of live positions' range in `LIVE_BUCKETS`, as int64 bytes.
 #[pyfunction]
-pub fn live_bucket(num_streams: i64) -> usize {
-    draft_policy::live_bucket(num_streams)
+pub fn live_buckets<'py>(
+    py: Python<'py>,
+    num_streams: PyBuffer<i64>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let buckets: Vec<i64> = num_streams
+        .to_vec(py)?
+        .into_iter()
+        .map(|count| draft_policy::live_bucket(count) as i64)
+        .collect();
+    Ok(le_bytes(py, &buckets, i64::to_le_bytes))
 }
 
-/// The odds a copy source is right, from the trials and accepts of its bucket.
+/// The chance the position each round follows is the answer's source,
+/// as float64 bytes.
 #[pyfunction]
-pub fn source_odds(num_streams: i64, trials: Vec<i64>, accepts: Vec<i64>) -> f64 {
-    draft_policy::source_odds(num_streams, &trials, &accepts)
+pub fn source_odds<'py>(
+    py: Python<'py>,
+    num_streams: PyBuffer<i64>,
+    trials: PyBuffer<i64>,
+    accepts: PyBuffer<i64>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let (trials, accepts) = (trials.to_vec(py)?, accepts.to_vec(py)?);
+    let odds: Vec<f64> = num_streams
+        .to_vec(py)?
+        .into_iter()
+        .map(|count| draft_policy::source_odds(count, &trials, &accepts))
+        .collect();
+    Ok(le_bytes(py, &odds, f64::to_le_bytes))
 }
 
-/// Each answer's copy draft length.
+/// Each answer's copy draft length, as int64 bytes.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-pub fn draft_lengths(
+pub fn draft_lengths<'py>(
+    py: Python<'py>,
     cap: usize,
     limit: usize,
-    survival: Vec<f64>,
-    written: Vec<i64>,
-    num_streams: Vec<i64>,
-    rho: Vec<f64>,
-    trials: Vec<i64>,
-    accepts: Vec<i64>,
-) -> Vec<usize> {
-    draft_policy::draft_lengths(
+    survival: PyBuffer<f64>,
+    written: PyBuffer<i64>,
+    num_streams: PyBuffer<i64>,
+    rho: PyBuffer<f64>,
+    trials: PyBuffer<i64>,
+    accepts: PyBuffer<i64>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let lengths: Vec<i64> = draft_policy::draft_lengths(
         cap,
         limit,
-        &survival,
-        &written,
-        &num_streams,
-        &rho,
-        &trials,
-        &accepts,
+        &survival.to_vec(py)?,
+        &written.to_vec(py)?,
+        &num_streams.to_vec(py)?,
+        &rho.to_vec(py)?,
+        &trials.to_vec(py)?,
+        &accepts.to_vec(py)?,
     )
+    .into_iter()
+    .map(|length| length as i64)
+    .collect();
+    Ok(le_bytes(py, &lengths, i64::to_le_bytes))
+}
+
+/// The draft policy's prior curve: `DraftPolicy(cap, max_answer_tokens,
+/// expected).curve()`, as float64 bytes.
+#[pyfunction]
+pub fn draft_policy_curve(
+    py: Python<'_>,
+    cap: usize,
+    max_answer_tokens: usize,
+    expected: f64,
+) -> Bound<'_, PyBytes> {
+    let curve = draft_policy::DraftPolicy::new(cap, max_answer_tokens, expected).curve();
+    le_bytes(py, &curve, f64::to_le_bytes)
 }
 
 /// Add the budget functions and constants to the native module.
@@ -344,9 +430,10 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(survival_rows, module)?,
         wrap_pyfunction!(answer_survival, module)?,
         wrap_pyfunction!(remaining_tokens, module)?,
-        wrap_pyfunction!(live_bucket, module)?,
+        wrap_pyfunction!(live_buckets, module)?,
         wrap_pyfunction!(source_odds, module)?,
         wrap_pyfunction!(draft_lengths, module)?,
+        wrap_pyfunction!(draft_policy_curve, module)?,
     ] {
         module.add_function(function)?;
     }

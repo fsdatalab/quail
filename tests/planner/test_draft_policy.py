@@ -1,6 +1,6 @@
 """Tests for the adaptive draft-length policy."""
 
-from quail.common.draft_policy import DraftPolicy
+from helpers.draft_policy import DraftPolicy
 
 
 def test_draft_length_grows_with_the_kv_read_and_shrinks_with_live_positions():
