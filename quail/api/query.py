@@ -6,7 +6,7 @@ import json
 import time
 from contextlib import closing
 from dataclasses import replace
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import _quail_native
 import pyarrow as pa
@@ -16,7 +16,6 @@ from quail.api.region_inputs import input_scans
 from quail.catalog.providers import ScanRequest
 from quail.common.expressions import (
     CompileError,
-    column_references,
     evaluate_expression,
     source_columns,
 )
@@ -29,11 +28,6 @@ from quail.execution.rows import as_table
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
-from quail.logical import (
-    LogicalPlan,
-    filter_stop_keys,
-    join_conditions,
-)
 from quail.physical import Scan, encode_graph
 from quail.physical.codec import decode_value, encode_value
 from quail.physical.plan import Refusal, RefusalError, refusal_from_fields
@@ -74,7 +68,7 @@ class QueryLike(Protocol):
 class Query:
     """A compiled query that plans and executes in the current process."""
 
-    def __init__(self, session: "Session", logical: LogicalPlan,
+    def __init__(self, session: "Session", logical: str,
                  order: str | None = None, *, catalog=None, assumed_rows=None,
                  text: str | None = None, dialect: str = "snowflake",
                  whole: bool = True):
@@ -88,8 +82,11 @@ class Query:
         # rows of each input table not yet computed, as a CTE's before it
         # runs, by table name
         self.assumed_rows = {} if assumed_rows is None else dict(assumed_rows)
+        # the region's logical plan, as Rust's JSON: as bound, then as the
+        # planner chose it
         self.logical = logical
         self._logical_input = logical
+        self._facts = {}
         self.order = order
         self._plan = None
         self._searched_plan = None
@@ -101,6 +98,22 @@ class Query:
         self.source_rows = {}
         # each input that holds a registered table whole: its identity
         self.input_identities = {}
+
+    def facts(self, logical: str | None = None) -> dict:
+        """Return what Rust reads from the logical plan, once per plan.
+
+        Args:
+            logical: A logical plan as JSON; the query's chosen plan when
+                omitted.
+
+        Returns:
+            The plan's scans, value columns, stop keys, join equalities,
+            and whether it asks the model; see ``region_facts`` in Rust.
+        """
+        logical = self.logical if logical is None else logical
+        if logical not in self._facts:
+            self._facts[logical] = json.loads(_quail_native.region_facts(logical))
+        return self._facts[logical]
 
     def token_inputs(self) -> dict:
         """Return the token store of every scanned alias.
@@ -125,11 +138,11 @@ class Query:
         """
         if self._plan is not None:
             return self._plan
-        if not self.logical.operators().prompts:
-            (scan,) = self.logical.operators().scans
+        if not self.facts()["asks_model"]:
+            (scan,) = self.facts()["scans"]
             num_documents = self.assumed_rows.get(
-                scan.provider,
-                self.catalog.get(scan.provider).statistics().num_rows)
+                scan["provider"],
+                self.catalog.get(scan["provider"]).statistics().num_rows)
             self._plan = self._relational_plan(num_documents or 0)
             return self._plan
         self._planning_started_at = time.perf_counter()
@@ -145,18 +158,19 @@ class Query:
         reads them as its inputs.
         """
         tables = {}
-        for scan in self._logical_input.operators().scans:
-            if scan.provider in tables:
+        for scan in self.facts(self._logical_input)["scans"]:
+            name = scan["provider"]
+            if name in tables:
                 continue
-            provider = self.catalog.get(scan.provider)
+            provider = self.catalog.get(name)
             with closing(provider.scan(ScanRequest(
                     columns=tuple(provider.columns)))) as reader:
                 table = reader.read_all()
             # a registered table's rows are the same for every query
             identity = (provider.content_identity()
-                        if scan.provider in self.session.catalog
-                        else self.input_identities.get(scan.provider))
-            tables[scan.provider] = (identity, table)
+                        if name in self.session.catalog
+                        else self.input_identities.get(name))
+            tables[name] = (identity, table)
         config = self.session.config
         settings = {
             "model": native.untagged(encode_value(self.session.model)),
@@ -169,8 +183,7 @@ class Query:
         }
         planner = self.session.planner
         call = planner.plan if config.backend == "quail" else planner.prepare
-        found, message = call(json.dumps(encode_value(self._logical_input)), tables,
-                              json.dumps(settings))
+        found, message = call(self._logical_input, tables, json.dumps(settings))
         if message is not None:
             raise CompileError(message)
         if config.backend == "quail":
@@ -188,10 +201,8 @@ class Query:
         """
         self._adopt_scans(found)
         config = self.session.config
-        alternatives = tuple(
-            LogicalAlternative(decode_value(LogicalPlan, json.loads(text)),
-                               tuple(rules))
-            for text, rules in found["alternatives"])
+        alternatives = tuple(LogicalAlternative(text, tuple(rules))
+                             for text, rules in found["alternatives"])
         pair_fractions = {int(position): fraction for position, fraction
                           in found["fields"]["pair_fractions"].items()}
         plan = plan_query(
@@ -288,7 +299,7 @@ class Query:
                        rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
-        has_inputs = input_scans(self._logical_input, self.session.catalog)
+        has_inputs = input_scans(self.facts(self._logical_input), self.session.catalog)
         if self.text is not None and (not self.whole or has_inputs):
             from quail.api.context import SessionContext
 
@@ -304,26 +315,20 @@ class Query:
 
         A model region's token stores are written when it is planned.
         """
-        if not self.logical.operators().prompts:
+        if not self.facts()["asks_model"]:
             self._prepare_relational()
 
     def _prepare_relational(self):
         """Read a relational stage's value columns without tokenizing them."""
         if self._token_inputs is not None:
             return
-        (scan,) = self.logical.operators().scans
-        provider = self.catalog.get(scan.provider)
-        expressions = (*self.logical.projection.columns,
-                       *(key.expression for key in self.logical.result.order),
-                       *(test.expression for predicate in scan.predicates
-                         for test in predicate.tests()))
-        columns = tuple(dict.fromkeys(
-            column for expression in expressions
-            for column in source_columns(expression)))
+        (scan,) = self.facts()["scans"]
+        provider = self.catalog.get(scan["provider"])
+        columns = tuple(self.facts()["relational_columns"])
         with closing(provider.scan(ScanRequest(columns=columns))) as reader:
             table = reader.read_all()
-        self._token_inputs = {scan.alias: table}
-        self._document_tokens = {scan.alias: TokenLengths([0] * table.num_rows)}
+        self._token_inputs = {scan["alias"]: table}
+        self._document_tokens = {scan["alias"]: TokenLengths([0] * table.num_rows)}
         self._plan = self._relational_plan(table.num_rows)
 
     def _relational_plan(self, num_documents: int):
@@ -372,29 +377,32 @@ class Query:
         plan.graph.validate(runtime_keys=set(self.session.registry.runtimes))
         plan.graph.validate_backend(plan.backend)
         inputs = {}
-        logical_scans = {
-            scan.alias: scan for scan in self.logical.operators().scans
-        }
+        documents = {scan["alias"]: decode_value(Any, scan["column"])
+                     for scan in self.facts()["scans"]}
         for node in plan.nodes:
             if not isinstance(node, Scan):
                 continue
             store = self._token_inputs[node.alias]
-            logical_scan = logical_scans[node.alias]
+            column = documents[node.alias]
             inputs[node.input_id] = document_input(
                 store.tokens,
                 (
-                    evaluate_expression(logical_scan.column, store)
-                    if set(source_columns(logical_scan.column))
+                    evaluate_expression(column, store)
+                    if set(source_columns(column))
                     <= set(store.projected_columns)
                     else None
                 ),
             )
         envelope = plan.to_envelope(self.session.registry.codecs)
-        source_rows = {scan.alias: self.source_rows[scan.provider]
-                       for scan in self.logical.operators().scans
-                       if scan.provider in self.source_rows}
+        source_rows = self._alias_source_rows()
         return PhysicalRequest(envelope, inputs, self._column_tables(),
                                source_rows)
+
+    def _alias_source_rows(self) -> dict:
+        """Each filtered input's rows in its registered table, by scan alias."""
+        return {scan["alias"]: self.source_rows[scan["provider"]]
+                for scan in self.facts()["scans"]
+                if scan["provider"] in self.source_rows}
 
     def _column_tables(self) -> dict:
         """One value table per alias whose columns the executor reads.
@@ -404,31 +412,8 @@ class Query:
         plan deduplicates also carries FIRST_DOCUMENT, computed from the
         tokens and the row columns the deduplicate setting lists for it.
         """
-        needed = {}
-        operators = self.logical.operators()
-        for join in operators.joins:
-            for condition in join_conditions(join):
-                for ref in column_references(condition.left) + column_references(
-                        condition.right):
-                    needed.setdefault(ref.alias, {})[ref.column] = None
-        for scan in operators.scans:
-            for predicate in scan.predicates:
-                for test in predicate.tests():
-                    for reference in column_references(test.expression):
-                        needed.setdefault(scan.alias, {})[reference.column] = None
-        # a Filter on labels or answers reads the source columns it tests
-        # by document ID
-        providers = {scan.alias: scan.provider for scan in operators.scans}
-        for alias, filters in operators.column_filters.items():
-            columns = self.catalog.get(providers[alias]).columns
-            for reference in (reference for each in filters
-                              for found in each.condition.tests()
-                              for reference in column_references(found.expression)):
-                if reference.alias == alias and reference.column in columns:
-                    needed.setdefault(alias, {})[reference.column] = None
-        for alias, key in filter_stop_keys(self.logical).items():
-            for column in key:
-                needed.setdefault(alias, {})[column] = None
+        needed = {alias: dict.fromkeys(columns)
+                  for alias, columns in self.facts()["value_columns"].items()}
         deduplicated = self.plan().settings.get("deduplicate", {})
         for alias in deduplicated:
             needed.setdefault(alias, {})
@@ -507,11 +492,10 @@ class Query:
                  "kind": output.answer.kind, "name": output.answer.name,
                  "columns": list(output.answer.columns)}}
             for node in plan.graph.topological_nodes() for output in node.outputs]
-        source_rows = {scan.alias: self.source_rows[scan.provider].to_pylist()
-                       for scan in self.logical.operators().scans
-                       if scan.provider in self.source_rows}
+        source_rows = {alias: rows.to_pylist()
+                       for alias, rows in self._alias_source_rows().items()}
         request = {
-            "logical": json.dumps(encode_value(self.logical)), "ports": ports,
+            "logical": self.logical, "ports": ports,
             "num_documents": {alias: len(tokens)
                               for alias, tokens in self._document_tokens.items()},
             "source_rows": source_rows}

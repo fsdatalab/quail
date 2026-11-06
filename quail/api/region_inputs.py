@@ -7,8 +7,11 @@ the region runs, or an empty table of the input's schema for planning
 before a run.
 """
 
+import base64
+import json
 from contextlib import closing
 
+import _quail_native
 import pyarrow as pa
 from pyarrow import compute as pc
 
@@ -19,20 +22,28 @@ from quail.catalog import (
     ScanRequest,
     table_name,
 )
-from quail.logical import LogicalPlan, Scan
 
 # planning before a run assumes this many rows of this many tokens each
 ASSUMED_INPUT_ROWS = 1_000
 ASSUMED_INPUT_TOKENS = 32
 
 
-def input_scans(logical: LogicalPlan, catalog) -> dict:
-    """Return each Scan of a region input, by its table name.
+def input_scans(facts: dict, catalog) -> dict:
+    """Return each scan of a region input, by its table name.
 
     A region input is a table the catalog does not hold.
+
+    Args:
+        facts: The region's facts, as ``region_facts`` returns them.
+        catalog: The session's catalog.
     """
-    return {node.provider: node for node in logical.walk()
-            if isinstance(node, Scan) and node.provider not in catalog}
+    return {scan["provider"]: scan for scan in facts["scans"]
+            if scan["provider"] not in catalog}
+
+
+def scan_schema(scan: dict) -> pa.Schema:
+    """Return the Arrow schema a scan's facts carry."""
+    return pa.ipc.read_schema(pa.py_buffer(base64.b64decode(scan["schema_ipc"])))
 
 
 def source_rows(catalog, name: str, table) -> pa.Array | None:
@@ -54,13 +65,13 @@ def source_rows(catalog, name: str, table) -> pa.Array | None:
     return pc.index_in(table.column(id_col), value_set=ids).cast(pa.int32())
 
 
-def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
+def region_query(session, logical: str, *, tables: dict | None = None,
                  keep_order: bool = False, **options):
     """Return the Query for a model region, over its input tables.
 
     Args:
         session: The session whose tables and model the region uses.
-        logical: The region's logical plan.
+        logical: The region's logical plan, as Rust's JSON.
         tables: Each input's rows as a pyarrow Table, by name, or None
             to plan before the inputs exist.
         keep_order: Read each input in the order given, as a plan Rust
@@ -72,7 +83,8 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
     """
     from quail.api.query import Query
 
-    scans = input_scans(logical, session.catalog)
+    scans = input_scans(json.loads(_quail_native.region_facts(logical)),
+                        session.catalog)
     if not scans:
         return Query(session, logical, **options)
     providers = dict(session.catalog.providers)
@@ -95,7 +107,7 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
                     # the whole table: its token store is kept for later queries
                     identities[name] = base.content_identity()
         else:
-            table = scan.schema.empty_table()
+            table = scan_schema(scan).empty_table()
             assumed[name] = ASSUMED_INPUT_ROWS
         providers[name] = MemoryTableProvider(table, id_col="",
                                               identity=f"input:{name}")

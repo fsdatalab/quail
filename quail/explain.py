@@ -78,7 +78,7 @@ def explain(logical, physical, *, verbose: bool = False, result=None,
     """Format the logical and physical operator trees.
 
     Args:
-        logical: The optimized logical plan.
+        logical: The optimized logical plan as JSON.
         physical: The physical plan or planning refusal.
         verbose: Include runtime settings, internal node fields, and
             the optimizer rules.
@@ -92,7 +92,7 @@ def explain(logical, physical, *, verbose: bool = False, result=None,
         The explain text.
     """
     request = {
-        "logical": encode_value(logical),
+        "logical": json.loads(logical),
         "verbose": verbose,
         "usd_per_hour": usd_per_hour,
         "rules": (None if rules is None

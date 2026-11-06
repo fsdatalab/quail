@@ -25,7 +25,6 @@ model regions call ``quail.api.engine.Engine``.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 
 import pyarrow as pa
@@ -34,8 +33,6 @@ from quail.api.compile import DATAFUSION_DIALECTS
 from quail.api.engine import Engine
 from quail.api.query import Query
 from quail.catalog import ScanRequest, TableProvider
-from quail.logical import LogicalPlan
-from quail.physical.codec import decode_value
 
 
 def ipc_bytes(table: pa.Table) -> bytes:
@@ -96,8 +93,8 @@ class SessionContext:
         """Return the SQL each model region of a query sends to Quail."""
         return self._native.region_sql(text)
 
-    def logical_plans(self, text: str) -> list[LogicalPlan]:
-        """Return the logical plan Rust binds for each model region of a query.
+    def logical_plans(self, text: str) -> list[str]:
+        """Return the logical plan Rust binds for each model region, as JSON.
 
         Raises:
             CompileError: The Rust binder refuses a region.
@@ -111,7 +108,7 @@ class SessionContext:
         for plan, message in bound:
             if message is not None:
                 raise CompileError(message)
-            plans.append(decode_value(LogicalPlan, json.loads(plan)))
+            plans.append(plan)
         return plans
 
     def explain(self, text: str, dialect: str = "snowflake") -> str:
@@ -150,8 +147,7 @@ class DataFusionQuery:
             DATAFUSION_DIALECTS[self.dialect])
         from quail.api.region_inputs import region_query
 
-        return [region_query(self.session, decode_value(LogicalPlan, json.loads(plan)),
-                             order=self.order)
+        return [region_query(self.session, plan, order=self.order)
                 for plan, message in bound if message is None]
 
     def plan(self) -> tuple:

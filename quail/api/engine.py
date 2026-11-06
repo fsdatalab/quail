@@ -12,11 +12,10 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 
+import _quail_native
 import pyarrow as pa
 
 from quail.api.execute import execute_query
-from quail.logical import LogicalPlan
-from quail.physical.codec import decode_value
 
 
 class Engine:
@@ -107,8 +106,7 @@ class Engine:
         found = json.loads(planned)
         if "refusal" in found:
             raise RefusalError(refusal_from_fields(found["refusal"]))
-        logical = decode_value(LogicalPlan, json.loads(found["logical"]))
-        query = region_query(self.session, logical, order=self._order,
+        query = region_query(self.session, found["logical"], order=self._order,
                              tables=tables, keep_order=True)
         query.adopt_plan(found)
         return self._run(query)
@@ -134,9 +132,9 @@ class Engine:
         from quail.api.region_inputs import region_query
 
         if kind == "plan":
-            logical = decode_value(LogicalPlan, json.loads(payload))
+            logical = payload
             if fetch is not None:
-                logical = with_limit(logical, fetch)
+                logical = _quail_native.limited_plan(logical, fetch)
             query = region_query(self.session, logical, order=self._order,
                                  tables=tables)
         else:
@@ -147,20 +145,3 @@ class Engine:
         """Close the session if this engine opened it."""
         if self._owns_session:
             self.session.close()
-
-
-def with_limit(logical: LogicalPlan, fetch: int) -> LogicalPlan:
-    """Return a region's plan that returns at most ``fetch`` rows.
-
-    DataFusion passes the limit when a LIMIT above the region reaches
-    it; Quail can then stop the model once enough rows pass.
-    """
-    from dataclasses import replace
-
-    from quail.logical import Result
-
-    root = logical.root
-    if isinstance(root, Result):
-        limit = fetch if root.limit is None else min(root.limit, fetch)
-        return replace(logical, root=replace(root, limit=limit))
-    return replace(logical, root=Result(input=root, limit=fetch))

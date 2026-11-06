@@ -4,7 +4,6 @@ import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
-from quail.logical import LogicalPlan
 from quail.physical import (
     PhysicalGraph,
     PhysicalNode,
@@ -68,7 +67,8 @@ class PhysicalPlan:
     estimates: Mapping[str, Mapping[str, float]] = field(
         default_factory=dict, repr=False)
     estimator: Any = field(default=None, repr=False, compare=False)
-    logical_plan: LogicalPlan | None = field(default=None, repr=False, compare=False)
+    # the logical plan the graph lowers, as Rust's JSON
+    logical_plan: str | None = field(default=None, repr=False, compare=False)
     graph: PhysicalGraph = field(init=False, repr=False)
 
     def __post_init__(self) -> None:

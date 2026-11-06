@@ -2,7 +2,6 @@
 
 from dataclasses import replace
 
-from quail.logical import LogicalPlan
 from quail.physical.plan import Refusal
 from quail.planner import native
 from quail.planner.candidates import ModelRegion
@@ -10,7 +9,7 @@ from quail.planner.context import PlanningContext
 from quail.specs import DeviceSpec, ModelSpec
 
 
-def plan_query(plan: LogicalPlan, *, model: ModelSpec,
+def plan_query(plan: str, *, model: ModelSpec,
                device: DeviceSpec, document_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
                registry, tokenizer=None, pair_fractions=None,

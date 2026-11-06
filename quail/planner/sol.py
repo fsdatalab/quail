@@ -34,19 +34,23 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 import _quail_native
 import numpy as np
 import pyarrow as pa
 
 from quail.common import budgets
-from quail.common.expressions import Prompt, column_name, evaluate_expression
+from quail.common.expressions import (
+    Prompt,
+    column_name,
+    condition_columns,
+    evaluate_expression,
+)
 from quail.common.pairs import pair_table, partner_map
 from quail.common.sol import SpeedOfLight, speed_of_light
 from quail.common.tokens import prefix_tree
 from quail.common.work import Work
-from quail.logical import condition_columns, filter_stop_keys, oriented_join_conditions
 from quail.physical.codec import decode_value, encode_value
 from quail.physical.lowering import Vocabulary
 from quail.planner.native import untagged
@@ -287,26 +291,27 @@ def _estimate_inputs(query, stores, chunk: int, credit: bool) -> dict:
         tokens; each stop key's values per row; and each join's allowed
         pairs, by the rows of each side.
     """
-    operators = query.logical.operators()
+    facts = query.facts()
     aliases = []
-    for scan in operators.scans:
-        store = stores[scan.alias]
+    for scan in facts["scans"]:
+        store = stores[scan["alias"]]
         tokens = [int(length) for length in store.lengths]
+        column = column_name(decode_value(Any, scan["column"]), qualified=False)
         aliases.append({
-            "alias": scan.alias,
-            "column": f"{scan.provider}.{column_name(scan.column, qualified=False)}",
+            "alias": scan["alias"],
+            "column": f"{scan['provider']}.{column}",
             "tokens": tokens,
             "shared": _shared_tokens(store.tokens) if credit else [0] * len(tokens)})
     stop_groups = {}
-    for alias, key in filter_stop_keys(query.logical).items():
+    for alias, key in facts["stop_keys"].items():
         columns = [stores[alias].column(name).to_pylist() for name in key]
         stop_groups[alias] = [_plain(list(values)) for values in zip(*columns)]
     allowed_pairs = {}
-    for position, join in enumerate(operators.joins):
-        oriented = oriented_join_conditions(join)
-        if oriented is None:
-            continue
-        left_alias, right_alias, conditions = oriented
+    for join in facts["join_conditions"]:
+        position = join["position"]
+        left_alias, right_alias = join["left_alias"], join["right_alias"]
+        conditions = [(decode_value(Any, left), decode_value(Any, right))
+                      for left, right in join["pairs"]]
         pairs = pair_table(
             left_alias, [evaluate_expression(left, stores[left.alias])
                          for left, _ in conditions],
@@ -382,7 +387,7 @@ def speed_of_light_estimate(
               "plan": None, "attention": None}
     found, message = _quail_native.plan_operator(
         "speed_of_light", json.dumps(fields),
-        json.dumps({"plan": encode_value(query.logical), "inputs": inputs}),
+        json.dumps({"plan": json.loads(query.logical), "inputs": inputs}),
         vocabulary.tokens, vocabulary.decoder(),
         _Oracles(answer, label, stores))
     if message is not None:

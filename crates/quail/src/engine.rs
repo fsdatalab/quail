@@ -87,7 +87,7 @@ impl PythonRunner {
         let mut logical = quail_planner::read_logical_plan(payload)
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         if let Some(fetch) = fetch {
-            logical.root = with_limit(logical.root, fetch as i64);
+            logical.root = quail_planner::logical::with_limit(logical.root, fetch as i64);
         }
         // Python plans a region that asks no model
         let operators = quail_planner::operators::operators(&logical);
@@ -203,26 +203,6 @@ impl RegionRunner for PythonRunner {
             }
             _ => self.run_here(region, inputs, fetch),
         }
-    }
-}
-
-/// A region's plan that returns at most `fetch` rows, when DataFusion
-/// passes a LIMIT above the region down to it, so the model can stop
-/// once enough rows pass.
-fn with_limit(root: quail_planner::LogicalNode, fetch: i64) -> quail_planner::LogicalNode {
-    use quail_planner::LogicalNode;
-    match root {
-        LogicalNode::Result(mut result) => {
-            result.limit = Some(result.limit.map_or(fetch, |limit| limit.min(fetch)));
-            LogicalNode::Result(result)
-        }
-        other => LogicalNode::Result(quail_planner::logical::ResultNode {
-            input: Box::new(other),
-            limit: Some(fetch),
-            order: Vec::new(),
-            offset: 0,
-            distinct: false,
-        }),
     }
 }
 

@@ -28,10 +28,11 @@ import quail_b as benchmark
 from bench import substrait
 from bench.results import write_json
 from quail.baselines.nodes import RequestExecution
-from quail.common.expressions import SPAN_SUFFIX
+from quail.common.expressions import SPAN_SUFFIX, Prompt
 from quail.common.prompts import bind_classify_prompt, bind_extract_prompt
 from quail.execution.result import answer_values
 from quail.physical import AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore
+from quail.physical.codec import decode_value
 from quail.physical.lowering import lower_prompt
 from quail.physical.plan import Refusal
 from quail.progress import say
@@ -287,44 +288,45 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
         info: The query's plan reading, for the operator ids.
         anchors: Written join position -> the anchor alias.
     """
-    operators = query.logical.operators()
-    filters, joins = operators.filters, operators.joins
+    prompts = query.facts()["prompts"]
+    filters = {alias: [decode_value(Prompt, prompt) for prompt in written]
+               for alias, written in prompts["filters"].items()}
+    joins = [decode_value(Prompt, prompt) for prompt in prompts["joins"]]
+    classifies = {name: (decode_value(Prompt, found["prompt"]), found["aliases"])
+                  for name, found in prompts["classifies"].items()}
 
     def lower(prompt):
         return lower_prompt(prompt, query.session.tokenizer)
 
+    every = [*(prompt for written in filters.values() for prompt in written),
+             *(prompt for prompt, _ in classifies.values()), *joins]
     preamble = next((list(lower(prompt).preamble_token_ids)
-                     for prompt in operators.prompts
-                     if lower(prompt).preamble_token_ids), [])
+                     for prompt in every if lower(prompt).preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": [], "classifies": [], "scores": [],
               "extracts": [], "features": [], "maps": []}
-    for alias, predicates in filters.items():
+    for alias, written_prompts in filters.items():
         written = _alias_filters(info, alias)
-        for position, predicate in enumerate(predicates):
+        for position, prompt in enumerate(written_prompts):
             if isinstance(written[position], InList):
                 continue
             pieces["filters"].append({
                 "id": written[position].id,
-                "tail": list(lower(predicate.prompt).tail_token_ids)})
-    for position, join in enumerate(joins):
+                "tail": list(lower(prompt).tail_token_ids)})
+    for position, prompt in enumerate(joins):
         anchor = anchors[position]
         pieces["joins"].append({
             "id": info.joins[position].id, "anchor": anchor,
-            **_pair_pieces(lower(join.prompt), anchor)})
-    if info.classifies:
-        labels = operators.labels
-        calls = {labels.names[call]: call for call, _ in labels.calls}
-        for operator in info.classifies:
-            call = calls[operator.output]
-            if operator.partner is None:
-                piece = {"tail": list(lower(call.prompt).tail_token_ids)}
-            else:
-                # the anchor is the call's first document
-                anchor = call.aliases()[0]
-                piece = {"anchor": anchor,
-                         **_pair_pieces(lower(call.prompt), anchor)}
-            pieces["classifies"].append({"id": operator.id, **piece})
+            **_pair_pieces(lower(prompt), anchor)})
+    for operator in info.classifies:
+        prompt, aliases = classifies[operator.output]
+        if operator.partner is None:
+            piece = {"tail": list(lower(prompt).tail_token_ids)}
+        else:
+            # the anchor is the call's first document
+            anchor = aliases[0]
+            piece = {"anchor": anchor, **_pair_pieces(lower(prompt), anchor)}
+        pieces["classifies"].append({"id": operator.id, **piece})
     # the planner lays a score out as the AI.IF prompt of its document,
     # so its head is the preamble and its tail follows the document
     for operator in info.scores:

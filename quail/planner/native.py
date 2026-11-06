@@ -19,11 +19,9 @@ import numpy as np
 from quail.common.document_ends import last_tokens
 from quail.common.expressions import CompileError
 from quail.common.tokens import prefix_tree
-from quail.logical import LogicalPlan
 from quail.physical.codec import (
     built_in_codecs,
     decode_graph,
-    decode_value,
     encode_graph,
     encode_value,
 )
@@ -125,7 +123,7 @@ def context_fields(context, vocabulary) -> dict:
         "document_tokens": {alias: np.asarray(values).astype(int).tolist()
                             for alias, values in context.document_tokens.items()},
         "plan": (None if context.logical_plan is None
-                 else encode_value(context.logical_plan)),
+                 else json.loads(context.logical_plan)),
         "attention": context.attention, "order": context.order,
         "pair_fractions": {str(key): float(value)
                            for key, value in (context.pair_fractions or {}).items()},
@@ -208,7 +206,7 @@ def search_plan(alternatives, context, registry):
     fields = context_fields(context, vocabulary)
     found, message = native.plan_operator(
         "search_plan", json.dumps(fields),
-        json.dumps({"alternatives": [[encode_value(alternative.plan),
+        json.dumps({"alternatives": [[json.loads(alternative.plan),
                                       list(alternative.rules)]
                                      for alternative in alternatives],
                     "rules": [rule.name for rule in registry.physical_rules.values()]}),
@@ -255,7 +253,7 @@ def planned_region(found: dict, tokenizer):
         return Refusal(reasons=tuple(refusal["reasons"]),
                        constraint=refusal["constraint"], needed=refusal["needed"],
                        available=refusal["available"], unit=refusal["unit"]), None
-    logical = decode_value(LogicalPlan, json.loads(found["logical"]))
+    logical = found["logical"]
     envelope = found["envelope"]
     codecs = {codec.type_name: codec for codec in built_in_codecs()}
     graph = decode_graph(envelope["graph"], codecs)
@@ -279,7 +277,7 @@ def column_placements(plan):
     """The placements of a plan's column operators that planning prices.
 
     Args:
-        plan: The bound logical plan.
+        plan: The bound logical plan as JSON.
 
     Returns:
         The plan, then each plan with a classification, extraction, or
@@ -288,13 +286,10 @@ def column_placements(plan):
     Raises:
         CompileError: A moved plan is not valid.
     """
-    found, message = _quail_native.column_placements(
-        json.dumps(encode_value(plan)))
+    found, message = _quail_native.column_placements(plan)
     if message is not None:
         raise CompileError(message)
-    return tuple(LogicalAlternative(decode_value(LogicalPlan, json.loads(text)),
-                                    tuple(rules))
-                 for text, rules in found)
+    return tuple(LogicalAlternative(text, tuple(rules)) for text, rules in found)
 
 
 def _plan_from(found: dict, native, fields, vocabulary, logical_plan, pricer=None):
@@ -326,7 +321,8 @@ def relational_plan(logical, context, num_documents: int):
     fields = context_fields(context, vocabulary)
     found, message = native.plan_operator(
         "relational_plan", json.dumps(fields),
-        json.dumps({"plan": encode_value(logical), "num_documents": num_documents}),
+        json.dumps({"plan": json.loads(logical),
+                    "num_documents": num_documents}),
         vocabulary.tokens, None)
     if message is not None:
         raise ValueError(message)
@@ -355,7 +351,7 @@ def request_plan(logical, context, settings: dict):
     vocabulary = Vocabulary(context.tokenizer)
     found, message = _quail_native.plan_operator(
         "request_plan", json.dumps(context_fields(context, vocabulary)),
-        json.dumps({"plan": encode_value(logical), "settings": settings}),
+        json.dumps({"plan": json.loads(logical), "settings": settings}),
         vocabulary.tokens, vocabulary.decoder())
     if message is not None:
         raise CompileError(message)

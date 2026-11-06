@@ -1169,6 +1169,25 @@ fn edit_graph(graph: &str, edit: &str) -> PyResult<(Option<String>, Option<Strin
     })
 }
 
+/// A logical plan's facts as JSON, as `quail_planner::facts::region_facts`
+/// reads them.
+#[pyfunction]
+fn region_facts(logical: &str) -> PyResult<String> {
+    let plan = quail_planner::read_logical_plan(logical)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    Ok(quail_planner::facts::region_facts(&plan).to_string())
+}
+
+/// A logical plan, as JSON, that returns at most `fetch` rows.
+#[pyfunction]
+fn limited_plan(logical: &str, fetch: i64) -> PyResult<String> {
+    let mut plan = quail_planner::read_logical_plan(logical)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    plan.root = quail_planner::logical::with_limit(plan.root, fetch);
+    quail_planner::write_logical_plan(&plan)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
 /// A region's logical plan, its tables' rows, and the settings, read
 /// from what Python passes the planner.
 fn planning_inputs(
@@ -1295,6 +1314,8 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(write_token_store, module)?)?;
     module.add_function(wrap_pyfunction!(collect_answers, module)?)?;
     module.add_function(wrap_pyfunction!(edit_graph, module)?)?;
+    module.add_function(wrap_pyfunction!(region_facts, module)?)?;
+    module.add_function(wrap_pyfunction!(limited_plan, module)?)?;
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
     module.add_function(wrap_pyfunction!(prefix_statistics, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)

@@ -1,17 +1,18 @@
-//! Quail's planner, ported from `quail/planner` and `quail/logical`.
+//! Quail's planner, ported from `quail/planner` and the deleted
+//! `quail/logical` package.
 //!
 //! | module | Python |
 //! |---|---|
-//! | `logical` | the node types of `quail/logical/nodes` and `LogicalPlan` |
+//! | `logical` | the logical node types and `LogicalPlan` |
 //! | `expressions` | the helpers of `quail/common/expressions.py` |
 //! | `context` | `PlanningContext` |
 //! | `costs` | the filter costs and join specs of `quail/planner/operators` |
 //! | `columns` | the column planners of `quail/planner/operators` |
 //! | `classify` | `quail/planner/operators/classify.py` |
-//! | `builder` | `quail/logical/naive.py`, `placement.py`, `builder.py` |
-//! | `nodes` | the methods of the node classes in `quail/logical/nodes` |
+//! | `builder` | building a logical plan from a bound region |
+//! | `nodes` | what each logical node reads and returns, and its checks |
 //! | `lowering` | `quail/planner/prompt_lowering.py`, with a tokenizer callback |
-//! | `operators` | `LogicalPlan.operators` in `quail/logical/plan.py` |
+//! | `operators` | a plan's operators, grouped by kind |
 //! | `plan_statistics` | `quail/planner/search/statistics.py` |
 //! | `search` | the step order, join order, and anchor search of `quail/planner/search` |
 //! | `scores` | `quail/planner/operators/score.py` |
@@ -29,6 +30,7 @@ pub mod costs;
 pub mod edits;
 pub mod explain;
 pub mod expressions;
+pub mod facts;
 pub mod graph;
 pub mod logical;
 pub mod lowering;

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+
+import _quail_native
 
 from quail.api.compile import SQLDialect, compile_region
 from quail.api.config import EngineConfig, resolve_model
@@ -139,7 +142,7 @@ class Session:
 
         logical, whole = compiled
         tables = None
-        if input_scans(logical, self.catalog):
+        if input_scans(json.loads(_quail_native.region_facts(logical)), self.catalog):
             from quail.api.compile import DATAFUSION_DIALECTS
             from quail.api.context import SessionContext
 

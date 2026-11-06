@@ -8,15 +8,12 @@ own region, whose rows the reading region takes as an input.
 
 from __future__ import annotations
 
-import json
 import re
 from enum import StrEnum
 
 import pyarrow as pa
 
 from quail.common.expressions import CompileError
-from quail.logical import LogicalPlan
-from quail.physical.codec import decode_value
 
 
 class SQLDialect(StrEnum):
@@ -88,8 +85,8 @@ def _message(error: Exception, sql: str) -> str:
 
 def compile_with_datafusion(sql: str, catalog, model,
                             dialect: str = "snowflake",
-                            rules=None) -> LogicalPlan | None:
-    """Compile AI SQL text into its model region's logical plan.
+                            rules=None) -> str | None:
+    """Compile AI SQL text into its model region's logical plan, as JSON.
 
     Returns:
         The plan of the query's one model region, or None when the query
@@ -115,8 +112,10 @@ class _CompilingEngine:
 
 
 def compile_region(sql: str, catalog, model, dialect: str = "snowflake",
-                   rules=None) -> tuple[LogicalPlan, bool] | None:
+                   rules=None) -> tuple[str, bool] | None:
     """Compile AI SQL text into the logical plan of its one model region.
+
+    The plan is Rust's JSON.
 
     Args:
         sql: The statement.
@@ -161,4 +160,4 @@ def compile_region(sql: str, catalog, model, dialect: str = "snowflake",
         if not whole and READ_AS_SQL in message:
             return None
         raise CompileError(message)
-    return decode_value(LogicalPlan, json.loads(plan)), whole
+    return plan, whole

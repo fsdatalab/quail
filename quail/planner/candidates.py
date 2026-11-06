@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from quail.logical import LogicalPlan
 from quail.physical.base import PhysicalGraph
 
 
@@ -13,14 +12,14 @@ from quail.physical.base import PhysicalGraph
 class ModelRegion:
     """Connected logical model work planned by one backend."""
 
-    logical_plan: Any
+    logical_plan: str  # as Rust's JSON
 
 
 @dataclass(frozen=True)
 class LogicalAlternative:
     """A logical plan and the rules that produced it."""
 
-    plan: LogicalPlan
+    plan: str  # as Rust's JSON
     rules: tuple[str, ...] = ()
 
 
@@ -43,5 +42,5 @@ class PhysicalCandidate:
     graph: PhysicalGraph | None
     plan: Any
     estimated_seconds: float
-    logical_plan: Any = None
+    logical_plan: str | None = None
     rewrites: tuple[str, ...] = ()

@@ -40,7 +40,7 @@ class PlanningContext:
     scan_fractions: Mapping[str, float] = field(default_factory=dict)
     # the logical plan the graph was planned from; None when the rules
     # run again over a finished plan
-    logical_plan: Any = None
+    logical_plan: str | None = None
     catalog: Any = None
     engine_config: Any = None
     # the plan's settings as the rules see them; a rule adds what the
