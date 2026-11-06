@@ -3,6 +3,7 @@
 //! `NativeSession` is `quail::Session`; Python's `quail.Session` runs
 //! queries through it, as a Rust program does.
 
+mod budgets;
 mod cost;
 
 use std::io::Cursor;
@@ -1032,6 +1033,7 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Tokenizer>()?;
     module.add_class::<NativePlanner>()?;
     module.add_class::<cost::CostModel>()?;
+    budgets::register(module)?;
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;

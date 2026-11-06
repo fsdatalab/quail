@@ -1,484 +1,175 @@
-"""Budget quantities derived from model and device specs.
+"""Memory and time budgets of a model on a device, from Rust's cost model.
 
-Chunk budget, admission budget, and roofline arithmetic.
+The planner prices plans with the same functions in
+``crates/quail-cost/src/budgets.rs``; this module reads them for the
+GPU executor, so the two never disagree.
 """
 
-from math import ceil
+import json
+from functools import lru_cache
+
+import _quail_native
 
 from quail.specs import DeviceSpec, ModelSpec
 
-POOL_FRACTION = 0.95    # fraction of device memory the executor claims
-PAGE_TOKENS = 16        # default KV page size; devices may require larger pages
-INT32_MAX = 2**31 - 1
-ACT_BYTES = 2           # bf16 activations, bytes per element
-ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
-#                         the arena for overlapped chunk construction
-READOUT_BLOCK_ROWS = 512
+POOL_FRACTION = _quail_native.POOL_FRACTION
+PAGE_TOKENS = _quail_native.PAGE_TOKENS
+ACT_RESERVE_CHUNKS = _quail_native.ACT_RESERVE_CHUNKS
+READOUT_BLOCK_ROWS = _quail_native.READOUT_BLOCK_ROWS
+CHECKPOINT_PASS_QUESTIONS = _quail_native.CHECKPOINT_PASS_QUESTIONS
+GRAPH_TOKEN_BUCKETS = tuple(_quail_native.GRAPH_TOKEN_BUCKETS)
+
+parallel_copies = _quail_native.parallel_copies
 
 
-def copy_verification_workspace_bytes(model: ModelSpec, chunk_tokens: int) -> int:
-    """Return shared readout workspace capped by one activation chunk.
+def _spec_json(spec) -> str:
+    from quail.physical.codec import encode_value, untagged
 
-    The head readout's two fp32 logits tables are released before copy
-    verification runs on the same CUDA stream. Reuse their bounded space,
-    leaving the other activation chunk for retained outputs and staging.
-    """
-    return int(min(chunk_tokens * model.act_per_token,
-                   2 * READOUT_BLOCK_ROWS * model.vocab * 4))
+    return json.dumps(untagged(encode_value(spec)))
 
 
-def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
-    """Return how many pooled GPU memories would hold the loaded weights.
-
-    Quail does not split weights across GPUs. A result above one causes a
-    planning refusal.
-    """
-    gpus = 1
-    while model.W_mem > device.mem_bytes * POOL_FRACTION * gpus:
-        gpus *= 2
-    return gpus
+@lru_cache(maxsize=64)
+def _budgets(model_json: str, device_json: str | None):
+    return _quail_native.Budgets(model_json, device_json)
 
 
-def kernel_index_cap(model: ModelSpec) -> int:
-    """Max tokens per chunk from the int32 element-offset limit.
-
-    Constraint: rows x widest projection < 2^31.
-    """
-    width = max(model.widest_projection, model.experts_active
-                * max(model.hidden, 2 * model.expert_intermediate))
-    return INT32_MAX // width
-
-
-def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
-    """Return the largest chunk that fits its memory reservations, or zero."""
-    available = device.mem_bytes * POOL_FRACTION - graph_memory_bytes(model, device)
-    free = available - model.W_resident
-    lower = 0
-    upper = max(0, int(free // (ACT_RESERVE_CHUNKS * model.act_per_token)))
-    while lower < upper:
-        chunk = (lower + upper + 1) // 2
-        if chunk_memory_bytes(model, chunk, device.page_tokens) <= available:
-            lower = chunk
-        else:
-            upper = chunk - 1
-    return lower
-
-
-def chunk_memory_bytes(model: ModelSpec, chunk_tokens: int,
-                       page_tokens: int = PAGE_TOKENS) -> float:
-    """Return resident weights, activation memory, and checkpoint reservations."""
-    return (model.W_resident
-            + ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token
-            + checkpoint_memory_bytes(model, chunk_tokens, page_tokens))
+def budgets_of(model: ModelSpec, device: DeviceSpec | None = None):
+    """Return the Rust ``Budgets`` of a model, on a device when given."""
+    return _budgets(_spec_json(model),
+                    None if device is None else _spec_json(device))
 
 
 def pages(tokens: int, page_tokens: int = PAGE_TOKENS) -> int:
-    """Return the KV pages that hold tokens."""
-    return -(-tokens // page_tokens)
-
-
-def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
-    """Return the chunk budget allowed by the model and device.
-
-    Memory, kernel indexing, and the model's configured cap are hard limits.
-    Return zero when even one token cannot fit the memory reservations.
-    """
-    b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
-    if model.chunk_cap_tokens:
-        b = min(b, model.chunk_cap_tokens)
-    return _chunk_leaving_kv(model, device, b)
-
-
-def _chunk_leaving_kv(model: ModelSpec, device: DeviceSpec, chunk: int) -> int:
-    """Shrink a chunk until its activation reserve leaves its own KV.
-
-    Args:
-        model: The model being budgeted.
-        device: The device it runs on.
-        chunk: The budget before the KV check.
-
-    Returns:
-        ``chunk`` when it already leaves one chunk of KV, or a smaller
-        one. A sliding-window model is unchanged; its arena check is
-        ``arena_pages``.
-    """
-    if model.sliding_window or chunk < 1:
-        return chunk
-    free = (device.mem_bytes * POOL_FRACTION - model.W_resident
-            - graph_memory_bytes(model, device))
-    per = ACT_RESERVE_CHUNKS * model.act_per_token + model.kappa_full
-    if per > 0:
-        chunk = min(chunk, max(1, int(free // per)))
-    full, _ = arena_pages(model, device, chunk)
-    while chunk > 1 and full * device.page_tokens < chunk:
-        chunk -= 1
-        full, _ = arena_pages(model, device, chunk)
-    return chunk
-
-
-def sliding_kv_fits(model: ModelSpec, device: DeviceSpec,
-                    chunk_tokens: int | None = None) -> bool:
-    """Whether the leftover arena holds one chunk's sliding KV.
-
-    Models without a sliding window always fit. The default chunk is
-    the budget; DiffusionGemma's 65536-token cap does not fit L40S.
-    """
-    if not model.sliding_window:
-        return True
-    try:
-        arena_pages(model, device, chunk_tokens)
-    except ValueError:
-        return False
-    return True
-
-
-# CUDA graph capture sizes, in tokens per pass, for Quail and the vLLM
-# baselines alike. A pass pads to the next size and runs eagerly past
-# the largest. vLLM's defaults (1, 2, 4, then every 8 to 256 and every
-# 16 to 512), then every 256 to 8,192, so a decode pass of hundreds of
-# rows or a full prefill pass pads by fewer than 256 rows
-GRAPH_TOKEN_BUCKETS = (
-    1, 2, 4, *range(8, 256, 8), *range(256, 513, 16), *range(768, 8_193, 256))
-
-
-# Families whose pipelines split their forward pass into captured
-# pieces (ModelPipeline.piece)
-GRAPH_ARCHS = ("qwen3", "qwen3_5")
-
-
-def graph_token_buckets(model: ModelSpec, device: DeviceSpec) -> tuple[int, ...]:
-    """Return the CUDA graph capture sizes of a dense Qwen3 or Qwen3.5 model.
-
-    The sizes are GRAPH_TOKEN_BUCKETS, up to the model's kernel index
-    cap. Other families, experts, SAE readouts, and diffusion canvases
-    run without graphs.
-    """
-    if (model.arch not in GRAPH_ARCHS or model.experts or model.sae is not None
-            or model.canvas_tokens):
-        return ()
-    cap = kernel_index_cap(model)
-    return tuple(size for size in GRAPH_TOKEN_BUCKETS if size <= cap)
-
-
-def graph_memory_bytes(model: ModelSpec, device: DeviceSpec) -> int:
-    """Reserve shared boundary buffers and one shared capture workspace.
-
-    The buckets' persistent state shares one allocation that fits the
-    largest bucket's activation footprint. All captures share a pool,
-    whose temporaries fit the same footprint. Attention and readout
-    still use the ordinary activation reserve.
-    """
-    buckets = graph_token_buckets(model, device)
-    if not buckets:
-        return 0
-    return ceil(2 * buckets[-1] * model.act_per_token)
-
-
-def arena_bytes(model: ModelSpec, device: DeviceSpec,
-                chunk_tokens: int) -> float:
-    """Bytes left for KV after weights, activations, and CUDA graph storage."""
-    return (device.mem_bytes * POOL_FRACTION - model.W_resident
-            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token
-            - graph_memory_bytes(model, device))
-
-
-# Questions one pass may start from checkpoints at once; each needs a
-# temporary copy of the checkpoint state.
-CHECKPOINT_PASS_QUESTIONS = 1_024
-# Document length a hybrid model's retained pool is split for when the
-# mean is unknown.
-CHECKPOINT_DEFAULT_DOC_TOKENS = 1_000
-MIB = 2**20
-INTERMEDIATE_BLOCK_TOKENS = 64
-
-
-# Rows past a document that its pages also cover: the shared question
-# preamble and a stage tail, taken as a round number for the split.
-SPLIT_EXTRA_TOKENS = 64
-
-
-def transient_sliding_pages(chunk_tokens: int, window: int,
-                            page_tokens: int = PAGE_TOKENS) -> int:
-    """Sliding-layer pages one chunk's fresh prefixes take before trimming.
-
-    The chunk's rows, plus one page of rounding per document longer
-    than the window, of which a chunk holds at most chunk / window.
-    """
-    return pages(chunk_tokens, page_tokens) + -(-chunk_tokens // window)
-
-
-def checkpoint_pages(model: ModelSpec, page_tokens: int = PAGE_TOKENS) -> float:
-    """KV pages of memory one document checkpoint takes."""
-    return model.checkpoint_bytes / (model.kappa * page_tokens)
-
-
-def checkpoint_pass_bytes(model: ModelSpec, questions: int,
-                          chunk_tokens: int) -> int:
-    """Temporary bytes a pass of `questions` starts from checkpoints.
-
-    Each question copies one layer's state and its convolution columns.
-    The pass also holds a 1 MiB intermediate buffer per question and
-    one per 64 tokens of the chunk.
-    """
-    buffers = questions + -(-chunk_tokens // INTERMEDIATE_BLOCK_TOKENS)
-    return (questions * (model.gdn_state_bytes + model.conv_state_bytes)
-            + buffers * MIB)
+    """Return the pages that hold `tokens` tokens."""
+    return _quail_native.pages(tokens, page_tokens)
 
 
 def execution_pages(chunk_tokens: int, page_tokens: int = PAGE_TOKENS) -> int:
-    """KV pages kept free for two chunks of execution."""
-    return 2 * pages(chunk_tokens, page_tokens)
+    """Return the KV pages kept free for two chunks of execution."""
+    return _quail_native.execution_pages(chunk_tokens, page_tokens)
 
 
-def checkpoint_memory_bytes(model: ModelSpec, chunk_tokens: int,
-                            page_tokens: int = PAGE_TOKENS) -> float:
-    """Return workspace, execution KV, and one retained document's KV and state.
-
-    Models without checkpoints, and models with set attention, which
-    keep none, reserve zero bytes. A retained document can
-    be as long as a chunk; startup reserves at least the default document
-    length used by the checkpoint pool.
-    """
-    if not model.checkpoint_bytes or not model.reuses_kv:
-        return 0
-    document_tokens = max(chunk_tokens, CHECKPOINT_DEFAULT_DOC_TOKENS)
-    reserved_pages = (execution_pages(chunk_tokens, page_tokens)
-                      + pages(document_tokens, page_tokens)
-                      + ceil(checkpoint_pages(model, page_tokens)))
-    return (checkpoint_pass_bytes(model, CHECKPOINT_PASS_QUESTIONS, chunk_tokens)
-            + reserved_pages * model.kappa * page_tokens)
+def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
+    """Return the tokens per forward pass."""
+    return budgets_of(model, device).chunk_budget()
 
 
-def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec,
-                      chunk_tokens: int) -> int:
-    """Pages a hybrid model shares between retained KV and checkpoints.
-
-    The arena after weights and two chunks of activations, less the
-    temporary copies of one pass of questions and two chunks of KV
-    kept free for execution.
-    """
-    free = (arena_bytes(model, device, chunk_tokens)
-            - checkpoint_pass_bytes(model, CHECKPOINT_PASS_QUESTIONS,
-                                  chunk_tokens))
-    page_bytes = model.kappa * device.page_tokens
-    return int(free // page_bytes) - execution_pages(chunk_tokens, device.page_tokens)
-
-
-def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                     kv_pages: int) -> int:
-    """Checkpoints the pool holds beside an arena of `kv_pages`; 0 without them.
-
-    One slot's room goes to the recurrent state's unused row 0, which
-    vLLM's decode kernel reads as no state.
-    """
-    pages = checkpoint_pages(model, device.page_tokens)
-    if not pages:
-        return 0
-    retained = kv_pages - execution_pages(chunk_tokens, device.page_tokens)
-    return max(0, int((hybrid_pool_pages(model, device, chunk_tokens)
-                       - retained) // pages) - 1)
-
-
-def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                       mean_document_tokens: float | None) -> int:
-    """Arena KV pages: two chunks of execution plus the retained KV.
-
-    A retained document of `l` tokens costs ceil(l / page_tokens) KV pages plus
-    its checkpoint, so the pool holds floor(pool / that) documents, and
-    the KV the checkpoints leave is retained KV.
-    """
-    mean = CHECKPOINT_DEFAULT_DOC_TOKENS if mean_document_tokens is None else max(
-        1.0, mean_document_tokens)
-    pool = hybrid_pool_pages(model, device, chunk_tokens)
-    ckpt = checkpoint_pages(model, device.page_tokens)
-    slots = int(pool // (pages(mean, device.page_tokens) + ckpt))
-    kv_pages = int(pool - slots * ckpt)
-    if kv_pages <= 0:
-        raise ValueError("the pool cannot hold one chunk's KV beside a checkpoint")
-    if slots < 1:
-        raise ValueError(
-            f"the pool holds no checkpoint of {ckpt:.1f} pages beside a "
-            f"document of {mean:.0f} tokens")
-    return kv_pages + execution_pages(chunk_tokens, device.page_tokens)
+def kernel_index_cap(model: ModelSpec) -> int:
+    """Return the most tokens one kernel call indexes."""
+    return budgets_of(model).kernel_index_cap()
 
 
 def arena_pages(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int | None = None,
                 mean_document_tokens: float | None = None) -> tuple[int, int]:
-    """Pages of the two KV pools: (every-token pool, sliding-layer pool).
+    """Return the pages of the two KV pools: (every-token, sliding-layer).
 
-    A model with set attention keeps no KV between chunks and gets one
-    page in each pool.
-
-    A model with Gated DeltaNet layers gets the KV pages left beside its
-    checkpoints (see hybrid_arena_pages) and 0 sliding pages.
-
-    A model without sliding layers gets one pool and 0 sliding pages.
-    With sliding layers, a document holds its whole prefix on the
-    full-attention layers and only the last window on the sliding
-    layers, so the sliding pool is sized to the fraction of a mean
-    document that the window keeps. It never drops below the pages one
-    chunk's fresh prefixes take before they are trimmed. An unknown
-    mean sizes it as if every document fit in the window, the largest
-    fraction.
+    Raises:
+        ValueError: The pool cannot hold a chunk's KV.
     """
-    if not model.reuses_kv:
-        # a set-attention model keeps no KV between chunks; the arena
-        # needs one page in each pool to exist
-        return 1, 1 if model.sliding_layer_set else 0
-    if chunk_tokens is None:
-        chunk_tokens = chunk_budget(model, device)
-    if model.state_layers:
-        return hybrid_arena_pages(model, device, chunk_tokens,
-                                  mean_document_tokens), 0
-    free = arena_bytes(model, device, chunk_tokens)
-    page_bytes_full = model.kappa_full * device.page_tokens
-    page_bytes_sliding = model.kappa_sliding * device.page_tokens
-    if not page_bytes_sliding:
-        return int(free // page_bytes_full), 0
-    window = model.sliding_window
-    mean = window if mean_document_tokens is None else max(1.0, mean_document_tokens)
-    ratio = min(1.0, (min(mean, window) + SPLIT_EXTRA_TOKENS)
-                / (mean + SPLIT_EXTRA_TOKENS))
-    full = int(free // (page_bytes_full + ratio * page_bytes_sliding))
-    sliding = int(full * ratio)
-    floor = transient_sliding_pages(chunk_tokens, window, device.page_tokens)
-    if sliding < floor:
-        sliding = floor
-        full = int((free - sliding * page_bytes_sliding) // page_bytes_full)
-    if full <= 0:
-        raise ValueError("the KV arena cannot hold one chunk's sliding KV")
-    return full, sliding
+    return budgets_of(model, device).arena_pages(chunk_tokens, mean_document_tokens)
 
 
 def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None,
                  mean_document_tokens: float | None = None) -> int:
-    """Admission budget: tokens of document KV that can be resident at once.
-
-    Computed from the memory left after resident weights and the
-    activation reservation. With sliding layers this is the
-    every-token pool; see arena_pages.
-    """
-    full, _ = arena_pages(model, device, chunk_tokens, mean_document_tokens)
-    return full * device.page_tokens
+    """Return the tokens of document KV that can be resident at once."""
+    return budgets_of(model, device).arena_tokens(chunk_tokens, mean_document_tokens)
 
 
-# ---- roofline arithmetic
+def arena_bytes(model: ModelSpec, device: DeviceSpec, chunk_tokens: int) -> float:
+    """Return the bytes left for KV after weights, activations, and graphs."""
+    return budgets_of(model, device).arena_bytes(chunk_tokens)
 
-def _projection_shapes(model: ModelSpec):
-    """Return (in_dim, out_dim, layers, precision) of each dense projection.
 
-    `layers` counts the layers that have the projection: the attention
-    projections sit in the layers that store KV, the Gated DeltaNet
-    projections in its layers, and the MLP in every layer.
-    """
-    query_width = 2 if model.attn_output_gate else 1
-    qkv_out = (query_width * model.num_q_heads + 2 * model.num_kv_heads) * model.d_head
-    inter = model.intermediate
-    attention = len(model.attention_layers)
-    shapes = [(model.hidden, qkv_out, attention, model.weight_precision),
-              (model.num_q_heads * model.d_head, model.hidden, attention,
-               model.weight_precision),
-              (model.hidden, model.ffn_width, model.layers, model.weight_precision),
-              (inter, model.hidden, model.layers, model.weight_precision)]
-    if model.gdn_layers:
-        key_width = model.gdn_key_heads * model.gdn_key_dim
-        value_width = model.gdn_value_heads * model.gdn_value_dim
-        gdn = len(model.gdn_layers)
-        precision = model.gdn_weight_precision or model.weight_precision
-        shapes += [(model.hidden,
-                    2 * key_width + 2 * value_width + 2 * model.gdn_value_heads,
-                    gdn, precision),
-                   (value_width, model.hidden, gdn, precision)]
-    if model.short_conv_layers:
-        short = len(model.short_conv_layers)
-        shapes += [(model.hidden, 3 * model.hidden, short, model.weight_precision),
-                   (model.hidden, model.hidden, short, model.weight_precision)]
-    return tuple(shapes)
+def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
+                       mean_document_tokens: float | None) -> int:
+    """Return a hybrid model's arena KV pages."""
+    return budgets_of(model, device).hybrid_arena_pages(
+        chunk_tokens, mean_document_tokens)
+
+
+def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int) -> int:
+    """Return the pages a hybrid model shares between KV and checkpoints."""
+    return budgets_of(model, device).hybrid_pool_pages(chunk_tokens)
+
+
+def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
+                     kv_pages: int) -> int:
+    """Return the checkpoints the pool holds beside an arena of `kv_pages`."""
+    return budgets_of(model, device).checkpoint_slots(chunk_tokens, kv_pages)
+
+
+def checkpoint_pages(model: ModelSpec, page_tokens: int = PAGE_TOKENS) -> float:
+    """Return the KV pages of memory one document checkpoint takes."""
+    return budgets_of(model).checkpoint_pages(page_tokens)
+
+
+def checkpoint_pass_bytes(model: ModelSpec, questions: int, chunk_tokens: int) -> int:
+    """Return the temporary bytes a pass of `questions` starts from checkpoints."""
+    return budgets_of(model).checkpoint_pass_bytes(questions, chunk_tokens)
+
+
+def checkpoint_memory_bytes(model: ModelSpec, chunk_tokens: int,
+                            page_tokens: int = PAGE_TOKENS) -> float:
+    """Return the workspace, execution KV, and one retained document's state."""
+    return budgets_of(model).checkpoint_memory_bytes(chunk_tokens, page_tokens)
+
+
+def chunk_memory_bytes(model: ModelSpec, chunk_tokens: int,
+                       page_tokens: int = PAGE_TOKENS) -> float:
+    """Return the resident weights, activations, and checkpoint reservations."""
+    return budgets_of(model).chunk_memory_bytes(chunk_tokens, page_tokens)
+
+
+def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
+    """Return the largest chunk that fits its memory reservations, or zero."""
+    return budgets_of(model, device).chunk_memory_bound()
+
+
+def copy_verification_workspace_bytes(model: ModelSpec, chunk_tokens: int) -> int:
+    """Return the readout workspace for copy verification."""
+    return budgets_of(model).copy_verification_workspace_bytes(chunk_tokens)
+
+
+def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
+    """Return the GPUs whose pooled memory holds the loaded weights."""
+    return budgets_of(model, device).minimum_weight_gpus()
+
+
+def sliding_kv_fits(model: ModelSpec, device: DeviceSpec,
+                    chunk_tokens: int | None = None) -> bool:
+    """Return whether the leftover arena holds one chunk's sliding KV."""
+    return budgets_of(model, device).sliding_kv_fits(chunk_tokens)
+
+
+def graph_token_buckets(model: ModelSpec, device: DeviceSpec) -> tuple[int, ...]:
+    """Return the pass sizes captured as CUDA graphs; empty without graphs."""
+    return tuple(budgets_of(model).graph_token_buckets())
+
+
+def graph_memory_bytes(model: ModelSpec, device: DeviceSpec) -> int:
+    """Return the memory the captured CUDA graphs hold."""
+    return budgets_of(model).graph_memory_bytes()
 
 
 def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
-    """Chunk size (tokens) where the dense projections become compute-bound.
+    """Return the tokens per pass where the projections become compute bound.
 
-    That is where they cross the roofline ridge.
+    Raises:
+        ValueError: The projections never cross the roofline ridge.
     """
-    compute_seconds = weight_bytes = activation_bytes = 0.0
-    for din, dout, layers, precision in _projection_shapes(model):
-        share = layers / model.layers
-        params = share * din * dout
-        compute_seconds += 2 * params / device.gemm_flops(precision)
-        weight_bytes += params * {"fp8": 1, "bf16": 2, "fp32": 4}[precision]
-        activation_bytes += share * (din + dout) * ACT_BYTES
-    denom = compute_seconds * device.hbm_bw - activation_bytes
-    if denom <= 0:
-        raise ValueError("projections never cross the ridge")
-    return weight_bytes / denom
-
-
-def _attention_time(model: ModelSpec, device: DeviceSpec,
-                    chunk: int, context: int) -> float:
-    """Ideal seconds for the attention kernels in one chunk, all layers."""
-    layers = len(model.attention_layers)
-    flops = 4.0 * chunk * context * model.num_q_heads * model.d_head
-    moved = (context * model.kappa / layers
-             + 2.0 * chunk * model.num_q_heads * model.d_head * ACT_BYTES)
-    return max(flops / device.arithmetic_bandwidth(model.attention_precision),
-               moved / device.hbm_bw) * layers
-
-
-# Below this many dense parameters a model runs unified attention only.
-# On Decision-2.0-Kai-0.6B (0.44e9) the tree path ran 4 to 7 percent
-# slower than unified on the QUAIL-B IMDB-2 and IMDB-8 joins, where the
-# roofline below picked tree.
-TREE_ATTENTION_MIN_PARAMS = 2e9
+    return budgets_of(model, device).compute_knee()
 
 
 def tree_attention_allowed(model: ModelSpec) -> bool:
-    """Whether the planner and the executor may run the model's tree path.
-
-    A diffusion model packs canvas rows, which the tree path does not.
-    A hybrid model's state layers have no tree path.
-    """
-    return (not model.canvas_tokens and not model.state_layers
-            and model.params >= TREE_ATTENTION_MIN_PARAMS)
+    """Return whether the model may use the tree attention path."""
+    return budgets_of(model).tree_attention_allowed()
 
 
 def cheaper_attention_path(model: ModelSpec, device: DeviceSpec, *,
                            readers: float, reader_rows: float,
                            node_tokens: float) -> str:
-    """Pick "unified" or "tree" attention for readers of one shared node.
-
-    The node is a join's anchor or a filter's parent document; its
-    readers are the partners or the children borrowing its pages.
-
-    Under unified attention every reader reads the node's KV itself.
-    Under tree attention the readers' rows are stacked into one read of
-    the node, then merged with each reader's attention over its own
-    rows. Both times take the larger of compute and memory, so tree
-    wins only for readers that are memory-bound on the node: few rows
-    each, many of them.
-
-    Args:
-        model: The model whose attention runs.
-        device: The device it runs on.
-        readers: Readers sharing the node in one forward pass.
-        reader_rows: Query rows per reader.
-        node_tokens: KV tokens of the shared node.
-    """
-    if readers <= 1 or reader_rows <= 0 or node_tokens <= 0:
-        return "unified"
-    unified = readers * _attention_time(model, device, reader_rows,
-                                        node_tokens)
-    rows = readers * reader_rows
-    tree = _attention_time(model, device, rows, node_tokens)
-    # the merge kernel reads two partial outputs and writes one, in
-    # bf16, once per layer
-    merge = 3 * rows * model.num_q_heads * model.d_head * ACT_BYTES / device.hbm_bw
-    tree += merge * len(model.attention_layers)
-    return "tree" if tree < unified else "unified"
-
-
-def parallel_copies(gpus: int, num_documents: float) -> float:
-    """Return the model copies that share work spread evenly over documents."""
-    return max(1.0, min(gpus, num_documents))
+    """Return "unified" or "tree" attention for readers of one shared node."""
+    return budgets_of(model, device).cheaper_attention_path(
+        readers, reader_rows, node_tokens)
