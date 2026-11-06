@@ -307,11 +307,6 @@ fn prompt_lowering<'py>(
     let get = |index: usize| arguments[index].to_string();
     match name {
         "lower_prompt" => lowering_result(lower::lower_prompt(&from_json(&get(0))?, &tokens)),
-        "score_token_parts" => lowering_result(lower::score_token_parts(
-            &from_json(&get(0))?,
-            &from_json(&get(1))?,
-            &tokens,
-        )),
         "answer_ids" => lowering_result(lower::answer_ids(&from_json(&get(0))?, &tokens)),
         "option_aliases" => lowering_result(lower::option_aliases(
             &from_json::<Vec<String>>(&get(0))?,
@@ -326,14 +321,6 @@ fn prompt_lowering<'py>(
             &from_json::<Vec<String>>(&get(1))?,
             &tokens,
         )),
-        "classify_prompt_tokens" => lowering_result(lower::classify_prompt_tokens(
-            &from_json(&get(0))?,
-            &from_json::<Vec<String>>(&get(1))?,
-            &tokens,
-        )),
-        "choice_token_parts" => {
-            lowering_result(lower::choice_token_parts(&from_json(&get(0))?, &tokens))
-        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "no prompt lowering function {other}"
         ))),
@@ -389,7 +376,6 @@ fn plan_operator<'py>(
     decode: Option<Bound<'py, PyAny>>,
     callbacks: Option<Bound<'py, PyAny>>,
 ) -> PyResult<(Option<String>, Option<String>)> {
-    use quail_planner::{classify, columns, costs, scores};
     let tokens = python_tokenizer(py, &tokenizer);
     let decoder = decode.as_ref().map(|decode| {
         move |ids: &[i64]| -> Result<String, quail_planner::CompileError> {
@@ -429,149 +415,6 @@ fn plan_operator<'py>(
     let arguments: serde_json::Value = from_json(arguments)?;
     let get = |key: &str| arguments[key].clone();
     match name {
-        "column_spec" => lowering_result(columns::column_spec(
-            &context,
-            &json_value(get("node"))?,
-            get("expected_rows").as_f64().unwrap_or_default(),
-            get("resident").as_bool().unwrap_or_default(),
-        )),
-        "score_spec" => lowering_result(
-            scores::score_spec(
-                &json_value(get("prompt"))?,
-                get("name").as_str().unwrap_or_default(),
-                get("expected_rows").as_f64().unwrap_or_default(),
-                get("mean_tokens").as_f64(),
-                &context,
-                get("chunk").as_i64().unwrap_or_default(),
-                get("pair_fraction").as_f64().unwrap_or(1.0),
-                get("prefix_groups").as_f64(),
-            )
-            .map(|(spec, work)| (spec, work_fields(&work))),
-        ),
-        "filter_costs" => {
-            let rows: Vec<f64> = json_value(get("rows"))?;
-            lowering_result(costs::prepare_filter_costs(
-                &json_value::<Vec<quail_physical::FilterPredicate>>(get("predicates"))?,
-                get("mean_tokens").as_f64().unwrap_or_default(),
-                get("chunk").as_i64().unwrap_or_default(),
-                &context,
-            ).map(|prepared| {
-                prepared
-                    .iter()
-                    .map(|cost| {
-                        serde_json::json!({
-                            "selectivity": cost.selectivity,
-                            "reuse_key": cost.reuse_key,
-                            "first": rows.iter().map(|count| cost.first.seconds(*count)).collect::<Vec<_>>(),
-                            "later": rows.iter().map(|count| cost.later.seconds(*count)).collect::<Vec<_>>(),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            }))
-        }
-        "join_specs" => {
-            let fractions: std::collections::BTreeMap<String, f64> =
-                json_value(get("pair_fractions"))?;
-            let fractions = fractions
-                .into_iter()
-                .map(|(key, fraction)| (key.parse().unwrap_or(usize::MAX), fraction))
-                .collect();
-            let counts: std::collections::BTreeMap<String, f64> = json_value(get("counts"))?;
-            lowering_result(costs::join_specs(
-                &json_value::<Vec<quail_planner::logical::SemanticJoin>>(get("joins"))?,
-                &fractions,
-                get("canvas").as_i64().unwrap_or_default(),
-                &context,
-                get("chunk").as_i64().unwrap_or_default(),
-            ).map(|specs| {
-                specs
-                    .iter()
-                    .map(|spec| {
-                        serde_json::json!({
-                            "written_position": spec.written_position,
-                            "aliases": spec.aliases,
-                            "anchor": spec.anchor,
-                            "anchor_free": spec.anchor_free,
-                            "semantics": spec.semantics,
-                            "selectivity": spec.selectivity,
-                            "frame_tokens": spec.frame_tokens,
-                            "label_tokens": spec.label_tokens,
-                            "tail_tokens": spec.tail_tokens,
-                            "on": spec.on,
-                            "pair_fraction": spec.pair_fraction,
-                            "work": spec.score.as_ref().map(|cost| work_fields(
-                                &scores::score_join_work(cost, &spec.aliases, spec.pair_fraction, &counts),
-                            )),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            }))
-        }
-        "classify_spec" | "classify_seconds" => {
-            let node: quail_planner::LogicalNode = json_value(get("node"))?;
-            let quail_planner::LogicalNode::SemanticClassify(column) = &node else {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "not a SemanticClassify",
-                ));
-            };
-            let call = quail_planner::nodes::column_call(column);
-            let alias = quail_planner::nodes::column_alias(column);
-            let rows = get("expected_rows").as_f64().unwrap_or_default();
-            if name == "classify_spec" {
-                lowering_result(classify::classify_spec(
-                    &context,
-                    call,
-                    &column.name,
-                    &alias,
-                    rows,
-                ))
-            } else {
-                lowering_result(classify::classify_seconds(
-                    &context,
-                    call,
-                    &column.name,
-                    &alias,
-                    get("resident").as_bool().unwrap_or_default(),
-                    rows,
-                ))
-            }
-        }
-        "choose_scoring" => {
-            let table: classify::ClassifyTable = json_value(get("table"))?;
-            let call: quail_physical::TaggedModelCall = json_value(get("call"))?;
-            let quail_physical::TaggedModelCall::Call(call) = &call;
-            lowering_result(table.choose_scoring(
-                &json_value(get("spec"))?,
-                call,
-                get("resident").as_bool().unwrap_or_default(),
-                &tokens,
-            ))
-        }
-        "classify_joined" => {
-            let table: classify::ClassifyTable = json_value(get("table"))?;
-            let call: quail_physical::TaggedModelCall = json_value(get("call"))?;
-            let quail_physical::TaggedModelCall::Call(call) = &call;
-            lowering_result(
-                table
-                    .classify_joined(
-                        call,
-                        get("name").as_str().unwrap_or_default(),
-                        get("partner").as_str().unwrap_or_default(),
-                        get("expected_rows").as_f64().unwrap_or_default(),
-                        get("partner_tokens").as_f64().unwrap_or_default(),
-                        get("anchors").as_f64(),
-                        &tokens,
-                    )
-                    .map(|(spec, work)| (spec, work_fields(&work))),
-            )
-        }
-        "operator_order" => {
-            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
-            lowering_result(
-                quail_planner::search::choose_operator_order(&plan, &context)
-                    .map(|found| operator_order_fields(&found)),
-            )
-        }
         "speed_of_light" => {
             let Some(callbacks) = callbacks else {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -660,54 +503,12 @@ fn plan_operator<'py>(
                 });
             lowering_result(edited)
         }
-        "request_plan" => {
-            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
-            let settings: quail_planner::request_plan::RequestSettings =
-                json_value(get("settings"))?;
-            lowering_result(quail_planner::request_plan::request_plan(
-                &plan, &context, &settings,
-            ))
-        }
-        "request_order" => {
-            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
-            lowering_result(quail_planner::request_order::request_order(&plan, &context))
-        }
         "relational_plan" => {
             let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
             let num_documents = get("num_documents").as_i64().unwrap_or_default();
             lowering_result(Ok::<_, quail_planner::CompileError>(
                 quail_planner::graph::relational_plan(&plan, num_documents, &context),
             ))
-        }
-        "refine_plan" => {
-            let envelope: quail_physical::PlanEnvelope = json_value(get("envelope"))?;
-            let rules: Vec<String> = json_value(get("rules"))?;
-            let plan = quail_planner::graph::PhysicalPlan {
-                model: envelope.model,
-                device: envelope.device,
-                gpus: envelope.gpus,
-                backend: envelope.backend,
-                estimated_seconds: get("estimated_seconds").as_f64().unwrap_or_default(),
-                nodes: envelope.graph.nodes,
-                settings: envelope.settings,
-                root: envelope.graph.root,
-                estimates: json_value(get("estimates"))?,
-                pricer: read_pricer(&get("pricer"))?,
-            };
-            let pricer = pricer_fields(&plan.pricer);
-            lowering_result(
-                quail_planner::physical_rules::apply_plan_rules(plan, &rules, &context).map(
-                    |found| match found {
-                        Ok(plan) => serde_json::json!({
-                            "envelope": plan.envelope(),
-                            "estimated_seconds": plan.estimated_seconds,
-                            "estimates": plan.estimates,
-                            "pricer": pricer,
-                        }),
-                        Err(refusal) => refusal_fields(&refusal),
-                    },
-                ),
-            )
         }
         "search_plan" => {
             let alternatives: Vec<(quail_planner::LogicalPlan, Vec<String>)> =
@@ -732,19 +533,6 @@ fn plan_operator<'py>(
                 ),
             )
         }
-        "plan_region" => {
-            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
-            lowering_result(
-                quail_planner::graph::plan_region(&plan, &context).map(|found| match found {
-                    Ok(physical) => serde_json::json!({
-                        "envelope": physical.envelope(),
-                        "estimated_seconds": physical.estimated_seconds,
-                        "estimates": physical.estimates,
-                    }),
-                    Err(refusal) => refusal_fields(&refusal),
-                }),
-            )
-        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "no operator planning function {other}"
         ))),
@@ -759,63 +547,6 @@ fn json_value<T: serde::de::DeserializeOwned>(found: serde_json::Value) -> PyRes
 /// A refusal, as the test helpers compare it.
 fn refusal_fields(refusal: &quail_planner::search::Refusal) -> serde_json::Value {
     serde_json::json!({"refusal": quail::planning::refusal_json(refusal)})
-}
-
-/// An operator order, or its refusal, as the test helpers compare it.
-fn operator_order_fields(
-    found: &Result<quail_planner::search::OperatorOrder, quail_planner::search::Refusal>,
-) -> serde_json::Value {
-    use quail_planner::search::StepKey;
-    let order = match found {
-        Err(refusal) => return refusal_fields(refusal),
-        Ok(order) => order,
-    };
-    let statistics = &order.statistics;
-    let key = |key: &StepKey| match key {
-        StepKey::Position(position) => serde_json::json!(position),
-        StepKey::Name(name) => serde_json::json!(name),
-    };
-    serde_json::json!({
-        "statistics": {
-            "stats": statistics.stats.iter().map(|(alias, stats)| (alias.clone(), serde_json::json!([
-                stats.num_documents, stats.total_tokens, stats.max_document_tokens]))).collect::<serde_json::Map<_, _>>(),
-            "lengths": statistics.lengths.iter().map(|(alias, found)| (alias.clone(), serde_json::json!([
-                found.count, found.total, found.squared.to_string(), found.maximum, found.window, found.short_counts]))).collect::<serde_json::Map<_, _>>(),
-            "chunk": statistics.chunk, "arena_pages": [statistics.arena_pages.0, statistics.arena_pages.1],
-            "admission": statistics.admission, "cap_pages": statistics.cap_pages, "pre": statistics.pre,
-            "asks": statistics.asks.iter().map(|(alias, positions)| (alias.clone(), serde_json::json!(positions))).collect::<serde_json::Map<_, _>>(),
-            "specs": statistics.specs.iter().map(|spec| spec.written_position).collect::<Vec<_>>(),
-        },
-        "filter_orders": order.filter_orders.iter().map(|(alias, positions)| (alias.clone(), serde_json::json!(positions))).collect::<serde_json::Map<_, _>>(),
-        "step_orders": order.step_orders.iter().map(|(alias, steps)| (alias.clone(), serde_json::json!(steps.iter().map(|step| serde_json::json!({
-            "kind": step.kind, "key": key(&step.key), "selectivity": step.selectivity,
-            "reuse_key": step.reuse_key.is_some(), "document_head": step.document_head,
-        })).collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
-        "join_sequence": order.join_sequence.iter().map(|(spec, anchor)| serde_json::json!([spec.written_position, anchor])).collect::<Vec<_>>(),
-        "join_steps": order.join_steps.iter().map(|step| serde_json::json!({
-            "written_position": step.written_position, "anchor": step.anchor, "resident": step.resident,
-            "resident_documents": step.resident_documents, "anchor_documents": step.anchor_documents,
-            "tuples": step.tuples, "tokens": step.tokens, "work": work_fields(&step.work),
-        })).collect::<Vec<_>>(),
-        "expected_rows": order.expected_rows,
-        "filter_work": order.filter_work.iter().map(|(alias, work)| (alias.clone(), serde_json::json!(work_fields(work)))).collect::<serde_json::Map<_, _>>(),
-        "order_rule": order.order_rule, "order_source": order.order_source,
-    })
-}
-
-/// A Work record's fields, as a dict of floats.
-fn work_fields(work: &quail_cost::work::Work) -> std::collections::BTreeMap<&'static str, f64> {
-    std::collections::BTreeMap::from([
-        ("tokens", work.tokens.total()),
-        ("pairs", work.pairs.total()),
-        ("kv_written", work.kv_written.total()),
-        ("kv_read", work.kv_read.total()),
-        ("sliding_pairs", work.sliding_pairs.total()),
-        ("sliding_kv_read", work.sliding_kv_read.total()),
-        ("state_written", work.state_written.total()),
-        ("state_read", work.state_read.total()),
-        ("sae_encoded", work.sae_encoded.total()),
-    ])
 }
 
 /// Tokenize the texts of `table`'s first column into a token store at

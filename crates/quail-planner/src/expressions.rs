@@ -267,10 +267,6 @@ fn value_key(value: &Value) -> String {
     }
 }
 
-fn is_number(value: &Value) -> bool {
-    matches!(value, Value::Number(_) | Value::Bool(_))
-}
-
 // ---------------------------------------------------------------- columns
 
 /// The source columns a value expression reads, in first use order.
@@ -911,11 +907,6 @@ pub fn validate_condition(condition: &Condition) -> Result<(), CompileError> {
         validate_condition(operand)?;
     }
     Ok(())
-}
-
-/// Whether a literal is a number, as Python's `isinstance(value, (int, float))`.
-pub fn is_numeric(value: &Value) -> bool {
-    is_number(value)
 }
 
 #[cfg(test)]

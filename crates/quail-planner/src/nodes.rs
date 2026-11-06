@@ -10,7 +10,7 @@ use quail_physical::{
 use crate::expressions::{
     CompileError, PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_name, column_references,
     compile_error, condition_aliases, condition_references, condition_text, projected_call,
-    projected_name, reference_name, repr_list, repr_str, sort_name, tests, validate_call,
+    projected_name, reference_name, repr_list, repr_str, sort_name, validate_call,
     validate_condition, validate_expression, validate_tree,
 };
 use crate::logical::{
@@ -940,15 +940,4 @@ pub fn validate_plan(plan: &LogicalPlan) -> Result<(), CompileError> {
         validate_node(node)?;
     }
     Ok(())
-}
-
-/// The conditions's tests that read a model call.
-pub fn tested_calls(condition: &Condition) -> Vec<&ModelCall> {
-    tests(condition)
-        .into_iter()
-        .filter_map(|test| match &test.expression {
-            ValueExpression::ModelCall(call) => Some(call),
-            _ => None,
-        })
-        .collect()
 }

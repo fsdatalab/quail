@@ -617,18 +617,6 @@ fn estimate_pair_fraction(left: &[ArrayRef], right: &[ArrayRef]) -> Result<f64, 
     Ok(pairs.max(1.0) / (num_left as f64 * num_right as f64))
 }
 
-/// Whether the region scans a document that is not a column or a struct
-/// field, which this planner does not tokenize.
-pub fn has_document_expression(logical: &LogicalPlan) -> bool {
-    quail_planner::operators::operators(logical)
-        .scans
-        .iter()
-        .any(|scan| match &scan.column {
-            ScanColumn::Unnamed(_) => false,
-            ScanColumn::Expression(expression) => !is_column(expression),
-        })
-}
-
 /// The table column a document reads, or a struct column it reads a
 /// field of.
 fn source_column(column: &ScanColumn) -> Option<String> {

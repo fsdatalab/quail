@@ -33,15 +33,6 @@ impl ComponentLatency {
         let memory = self.memory_seconds.scalar().expect("scalar memory time");
         if memory > compute { memory } else { compute }
     }
-
-    /// Which limit sets the component's time.
-    pub fn bound_by(&self) -> &'static str {
-        if self.compute_seconds.scalar() >= self.memory_seconds.scalar() {
-            "compute"
-        } else {
-            "memory"
-        }
-    }
 }
 
 /// Price one component against the device's limits.

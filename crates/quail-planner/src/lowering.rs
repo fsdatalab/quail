@@ -532,11 +532,3 @@ pub fn choice_token_parts(
     }
     Ok((lowered.tail_token_ids.clone(), frame, blocks))
 }
-
-/// The complete canonical token ids for one filter document.
-pub fn render_filter_prompt_ids(lowered: &LoweredPrompt, document: &[i64]) -> Vec<i64> {
-    let mut ids = lowered.preamble_token_ids.clone();
-    ids.extend_from_slice(document);
-    ids.extend_from_slice(&lowered.tail_token_ids);
-    ids
-}
