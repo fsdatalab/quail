@@ -41,9 +41,10 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import Scan, encode_graph
-from quail.physical.codec import encode_value
+from quail.physical.codec import decode_value, encode_value
 from quail.physical.plan import Refusal, RefusalError, refusal_from_fields
 from quail.planner import native, plan_query, refine_plan
+from quail.planner.candidates import LogicalAlternative
 from quail.planner.context import PlanningContext
 
 # the start of Rust's message for a document that is an expression
@@ -264,12 +265,10 @@ class Query:
     def _plans_in_rust(self) -> bool:
         """Whether Rust plans this region.
 
-        Rust plans the Quail backend's regions whose documents are
-        columns or struct fields.
+        Rust plans the regions whose documents are columns or struct
+        fields; for a backend other than Quail's, it prepares them and the
+        backend lowers them.
         """
-        if self.session.config.backend != "quail":
-            return False
-
         def column(expression) -> bool:
             if isinstance(expression, ColumnRef):
                 return True
@@ -308,15 +307,59 @@ class Query:
             "physical_rules": [rule.name for rule in
                                self.session.registry.physical_rules.values()],
         }
-        found, message = self.session.planner.plan(
-            json.dumps(encode_value(self._logical_input)), tables,
-            json.dumps(settings))
+        planner = self.session.planner
+        call = planner.plan if config.backend == "quail" else planner.prepare
+        found, message = call(json.dumps(encode_value(self._logical_input)), tables,
+                              json.dumps(settings))
         if message is not None:
             if message.startswith(DOCUMENT_EXPRESSION):
                 # Python tokenizes a document that is an expression
                 return None
             raise CompileError(message)
-        return self.adopt_plan(json.loads(found))
+        if config.backend == "quail":
+            return self.adopt_plan(json.loads(found))
+        return self._lower_prepared(json.loads(found))
+
+    def _lower_prepared(self, found: dict):
+        """Lower a region Rust prepared with the session's backend.
+
+        Args:
+            found: What ``NativePlanner.prepare`` returns, read from JSON.
+
+        Returns:
+            The physical plan, or a Refusal.
+        """
+        self._adopt_scans(found)
+        config = self.session.config
+        alternatives = tuple(
+            LogicalAlternative(decode_value(LogicalPlan, json.loads(text)),
+                               tuple(rules))
+            for text, rules in found["alternatives"])
+        pair_fractions = {int(position): fraction for position, fraction
+                          in found["fields"]["pair_fractions"].items()}
+        plan = plan_query(
+            self._logical_input, model=self.session.model,
+            device=self.session.device, document_tokens=self._document_tokens,
+            gpus=config.gpus, order=self.order, canvas_draws=config.canvas_draws,
+            attention=config.attention, backend=config.backend,
+            registry=self.session.registry, tokenizer=self.session.tokenizer,
+            pair_fractions=pair_fractions, catalog=self.catalog,
+            engine_config=config, logical_candidates=alternatives)
+        if not isinstance(plan, Refusal):
+            self.logical = plan.logical_plan
+            if config.gpu_timing:
+                plan = replace(plan, settings={**plan.settings, "gpu_timing": True})
+        self._plan = self._searched_plan = plan
+        return plan
+
+    def _adopt_scans(self, found: dict) -> None:
+        """Read the token store and column files Rust wrote as the inputs."""
+        self._token_inputs, self._document_tokens = {}, {}
+        for alias, files in found["scans"].items():
+            store = TokenStore(files["tokens"])
+            self._token_inputs[alias] = ScanInput(store, {
+                name: ColumnStore(path) for name, path in files["columns"]})
+            self._document_tokens[alias] = store.lengths
 
     def adopt_plan(self, found: dict):
         """Take the plan Rust made, and read its scans' files as the inputs.
@@ -328,12 +371,7 @@ class Query:
         Returns:
             The physical plan, or the Refusal.
         """
-        self._token_inputs, self._document_tokens = {}, {}
-        for alias, files in found["scans"].items():
-            store = TokenStore(files["tokens"])
-            self._token_inputs[alias] = ScanInput(store, {
-                name: ColumnStore(path) for name, path in files["columns"]})
-            self._document_tokens[alias] = store.lengths
+        self._adopt_scans(found)
         if "refusal" in found:
             refusal = refusal_from_fields(found["refusal"])
             self._plan = self._searched_plan = refusal

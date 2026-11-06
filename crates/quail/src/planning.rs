@@ -84,6 +84,26 @@ pub struct Planned {
     pub scans: Vec<ScanFiles>,
 }
 
+/// A region's column placements, its scans' files, and the planning
+/// context's fields, before a backend lowers it.
+pub struct Prepared {
+    pub alternatives: Vec<quail_planner::rules::LogicalAlternative>,
+    /// The planning context's fields, as Python's planner reads them.
+    pub fields: serde_json::Value,
+    pub scans: Vec<ScanFiles>,
+    measured: Measured,
+}
+
+/// What the Quail backend's search reads of a region's scans.
+struct Measured {
+    document_tokens: BTreeMap<String, Vec<i64>>,
+    first_documents: BTreeMap<String, Vec<bool>>,
+    page_shared: BTreeMap<String, Vec<i64>>,
+    reader_groups: BTreeMap<String, Vec<(i64, i64, i64)>>,
+    ends: BTreeMap<String, Vec<i64>>,
+    pair_fractions: BTreeMap<usize, f64>,
+}
+
 /// A region every alternative of which was refused, with the files of
 /// its scans, which the speed-of-light estimate still reads.
 #[derive(Debug)]
@@ -143,21 +163,20 @@ impl Planner {
         self.directory.path().join(format!("{kind}-{number}.arrow"))
     }
 
-    /// Plan `logical` over `tables`, each scanned table's rows by
-    /// provider name, for `settings`.
-    ///
-    /// Returns the plan, or the refusal of every alternative.
+    /// Place the column operators of `logical`, write each scan's token
+    /// store and column files from `tables`, and measure them: what every
+    /// backend plans from.
     ///
     /// # Errors
     ///
-    /// A scanned table is missing, a document column is not text, or
-    /// planning fails.
-    pub fn plan(
+    /// A scanned table is missing, a document is an expression or not
+    /// text, or a placement is not valid.
+    pub fn prepare(
         &self,
         logical: LogicalPlan,
         tables: &HashMap<String, TableRows>,
         settings: &Settings,
-    ) -> Result<Result<Planned, Refused>, CompileError> {
+    ) -> Result<Prepared, CompileError> {
         let alternatives = quail_planner::rules::column_placements(logical.clone())?;
         let scans = scans_of(alternatives.iter().map(|alternative| &alternative.plan));
         if scans.iter().any(|scan| match &scan.column {
@@ -226,19 +245,6 @@ impl Planner {
             );
         }
         let pair_fractions = pair_fractions(&logical, &scans, tables)?;
-        let encode = |text: &str| -> Result<Vec<i64>, CompileError> {
-            Ok(self
-                .tokenizer
-                .encode(text)
-                .map_err(arrow_error)?
-                .into_iter()
-                .map(i64::from)
-                .collect())
-        };
-        let decode = |ids: &[i64]| -> Result<String, CompileError> {
-            let ids: Vec<u32> = ids.iter().map(|id| *id as u32).collect();
-            self.tokenizer.decode(&ids).map_err(arrow_error)
-        };
         let fields = serde_json::json!({
             "model": settings.model,
             "device": settings.device,
@@ -259,6 +265,63 @@ impl Planner {
             "reader_groups": reader_groups,
             "last_tokens": ends,
         });
+        Ok(Prepared {
+            alternatives,
+            fields,
+            scans: files,
+            measured: Measured {
+                document_tokens,
+                first_documents,
+                page_shared,
+                reader_groups,
+                ends,
+                pair_fractions,
+            },
+        })
+    }
+
+    /// Plan `logical` over `tables`, each scanned table's rows by
+    /// provider name, for `settings`.
+    ///
+    /// Returns the plan, or the refusal of every alternative.
+    ///
+    /// # Errors
+    ///
+    /// A scanned table is missing, a document column is not text, or
+    /// planning fails.
+    pub fn plan(
+        &self,
+        logical: LogicalPlan,
+        tables: &HashMap<String, TableRows>,
+        settings: &Settings,
+    ) -> Result<Result<Planned, Refused>, CompileError> {
+        let Prepared {
+            alternatives,
+            fields,
+            scans: files,
+            measured,
+        } = self.prepare(logical, tables, settings)?;
+        let Measured {
+            document_tokens,
+            first_documents,
+            page_shared,
+            reader_groups,
+            ends,
+            pair_fractions,
+        } = measured;
+        let encode = |text: &str| -> Result<Vec<i64>, CompileError> {
+            Ok(self
+                .tokenizer
+                .encode(text)
+                .map_err(arrow_error)?
+                .into_iter()
+                .map(i64::from)
+                .collect())
+        };
+        let decode = |ids: &[i64]| -> Result<String, CompileError> {
+            let ids: Vec<u32> = ids.iter().map(|id| *id as u32).collect();
+            self.tokenizer.decode(&ids).map_err(arrow_error)
+        };
         let context = PlanningContext {
             model: serde_json::from_value(settings.model.clone()).map_err(arrow_error)?,
             device: serde_json::from_value(settings.device.clone()).map_err(arrow_error)?,
@@ -609,6 +672,30 @@ fn scans_json(scans: &[ScanFiles]) -> serde_json::Value {
         })
         .collect::<serde_json::Map<String, serde_json::Value>>()
         .into()
+}
+
+/// A prepared region as JSON: each column placement's logical plan and
+/// rules, the context fields, and each scan's files.
+///
+/// # Errors
+///
+/// A logical plan does not write.
+pub fn prepared_json(prepared: &Prepared) -> Result<serde_json::Value, CompileError> {
+    let alternatives = prepared
+        .alternatives
+        .iter()
+        .map(|alternative| {
+            Ok(serde_json::json!([
+                quail_planner::write_logical_plan(&alternative.plan).map_err(arrow_error)?,
+                alternative.rules,
+            ]))
+        })
+        .collect::<Result<Vec<_>, CompileError>>()?;
+    Ok(serde_json::json!({
+        "alternatives": alternatives,
+        "fields": prepared.fields,
+        "scans": scans_json(&prepared.scans),
+    }))
 }
 
 /// A refusal's fields as JSON.

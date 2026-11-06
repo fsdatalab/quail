@@ -942,6 +942,40 @@ impl NativeTokenizer {
     }
 }
 
+/// A region's logical plan, its tables' rows, and the settings, read
+/// from what Python passes the planner.
+fn planning_inputs(
+    logical: &str,
+    tables: &Bound<'_, pyo3::types::PyDict>,
+    settings: &str,
+) -> PyResult<(
+    quail_planner::LogicalPlan,
+    std::collections::HashMap<String, quail::planning::TableRows>,
+    quail::planning::Settings,
+)> {
+    let logical = quail_planner::read_logical_plan(logical)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    let settings: quail::planning::Settings = from_json(settings)?;
+    let mut rows = std::collections::HashMap::new();
+    for (name, entry) in tables.iter() {
+        let (identity, table): (Option<String>, Bound<'_, PyAny>) = entry.extract()?;
+        let reader = quail::pyarrow::stream_from_pyarrow(&table)?;
+        let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
+        let batches = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| python_error(error.into()))?;
+        rows.insert(
+            name.extract::<String>()?,
+            quail::planning::TableRows {
+                identity,
+                schema,
+                batches,
+            },
+        );
+    }
+    Ok((logical, rows, settings))
+}
+
 /// Plans model regions in Rust for one session, with the session's
 /// tokenizer, keeping the token stores of tables read whole.
 #[pyclass(name = "NativePlanner", module = "_quail_native")]
@@ -962,6 +996,29 @@ impl NativePlanner {
         })
     }
 
+    /// Prepare a region for a backend other than Quail's: its column
+    /// placements, its scans' files, and the planning context's fields,
+    /// over `tables` as `plan` reads them.
+    ///
+    /// Returns (the prepared region as JSON, None) or (None, a
+    /// CompileError's message).
+    fn prepare(
+        &self,
+        py: Python<'_>,
+        logical: &str,
+        tables: &Bound<'_, pyo3::types::PyDict>,
+        settings: &str,
+    ) -> PyResult<(Option<String>, Option<String>)> {
+        let (logical, rows, settings) = planning_inputs(logical, tables, settings)?;
+        let prepared = match py.detach(|| self.planner.prepare(logical, &rows, &settings)) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok((None, Some(error.0))),
+        };
+        let found = quail::planning::prepared_json(&prepared)
+            .map_err(|error| PyRuntimeError::new_err(error.0))?;
+        Ok((Some(found.to_string()), None))
+    }
+
     /// Plan a region's logical plan, as JSON, over `tables`: by provider
     /// name, (content identity or None, the rows as a pyarrow Table).
     /// `settings` is the configuration as JSON.
@@ -977,26 +1034,7 @@ impl NativePlanner {
         tables: &Bound<'_, pyo3::types::PyDict>,
         settings: &str,
     ) -> PyResult<(Option<String>, Option<String>)> {
-        let logical = quail_planner::read_logical_plan(logical)
-            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-        let settings: quail::planning::Settings = from_json(settings)?;
-        let mut rows = std::collections::HashMap::new();
-        for (name, entry) in tables.iter() {
-            let (identity, table): (Option<String>, Bound<'_, PyAny>) = entry.extract()?;
-            let reader = quail::pyarrow::stream_from_pyarrow(&table)?;
-            let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
-            let batches = reader
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| python_error(error.into()))?;
-            rows.insert(
-                name.extract::<String>()?,
-                quail::planning::TableRows {
-                    identity,
-                    schema,
-                    batches,
-                },
-            );
-        }
+        let (logical, rows, settings) = planning_inputs(logical, tables, settings)?;
         let found = py.detach(|| self.planner.plan(logical, &rows, &settings));
         let planned = match found {
             Ok(Ok(planned)) => planned,
