@@ -66,7 +66,7 @@ def _device():
 
 
 def _prompt_ids():
-    from quail.common.tokens import NativeEncoder
+    from quail.common.tokens import Tokenizer
     from quail.logical import bind_prompt
     from quail.physical.lowering import (
         lower_prompt,
@@ -76,7 +76,7 @@ def _prompt_ids():
     from quail.specs.files import resolve_model_path
 
     spec = MODELS[MODEL]
-    ids = NativeEncoder(resolve_model_path(spec.hf_name, spec.revision))
+    ids = Tokenizer(resolve_model_path(spec.hf_name, spec.revision))
 
     prompt = lower_prompt(bind_prompt(QUESTION, ("body",), turn=spec.turn), ids)
     return [render_filter_prompt_ids(prompt, ids(review))
@@ -211,7 +211,7 @@ def quail(prompts, stock_layers):
 
 def test_answers_agree_with_stock_vllm(stock_layers, quail):
     from quail.common.prompts import true_false_token_ids
-    from quail.common.tokens import NativeEncoder
+    from quail.common.tokens import Tokenizer
     from quail.specs import MODELS
     from quail.specs.files import resolve_model_path
 
@@ -220,7 +220,7 @@ def test_answers_agree_with_stock_vllm(stock_layers, quail):
     rows = [rows[-1] for rows in quail_layers]
     spec = MODELS[MODEL]
     true_ids, false_ids = true_false_token_ids(
-        NativeEncoder(resolve_model_path(spec.hf_name, spec.revision)))
+        Tokenizer(resolve_model_path(spec.hf_name, spec.revision)))
     columns = list(model.quail_answer_token_ids)
     weights = model.quail_answer_weights.float().cpu()
     norm = model.model.norm

@@ -854,27 +854,97 @@ fn prefix_statistics<'py>(
 }
 
 /// A model's tokenizer, read from its `tokenizer.json`: the one the
-/// planner writes token stores with, for the GPU worker's extractions
-/// and answers.
-#[pyclass(name = "NativeTokenizer", module = "_quail_native", frozen)]
-struct NativeTokenizer {
+/// planner writes token stores with and the GPU worker decodes with.
+#[pyclass(name = "Tokenizer", module = "_quail_native", frozen)]
+struct Tokenizer {
     inner: quail_inputs::HfTokenizer,
+    /// The ids that end an answer: the model's turn close and its end of
+    /// text, which no document holds.
+    #[pyo3(get)]
+    stop_ids: Vec<u32>,
+}
+
+/// Token ids and each token's character range.
+type TokensAndRanges = (Vec<u32>, Vec<(i64, i64)>);
+
+/// Several texts' token ids and character ranges, flat, then each text's
+/// first token, with one past the last.
+type Packed = (Vec<u32>, Vec<(i64, i64)>, Vec<i64>);
+
+fn arrow_error(error: datafusion::arrow::error::ArrowError) -> PyErr {
+    python_error(error.into())
 }
 
 #[pymethods]
-impl NativeTokenizer {
-    /// The tokenizer in the `tokenizer.json` at `tokenizer_file`.
+impl Tokenizer {
+    /// The tokenizer at `path`, a model directory or its
+    /// `tokenizer.json`; `turn_suffix` is the model's chat-turn text after
+    /// a prompt, whose first token closes a turn.
     #[new]
-    fn new(tokenizer_file: &str) -> PyResult<Self> {
-        let inner = quail_inputs::HfTokenizer::from_file(std::path::Path::new(tokenizer_file))
-            .map_err(|error| python_error(error.into()))?;
-        Ok(Self { inner })
+    #[pyo3(signature = (path, turn_suffix=""))]
+    fn new(path: std::path::PathBuf, turn_suffix: &str) -> PyResult<Self> {
+        let inner = quail_inputs::HfTokenizer::from_file(&path).map_err(arrow_error)?;
+        let mut stop_ids: Vec<u32> = inner.eos_token_id().into_iter().collect();
+        if !turn_suffix.is_empty()
+            && let Some(&close) = inner.encode(turn_suffix).map_err(arrow_error)?.first()
+        {
+            stop_ids.push(close);
+        }
+        stop_ids.sort_unstable();
+        stop_ids.dedup();
+        Ok(Self { inner, stop_ids })
+    }
+
+    /// The token ids of a text, without special tokens.
+    fn __call__(&self, text: &str) -> PyResult<Vec<u32>> {
+        self.inner.encode(text).map_err(arrow_error)
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// The end-of-text token the model's config names, or None.
+    #[getter]
+    fn eos_token_id(&self) -> Option<u32> {
+        self.inner.eos_token_id()
+    }
+
+    /// A text's token ids and each token's character range.
+    fn encode(&self, text: &str) -> PyResult<TokensAndRanges> {
+        let found = self
+            .inner
+            .encode_with_offsets(&[text])
+            .map_err(arrow_error)?;
+        Ok((found.ids, found.offsets))
+    }
+
+    /// Each text's token ids and character ranges, encoded together.
+    fn encode_batch(&self, texts: Vec<String>) -> PyResult<Vec<TokensAndRanges>> {
+        let (ids, offsets, boundaries) = self.encode_packed(texts)?;
+        Ok(boundaries
+            .windows(2)
+            .map(|range| {
+                let (start, end) = (range[0] as usize, range[1] as usize);
+                (ids[start..end].to_vec(), offsets[start..end].to_vec())
+            })
+            .collect())
+    }
+
+    /// Every text's token ids and character ranges, encoded together.
+    fn encode_packed(&self, texts: Vec<String>) -> PyResult<Packed> {
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let found = self
+            .inner
+            .encode_with_offsets(&texts)
+            .map_err(arrow_error)?;
+        Ok((found.ids, found.offsets, found.boundaries))
     }
 
     /// The tokens of each text in `table`'s first column, as a pyarrow
     /// Table of one large list of int32 column, `tokens`.
-    fn encode<'py>(&self, table: &Bound<'py, PyAny>) -> PyResult<Py<PyAny>> {
-        use quail_inputs::Tokenizer;
+    fn encode_arrow(&self, table: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
         let py = table.py();
         let batches = quail::pyarrow::from_pyarrow(table)?;
         let lists = py
@@ -882,25 +952,22 @@ impl NativeTokenizer {
                 batches
                     .iter()
                     .map(|batch| {
-                        let texts = batch.column(0).as_string::<i32>();
-                        let tokens: datafusion::arrow::array::ArrayRef =
-                            std::sync::Arc::new(self.inner.encode_batch(texts)?);
+                        let tokens: datafusion::arrow::array::ArrayRef = std::sync::Arc::new(
+                            self.inner
+                                .encode_batch(batch.column(0).as_string::<i32>())?,
+                        );
                         Ok(tokens)
                     })
                     .collect::<Result<Vec<_>, datafusion::arrow::error::ArrowError>>()
             })
-            .map_err(|error| python_error(error.into()))?;
-        let field = datafusion::arrow::datatypes::Field::new(
+            .map_err(arrow_error)?;
+        let item = Field::new_list_field(DataType::Int32, true);
+        let field = Field::new(
             "tokens",
-            datafusion::arrow::datatypes::DataType::LargeList(std::sync::Arc::new(
-                datafusion::arrow::datatypes::Field::new_list_field(
-                    datafusion::arrow::datatypes::DataType::Int32,
-                    true,
-                ),
-            )),
+            DataType::LargeList(std::sync::Arc::new(item)),
             true,
         );
-        let schema = std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![field]));
+        let schema = std::sync::Arc::new(Schema::new(vec![field]));
         let batches = lists
             .into_iter()
             .map(|tokens| {
@@ -910,7 +977,7 @@ impl NativeTokenizer {
                 )
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| python_error(error.into()))?;
+            .map_err(arrow_error)?;
         Ok(quail::pyarrow::to_pyarrow(py, schema, batches)?.unbind())
     }
 
@@ -919,8 +986,12 @@ impl NativeTokenizer {
     fn token_bytes<'py>(&self, py: Python<'py>) -> Vec<Option<Bound<'py, pyo3::types::PyBytes>>> {
         self.inner
             .token_bytes()
-            .into_iter()
-            .map(|found| found.map(|bytes| pyo3::types::PyBytes::new(py, &bytes)))
+            .iter()
+            .map(|found| {
+                found
+                    .as_deref()
+                    .map(|bytes| pyo3::types::PyBytes::new(py, bytes))
+            })
             .collect()
     }
 
@@ -929,11 +1000,14 @@ impl NativeTokenizer {
         self.inner.token_texts()
     }
 
+    /// The bytes of token ids' texts, joined.
+    fn decode<'py>(&self, py: Python<'py>, ids: Vec<u32>) -> Bound<'py, pyo3::types::PyBytes> {
+        pyo3::types::PyBytes::new(py, &self.inner.decode_bytes(&ids))
+    }
+
     /// The text of each token id list, without special tokens.
     fn decode_batch(&self, lists: Vec<Vec<u32>>) -> PyResult<Vec<String>> {
-        self.inner
-            .decode_batch(&lists)
-            .map_err(|error| python_error(error.into()))
+        self.inner.decode_batch(&lists).map_err(arrow_error)
     }
 
     /// The id of an added token, such as `<|im_end|>`, or None.
@@ -1055,7 +1129,7 @@ impl NativePlanner {
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSession>()?;
-    module.add_class::<NativeTokenizer>()?;
+    module.add_class::<Tokenizer>()?;
     module.add_class::<NativePlanner>()?;
     module.add_class::<cost::CostModel>()?;
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;

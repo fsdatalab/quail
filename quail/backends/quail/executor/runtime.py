@@ -45,7 +45,7 @@ class QuailModelExecution:
             arena: Its KV arena.
             pipeline: Its forward pass pipeline.
             decision_head: A decision model's option-scoring head.
-            tokenizer: The model's ModelTokenizer, for a model that runs
+            tokenizer: The model's Tokenizer, for a model that runs
                 AI.MAP and AI.EXTRACT; the word index is built from it here.
         """
         from quail.backends.quail.executor.extract import Vocabulary

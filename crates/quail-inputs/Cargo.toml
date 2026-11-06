@@ -7,6 +7,7 @@ description = "Quail's tokenized document columns: token stores, length estimate
 publish = false
 
 [dependencies]
+serde_json = "1"
 arrow = { version = "59.3.2", default-features = false, features = ["ipc"] }
 # the 1.0 release candidate tokenizes about 30 times faster than 0.22
 # with the same ids; pinned until 1.0 is released

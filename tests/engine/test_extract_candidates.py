@@ -19,9 +19,9 @@ def test_first_tokens_follow_the_models_spelling():
     text = RANKED
     ids, offsets = tables.tokenizer.encode(text)
     scan = DocumentTokens.from_tokens(tables, ids, offsets, 1)
-    the = tables.tokenizer.encode_ids("The")[0]
-    march = tables.tokenizer.encode_ids("March")[0]
-    space_march = tables.tokenizer.encode_ids(" March")[0]
+    the = tables.tokenizer("The")[0]
+    march = tables.tokenizer("March")[0]
+    space_march = tables.tokenizer(" March")[0]
     lp = {the: -0.5, march: -1.0, space_march: -3.0}
     starts = first_tokens(tables, _scores(tables, lp), scan)
     by_char = {scan.starts[i - 1]: value for i, value in starts.items(tables)}
@@ -38,7 +38,7 @@ def test_first_tokens_follow_the_models_spelling():
     # a stream holds its first token until the writing reaches it
     assert streams[1].stream == [the]
     streams[1].extend(tables)
-    assert streams[1].stream[:3] == tables.tokenizer.encode_ids("The rent is")
+    assert streams[1].stream[:3] == tables.tokenizer("The rent is")
     # a start's offset includes its token's leading space
     assert text[streams[1].char:streams[1].ends[2]] == " The rent is"
     (march_stream,) = make_streams(tables, text, starts, march)
@@ -54,7 +54,7 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(
     tables = make_vocabulary(*texts)
     streams = []
     expected = []
-    word = tables.tokenizer.encode_ids("word")[0]
+    word = tables.tokenizer("word")[0]
     for text in texts:
         ids, offsets = tables.tokenizer.encode(text)
         scan = DocumentTokens.from_tokens(tables, ids, offsets)

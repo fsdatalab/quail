@@ -16,7 +16,7 @@ use arrow::error::ArrowError;
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::HfTokenizer;
 
 /// The column of each document's tokens.
 pub const TOKEN_COLUMN: &str = "__quail_token_ids";
@@ -88,7 +88,7 @@ impl TokenStoreWriter {
     /// The tokenizer or the write fails.
     pub fn write_texts(
         &mut self,
-        tokenizer: &dyn Tokenizer,
+        tokenizer: &HfTokenizer,
         texts: &StringArray,
     ) -> Result<(), ArrowError> {
         self.write(tokenizer.encode_batch(texts)?)

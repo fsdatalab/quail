@@ -39,9 +39,9 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
         first_window_chars=1,
         window_chars=8,
     )
-    extra_stop = vocabulary.tokenizer.encode_ids("none")[0]
+    extra_stop = vocabulary.tokenizer("none")[0]
     vocabulary.tokenizer.stop_ids = (*vocabulary.tokenizer.stop_ids, extra_stop)
-    vocabulary.tokenizer.is_stop[extra_stop] = True
+    vocabulary.is_stop[extra_stop] = True
     state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
     documents = ExtractionInputs(
         state, [spec] * num_questions, vocabulary, [0], None, [text]
@@ -49,9 +49,9 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
     size = len(vocabulary.vocab)
     head = torch.eye(size, dtype=dtype)
     logits = torch.full((num_questions, 20, size), -10.0, dtype=dtype)
-    first = vocabulary.tokenizer.encode_ids("five")[0]
-    alternate = vocabulary.tokenizer.encode_ids(" five")[0]
-    continuations = [vocabulary.tokenizer.encode_ids(word)[0]
+    first = vocabulary.tokenizer("five")[0]
+    alternate = vocabulary.tokenizer(" five")[0]
+    continuations = [vocabulary.tokenizer(word)[0]
                      for word in (" years", " days")]
     logits[:, 0, [first, alternate]] = 2
     for q in range(num_questions):
@@ -140,7 +140,7 @@ def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
         return values
 
     first, years, longer = [
-        vocabulary.tokenizer.encode_ids(word)[0] for word in ("five", " years", " long")
+        vocabulary.tokenizer(word)[0] for word in ("five", " years", " long")
     ]
     decoder.start(0, 0, 0, [0, 1])
     decoder.submit(logits(first), [0], [0], None)

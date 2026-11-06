@@ -199,7 +199,7 @@ class Decoder:
         top, lp_top = ids[index, top_col], lps[index, top_col]
         stop = values[:, 0]
         leaves = ((lp_top > np.maximum(lp_draft, stop)) & (top != draft)
-                  & ~vocabulary.tokenizer.is_stop[top])
+                  & ~vocabulary.is_stop[top])
         writes = (lp_draft > stop) & ~leaves
         return int(np.argmin(writes)) if not writes.all() else n
 
@@ -298,7 +298,7 @@ class Decoder:
         vocabulary = self.vocabulary
         top = self.top
         return (lp[top] > max(best_lp, stop_lp) and not top_allowed
-                and not vocabulary.tokenizer.is_stop[top])
+                and not vocabulary.is_stop[top])
 
     def settle(self, document: Document, q: int) -> None:
         """Set the question's answer for the document: its span, or none.

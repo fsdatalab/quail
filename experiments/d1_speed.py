@@ -124,13 +124,13 @@ def _quail_state():
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows
     from quail.common import budgets
-    from quail.common.tokens import NativeEncoder
+    from quail.common.tokens import Tokenizer
     from quail.physical.lowering import answer_ids
     from quail.specs import D1_2B_BF16, H100_SXM
     from quail.specs.files import resolve_model_path
 
     spec, device = D1_2B_BF16, H100_SXM
-    encoder = NativeEncoder(resolve_model_path(spec.hf_name, spec.revision))
+    encoder = Tokenizer(resolve_model_path(spec.hf_name, spec.revision))
     true_ids, false_ids = answer_ids(spec, encoder)
     model = load_model(spec.hf_name, revision=spec.revision,
                        answer_token_ids=list(true_ids) + list(false_ids))

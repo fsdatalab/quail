@@ -2,10 +2,7 @@
 
 import re
 
-import numpy as np
-
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.backends.quail.executor.tokenizer import ModelTokenizer
 from quail.physical import ExtractSpec
 
 NEG = float("-inf")
@@ -23,7 +20,7 @@ NONE_HELD = "None of the parties may assign this Agreement."
 class FakeTokenizer:
     """Words, numbers, and punctuation as tokens, spaced like a byte-level BPE.
 
-    It has NativeEncoder's methods. A token after a space is spelled with
+    It has Tokenizer's methods. A token after a space is spelled with
     "Ġ" and a line break "Ċ", as a byte-level BPE spells them.
     """
 
@@ -39,7 +36,7 @@ class FakeTokenizer:
                     self.tokens.append(piece)
         self.ids = {token: index for index, token in enumerate(self.tokens)}
         self.eos_token_id = self.ids["<|im_end|>"]
-        self.unk_token_id = None
+        self.stop_ids = [self.eos_token_id]
 
     def __len__(self):
         return len(self.tokens)
@@ -57,8 +54,26 @@ class FakeTokenizer:
     def __call__(self, text):
         return [self.ids[piece] for piece, _ in self._pieces(text)]
 
+    def _encode(self, text):
+        found = list(self._pieces(text))
+        return [self.ids[piece] for piece, _ in found], [span for _, span in found]
+
+    def encode(self, text):
+        return self._encode(text)
+
+    def encode_batch(self, texts):
+        return [self._encode(text) for text in texts]
+
+    def encode_packed(self, texts):
+        encoded = self.encode_batch(texts)
+        boundaries = [0]
+        for ids, _ in encoded:
+            boundaries.append(boundaries[-1] + len(ids))
+        return ([t for ids, _ in encoded for t in ids],
+                [span for _, spans in encoded for span in spans], boundaries)
+
     def token_bytes(self):
-        return {index: token.encode() for index, token in enumerate(self.tokens)}
+        return [token.encode() for token in self.tokens]
 
     def token_texts(self):
         return [self.spelled(index) for index in range(len(self.tokens))]
@@ -66,12 +81,6 @@ class FakeTokenizer:
     def decode_batch(self, tokens):
         return ["".join(self.tokens[int(t)] for t in ids if int(t) != self.eos_token_id)
                 for ids in tokens]
-
-    def batch_numpy(self, texts):
-        lists = [self(text) for text in texts.to_pylist()]
-        boundaries = np.r_[0, np.cumsum([len(ids) for ids in lists])].astype(np.int64)
-        ids = np.array([t for ids in lists for t in ids], dtype=np.int64)
-        return ids, boundaries
 
     def spelled(self, index):
         token = self.tokens[index]
@@ -92,7 +101,7 @@ def make_vocabulary(*extra):
                                *(squeezed(text)[0] for text in (LEASE, TERM,
                                                                 NOTHING)),
                                *extra])
-    return Vocabulary(ModelTokenizer(tokenizer, eos_token_id=tokenizer.eos_token_id))
+    return Vocabulary(tokenizer)
 
 
 def make_spec(*extra):
@@ -100,8 +109,8 @@ def make_spec(*extra):
     return ExtractSpec(
         name="ends", aliases=("c",), query_template="{0}",
         arguments=(("c", "text"),), expected_rows=3, estimated_seconds=0.0,
-        prompt_token_parts=(tuple(tables.tokenizer.encode_ids(HEAD)),
-                            tuple(tables.tokenizer.encode_ids(TAIL))),
+        prompt_token_parts=(tuple(tables.tokenizer(HEAD)),
+                            tuple(tables.tokenizer(TAIL))),
         question=QUESTION, draft_tokens=16, draft_policy="fixed"), tables
 
 

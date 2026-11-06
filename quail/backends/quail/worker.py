@@ -24,7 +24,6 @@ from quail.backends.quail.executor.readout import (
     DecisionHead,
 )
 from quail.backends.quail.executor.state import GpuRuntime
-from quail.backends.quail.executor.tokenizer import ModelTokenizer
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
     execute_single_graph,
@@ -125,7 +124,7 @@ class LoadedGpu:
         tokenizer = None
         if spec.role not in ("reranker", "decision"):
             say(f"loading the tokenizer of {spec.name} for AI.MAP and AI.EXTRACT")
-            tokenizer = ModelTokenizer.load(spec, model_path)
+            tokenizer = model_tokenizer(spec, model_path)
         self.execution = backend.start(context)
         self.execution.bind_loaded_model(
             model=self.model, arena=self.arena, pipeline=self.pipeline,
@@ -216,12 +215,29 @@ def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages) -> dict:
     }
 
 
+def model_tokenizer(spec, model_path: str = ""):
+    """Load a model's tokenizer, with the ids that end its answers.
+
+    Args:
+        spec: The model spec.
+        model_path: A local checkpoint that replaces the spec's Hugging
+            Face repository at its pinned revision.
+    """
+    from quail.common.tokens import Tokenizer
+    from quail.specs.files import resolve_model_path
+
+    path = resolve_model_path(model_path or spec.hf_name,
+                              None if model_path else spec.revision,
+                              include_weights=False)
+    return Tokenizer(path, spec.turn_suffix)
+
+
 def decision_offsets(spec, path) -> tuple[int, ...]:
     """The rows a decision readout reads, as distances before the last row."""
     from quail.common.prompts import answer_row_offsets
-    from quail.common.tokens import NativeEncoder
+    from quail.common.tokens import Tokenizer
 
-    offsets = answer_row_offsets(spec.prompt_layout, NativeEncoder(path),
+    offsets = answer_row_offsets(spec.prompt_layout, Tokenizer(path),
                                  spec.turn_suffix)
     if len(offsets) != 3:
         raise ValueError(

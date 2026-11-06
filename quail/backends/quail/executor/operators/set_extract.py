@@ -57,7 +57,7 @@ def token_span(text: str, tokens, vocabulary, first: int, last: int):
     Returns:
         (text, (start, end)), or (None, None) when only spaces are left.
     """
-    sizes = [len(vocabulary.get(int(token), b"")) for token in tokens[:last + 1]]
+    sizes = [len(vocabulary[int(token)] or b"") for token in tokens[:last + 1]]
     data = text.encode("utf-8")
     begin, end = sum(sizes[:first]), sum(sizes)
     start = len(data[:begin].decode("utf-8", "ignore"))
@@ -92,7 +92,7 @@ def read_texts(spans, keep, documents, texts, head, vocabulary):
         documents: Per read, its prompt head and document tokens.
         texts: Per read, its document text.
         head: The prompt head's tokens.
-        vocabulary: Token id -> its bytes.
+        vocabulary: Each token id's bytes.
     """
     answers, characters = [None] * len(spans), [None] * len(spans)
     for index in np.flatnonzero(keep):

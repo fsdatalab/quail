@@ -1,31 +1,30 @@
-//! Tokenizers: text to token lists, as Arrow arrays.
+//! The model's tokenizer: text to token ids and back, with each token's
+//! bytes and character range.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int32Builder, LargeListArray, LargeListBuilder, StringArray};
 use arrow::error::ArrowError;
 
-/// Turns document texts into token lists.
-///
-/// A model's tokenizer returns integer token ids. A test tokenizer may
-/// return words, which the token store keeps as strings.
-pub trait Tokenizer: Send + Sync {
-    /// The tokens of each text, as a large list array of int32 ids or of
-    /// strings; a null text has no tokens.
-    ///
-    /// # Errors
-    ///
-    /// The tokenizer fails on a text.
-    fn encode_batch(&self, texts: &StringArray) -> Result<LargeListArray, ArrowError>;
-
-    /// The tokenizer's name, for the notes a query reports.
-    fn name(&self) -> &str;
-}
-
-/// A Hugging Face tokenizer read from a model's `tokenizer.json`.
+/// A model's Hugging Face tokenizer, read from its `tokenizer.json`.
 pub struct HfTokenizer {
     inner: tokenizers::pipeline::PipelineTokenizer,
     options: tokenizers::pipeline::EncodeOptions,
+    /// Each token id's bytes, None for an id the vocabulary does not hold.
+    token_bytes: Vec<Option<Vec<u8>>>,
+    /// The end-of-text token the model's `tokenizer_config.json` names.
+    eos_token_id: Option<u32>,
+}
+
+/// Token ids of several texts, flat, with each token's character range
+/// in its text and each text's first token.
+#[derive(Debug, Default, PartialEq)]
+pub struct Encoded {
+    pub ids: Vec<u32>,
+    pub offsets: Vec<(i64, i64)>,
+    /// `boundaries[i]..boundaries[i + 1]` are text `i`'s tokens.
+    pub boundaries: Vec<i64>,
 }
 
 fn external(error: impl std::fmt::Display) -> ArrowError {
@@ -33,19 +32,47 @@ fn external(error: impl std::fmt::Display) -> ArrowError {
 }
 
 impl HfTokenizer {
-    /// Read the tokenizer in `path`, a `tokenizer.json` file.
+    /// Read the tokenizer at `path`: a model directory holding
+    /// `tokenizer.json`, or the file itself.
     ///
     /// # Errors
     ///
     /// The file does not read as a tokenizer.
-    pub fn from_file(path: &std::path::Path) -> Result<Self, ArrowError> {
-        let text = std::fs::read_to_string(path)?;
+    pub fn from_file(path: &Path) -> Result<Self, ArrowError> {
+        let (file, directory) = if path.is_dir() {
+            (path.join("tokenizer.json"), Some(path))
+        } else {
+            (path.to_path_buf(), path.parent())
+        };
+        let text = std::fs::read_to_string(&file)?;
         // a model's file is in the 0.x format, which 1.0 reads once converted
         let converted = tokenizers::canonicalize_str(&text).map_err(external)?;
-        Ok(Self {
+        let mut tokenizer = Self {
             inner: tokenizers::from_json(&converted).map_err(external)?,
             options: tokenizers::pipeline::EncodeOptions::no_specials(),
-        })
+            token_bytes: Vec::new(),
+            eos_token_id: None,
+        };
+        tokenizer.token_bytes = tokenizer.read_token_bytes();
+        tokenizer.eos_token_id = directory
+            .and_then(eos_token)
+            .and_then(|token| tokenizer.added_token_id(&token));
+        Ok(tokenizer)
+    }
+
+    /// The number of token ids.
+    pub fn len(&self) -> usize {
+        self.token_bytes.len()
+    }
+
+    /// Whether the vocabulary is empty.
+    pub fn is_empty(&self) -> bool {
+        self.token_bytes.is_empty()
+    }
+
+    /// The end-of-text token the model's config names, or None.
+    pub fn eos_token_id(&self) -> Option<u32> {
+        self.eos_token_id
     }
 
     /// The token ids of one text, without special tokens.
@@ -65,6 +92,91 @@ impl HfTokenizer {
             .unwrap_or_default())
     }
 
+    /// The tokens of each text, as a large list array of int32 ids; a
+    /// null text has no tokens.
+    ///
+    /// # Errors
+    ///
+    /// The tokenizer fails on a text.
+    pub fn encode_batch(&self, texts: &StringArray) -> Result<LargeListArray, ArrowError> {
+        let inputs: Vec<&str> = texts.iter().map(|text| text.unwrap_or("")).collect();
+        let encodings = self
+            .inner
+            .encode(inputs, &self.options)
+            .wait()
+            .map_err(external)?;
+        let total = encodings.iter().map(|found| found.len()).sum();
+        let mut builder =
+            LargeListBuilder::with_capacity(Int32Builder::with_capacity(total), encodings.len());
+        for encoding in &encodings {
+            for &id in tokenizers::pipeline::PipelineToken::cast_slice(encoding.ids()) {
+                builder.values().append_value(id as i32);
+            }
+            builder.append(true);
+        }
+        Ok(builder.finish())
+    }
+
+    /// The tokens of each text with each token's character range: a token
+    /// starts at the character holding its first byte and ends after the
+    /// character holding its last.
+    ///
+    /// # Errors
+    ///
+    /// The tokenizer fails on a text, or a text's tokens' bytes do not
+    /// spell it, so no range could be read.
+    pub fn encode_with_offsets(&self, texts: &[&str]) -> Result<Encoded, ArrowError> {
+        let encodings = self
+            .inner
+            .encode(texts.to_vec(), &self.options)
+            .wait()
+            .map_err(external)?;
+        let mut found = Encoded {
+            boundaries: vec![0],
+            ..Encoded::default()
+        };
+        for (text, encoding) in texts.iter().zip(&encodings) {
+            let bytes = text.as_bytes();
+            // the characters that start before each byte position
+            let mut starts_before = Vec::with_capacity(bytes.len() + 1);
+            let mut count = 0i64;
+            starts_before.push(0);
+            for &byte in bytes {
+                count += i64::from(byte & 0xC0 != 0x80);
+                starts_before.push(count);
+            }
+            let mut at = 0usize;
+            for &id in tokenizers::pipeline::PipelineToken::cast_slice(encoding.ids()) {
+                let piece = self
+                    .token_bytes
+                    .get(id as usize)
+                    .and_then(Option::as_deref)
+                    .unwrap_or_default();
+                let end = at + piece.len();
+                if bytes.get(at..end) != Some(piece) {
+                    return Err(external(
+                        "AI.EXTRACT requires token bytes that preserve the source text",
+                    ));
+                }
+                let first = if piece.is_empty() {
+                    starts_before[at]
+                } else {
+                    starts_before[at + 1] - 1
+                };
+                found.ids.push(id);
+                found.offsets.push((first, starts_before[end]));
+                at = end;
+            }
+            if at != bytes.len() {
+                return Err(external(
+                    "AI.EXTRACT requires token bytes that preserve the source text",
+                ));
+            }
+            found.boundaries.push(found.ids.len() as i64);
+        }
+        Ok(found)
+    }
+
     /// The id of an added token, such as `<|im_end|>`, or None.
     pub fn added_token_id(&self, token: &str) -> Option<u32> {
         self.inner.get_added_vocabulary().token_to_id(token)
@@ -74,8 +186,7 @@ impl HfTokenizer {
     /// `Ġthe` in byte-level BPE, empty for an id the vocabulary does not
     /// hold.
     pub fn token_texts(&self) -> Vec<String> {
-        let size = self.token_bytes().len();
-        (0..size as u32)
+        (0..self.len() as u32)
             .map(|id| {
                 self.inner
                     .decode_tokens(&[id], false)
@@ -83,6 +194,34 @@ impl HfTokenizer {
                     .unwrap_or_default()
             })
             .collect()
+    }
+
+    /// The bytes of each token id's text, None for an id the vocabulary
+    /// does not hold.
+    pub fn token_bytes(&self) -> &[Option<Vec<u8>>] {
+        &self.token_bytes
+    }
+
+    /// The bytes of token ids' texts, joined.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        ids.iter()
+            .filter_map(|id| {
+                self.token_bytes
+                    .get(*id as usize)
+                    .and_then(Option::as_deref)
+            })
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// The text of token ids.
+    ///
+    /// # Errors
+    ///
+    /// An id is outside the vocabulary.
+    pub fn decode(&self, ids: &[u32]) -> Result<String, ArrowError> {
+        self.inner.decode(ids, false).map_err(external)
     }
 
     /// The text of each token id list, without special tokens.
@@ -97,11 +236,10 @@ impl HfTokenizer {
             .collect()
     }
 
-    /// The bytes of each token id's text, None for an id the vocabulary
-    /// does not hold. An added token is its text; a model token has the
-    /// pre-tokenizer's spelling undone: byte-level BPE's characters for
-    /// bytes, or SentencePiece's `▁` for a space and `<0xHH>` for a byte.
-    pub fn token_bytes(&self) -> Vec<Option<Vec<u8>>> {
+    /// An added token is its text; a model token has the pre-tokenizer's
+    /// spelling undone: byte-level BPE's characters for bytes, or
+    /// SentencePiece's `▁` for a space and `<0xHH>` for a byte.
+    fn read_token_bytes(&self) -> Vec<Option<Vec<u8>>> {
         // ids past this many consecutive misses are past the vocabulary
         const MISSES: u32 = 4096;
         let added = self.inner.get_added_vocabulary();
@@ -147,39 +285,16 @@ impl HfTokenizer {
             })
             .collect()
     }
-
-    /// The text of token ids.
-    ///
-    /// # Errors
-    ///
-    /// An id is outside the vocabulary.
-    pub fn decode(&self, ids: &[u32]) -> Result<String, ArrowError> {
-        self.inner.decode(ids, false).map_err(external)
-    }
 }
 
-impl Tokenizer for HfTokenizer {
-    fn encode_batch(&self, texts: &StringArray) -> Result<LargeListArray, ArrowError> {
-        let inputs: Vec<&str> = texts.iter().map(|text| text.unwrap_or("")).collect();
-        let encodings = self
-            .inner
-            .encode(inputs, &self.options)
-            .wait()
-            .map_err(external)?;
-        let total = encodings.iter().map(|found| found.len()).sum();
-        let mut builder =
-            LargeListBuilder::with_capacity(Int32Builder::with_capacity(total), encodings.len());
-        for encoding in &encodings {
-            for &id in tokenizers::pipeline::PipelineToken::cast_slice(encoding.ids()) {
-                builder.values().append_value(id as i32);
-            }
-            builder.append(true);
-        }
-        Ok(builder.finish())
-    }
-
-    fn name(&self) -> &str {
-        "Hugging Face tokenizers"
+/// The end-of-text token's text the `tokenizer_config.json` in a model's
+/// directory names.
+fn eos_token(directory: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(directory.join("tokenizer_config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+    match config.get("eos_token")? {
+        serde_json::Value::String(token) => Some(token.clone()),
+        other => other.get("content")?.as_str().map(str::to_string),
     }
 }
 
@@ -254,5 +369,43 @@ mod byte_tests {
     fn sentencepiece_spaces_and_byte_tokens_map_to_bytes() {
         assert_eq!(sentencepiece_bytes("\u{2581}the"), b" the");
         assert_eq!(sentencepiece_bytes("<0x0A>"), b"\n");
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::HfTokenizer;
+
+    fn fixture() -> HfTokenizer {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tokenizer");
+        HfTokenizer::from_file(&path).expect("the fixture tokenizer")
+    }
+
+    #[test]
+    fn each_token_covers_the_characters_its_bytes_spell() {
+        let tokenizer = fixture();
+        let texts = ["a café", "", "yes no"];
+        let found = tokenizer.encode_with_offsets(&texts).expect("encoded");
+        assert_eq!(found.boundaries.len(), texts.len() + 1);
+        for (index, text) in texts.iter().enumerate() {
+            let range = found.boundaries[index] as usize..found.boundaries[index + 1] as usize;
+            let ids = &found.ids[range.clone()];
+            assert_eq!(tokenizer.decode_bytes(ids), text.as_bytes());
+            let chars: Vec<char> = text.chars().collect();
+            let mut covered = String::new();
+            let mut end = 0;
+            for &(start, stop) in &found.offsets[range] {
+                assert!(start >= 0 && start <= stop && stop as usize <= chars.len());
+                if start >= end {
+                    covered.extend(&chars[start as usize..stop as usize]);
+                }
+                end = end.max(stop);
+            }
+            assert_eq!(covered, *text);
+        }
+        // the two tokens of é's two bytes both cover é
+        let cafe = &found.offsets[found.boundaries[0] as usize..found.boundaries[1] as usize];
+        assert_eq!(cafe.last(), Some(&(5, 6)));
     }
 }

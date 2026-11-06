@@ -17,8 +17,8 @@ if TYPE_CHECKING:
         AsyncLabelLogprobs,
         AsyncScores,
     )
-    from quail.backends.quail.executor.tokenizer import ModelTokenizer
     from quail.common.decode import DecodeCost
+    from quail.common.tokens import Tokenizer
     from quail.specs.base import ModelSpec
 
 
@@ -36,7 +36,7 @@ class LoadedModelState:
     decision_head: Any = None
     # the tokenizer AI.MAP and AI.EXTRACT read, and the word index of
     # AI.EXTRACT; None for a model that runs neither
-    tokenizer: ModelTokenizer | None = None
+    tokenizer: Tokenizer | None = None
     vocabulary: Vocabulary | None = None
     # the SAE encoder AI.SAE_FEATURES reads, loaded on first use
     sae: Any = None

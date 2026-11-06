@@ -71,10 +71,10 @@ def test_documents_with_equal_tokens_but_other_values_have_their_own_first(tmp_p
 
 
 def test_a_model_tokenizer_in_rust_gives_gigatokens_ids_and_bytes(tmp_path):
-    from gigatoken import Tokenizer
+    from gigatoken import Tokenizer as Gigatoken
 
     from quail.builtins import built_in_registry
-    from quail.common.tokens import NativeEncoder
+    from quail.common.tokens import Tokenizer
     from quail.specs.files import resolve_model_path
 
     model = built_in_registry().model("qwen3-4b-fp8")
@@ -89,11 +89,11 @@ def test_a_model_tokenizer_in_rust_gives_gigatokens_ids_and_bytes(tmp_path):
                              str(Path(directory) / "tokenizer.json"))
     store = TokenStore(str(path))
     try:
-        reference = Tokenizer(directory)
+        reference = Gigatoken(directory)
         found = [list(np.asarray(store[index])) for index in range(len(store))]
         assert found == [list(reference.encode(text)) for text in texts]
     finally:
         store.close()
-    encoder = NativeEncoder(directory)
-    assert encoder.token_bytes() == dict(reference.vocab)
-    assert [encoder.decode(ids).decode() for ids in found] == texts
+    tokenizer = Tokenizer(directory)
+    assert dict(enumerate(tokenizer.token_bytes())) == dict(reference.vocab)
+    assert [tokenizer.decode(ids).decode() for ids in found] == texts

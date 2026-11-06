@@ -53,7 +53,7 @@ def copy_batch(num_fields, num_documents=4, document_tokens=24, draft_tokens=2,
     for slot in range(slots.size, num_slots):
         decoder.start(slot, num_fields, 0, [0, 1, 2])
     hidden = torch.full((num_slots, size), -10.0)
-    hidden[:, vocabulary.tokenizer.encode_ids("five")[0]] = 1
+    hidden[:, vocabulary.tokenizer("five")[0]] = 1
     decoder.submit(hidden, np.arange(num_slots), np.arange(num_slots), None)
     decoder.harvest(wait=True, prepare=prepare)
     return decoder, vocabulary
@@ -66,7 +66,7 @@ def continuation(decoder, vocabulary):
                             input_ids=torch.empty(len(rows), dtype=torch.int64))
     decoder.feed(chunk)
     hidden = torch.full((len(rows), len(vocabulary.vocab)), -10.0)
-    hidden[:, vocabulary.tokenizer.encode_ids(" years")[0]] = 1
+    hidden[:, vocabulary.tokenizer(" years")[0]] = 1
     decoder.submit(hidden, [], [], rows)
     decoder.harvest(wait=True)
     return len(rows)
@@ -78,7 +78,7 @@ def test_maps_keep_argmax_tie_order_in_a_shared_projection():
     decoder.feed(SimpleNamespace(
         decode_rows=rows, tokens=len(rows), meta={},
         input_ids=torch.empty(len(rows), dtype=torch.int64)))
-    tokens = [vocabulary.tokenizer.encode_ids(word)[0] for word in ("five", " years")]
+    tokens = [vocabulary.tokenizer(word)[0] for word in ("five", " years")]
     hidden = torch.full((len(rows), len(vocabulary.vocab)), -10.0)
     hidden[:, tokens] = 1
     with Dispatches() as dispatches:
@@ -152,11 +152,11 @@ def verifier_inputs(decoder, vocabulary, mixed=False):
         valid = indices <= 40 + documents % 9
         documents, indices = documents[valid], indices[valid]
     hidden = torch.full((len(documents), len(vocabulary.vocab)), -10.0)
-    hidden[:, vocabulary.tokenizer.encode_ids(" years")[0]] = 1
+    hidden[:, vocabulary.tokenizer(" years")[0]] = 1
     if mixed:
         rejects = ((documents % 4 == 0) & (indices == 20)
                    | (documents % 4 == 1) & (indices == 40))
-        hidden[rejects, vocabulary.tokenizer.encode_ids(" days")[0]] = 2
+        hidden[rejects, vocabulary.tokenizer(" days")[0]] = 2
         stops = (documents % 4 == 2) & (indices == 1 + documents % 43)
         hidden[stops, vocabulary.tokenizer.stop_ids[0]] = 2
     group = decoder.copy_groups[0]

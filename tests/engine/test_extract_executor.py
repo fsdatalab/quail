@@ -78,9 +78,8 @@ def packed_scripted_inputs(monkeypatch):
 def test_continuation_arrays_handle_duplicates_ties_and_stops(
         scores, stop, chosen, done):
     tokens = [33, 1, 1]
-    vocabulary = SimpleNamespace(
-        vocab=range(64), tokenizer=SimpleNamespace(is_stop=np.zeros(64, dtype=bool)))
-    vocabulary.tokenizer.is_stop[62] = True
+    vocabulary = SimpleNamespace(vocab=range(64), is_stop=np.zeros(64, dtype=bool))
+    vocabulary.is_stop[62] = True
     decoder = Decoder(vocabulary, 4, 9, 1, make_spec()[0])
     text = "abcdefghij"
     streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
@@ -102,13 +101,13 @@ def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
     # answer is not in the document, and neither extraction answers
     state, model, run, _ = _setup(monkeypatch)
     tables = model.tables
-    stray = tables.tokenizer.encode_ids(" five")[0]
+    stray = tables.tokenizer(" five")[0]
     cue_row = model._cue_row
 
     def straying(key):
         if key[1] != 0:
             return cue_row(key)
-        march = tables.tokenizer.encode_ids("March")[0]
+        march = tables.tokenizer("March")[0]
         return model._cue({stray: -0.05, march: -0.5}, -6.0)
 
     model._cue_row = straying
@@ -126,9 +125,9 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
     text = "five days or five years"
     asked, model = _extract_spec(monkeypatch, text, "five years", recurrent=recurrent)
     assert asked.answer == "five years" and asked.span == (13, 23)
-    assert asked.written == model.tables.tokenizer.encode_ids(" five years")
+    assert asked.written == model.tables.tokenizer(" five years")
     assert asked.steps >= 2
-    assert any(model.tables.tokenizer.encode_ids(" days")[0] in suffix
+    assert any(model.tables.tokenizer(" days")[0] in suffix
                for _, suffix, _, _, _ in model.packed)
 
 
@@ -151,7 +150,7 @@ class ScriptedModel:
         self.filter_truth = {}      # key -> a filter question's answer
         self.reads = Counter()      # key -> times its prefix was packed
         self.width = 1 + 2 * k
-        self.cue_token = tables.tokenizer.encode_ids(TAIL)[-1]
+        self.cue_token = tables.tokenizer(TAIL)[-1]
         self.kv = {}                # key -> tokens appended after the prefix
         self.prefix_len = {}        # key -> the prefix's tokens
         self.packed = []
@@ -172,13 +171,13 @@ class ScriptedModel:
     def _cue(self, lps, stop_lp):
         """A row: the stop, then the top tokens."""
         for token, value in lps.items():
-            if self.tables.tokenizer.is_stop[token]:
+            if self.tables.is_stop[token]:
                 stop_lp = np.logaddexp(stop_lp, value)
         return self._top(lps, [stop_lp])
 
     def _gold_ids(self, key):
         gold = self.gold[key]
-        return self.tables.tokenizer.encode_ids(gold) if gold else []
+        return self.tables.tokenizer(gold) if gold else []
 
     def forward_chunk(self, chunk):
         specs = list(chunk.specs)
@@ -318,7 +317,7 @@ def _extract_spec(monkeypatch, text, gold, spec=None, vocabulary=None, recurrent
                      spec=spec)
     execute_extractions(state, [node], {
         "document_ids": [0],
-        "documents": {"c": [vocabulary.tokenizer.encode_ids(text)]},
+        "documents": {"c": [vocabulary.tokenizer(text)]},
         "texts": {"c": [text]}})
     return _snapshot(seen[-1]).documents[0].answers[0], model
 
@@ -338,7 +337,7 @@ def _setup(monkeypatch, documents=None, token_documents=None,
     state = _state(model, recurrent=recurrent)
     state.loaded_model.vocabulary = tables
     state.loaded_model.tokenizer = tables.tokenizer
-    tokens = {"c": ([tables.tokenizer.encode_ids(text) for text in documents]
+    tokens = {"c": ([tables.tokenizer(text) for text in documents]
                     if token_documents is None else token_documents)}
     stages_seen = {}
     original = ExtractPart.__init__
@@ -466,7 +465,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": state.chunk_tokens,
         "true_ids": [1], "false_ids": [2],
-        "documents": {"c": tables.tokenizer.document_batch(DOCS, [None] * len(DOCS))},
+        "documents": {"c": tables.document_batch(DOCS, [None] * len(DOCS))},
         "texts": {"c": pa.array(DOCS)},
         "physical_plan": plan_envelope(
             backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
@@ -512,7 +511,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
         model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
         model.filter_truth[("c", index)] = index != 2
-    question = tables.tokenizer.encode_ids(" question")
+    question = tables.tokenizer(" question")
     graph = PhysicalGraph(
         (
             Scan(node_id="input:c", alias="c", input_id="c"),
@@ -565,7 +564,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"],
              "chunk_tokens": 400,
-             "documents": {"c": [tables.tokenizer.encode_ids(text) for text in DOCS]},
+             "documents": {"c": [tables.tokenizer(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}, "gpu_timing": True}
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
@@ -647,7 +646,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                                     execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
-             "documents": {"c": [tables.tokenizer.encode_ids(text) for text in DOCS]},
+             "documents": {"c": [tables.tokenizer(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
@@ -684,7 +683,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
         model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
         model.filter_truth[("c", index)] = index != 1
-    question = tables.tokenizer.encode_ids(" question")
+    question = tables.tokenizer(" question")
     graph = PhysicalGraph(
         (
             Scan(node_id="input:c", alias="c", input_id="c"),
@@ -740,7 +739,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
                                     execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
-             "documents": {"c": [tables.tokenizer.encode_ids(text) for text in DOCS]},
+             "documents": {"c": [tables.tokenizer(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
@@ -799,7 +798,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
     execution.loaded_model.vocabulary = tables
     execution.loaded_model.tokenizer = tables.tokenizer
     execution.loaded_model.input_staging = None
-    documents = [tables.tokenizer.encode_ids(text) for text in texts]
+    documents = [tables.tokenizer(text) for text in texts]
     # a chunk holds about one document and its question
     chunk = max(len(document) for document in documents) + len(
         spec.prompt_token_parts[0]) + len(spec.prompt_token_parts[1]) + 8

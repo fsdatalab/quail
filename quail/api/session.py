@@ -9,7 +9,7 @@ from quail.api.config import EngineConfig, resolve_model
 from quail.api.query import QueryLike
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, TableProvider
-from quail.common.tokens import NativeEncoder
+from quail.common.tokens import Tokenizer
 from quail.extensions import ExtensionRegistry
 from quail.physical.plan import Refusal, RefusalError
 from quail.specs.files import resolve_model_path
@@ -198,5 +198,5 @@ class Session:
         if self._tokenizer is None:
             directory = self._tokenizer_directory or resolve_model_path(
                 self.model.hf_name, self.model.revision, include_weights=False)
-            self._tokenizer = NativeEncoder(directory)
+            self._tokenizer = Tokenizer(directory)
         return self._tokenizer

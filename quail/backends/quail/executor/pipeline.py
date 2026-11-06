@@ -211,7 +211,7 @@ def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
                     values, keep, [prefixes[int(p)] for p in asked],
                     [texts[int(ids[p])] for p in asked],
                     len(node.spec.prompt_token_parts[0]),
-                    state.loaded_model.tokenizer.encoder.token_bytes())
+                    state.loaded_model.tokenizer.token_bytes())
                 results[node.node_id] = read_result(node, ids[asked], SetReads(
                     answers, characters, list(found), suffix_tokens=suffix_tokens,
                     **cost))

@@ -7,6 +7,7 @@ from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from pathlib import Path
 
+import _quail_native
 import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
@@ -232,76 +233,16 @@ class _StoreWriter:
             Path(self.path).unlink(missing_ok=True)
 
 
-class NativeEncoder:
-    """A model's tokenizer, run by Quail's Rust tokenizer.
-
-    Args:
-        source: A model directory holding ``tokenizer.json``, or the file.
-    """
-
-    def __init__(self, source):
-        import _quail_native
-
-        path = Path(source)
-        self.path = path / "tokenizer.json" if path.is_dir() else path
-        self.tokenizer = _quail_native.NativeTokenizer(str(self.path))
-        self._token_bytes = None
-
-    def __call__(self, text: str) -> list[int]:
-        return self.batch_arrow(pa.array([text]))[0].values.to_pylist()
-
-    def __len__(self) -> int:
-        return len(self._bytes())
-
-    def _bytes(self) -> list:
-        if self._token_bytes is None:
-            self._token_bytes = self.tokenizer.token_bytes()
-        return self._token_bytes
-
-    def decode(self, tokens) -> bytes:
-        """Return the bytes of a token id list's text."""
-        found = self._bytes()
-        return b"".join(found[int(token)] or b"" for token in tokens)
-
-    def token_bytes(self) -> dict[int, bytes]:
-        """Return the bytes of each token id's text."""
-        return {index: value for index, value in enumerate(self._bytes())
-                if value is not None}
-
-    def token_texts(self) -> list[str]:
-        """Return each token id's text in the tokenizer's own spelling."""
-        return self.tokenizer.token_texts()
-
-    def decode_batch(self, tokens: list) -> list[str]:
-        """Return the text of each token id list, without special tokens."""
-        return self.tokenizer.decode_batch([[int(t) for t in ids] for ids in tokens])
-
-    def added_token_id(self, token: str) -> int | None:
-        """Return the id of an added token, such as ``<|im_end|>``."""
-        return self.tokenizer.added_token_id(token)
-
-    def batch_arrow(self, texts) -> pa.LargeListArray:
-        """Return each text's token ids as a large list of int32."""
-        texts = pa.array(texts, type=pa.string()) if not isinstance(
-            texts, (pa.Array, pa.ChunkedArray)) else texts.cast(pa.string())
-        table = self.tokenizer.encode(pa.table({"text": texts}))
-        return table.column("tokens").combine_chunks()
-
-    def batch_numpy(self, texts):
-        """Return flat token ids and each text's boundaries in them."""
-        tokens = self.batch_arrow(texts)
-        offsets = tokens.offsets.to_numpy()
-        ids = tokens.values.to_numpy(zero_copy_only=False)[offsets[0]:offsets[-1]]
-        return ids.astype(np.int64), (offsets - offsets[0]).astype(np.int64)
+# a model's tokenizer, run in Rust: the planner writes token stores with it
+# and the GPU worker encodes continuations and decodes answers with it
+Tokenizer = _quail_native.Tokenizer
 
 
 class TokenOffsets:
     """Map byte-preserving token sequences to original Unicode character ranges."""
 
-    def __init__(self, vocabulary):
-        self.vocabulary = pa.array(
-            [vocabulary.get(index) for index in range(max(vocabulary, default=-1) + 1)],
-            type=pa.binary())
+    def __init__(self, token_bytes):
+        self.vocabulary = pa.array(token_bytes, type=pa.binary())
 
     def __call__(self, tokens, texts):
         positions, exact = self.numpy(tokens, texts)
@@ -381,7 +322,7 @@ class TokenStoreWriter(_StoreWriter):
         """Tokenize the document column of one source batch; a null is empty."""
         texts = pc.fill_null(self._document_texts(batch), "")
         offsets = None
-        batch_arrow = getattr(self._tokenizer, "batch_arrow", None)
+        encode_arrow = getattr(self._tokenizer, "encode_arrow", None)
         if self._existing_tokens is not None:
             selected = self._existing_tokens.slice(self._row, len(texts))
             if len(selected) != len(texts):
@@ -389,12 +330,13 @@ class TokenStoreWriter(_StoreWriter):
             tokens = (selected.chunk(0) if selected.num_chunks == 1
                       else selected.combine_chunks())
             self._row += len(texts)
-        elif batch_arrow is None:
+        elif encode_arrow is None:
             tokens = pa.array(
                 [self._tokenizer(text) for text in texts.to_pylist()],
                 type=self._token_list_type)
         else:
-            tokens = batch_arrow(texts).cast(self._token_list_type)
+            tokens = encode_arrow(pa.table({"text": texts.cast(pa.string())})).column(
+                "tokens").combine_chunks().cast(self._token_list_type)
         if self._offsets_encoder is not None:
             offsets = self._offsets_encoder(tokens, texts)
         counts = pc.list_value_length(tokens).cast(pa.int64())

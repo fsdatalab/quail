@@ -53,7 +53,7 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
     num_tokens = len(vocabulary.vocab)
     logits = rng.normal(-8, 1, (num_questions, num_documents, 16, num_tokens))
     # Force repeated starts, alternate continuations, stops, and absent words.
-    pool = vocabulary.tokenizer.encode_ids(pool_text)
+    pool = vocabulary.tokenizer(pool_text)
     for q in range(num_questions):
         for document in range(num_documents):
             for at in range(16):
@@ -189,7 +189,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
     inputs = {
         "documents": {
             "c": (
-                None if lag else vocabulary.tokenizer.document_batch(
+                None if lag else vocabulary.document_batch(
                     texts, [None] * len(texts))
             )
         },
@@ -210,7 +210,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         setup.page_tokens,
         len(stages) - 1,
     )
-    pool = [*vocabulary.tokenizer.encode_ids("five years days lease"),
+    pool = [*vocabulary.tokenizer("five years days lease"),
             *vocabulary.tokenizer.stop_ids]
     head = torch.zeros(len(vocabulary.vocab), 1024)
     head[rng.choice(pool, 1024), np.arange(1024)] = 1
@@ -371,7 +371,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     )
     texts = ["five days or five years", "five years", "lease for five days"]
     spec, vocabulary = make_spec(*texts, "five days years lease", "or", "for")
-    vocabulary.tokenizer.encoder.decode_batch = batch_decode
+    vocabulary.tokenizer.decode_batch = batch_decode
     spec = replace(spec, max_answer_tokens=6, draft_tokens=3, top_tokens=4)
     setup = Setup(path="unified", pages=pages, page_tokens=4, budget=128)
     arena = make_arena(setup)
@@ -381,12 +381,12 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     state.loaded_model.vocabulary = vocabulary
     state.loaded_model.tokenizer = vocabulary.tokenizer
     head = torch.zeros(len(vocabulary.vocab), 1024)
-    pool = [*vocabulary.tokenizer.encode_ids("five days years lease"),
+    pool = [*vocabulary.tokenizer("five days years lease"),
             *vocabulary.tokenizer.stop_ids]
     head[np.array(pool)[np.arange(1024) % len(pool)], np.arange(1024)] = 1
     state.loaded_model.model.quail_full_head = head
     ids = np.arange(len(texts))
-    tokens = vocabulary.tokenizer.document_batch(texts, [None] * len(texts))
+    tokens = vocabulary.document_batch(texts, [None] * len(texts))
     extracts = ExtractPart(
         state,
         [

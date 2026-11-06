@@ -92,11 +92,11 @@ def _spec():
 
 
 def _tokenizer():
-    from quail.common.tokens import NativeEncoder
+    from quail.common.tokens import Tokenizer
     from quail.specs.files import resolve_model_path
 
     spec = _spec()
-    return NativeEncoder(resolve_model_path(spec.hf_name, spec.revision))
+    return Tokenizer(resolve_model_path(spec.hf_name, spec.revision))
 
 
 def _prompts():
@@ -224,11 +224,11 @@ def answer_ids():
 
 
 def _encoder():
-    from quail.common.tokens import NativeEncoder
+    from quail.common.tokens import Tokenizer
     from quail.specs.files import resolve_model_path
 
     spec = _spec()
-    return NativeEncoder(resolve_model_path(spec.hf_name, spec.revision))
+    return Tokenizer(resolve_model_path(spec.hf_name, spec.revision))
 
 
 def _ends(head, tail, documents):
