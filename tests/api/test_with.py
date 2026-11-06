@@ -97,7 +97,13 @@ def test_extraction_then_score_sends_the_extracted_text_to_the_scorer(session):
     assert result.report["ctes"]["clauses"]["wall_s"] == 1.0
     assert result.report["ctes"]["clauses"]["node_metrics"]["ai-extract:0"][
         "evaluated_documents"] == 3
-    assert result.plan == query.plan().graph
+    # the last stage is planned once its CTE has rows, so only its
+    # estimates differ from the plan made before the run
+    assert [
+        [node.node_id for node in stage.graph.nodes]
+        for stage in result.plan.nodes
+    ] == [[node.node_id for node in stage.graph.nodes]
+          for stage in query.plan().graph.nodes]
     assert "AiExtract" in result.explain()
     assert "quail.ai_score" in result.explain()
 

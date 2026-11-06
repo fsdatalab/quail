@@ -13,7 +13,13 @@ from contextlib import closing
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.catalog import Catalog, MemoryTableProvider, ScanRequest
+from quail.catalog import (
+    INPUT_SEPARATOR,
+    Catalog,
+    MemoryTableProvider,
+    ScanRequest,
+    table_name,
+)
 from quail.common.tokens import TokenLengths
 from quail.logical import LogicalPlan, Scan
 
@@ -41,8 +47,8 @@ def source_rows(catalog, name: str, table) -> pa.Array | None:
     rows ``<table>__<alias>``; its rows are found in the table by the
     table's id column. Returns None for any other input.
     """
-    base = name.split("__", 1)[0]
-    if table is None or "__" not in name or base not in catalog:
+    base = table_name(name)
+    if table is None or INPUT_SEPARATOR not in name or base not in catalog:
         return None
     provider = catalog.get(base)
     id_col = getattr(provider, "id_col", "")
@@ -54,7 +60,7 @@ def source_rows(catalog, name: str, table) -> pa.Array | None:
 
 
 def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
-                 **options):
+                 keep_order: bool = False, **options):
     """Return the Query for a model region, over its input tables.
 
     Args:
@@ -62,6 +68,8 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
         logical: The region's logical plan.
         tables: Each input's rows as a pyarrow Table, by name, or None
             to plan before the inputs exist.
+        keep_order: Read each input in the order given, as a plan Rust
+            made over these rows expects, rather than in the table's order.
         **options: Passed to Query.
 
     Returns:
@@ -74,16 +82,23 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
         return Query(session, logical, **options)
     providers = dict(session.catalog.providers)
     assumed = {}
-    rows = {}
+    rows, identities = {}, {}
     for name, scan in scans.items():
         if tables is not None and name in tables:
             table = tables[name]
             found = source_rows(session.catalog, name, table)
-            if found is not None:
+            if found is not None and keep_order:
+                rows[name] = found
+            elif found is not None:
                 # DataFusion scans in parallel; the region reads the rows in
                 # the table's order
                 order = pc.sort_indices(found)
                 table, rows[name] = table.take(order), pc.take(found, order)
+            if found is not None:
+                base = session.catalog.get(table_name(name))
+                if len(found) == base.statistics().num_rows:
+                    # the whole table: its token store is kept for later queries
+                    identities[name] = base.content_identity()
         else:
             table = scan.schema.empty_table()
             assumed[name] = lambda _column: TokenLengths(
@@ -94,6 +109,7 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
     store = session.inputs.over(catalog, assumed)
     query = Query(session, logical, catalog=catalog, inputs=store, **options)
     query.source_rows = rows
+    query.input_identities = identities
     # the store's token files live as long as the query
     weakref.finalize(query, store.close)
     return query

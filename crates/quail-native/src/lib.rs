@@ -13,6 +13,7 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlan;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use quail::planning::pricer_fields;
 use quail::pyarrow::to_pyarrow;
 use quail_datafusion::{bind, region_sql};
 
@@ -29,31 +30,34 @@ struct NativeSession {
 
 #[pymethods]
 impl NativeSession {
-    /// Create a session whose model regions run on `engine`, as
-    /// `quail::Session::with_engine` describes.
+    /// Create a session whose model regions run on `engine`, planned by
+    /// `planner` when given, as `quail::Session::with_planner` describes.
     #[new]
-    fn new(engine: Py<PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (engine, planner=None))]
+    fn new(engine: Py<PyAny>, planner: Option<PyRef<'_, NativePlanner>>) -> PyResult<Self> {
+        let planner = planner.map(|found| std::sync::Arc::clone(&found.planner));
         Ok(Self {
-            session: quail::Session::with_engine(engine).map_err(python_error)?,
+            session: quail::Session::with_planner(engine, planner).map_err(python_error)?,
         })
     }
 
     /// Register a table by its schema, given as the IPC stream bytes of
     /// an empty table, and a function `scan(columns)` that returns
     /// those columns' rows as a pyarrow Table. `id_column` names the
-    /// column whose values are unique.
-    #[pyo3(signature = (name, schema, scan, id_column=None))]
+    /// column whose values are unique, and `identity` the rows.
+    #[pyo3(signature = (name, schema, scan, id_column=None, identity=""))]
     fn register(
         &self,
         name: &str,
         schema: &[u8],
         scan: Py<PyAny>,
         id_column: Option<&str>,
+        identity: &str,
     ) -> PyResult<()> {
         let reader = StreamReader::try_new(Cursor::new(schema), None)
             .map_err(|error| python_error(error.into()))?;
         self.session
-            .register_python_table(name, reader.schema(), scan, id_column)
+            .register_python_table(name, reader.schema(), scan, id_column, identity)
             .map_err(python_error)
     }
 
@@ -856,7 +860,7 @@ fn prefix_statistics<'py>(
 /// tokenizer, keeping the token stores of tables read whole.
 #[pyclass(name = "NativePlanner", module = "_quail_native")]
 struct NativePlanner {
-    planner: quail::planning::Planner,
+    planner: std::sync::Arc<quail::planning::Planner>,
 }
 
 #[pymethods]
@@ -865,8 +869,10 @@ impl NativePlanner {
     #[new]
     fn new(tokenizer_file: &str) -> PyResult<Self> {
         Ok(Self {
-            planner: quail::planning::Planner::new(std::path::Path::new(tokenizer_file))
-                .map_err(|error| PyRuntimeError::new_err(error.0))?,
+            planner: std::sync::Arc::new(
+                quail::planning::Planner::new(std::path::Path::new(tokenizer_file))
+                    .map_err(|error| PyRuntimeError::new_err(error.0))?,
+            ),
         })
     }
 
@@ -913,31 +919,8 @@ impl NativePlanner {
             }
             Err(error) => return Ok((None, Some(error.0))),
         };
-        let scans: serde_json::Map<String, serde_json::Value> = planned
-            .scans
-            .iter()
-            .map(|scan| {
-                (
-                    scan.alias.clone(),
-                    serde_json::json!({
-                        "tokens": scan.tokens,
-                        "columns": scan.columns,
-                    }),
-                )
-            })
-            .collect();
-        let plan = &planned.selected.plan;
-        let found = serde_json::json!({
-            "envelope": plan.envelope(),
-            "estimated_seconds": plan.estimated_seconds,
-            "estimates": plan.estimates,
-            "alternative": planned.selected.alternative,
-            "pricer": pricer_fields(&plan.pricer),
-            "logical": quail_planner::write_logical_plan(&planned.logical)
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
-            "fields": planned.fields,
-            "scans": scans,
-        });
+        let found = quail::planning::planned_json(&planned)
+            .map_err(|error| PyRuntimeError::new_err(error.0))?;
         Ok((Some(found.to_string()), None))
     }
 }
@@ -972,54 +955,7 @@ mod erased_json {
     }
 }
 
-const WORK_FIELDS: [&str; 9] = [
-    "tokens",
-    "pairs",
-    "kv_written",
-    "kv_read",
-    "sliding_pairs",
-    "sliding_kv_read",
-    "state_written",
-    "state_read",
-    "sae_encoded",
-];
-
-fn work_values(work: &quail_cost::work::Work) -> [&quail_cost::quantity::Quantity; 9] {
-    [
-        &work.tokens,
-        &work.pairs,
-        &work.kv_written,
-        &work.kv_read,
-        &work.sliding_pairs,
-        &work.sliding_kv_read,
-        &work.state_written,
-        &work.state_read,
-        &work.sae_encoded,
-    ]
-}
-
-/// A plan's pricer as JSON, for Python to hand back when it reprices an
-/// edited graph.
-fn pricer_fields(pricer: &quail_planner::pricing::PlanPricer) -> serde_json::Value {
-    let work = |work: &quail_cost::work::Work| {
-        WORK_FIELDS
-            .iter()
-            .zip(work_values(work))
-            .map(|(name, value)| (name.to_string(), serde_json::Value::from(value.total())))
-            .collect::<serde_json::Map<String, serde_json::Value>>()
-    };
-    serde_json::json!({
-        "chunk": pricer.chunk,
-        "cap_pages": pricer.cap_pages,
-        "stats": pricer.stats.iter().map(|(alias, stats)| (alias.clone(), serde_json::json!(
-            [stats.num_documents, stats.total_tokens, stats.max_document_tokens]
-        ))).collect::<serde_json::Map<String, serde_json::Value>>(),
-        "stage_works": pricer.stage_works.iter().map(|(position, found)| (position.to_string(),
-            serde_json::Value::Object(work(found)))).collect::<serde_json::Map<String, serde_json::Value>>(),
-        "expected_rows": pricer.expected_rows,
-    })
-}
-
+/// Read a plan's pricer from the JSON [`pricer_fields`] writes.
 fn read_pricer(value: &serde_json::Value) -> PyResult<quail_planner::pricing::PlanPricer> {
     let bad = || pyo3::exceptions::PyValueError::new_err("a malformed plan pricer");
     let stats: std::collections::BTreeMap<String, (i64, i64, i64)> =

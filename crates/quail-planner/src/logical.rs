@@ -25,6 +25,17 @@ pub enum ScanColumn {
     Expression(ValueExpression),
 }
 
+/// What separates a table's name from its alias in the name of a model
+/// region's input that holds some of the table's rows, as in
+/// `reviews__r`.
+pub const INPUT_SEPARATOR: &str = "__";
+
+/// The registered table a scanned provider reads: the provider itself,
+/// or the table a region's input `<table>__<alias>` holds rows of.
+pub fn table_name(provider: &str) -> &str {
+    provider.split(INPUT_SEPARATOR).next().unwrap_or(provider)
+}
+
 /// One logical operator and its inputs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]

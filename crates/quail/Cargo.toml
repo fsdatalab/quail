@@ -15,6 +15,7 @@ arrow = { version = "59.3.2", default-features = false, features = ["ffi", "ipc"
 # module's build sets PYO3_BUILD_EXTENSION_MODULE instead
 pyo3 = "0.30"
 quail-datafusion = { path = "../quail-datafusion" }
+quail-cost = { path = "../quail-cost" }
 quail-inputs = { path = "../quail-inputs" }
 quail-physical = { path = "../quail-physical" }
 serde = { version = "1", features = ["derive"] }

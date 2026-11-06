@@ -60,12 +60,12 @@ class SessionContext:
     """
 
     def __init__(self, session, physical_executor: Callable | None = None, *,
-                 order: str | None = None, run_region: Callable | None = None):
+                 order: str | None = None, run_query: Callable | None = None):
         from _quail_native import NativeSession
 
         self.session = session
-        engine = Engine(session, physical_executor, order=order, run_region=run_region)
-        self._native = NativeSession(engine)
+        engine = Engine(session, physical_executor, order=order, run_query=run_query)
+        self._native = NativeSession(engine, session.planner)
         for name, provider in session.catalog.providers.items():
             self._register_table(name, provider)
 
@@ -84,7 +84,8 @@ class SessionContext:
             return reader.read_all()
 
         self._native.register(name, ipc_bytes(provider.schema().empty_table()), scan,
-                              getattr(provider, "id_col", None) or None)
+                              getattr(provider, "id_col", None) or None,
+                              provider.content_identity())
 
     def sql(self, text: str, dialect: str = "snowflake") -> pa.Table:
         """Run a query and return its rows."""

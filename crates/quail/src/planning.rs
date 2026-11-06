@@ -99,6 +99,14 @@ fn arrow_error(error: impl std::fmt::Display) -> CompileError {
     CompileError::new(error.to_string())
 }
 
+impl std::fmt::Debug for Planner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Planner")
+            .field("directory", &self.directory.path())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Planner {
     /// A planner with the `tokenizer.json` at `tokenizer_file`.
     ///
@@ -523,4 +531,84 @@ fn is_column(expression: &ValueExpression) -> bool {
         ValueExpression::GetField(field) => is_column(&field.input),
         _ => false,
     }
+}
+
+/// The field names of [`work_values`], in order.
+pub const WORK_FIELDS: [&str; 9] = [
+    "tokens",
+    "pairs",
+    "kv_written",
+    "kv_read",
+    "sliding_pairs",
+    "sliding_kv_read",
+    "state_written",
+    "state_read",
+    "sae_encoded",
+];
+
+/// A work's quantities in [`WORK_FIELDS`] order.
+pub fn work_values(work: &quail_cost::work::Work) -> [&quail_cost::quantity::Quantity; 9] {
+    [
+        &work.tokens,
+        &work.pairs,
+        &work.kv_written,
+        &work.kv_read,
+        &work.sliding_pairs,
+        &work.sliding_kv_read,
+        &work.state_written,
+        &work.state_read,
+        &work.sae_encoded,
+    ]
+}
+
+/// A plan's pricer as JSON, for Python to hand back when it reprices an
+/// edited plan.
+pub fn pricer_fields(pricer: &quail_planner::pricing::PlanPricer) -> serde_json::Value {
+    let work = |work: &quail_cost::work::Work| {
+        WORK_FIELDS
+            .iter()
+            .zip(work_values(work))
+            .map(|(name, value)| (name.to_string(), serde_json::Value::from(value.total())))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+    };
+    serde_json::json!({
+        "chunk": pricer.chunk,
+        "cap_pages": pricer.cap_pages,
+        "stats": pricer.stats.iter().map(|(alias, stats)| (alias.clone(), serde_json::json!(
+            [stats.num_documents, stats.total_tokens, stats.max_document_tokens]
+        ))).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "stage_works": pricer.stage_works.iter().map(|(position, found)| (position.to_string(),
+            serde_json::Value::Object(work(found)))).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "expected_rows": pricer.expected_rows,
+    })
+}
+
+/// A planned region as JSON: the plan's envelope, estimates, and pricer,
+/// the chosen logical plan, the context fields, and each scan's files.
+///
+/// # Errors
+///
+/// The logical plan does not write.
+pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError> {
+    let scans: serde_json::Map<String, serde_json::Value> = planned
+        .scans
+        .iter()
+        .map(|scan| {
+            (
+                scan.alias.clone(),
+                serde_json::json!({"tokens": scan.tokens, "columns": scan.columns}),
+            )
+        })
+        .collect();
+    let plan = &planned.selected.plan;
+    Ok(serde_json::json!({
+        "envelope": plan.envelope(),
+        "estimated_seconds": plan.estimated_seconds,
+        "estimates": plan.estimates,
+        "alternative": planned.selected.alternative,
+        "pricer": pricer_fields(&plan.pricer),
+        "logical": quail_planner::write_logical_plan(&planned.logical).map_err(arrow_error)?,
+        "fields": planned.fields,
+        "scans": scans,
+    }))
 }

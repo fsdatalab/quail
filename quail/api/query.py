@@ -110,6 +110,8 @@ class Query:
         self.token_wait_s = 0.0
         # each filtered input's rows' positions in its registered table
         self.source_rows = {}
+        # each input that holds a registered table whole: its identity
+        self.input_identities = {}
 
     def token_inputs(self) -> dict:
         """Return the token store of every scanned alias.
@@ -293,7 +295,8 @@ class Query:
                 table = reader.read_all()
             # a registered table's rows are the same for every query
             identity = (provider.content_identity()
-                        if scan.provider in self.session.catalog else None)
+                        if scan.provider in self.session.catalog
+                        else self.input_identities.get(scan.provider))
             tables[scan.provider] = (identity, table)
         config = self.session.config
         settings = {
@@ -314,11 +317,23 @@ class Query:
                 return None
             raise CompileError(message)
         found = json.loads(found)
-        plan, logical = native.planned_region(found, self.session.tokenizer)
-        if logical is None:
+        if "refusal" in found:
             # a refused region takes Python's path, which still tokenizes
             # its tables for the speed-of-light estimate
             return None
+        return self.adopt_plan(found)
+
+    def adopt_plan(self, found: dict):
+        """Take the plan Rust made, and read its scans' files as the inputs.
+
+        Args:
+            found: A planned region, as ``NativePlanner.plan`` returns it
+                and read from JSON.
+
+        Returns:
+            The physical plan.
+        """
+        plan, logical = native.planned_region(found, self.session.tokenizer)
         self.logical = logical
         self._token_inputs, self._document_tokens = {}, {}
         for alias, files in found["scans"].items():
@@ -326,8 +341,11 @@ class Query:
             self._token_inputs[alias] = ScanInput(store, {
                 name: ColumnStore(path) for name, path in files["columns"]})
             self._document_tokens[alias] = store.lengths
-        if config.gpu_timing:
+        if self.session.config.gpu_timing:
             plan = replace(plan, settings={**plan.settings, "gpu_timing": True})
+        if self._planning_started_at is None:
+            self._planning_started_at = self._planning_finished_at = time.perf_counter()
+        self._plan = self._searched_plan = plan
         return plan
 
     @property

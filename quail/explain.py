@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
+from quail.catalog import table_name
 from quail.logical import (
     DEFAULT_SELECTIVITY,
     LogicalPlan,
@@ -90,7 +91,7 @@ def logical_tree(logical):
         elif isinstance(node, logical_nodes.Unnest):
             title = f"Unnest: {', '.join(node.columns)}"
         elif isinstance(node, logical_nodes.Scan):
-            title = f"Scan {node.provider} as {node.alias}"
+            title = f"Scan {table_name(node.provider)} as {node.alias}"
             columns = ", ".join(dict.fromkeys(
                 (column_name(node.column, qualified=False), *node.columns)))
             title += f" [{columns}]"
@@ -355,8 +356,8 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         title = type(node).__name__
         if isinstance(node, Scan):
             source = scans.get(node.alias)
-            title = (f"Scan {source.provider} as {node.alias}" if source else
-                     f"Scan: {node.alias}")
+            title = (f"Scan {table_name(source.provider)} as {node.alias}"
+                     if source else f"Scan: {node.alias}")
             mean = node.total_tokens / node.num_documents if node.num_documents else 0
             details.append(f"tokens={node.total_tokens:,}, "
                            f"mean_document_tokens={_number(mean)}")

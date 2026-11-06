@@ -16,12 +16,16 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
+use std::collections::HashMap;
+
 use quail_datafusion::{
-    InputRows, ModelRegion, RegionBatches, RegionRunner, bind, quail_column_names, region_sql,
+    IdentifiedTable, InputRows, ModelRegion, RegionBatches, RegionRunner, bind, quail_column_names,
+    region_sql,
 };
 use quail_planner::prompts::Turn;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::planning::{DOCUMENT_EXPRESSION, Planner, Settings, TableRows, planned_json};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 
 /// Runs each model region by calling the engine's
@@ -36,6 +40,9 @@ pub(crate) struct PythonRunner {
     /// While a query runs: the thread that called DataFusion, and where
     /// a worker sends it a region to run.
     pub(crate) caller: Mutex<Option<(ThreadId, UnboundedSender<RegionCall>)>>,
+    /// The planner and configuration Rust plans each region with, then
+    /// calls the engine's `execute`; None calls `run_region`.
+    pub(crate) planning: Option<(Arc<Planner>, Settings)>,
 }
 
 /// A region a DataFusion worker hands to the calling thread to run.
@@ -65,6 +72,54 @@ impl PythonRunner {
         }
     }
 
+    /// Plan a bound region in Rust, or None when Python plans it: a
+    /// region Rust refuses, or whose document is an expression.
+    fn plan_here(
+        &self,
+        region: &ModelRegion,
+        inputs: &[InputRows],
+        payload: &str,
+    ) -> Result<Option<String>> {
+        let Some((planner, settings)) = &self.planning else {
+            return Ok(None);
+        };
+        let logical = quail_planner::read_logical_plan(payload)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        // Python plans a CTE's stages and a region that asks no model
+        let operators = quail_planner::operators::operators(&logical);
+        let asks_model = !(operators.filters.is_empty()
+            && operators.joins.is_empty()
+            && operators.classifies.is_empty()
+            && operators.extracts.is_empty()
+            && operators.sae_features.is_empty()
+            && operators.maps.is_empty()
+            && operators.projections.is_empty());
+        if matches!(logical.root, quail_planner::LogicalNode::WithCte(_)) || !asks_model {
+            return Ok(None);
+        }
+        let mut tables = named_tables(region)?;
+        for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
+            tables.insert(
+                name.clone(),
+                TableRows {
+                    identity: whole_table_identity(input),
+                    schema: Arc::new(input.schema().as_arrow().clone()),
+                    batches: batches.clone(),
+                },
+            );
+        }
+        match planner.plan(logical, &tables, settings) {
+            Ok(Ok(planned)) => Ok(Some(
+                planned_json(&planned)
+                    .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?
+                    .to_string(),
+            )),
+            Ok(Err(_)) => Ok(None),
+            Err(error) if error.0.starts_with(DOCUMENT_EXPRESSION) => Ok(None),
+            Err(error) => Err(DataFusionError::Plan(format!("CompileError: {}", error.0))),
+        }
+    }
+
     /// Run the region on this thread.
     pub(crate) fn run_here(
         &self,
@@ -73,6 +128,23 @@ impl PythonRunner {
         fetch: Option<usize>,
     ) -> Result<RegionBatches> {
         let (kind, payload) = self.request(region)?;
+        // a region under a LIMIT takes the limit in Python's planning
+        let sorted;
+        let (planned, inputs) = if kind == "plan" && fetch.is_none() && self.planning.is_some() {
+            sorted = inputs
+                .iter()
+                .zip(&region.inputs)
+                .map(|((name, batches), input)| {
+                    Ok((name.clone(), in_source_order(input, batches)?))
+                })
+                .collect::<Result<Vec<InputRows>>>()?;
+            (
+                self.plan_here(region, &sorted, &payload)?,
+                sorted.as_slice(),
+            )
+        } else {
+            (None, inputs)
+        };
         let reader = Python::attach(|py| {
             // each input as a pyarrow Table, by the table name the region reads
             let mut tables = Vec::new();
@@ -81,9 +153,13 @@ impl PythonRunner {
                 tables.push((name.clone(), to_pyarrow(py, schema, batches.clone())?));
             }
             let tables = tables.into_py_dict(py)?;
-            let answer =
-                self.engine
-                    .call_method1(py, "run_region", (kind, payload, tables, fetch))?;
+            let answer = match &planned {
+                Some(found) => self.engine.call_method1(py, "execute", (found, tables))?,
+                None => {
+                    self.engine
+                        .call_method1(py, "run_region", (kind, payload, tables, fetch))?
+                }
+            };
             stream_from_pyarrow(answer.bind(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
@@ -125,6 +201,148 @@ impl RegionRunner for PythonRunner {
             _ => self.run_here(region, inputs, fetch),
         }
     }
+}
+
+/// An input's rows in the order of the registered table it holds rows of,
+/// found by the table's id column; the rows unchanged for any other input.
+///
+/// DataFusion scans and filters in parallel, so the rows reach the region
+/// in no fixed order.
+fn in_source_order(
+    input: &datafusion::logical_expr::LogicalPlan,
+    batches: &[RecordBatch],
+) -> Result<Vec<RecordBatch>> {
+    use datafusion::arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::Constraint;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    let mut source = None;
+    input.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = source_as_provider(&scan.source)
+            && provider.downcast_ref::<IdentifiedTable>().is_some()
+        {
+            source = Some(provider);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let Some(provider) = source else {
+        return Ok(batches.to_vec());
+    };
+    let table = provider
+        .downcast_ref::<IdentifiedTable>()
+        .expect("an identified table");
+    let Some(python) = table.inner().downcast_ref::<PythonTable>() else {
+        return Ok(batches.to_vec());
+    };
+    let key = python
+        .constraints
+        .iter()
+        .find_map(|constraint| match constraint {
+            Constraint::PrimaryKey(keys) if keys.len() == 1 => Some(keys[0]),
+            _ => None,
+        });
+    let Some(key) = key.map(|index| python.schema.field(index).name().clone()) else {
+        return Ok(batches.to_vec());
+    };
+    let Some(first) = batches.first() else {
+        return Ok(Vec::new());
+    };
+    let rows = concat_batches(&first.schema(), batches)?;
+    let Ok(column) = rows.schema().index_of(&key) else {
+        return Ok(batches.to_vec());
+    };
+    let texts = |values: &ArrayRef| -> Result<Vec<Option<String>>> {
+        let values = cast(values, &DataType::Utf8)?;
+        let values = values
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .expect("a string array");
+        Ok(values
+            .iter()
+            .map(|value| value.map(str::to_string))
+            .collect())
+    };
+    let mut positions: HashMap<String, u64> = HashMap::new();
+    let mut next = 0u64;
+    for batch in python.column_rows(&key)? {
+        for value in texts(batch.column(0))? {
+            if let Some(value) = value {
+                positions.entry(value).or_insert(next);
+            }
+            next += 1;
+        }
+    }
+    let found: datafusion::arrow::array::UInt64Array = texts(rows.column(column))?
+        .into_iter()
+        .map(|value| value.and_then(|value| positions.get(&value).copied()))
+        .collect();
+    let order = sort_to_indices(&found, None, None)?;
+    Ok(vec![take_record_batch(&rows, &order)?])
+}
+
+/// The rows and identity of each identified table a region reads by
+/// name, by table name.
+fn named_tables(region: &ModelRegion) -> Result<HashMap<String, TableRows>> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    let mut found: Vec<(String, Arc<dyn TableProvider>)> = Vec::new();
+    region.bound.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = source_as_provider(&scan.source)
+            && provider.downcast_ref::<IdentifiedTable>().is_some()
+        {
+            found.push((scan.table_name.table().to_string(), provider));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let mut tables = HashMap::new();
+    for (name, provider) in found {
+        let table = provider
+            .downcast_ref::<IdentifiedTable>()
+            .expect("an identified table");
+        let Some(python) = table.inner().downcast_ref::<PythonTable>() else {
+            continue;
+        };
+        tables.insert(
+            name,
+            TableRows {
+                identity: Some(table.identity().to_string()),
+                schema: Arc::clone(&python.schema),
+                batches: python.rows()?,
+            },
+        );
+    }
+    Ok(tables)
+}
+
+/// The content identity of an input that is a whole table with one,
+/// read without filters.
+fn whole_table_identity(input: &datafusion::logical_expr::LogicalPlan) -> Option<String> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    let mut identity = None;
+    let mut whole = true;
+    let _ = input.apply(|node| {
+        match node {
+            LogicalPlan::TableScan(scan) => {
+                whole &= scan.filters.is_empty() && scan.fetch.is_none();
+                identity = source_as_provider(&scan.source).ok().and_then(|provider| {
+                    provider
+                        .downcast_ref::<IdentifiedTable>()
+                        .map(|table| table.identity().to_string())
+                });
+            }
+            LogicalPlan::SubqueryAlias(_) | LogicalPlan::Projection(_) => {}
+            _ => whole = false,
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if whole { identity } else { None }
 }
 
 /// Give a batch of Quail's rows the region's schema: each region
@@ -171,6 +389,32 @@ pub(crate) struct PythonTable {
     pub(crate) scan: Py<PyAny>,
     /// The id column as a primary key, which DataFusion's rules read.
     pub(crate) constraints: Constraints,
+}
+
+impl PythonTable {
+    /// Every row of the table.
+    pub(crate) fn rows(&self) -> Result<Vec<RecordBatch>> {
+        let columns: Vec<String> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        self.scan_columns(columns)
+    }
+
+    /// One column of the table's rows.
+    fn column_rows(&self, name: &str) -> Result<Vec<RecordBatch>> {
+        self.scan_columns(vec![name.to_string()])
+    }
+
+    fn scan_columns(&self, columns: Vec<String>) -> Result<Vec<RecordBatch>> {
+        Python::attach(|py| {
+            let answer = self.scan.call1(py, (columns,))?;
+            from_pyarrow(answer.bind(py))
+        })
+        .map_err(|error| DataFusionError::External(Box::new(error)))
+    }
 }
 
 #[async_trait]

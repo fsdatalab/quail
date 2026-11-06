@@ -15,8 +15,8 @@ use datafusion::optimizer::AnalyzerRule;
 
 use crate::bind::UNSUPPORTED;
 use crate::functions::{is_ai_call, is_quail_call};
+use crate::identified::IdentifiedTable;
 use crate::region::ModelRegion;
-use crate::table::RunnerTable;
 
 /// Replace each subtree of AI work that Quail can plan with one
 /// `ModelRegion`, and leave the relational operators above it to
@@ -932,9 +932,9 @@ fn single_scan(plan: &LogicalPlan) -> Option<TableScan> {
     }
 }
 
-/// Whether a subtree is a table the runner reads by name: its scan,
-/// alone or under its alias.
-fn read_by_runner(plan: &LogicalPlan) -> bool {
+/// Whether a subtree is a table the runner reads by name: an identified
+/// table's scan, alone or under its alias.
+fn read_by_name(plan: &LogicalPlan) -> bool {
     let scan = match plan {
         LogicalPlan::TableScan(scan) => scan,
         LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
@@ -944,14 +944,14 @@ fn read_by_runner(plan: &LogicalPlan) -> bool {
         _ => return false,
     };
     source_as_provider(&scan.source)
-        .is_ok_and(|provider| provider.downcast_ref::<RunnerTable>().is_some())
+        .is_ok_and(|provider| provider.downcast_ref::<IdentifiedTable>().is_some())
 }
 
 /// Whether DataFusion computes this part of a region as an input: it
-/// calls no model, reads one table, and is more than a table the runner
-/// reads by name.
+/// calls no model, reads one table, and is more than an identified table
+/// the runner reads by name.
 fn plain_input(plan: &LogicalPlan) -> Result<Option<TableScan>> {
-    if read_by_runner(plan) || calls_ai(plan)? {
+    if read_by_name(plan) || calls_ai(plan)? {
         return Ok(None);
     }
     let subquery = plan.exists(|node| {
@@ -1038,8 +1038,13 @@ fn cut_input(
     {
         return Ok(Transformed::no(node));
     }
-    // not the table's own name, which the runner would read whole
-    let name = format!("{}__{}", scan.table_name.table(), qualifier.table());
+    // not the table's own name: two aliases of one table read different rows
+    let name = format!(
+        "{}{}{}",
+        scan.table_name.table(),
+        quail_planner::logical::INPUT_SEPARATOR,
+        qualifier.table()
+    );
     let fields = Arc::new(schema.as_arrow().clone());
     let mut placeholder = MemTable::try_new(Arc::clone(&fields), vec![vec![]])?;
     let provider = source_as_provider(&scan.source)?;
@@ -1068,15 +1073,15 @@ fn cut_input(
     Ok(Transformed::new(read, true, TreeNodeRecursion::Jump))
 }
 
-/// A scan of a table the runner does not read itself, as a scan of a
-/// region input of the table's name: DataFusion scans the table and
-/// passes its rows. A table read twice, as in a self join, is one input.
+/// A scan of a table without an identity, as a scan of a region input of
+/// the table's name: DataFusion scans the table and passes its rows. A
+/// table read twice, as in a self join, is one input.
 fn table_input(
     scan: &TableScan,
     inputs: &mut Vec<(String, LogicalPlan)>,
 ) -> Result<Transformed<LogicalPlan>> {
     let provider = source_as_provider(&scan.source)?;
-    if provider.downcast_ref::<RunnerTable>().is_some() {
+    if provider.downcast_ref::<IdentifiedTable>().is_some() {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan.clone())));
     }
     let name = scan.table_name.table().to_string();

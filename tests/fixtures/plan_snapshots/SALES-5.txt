@@ -9,7 +9,7 @@ logical:
   Limit: 25
     Sort: commit_score DESC NULLS LAST, c.id ASC NULLS LAST
       Project: c.id, AI.SCORE('Judge strictly from the sales call above whether the customer commits to buying, such as accepting the terms, agreeing to sign, or asking for the contract or paperwork. Interest, questions, or agreeing to another meeting do not count.\n\n{0}\n\nInstruction: answer TRUE if the customer commits to buying, FALSE otherwise.') AS commit_score
-        Scan sales_calls__c as c [transcript, id]
+        Scan sales_calls as c [transcript, id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
@@ -30,7 +30,7 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
         expected_rows=0.0
         estimated_seconds=0.0
         share_prefixes=False
-        Scan sales_calls__c as c                                    0
+        Scan sales_calls as c                                       0
           tokens=0, mean_document_tokens=0
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

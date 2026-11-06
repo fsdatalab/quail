@@ -28,17 +28,18 @@ class Engine:
         physical_executor: Optional callable(PhysicalRequest) that
             returns the PhysicalResponse, for tests without a GPU.
         order: The stage order rule each region is planned with.
-        run_region: Optional callable that replaces ``run_region``.
+        run_query: Optional callable(Query) -> pyarrow Table that runs a
+            region's query in place of the engine.
         owns_session: Whether ``close`` closes the session.
     """
 
     def __init__(self, session, physical_executor: Callable | None = None, *,
-                 order: str | None = None, run_region: Callable | None = None,
+                 order: str | None = None, run_query: Callable | None = None,
                  owns_session: bool = False):
         self.session = session
         self._physical_executor = physical_executor
         self._order = order
-        self._run_region = run_region
+        self._run_query = run_query
         self._owns_session = owns_session
 
     @classmethod
@@ -66,6 +67,51 @@ class Engine:
         """The optimizer rules each model region runs, in order."""
         return [rule.name for rule in self.session.registry.logical_rules.values()]
 
+    @property
+    def settings(self) -> str | None:
+        """The configuration Rust plans regions for, as JSON.
+
+        None for a backend whose regions Python plans.
+        """
+        config = self.session.config
+        if config.backend != "quail":
+            return None
+        from quail.physical.codec import encode_value
+        from quail.planner import native
+
+        return json.dumps({
+            "model": native.untagged(encode_value(self.session.model)),
+            "device": native.untagged(encode_value(self.session.device)),
+            "gpus": config.gpus, "canvas_draws": config.canvas_draws,
+            "attention": config.attention, "order": self._order,
+            "backend": config.backend,
+            "physical_rules": [rule.name for rule in
+                               self.session.registry.physical_rules.values()],
+        })
+
+    def execute(self, planned: str, tables: dict | None = None) -> pa.Table:
+        """Run a region Rust planned and return its rows.
+
+        Args:
+            planned: The planned region as JSON: its physical plan, the
+                logical plan it lowers, and each scan's files.
+            tables: The rows of each table the region reads, by name.
+        """
+        from quail.api.region_inputs import region_query
+
+        found = json.loads(planned)
+        logical = decode_value(LogicalPlan, json.loads(found["logical"]))
+        query = region_query(self.session, logical, order=self._order,
+                             tables=tables, keep_order=True)
+        query.adopt_plan(found)
+        return self._run(query)
+
+    def _run(self, query) -> pa.Table:
+        if self._run_query is not None:
+            return self._run_query(query)
+        result = execute_query(query, physical_executor=self._physical_executor)
+        return result.collect()
+
     def run_region(self, kind: str, payload: str, tables: dict | None = None,
                    fetch: int | None = None) -> pa.Table:
         """Plan and run one model region and return its rows.
@@ -78,8 +124,6 @@ class Engine:
                 DataFusion, by table name.
             fetch: The most rows DataFusion reads, or None.
         """
-        if self._run_region is not None:
-            return self._run_region(kind, payload, tables, fetch)
         from quail.api.region_inputs import region_query
 
         if kind == "plan":
@@ -90,8 +134,7 @@ class Engine:
                                  tables=tables)
         else:
             query = self.session.sql(payload, order=self._order)
-        result = execute_query(query, physical_executor=self._physical_executor)
-        return result.collect()
+        return self._run(query)
 
     def close(self) -> None:
         """Close the session if this engine opened it."""

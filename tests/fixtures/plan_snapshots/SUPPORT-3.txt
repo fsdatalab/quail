@@ -14,7 +14,7 @@ logical:
         Join
           on a.id = u.prev_assistant_id
           Scan support_messages as a [content, id]
-          Scan support_messages__u as u [content, id, prev_assistant_id]
+          Scan support_messages as u [content, id, prev_assistant_id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
@@ -28,7 +28,7 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
       join 1 full (a, u) over pairs from hash_join:a-u  PROMPT("Does the customer's reply in DOC…")           0       5.26%
       Scan support_messages as a [1]                                                                          6
         tokens=144, mean_document_tokens=24
-      Scan support_messages__u as u [2]                                                                       0
+      Scan support_messages as u [2]                                                                          0
         tokens=0, mean_document_tokens=0
       HashJoin: a.id = u.prev_assistant_id
         pairs kept: 0 of the cross product

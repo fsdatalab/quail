@@ -2360,8 +2360,14 @@ dependencies = [
  "datafusion",
  "pyo3",
  "pyo3-build-config",
+ "quail-cost",
  "quail-datafusion",
+ "quail-inputs",
+ "quail-physical",
  "quail-planner",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -32,7 +32,7 @@ use datafusion::common::{Constraint, Constraints, DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use pyo3::prelude::*;
-use quail_datafusion::{ModelRegion, RegionRunner, RunnerTable, quail_schema};
+use quail_datafusion::{IdentifiedTable, ModelRegion, RegionRunner, quail_schema};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -168,14 +168,41 @@ impl Session {
     ///
     /// An attribute is missing or a rule name is unknown.
     pub fn with_engine(engine: Py<PyAny>) -> Result<Self> {
-        let (prompting, rules) = Python::attach(|py| {
+        Self::with_planner(engine, None)
+    }
+
+    /// A session as [`Session::with_engine`] describes, whose regions
+    /// `planner` plans in Rust when the engine has a `settings`
+    /// attribute, the configuration as JSON, and the engine's `execute`
+    /// runs; without a planner every region goes to `run_region`.
+    ///
+    /// # Errors
+    ///
+    /// An attribute is missing or malformed, or a rule name is unknown.
+    pub fn with_planner(
+        engine: Py<PyAny>,
+        planner: Option<Arc<planning::Planner>>,
+    ) -> Result<Self> {
+        let (prompting, rules, settings) = Python::attach(|py| {
             let bound = engine.bind(py);
             let turn: Option<(String, String)> = bound.getattr("turn")?.extract()?;
             let layout: Option<String> = bound.getattr("layout")?.extract()?;
             let rules: Option<Vec<String>> = bound.getattr("rules")?.extract()?;
-            Ok::<_, PyErr>((turn.zip(layout), rules))
+            let settings: Option<String> = match bound.getattr("settings") {
+                Ok(found) => found.extract()?,
+                Err(_) => None,
+            };
+            Ok::<_, PyErr>((turn.zip(layout), rules, settings))
         })
         .map_err(python_failure)?;
+        let planning = match (planner, settings) {
+            (Some(planner), Some(settings)) => Some((
+                planner,
+                serde_json::from_str::<planning::Settings>(&settings)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?,
+            )),
+            _ => None,
+        };
         let regions = match rules {
             Some(rules) => {
                 for name in &rules {
@@ -189,6 +216,7 @@ impl Session {
             engine,
             prompting,
             caller: Mutex::new(None),
+            planning,
         });
         let context = quail_datafusion::session_context_with_rules(
             Arc::clone(&runner) as Arc<dyn RegionRunner>,
@@ -221,8 +249,8 @@ impl Session {
     }
 
     /// Register a table whose rows `scan(columns)` returns as a pyarrow
-    /// Table, and which the engine reads by name inside model regions.
-    /// `id_column` names the column whose values are unique.
+    /// Table, the same rows whenever it is scanned, which `identity`
+    /// names. `id_column` names the column whose values are unique.
     ///
     /// # Errors
     ///
@@ -233,6 +261,7 @@ impl Session {
         schema: SchemaRef,
         scan: Py<PyAny>,
         id_column: Option<&str>,
+        identity: &str,
     ) -> Result<()> {
         let keys: Vec<usize> = id_column
             .and_then(|column| schema.index_of(column).ok())
@@ -248,7 +277,10 @@ impl Session {
             scan,
             constraints,
         };
-        self.register_table(name, Arc::new(RunnerTable::new(Arc::new(table))))
+        self.register_table(
+            name,
+            Arc::new(IdentifiedTable::new(Arc::new(table), identity)),
+        )
     }
 
     /// Run a query and return its rows, with each column named as

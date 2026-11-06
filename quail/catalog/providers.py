@@ -11,6 +11,15 @@ import pyarrow as pa
 
 from quail.logical import CompileError
 
+# separates a table's name from its alias in the name of a model region's
+# input that holds some of the table's rows, as in reviews__r
+INPUT_SEPARATOR = "__"
+
+
+def table_name(provider: str) -> str:
+    """Return the registered table a scanned provider reads."""
+    return provider.split(INPUT_SEPARATOR, 1)[0]
+
 
 @dataclass(frozen=True)
 class ScanRequest:

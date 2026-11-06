@@ -1,4 +1,4 @@
-//! `RunnerTable`: a table the region runner reads itself.
+//! `IdentifiedTable`: a table whose rows have a content identity.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -12,31 +12,47 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 
-/// A table the [`crate::RegionRunner`] reads by name inside a model
-/// region, such as a Python provider whose token counts Quail caches.
+/// A table whose rows are the same whenever it is scanned, named by its
+/// content identity, such as a registered Python provider's.
 ///
-/// DataFusion scans the inner table for the operators outside model
-/// regions. A model region that reads any other table receives that
-/// table's rows as an input.
-pub struct RunnerTable {
+/// A model region reads it by name; the runner reads its rows and keeps
+/// its token store for later queries under the identity. DataFusion
+/// scans it for the operators outside model regions.
+pub struct IdentifiedTable {
     inner: Arc<dyn TableProvider>,
+    identity: String,
 }
 
-impl RunnerTable {
-    /// Mark `inner` as read by the region runner.
-    pub fn new(inner: Arc<dyn TableProvider>) -> Self {
-        Self { inner }
+impl IdentifiedTable {
+    /// `inner`, whose rows `identity` names.
+    pub fn new(inner: Arc<dyn TableProvider>, identity: impl Into<String>) -> Self {
+        Self {
+            inner,
+            identity: identity.into(),
+        }
+    }
+
+    /// The identity of the table's rows.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// The table it marks.
+    pub fn inner(&self) -> &Arc<dyn TableProvider> {
+        &self.inner
     }
 }
 
-impl fmt::Debug for RunnerTable {
+impl fmt::Debug for IdentifiedTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RunnerTable").finish_non_exhaustive()
+        f.debug_struct("IdentifiedTable")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
     }
 }
 
 #[async_trait]
-impl TableProvider for RunnerTable {
+impl TableProvider for IdentifiedTable {
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
