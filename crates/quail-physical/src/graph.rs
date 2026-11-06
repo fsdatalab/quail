@@ -37,6 +37,27 @@ tagged_struct! {
     }
 }
 
+tagged_struct! {
+    /// A model call's answer columns, as a node's output reports them
+    /// before later row operations.
+    AnswerOutput(AnswerOutputFields, AnswerOutputTagged) = "quail.physical.base.AnswerOutput" {
+        kind: String,
+        name: String,
+        columns: Vec<String>,
+    }
+}
+
+tagged_struct! {
+    /// One output of a node: its name, what it carries, its columns, and
+    /// the model answer it holds, if any.
+    OutputPort(OutputPortFields, OutputPortTagged) = "quail.physical.base.OutputPort" {
+        name: String,
+        value_type: ValueType,
+        schema: Vec<String>,
+        answer: Option<AnswerOutput>,
+    }
+}
+
 /// A physical graph: its nodes, and the port that returns the result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

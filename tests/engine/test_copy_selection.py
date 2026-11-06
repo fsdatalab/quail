@@ -1,7 +1,6 @@
 """Lazy copy preparation and diagnostic parity with the host token rule."""
 
 import json
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -31,8 +30,7 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
 ):
     text = "five days or five years. five years."
     spec, vocabulary = make_spec(text)
-    spec = replace(
-        spec,
+    spec = spec.replace(
         top_tokens=4,
         max_answer_tokens=12,
         draft_tokens=draft_tokens,
@@ -118,8 +116,7 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
 def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
     text = "five days or five years long lease"
     spec, vocabulary = make_spec(text, "five")
-    spec = replace(
-        spec,
+    spec = spec.replace(
         top_tokens=4,
         max_answer_tokens=8,
         draft_tokens=4,

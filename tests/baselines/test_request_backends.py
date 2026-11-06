@@ -12,10 +12,10 @@ from helpers.baselines import (
     _session,
 )
 
-from quail.baselines.nodes import RequestExecution
 from quail.baselines.vllm import stock_vllm_backend
 from quail.builtins import built_in_registry
-from quail.physical import decode_graph
+from quail.physical import RequestExecution
+from quail.physical.plan import graph_from_envelope
 from quail.specs import (
     B200,
     H100_SXM,
@@ -51,8 +51,8 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
         assert plan.backend == request_node.backend == backend_name
         assert request_node.filters[0].alias == "d"
         plan.graph.validate_backend(backend_name)
-        envelope = plan.to_envelope(registry.codecs)
-        decoded = decode_graph(envelope["graph"], registry.codecs)
+        envelope = plan.to_envelope()
+        decoded = graph_from_envelope(envelope)
         assert decoded.node("request-model") == request_node
         session.close()
 
@@ -201,7 +201,7 @@ class _MapClient:
 @pytest.mark.parametrize("submission", ["operator-at-a-time", "shuffled"])
 def test_extracts_and_maps_of_a_document_go_in_one_generate_call(submission,
                                                                  with_maps):
-    from quail.baselines.nodes import RequestExtractSpec, RequestMapSpec
+    from quail.physical import RequestExtractSpec, RequestMapSpec
 
     class Client(_MapClient):
         def __init__(self):
@@ -239,7 +239,7 @@ def test_extracts_and_maps_of_a_document_go_in_one_generate_call(submission,
 
 @pytest.mark.parametrize("submission", ["operator-at-a-time", "shuffled", "pipelined"])
 def test_maps_write_each_answer_under_its_own_limit(submission):
-    from quail.baselines.nodes import RequestMapSpec
+    from quail.physical import RequestMapSpec
 
     specs = tuple(RequestMapSpec(alias="d", output=output, tail_token_ids=(tail,),
                                  max_answer_tokens=limit)

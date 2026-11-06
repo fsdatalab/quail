@@ -219,8 +219,7 @@ def iter_ipc_stream(path: str | Path, limit: int | None = None):
     yield chunks.take()
 
 
-def result_from_parts(table: pa.Table, report: dict, answers: dict,
-                      codecs=None) -> QueryResult:
+def result_from_parts(table: pa.Table, report: dict, answers: dict) -> QueryResult:
     """Rebuild a QueryResult from saved parts.
 
     Args:
@@ -229,22 +228,17 @@ def result_from_parts(table: pa.Table, report: dict, answers: dict,
         answers: Answer tables by kind, each keyed as the result keys
             them: filters by (alias, position), joins by position, and
             classifies, scores, and extracts by name.
-        codecs: Node codecs used to decode the executed plan, when the
-            caller wants ``result.explain()`` to work.
     """
     result = QueryResult.from_table(table, report)
     result.answer_tables = answers
-    if codecs is not None:
-        result.attach_executed_plan(codecs)
-    return result
+    return result.attach_executed_plan()
 
 
-def load_result(directory: str | Path, manifest: dict, codecs=None
-                ) -> QueryResult:
+def load_result(directory: str | Path, manifest: dict) -> QueryResult:
     """Load a saved result directory into a QueryResult."""
     directory = Path(directory)
     files = manifest["files"]
     report = json.loads((directory / files["report"]).read_text("utf-8"))
     answers = read_answer_tables(files, lambda name: read_table(directory / name))
     return result_from_parts(read_table(directory / files["result"]), report,
-                             answers, codecs)
+                             answers)

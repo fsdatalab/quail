@@ -19,14 +19,12 @@ from bench.quailb import (
 from bench.substrait import sql_string
 from quail.api.config import EngineConfig
 from quail.api.execute import execute_query
-from quail.baselines.nodes import RequestExecution
-from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.result import answer_table
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.physical import decode_graph
-from quail.physical.plan import Refusal
+from quail.physical import RequestExecution
+from quail.physical.plan import Refusal, graph_from_envelope
 from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.minimum import DocumentTokens, token_metrics
 from quail_b.prompts import DISCUSS_ASPECT, F1
@@ -102,7 +100,7 @@ _REPORT = {"wall_s": 2.0, "boot_s": 3.0, "boot_kind": "cold", "boot": {},
 def _execute(query, nodes, **metrics):
     """Run a query on a request backend whose node results nodes() plants."""
     def execute(request):
-        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+        graph = graph_from_envelope(request.plan)
         outputs = export_physical_outputs(
             graph, RunResult(None, nodes(graph, request), NodeMetrics()))
         return PhysicalResponse(outputs, {**_REPORT, **metrics})

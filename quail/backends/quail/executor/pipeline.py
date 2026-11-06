@@ -29,8 +29,15 @@ from quail.common.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import id_positions
 from quail.execution.rows import Rows
 from quail.execution.runtimes.filter import FilterRuntime
-from quail.physical import AiClassify, AiExtract, AiFilter, AiJoin, AiScore, Filter
-from quail.physical.base import ValueType
+from quail.physical import (
+    AiClassify,
+    AiExtract,
+    AiFilter,
+    AiJoin,
+    AiScore,
+    Filter,
+    ValueType,
+)
 
 
 def execute_pipeline(state: QueryExecutionState, nodes, inputs, context) -> dict:

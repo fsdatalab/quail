@@ -27,6 +27,7 @@ from quail.physical import (
     AiMap,
     AiSaeFeatures,
     AiScore,
+    Barrier,
     PhysicalGraph,
     Scan,
 )
@@ -227,13 +228,22 @@ def model_answers(graph, result) -> tuple[dict, list]:
     return {alias: pa.concat_tables(tables) for alias, tables in filters.items()}, joins
 
 
+# the fields the report shows of each executed join and barrier
+_JOIN_FIELDS = {
+    AiJoin.type_name: (
+        "written_position", "exec_index", "anchor", "partners", "semantics",
+        "selectivity", "expected_rows", "anchor_frame_tokens", "pair_tail_tokens",
+        "anchor_resident", "tuple_tokens", "pairs_from", "keep_kv", "attention",
+        "share_prefixes"),
+    Barrier.type_name: ("next_anchor", "aliases"),
+}
+
+
 def executed_join_plan(graph) -> list[dict]:
     """Describe the join nodes executed from the saved graph."""
-    from quail.physical import Barrier
-
     return [
         {"type": node.type_name, "id": node.node_id,
-         **node.explain_fields()}
+         **{name: getattr(node, name) for name in _JOIN_FIELDS[node.type_name]}}
         for node in graph.topological_nodes()
-        if isinstance(node, (AiJoin, Barrier))
+        if node.type_name in _JOIN_FIELDS
     ]

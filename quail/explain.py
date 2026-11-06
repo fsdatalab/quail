@@ -6,10 +6,7 @@ from dataclasses import asdict, fields, is_dataclass
 
 import _quail_native
 
-from quail.physical.codec import built_in_codecs, encode_value, untagged
 from quail.physical.plan import Refusal
-
-_BUILT_IN_MODULE = "quail.physical.nodes"
 
 
 def _json(value) -> str:
@@ -29,32 +26,6 @@ def _shown(value):
     return str(value)
 
 
-def _graph(graph) -> tuple[dict, dict]:
-    """Encode a graph for Rust, with each extension node's own report.
-
-    Returns:
-        (the encoded graph, node id -> an extension node's type name,
-        inputs, outputs, and explain fields).
-    """
-    codecs = {codec.type_name: codec for codec in built_in_codecs()}
-    nodes, extensions = [], {}
-    for node in graph.nodes:
-        codec = codecs.get(node.type_name)
-        if codec is not None and type(node).__module__.startswith(_BUILT_IN_MODULE):
-            nodes.append(codec.encode(node))
-            continue
-        nodes.append({"id": node.node_id})
-        extensions[node.node_id] = {
-            "type_name": node.type_name,
-            "inputs": [[port.name, port.source.node_id, port.source.port]
-                       for port in node.inputs],
-            "outputs": [output.name for output in node.outputs],
-            "fields": [(name, _shown(value))
-                       for name, value in node.explain_fields().items()],
-        }
-    return {"nodes": nodes, "root": encode_value(graph.root)}, extensions
-
-
 def _metrics(node_metrics) -> dict:
     """Each node's measured metrics as (field, value) pairs."""
     return {
@@ -69,7 +40,7 @@ def _model_spec(model: str):
     from quail.specs import MODELS
 
     spec = MODELS.get(model)
-    return None if spec is None else untagged(encode_value(spec))
+    return None if spec is None else asdict(spec)
 
 
 def explain(logical, physical, *, verbose: bool = False, result=None,
@@ -100,16 +71,14 @@ def explain(logical, physical, *, verbose: bool = False, result=None,
     if isinstance(physical, Refusal):
         request["refusal"] = asdict(physical)
     else:
-        graph, extensions = _graph(physical.graph)
         request["physical"] = {
             "backend": physical.backend, "model": physical.model,
             "device": physical.device, "gpus": physical.gpus,
             "settings": list(physical.settings.items()),
             "shown_settings": [(name, _shown(value))
                                for name, value in physical.settings.items()],
-            "graph": graph,
+            "graph": json.loads(physical.graph.to_json()),
             "estimates": list((physical.estimates or {}).items()),
-            "extensions": extensions,
         }
         request["model_spec"] = _model_spec(physical.model)
         if result is not None:
@@ -131,11 +100,10 @@ def physical_tree(graph, *, verbose: bool = False, node_metrics=None,
     Returns:
         The tree text.
     """
-    encoded, extensions = _graph(graph)
     request = {
         "tree_only": True,
         "verbose": verbose,
-        "physical": {"graph": encoded, "extensions": extensions},
+        "physical": {"graph": json.loads(graph.to_json())},
         "run": {"report": report or {},
                 "metrics": _metrics(node_metrics or {})},
     }

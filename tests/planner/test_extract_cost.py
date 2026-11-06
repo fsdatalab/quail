@@ -9,8 +9,10 @@ from helpers.rust_cost import Cost, cost_model, native
 from helpers.work import ask, decode, scan
 
 from quail.common.work import Work
-from quail.physical import ExtractSpec
 from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+# an ExtractSpec's default answer limit
+MAX_ANSWER_TOKENS = 64
 
 HEAD, TAIL = 2, 40
 CHUNK = 10000
@@ -21,7 +23,7 @@ ANSWER_TOKENS = 16
 def _cost(lengths, *, gpus=1):
     return Cost(*cost_model().extract_estimate(
         len(lengths), lengths, [], HEAD, TAIL, CHUNK, QWEN3_4B_FP8.name,
-        H100_SXM.name, False, ExtractSpec.max_answer_tokens, 16, "fixed", 0.0,
+        H100_SXM.name, False, MAX_ANSWER_TOKENS, 16, "fixed", 0.0,
         gpus, ANSWER_TOKENS))
 
 
@@ -29,7 +31,7 @@ def _document(length, *, resident=False, shared=0):
     """One document's work fields, fed tokens, and readout rows."""
     [record] = native.CostModel.extract_document_work(
         [length], [shared], HEAD, TAIL, 0, resident,
-        ExtractSpec.max_answer_tokens, 16, "fixed", 0.0, ANSWER_TOKENS, False)
+        MAX_ANSWER_TOKENS, 16, "fixed", 0.0, ANSWER_TOKENS, False)
     return record
 
 
@@ -123,8 +125,8 @@ def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     work, fed, rows = _document(100)
     context = HEAD + 100 + TAIL
     round_tokens = 1 + 16
-    rounds = _rounds(ANSWER_TOKENS, ExtractSpec.max_answer_tokens, 16)
-    answer = _rounds_work(context, round_tokens, ExtractSpec.max_answer_tokens,
+    rounds = _rounds(ANSWER_TOKENS, MAX_ANSWER_TOKENS, 16)
+    answer = _rounds_work(context, round_tokens, MAX_ANSWER_TOKENS,
                           ANSWER_TOKENS)
     _assert_same_work(work, scan(HEAD + 100, TAIL) + answer)
     assert fed == pytest.approx(TAIL + rounds * round_tokens)

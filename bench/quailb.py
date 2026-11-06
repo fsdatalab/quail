@@ -13,6 +13,7 @@ no Modal or volume is involved:
 """
 
 import argparse
+import json
 import os
 import time
 from dataclasses import asdict
@@ -28,11 +29,17 @@ import quail_b as benchmark
 from bench import substrait
 from bench.results import write_json
 from quail.api.prompts import bind_classify_prompt, bind_extract_prompt
-from quail.baselines.nodes import RequestExecution
-from quail.common.expressions import SPAN_SUFFIX, Prompt
+from quail.common.expressions import SPAN_SUFFIX
 from quail.execution.result import answer_values
-from quail.physical import AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore
-from quail.physical.codec import decode_value
+from quail.physical import (
+    AiClassify,
+    AiExtract,
+    AiMap,
+    AiSaeFeatures,
+    AiScore,
+    RequestExecution,
+    decode_plan_value,
+)
 from quail.physical.lowering import lower_prompt
 from quail.physical.plan import Refusal
 from quail.progress import say
@@ -290,10 +297,11 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
         anchors: Written join position -> the anchor alias.
     """
     prompts = query.facts()["prompts"]
-    filters = {alias: [decode_value(Prompt, prompt) for prompt in written]
+    filters = {alias: [decode_plan_value(json.dumps(prompt)) for prompt in written]
                for alias, written in prompts["filters"].items()}
-    joins = [decode_value(Prompt, prompt) for prompt in prompts["joins"]]
-    classifies = {name: (decode_value(Prompt, found["prompt"]), found["aliases"])
+    joins = [decode_plan_value(json.dumps(prompt)) for prompt in prompts["joins"]]
+    classifies = {name: (decode_plan_value(json.dumps(found["prompt"])),
+                         found["aliases"])
                   for name, found in prompts["classifies"].items()}
 
     def lower(prompt):

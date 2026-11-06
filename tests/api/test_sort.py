@@ -5,8 +5,7 @@ import pyarrow as pa
 from quail.execution.metrics import NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.runtimes import SortRuntime
-from quail.physical import Sort
-from quail.physical.base import input_ports
+from quail.physical import Sort, input_ports
 
 
 def _sort(**fields):

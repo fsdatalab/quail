@@ -7,7 +7,6 @@ import pytest
 from helpers import server_fakes
 
 import quail
-from quail.builtins import built_in_registry
 from quail.remote import artifacts, inputs
 from quail.server.executor import InProcessExecutor
 from quail.server.scheduler import Scheduler
@@ -44,8 +43,7 @@ def test_in_process_run_saves_a_readable_and_verified_result(store, tmp_path):
     assert final.progress["label"] == "filter (2 stages)"
     assert final.result["rows"] == 2 and final.result["columns"] == ["r.id"]
     directory = tmp_path / final.result["directory"]
-    result = artifacts.load_result(directory, final.result,
-                                   built_in_registry().codecs)
+    result = artifacts.load_result(directory, final.result)
     assert sorted(result.to_rows()) == [("r0",), ("r3",)]
     assert result.report["fresh_tokens"] > 0
     assert "Scan" in result.explain()

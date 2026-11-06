@@ -1,6 +1,5 @@
 """Test classification within filter and join pipelines."""
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -33,8 +32,8 @@ from quail.physical import (
     PhysicalGraph,
     PortRef,
     Scan,
+    input_ports,
 )
-from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS
 
 # the classification frame is written after the document like a join
@@ -143,7 +142,7 @@ def fused_graph(*, classify_only=False):
             node_id="classify:kind",
             inputs=input_ports((PortRef("label:again", "rows:r"),)),
             backend_name="quail", model="qwen3-4b-fp8",
-            spec=replace(spec, name="kind", labels=("b", "a"),
+            spec=spec.replace(name="kind", labels=("b", "a"),
                          prompt_token_parts=((), (CLASSIFY_FRAME + 1, CUE)))),
         AiJoin(
             node_id="group:0", anchor="r", anchor_resident="filter",
@@ -157,7 +156,7 @@ def fused_graph(*, classify_only=False):
     if classify_only:
         nodes = [node for node in nodes if node.node_id not in (
             "input:p", "filter:r", "group:0")]
-        nodes = [replace(node, inputs=input_ports((PortRef("input:r", "rows:r"),)))
+        nodes = [node.replace(inputs=input_ports((PortRef("input:r", "rows:r"),)))
                  if node.node_id == "classify:r" else node for node in nodes]
         return PhysicalGraph(tuple(nodes), PortRef("classify:kind", "rows:r"))
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "rows:r"))
@@ -296,8 +295,8 @@ def joined_graph(two_joins=False):
     if two_joins:
         nodes.insert(2, Scan(node_id="input:q", alias="q", input_id="q"))
         join = nodes[3]
-        nodes.insert(4, replace(
-            join, node_id="group:1", written_position=3, exec_index=1, partners=("q",),
+        nodes.insert(4, join.replace(
+            node_id="group:1", written_position=3, exec_index=1, partners=("q",),
             inputs=input_ports((PortRef("group:0", "rows:r"),
                                 PortRef("input:q", "rows:q"))),
             frame_token_ids=(FRAME + 1,), label_token_ids=(("q", ()),)))
@@ -307,12 +306,11 @@ def joined_graph(two_joins=False):
 @pytest.mark.parametrize("two_joins", [True])
 def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         monkeypatch, two_joins):
-    from quail.physical.pipelines import build_pipelines
 
     graph = joined_graph(two_joins)
     pipelines = {tuple(
         member.node_id for member in pipeline)
-        for pipeline in build_pipelines(graph).values()}
+        for pipeline in graph.pipelines().values()}
     assert pipelines == {("group:0", "group:1", "classify:rp") if two_joins
                       else ("group:0", "classify:rp")}
 
@@ -448,7 +446,7 @@ def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
             alias="r", arena_writes=True, question_token_ids=(QUESTION,),
             written_position=0, question_tokens=1, preamble_tokens=0,
             selectivity=0.8, expected_rows=14 * 0.8),
-        replace(nodes[1], inputs=input_ports((PortRef("filter:r", "rows:r"),))),
+        nodes[1].replace(inputs=input_ports((PortRef("filter:r", "rows:r"),))),
         nodes[2],
         AiFilter(
             node_id="filter:again",
@@ -460,13 +458,12 @@ def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
             node_id="classify:kind",
             inputs=input_ports((PortRef("filter:again", "rows:r"),)),
             backend_name="quail", model="qwen3-4b-fp8",
-            spec=replace(spec, name="kind", labels=("b", "a"),
+            spec=spec.replace(name="kind", labels=("b", "a"),
                          prompt_token_parts=((), (CLASSIFY_FRAME + 1, CUE)))),
     ]
     graph = PhysicalGraph(tuple(nodes), PortRef("classify:kind", "rows:r"))
-    from quail.physical.pipelines import build_pipelines
 
-    assert [member.node_id for member in build_pipelines(graph)["filter:r"]] == [
+    assert [member.node_id for member in graph.pipelines()["filter:r"]] == [
         "filter:r", "classify:r", "label:r", "filter:again", "classify:kind"]
     state = {
         "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,

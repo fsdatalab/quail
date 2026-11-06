@@ -15,7 +15,8 @@ from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import filter_answer_table
 from quail.execution.rows import Rows, extraction_rows
 from quail.execution.types import PhysicalResponse
-from quail.physical import AiExtract, AiFilter, decode_graph
+from quail.physical import AiExtract, AiFilter
+from quail.physical.plan import graph_from_envelope
 
 TEXTS = ["No date", "June", "No date", "August"]
 
@@ -47,7 +48,7 @@ class FixedWorkers:
 
     def execute(self, request):
         registry = self.session.registry
-        graph = decode_graph(request.plan["graph"], registry.codecs)
+        graph = graph_from_envelope(request.plan)
         report = execute_distributed_graph(
             quail_runtime_payload(request, graph), graph, request.gpus,
             self.round, self.session.device, registry.runtimes, registry)

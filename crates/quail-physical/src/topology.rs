@@ -3,9 +3,104 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::graph::{InputPort, PortRef, ValueType};
+use crate::graph::{AnswerOutput, InputPort, OutputPort, PortRef, ValueType};
 use crate::nodes::*;
 use crate::specs::ExtractSpec;
+
+/// The outputs of a request backend's node: each table's survivors, then
+/// each operator's answers.
+fn request_outputs(attributes: &RequestExecutionAttributes) -> Vec<OutputPort> {
+    let port =
+        |name: String, value_type: ValueType, schema: Vec<String>, kind: Option<&str>| OutputPort {
+            answer: kind.map(|kind| AnswerOutput {
+                kind: kind.into(),
+                name: schema.last().cloned().unwrap_or_default(),
+                columns: schema.clone(),
+            }),
+            name,
+            value_type,
+            schema,
+        };
+    let answers = |alias: &str| vec![alias.to_string(), "predicate".into(), "answer".into()];
+    let mut outputs: Vec<OutputPort> = attributes
+        .aliases
+        .iter()
+        .map(|alias| {
+            port(
+                format!("rows:{alias}"),
+                ValueType::Rows,
+                vec![alias.clone()],
+                None,
+            )
+        })
+        .collect();
+    for spec in &attributes.filters {
+        outputs.push(port(
+            format!("filter_answers:{}", spec.alias),
+            ValueType::FilterAnswers,
+            answers(&spec.alias),
+            None,
+        ));
+    }
+    for spec in &attributes.joins {
+        let mut schema = spec.aliases.clone();
+        schema.push("answer".into());
+        outputs.push(port(
+            format!("join_answers:{}", spec.written_position),
+            ValueType::JoinAnswers,
+            schema,
+            None,
+        ));
+    }
+    for spec in &attributes.classifies {
+        let mut schema = vec![spec.alias.clone()];
+        schema.extend(spec.partner.iter().cloned());
+        schema.push(spec.output.clone());
+        outputs.push(port(
+            format!("label_answers:{}", spec.output),
+            ValueType::LabelAnswers,
+            schema,
+            Some("classifies"),
+        ));
+    }
+    for spec in attributes
+        .classifies
+        .iter()
+        .filter(|spec| !spec.tests.is_empty())
+    {
+        outputs.push(port(
+            format!("label_in_answers:{}", spec.output),
+            ValueType::FilterAnswers,
+            answers(&spec.alias),
+            None,
+        ));
+    }
+    for spec in &attributes.extracts {
+        let mut answer = port(
+            format!("extract_answers:{}", spec.output),
+            ValueType::ExtractAnswers,
+            vec![
+                spec.alias.clone(),
+                spec.output.clone(),
+                format!("{}_span", spec.output),
+            ],
+            Some("extracts"),
+        );
+        if let Some(found) = &mut answer.answer {
+            found.name = spec.output.clone();
+        }
+        outputs.push(answer);
+    }
+    for spec in &attributes.maps {
+        outputs.push(port(
+            format!("map_answers:{}", spec.output),
+            ValueType::Rows,
+            vec![spec.alias.clone(), spec.output.clone()],
+            Some("maps"),
+        ));
+    }
+    outputs
+}
 
 /// The value type a port name carries.
 pub fn value_type_for_port(name: &str) -> ValueType {
@@ -44,7 +139,8 @@ pub fn port(node_id: &str, port: impl Into<String>) -> PortRef {
     }
 }
 
-fn same_decoding(one: &ExtractSpec, other: &ExtractSpec) -> bool {
+/// Whether two extractions can use the same decoder.
+pub fn same_decoding(one: &ExtractSpec, other: &ExtractSpec) -> bool {
     one.max_answer_tokens == other.max_answer_tokens
         && one.draft_tokens == other.draft_tokens
         && one.draft_policy == other.draft_policy
@@ -147,34 +243,78 @@ impl PhysicalNode {
         }
     }
 
-    /// The node's outputs: each port's name and value type.
-    pub fn outputs(&self) -> Vec<(String, ValueType)> {
-        let rows = |name: String| (name, ValueType::Rows);
+    /// The kind of answer a model node's rows output reports.
+    fn answer_kind(&self) -> &'static str {
         match self {
-            PhysicalNode::Scan(node) => vec![rows(format!("rows:{}", node.attributes.alias))],
-            PhysicalNode::AiFilter(node) => vec![
-                rows(format!("rows:{}", node.attributes.alias)),
-                (
-                    format!("filter_answers:{}", node.attributes.alias),
-                    ValueType::FilterAnswers,
-                ),
-            ],
+            PhysicalNode::AiClassify(_) => "classifies",
+            PhysicalNode::AiExtract(_) => "extracts",
+            PhysicalNode::AiMap(_) => "maps",
+            PhysicalNode::AiSaeFeatures(_) => "features",
+            _ => "scores",
+        }
+    }
+
+    /// A model node's spec name; empty without a spec.
+    pub fn spec_name(&self) -> String {
+        match self {
+            PhysicalNode::AiScore(node) => node.attributes.spec.as_ref().map(|s| s.name.clone()),
+            PhysicalNode::AiClassify(node) => node.attributes.spec.as_ref().map(|s| s.name.clone()),
+            PhysicalNode::AiExtract(node) => node.attributes.spec.as_ref().map(|s| s.name.clone()),
+            PhysicalNode::AiMap(node) => node.attributes.spec.as_ref().map(|s| s.name.clone()),
+            PhysicalNode::AiSaeFeatures(node) => {
+                node.attributes.spec.as_ref().map(|s| s.name.clone())
+            }
+            _ => None,
+        }
+        .unwrap_or_default()
+    }
+
+    /// The node's outputs: each port's name, value type, columns, and
+    /// model answer.
+    pub fn output_ports(&self) -> Vec<OutputPort> {
+        let output = |name: String, value_type: ValueType, schema: Vec<String>| OutputPort {
+            name,
+            value_type,
+            schema,
+            answer: None,
+        };
+        let rows = |name: String, schema: Vec<String>| output(name, ValueType::Rows, schema);
+        let of = |alias: &str| vec![alias.to_string()];
+        let answers = |alias: &str| vec![alias.to_string(), "predicate".into(), "answer".into()];
+        match self {
+            PhysicalNode::Scan(node) => {
+                let alias = &node.attributes.alias;
+                vec![rows(format!("rows:{alias}"), of(alias))]
+            }
+            PhysicalNode::AiFilter(node) => {
+                let alias = &node.attributes.alias;
+                vec![
+                    rows(format!("rows:{alias}"), of(alias)),
+                    output(
+                        format!("filter_answers:{alias}"),
+                        ValueType::FilterAnswers,
+                        answers(alias),
+                    ),
+                ]
+            }
             PhysicalNode::Filter(node) => {
                 let attributes = &node.attributes;
-                match attributes.aliases.len() {
-                    0 => vec![rows("rows".into())],
-                    1 => vec![
-                        rows(format!("rows:{}", attributes.aliases[0])),
-                        (
-                            format!("filter_answers:{}", attributes.aliases[0]),
+                match attributes.aliases.as_slice() {
+                    [] => vec![rows("rows".into(), attributes.columns.clone())],
+                    [alias] => vec![
+                        rows(format!("rows:{alias}"), Vec::new()),
+                        output(
+                            format!("filter_answers:{alias}"),
                             ValueType::FilterAnswers,
+                            Vec::new(),
                         ),
                     ],
                     _ => vec![
-                        rows("rows".into()),
-                        (
+                        rows("rows".into(), Vec::new()),
+                        output(
                             format!("join_answers:{}", attributes.written_position),
                             ValueType::JoinAnswers,
+                            Vec::new(),
                         ),
                     ],
                 }
@@ -183,29 +323,89 @@ impl PhysicalNode {
                 .attributes
                 .aliases
                 .iter()
-                .map(|alias| rows(format!("rows:{alias}")))
+                .map(|alias| rows(format!("rows:{alias}"), of(alias)))
                 .collect(),
-            PhysicalNode::Exchange(node) => vec![rows(format!("rows:{}", node.attributes.anchor))],
-            PhysicalNode::HashJoin(node) => vec![(
-                format!("pairs:{}", node.attributes.written_position),
-                ValueType::Pairs,
-            )],
-            PhysicalNode::AiJoin(node) => vec![
-                rows(format!("rows:{}", node.attributes.anchor)),
-                (
-                    format!("join_answers:{}", node.attributes.written_position),
-                    ValueType::JoinAnswers,
-                ),
-            ],
-            PhysicalNode::Recombine(_) => vec![rows("tuples".into())],
-            _ if self.is_inference() => {
-                if self.has_spec() {
-                    vec![rows(self.rows_port())]
-                } else {
-                    Vec::new()
-                }
+            PhysicalNode::Exchange(node) => {
+                let anchor = &node.attributes.anchor;
+                vec![rows(format!("rows:{anchor}"), of(anchor))]
             }
-            _ => vec![rows("rows".into())],
+            PhysicalNode::HashJoin(node) => {
+                let attributes = &node.attributes;
+                vec![output(
+                    format!("pairs:{}", attributes.written_position),
+                    ValueType::Pairs,
+                    vec![attributes.left.clone(), attributes.right.clone()],
+                )]
+            }
+            PhysicalNode::AiJoin(node) => {
+                let attributes = &node.attributes;
+                let mut schema = of(&attributes.anchor);
+                schema.extend(attributes.partners.iter().cloned());
+                schema.push("answer".into());
+                vec![
+                    rows(
+                        format!("rows:{}", attributes.anchor),
+                        of(&attributes.anchor),
+                    ),
+                    output(
+                        format!("join_answers:{}", attributes.written_position),
+                        ValueType::JoinAnswers,
+                        schema,
+                    ),
+                ]
+            }
+            PhysicalNode::Project(_)
+            | PhysicalNode::Sort(_)
+            | PhysicalNode::Unnest(_)
+            | PhysicalNode::Limit(_) => vec![rows("rows".into(), self.output_schema())],
+            PhysicalNode::Recombine(_) => vec![rows("tuples".into(), self.output_schema())],
+            PhysicalNode::RequestExecution(node) => request_outputs(&node.attributes),
+            PhysicalNode::Extension(node) => node.outputs.clone(),
+            _ if self.has_spec() => {
+                let name = self.spec_name();
+                let mut columns = self.spec_aliases();
+                columns.push(name.clone());
+                if matches!(self, PhysicalNode::AiExtract(_)) {
+                    columns.push(format!("{name}_span"));
+                }
+                vec![OutputPort {
+                    name: self.rows_port(),
+                    value_type: ValueType::Rows,
+                    schema: columns.clone(),
+                    answer: Some(AnswerOutput {
+                        kind: self.answer_kind().into(),
+                        name,
+                        columns,
+                    }),
+                }]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The node's outputs: each port's name and value type.
+    pub fn outputs(&self) -> Vec<(String, ValueType)> {
+        self.output_ports()
+            .into_iter()
+            .map(|port| (port.name, port.value_type))
+            .collect()
+    }
+
+    /// Where the node runs: a model node, or a condition on documents, on
+    /// the GPU executor; every other node on the coordinator.
+    pub fn location(&self) -> Location {
+        match self {
+            PhysicalNode::Filter(node) if node.attributes.aliases.is_empty() => {
+                Location::Coordinator
+            }
+            PhysicalNode::Filter(_)
+            | PhysicalNode::AiFilter(_)
+            | PhysicalNode::AiJoin(_)
+            | PhysicalNode::HashJoin(_)
+            | PhysicalNode::RequestExecution(_) => Location::GpuExecutor,
+            PhysicalNode::Extension(node) => node.location,
+            _ if self.is_inference() => Location::GpuExecutor,
+            _ => Location::Coordinator,
         }
     }
 
@@ -352,6 +552,8 @@ impl PhysicalNode {
     /// The backend of a model node; None for every other node.
     pub fn backend(&self) -> Option<&str> {
         match self {
+            PhysicalNode::RequestExecution(node) => Some(&node.attributes.backend_name),
+            PhysicalNode::Extension(node) => node.backend.as_deref(),
             PhysicalNode::AiFilter(_) | PhysicalNode::AiJoin(_) => Some("quail"),
             PhysicalNode::AiScore(node) => Some(&node.attributes.backend_name),
             PhysicalNode::AiClassify(node) => Some(&node.attributes.backend_name),
@@ -665,4 +867,112 @@ pub fn resident_inputs(nodes: &[PhysicalNode], pipelines: &Pipelines) -> BTreeSe
         }
     }
     resident
+}
+
+/// The name of a value type, as plans write it.
+pub fn value_type_name(value_type: ValueType) -> &'static str {
+    match value_type {
+        ValueType::FilterAnswers => "filter_answers",
+        ValueType::JoinAnswers => "join_answers",
+        ValueType::LabelAnswers => "label_answers",
+        ValueType::ExtractAnswers => "extract_answers",
+        ValueType::Pairs => "pairs",
+        ValueType::Rows => "rows",
+        ValueType::Any => "any",
+    }
+}
+
+/// Check node ids, that every input reads an output of its type and
+/// columns, that the root exists, and that the graph has no cycle.
+///
+/// # Errors
+///
+/// The graph breaks one of those rules.
+pub fn validate_graph(nodes: &[PhysicalNode], root: &PortRef) -> Result<(), String> {
+    let mut by_id: BTreeMap<&str, &PhysicalNode> = BTreeMap::new();
+    for node in nodes {
+        if by_id.insert(node.id(), node).is_some() {
+            return Err(format!("duplicate physical node id {:?}", node.id()));
+        }
+    }
+    let outputs: BTreeMap<(String, String), OutputPort> = nodes
+        .iter()
+        .flat_map(|node| {
+            node.output_ports()
+                .into_iter()
+                .map(|port| ((node.id().to_string(), port.name.clone()), port))
+        })
+        .collect();
+    for node in nodes {
+        for input in node.inputs() {
+            let key = (input.source.node_id.clone(), input.source.port.clone());
+            let Some(actual) = outputs.get(&key) else {
+                return Err(format!(
+                    "{:?} reads missing output {:?}.{:?}",
+                    node.id(),
+                    key.0,
+                    key.1
+                ));
+            };
+            let expected = input.value_type;
+            if expected != ValueType::Any
+                && actual.value_type != ValueType::Any
+                && expected != actual.value_type
+            {
+                return Err(format!(
+                    "{:?} input {:?} expects {}, got {}",
+                    node.id(),
+                    input.name,
+                    value_type_name(expected),
+                    value_type_name(actual.value_type)
+                ));
+            }
+            if !input.schema.is_empty()
+                && !actual.schema.is_empty()
+                && input.schema != actual.schema
+            {
+                return Err(format!(
+                    "{:?} input {:?} has a different schema from its source",
+                    node.id(),
+                    input.name
+                ));
+            }
+        }
+    }
+    let root_key = (root.node_id.clone(), root.port.clone());
+    if !outputs.contains_key(&root_key) {
+        return Err(format!(
+            "root output {:?}.{:?} does not exist",
+            root_key.0, root_key.1
+        ));
+    }
+    // depth-first, each node after its inputs
+    fn visit<'a>(
+        id: &'a str,
+        by_id: &BTreeMap<&'a str, &'a PhysicalNode>,
+        visiting: &mut BTreeSet<&'a str>,
+        visited: &mut BTreeSet<&'a str>,
+    ) -> Result<(), String> {
+        if visiting.contains(id) {
+            return Err("physical graph contains a cycle".into());
+        }
+        if visited.contains(id) {
+            return Ok(());
+        }
+        visiting.insert(id);
+        if let Some(node) = by_id.get(id) {
+            for input in node.inputs() {
+                visit(input.source.node_id.as_str(), by_id, visiting, visited)?;
+            }
+        }
+        visiting.remove(id);
+        visited.insert(id);
+        Ok(())
+    }
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for id in by_id.keys() {
+        visit(id, &by_id, &mut visiting, &mut visited)?;
+    }
+    Ok(())
 }

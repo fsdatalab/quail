@@ -10,7 +10,6 @@ from typing import Any, Mapping
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
-from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.baselines.operators import (
     allowed_members_by_anchor,
     answer_documents,
@@ -37,7 +36,7 @@ from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import answer_values
 from quail.execution.rows import Rows, extraction_rows
-from quail.physical import PhysicalNode
+from quail.physical import PhysicalNode, RequestExecution, RequestExtractSpec
 
 
 class RequestModelExecution:

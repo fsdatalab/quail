@@ -7,13 +7,8 @@ import time
 from quail.backends import BackendExecutionContext
 from quail.execution.result import QueryResult
 from quail.execution.types import PhysicalRequest, PhysicalResponse
-from quail.physical import (
-    ExecutionLocation,
-    Scan,
-    check_plan_envelope,
-    decode_graph,
-)
-from quail.physical.plan import Refusal, RefusalError
+from quail.physical import ExecutionLocation, Scan
+from quail.physical.plan import Refusal, RefusalError, graph_from_envelope
 
 
 class _BackendState:
@@ -68,9 +63,8 @@ def _validate_physical_request(request, registry):
     if not isinstance(request, PhysicalRequest):
         raise TypeError("execution requires a PhysicalRequest")
     envelope = request.plan
-    check_plan_envelope(envelope)
+    graph = graph_from_envelope(envelope)
     backend = registry.backend(envelope["backend"])
-    graph = decode_graph(envelope["graph"], registry.codecs)
     graph.validate(runtime_keys=set(registry.runtimes))
     graph.validate_backend(envelope["backend"])
     needed_inputs = {
@@ -243,7 +237,7 @@ def _prepare_backend(plan, registry) -> None:
     prepare = getattr(backend, "prepare_request", None)
     if prepare is None:
         return
-    envelope = plan.to_envelope(registry.codecs)
+    envelope = plan.to_envelope()
     prepare(BackendExecutionContext(
         request=PhysicalRequest(envelope, {}),
         graph=plan.graph,

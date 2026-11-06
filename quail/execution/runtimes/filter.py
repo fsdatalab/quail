@@ -6,6 +6,7 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail.common.expressions import accepts
 from quail.common.pairs import columns_key
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult, answer_table, filter_answer_table
@@ -62,7 +63,7 @@ def filter_result_rows(node, value) -> NodeResult:
     num_rows, batches = 0, []
     for batch in row_batches(value):
         num_rows += batch.num_rows
-        kept = node.predicate.accepts(ResultColumns(batch), qualified=True)
+        kept = accepts(node.predicate, ResultColumns(batch), qualified=True)
         batches.append(batch.filter(kept).select(list(node.columns)))
     table = pa.Table.from_batches(batches)
     return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
@@ -115,7 +116,7 @@ def filter_scores(node, rows: Rows, tested: pa.Table | None = None) -> NodeResul
         tested: The columns the predicate reads, one row per row of
             rows, when the rows lack some of them.
     """
-    answers = node.predicate.accepts(rows if tested is None else tested)
+    answers = accepts(node.predicate, rows if tested is None else tested)
     filtered = rows.filter(answers)
     if len(node.aliases) == 1:
         answer_name = f"filter_answers:{node.aliases[0]}"

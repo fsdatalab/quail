@@ -928,6 +928,41 @@ mod tests {
         }
     }
 
+    fn stars(comparison: &str, value: Value) -> Condition {
+        Condition::Compare(Box::new(RegularPredicate {
+            expression: ValueExpression::ColumnRef(ColumnRef {
+                alias: "r".into(),
+                provider: "reviews".into(),
+                column: "stars".into(),
+            }),
+            comparison: comparison.into(),
+            value,
+        }))
+    }
+
+    #[test]
+    fn not_moves_down_to_the_column_tests() {
+        let not = |operand| {
+            Condition::Not(Not {
+                operand: Box::new(operand),
+            })
+        };
+        let (high, low) = (stars(">", Value::from(4)), stars("<", Value::from(3)));
+        let written = not(Condition::And(Connective {
+            operands: vec![
+                high.clone(),
+                Condition::Or(Connective {
+                    operands: vec![low.clone(), not(stars("is null", Value::Null))],
+                }),
+            ],
+        }));
+        // De Morgan's laws, two NOTs cancel, and NOT IS NULL is IS NOT NULL
+        assert_eq!(
+            condition_text(&normalize(written)),
+            "NOT (r.stars > 4) OR (NOT (r.stars < 3) AND r.stars IS NULL)"
+        );
+    }
+
     #[test]
     fn strings_print_with_python_quotes() {
         assert_eq!(repr_str("lease"), "'lease'");

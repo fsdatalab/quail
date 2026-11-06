@@ -11,7 +11,6 @@ from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
 from quail.common.expressions import CompileError
 from quail.physical import AiMap
-from quail.physical.pipelines import build_pipelines
 
 REVIEWS = pa.table({"id": [1, 2, 3],
                     "body": ["good film", "bad film", "long dull film"]})
@@ -64,7 +63,7 @@ def test_a_map_after_a_filter_reads_only_its_survivors(session):
     (node,) = _maps(plan)
     (filter_id,) = [n.node_id for n in plan.graph.nodes if n.node_id != node.node_id
                     and n.type_name == "quail.ai_filter"]
-    assert [member.node_id for member in build_pipelines(plan.graph)[
+    assert [member.node_id for member in plan.graph.pipelines()[
         filter_id]] == [filter_id, node.node_id]
     oracle = Oracle(filters=lambda alias, document, position: document != 0)
     assert finish(query, oracle).collect().to_pylist() == [
@@ -79,7 +78,7 @@ def test_a_map_after_a_classification_shares_its_pipeline(session):
     plan = query.plan()
     (node,) = _maps(plan)
     (classify,) = [n for n in plan.graph.nodes if n.type_name == "quail.ai_classify"]
-    assert [member.node_id for member in build_pipelines(plan.graph)[
+    assert [member.node_id for member in plan.graph.pipelines()[
         classify.node_id]] == [classify.node_id, node.node_id]
 
 
@@ -132,7 +131,7 @@ def test_a_plain_test_keeps_only_matching_map_answers(session, form, dialect):
     (node,) = _maps(plan)
     (test,) = [node for node in plan.nodes if node.type_name == "quail.filter"]
     assert test.inputs[0].source.node_id == node.node_id
-    assert [member.node_id for member in build_pipelines(plan.graph)[node.node_id]] == [
+    assert [member.node_id for member in plan.graph.pipelines()[node.node_id]] == [
         node.node_id, test.node_id]
     rows = finish(query, Oracle()).collect().to_pylist()
     assert [list(row.values()) for row in rows] == [[2, "topic 1"]]

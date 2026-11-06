@@ -36,6 +36,7 @@ from quail.physical import (
     AiScore,
     ClassifySpec,
 )
+from quail.physical.plan import graph_from_envelope
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
@@ -356,11 +357,10 @@ def oracle_executor(oracle: Oracle, **report):
     def execute(request):
         from helpers.fakes import graph_state
         from quail.backends.quail.graph import execute_single_graph
-        from quail.builtins import built_in_registry
         from quail.execution.types import PhysicalResponse
-        from quail.physical import Scan, decode_graph
+        from quail.physical import Scan
 
-        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+        graph = graph_from_envelope(request.plan)
         scans = [node for node in graph.nodes if isinstance(node, Scan)]
         oracle.documents = {node.alias: request.inputs[node.input_id].documents
                             for node in scans}

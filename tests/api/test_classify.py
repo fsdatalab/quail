@@ -19,15 +19,13 @@ from quail.common.expressions import (
     CompileError,
     RegularPredicate,
     column_references,
+    condition_tests,
 )
 from quail.physical import (
     AiClassify,
     AiJoin,
     Filter,
-    decode_graph,
-    encode_graph,
 )
-from quail.physical.pipelines import build_pipelines
 from quail.physical.plan import Refusal
 
 
@@ -87,8 +85,6 @@ def test_classify_plans_filters_and_returns_labels(session):
         (False,) * len(ids) for ids in classify.spec.label_token_ids)
     assert test.predicate == RegularPredicate(
         ColumnRef("d", "documents", "topic"), "in", ("refund", "shipping"))
-    codecs = session.registry.codecs
-    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
 
     result = finish(query, _labels(["refund", "praise"]))
     rows = result.collect()
@@ -246,8 +242,8 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
         "d.body, a.aspect))").plan()
     assert not isinstance(spread, Refusal)
     (classify,) = [n for n in spread.nodes if isinstance(n, AiClassify)]
-    assert classify.node_id in {member.node_id for member in build_pipelines(
-        spread.graph)[classify.inputs[0].source.node_id]}
+    pipeline = spread.graph.pipelines()[classify.inputs[0].source.node_id]
+    assert classify.node_id in {member.node_id for member in pipeline}
     distributed.close()
     # a joined row's label is not tested in WHERE
     with pytest.raises(CompileError, match="one table|filter on a label"):
@@ -265,10 +261,8 @@ def test_streamed_classifications_share_one_pipeline(session):
     topic, kind = classifies
     assert [node.spec.name for node in classifies] == ["topic", "kind"]
     assert tuple(
-        member.node_id for member in build_pipelines(plan.graph)[topic.node_id]) == (
+        member.node_id for member in plan.graph.pipelines()[topic.node_id]) == (
         topic.node_id, "filter:d:0", kind.node_id)
-    codecs = session.registry.codecs
-    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
     assert kind.spec.estimated_seconds < topic.spec.estimated_seconds
 
     scorer = _labels(["refund", "praise"])
@@ -283,8 +277,7 @@ def test_streamed_classifications_share_one_pipeline(session):
 
     split = _classify_then_filter(session, filters=2)
     assert tuple(
-        member.node_id for member in build_pipelines(
-            split.plan().graph)[topic.node_id]) == (
+        member.node_id for member in split.plan().graph.pipelines()[topic.node_id]) == (
         topic.node_id, "filter:d:0", "filter:d:1", kind.node_id)
 
     # a later test on a label runs right after its classification, so
@@ -292,8 +285,8 @@ def test_streamed_classifications_share_one_pipeline(session):
     interleaved = _classify_then_filter(session, later_filters=(
         ("kind", ("complaint",)), ("topic", ("refund",))))
     assert tuple(
-        member.node_id for member in build_pipelines(
-            interleaved.plan().graph)[topic.node_id]) == (
+        member.node_id
+        for member in interleaved.plan().graph.pipelines()[topic.node_id]) == (
         topic.node_id, "filter:d:0", "filter:d:2", kind.node_id, "filter:d:1")
     scorer = _labels(["shipping", "praise"])
     result = finish(interleaved, scorer)
@@ -309,7 +302,7 @@ def test_plain_label_tests_share_the_classification_used_by_membership(session):
     (classify,) = [node for node in query.plan().nodes if isinstance(node, AiClassify)]
     # every label test reads the one classification's column
     tested = {reference.column for node in nodes(query.logical, "Filter")
-              for test in node.condition.tests()
+              for test in condition_tests(node.condition)
               for reference in column_references(test.expression)}
     assert tested == {classify.spec.name}
     assert finish(query, _labels(["a", "b"])).collect().to_pylist() == [{"d.id": 7}]

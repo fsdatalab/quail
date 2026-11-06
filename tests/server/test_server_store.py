@@ -1,8 +1,10 @@
 """Saved query records: revisions, query ids, epochs, cancel, recovery."""
 
+import json
+from dataclasses import asdict
+
 import pytest
 
-from quail.physical.codec import decode_fields, encode_fields
 from quail.remote.records import (
     InvalidRequestError,
     QueryIdConflictError,
@@ -38,7 +40,7 @@ def test_create_saves_a_complete_snapshot_and_client_ids_return_it_or_conflict(
     assert status.inputs == INPUTS and not status.done
     assert store.get(status.id) == status
     # the snapshot round trips through JSON without Quail objects
-    assert decode_fields(QueryStatus, encode_fields(status)) == status
+    assert QueryStatus(**json.loads(json.dumps(asdict(status)))) == status
     with pytest.raises(UnknownQueryError):
         store.get("missing")
     with pytest.raises(InvalidRequestError):

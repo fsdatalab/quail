@@ -2,9 +2,8 @@
 
 import json
 from types import SimpleNamespace
-from typing import Any
 
-from quail.physical.codec import decode_value
+from quail.physical import decode_plan_value
 
 NODE_PREFIX = "quail.logical."
 
@@ -17,7 +16,7 @@ def _read(value):
         return SimpleNamespace(kind=tag.rsplit(".", 1)[-1], **fields)
     if isinstance(value, list):
         return tuple(_read(item) for item in value)
-    return decode_value(Any, value)
+    return decode_plan_value(json.dumps(value))
 
 
 def read_plan(logical: str) -> SimpleNamespace:

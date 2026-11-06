@@ -16,7 +16,6 @@ from quail.physical import (
     Project,
     Recombine,
 )
-from quail.physical.pipelines import build_pipelines
 
 
 class NodeRuntime(Protocol):
@@ -110,8 +109,7 @@ class GenericRunner:
                 observer.after_node(node, result)
 
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
-        pipelines = (build_pipelines(graph, completed)
-                     if context.run_pipeline else {})
+        pipelines = graph.pipelines(completed) if context.run_pipeline else {}
         for node in graph.topological_nodes():
             pipeline = pipelines.get(node.node_id)
             if pipeline is not None:

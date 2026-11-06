@@ -116,7 +116,7 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
                 "estimated_seconds": plan.estimated_seconds,
                 "backend": plan.backend,
                 "gpus": plan.gpus,
-                "envelope": plan.to_envelope(session.registry.codecs),
+                "envelope": plan.to_envelope(),
             })
             if job.model_phase is not None:
                 emit("phase", {

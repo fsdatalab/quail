@@ -10,7 +10,8 @@ from quail.api import execute as runtime
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.result import filter_answer_table
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.physical import AiFilter, Scan, decode_graph
+from quail.physical import AiFilter, Scan
+from quail.physical.plan import graph_from_envelope
 
 
 def test_query_scans_provider_and_preserves_extension_objects(
@@ -34,7 +35,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
         calls.append("execute")
         assert "extensions" not in physical.plan
         assert physical.plan["device"] == session.config.device
-        graph = decode_graph(physical.plan["graph"], registry.codecs)
+        graph = graph_from_envelope(physical.plan)
         source = next(node for node in graph.nodes if isinstance(node, Scan))
         documents = physical.inputs[source.input_id].documents
         assert [list(document) for document in documents] == [

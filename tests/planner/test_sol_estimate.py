@@ -12,8 +12,7 @@ from helpers.sessions import TOKENIZER, encoder
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.common.expressions import Prompt
-from quail.physical.codec import decode_value
+from quail.physical import decode_plan_value
 from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_USD_PER_HOUR
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
@@ -170,13 +169,13 @@ def _label(prompt, assignment):
 
 def _filter_prompt(query, alias):
     """Return the first AI.IF prompt on one table's documents."""
-    return decode_value(Prompt, query.facts()["prompts"]["filters"][alias][0])
+    return decode_plan_value(json.dumps(query.facts()["prompts"]["filters"][alias][0]))
 
 
 def _classification_prompt(query):
     """Return the prompt of the query's one classification."""
     (classify,) = query.facts()["prompts"]["classifies"].values()
-    return decode_value(Prompt, classify["prompt"])
+    return decode_plan_value(json.dumps(classify["prompt"]))
 
 
 def test_classifications_and_label_filters_price_like_filters(tmp_path):

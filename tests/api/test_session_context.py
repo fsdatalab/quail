@@ -6,7 +6,6 @@ from helpers.oracle import Oracle, finish, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER, check_table
 
 import quail
-from quail.physical import encode_graph
 
 pytest.importorskip("_quail_native")
 
@@ -94,9 +93,8 @@ def test_a_region_plans_and_answers_as_the_written_query(context, name):
     text = QUERIES[name]
     session = context.session
     (region,) = context.region_sql(text)
-    codecs = session.registry.codecs
-    assert (encode_graph(session.sql(region).plan().graph, codecs)
-            == encode_graph(session.sql(text).plan().graph, codecs)), region
+    assert (session.sql(region).plan().graph
+            == session.sql(text).plan().graph), region
     expected = finish(session.sql(text), ORACLE).collect()
     table = context.sql(text)
     assert table.column_names == expected.column_names
@@ -160,8 +158,6 @@ def test_every_check_query_plans_the_same_graph_through_datafusion():
             context.register(name, quail.DocumentProvider.from_table(
                 check_table(columns), id_col="id"))
         (region,) = context.region_sql(entry["sql"])
-        codecs = session.registry.codecs
-        assert (encode_graph(session.sql(region).plan().graph, codecs)
-                == encode_graph(session.sql(entry["sql"]).plan().graph, codecs)
-                ), entry["id"]
+        assert (session.sql(region).plan().graph
+                == session.sql(entry["sql"]).plan().graph), entry["id"]
         session.close()

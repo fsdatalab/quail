@@ -11,7 +11,7 @@ from quail.catalog import DocumentProvider, ScanRequest, TableProvider
 from quail.common.expressions import ColumnRef
 from quail.execution.result import QueryResult
 from quail.extensions import ExtensionRegistry
-from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
+from quail.physical import ExtensionNode, PhysicalGraph, PhysicalNode
 from quail.physical.lowering import lower_prompt
 from quail.remote.client import QueryRun
 from quail.remote.records import QueryFailedError, QueryStatus
@@ -24,8 +24,8 @@ __all__ = [
     "ColumnRef",
     "DocumentProvider",
     "EngineConfig",
+    "ExtensionNode",
     "ExtensionRegistry",
-    "NodeCodec",
     "PhysicalGraph",
     "PhysicalNode",
     "Query",

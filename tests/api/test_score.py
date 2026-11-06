@@ -17,8 +17,6 @@ from quail.physical import (
     AiClassify,
     AiScore,
     Filter,
-    decode_graph,
-    encode_graph,
 )
 
 PROJECTION_SQL = (
@@ -89,12 +87,6 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
     )
     assert score_filter.predicate == RegularPredicate(
         ColumnRef("d", "", "score"), ">=", 0.7)
-    graph = physical.graph
-    decoded = decode_graph(
-        encode_graph(graph, session.registry.codecs),
-        session.registry.codecs,
-    )
-    assert decoded == graph
 
     for template, query_text in QUERY_TEXTS:
         query = session.sql(
@@ -147,10 +139,6 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
                 assert any(isinstance(node, Filter)
                            and node.predicate.value == ("praise",)
                            for node in physical.nodes)
-            decoded = decode_graph(
-                encode_graph(physical.graph, session.registry.codecs),
-                session.registry.codecs)
-            assert decoded == physical.graph
             result = finish(query, mixed())
             rows = result.collect()
             assert list(zip(rows.column("d.id").to_pylist(),

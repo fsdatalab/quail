@@ -79,7 +79,6 @@ def test_map_answer_tests_follow_maps_on_both_sides_of_join_placement(query,
     from helpers.oracle import Oracle, finish
 
     from quail.physical import AiMap, Filter
-    from quail.physical.pipelines import build_pipelines
 
     # distinct documents, so each gets its own answer
     path = tmp_path / "leases.parquet"
@@ -99,7 +98,7 @@ def test_map_answer_tests_follow_maps_on_both_sides_of_join_placement(query,
         (test,) = [node for node in candidate.nodes if isinstance(node, Filter)]
         assert test.inputs[0].source.node_id == node.node_id
         assert test.selectivity == 0.25
-        pipeline = next(members for members in build_pipelines(candidate.graph).values()
+        pipeline = next(members for members in candidate.graph.pipelines().values()
                         if node in members)
         assert pipeline[pipeline.index(node) + 1] == test
         mapped._plan = candidate

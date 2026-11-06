@@ -14,9 +14,10 @@ from quail.common.expressions import (
     Not,
     Or,
     RegularPredicate,
-    normalize,
+    evaluate_condition,
 )
 from quail.common.selection import selected_rows
+from quail.physical.plan import graph_from_envelope
 
 REF = ColumnRef("r", "reviews", "stars")
 
@@ -50,11 +51,9 @@ def test_regular_predicates_select_documents_before_the_model(session):
     answer = make_executor(TRUTH)
 
     def execute(request):
-        from quail.builtins import built_in_registry
         from quail.physical import Scan as PhysicalScan
-        from quail.physical import decode_graph
 
-        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+        graph = graph_from_envelope(request.plan)
         for node in graph.nodes:
             if isinstance(node, PhysicalScan):
                 seen.append(len(request.inputs[node.input_id].documents))
@@ -92,18 +91,12 @@ def test_regular_predicates_select_documents_before_the_model(session):
     assert _run(query, make_executor(TRUTH)).to_rows() == []
 
 
-def test_not_moves_down_to_the_column_tests_and_keeps_sqls_nulls():
+def test_not_and_or_keep_sqls_nulls():
     stars = pa.table({"stars": [5, None, 2]})
     high, low = _predicate(">", 4), _predicate("<", 3)
     written = Not(And((high, Or((low, Not(_predicate("is null")))))))
-    # De Morgan's laws, two NOTs cancel, and NOT IS NULL is IS NOT NULL
-    assert normalize(written) == Or((Not(high), And((Not(low),
-                                                     _predicate("is null")))))
-    assert str(normalize(written)) == (
-        "NOT (r.stars > 4) OR (NOT (r.stars < 3) AND r.stars IS NULL)")
     # the null row stays null through NOT, AND, and OR, so it is rejected
-    assert written.evaluate(stars).to_pylist() == [False, None, True]
-    assert normalize(written).evaluate(stars).to_pylist() == [False, None, True]
+    assert evaluate_condition(written, stars).to_pylist() == [False, None, True]
     assert selected_rows(stars, (written,)).to_pylist() == [2]
 
 

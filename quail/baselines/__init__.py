@@ -7,10 +7,7 @@ These backends exist to measure Quail against; a user runs the
 
 
 def register_baselines(registry):
-    """Register the comparison backends, their node, and their runtimes."""
-    from quail.physical import NodeCodec
-
-    from .nodes import RequestExecution
+    """Register the comparison backends and their node's runtime."""
     from .request import request_runtimes
     from .vllm import (
         dumb_vllm_backend,
@@ -24,7 +21,6 @@ def register_baselines(registry):
                     shuffled_vllm_backend(), ngram_vllm_backend(),
                     dumb_vllm_backend()):
         registry.register_backend(backend)
-    registry.register_codec(NodeCodec(RequestExecution))
     for runtime_key, runtime in request_runtimes().items():
         registry.register_runtime(runtime, key=runtime_key)
     return registry

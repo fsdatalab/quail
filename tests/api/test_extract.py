@@ -1,6 +1,5 @@
 """AI.EXTRACT: the operator surface, its prompt, and its plan."""
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -13,16 +12,14 @@ from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
-from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
 from quail.common.expressions import CompileError
 from quail.physical import (
     AiExtract,
     Filter,
-    decode_graph,
-    encode_graph,
+    RequestExecution,
+    RequestExtractSpec,
 )
-from quail.physical.pipelines import build_pipelines, resident_inputs
 from quail.physical.plan import Refusal
 
 QUESTION = "When does the lease end?"
@@ -152,8 +149,8 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     # an engine that takes text gets the preamble, the document, and
     # the tail's text, tokenized by the engine itself
     texted = _TextPhraseClient()
-    node = replace(node, preamble_text="DOCUMENT:\n",
-                   extracts=(replace(specs[0], tail_text="\nQ?\nPhrase:"),))
+    node = node.replace(preamble_text="DOCUMENT:\n",
+                   extracts=(specs[0].replace(tail_text="\nQ?\nPhrase:"),))
     result = request_tests._execution(
         documents, client=texted, document_texts={"c": TEXTS}).execute(node, {})
     assert texted.prompts == ["DOCUMENT:\n" + text + "\nQ?\nPhrase:"
@@ -326,15 +323,13 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     # which runs in the same pipeline over the resident KV
     assert extracts[1].spec.expected_rows == pytest.approx(2 * 0.5 ** 3)
     assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
-    pipelines = build_pipelines(plan.graph)
+    pipelines = plan.graph.pipelines()
     assert [member.node_id for member in pipelines[extracts[0].node_id]] == [
         extracts[0].node_id, filters[0].node_id, filters[1].node_id,
         filters[2].node_id, extracts[1].node_id, filters[3].node_id]
     # the second extraction reads the KV the first left resident
-    residents = resident_inputs(plan.graph, pipelines)
+    residents = plan.graph.resident_inputs()
     assert extracts[1].node_id in residents and extracts[0].node_id not in residents
-    codecs = session.registry.codecs
-    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
     assert "Filter: c.lease.ends ilike '%march%'" in query.explain()
 
     # one document answers; its answer passes the tests

@@ -26,7 +26,6 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 
 from quail.execution.result import QueryResult
-from quail.physical.codec import decode_fields
 from quail.progress import say
 from quail.remote.artifacts import read_answer_tables, result_from_parts
 from quail.remote.inputs import PreparedInput, describe
@@ -146,8 +145,7 @@ class ServerClient:
                 timeout=max(self.timeout_s, size / (1 << 20)))
 
     def submit(self, body: dict) -> QueryStatus:
-        return decode_fields(QueryStatus, self._request("POST", "/v1/queries",
-                                                   body=body))
+        return QueryStatus(**self._request("POST", "/v1/queries", body=body))
 
     def status(self, query_id: str, *, after: int | None = None,
                poll_s: float = 0.0) -> QueryStatus:
@@ -157,11 +155,10 @@ class ServerClient:
                 {"after": after, "wait": f"{poll_s:g}"})
         data = self._request("GET", f"/v1/queries/{query_id}{query}",
                              timeout=self.timeout_s + poll_s)
-        return decode_fields(QueryStatus, data)
+        return QueryStatus(**data)
 
     def cancel(self, query_id: str) -> QueryStatus:
-        return decode_fields(QueryStatus,
-            self._request("POST", f"/v1/queries/{query_id}/cancel"))
+        return QueryStatus(**self._request("POST", f"/v1/queries/{query_id}/cancel"))
 
     def answers(self, query_id: str, *, after: int = 0,
                 limit: int = 1000) -> dict:
@@ -205,10 +202,9 @@ def _table(payload: bytes) -> pa.Table:
 class QueryRun:
     """A handle to one accepted execution on the server."""
 
-    def __init__(self, client: ServerClient, query_id: str, codecs=None):
+    def __init__(self, client: ServerClient, query_id: str):
         self._client = client
         self.id = query_id
-        self._codecs = codecs
 
     def __repr__(self) -> str:
         return f"QueryRun({self.id!r})"
@@ -307,7 +303,7 @@ class QueryRun:
         report = json.loads(self._client.file(self.id, files["report"]))
         answers = read_answer_tables(
             files, lambda name: _table(self._client.file(self.id, name)))
-        return result_from_parts(table, report, answers, self._codecs)
+        return result_from_parts(table, report, answers)
 
 
 class RemoteConnection:
@@ -317,10 +313,9 @@ class RemoteConnection:
     the server can list the queries one client session submitted.
     """
 
-    def __init__(self, endpoint: str, codecs, *, token: str | None = None,
+    def __init__(self, endpoint: str, *, token: str | None = None,
                  resolve_revision=None):
         self.client = ServerClient(endpoint, token=token)
-        self.codecs = codecs
         self.session_id = uuid.uuid4().hex
         self._resolve_revision = resolve_revision
         self._workdir = tempfile.TemporaryDirectory(prefix="quail-inputs-")
@@ -337,7 +332,7 @@ class RemoteConnection:
         self._workdir.cleanup()
 
     def run(self, query_id: str) -> QueryRun:
-        return QueryRun(self.client, query_id, self.codecs)
+        return QueryRun(self.client, query_id)
 
     def submit(self, spec: dict, config: dict, *, query_id: str,
                timeout_s: float | None) -> QueryRun:

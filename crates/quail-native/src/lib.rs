@@ -5,6 +5,7 @@
 
 mod budgets;
 mod cost;
+mod physical;
 
 use std::io::Cursor;
 
@@ -1099,6 +1100,7 @@ impl NativePlanner {
 
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    physical::register(module)?;
     module.add_class::<NativeSession>()?;
     module.add_class::<Tokenizer>()?;
     module.add_class::<NativePlanner>()?;

@@ -1,7 +1,7 @@
 """Shared AI.EXTRACT execution on a scripted model."""
 
+import json
 from collections import Counter
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -44,15 +44,14 @@ from quail.physical import (
     PhysicalGraph,
     PortRef,
     Scan,
-    plan_envelope,
+    input_ports,
 )
-from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS, QWEN3_4B_FP8
 
 
 def make_spec(*texts):
     spec, vocabulary = make_extract_spec(*texts)
-    return replace(spec, top_tokens=4), vocabulary
+    return spec.replace(top_tokens=4), vocabulary
 
 
 @pytest.fixture(autouse=True)
@@ -331,7 +330,7 @@ def _setup(monkeypatch, documents=None, token_documents=None,
            policy="fixed", recurrent=False):
     """A state, its scripted model, and a node builder for one spec name."""
     spec, tables = make_spec()
-    spec = replace(spec, draft_policy=policy, round_cost_per_token=0.05)
+    spec = spec.replace(draft_policy=policy, round_cost_per_token=0.05)
     documents = DOCS if documents is None else documents
     model = ScriptedModel(tables, {}, {}, 4)
     state = _state(model, recurrent=recurrent)
@@ -353,8 +352,8 @@ def _setup(monkeypatch, documents=None, token_documents=None,
 
     def node(name):
         return AiExtract(node_id=f"ai-extract:{name}", backend_name="quail",
-                         model="qwen3-4b-fp8", spec=replace(
-                             spec, name=name, share_prefixes=share_prefixes))
+                         model="qwen3-4b-fp8", spec=spec.replace(
+                             name=name, share_prefixes=share_prefixes))
 
     inputs = {"document_ids": (list(range(len(documents))) if document_ids is None
                                else document_ids), "documents": tokens,
@@ -362,7 +361,7 @@ def _setup(monkeypatch, documents=None, token_documents=None,
 
     def run(name="ends", keep_kv=False):
         result = execute_extractions(
-            state, [replace(node(name), keep_kv=keep_kv)], inputs)[node(name).node_id]
+            state, [node(name).replace(keep_kv=keep_kv)], inputs)[node(name).node_id]
         return result, _snapshot(stages_seen["stages"])
 
     def run_pipeline(*names):
@@ -457,7 +456,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
         nodes.append(AiExtract(
             node_id=f"ai-extract:{name}", backend_name="quail", model="qwen3-4b-fp8",
             inputs=input_ports((PortRef(previous.node_id, "rows:c"),)),
-            spec=replace(spec, name=name, share_prefixes=True),
+            spec=spec.replace(name=name, share_prefixes=True),
             keep_kv=name == "starts"))
     graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "rows:c"))
     registry = built_in_registry()
@@ -483,9 +482,9 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
         "true_ids": [1], "false_ids": [2],
         "documents": {"c": tables.document_batch(DOCS, [None] * len(DOCS))},
         "texts": {"c": pa.array(DOCS)},
-        "physical_plan": plan_envelope(
-            backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
-            gpus=gpus, graph=graph, codecs=registry.codecs),
+        "physical_plan": {
+            "backend": "quail", "model": "qwen3-4b-fp8", "device": "h100-sxm",
+            "gpus": gpus, "settings": {}, "graph": json.loads(graph.to_json())},
     }
     rounds = []
 
@@ -556,7 +555,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
                 inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
                 backend_name="quail",
                 model="qwen3-4b-fp8",
-                spec=replace(plain, name="starts"),
+                spec=plain.replace(name="starts"),
             ),
         ),
         PortRef("ai-extract:starts", "rows:c"),
@@ -609,7 +608,6 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     # passed, over the KV the first question left; the dropped
     # document is packed once and its KV freed
     from quail.physical import Filter
-    from quail.physical.pipelines import build_pipelines
 
     spec, tables = make_spec()
     model = ScriptedModel(tables, {}, {}, 4)
@@ -629,7 +627,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
         AiExtract(node_id="ai-extract:starts",
                   inputs=input_ports((PortRef("filter:c:0", "rows:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8",
-                  spec=replace(spec, name="starts")),
+                  spec=spec.replace(name="starts")),
         Filter(node_id="filter:c:1",
                # a condition on two extractions reads each as the
                # document settles: starts from the part before it, ends
@@ -645,7 +643,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                                      "start"), "<", 40))))),
                aliases=("c",), written_position=1),
     ), PortRef("filter:c:1", "rows:c"))
-    assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
+    assert [member.node_id for member in graph.pipelines()["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:0", "ai-extract:starts", "filter:c:1"]
     local = _state(model)
     torch, arena = local.torch, local.loaded_model.arena
@@ -690,7 +688,6 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
     # the filter's question follows the document in KV, in place of
     # the answer the extraction wrote; the document is packed once
     from quail.physical import Filter
-    from quail.physical.pipelines import build_pipelines
 
     spec, tables = make_spec()
     head = list(spec.prompt_token_parts[0])
@@ -735,7 +732,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
         ),
         PortRef("ai_filter:c", "rows:c"),
     )
-    assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
+    assert [member.node_id for member in graph.pipelines()["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:1", "ai_filter:c"]
     local = _state(model)
     torch, arena = local.torch, local.loaded_model.arena

@@ -5,7 +5,7 @@
 //! validates the graph, as `PhysicalPlan.insert`, `remove`, and `move`
 //! do before they price the result.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use quail_physical::{InputPort, PhysicalNode, PortRef, ValueType, build_pipelines};
 use serde::Deserialize;
@@ -86,94 +86,17 @@ pub fn recompute_seconds(
         .sum()
 }
 
-/// Check node ids, that every input reads an output of its type, that
-/// the root exists, and that the graph has no cycle.
+/// Check the graph as [`quail_physical::validate_graph`] does.
 ///
 /// # Errors
 ///
-/// The graph breaks one of those rules.
+/// The graph breaks one of its rules.
 pub fn validate_graph(graph: &Graph) -> Result<(), String> {
-    let mut by_id: BTreeMap<&str, &PhysicalNode> = BTreeMap::new();
-    for node in &graph.nodes {
-        if by_id.insert(node.id(), node).is_some() {
-            return Err(format!("duplicate physical node id {:?}", node.id()));
-        }
-    }
-    let outputs: BTreeMap<(String, String), ValueType> = graph
-        .nodes
-        .iter()
-        .flat_map(|node| {
-            node.outputs()
-                .into_iter()
-                .map(|(name, value_type)| ((node.id().to_string(), name), value_type))
-        })
-        .collect();
-    for node in &graph.nodes {
-        for input in node.inputs() {
-            let key = (input.source.node_id.clone(), input.source.port.clone());
-            let Some(actual) = outputs.get(&key) else {
-                return Err(format!(
-                    "{:?} reads missing output {:?}.{:?}",
-                    node.id(),
-                    key.0,
-                    key.1
-                ));
-            };
-            let expected = input.value_type;
-            if expected != ValueType::Any && *actual != ValueType::Any && expected != *actual {
-                return Err(format!(
-                    "{:?} input {:?} expects {}, got {}",
-                    node.id(),
-                    input.name,
-                    type_name(expected),
-                    type_name(*actual)
-                ));
-            }
-        }
-    }
-    let root = (graph.root.node_id.clone(), graph.root.port.clone());
-    if !outputs.contains_key(&root) {
-        return Err(format!(
-            "root output {:?}.{:?} does not exist",
-            root.0, root.1
-        ));
-    }
-    // depth-first, each node after its inputs
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    fn visit<'a>(
-        id: &'a str,
-        by_id: &BTreeMap<&'a str, &'a PhysicalNode>,
-        visiting: &mut BTreeSet<&'a str>,
-        visited: &mut BTreeSet<&'a str>,
-    ) -> Result<(), String> {
-        if visiting.contains(id) {
-            return Err("physical graph contains a cycle".into());
-        }
-        if visited.contains(id) {
-            return Ok(());
-        }
-        visiting.insert(id);
-        if let Some(node) = by_id.get(id) {
-            for input in node.inputs() {
-                visit(input.source.node_id.as_str(), by_id, visiting, visited)?;
-            }
-        }
-        visiting.remove(id);
-        visited.insert(id);
-        Ok(())
-    }
-    for id in by_id.keys() {
-        visit(id, &by_id, &mut visiting, &mut visited)?;
-    }
-    Ok(())
+    quail_physical::validate_graph(&graph.nodes, &graph.root)
 }
 
 fn type_name(value_type: ValueType) -> String {
-    serde_json::to_value(value_type)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_default()
+    quail_physical::value_type_name(value_type).to_string()
 }
 
 fn find<'a>(graph: &'a Graph, node_id: &str) -> Result<&'a PhysicalNode, String> {

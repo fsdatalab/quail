@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import weakref
 from collections.abc import Callable, Iterable
 from copy import copy
@@ -476,14 +477,14 @@ class QueryResult:
         finally:
             reader.close()
 
-    def attach_executed_plan(self, codecs) -> "QueryResult":
+    def attach_executed_plan(self) -> "QueryResult":
         """Decode the executed plan and node metrics from a saved report."""
         from quail.execution.metrics import NodeMetrics
-        from quail.physical import decode_graph
+        from quail.physical import PhysicalGraph
 
         encoded = self.report.get("executed_plan")
         if encoded is not None:
-            self.plan = decode_graph(encoded, codecs)
+            self.plan = PhysicalGraph.from_json(json.dumps(encoded))
             self.node_metrics = {
                 node_id: NodeMetrics.from_scalars(metrics)
                 for node_id, metrics in self.report.get(

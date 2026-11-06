@@ -1,6 +1,5 @@
 """Copy decoding agrees with the host reference token rule on CPU."""
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -39,8 +38,7 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
     texts = [text.replace(" ", "  \n") if spellings else text for text in plain]
     pool_text = " ".join(words)
     spec, vocabulary = make_spec(*texts, *plain, pool_text, *words)
-    spec = replace(
-        spec,
+    spec = spec.replace(
         draft_tokens=draft_tokens,
         draft_policy=draft_policy,
         max_answer_tokens=answer_limit,
@@ -159,8 +157,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         " ".join(rng.choice(["five", "years", "days", "lease"], 25)) for _ in range(12)
     ]
     spec, vocabulary = make_spec(*texts, "five years days lease")
-    spec = replace(
-        spec,
+    spec = spec.replace(
         draft_tokens=draft_tokens,
         max_answer_tokens=8,
         top_tokens=4,
@@ -171,8 +168,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
             node_id=f"extract:{q}",
             backend_name="quail",
             model="qwen3-4b-fp8",
-            spec=replace(
-                spec,
+            spec=spec.replace(
                 name=f"answer{q}",
                 prompt_token_parts=(
                     spec.prompt_token_parts[0],
@@ -368,8 +364,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     from quail.backends.quail.executor.operators.map import MapPart
     from quail.backends.quail.executor.parts import execute_parts
     from quail.common.expressions import ColumnRef, RegularPredicate
-    from quail.physical import AiExtract, Filter, PortRef
-    from quail.physical.base import input_ports
+    from quail.physical import AiExtract, Filter, PortRef, input_ports
 
     cpu_staging(monkeypatch)
     monkeypatch.setattr(
@@ -378,7 +373,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     texts = ["five days or five years", "five years", "lease for five days"]
     spec, vocabulary = make_spec(*texts, "five days years lease", "or", "for")
     vocabulary.tokenizer.decode_batch = batch_decode
-    spec = replace(spec, max_answer_tokens=6, draft_tokens=3, top_tokens=4)
+    spec = spec.replace(max_answer_tokens=6, draft_tokens=3, top_tokens=4)
     setup = Setup(path="unified", pages=pages, page_tokens=4, budget=128)
     arena = make_arena(setup)
     model = TokenModel(arena)
@@ -401,7 +396,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
                 backend_name="quail",
                 model="qwen3-4b-fp8",
                 attention=extract_attention,
-                spec=replace(spec, name=f"answer{q}"),
+                spec=spec.replace(name=f"answer{q}"),
             )
             for q in range(2)
         ],

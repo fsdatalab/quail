@@ -9,8 +9,7 @@ from quail.backends.quail.coordinator import (
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import filter_answer_table
 from quail.execution.rows import Rows
-from quail.physical import InputPort, PortRef, ValueType
-from quail.physical.base import input_ports
+from quail.physical import InputPort, PortRef, ValueType, input_ports
 
 
 def test_a_shard_keeps_its_own_rows_and_pairs_and_every_partner():

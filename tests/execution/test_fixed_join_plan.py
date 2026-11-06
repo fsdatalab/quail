@@ -19,11 +19,8 @@ from quail.physical import (
     Barrier,
     PortRef,
     Scan,
-    decode_graph,
-    encode_graph,
 )
-from quail.physical.pipelines import build_pipelines
-from quail.physical.plan import PlanEditError
+from quail.physical.plan import PlanEditError, graph_from_envelope
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
@@ -101,7 +98,7 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
             gpu_index=0, gpu=state["gpu"], registry=session.registry)
 
     def execute(request):
-        graph = decode_graph(request.plan["graph"], session.registry.codecs)
+        graph = graph_from_envelope(request.plan)
         documents = {node.alias: request.inputs[node.input_id].documents
                 for node in graph.nodes if isinstance(node, Scan)}
         extra = check(request, graph) if check else {}
@@ -243,7 +240,7 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
             "Project"]
         test, ask, join, project = plan.nodes[3:7]
         members = tuple(
-            member.node_id for member in build_pipelines(plan.graph)["ai-classify:0"])
+            member.node_id for member in plan.graph.pipelines()["ai-classify:0"])
         assert members == (("ai-classify:0", test.node_id, ask.node_id)
                            + ((join.node_id,) if join.anchor == "c" else ()))
         (claims_port,) = [port.source for port in join.inputs
@@ -251,8 +248,6 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         assert claims_port == PortRef(ask.node_id, "rows:c")
         assert [port.source.port for port in project.inputs] == [
             "join_answers:0", "rows:c"]
-        codecs = session.registry.codecs
-        assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
         execute = fever_executor(session, monkeypatch, 1, capacity=10)
         result = execute_query(query, physical_executor=execute)
         assert result.collect().to_pylist() == [

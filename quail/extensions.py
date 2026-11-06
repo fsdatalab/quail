@@ -8,8 +8,6 @@ from dataclasses import dataclass
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from quail.physical import NodeCodec, PhysicalNode
-
 if TYPE_CHECKING:
     from quail.backends.base import ModelBackend
     from quail.execution.runner import ExecutionObserver, NodeRuntime
@@ -43,7 +41,7 @@ class PhysicalRule:
 _KINDS = {
     "logical_rule", "physical_rule",
     "backend",
-    "model", "device", "codec", "runtime", "observer",
+    "model", "device", "runtime", "observer",
 }
 
 
@@ -99,10 +97,6 @@ class ExtensionRegistry:
         return self._values("device")
 
     @property
-    def codecs(self) -> Mapping[str, NodeCodec]:
-        return self._values("codec")
-
-    @property
     def runtimes(self) -> Mapping[str, NodeRuntime]:
         return self._values("runtime")
 
@@ -131,34 +125,6 @@ class ExtensionRegistry:
 
     def register_device(self, device: DeviceSpec) -> ExtensionRegistry:
         return self._add("device", device.name, device)
-
-    def register_node(
-        self,
-        node_type: type[PhysicalNode],
-        *,
-        runtime: NodeRuntime,
-        codec: NodeCodec | None = None,
-    ) -> ExtensionRegistry:
-        """Register a physical node's codec and runtime together.
-
-        Args:
-            node_type: Physical node class with a type_name and runtime_key.
-            runtime: Implementation that executes the node.
-            codec: Node codec. Defaults to NodeCodec(node_type).
-        """
-        if not isinstance(node_type, type) or not issubclass(node_type, PhysicalNode):
-            raise TypeError("register_node needs a PhysicalNode class")
-        codec = NodeCodec(node_type) if codec is None else codec
-        if codec.node_type is not node_type:
-            raise ValueError("the codec must describe the registered node class")
-        self._check_name("codec", codec.type_name)
-        self._check_name("runtime", node_type.runtime_key)
-        self._registrations["codec", codec.type_name] = codec
-        self._registrations["runtime", node_type.runtime_key] = runtime
-        return self
-
-    def register_codec(self, codec: NodeCodec) -> ExtensionRegistry:
-        return self._add("codec", codec.type_name, codec)
 
     def register_runtime(
         self, runtime: NodeRuntime, *, key: str | None = None,

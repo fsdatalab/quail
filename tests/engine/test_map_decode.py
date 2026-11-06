@@ -10,7 +10,6 @@ wrote its KV where the next row reads it.
 from types import SimpleNamespace
 
 import numpy as np
-import pyarrow as pa
 import pytest
 import torch
 from helpers.fakes import cpu_staging, fake_pipeline
@@ -30,6 +29,7 @@ from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.common.answers import answer_survival
 from quail.common.decode import DecodeCost
+from quail.common.expressions import ColumnRef, RegularPredicate
 from quail.common.tokens import prefix_tree
 from quail.specs import DEVICES, QWEN3_4B_FP8
 
@@ -160,13 +160,9 @@ def classification_and_condition(ids):
             suffixes=[[702]], frame=[700, 701], single=True,
             readout=Bits(), decide=classify)]))
 
-    def accepts(table):
-        assert table["label"][0].as_py() is not None
-        return pa.array([table["label"][0].as_py() == "keep"])
-
     condition = ConditionGate(SimpleNamespace(
         node_id="condition", tested_columns=("label",),
-        predicate=SimpleNamespace(accepts=accepts)),
+        predicate=RegularPredicate(ColumnRef("d", "", "label"), "=", "keep")),
         {"label": classification}, classification, None)
     return classification, condition
 

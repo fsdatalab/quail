@@ -20,7 +20,7 @@ def token_ids(text):
 
 
 def _round_trip(plan, session) -> tuple[dict, dict]:
-    text = json.dumps(plan.to_envelope(session.registry.codecs))
+    text = json.dumps(plan.to_envelope())
     return json.loads(text), json.loads(native.read_and_write_plan(text))
 
 
@@ -92,7 +92,7 @@ def test_a_plan_with_an_unknown_field_is_refused():
         plan = session.sql(
             "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body))"
         ).plan()
-        written = plan.to_envelope(session.registry.codecs)
+        written = plan.to_envelope()
     written["graph"]["nodes"][0]["attributes"]["surprise"] = 1
     with pytest.raises(ValueError, match="surprise"):
         native.read_and_write_plan(json.dumps(written))

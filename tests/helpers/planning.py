@@ -1,6 +1,7 @@
 """Plan a logical plan with Rust's planner, as a session does."""
 
 import json
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import _quail_native
@@ -8,7 +9,6 @@ import _quail_native
 from quail.api.compile import DATAFUSION_DIALECTS
 from quail.builtins import PHYSICAL_RULES
 from quail.common.expressions import CompileError
-from quail.physical.codec import built_in_codecs, encode_value, untagged
 from quail.physical.lowering import Vocabulary
 from quail.physical.plan import plan_from_json
 from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -60,16 +60,15 @@ def search(alternatives, fields, word_tokenizer=tokenizer):
     if "refusal" not in found:
         found["logical"] = alternatives[found["alternative"]].plan
         found["fields"] = fields
-    codecs = {codec.type_name: codec for codec in built_in_codecs()}
-    return plan_from_json(found, codecs)
+    return plan_from_json(found)
 
 
 def _plan(logical, document_tokens, model=QWEN3_4B_FP8, gpus=1, order=None,
           attention=None):
     """Plan as a session would: the column placements, then the physical planner."""
     fields = {
-        "model": untagged(encode_value(model)),
-        "device": untagged(encode_value(H100_SXM)),
+        "model": asdict(model),
+        "device": asdict(H100_SXM),
         "gpus": gpus, "canvas_draws": 4,
         "document_tokens": {alias: [int(value) for value in lengths]
                             for alias, lengths in document_tokens.items()},

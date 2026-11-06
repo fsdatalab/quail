@@ -160,7 +160,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     # saved reports can be loaded separately from their result tables
     restored = QueryResult.from_table(result.collect(), report=dict(result.report))
     assert restored.plan is None
-    restored.attach_executed_plan(registry.codecs)
+    restored.attach_executed_plan()
     assert [node.node_id for node in restored.plan.topological_nodes()] == [
         node.node_id for node in result.plan.topological_nodes()]
     assert restored.node_metrics == result.node_metrics
@@ -172,7 +172,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
         node_id: {**metrics, "borrowed_prefix_tokens": 3}
         for node_id, metrics in report["node_metrics"].items()}
     counted = QueryResult.from_table(result.collect(), report=report)
-    counted.attach_executed_plan(registry.codecs)
+    counted.attach_executed_plan()
     assert all(metrics.extension == {"borrowed_prefix_tokens": 3}
                for metrics in counted.node_metrics.values())
     assert {node_id: metrics.wall_s

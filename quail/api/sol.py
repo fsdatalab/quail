@@ -33,8 +33,8 @@ production planner.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Mapping
 
 import _quail_native
 import numpy as np
@@ -42,15 +42,16 @@ import pyarrow as pa
 
 from quail.common import budgets
 from quail.common.expressions import (
-    Prompt,
+    accepts,
     column_name,
     condition_columns,
     evaluate_expression,
+    table_alias,
 )
 from quail.common.pairs import pair_table, partner_map
 from quail.common.tokens import prefix_tree
 from quail.common.work import Work
-from quail.physical.codec import decode_value, encode_value, untagged
+from quail.physical import decode_plan_value
 from quail.physical.lowering import Vocabulary
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -309,7 +310,7 @@ class _Oracles:
 
     def _prompt(self, text):
         if text not in self._prompts:
-            self._prompts[text] = decode_value(Prompt, json.loads(text))
+            self._prompts[text] = decode_plan_value(text)
         return self._prompts[text]
 
     def answer(self, prompt, assignment):
@@ -320,10 +321,10 @@ class _Oracles:
         return str(self._label(self._prompt(prompt), dict(json.loads(assignment))))
 
     def accepts(self, condition, values):
-        condition = decode_value(object, json.loads(condition))
+        condition = decode_plan_value(condition)
         (column,) = condition_columns(condition)
-        kept = condition.accepts(pa.table({column: pa.array(json.loads(values),
-                                                            pa.string())}))
+        kept = accepts(condition, pa.table({column: pa.array(json.loads(values),
+                                                             pa.string())}))
         return json.dumps(kept.to_pylist())
 
     def subset_shared(self, alias, rows):
@@ -343,7 +344,8 @@ def _estimate_inputs(query, stores, chunk: int, credit: bool) -> dict:
     for scan in facts["scans"]:
         store = stores[scan["alias"]]
         tokens = [int(length) for length in store.lengths]
-        column = column_name(decode_value(Any, scan["column"]), qualified=False)
+        column = column_name(decode_plan_value(json.dumps(scan["column"])),
+                             qualified=False)
         aliases.append({
             "alias": scan["alias"],
             "column": f"{scan['provider']}.{column}",
@@ -357,12 +359,13 @@ def _estimate_inputs(query, stores, chunk: int, credit: bool) -> dict:
     for join in facts["join_conditions"]:
         position = join["position"]
         left_alias, right_alias = join["left_alias"], join["right_alias"]
-        conditions = [(decode_value(Any, left), decode_value(Any, right))
+        conditions = [(decode_plan_value(json.dumps(left)),
+                       decode_plan_value(json.dumps(right)))
                       for left, right in join["pairs"]]
         pairs = pair_table(
-            left_alias, [evaluate_expression(left, stores[left.alias])
+            left_alias, [evaluate_expression(left, stores[table_alias(left)])
                          for left, _ in conditions],
-            right_alias, [evaluate_expression(right, stores[right.alias])
+            right_alias, [evaluate_expression(right, stores[table_alias(right)])
                           for _, right in conditions])
         allowed_pairs[str(position)] = {
             alias: [[int(key), [int(row) for row in groups.rows[
@@ -426,8 +429,7 @@ def speed_of_light_estimate(
                   "order": query.order, "credit_shared": credit_shared_prefixes,
                   "chunk_tokens": chunk}
     vocabulary = Vocabulary(query.session.tokenizer)
-    fields = {"model": untagged(encode_value(model)),
-              "device": untagged(encode_value(device)),
+    fields = {"model": asdict(model), "device": asdict(device),
               "gpus": 1, "canvas_draws": 4,
               "document_tokens": {data["alias"]: data["tokens"]
                                   for data in inputs["aliases"]},

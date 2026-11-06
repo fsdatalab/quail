@@ -1,14 +1,18 @@
 //! The built-in physical nodes.
 //!
 //! A node in a plan's graph is written `{"type": <type name>, "id",
-//! "inputs", "attributes"}`.
+//! "inputs", "attributes"}`; an extension's node also writes its
+//! `outputs`, `backend`, and `location`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::expressions::{Condition, Projected, ValueExpression};
-use crate::graph::InputPort;
-use crate::specs::{ClassifySpec, ExtractSpec, MapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds};
+use crate::graph::{InputPort, OutputPort};
+use crate::specs::{
+    ClassifySpec, ExtractSpec, MapSpec, RequestClassifySpec, RequestExtractSpec, RequestFilterSpec,
+    RequestJoinSpec, RequestMapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds,
+};
 
 /// A node's id, inputs, and type-specific attributes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,11 +39,57 @@ macro_rules! physical_nodes {
             }
         )*
 
-        /// A node of a plan's graph, tagged with its type name.
-        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-        #[serde(tag = "type")]
+        /// A node of a plan's graph, tagged with its type name: one of
+        /// Quail's, or an extension's.
+        #[derive(Debug, Clone, PartialEq)]
         pub enum PhysicalNode {
+            $($variant(Node<$attributes>),)*
+            /// A node of a type an extension registers.
+            Extension(ExtensionNode),
+        }
+
+        /// Quail's own node types, read and written with their tag.
+        #[derive(Serialize)]
+        #[serde(tag = "type")]
+        enum KnownRef<'a> {
+            $(#[serde(rename = $type_name)] $variant(&'a Node<$attributes>),)*
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum Known {
             $(#[serde(rename = $type_name)] $variant(Node<$attributes>),)*
+        }
+
+        /// The type names of Quail's own nodes.
+        pub const NODE_TYPES: &[&str] = &[$($type_name,)*];
+
+        impl Serialize for PhysicalNode {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                match self {
+                    $(PhysicalNode::$variant(node) => KnownRef::$variant(node).serialize(serializer),)*
+                    PhysicalNode::Extension(node) => node.serialize(serializer),
+                }
+            }
+        }
+
+        impl<'de> Deserialize<'de> for PhysicalNode {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                use serde::de::Error;
+                let value = Value::deserialize(deserializer)?;
+                let known = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| NODE_TYPES.contains(&tag));
+                if !known {
+                    return serde_json::from_value(value)
+                        .map(PhysicalNode::Extension)
+                        .map_err(D::Error::custom);
+                }
+                Ok(match serde_json::from_value(value).map_err(D::Error::custom)? {
+                    $(Known::$variant(node) => PhysicalNode::$variant(node),)*
+                })
+            }
         }
 
         impl PhysicalNode {
@@ -47,6 +97,7 @@ macro_rules! physical_nodes {
             pub fn id(&self) -> &str {
                 match self {
                     $(PhysicalNode::$variant(node) => &node.id,)*
+                    PhysicalNode::Extension(node) => &node.id,
                 }
             }
 
@@ -54,6 +105,7 @@ macro_rules! physical_nodes {
             pub fn inputs(&self) -> &[InputPort] {
                 match self {
                     $(PhysicalNode::$variant(node) => &node.inputs,)*
+                    PhysicalNode::Extension(node) => &node.inputs,
                 }
             }
 
@@ -61,17 +113,50 @@ macro_rules! physical_nodes {
             pub fn inputs_mut(&mut self) -> &mut Vec<InputPort> {
                 match self {
                     $(PhysicalNode::$variant(node) => &mut node.inputs,)*
+                    PhysicalNode::Extension(node) => &mut node.inputs,
                 }
             }
 
             /// The node's registered type name.
-            pub fn type_name(&self) -> &'static str {
+            pub fn type_name(&self) -> &str {
                 match self {
                     $(PhysicalNode::$variant(_) => $type_name,)*
+                    PhysicalNode::Extension(node) => &node.type_name,
                 }
             }
         }
     };
+}
+
+/// Where a node runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Location {
+    Coordinator,
+    GpuExecutor,
+}
+
+fn coordinator() -> Location {
+    Location::Coordinator
+}
+
+/// A node of a type Quail does not define: an extension's.
+///
+/// It carries what Quail cannot derive from its attributes: its outputs,
+/// the backend of a model node, and where it runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionNode {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub id: String,
+    pub inputs: Vec<InputPort>,
+    pub attributes: Map<String, Value>,
+    pub outputs: Vec<OutputPort>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default = "coordinator")]
+    pub location: Location,
 }
 
 physical_nodes! {
@@ -236,5 +321,18 @@ physical_nodes! {
         lists: Vec<String>,
         outer: bool,
         columns: Vec<String>,
+    }
+    /// A request backend's whole model work: each document or pair
+    /// submitted to an engine such as vLLM.
+    RequestExecution(RequestExecutionAttributes) = "quail.request_execution" {
+        backend_name: String,
+        aliases: Vec<String>,
+        preamble_token_ids: TokenIds,
+        preamble_text: String,
+        filters: Vec<RequestFilterSpec>,
+        joins: Vec<RequestJoinSpec>,
+        classifies: Vec<RequestClassifySpec>,
+        extracts: Vec<RequestExtractSpec>,
+        maps: Vec<RequestMapSpec>,
     }
 }

@@ -64,7 +64,7 @@ class Session:
         if endpoint is not None:
             from quail.remote.client import RemoteConnection
 
-            self._remote = RemoteConnection(endpoint, self.registry.codecs)
+            self._remote = RemoteConnection(endpoint)
         else:
             _ = self.tokenizer
 

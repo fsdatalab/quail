@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from quail.common.expressions import CompileError, Prompt
-from quail.physical.codec import decode_value, encode_value
+from quail.physical import decode_plan_value
 
 # interned word ids start here, above any vocabulary
 _WORDS = 1 << 40
@@ -135,7 +135,7 @@ class LoweredPrompt:
 
 
 def _decode_prompt(value):
-    return decode_value(Prompt, value)
+    return decode_plan_value(json.dumps(value))
 
 
 def _lowered(found: dict, vocabulary: Vocabulary) -> LoweredPrompt:
@@ -177,7 +177,8 @@ def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
     Raises:
         CompileError: The prompt cannot be lowered for this tokenizer.
     """
-    found, vocabulary = _call("lower_prompt", [encode_value(prompt)], tokenizer)
+    found, vocabulary = _call("lower_prompt", [json.loads(prompt.to_json())],
+                             tokenizer)
     return _lowered(found, vocabulary)
 
 
@@ -226,7 +227,7 @@ def set_question_parts(prompt: Prompt, tokenizer) -> dict:
         CompileError: The prompt cannot be lowered for this tokenizer.
     """
     (state_tail, header), vocabulary = _call(
-        "set_question_parts", [encode_value(prompt), prompt.layout], tokenizer)
+        "set_question_parts", [json.loads(prompt.to_json()), prompt.layout], tokenizer)
     return dict(state_tail_tokens=state_tail,
                 question_header_token_ids=tuple(
                     vocabulary.word(token) for token in header))

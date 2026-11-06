@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from dataclasses import asdict, replace
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import _quail_native
 import pyarrow as pa
@@ -27,8 +27,7 @@ from quail.execution.rows import as_table
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
-from quail.physical import Scan, encode_graph
-from quail.physical.codec import decode_value, encode_value, untagged
+from quail.physical import Scan, decode_plan_value
 from quail.physical.plan import Refusal, RefusalError, plan_from_json
 
 # the start of Rust's message for a document that is an expression
@@ -69,8 +68,8 @@ def planning_settings(session, order: str | None) -> dict:
     config = session.config
     backend = session.registry.backend(config.backend)
     return {
-        "model": untagged(encode_value(session.model)),
-        "device": untagged(encode_value(session.device)),
+        "model": asdict(session.model),
+        "device": asdict(session.device),
         "gpus": config.gpus, "canvas_draws": config.canvas_draws,
         "attention": config.attention, "order": order,
         "backend": config.backend,
@@ -382,7 +381,7 @@ class RegionQuery:
             The physical plan, or the Refusal.
         """
         self._adopt_scans(found)
-        plan = plan_from_json(found, self.session.registry.codecs)
+        plan = plan_from_json(found)
         if isinstance(plan, Refusal):
             self._plan = self._searched_plan = plan
             return plan
@@ -466,7 +465,7 @@ class RegionQuery:
         plan.graph.validate(runtime_keys=set(self.session.registry.runtimes))
         plan.graph.validate_backend(plan.backend)
         inputs = {}
-        documents = {scan["alias"]: decode_value(Any, scan["column"])
+        documents = {scan["alias"]: decode_plan_value(json.dumps(scan["column"]))
                      for scan in self.facts()["scans"]}
         for node in plan.nodes:
             if not isinstance(node, Scan):
@@ -482,7 +481,7 @@ class RegionQuery:
                     else None
                 ),
             )
-        envelope = plan.to_envelope(self.session.registry.codecs)
+        envelope = plan.to_envelope()
         source_rows = self._alias_source_rows()
         return PhysicalRequest(envelope, inputs, self._column_tables(),
                                source_rows)
@@ -553,8 +552,7 @@ class RegionQuery:
             for node_id, node_result in run.nodes.items()
         }
         # Saved reports need the graph and metrics without Python objects.
-        report["executed_plan"] = encode_graph(
-            plan.graph, self.session.registry.codecs)
+        report["executed_plan"] = json.loads(plan.graph.to_json())
         report["node_metrics"] = scalar_node_metrics(run.nodes)
         observer_reports = {
             observer.name: dict(observer.report())

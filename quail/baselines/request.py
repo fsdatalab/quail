@@ -10,12 +10,11 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.resources import release_models
 from quail.baselines.execution import RequestModelExecution
-from quail.baselines.nodes import RequestExecution
 from quail.execution.metrics import scalar_node_metrics
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph
 from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.physical import Scan
+from quail.physical import RequestExecution, Scan
 from quail.specs import DEVICES, SupportResult
 
 

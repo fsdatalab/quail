@@ -16,12 +16,17 @@ pub use expressions::{
     GetField, Literal, ModelCall, Not, Projected, Prompt, RegularPredicate, ScalarFunction,
     SortExpression, SortKey, TaggedModelCall, ValueExpression,
 };
-pub use graph::{InputPort, PhysicalGraph, PlanEnvelope, PortRef, ValueType};
+pub use graph::{
+    AnswerOutput, InputPort, OutputPort, PhysicalGraph, PlanEnvelope, PortRef, ValueType,
+};
 pub use nodes::*;
-pub use specs::{ClassifySpec, ExtractSpec, MapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds};
+pub use specs::{
+    ClassifySpec, ExtractSpec, MapSpec, RequestClassifySpec, RequestExtractSpec, RequestFilterSpec,
+    RequestJoinSpec, RequestMapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds,
+};
 pub use topology::{
-    Pipelines, build_pipelines, groups_acyclic, input_ports, port, resident_inputs,
-    topological_nodes, value_type_for_port,
+    Pipelines, build_pipelines, groups_acyclic, input_ports, port, resident_inputs, same_decoding,
+    topological_nodes, validate_graph, value_type_for_port, value_type_name,
 };
 
 /// Read a plan envelope from JSON.

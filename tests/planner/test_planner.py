@@ -1,5 +1,6 @@
 """Planner ordering, anchor selection, sharding, break-evens, and refusals."""
 
+import json
 from dataclasses import replace
 
 import _quail_native
@@ -19,7 +20,6 @@ from quail.physical import (
     Project,
     Scan,
 )
-from quail.physical.codec import encode_fields
 from quail.physical.plan import Refusal
 from quail.specs import QWEN3_4B_FP8, QWEN3_32B_FP8
 
@@ -30,7 +30,7 @@ def filter_sequence(plan, alias=None):
 
 
 def join_stages(plan):
-    return [encode_fields(node, exclude=("node_id", "inputs"))
+    return [json.loads(node.to_json())["attributes"]
             for node in plan.nodes if isinstance(node, AiJoin)]
 
 

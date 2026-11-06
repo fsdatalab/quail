@@ -5,7 +5,6 @@ from quail.backends.quail import quail_runtimes
 from quail.baselines import register_baselines
 from quail.execution.runtimes import built_in_runtimes
 from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
-from quail.physical import built_in_codecs
 from quail.specs import DEVICES, MODELS
 
 # the optimizer rules each model region runs, in order, as
@@ -34,8 +33,6 @@ def built_in_registry() -> ExtensionRegistry:
         registry.register_logical_rule(LogicalRule(name))
     for name in PHYSICAL_RULES:
         registry.register_physical_rule(PhysicalRule(name))
-    for codec in built_in_codecs():
-        registry.register_codec(codec)
     for runtimes in (built_in_runtimes(), quail_runtimes()):
         for runtime_key, runtime in runtimes.items():
             registry.register_runtime(runtime, key=runtime_key)

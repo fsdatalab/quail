@@ -1,7 +1,6 @@
 """Extraction head work and tensor dispatches are batched across fields."""
 
 from collections import Counter
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -32,7 +31,7 @@ def copy_batch(num_fields, num_documents=4, document_tokens=24, draft_tokens=2,
     """Build independent fields over repeated document spans with a small head."""
     text = text or "five" + " years" * (document_tokens - 1)
     spec, vocabulary = make_spec(text)
-    spec = replace(spec, top_tokens=4, draft_tokens=draft_tokens,
+    spec = spec.replace(top_tokens=4, draft_tokens=draft_tokens,
                    max_answer_tokens=answer_limit, first_window_chars=8,
                    window_chars=16)
     state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))

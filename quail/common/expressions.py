@@ -1,31 +1,64 @@
-"""Expressions used by logical query operators."""
+"""Evaluate Quail's expressions over Arrow columns.
+
+The expression classes are Rust's, from ``_quail_native``: a value
+expression is a tree of ColumnRef, GetField, ScalarFunction, Literal,
+and Alias nodes, and a condition is a RegularPredicate, or a Not, And, or
+Or of conditions. Rust's planner validates them; this module computes
+them with Arrow compute.
+"""
 
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
-from typing import Any, ClassVar, Optional
 
-import numpy as np
 import pyarrow as pa
+from _quail_native import (
+    Alias,
+    And,
+    ColumnRef,
+    GetField,
+    Literal,
+    ModelCall,
+    Not,
+    Or,
+    Prompt,
+    RegularPredicate,
+    ScalarFunction,
+)
 from pyarrow import compute as pc
 
 from quail.common.predicates import (
-    COLUMN_COMPARISONS,
     COMPARISON_KERNELS,
-    TEXT_COMPARISONS,
     accepted_rows,
     compare_literal,
     membership,
 )
 
-DESCRIPTION_WORDS = 25
-# the functions a ScalarFunction may compute, by name
+__all__ = [
+    "Alias", "And", "ColumnRef", "GetField", "Literal", "ModelCall", "Not", "Or",
+    "Prompt", "RegularPredicate", "ScalarFunction",
+]
+
 # the SQL names of the scalar functions whose Arrow compute function has
 # another name; every other scalar function of Arrow compute is called by
 # its own name
 FUNCTION_ALIASES = {"length": "utf8_length", "lower": "utf8_lower",
                     "upper": "utf8_upper", "trim": "utf8_trim_whitespace"}
+DEFAULT_SELECTIVITY = 0.2
+SCORE_COMPARISONS = ("<", "<=", ">", ">=")
+# the text before each label of a classification prompt
+LABEL_PREFIX = " "
+PROBABILITIES_SUFFIX = "_probabilities"
+# an "extract" call's second result column: the answer's character
+# span in the document
+SPAN_SUFFIX = "_span"
+# the Arrow type of one feature list
+FEATURE_LIST = pa.list_(
+    pa.struct([("feature", pa.int32()), ("strength", pa.float32())]))
+
+
+class CompileError(ValueError):
+    """Raised when a query is malformed or outside the language."""
 
 
 @functools.cache
@@ -56,110 +89,16 @@ def arrow_function(name: str):
     return getattr(pc, arrow)
 
 
-class CompileError(ValueError):
-    """Raised when a query is malformed or outside the language."""
-
-
-@dataclass(frozen=True)
-class ColumnRef:
-    alias: str  # table alias in the query ("r")
-    provider: str  # provider name in the catalog ("reviews")
-    column: str  # column name ("review")
-
-    type_name: ClassVar[str] = "quail.column_ref"
-
-    def validate(self) -> None:
-        if not self.alias or not self.column:
-            raise CompileError("a column reference names a table alias and a column")
-
-    def __str__(self) -> str:
-        return column_name(self)
-
-
-def _validate_tree(expression) -> None:
-    """Validate one value expression, whatever its node type."""
-    if not isinstance(expression, (ColumnRef, GetField, ScalarFunction, Literal,
-                                   Alias)):
-        raise CompileError(
-            f"a value expression is a column, a field, a function, a "
-            f"literal, or an alias, got {type(expression).__name__}")
-    expression.validate()
-
-
-@dataclass(frozen=True)
-class GetField:
-    """One field of a struct-valued expression."""
-
-    input: Expression
-    field: str
-
-    type_name: ClassVar[str] = "quail.get_field"
-
-    @property
-    def alias(self) -> str:
-        return table_alias(self)
-
-    def validate(self) -> None:
-        _validate_tree(self.input)
-        if not isinstance(self.field, str) or not self.field:
-            raise CompileError("a field access names a struct field")
-
-    def __str__(self) -> str:
-        return column_name(self)
-
-
-@dataclass(frozen=True)
-class Literal:
-    """A constant in a value expression, such as the 3 of ``abs(r.stars - 3)``.
-
-    A tuple is a list of constants, passed to Arrow as an array, such as
-    the value set of ``is_in``; None is NULL.
-    """
-
-    value: Any
-
-    type_name: ClassVar[str] = "quail.literal"
-
-    def validate(self) -> None:
-        values = self.value if isinstance(self.value, tuple) else (self.value,)
-        if not all(value is None or isinstance(value, (str, int, float, bool))
-                   for value in values):
-            raise CompileError(
-                f"a literal is a string, number, boolean, NULL, or a list of "
-                f"them, got {self.value!r}")
-
-    def __str__(self) -> str:
-        return repr(self.value)
-
-
-@dataclass(frozen=True)
-class ScalarFunction:
-    """A function of value expressions, computed row by row without the model."""
-
-    function: str
-    args: tuple[Expression, ...]
-
-    type_name: ClassVar[str] = "quail.scalar_function"
-
-    @property
-    def alias(self) -> str:
-        return table_alias(self)
-
-    def validate(self) -> None:
-        arrow_function(self.function)
-        for argument in self.args:
-            _validate_tree(argument)
-
-    def __str__(self) -> str:
-        return column_name(self)
+def effective_selectivity(selectivity: float | None) -> float:
+    """Return the selectivity the planner uses: the given one or the default."""
+    return DEFAULT_SELECTIVITY if selectivity is None else selectivity
 
 
 def evaluate_expression(expression, columns, *, qualified: bool = False):
     """Evaluate a value expression over the columns of one table.
 
     Args:
-        expression: A column name, or a tree of ColumnRef, GetField,
-            ScalarFunction, Literal, and Alias nodes.
+        expression: A column name, or a value expression.
         columns: The table, record batch, or scan input the columns come
             from, read with ``column(name)``.
         qualified: Whether result columns include their table alias.
@@ -202,7 +141,7 @@ def evaluate_expression(expression, columns, *, qualified: bool = False):
             f"{[str(values.type) for values in arguments]}: {error}") from error
 
 
-def column_references(expression) -> tuple[ColumnRef, ...]:
+def column_references(expression) -> tuple:
     """Return the source columns a value expression reads, in first use order."""
     if isinstance(expression, ColumnRef):
         return (expression,)
@@ -236,9 +175,6 @@ def table_alias(expression) -> str:
     return aliases[0]
 
 
-LABEL_PREFIX = " "
-
-
 def column_name(column, *, qualified: bool = True) -> str:
     """Return the name used for a source, computed, or projected column.
 
@@ -263,726 +199,71 @@ def column_name(column, *, qualified: bool = True) -> str:
     return column.name
 
 
-def aliased_call(expression, *kinds):
-    """Return the model call an Alias projects, or None.
-
-    Args:
-        expression: A projected column.
-        kinds: When given, the model call kinds that count.
-    """
-    if not isinstance(expression, Alias) or not isinstance(
-            expression.expression, ModelCall):
-        return None
-    call = expression.expression
-    return call if not kinds or call.kind in kinds else None
-
-
-@dataclass(frozen=True)
-class Prompt:
-    """The text of one model call, laid out for a model's prompt format.
-
-    Rust's planner lowers the text to token ids with the session's
-    tokenizer. A classification
-    prompt keeps the text before each label in label_prefix and what
-    rendered its label list, so lowering can render it again with one
-    letter per label.
-
-    Attributes:
-        template: The template as the query names the predicate.
-        args: Column references in placeholder order.
-        preamble: The text before the document.
-        tail: The text after the document, or after a join's last
-            partner, with the document placeholder.
-        frame: The text after the anchor document that every pair shares.
-        frame_text: The text whose token count is the frame's; empty
-            when the prompt has no frame.
-        kind: filter, join, label, extract, or score.
-        layout: The name of the prompt layout the text was built with.
-        tail_segments: The tail after the placeholder, one entry per
-            separately tokenized segment; empty means one segment.
-        label_texts: Per placeholder of a join or a classification of
-            joined rows, (alias, its label text, its frame text).
-        label_prefix: The text before a scored letter or label.
-        categories: A classification's labels, in query order.
-        descriptions: Their descriptions, in label order.
-        task_description: A classification's extra instructions.
-        turn: The model's chat text around the prompt.
-        source: The classification template, or the extraction
-            question, as written.
-        letters: The letters naming the labels of a lettered prompt.
-    """
-
-    template: str
-    args: tuple  # tuple[ColumnRef, ...] in placeholder order
-    preamble: str
-    tail: str
-    frame: str = ""
-    frame_text: str = ""
-    kind: str = "filter"
-    layout: str = "ai-if"
-    tail_segments: tuple = ()
-    label_texts: tuple = ()
-    label_prefix: str = LABEL_PREFIX
-    categories: tuple = ()
-    descriptions: tuple = ()
-    task_description: str = ""
-    turn: tuple = ("", "")
-    source: str = ""
-    letters: tuple = ()
-
-    type_name: ClassVar[str] = "quail.prompt"
-
-
-DEFAULT_SELECTIVITY = 0.2
-
-
-SCORE_COMPARISONS = ("<", "<=", ">", ">=")
-
-
-MODEL_CALL_KINDS = ("boolean", "score", "label", "extract", "features", "map")
-# the token poolings of an AI.SAE_FEATURES call
-SAE_POOLINGS = ("last", "max")
-
-
-def effective_selectivity(selectivity: Optional[float]) -> float:
-    """Return the selectivity the planner uses: the given one or the default."""
-    return DEFAULT_SELECTIVITY if selectivity is None else selectivity
-
-
-PROBABILITIES_SUFFIX = "_probabilities"
-# an "extract" call's second result column: the answer's character
-# span in the document
-SPAN_SUFFIX = "_span"
-# the Arrow type of one feature list
-FEATURE_LIST = pa.list_(
-    pa.struct([("feature", pa.int32()), ("strength", pa.float32())]))
-
-
-@dataclass(frozen=True)
-class ModelCall:
-    """One prompt asked of every row; the model answers with a value.
-
-    The AI functions of the language are all model calls. They differ
-    only in ``kind``, the type of the answer.
-    """
-
-    prompt: Prompt
-    kind: str = "boolean"
-    # a "label" call only: the labels in written order, and one
-    # description per label, empty for none
-    labels: tuple = ()
-    descriptions: tuple = ()
-    # a "label" call only: whether the result also carries each label's
-    # probability, as the column named after the label column plus
-    # PROBABILITIES_SUFFIX
-    probabilities: bool = False
-    # an "extract" call only: the question the answer is copied for
-    question: str = ""
-    # a "features" call only: which tokens become the row's feature
-    # list, "last" or "max"
-    pooling: str = ""
-    # a "map" call only: the most tokens its answer may have
-    max_answer_tokens: int = 0
-
-    type_name: ClassVar[str] = "quail.model_call"
-
-    def aliases(self) -> tuple[str, ...]:
-        """Return the table aliases the prompt reads, in placeholder order."""
-        return tuple(dict.fromkeys(ref.alias for ref in self.prompt.args))
-
-    def validate(self) -> None:
-        if self.kind not in MODEL_CALL_KINDS:
-            raise CompileError(
-                f"model call kind must be one of {MODEL_CALL_KINDS}, got {self.kind!r}"
-            )
-        if self.kind != "label" and (
-            self.labels or self.descriptions or self.probabilities
-        ):
-            raise CompileError("only an AI.CLASSIFY call has labels")
-        if self.kind != "extract" and self.question:
-            raise CompileError("only an AI.EXTRACT call has a question")
-        if self.kind != "features" and self.pooling:
-            raise CompileError("only an AI.SAE_FEATURES call has a pooling")
-        if self.kind == "map" and (type(self.max_answer_tokens) is not int
-                                   or self.max_answer_tokens < 1):
-            raise CompileError("an AI.MAP answer limit is a positive integer")
-        if self.kind != "map" and self.max_answer_tokens:
-            raise CompileError("only an AI.MAP call has an answer limit")
-        if self.kind == "label":
-            validate_labels(self.labels, self.descriptions)
-        elif self.kind == "extract":
-            validate_question(self.question)
-        elif self.kind == "features" and self.pooling not in SAE_POOLINGS:
-            raise CompileError(
-                f"AI.SAE_FEATURES pooling must be one of {SAE_POOLINGS}, "
-                f"got {self.pooling!r}")
-
-
-def validate_question(question: str) -> None:
-    """Check an AI.EXTRACT question: text with at least one word.
-
-    Raises:
-        CompileError: The question is empty or not a string.
-    """
-    if not isinstance(question, str) or not question.strip():
-        raise CompileError("AI.EXTRACT needs a question with at least one word")
-
-
-@dataclass(frozen=True)
-class ExtractStruct:
-    """Several AI.EXTRACT fields of one table, returned as struct columns.
-
-    Each field is its own extraction, projected as an Alias named
-    ``name.field``. The result packs the fields' answers into the
-    struct column ``name`` and their spans into ``name`` plus
-    SPAN_SUFFIX, each with one struct field per extraction field.
-
-    Attributes:
-        name: The struct column's name.
-        fields: The field names, in written order.
-    """
-
-    name: str
-    fields: tuple[str, ...]
-
-    type_name: ClassVar[str] = "quail.extract_struct"
-
-    def member(self, field: str) -> str:
-        """Return the name of one field's extraction."""
-        return f"{self.name}.{field}"
-
-    @property
-    def members(self) -> tuple[str, ...]:
-        """Return the names of the fields' extractions, in field order."""
-        return tuple(self.member(field) for field in self.fields)
-
-    def packing(self) -> tuple:
-        """Return the answer and span struct columns as Project packs them.
-
-        Returns:
-            (struct column, ((field, member column), ...)) for the
-            answers, then for the spans.
-        """
-        return tuple(
-            (self.name + suffix,
-             tuple((field, self.member(field) + suffix) for field in self.fields))
-            for suffix in ("", SPAN_SUFFIX))
-
-    def validate(self) -> None:
-        if not self.name or "." in self.name:
-            raise CompileError(
-                f"an extraction needs a column name without a dot, "
-                f"got {self.name!r}")
-        if not self.fields:
-            raise CompileError(f"AI.EXTRACT {self.name!r} needs at least one field")
-        for field in self.fields:
-            if not isinstance(field, str) or not field or "." in field:
-                raise CompileError(
-                    f"an AI.EXTRACT field needs a name without a dot, "
-                    f"got {field!r}")
-        if len(set(self.fields)) != len(self.fields):
-            raise CompileError(
-                f"AI.EXTRACT {self.name!r} names a field twice: {list(self.fields)}")
-
-
-def packed_columns(columns, packing) -> tuple[str, ...]:
-    """Return result column names after packing members into struct columns.
-
-    Each struct column takes the place of its first member; its other
-    members leave the result.
-
-    Args:
-        columns: The column names before packing.
-        packing: (struct column, ((field, member column), ...)) pairs.
-    """
-    owner = {member: name for name, fields in packing for _, member in fields}
-    out = []
-    for column in columns:
-        name = owner.get(column, column)
-        if name not in out:
-            out.append(name)
-    return tuple(out)
-
-
-def validate_labels(labels: tuple, descriptions: tuple = ()) -> None:
-    """Check an AI.CLASSIFY label list and its descriptions.
-
-    Raises:
-        CompileError: Fewer than two labels, an empty label, two labels
-            equal ignoring case, or a description count that differs
-            from the label count.
-    """
-    if len(labels) < 2:
-        raise CompileError("AI.CLASSIFY needs at least two labels")
-    if any(not isinstance(label, str) or not label.strip() for label in labels):
-        raise CompileError("every AI.CLASSIFY label is non-empty text")
-    folded = [label.casefold() for label in labels]
-    if len(set(folded)) != len(folded):
-        raise CompileError(
-            f"AI.CLASSIFY labels must differ ignoring case, got {list(labels)}"
-        )
-    if descriptions and len(descriptions) != len(labels):
-        raise CompileError(
-            "AI.CLASSIFY needs one description per label, empty for none"
-        )
-    for description in descriptions:
-        if not isinstance(description, str):
-            raise CompileError("an AI.CLASSIFY description is text or empty")
-        if len(description.split()) > DESCRIPTION_WORDS:
-            raise CompileError(
-                f"an AI.CLASSIFY description has at most {DESCRIPTION_WORDS} "
-                f"words, got {len(description.split())}"
-            )
-
-
-def literal_value(value):
-    """Return a literal as a plain Python value: a NumPy scalar becomes one."""
-    if isinstance(value, tuple):
-        return tuple(literal_value(item) for item in value)
-    return value.item() if isinstance(value, np.generic) else value
-
-
-@dataclass(frozen=True)
-class RegularPredicate:
-    """A test of a value expression or a model score against literals.
-
-    ``expression`` reads one or more source columns through fields and
-    scalar functions, such as the ``start`` field of an extraction's
-    span or ``greater(r.stars, r.min_stars)``; or it is an AI.SCORE
-    call, compared with a threshold between 0 and 1. ``value`` is the
-    literal compared with, a tuple of literals for ``in``, and None for
-    the null tests and ``is true``, which keeps the rows where a
-    boolean expression is true. A column test is decided without the
-    model.
-    """
-
-    expression: Expression | ModelCall
-    comparison: str
-    value: Any = None
-
-    type_name: ClassVar[str] = "quail.regular_predicate"
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "value", literal_value(self.value))
-
-    @property
-    def column(self) -> ColumnRef:
-        """The one source column the expression reads.
-
-        Raises:
-            CompileError: The expression reads more than one column; use
-                column_references() for a test of several.
-        """
-        columns = column_references(self.expression)
-        if len(columns) != 1:
-            raise CompileError(f"{self} reads {len(columns)} columns, not one")
-        return columns[0]
-
-    @property
-    def function(self) -> Optional[str]:
-        """The function applied last, or None."""
-        return (self.expression.function
-                if isinstance(self.expression, ScalarFunction) else None)
-
-    def aliases(self) -> tuple[str, ...]:
-        if isinstance(self.expression, ModelCall):
-            return self.expression.aliases()
-        return tuple(dict.fromkeys(
-            reference.alias for reference in column_references(self.expression)))
-
-    def tests(self) -> tuple[RegularPredicate, ...]:
-        """Return this test alone, as And.tests() returns its tests."""
-        return (self,)
-
-    @property
-    def text(self) -> bool:
-        """Whether the comparison tests text against a pattern."""
-        return self.comparison in TEXT_COMPARISONS
-
-    def validate(self) -> None:
-        if isinstance(self.expression, ModelCall):
-            self.expression.validate()
-            if self.expression.kind != "score":
-                raise CompileError("only an AI.SCORE call compares with a threshold")
-            if self.comparison not in SCORE_COMPARISONS:
-                raise CompileError(
-                    f"unsupported AI.SCORE comparison {self.comparison!r}")
-            if not isinstance(self.value, (int, float)) or not 0 <= self.value <= 1:
-                raise CompileError("AI.SCORE threshold must be between 0 and 1")
-            return
-        if not column_references(self.expression):
-            raise CompileError("a column predicate tests a column")
-        self.expression.validate()
-        if self.comparison not in COLUMN_COMPARISONS:
-            raise CompileError(
-                f"unsupported column comparison {self.comparison!r}; "
-                f"supported: {', '.join(COLUMN_COMPARISONS)}"
-            )
-        if self.comparison == "in":
-            if not isinstance(self.value, tuple) or not self.value:
-                raise CompileError("IN needs a non-empty list of literals")
-            if len(set(self.value)) != len(self.value):
-                raise CompileError(f"{self.name} IN lists a value twice")
-        elif self.comparison.startswith("is"):
-            if self.value is not None:
-                raise CompileError("a null test takes no value")
-        elif self.text:
-            if not isinstance(self.value, str):
-                raise CompileError(f"{self.comparison} compares with a string")
-        elif self.value is None or isinstance(self.value, (tuple, list)):
-            raise CompileError(f"{self.comparison} compares with one literal")
-
-    def validate_text_column(self) -> None:
-        """Check the literals of a test over a text column, such as an answer.
-
-        Raises:
-            CompileError: The text is compared with a number or boolean,
-                or its length with a string.
-        """
-        self.validate()
-        if self.comparison == "is true" and self.function != "length":
-            raise CompileError(f"{self.name} is text, not true or false")
-        if self.comparison.startswith("is"):
-            return
-        values = self.value if isinstance(self.value, tuple) else (self.value,)
-        if self.function is None and any(not isinstance(v, str) for v in values):
-            raise CompileError(
-                f"{self.name} is text; {self.comparison} compares it with a string")
-        if self.function == "length" and any(
-                isinstance(v, (str, bool)) for v in values):
-            raise CompileError(f"{self.name} compares with a number")
-
-    def evaluate(self, columns, *, qualified: bool = False) -> pa.ChunkedArray:
-        """Return a boolean array of the rows the predicate accepts.
-
-        A null compared with a literal is neither accepted nor rejected
-        and comes back null; accepts() treats it as rejected.
-
-        Args:
-            columns: The table, record batch, or rows holding the
-                tested column, read with ``column(name)``.
-            qualified: Whether the columns are named with their table
-                alias, as result rows name them.
-
-        Raises:
-            CompileError: The literal cannot be compared with the
-                column's values, such as a string against a number
-                column.
-        """
-        values = evaluate_expression(self.expression, columns, qualified=qualified)
-        comparison = self.comparison
-        try:
-            if comparison == "is null":
-                return pc.is_null(values)
-            if comparison == "is not null":
-                return pc.is_valid(values)
-            if comparison == "is true":
-                if not pa.types.is_boolean(values.type):
-                    raise TypeError(f"a test is true or false, got {values.type}")
-                return values
-            if comparison == "in":
-                return membership(values, self.value)
-            if isinstance(self.value, str):
-                return COMPARISON_KERNELS[comparison](values, self.value)
-            return compare_literal(values, comparison, self.value)
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
-                pa.ArrowTypeError, TypeError, ValueError, OverflowError) as error:
-            raise CompileError(
-                f"{self} cannot be evaluated on a column of type "
-                f"{values.type}: {error}") from error
-
-    def accepts(self, columns, *, qualified: bool = False) -> pa.Array:
-        """Return the rows the predicate accepts, with every null rejected."""
-        return accepted_rows(self.evaluate(columns, qualified=qualified))
-
-    @property
-    def name(self) -> str:
-        """The tested expression as written."""
-        return _explain(self.expression)
-
-    def __str__(self) -> str:
-        if self.comparison == "in":
-            return f"{self.name} IN ({', '.join(repr(v) for v in self.value)})"
-        if self.comparison == "is true":
-            return self.name
-        if self.comparison.startswith("is"):
-            return f"{self.name} {self.comparison.upper()}"
-        return f"{self.name} {self.comparison} {self.value!r}"
-
-
-class _Connective:
-    """The methods Not, And, and Or share: a node over other conditions.
-
-    A condition is a RegularPredicate, or a Not, And, or Or over
-    conditions. Arrow's Kleene kernels evaluate it, so a null follows
-    SQL's three-valued logic: ``NOT NULL`` is null, ``NULL OR TRUE`` is
-    true, and a row whose condition is null is rejected at the end.
-    """
-
-    operands: tuple
-    minimum_operands: ClassVar[int] = 2
-
-    def tests(self) -> tuple[RegularPredicate, ...]:
-        """Return the column tests under the node, in written order."""
-        return tuple(test for operand in self.operands for test in operand.tests())
-
-    def aliases(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(
-            alias for test in self.tests() for alias in test.aliases()))
-
-    def validate(self) -> None:
-        name = type(self).__name__.upper()
-        if len(self.operands) < self.minimum_operands:
-            raise CompileError(
-                f"{name} takes at least {self.minimum_operands} conditions")
-        for operand in self.operands:
-            if not isinstance(operand, CONDITION_TYPES):
-                raise CompileError(
-                    f"{name} combines conditions, got {type(operand).__name__}")
-            if (isinstance(operand, RegularPredicate)
-                    and isinstance(operand.expression, ModelCall)):
-                raise CompileError(
-                    f"{name} combines column tests, not AI calls; put the "
-                    f"logic inside one prompt's text")
-            operand.validate()
-
-    def evaluate(self, columns, *, qualified: bool = False):
-        """Return a boolean array of the rows the condition accepts.
-
-        Args:
-            columns: The table, record batch, or rows holding the
-                tested columns, read with ``column(name)``.
-            qualified: Whether the columns are named with their table
-                alias, as result rows name them.
-        """
-        return self.combine([operand.evaluate(columns, qualified=qualified)
-                             for operand in self.operands])
-
-    def accepts(self, columns, *, qualified: bool = False) -> pa.Array:
-        """Return the rows the condition accepts, with every null rejected."""
-        return accepted_rows(self.evaluate(columns, qualified=qualified))
-
-    def __str__(self) -> str:
-        return f" {type(self).__name__.upper()} ".join(
-            _operand_text(operand) for operand in self.operands)
-
-
-@dataclass(frozen=True)
-class Not(_Connective):
-    """The rows a condition rejects; a null stays null."""
-
-    operand: RegularPredicate | Not | And | Or
-
-    type_name: ClassVar[str] = "quail.not"
-    minimum_operands: ClassVar[int] = 1
-
-    @property
-    def operands(self) -> tuple:
-        return (self.operand,)
-
-    def combine(self, masks):
-        (mask,) = masks
-        return pc.invert(mask)
-
-    def __str__(self) -> str:
-        return f"NOT {_operand_text(self.operand, always=True)}"
-
-
-@dataclass(frozen=True)
-class And(_Connective):
-    """The rows every condition accepts."""
-
-    operands: tuple[RegularPredicate | Not | And | Or, ...]
-
-    type_name: ClassVar[str] = "quail.and"
-
-    def combine(self, masks):
-        return functools.reduce(pc.and_kleene, masks)
-
-
-@dataclass(frozen=True)
-class Or(_Connective):
-    """The rows at least one condition accepts."""
-
-    operands: tuple[RegularPredicate | Not | And | Or, ...]
-
-    type_name: ClassVar[str] = "quail.or"
-
-    def combine(self, masks):
-        return functools.reduce(pc.or_kleene, masks)
-
-
-CONDITION_TYPES = (RegularPredicate, Not, And, Or)
-# the opposite of each comparison whose negation is another comparison
-_NEGATED_COMPARISONS = {"is null": "is not null", "is not null": "is null"}
-
-
-def _operand_text(operand, *, always: bool = False) -> str:
-    """Return a condition as text, in parentheses when it combines others."""
-    text = str(operand)
-    return f"({text})" if always or isinstance(operand, (And, Or)) else text
-
-
-def negate(condition):
-    """Return the condition that accepts the rows the condition rejects.
-
-    NOT moves down to the column tests by De Morgan's laws, two NOTs
-    cancel, and ``NOT x IS NULL`` becomes ``x IS NOT NULL``, as
-    Spark's BooleanSimplification rule does. Every rewrite keeps SQL's
-    three-valued logic.
-    """
-    if isinstance(condition, Not):
-        return condition.operand
-    if isinstance(condition, And):
-        return Or(tuple(negate(operand) for operand in condition.operands))
-    if isinstance(condition, Or):
-        return And(tuple(negate(operand) for operand in condition.operands))
-    if condition.comparison in _NEGATED_COMPARISONS:
-        return RegularPredicate(condition.expression,
-                                _NEGATED_COMPARISONS[condition.comparison])
-    return Not(condition)
-
-
-def normalize(condition):
-    """Return the condition with NOT on column tests only and AND and OR flat.
-
-    For example, ``NOT (a AND (b AND c))`` becomes
-    ``NOT a OR NOT b OR NOT c``.
-    """
-    if isinstance(condition, Not):
-        negated = negate(normalize(condition.operand))
-        return negated if isinstance(negated, Not) else normalize(negated)
-    if isinstance(condition, (And, Or)):
-        kind = type(condition)
-        operands = []
-        for operand in map(normalize, condition.operands):
-            operands.extend(operand.operands if isinstance(operand, kind)
-                            else (operand,))
-        return kind(tuple(operands))
-    return condition
+def condition_tests(condition) -> tuple:
+    """Return the column tests under a condition, in written order."""
+    if isinstance(condition, RegularPredicate):
+        return (condition,)
+    return tuple(test for operand in condition.operands
+                 for test in condition_tests(operand))
 
 
 def condition_columns(condition) -> tuple[str, ...]:
     """Return the names of the columns a condition's tests read, unqualified."""
     return tuple(dict.fromkeys(
-        reference.column for test in condition.tests()
+        reference.column for test in condition_tests(condition)
         for reference in column_references(test.expression)))
 
 
-@dataclass(frozen=True)
-class Alias:
-    """An expression returned under a name: a model call or a value expression."""
+def evaluate_condition(condition, columns, *, qualified: bool = False):
+    """Return a boolean array of the rows a condition accepts.
 
-    expression: Expression | ModelCall
-    name: str
+    A null compared with a literal is neither accepted nor rejected and
+    comes back null, and Arrow's Kleene kernels follow SQL's
+    three-valued logic: ``NOT NULL`` is null and ``NULL OR TRUE`` is
+    true. ``accepts`` treats a null as rejected.
 
-    type_name: ClassVar[str] = "quail.alias"
+    Args:
+        condition: A RegularPredicate, or a Not, And, or Or of conditions.
+        columns: The table, record batch, or rows holding the tested
+            columns, read with ``column(name)``.
+        qualified: Whether the columns are named with their table alias,
+            as result rows name them.
 
-    def validate(self) -> None:
-        if isinstance(self.expression, ModelCall):
-            self.expression.validate()
-        else:
-            _validate_tree(self.expression)
-        if not self.name:
-            raise CompileError("a projected expression needs a name")
-
-
-# a value expression: a tree of these nodes with ColumnRef leaves
-Expression = ColumnRef | GetField | ScalarFunction | Literal | Alias
-
-
-def model_call(expression) -> ModelCall:
-    """Return the model call inside a predicate or projected expression."""
-    if isinstance(expression, ModelCall):
-        return expression
-    if isinstance(expression, (RegularPredicate, Alias)) and isinstance(
-            expression.expression, ModelCall):
-        return expression.expression
-    raise TypeError(f"{type(expression).__name__} holds no model call")
-
-
-@dataclass(frozen=True)
-class FilterPredicate:
-    """One predicate over a table's documents, with its selectivity hint."""
-
-    expression: Any  # ModelCall | RegularPredicate over an AI.SCORE call
-    selectivity: Optional[float] = None  # fraction of documents that
-    #                                       pass; None means not given
-
-    type_name: ClassVar[str] = "quail.filter_predicate"
-
-    @property
-    def prompt(self) -> Prompt:
-        """The prompt the predicate asks."""
-        return model_call(self.expression).prompt
-
-
-@dataclass(frozen=True)
-class Equality:
-    """One ordinary join condition: two columns of two tables are equal."""
-
-    left: Any  # a value expression over one table
-    right: Any
-
-    type_name: ClassVar[str] = "quail.equality"
-
-    def aliases(self) -> tuple[str, str]:
-        return self.left.alias, self.right.alias
-
-    def __str__(self) -> str:
-        return f"{column_name(self.left)} = {column_name(self.right)}"
+    Raises:
+        CompileError: A literal cannot be compared with its column's
+            values, such as a string against a number column.
+    """
+    if isinstance(condition, Not):
+        return pc.invert(evaluate_condition(condition.operand, columns,
+                                            qualified=qualified))
+    if isinstance(condition, (And, Or)):
+        combine = pc.and_kleene if isinstance(condition, And) else pc.or_kleene
+        return functools.reduce(combine, [
+            evaluate_condition(operand, columns, qualified=qualified)
+            for operand in condition.operands])
+    values = evaluate_expression(condition.expression, columns, qualified=qualified)
+    comparison, value = condition.comparison, condition.value
+    try:
+        if comparison == "is null":
+            return pc.is_null(values)
+        if comparison == "is not null":
+            return pc.is_valid(values)
+        if comparison == "is true":
+            if not pa.types.is_boolean(values.type):
+                raise TypeError(f"a test is true or false, got {values.type}")
+            return values
+        if comparison == "in":
+            return membership(values, value)
+        if isinstance(value, str):
+            return COMPARISON_KERNELS[comparison](values, value)
+        return compare_literal(values, comparison, value)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
+            pa.ArrowTypeError, TypeError, ValueError, OverflowError) as error:
+        raise CompileError(
+            f"{column_name(condition.expression)} {comparison} {value!r} cannot "
+            f"be evaluated on a column of type {values.type}: {error}") from error
 
 
-def _explain(expression) -> str:
-    if isinstance(expression, RegularPredicate):
-        return str(expression)
-    if isinstance(expression, Alias):
-        call = aliased_call(expression)
-        if call is None:
-            return f"{column_name(expression.expression)} AS {expression.name}"
-        if call.kind in ("label", "extract", "map"):
-            # the SemanticClassify, SemanticExtract, or SemanticMap
-            # below computes the column
-            return expression.name
-        return f"{_explain(call)} AS {expression.name}"
-    if isinstance(expression, (str, ColumnRef, GetField, ScalarFunction, Literal)):
-        return column_name(expression)
-    if expression.kind == "label":
-        return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"
-    if expression.kind == "extract":
-        return f"AI.EXTRACT({expression.prompt.template!r}, {expression.question!r})"
-    if expression.kind == "features":
-        return (f"AI.SAE_FEATURES({expression.prompt.template!r}, "
-                f"pooling={expression.pooling!r})")
-    if expression.kind == "map":
-        return (f"AI.MAP({expression.prompt.template!r}, "
-                f"max_answer_tokens={expression.max_answer_tokens})")
-    function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
-    return f"{function}({expression.prompt.template!r})"
-
-
-@dataclass(frozen=True)
-class SortKey:
-    """One ORDER BY term: a column or a projected expression and its direction."""
-
-    expression: Any  # a value expression or an Alias
-    descending: bool = False
-    nulls_first: bool = False
-
-    type_name: ClassVar[str] = "quail.sort_key"
-
-    @property
-    def name(self) -> str:
-        """Return the result column name the key sorts on."""
-        return column_name(self.expression)
-
-    def validate(self) -> None:
-        _validate_tree(self.expression)
-
-    def __str__(self) -> str:
-        return (
-            f"{self.name} {'DESC' if self.descending else 'ASC'} "
-            f"NULLS {'FIRST' if self.nulls_first else 'LAST'}"
-        )
-
-
+def accepts(condition, columns, *, qualified: bool = False) -> pa.Array:
+    """Return the rows a condition accepts, with every null rejected."""
+    return accepted_rows(evaluate_condition(condition, columns, qualified=qualified))

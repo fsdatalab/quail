@@ -37,10 +37,8 @@ from quail.common.tokens import (
 )
 from quail.execution.runner import ExecutionContext
 from quail.execution.types import PhysicalResponse
-from quail.physical import (
-    Scan,
-    decode_graph,
-)
+from quail.physical import Scan
+from quail.physical.plan import graph_from_envelope
 from quail.progress import say, set_gpu_index
 from quail.specs.files import resolve_model_path
 
@@ -491,7 +489,7 @@ def _child_execute(state, sub) -> dict:
     """
     if "query" in sub:
         payload = sub["query"]
-        graph = decode_graph(payload["physical_plan"]["graph"], state.registry.codecs)
+        graph = graph_from_envelope(payload["physical_plan"])
         state.runtime_context = execution_context(
             _execution_state(state.gpu, payload, state.registry), payload, graph)
     context = state.runtime_context

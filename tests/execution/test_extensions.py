@@ -1,23 +1,26 @@
 """Extension registration, ordering, and rollback tests."""
 
 import sys
-from dataclasses import dataclass
 from types import ModuleType
-from typing import ClassVar
 
+import pyarrow as pa
 import pytest
 
 from quail.builtins import built_in_registry
+from quail.execution.metrics import NodeResult
+from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext, GenericRunner
-from quail.execution.runtimes import ScanRuntime
 from quail.extensions import PhysicalRule
-from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
+from quail.physical import (
+    ExtensionNode,
+    GraphValidationError,
+    OutputPort,
+    PhysicalGraph,
+    PortRef,
+    ValueType,
+)
 
-
-@dataclass(frozen=True)
-class CustomInput(Scan):
-    type_name: ClassVar[str] = "test.custom_input"
-    runtime_key: ClassVar[str] = "test.custom_input_runtime"
+CUSTOM_INPUT = "test.custom_input"
 
 
 def _module(monkeypatch, name, register):
@@ -102,34 +105,25 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
     assert not registry.extension_modules
 
 
-def test_node_registration_validation_and_execution():
-    for existing in ["codec", "runtime"]:
-        registry = built_in_registry()
-        if existing == "codec":
-            registry.register_codec(NodeCodec(CustomInput))
-        else:
-            registry.register_runtime(ScanRuntime(), key=CustomInput.runtime_key)
-        codecs, runtimes = dict(registry.codecs), dict(registry.runtimes)
-        with pytest.raises(ValueError, match=f"duplicate {existing}"):
-            registry.register_node(CustomInput, runtime=ScanRuntime())
-        assert dict(registry.codecs) == codecs
-        assert dict(registry.runtimes) == runtimes
+def test_an_extension_node_round_trips_and_runs_with_its_registered_runtime():
+    class SourceRuntime:
+        def execute(self, node, inputs, context):
+            return NodeResult({f"rows:{node.alias}": Rows(
+                {node.alias: pa.array(context.sources[node.input_id])})})
 
-    registry = built_in_registry().register_node(CustomInput, runtime=ScanRuntime())
-    node = CustomInput(node_id="custom", alias="d", input_id="d", num_documents=2)
-    codec = registry.codecs[node.type_name]
-    assert codec.decode(codec.encode(node)) == node
-    assert isinstance(registry.runtimes[node.runtime_key], ScanRuntime)
+    registry = built_in_registry().register_runtime(SourceRuntime(), key=CUSTOM_INPUT)
+    with pytest.raises(ValueError, match="duplicate runtime"):
+        registry.register_runtime(SourceRuntime(), key=CUSTOM_INPUT)
+    node = ExtensionNode(
+        CUSTOM_INPUT, "custom",
+        outputs=(OutputPort("rows:d", ValueType.ROWS, schema=("d",)),),
+        alias="d", input_id="d")
+    graph = PhysicalGraph((node,), PortRef("custom", "rows:d"))
+    assert PhysicalGraph.from_json(graph.to_json()) == graph
     result = GenericRunner().run(
-        PhysicalGraph((node,), PortRef("custom", "rows:d")),
-        ExecutionContext(runtimes=registry.runtimes, sources={"d": [3, 7]}),
-    )
+        graph, ExecutionContext(runtimes=registry.runtimes, sources={"d": [3, 7]}))
     assert result.value.ids["d"].to_pylist() == [3, 7]
-
-    registry = built_in_registry()
-    with pytest.raises(ValueError, match="codec must describe"):
-        registry.register_node(
-            CustomInput, runtime=ScanRuntime(), codec=NodeCodec(Scan),
-        )
-    assert CustomInput.type_name not in registry.codecs
-    assert CustomInput.runtime_key not in registry.runtimes
+    with pytest.raises(GraphValidationError, match="unregistered runtimes"):
+        graph.validate(runtime_keys=set(built_in_registry().runtimes))
+    with pytest.raises(ValueError, match="one of Quail's node types"):
+        ExtensionNode("quail.scan", "custom")

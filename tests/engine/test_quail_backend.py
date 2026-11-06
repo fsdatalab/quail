@@ -1,5 +1,6 @@
 """Quail backend execution tests without a GPU."""
 
+import json
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -22,13 +23,12 @@ from quail.physical import (
     PhysicalGraph,
     PortRef,
     Scan,
+    input_ports,
 )
-from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS
 
 
 def test_filter_execution_and_retention_inputs(monkeypatch):
-    from quail.physical import plan_envelope
 
     filtered = AiFilter(
         node_id="filter:d", inputs=input_ports((PortRef("input:d", "rows:d"),)),
@@ -65,9 +65,9 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
         "order_rule": "by_cost", "documents": {"d": [[1], [2], [3], [4]]},
         "joins": [], "filters": {}, "filter_arena_writes": {},
         "shards": {"d": ((0, 2), (1, 3))},
-        "physical_plan": plan_envelope(
-            backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
-            gpus=2, graph=graph, codecs=registry.codecs),
+        "physical_plan": {
+            "backend": "quail", "model": "qwen3-4b-fp8", "device": "h100-sxm",
+            "gpus": 2, "settings": {}, "graph": json.loads(graph.to_json())},
     }
     result = execute_distributed_graph(
         payload, graph, 2, round_fn, DEVICES["h100-sxm"], registry.runtimes,

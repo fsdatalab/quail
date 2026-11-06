@@ -18,7 +18,7 @@ import json
 import _quail_native
 
 from quail.common.expressions import CompileError, Prompt
-from quail.physical.codec import decode_value, encode_value
+from quail.physical import decode_plan_value
 
 Turn = tuple[str, str]
 
@@ -27,11 +27,11 @@ def _bind(kind: str, template: str, args, *, turn: Turn = ("", ""),
           layout: str = "ai-if", labels=(), descriptions=(),
           task_description: str = "") -> Prompt:
     found, message = _quail_native.bind_prompt(
-        kind, template, json.dumps([encode_value(arg) for arg in args]),
+        kind, template, json.dumps([json.loads(arg.to_json()) for arg in args]),
         list(labels), list(descriptions), task_description, tuple(turn), layout)
     if message is not None:
         raise CompileError(message)
-    return decode_value(Prompt, json.loads(found))
+    return decode_plan_value(found)
 
 
 def bind_prompt(template: str, args: tuple, turn: Turn = ("", ""),

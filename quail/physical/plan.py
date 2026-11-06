@@ -1,15 +1,12 @@
-"""A physical plan, a refusal to plan, and the pass that sets document KV lifetimes."""
+"""A physical plan, a refusal to plan, and the edits that change a plan."""
 
 import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
-from quail.physical import (
-    PhysicalGraph,
-    PhysicalNode,
-    PortRef,
-)
-from quail.physical.codec import plan_envelope
+import _quail_native
+
+from quail.physical import PhysicalGraph, PortRef
 
 
 @dataclass(frozen=True)
@@ -56,21 +53,30 @@ def _estimates(estimates: dict) -> dict:
             for node_id, entry in estimates.items()}
 
 
-def plan_from_json(found: dict, codecs: dict):
+def graph_from_envelope(envelope: Mapping[str, Any]) -> PhysicalGraph:
+    """Read and validate the graph of a plan envelope.
+
+    Raises:
+        ValueError: The envelope has a missing or unknown field, or its
+            graph does not read or is invalid.
+    """
+    text = json.dumps(envelope)
+    _quail_native.read_and_write_plan(text)
+    return PhysicalGraph.from_json(json.dumps(envelope["graph"]))
+
+
+def plan_from_json(found: dict):
     """Return the PhysicalPlan, or the Refusal, that Rust's planner wrote.
 
     Args:
         found: A planned region as ``NativePlanner.plan`` returns it, read
             from JSON: the envelope, the estimates, the logical plan, and,
             for Quail's backend, the pricer and the context fields.
-        codecs: The node codecs by type name, from the session registry.
     """
     if "refusal" in found:
         return refusal_from_fields(found["refusal"])
-    from quail.physical.codec import decode_graph
-
     envelope = found["envelope"]
-    graph = decode_graph(envelope["graph"], codecs)
+    graph = PhysicalGraph.from_json(json.dumps(envelope["graph"]))
     settings = dict(envelope["settings"])
     if "candidates" in settings:
         settings["candidates"] = tuple(
@@ -118,8 +124,6 @@ class PhysicalPlan:
     def __post_init__(self) -> None:
         if not self.nodes:
             raise ValueError("a physical plan needs at least one node")
-        if not all(isinstance(node, PhysicalNode) for node in self.nodes):
-            raise TypeError("PhysicalPlan nodes must implement PhysicalNode")
         root = self.root or PortRef(
             self.nodes[-1].node_id, self.nodes[-1].outputs[0].name
         )
@@ -128,7 +132,6 @@ class PhysicalPlan:
         object.__setattr__(self, "nodes", graph.nodes)
         object.__setattr__(self, "root", graph.root)
         object.__setattr__(self, "graph", graph)
-
 
     def _edit(self, edit: dict) -> "PhysicalPlan":
         """Apply an edit in Rust: rewire, set KV retention, validate, price.
@@ -141,34 +144,28 @@ class PhysicalPlan:
                 node that changes what the query means, or leaves an
                 invalid graph.
         """
-        import _quail_native
-
-        from quail.physical.codec import built_in_codecs, decode_graph, encode_graph
-
-        codecs = {codec.type_name: codec for codec in built_in_codecs()}
+        graph = json.loads(self.graph.to_json())
         if self.pricing is not None:
             retained = sorted(self.settings.get("retention", {}).get("initial", {}))
             found, message = _quail_native.plan_operator(
                 "edit_plan", json.dumps(self.pricing["fields"]),
-                json.dumps({"pricer": self.pricing["pricer"],
-                            "graph": encode_graph(self.graph, codecs),
+                json.dumps({"pricer": self.pricing["pricer"], "graph": graph,
                             "edit": edit, "retained": retained}),
                 _no_tokens)
             if message is not None:
                 raise PlanEditError(message)
             found = json.loads(found)
-            graph = decode_graph(found["graph"], codecs)
-            return replace(self, nodes=graph.nodes, root=graph.root,
+            edited = PhysicalGraph.from_json(json.dumps(found["graph"]))
+            return replace(self, nodes=edited.nodes, root=edited.root,
                            estimated_seconds=found["seconds"],
                            estimates=_estimates(found["estimates"]))
-        found, message = _quail_native.edit_graph(
-            json.dumps(encode_graph(self.graph, codecs)), json.dumps(edit))
+        found, message = _quail_native.edit_graph(json.dumps(graph), json.dumps(edit))
         if message is not None:
             raise PlanEditError(message)
-        graph = decode_graph(json.loads(found), codecs)
-        return replace(self, nodes=graph.nodes, root=graph.root, estimates={})
+        edited = PhysicalGraph.from_json(found)
+        return replace(self, nodes=edited.nodes, root=edited.root, estimates={})
 
-    def insert(self, node: PhysicalNode, *, between: tuple) -> "PhysicalPlan":
+    def insert(self, node, *, between: tuple) -> "PhysicalPlan":
         """Put node on the edge from producer to consumer.
 
         The consumer's port that read the producer reads the new node
@@ -176,10 +173,7 @@ class PhysicalPlan:
         changes. The node must have no inputs yet and exactly one
         output of the value type the edge carries.
         """
-        from quail.physical.codec import built_in_codecs
-
-        codecs = {codec.type_name: codec for codec in built_in_codecs()}
-        return self._edit({"op": "insert", "node": codecs[node.type_name].encode(node),
+        return self._edit({"op": "insert", "node": json.loads(node.to_json()),
                            "between": list(between)})
 
     def remove(self, node_id: str) -> "PhysicalPlan":
@@ -197,14 +191,14 @@ class PhysicalPlan:
         return self._edit({"op": "move", "node_id": node_id,
                            "between": list(between)})
 
-    def to_envelope(self, codecs) -> dict:
+    def to_envelope(self) -> dict:
         """Encode the typed graph for a process boundary."""
-        return plan_envelope(
-            backend=self.backend,
-            model=self.model,
-            device=self.device,
-            gpus=self.gpus,
-            graph=self.graph,
-            codecs=codecs,
-            settings=self.settings,
-        )
+        self.graph.validate_backend(self.backend)
+        return {
+            "backend": self.backend,
+            "model": self.model,
+            "device": self.device,
+            "gpus": self.gpus,
+            "settings": dict(self.settings),
+            "graph": json.loads(self.graph.to_json()),
+        }

@@ -10,7 +10,6 @@ from quail.api.config import EngineConfig
 from quail.backends.quail.executor.operators.sae_features import FEATURE_LIST
 from quail.catalog import DocumentProvider
 from quail.common.expressions import CompileError
-from quail.physical import decode_graph, encode_graph
 
 REVIEWS = ["great sound", "meh", "broken zipper"]
 
@@ -62,9 +61,6 @@ def test_unnest_groups_rows_by_feature(session):
     query = session.sql(
         f"SELECT f.feature, COUNT(*) AS n, MAX(f.strength) AS top "
         f"FROM reviews r, {UNNEST} GROUP BY f.feature ORDER BY n DESC")
-    codecs = session.registry.codecs
-    plan = query.plan()
-    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
     rows = finish(query, _unnest_oracle()).collect()
     assert rows.to_pylist()[0] == {"f.feature": 100, "n": 3, "top": 0.5}
     assert sorted(row["f.feature"] for row in rows.to_pylist()) == [0, 1, 2, 100]

@@ -27,8 +27,8 @@ from quail.physical import (
     PhysicalGraph,
     PortRef,
     Scan,
+    input_ports,
 )
-from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS
 
 DOC = 1000

@@ -12,6 +12,7 @@ from quail.backends.quail.executor.parts import (
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
+from quail.common.expressions import accepts
 from quail.common.pairs import columns_key
 from quail.common.selection import group_ids
 from quail.common.tokens import DocumentKeys, DocumentPrefixes
@@ -170,7 +171,7 @@ class ConditionGate(SingleResultPart):
         documents = [key[1] for key in keys]
         values = {column: self.read(column, documents)
                   for column in self.node.tested_columns}
-        kept = self.node.predicate.accepts(pa.table(values))
+        kept = accepts(self.node.predicate, pa.table(values))
         kept = kept.to_numpy(zero_copy_only=False).tolist()
         self.decided.update(zip(keys, kept))
         return [key for key, keep in zip(keys, kept) if keep]
@@ -187,7 +188,7 @@ class ConditionGate(SingleResultPart):
         token = tuple(_hashable(found[0].as_py()) for found in values.values())
         if token not in self.accepted:
             self.accepted[token] = bool(
-                self.node.predicate.accepts(pa.table(values))[0].as_py())
+                accepts(self.node.predicate, pa.table(values))[0].as_py())
         return None if self.accepted[token] else Stage.DROP
 
     def finish(self, every):

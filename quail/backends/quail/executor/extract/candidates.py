@@ -14,7 +14,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.physical import ExtractSpec
+
+# the source characters an ExtractSpec tokenizes in its first window and
+# in each later one, unless the plan sets them
+FIRST_WINDOW_CHARS = 64
+WINDOW_CHARS = 512
 
 NEG = float("-inf")
 
@@ -124,8 +128,8 @@ class Stream:
     exhausted: bool = False
     windows: int = 0    # windows tokenized so far
     normalized: SqueezedText | None = None
-    first_window_chars: int = ExtractSpec.first_window_chars
-    window_chars: int = ExtractSpec.window_chars
+    first_window_chars: int = FIRST_WINDOW_CHARS
+    window_chars: int = WINDOW_CHARS
 
     def extend(self, vocabulary: Vocabulary) -> None:
         """Tokenize the next window of the document past the stream's end.
@@ -289,8 +293,8 @@ def first_tokens(vocabulary: Vocabulary, lp, scan: DocumentTokens) -> FirstToken
 
 
 def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
-                 first, *, first_window_chars: int = ExtractSpec.first_window_chars,
-                 window_chars: int = ExtractSpec.window_chars) -> list:
+                 first, *, first_window_chars: int = FIRST_WINDOW_CHARS,
+                 window_chars: int = WINDOW_CHARS) -> list:
     """Return a stream for each start the chosen first token begins.
 
     A stream's tokens are the text from the start as the model writes

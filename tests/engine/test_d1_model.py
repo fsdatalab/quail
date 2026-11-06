@@ -132,7 +132,6 @@ def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
     from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
     from quail.physical import AiClassify, AiJoin
-    from quail.physical.pipelines import build_pipelines
 
     body = " ".join(["word"] * 300)
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
@@ -158,7 +157,7 @@ def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
     assert [question_text(part).strip() for part in spec.join_layout] == [
         "QUESTION:", "aspects record:"]
     assert question_text(spec.prompt_token_parts[0]).endswith("\nreviews record:\n")
-    assert build_pipelines(plan.graph)[join.node_id] == (join, label)
+    assert plan.graph.pipelines()[join.node_id] == (join, label)
     # priced by its own estimate over each anchor's kept pairs, not as a
     # pass group of one question for each pair
     assert label.pass_group == -1

@@ -79,13 +79,11 @@ pub struct PhysicalRequest {
     pub graph: Value,
     #[serde(default)]
     pub estimates: Vec<(String, Value)>,
-    /// node id -> the node, for a node type Quail does not define.
-    #[serde(default)]
-    pub extensions: HashMap<String, ExtensionNode>,
 }
 
-/// A node of a type Quail does not define, as its Python class reports it.
-#[derive(Debug, Deserialize)]
+/// A node that explain shows by its fields alone: an extension's, or a
+/// request backend's.
+#[derive(Debug)]
 pub struct ExtensionNode {
     pub type_name: String,
     /// Each input as (port name, source node id, source port).
@@ -741,6 +739,106 @@ impl Node {
     }
 }
 
+/// A node explain shows by its fields alone: an extension's node, with
+/// its attributes, or a request backend's, with each operator it
+/// submits; None for any other node.
+fn shown_alone(node: &PhysicalNode) -> Option<ExtensionNode> {
+    let inputs = node
+        .inputs()
+        .iter()
+        .map(|input| {
+            (
+                input.name.clone(),
+                input.source.node_id.clone(),
+                input.source.port.clone(),
+            )
+        })
+        .collect();
+    let outputs = node.outputs().into_iter().map(|(name, _)| name).collect();
+    let fields = match node {
+        PhysicalNode::Extension(extension) => extension
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), Shown::Text(py_str(value))))
+            .collect(),
+        PhysicalNode::RequestExecution(request) => request_fields(&request.attributes),
+        _ => return None,
+    };
+    Some(ExtensionNode {
+        type_name: node.type_name().to_string(),
+        inputs,
+        outputs,
+        fields,
+    })
+}
+
+/// Text without runs of whitespace, cut to 60 characters.
+fn short_text(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= 60 {
+        text
+    } else {
+        format!("{}...", prefix(&text, 57))
+    }
+}
+
+/// A request backend's node fields: its backend and tables, then each
+/// filter's questions, join, classification, extraction, and map.
+fn request_fields(request: &quail_physical::RequestExecutionAttributes) -> Vec<(String, Shown)> {
+    let text = |value: Value| Shown::Text(py_str(&value));
+    let mut fields = vec![
+        (
+            "backend".to_string(),
+            text(Value::from(request.backend_name.clone())),
+        ),
+        (
+            "aliases".to_string(),
+            text(Value::from(request.aliases.clone())),
+        ),
+    ];
+    for spec in &request.filters {
+        let texts: Vec<String> = if spec.question_texts.is_empty() {
+            spec.written_positions
+                .iter()
+                .map(|position| format!("predicate {}", position + 1))
+                .collect()
+        } else {
+            spec.question_texts.clone()
+        };
+        let shown: Vec<String> = texts.iter().map(|found| short_text(found)).collect();
+        fields.push((format!("filter {}", spec.alias), text(Value::from(shown))));
+    }
+    for spec in &request.joins {
+        fields.push((
+            format!("join {}", spec.written_position + 1),
+            Shown::Text(format!(
+                "{}: {}",
+                spec.semantics,
+                short_text(&spec.tail_text)
+            )),
+        ));
+    }
+    for spec in &request.classifies {
+        fields.push((
+            format!("classify {}", spec.output),
+            text(Value::from(spec.labels.clone())),
+        ));
+    }
+    for spec in &request.extracts {
+        fields.push((
+            format!("extract {}", spec.output),
+            Shown::Text(format!("question={}", repr_str(&spec.question))),
+        ));
+    }
+    for spec in &request.maps {
+        fields.push((
+            format!("map {}", spec.output),
+            Shown::Text(short_text(&spec.tail_text)),
+        ));
+    }
+    fields
+}
+
 /// A JSON value with each object's keys in written order, as explain's
 /// `key=value` lines show it.
 #[derive(Debug, Clone, PartialEq)]
@@ -1078,35 +1176,10 @@ impl Graph {
         let mut nodes = Vec::new();
         for value in physical.graph["nodes"].as_array().into_iter().flatten() {
             let id = value["id"].as_str().unwrap_or_default().to_string();
-            if let Some(extension) = physical.extensions.get(&id) {
-                nodes.push(Node {
-                    inputs: extension
-                        .inputs
-                        .iter()
-                        .map(|(name, node_id, port)| {
-                            (
-                                name.clone(),
-                                PortRef {
-                                    node_id: node_id.clone(),
-                                    port: port.clone(),
-                                },
-                            )
-                        })
-                        .collect(),
-                    id,
-                    known: None,
-                    extension: Some(ExtensionNode {
-                        type_name: extension.type_name.clone(),
-                        inputs: extension.inputs.clone(),
-                        outputs: extension.outputs.clone(),
-                        fields: extension.fields.clone(),
-                    }),
-                });
-                continue;
-            }
             let node: PhysicalNode = serde_json::from_value(value.clone())
                 .or_else(|_| serde_json::from_value(numeric_tokens(value.clone(), false)))
                 .map_err(|error| format!("the node {id} does not read: {error}"))?;
+            let extension = shown_alone(&node);
             nodes.push(Node {
                 id,
                 inputs: node
@@ -1114,8 +1187,8 @@ impl Graph {
                     .iter()
                     .map(|input| (input.name.clone(), input.source.clone()))
                     .collect(),
-                known: Some(node),
-                extension: None,
+                known: extension.is_none().then_some(node),
+                extension,
             });
         }
         let root: PortRef = serde_json::from_value(physical.graph["root"].clone())
