@@ -2,7 +2,6 @@
 
 import json
 import zlib
-from contextlib import closing
 
 import pyarrow as pa
 import pytest
@@ -10,8 +9,6 @@ from helpers.sessions import CONFIG, TOKENIZER, check_table
 
 import quail
 from quail.api.config import EngineConfig
-from quail.api.stages import StageExecution
-from quail.logical import WithCTE
 from quail.physical.plan import Refusal
 
 native = pytest.importorskip("_quail_native")
@@ -64,11 +61,6 @@ NODE_CASES = {
     "quail.exchange": ("qwen3-4b-fp8", 2,
                        "SELECT r.id, a.id FROM reviews r JOIN aspects a "
                        "ON AI_FILTER(PROMPT('q4: {0} {1}', r.body, a.aspect))"),
-    "quail.query_stage": ("qwen3-4b-fp8", 1,
-                          "WITH clauses AS (SELECT c.id, AI.EXTRACT(c.text, "
-                          "{'terms': 'What is the termination clause?'}) AS clause "
-                          "FROM contracts c) SELECT x.id, AI.SCORE(PROMPT("
-                          "'Early? {0}', x.clause.terms)) AS score FROM clauses x"),
     "quail.unnest": ("qwen3.5-2b-sae-bf16", 1,
                      "SELECT r.id, f.feature FROM reviews r, UNNEST(AI.SAE_FEATURES("
                      "PROMPT('{0} What is this about?', r.body), pooling => 'last')) "
@@ -86,11 +78,6 @@ def test_a_plan_with_each_node_type_reads_into_the_rust_types_unchanged(node_typ
                 name, quail.DocumentProvider.from_table(table, id_col="id"))
         query = session.sql(text)
         plans = [query.plan()]
-        if isinstance(query.logical.root, WithCTE):
-            # each CTE stage plans its own graph
-            with closing(StageExecution(query)) as stages:
-                stages.plan()
-                plans.extend(stages.plans.values())
         trips = [_round_trip(plan, session) for plan in plans]
     assert node_type in {node["type"] for written, _ in trips
                          for node in written["graph"]["nodes"]}

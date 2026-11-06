@@ -10,7 +10,6 @@ import pyarrow as pa
 from quail.common.expressions import (
     PROBABILITIES_SUFFIX,
     SPAN_SUFFIX,
-    Alias,
     ColumnRef,
     CompileError,
     ModelCall,
@@ -36,7 +35,6 @@ from quail.logical.nodes import (
     SemanticMap,
     SemanticSaeFeatures,
     Unnest,
-    WithCTE,
 )
 from quail.logical.nodes.column import SemanticColumn
 
@@ -116,8 +114,7 @@ class LogicalPlan:
     @property
     def projection(self) -> Project:
         """Return the first projection over source columns and model answers."""
-        node = self.root.input if isinstance(self.root, WithCTE) else self.root
-        projection = next((found for found in LogicalPlan(node).walk()
+        projection = next((found for found in self.walk()
                            if isinstance(found, Project)), None)
         if projection is None:
             raise CompileError("a query plan needs a projection")
@@ -126,15 +123,7 @@ class LogicalPlan:
     @property
     def result(self) -> Result:
         """Return result modifiers, using defaults when they are absent."""
-        root = self.root.input if isinstance(self.root, WithCTE) else self.root
-        return root if isinstance(root, Result) else Result(root)
-
-    def stages(self) -> tuple:
-        """Return CTE definitions and the final query in dependency order."""
-        if isinstance(self.root, WithCTE):
-            return (*((name, LogicalPlan(node)) for name, node in self.root.ctes),
-                    ("", LogicalPlan(self.root.input)))
-        return (("", self),)
+        return self.root if isinstance(self.root, Result) else Result(self.root)
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
         """Return the columns produced by the root node."""
@@ -169,8 +158,6 @@ class LogicalPlan:
         Raises:
             CompileError: A Scan carries no provider schema.
         """
-        if isinstance(self.root, WithCTE):
-            return LogicalPlan(self.root.input).schema()
         scans = {node.alias: node for node in self.walk() if isinstance(node, Scan)}
         for scan in scans.values():
             if scan.schema is None:
@@ -434,39 +421,3 @@ def _unnested_fields(node: Unnest, fields: dict) -> dict:
         else:
             types[name] = value_type
     return types
-
-
-def cte_schema(plan: LogicalPlan) -> pa.Schema:
-    """Return the schema of a plan's result, named as a CTE's columns.
-
-    A projected column reference is named by its column alone, so
-    ``SELECT c.id`` gives ``id``, and an unnested field by its field
-    alone, so ``SELECT f.feature`` gives ``feature``; every other column
-    keeps its name.
-
-    Raises:
-        CompileError: A projected expression has no AS name, or two
-            columns would share one name.
-    """
-    expressions = {column_name(column): column for column in plan.projection.columns}
-    unnested = {name: name.removeprefix(f"{column}.")
-                for node in plan.walk() if isinstance(node, Unnest)
-                for column, names in node.fields().items() for name in names}
-    fields = []
-    for result in plan.schema():
-        column = expressions.get(result.name)
-        if result.name in unnested:
-            result = result.with_name(unnested[result.name])
-        elif isinstance(column, ColumnRef):
-            result = result.with_name(column.column)
-        elif column is not None and not isinstance(column, Alias):
-            raise CompileError(
-                f"{result.name} in a CTE needs an AS name; a later query reads "
-                f"the column by that name")
-        fields.append(result)
-    schema = pa.schema(fields)
-    if len(set(schema.names)) != len(schema.names):
-        raise CompileError(
-            f"the CTE returns a column name twice: {schema.names}; give one an "
-            f"AS name")
-    return schema

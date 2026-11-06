@@ -23,7 +23,6 @@ from quail.logical.nodes.sae_features import (
 )
 from quail.logical.nodes.scan import Scan
 from quail.logical.nodes.unnest import Unnest
-from quail.logical.nodes.with_cte import WithCTE
 
 __all__ = [
     "FEATURE_LIST",
@@ -35,7 +34,6 @@ __all__ = [
     "Project",
     "Result",
     "Scan",
-    "WithCTE",
     "SemanticClassify",
     "SemanticColumn",
     "columns_above_joins",

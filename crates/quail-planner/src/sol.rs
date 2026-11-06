@@ -114,9 +114,6 @@ fn round_to(value: f64, digits: usize) -> f64 {
 fn refuse_unpriced(plan: &LogicalPlan, found: &Operators) -> Result<(), CompileError> {
     for node in walk(plan) {
         match node {
-            LogicalNode::WithCte(_) => {
-                return not_priced("the speed of light estimate does not price quail.with_cte");
-            }
             LogicalNode::Result(result)
                 if result.limit.is_some()
                     && !(!result.order.is_empty() || result.distinct || result.offset != 0) =>

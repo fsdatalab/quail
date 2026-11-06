@@ -42,10 +42,7 @@ pub struct Operators {
 ///
 /// The plan has no Project.
 pub fn projection(plan: &LogicalPlan) -> &LogicalNode {
-    let root = match &plan.root {
-        LogicalNode::WithCte(with) => with.input.as_ref(),
-        other => other,
-    };
+    let root = &plan.root;
     subtree(root)
         .into_iter()
         .find(|node| matches!(node, LogicalNode::Project(_)))

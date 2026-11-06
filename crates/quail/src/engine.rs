@@ -89,7 +89,7 @@ impl PythonRunner {
         if let Some(fetch) = fetch {
             logical.root = with_limit(logical.root, fetch as i64);
         }
-        // Python plans a CTE's stages and a region that asks no model
+        // Python plans a region that asks no model
         let operators = quail_planner::operators::operators(&logical);
         let asks_model = !(operators.filters.is_empty()
             && operators.joins.is_empty()
@@ -98,7 +98,7 @@ impl PythonRunner {
             && operators.sae_features.is_empty()
             && operators.maps.is_empty()
             && operators.projections.is_empty());
-        if matches!(logical.root, quail_planner::LogicalNode::WithCte(_)) || !asks_model {
+        if !asks_model {
             return Ok(None);
         }
         let mut tables = named_tables(region)?;
@@ -212,7 +212,6 @@ impl RegionRunner for PythonRunner {
 fn with_limit(root: quail_planner::LogicalNode, fetch: i64) -> quail_planner::LogicalNode {
     use quail_planner::LogicalNode;
     match root {
-        LogicalNode::WithCte(_) => root,
         LogicalNode::Result(mut result) => {
             result.limit = Some(result.limit.map_or(fetch, |limit| limit.min(fetch)));
             LogicalNode::Result(result)

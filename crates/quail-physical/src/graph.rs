@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::nodes::{NestedNode, PhysicalNode};
+use crate::nodes::PhysicalNode;
 use crate::tagged_struct;
 
 /// What a port carries between two nodes.
@@ -43,14 +43,6 @@ tagged_struct! {
 pub struct PhysicalGraph {
     pub nodes: Vec<PhysicalNode>,
     pub root: PortRef,
-}
-
-tagged_struct! {
-    /// A graph nested inside a node, which carries a class tag.
-    NestedGraph(NestedGraphFields, NestedGraphTagged) = "quail.physical.base.PhysicalGraph" {
-        nodes: Vec<NestedNode>,
-        root: PortRef,
-    }
 }
 
 /// The physical plan as it crosses a process boundary.

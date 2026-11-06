@@ -237,7 +237,6 @@ impl PhysicalNode {
             }
             PhysicalNode::Sort(node) => node.attributes.columns.clone(),
             PhysicalNode::Unnest(node) => node.attributes.columns.clone(),
-            PhysicalNode::QueryStage(node) => node.attributes.columns.clone(),
             PhysicalNode::Filter(node) if node.attributes.aliases.is_empty() => {
                 node.attributes.columns.clone()
             }

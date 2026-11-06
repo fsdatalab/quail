@@ -23,7 +23,6 @@ from quail.physical import (
     Limit,
     PortRef,
     Project,
-    QueryStage,
     Recombine,
     Scan,
     Sort,
@@ -212,8 +211,7 @@ def measured_stages(report) -> dict:
         mapped to the stage dicts of report["stages"]. Stages saved
         before written_position was recorded are left out.
     """
-    stages = {("cte", name): measured_stages(stage)
-              for name, stage in (report or {}).get("ctes", {}).items()}
+    stages = {}
     for stage in (report or {}).get("stages", ()):
         written_position = stage.get("written_position")
         if written_position is None:
@@ -246,10 +244,8 @@ def run_summary(report, graph, gpus, usd_per_hour=None) -> list:
     if not pairs:
         # a score over document pairs has no join stage records
         pairs = report.get("evaluated_document_pairs") or 0
-    nodes = [child for node in graph.nodes
-             for child in (node.graph.nodes if isinstance(node, QueryStage)
-                           else (node,))]
-    documents = sum(node.num_documents for node in nodes if isinstance(node, Scan))
+    documents = sum(node.num_documents for node in graph.nodes
+                    if isinstance(node, Scan))
     if wall > 0 and pairs:
         items.append(("throughput", f"{_number(pairs / wall)} document "
                       f"pairs/second over {pairs:,} evaluated pairs"))
@@ -281,9 +277,7 @@ def _estimated_rows(graph):
     for node in graph.topological_nodes():
         inputs = [rows.get(port.source) for port in node.inputs]
         value = None
-        if isinstance(node, QueryStage):
-            value = _estimated_rows(node.graph).get(node.graph.root)
-        elif isinstance(node, Scan):
+        if isinstance(node, Scan):
             value = (node.num_documents if node.expected_rows is None
                      else node.expected_rows)
         elif isinstance(node, AiFilter):
@@ -325,8 +319,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         estimates: Optional per node estimates (PhysicalPlan.estimates).
         stages: Optional measured stages from measured_stages(report).
     """
-    if any(isinstance(node, QueryStage) for node in graph.nodes):
-        return _stage_tree(graph, logical, verbose, metrics, stages)
     estimates_by_node = estimates or {}
     stages = stages or {}
     scans, filters, joins = _logical_context(logical)
@@ -564,35 +556,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
     return "\n".join(lines)
 
 
-def _stage_tree(graph, logical, verbose, metrics, stages):
-    definitions = {} if logical is None else dict(logical.stages())
-    parts = []
-    for node in graph.topological_nodes():
-        inputs = ", ".join(port.name for port in node.inputs) or "registered tables"
-        title = f"QueryStage {node.name or 'query'}: reads {inputs}"
-        if node.name:
-            title += "; materialize once"
-        if metrics is not None and node.node_id in metrics:
-            measured = metrics[node.node_id]
-            rows = (f"{measured.output_rows:,} rows, "
-                    if measured.output_rows is not None else "")
-            title += f"; {rows}{_seconds(measured.wall_s)}"
-        parts.append(title)
-        nested_metrics = None if metrics is None else {
-            name.removeprefix(node.node_id + "/"): value
-            for name, value in metrics.items() if name.startswith(node.node_id + "/")}
-        parts.extend("  " + line for line in physical_tree(
-            node.graph, logical=definitions.get(node.name), verbose=verbose,
-            metrics=nested_metrics, estimates=node.estimates,
-            stages=(stages or {}).get(("cte", node.name), stages),
-        ).splitlines())
-        for alias, provider, rows, tokens in node.assumptions:
-            parts.append(
-                f"  note: {alias!r} reads the CTE {provider!r}, which has not run; "
-                f"planned on {rows:,} rows of {tokens:,} tokens each")
-    return "\n".join(parts)
-
-
 def rule_lines(rules) -> list[str]:
     """Return rule categories and the order used during search."""
     def names(selected):
@@ -718,8 +681,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         lines.append("  est. time is each pass group's work, on its first "
                      "operator; the other operators in the group are asked "
                      "in its passes")
-    elif physical.estimates and not any(
-            isinstance(node, QueryStage) for node in physical.nodes):
+    elif physical.estimates:
         lines.append("  est. time is each node's work alone; node times do "
                      "not add up to the plan estimate")
         lines.append("  because chunk packing shares forward passes across "

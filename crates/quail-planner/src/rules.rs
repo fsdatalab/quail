@@ -86,17 +86,6 @@ pub fn with_children(node: &LogicalNode, mut new: Vec<LogicalNode>) -> LogicalNo
             *join.right = new.pop().expect("a right child");
             *join.left = new.pop().expect("a left child");
         }
-        LogicalNode::WithCte(with) => {
-            assert_eq!(
-                new.len(),
-                with.ctes.len() + 1,
-                "WithCTE needs its definitions and its input"
-            );
-            *with.input = new.pop().expect("an input");
-            for ((_, cte), child) in with.ctes.iter_mut().zip(new) {
-                *cte = child;
-            }
-        }
         other => {
             assert_eq!(new.len(), 1, "the node needs one child");
             *input_mut(other) = new.pop().expect("an input");
@@ -113,7 +102,6 @@ fn input_mut(node: &mut LogicalNode) -> &mut LogicalNode {
         LogicalNode::Project(found) => &mut found.input,
         LogicalNode::Result(found) => &mut found.input,
         LogicalNode::Unnest(found) => &mut found.input,
-        LogicalNode::WithCte(found) => &mut found.input,
         LogicalNode::SemanticClassify(found)
         | LogicalNode::SemanticExtract(found)
         | LogicalNode::SemanticMap(found)
@@ -259,10 +247,6 @@ pub fn push_down_projection(root: &LogicalNode) -> LogicalNode {
     }
     let order: Vec<SortKey> = match &plan.root {
         LogicalNode::Result(result) => result.order.clone(),
-        LogicalNode::WithCte(with) => match with.input.as_ref() {
-            LogicalNode::Result(result) => result.order.clone(),
-            _ => Vec::new(),
-        },
         _ => Vec::new(),
     };
     for key in &order {

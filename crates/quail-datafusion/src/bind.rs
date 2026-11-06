@@ -168,19 +168,19 @@ fn bind_plans(
             return compile_error("the query has no AI predicate");
         }
     }
-    let root = if stages.is_empty() {
-        built.root
-    } else {
-        LogicalNode::WithCte(quail_planner::logical::WithCte {
-            input: Box::new(built.root),
-            ctes: stages,
-        })
-    };
+    if !stages.is_empty() {
+        return compile_error(STAGED);
+    }
     // each scan loads the column values the plan reads
     Ok(quail_planner::LogicalPlan {
-        root: quail_planner::rules::push_down_projection(&root),
+        root: quail_planner::rules::push_down_projection(&built.root),
     })
 }
+
+/// The binder's refusal of a region that reads a subquery it does not
+/// merge: `ClaimModelRegions` runs such a subquery as its own region, an
+/// input of the region that reads it.
+pub(crate) const STAGED: &str = "the region reads a subquery that runs before it";
 
 /// A CTE or FROM subquery that runs as its own stage: its name and plan.
 type Stage = (String, LogicalNode);
@@ -3142,7 +3142,7 @@ fn subquery_body(alias: &datafusion::logical_expr::SubqueryAlias) -> (String, &L
 
 /// A merged JOIN input: its alias, each column's expression, the table it
 /// reads, and its WHERE condition.
-type Merged = (String, Vec<(String, Expr)>, LogicalPlan, Option<Expr>);
+pub(crate) type Merged = (String, Vec<(String, Expr)>, LogicalPlan, Option<Expr>);
 
 /// Merge each JOIN input that is a subquery reading one table, selecting
 /// and filtering it without a model call, into the query that reads it,
@@ -3157,8 +3157,11 @@ type Merged = (String, Vec<(String, Expr)>, LogicalPlan, Option<Expr>);
 /// Returns:
 ///     The rewritten plan and the merged subqueries' WHERE conditions,
 ///     to run before the query's own.
-fn merge_join_subqueries(plan: &LogicalPlan) -> Result<(LogicalPlan, Vec<Expr>), CompileError> {
-    use datafusion::common::tree_node::Transformed;
+/// The JOIN inputs that are subqueries reading one table, selecting and
+/// filtering it without a model call, each read once: the binder merges
+/// each into the query that reads it. Each is its alias, its columns'
+/// expressions, the table it reads, and its WHERE.
+pub(crate) fn merged_subqueries(plan: &LogicalPlan) -> Vec<Merged> {
     let mut readers: BTreeMap<String, usize> = BTreeMap::new();
     let _ = plan.apply(|node| {
         // each read of a CTE is one copy of its body under the CTE's name
@@ -3214,6 +3217,12 @@ fn merge_join_subqueries(plan: &LogicalPlan) -> Result<(LogicalPlan, Vec<Expr>),
         }
         Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     });
+    merged
+}
+
+fn merge_join_subqueries(plan: &LogicalPlan) -> Result<(LogicalPlan, Vec<Expr>), CompileError> {
+    use datafusion::common::tree_node::Transformed;
+    let merged = merged_subqueries(plan);
     if merged.is_empty() {
         return Ok((plan.clone(), Vec::new()));
     }

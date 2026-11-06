@@ -118,10 +118,18 @@ class Vocabulary:
         to boundaries[i + 1].
         """
         texts = pa.array(texts, type=pa.large_string()).to_pylist()
-        ids, offsets, boundaries = self.tokenizer.encode_packed(texts)
-        return (np.asarray(ids, dtype=np.int64),
-                np.asarray(offsets, dtype=np.int64).reshape(-1, 2),
-                np.asarray(boundaries, dtype=np.int64))
+        ids, ranges, boundaries = self.tokenizer.encode_packed(texts)
+        return (np.frombuffer(ids, dtype="<i8"),
+                np.frombuffer(ranges, dtype="<i8").reshape(-1, 2),
+                np.frombuffer(boundaries, dtype="<i8"))
+
+    def encode_batch(self, texts) -> list:
+        """Return (token ids, character ranges) of each text, encoded together."""
+        if not len(texts):
+            return []
+        ids, ranges, boundaries = self.encode_packed(texts)
+        return [(ids[start:end], ranges[start:end])
+                for start, end in zip(boundaries[:-1], boundaries[1:])]
 
     def document_batch(self, texts, stored) -> list[TokenView]:
         """Return document token views with source character ranges.
@@ -133,7 +141,7 @@ class Vocabulary:
                    if not isinstance(tokens, TokenView)
                    or tokens.character_offsets is None]
         result = list(stored)
-        encoded = self.tokenizer.encode_batch([texts[index] for index in missing])
+        encoded = self.encode_batch([texts[index] for index in missing])
         for index, (ids, offsets) in zip(missing, encoded):
             bounds = np.asarray(offsets, dtype=np.int64).reshape(-1)
             result[index] = TokenView(

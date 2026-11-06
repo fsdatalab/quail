@@ -342,7 +342,17 @@ impl Extracted {
         if quail_plans(&plan)? {
             let selected = select_list(plan.clone(), needed.clone())?;
             let pushed = precompute_plain_expressions(push_plain_terms(selected)?)?;
-            let (bound, inputs) = split_inputs(pushed)?;
+            let (mut bound, mut inputs) = split_inputs(pushed.clone(), false)?;
+            if binds_stages(&bound) {
+                // a subquery the binder would run as a stage runs before
+                // the region instead, as its own input
+                (bound, inputs) = split_inputs(pushed, true)?;
+            }
+            if !calls_ai(&bound)? {
+                // every model call is in a subquery that runs first: DataFusion
+                // runs this part, and the subqueries are claimed below it
+                return self.hand_back(plan, needed, limited, None);
+            }
             match binder_refusal(&bound) {
                 None => {
                     let mut region = ModelRegion::new(bound);
@@ -574,6 +584,16 @@ fn binder_refusal(plan: &LogicalPlan) -> Option<String> {
         Err(error) if error.0.contains(UNSUPPORTED) => Some(error.0),
         _ => None,
     }
+}
+
+/// Whether the binder reads `plan` as stages: subqueries that run before
+/// the query that reads them.
+fn binds_stages(plan: &LogicalPlan) -> bool {
+    let turn: quail_planner::prompts::Turn = (String::new(), String::new());
+    matches!(
+        crate::bind::bind_region(plan, &turn, "ai-if"),
+        Err(error) if error.0 == crate::bind::STAGED
+    )
 }
 
 /// `plan` with DataFusion's `PushDownFilter` applied, or `plan` when the
@@ -972,10 +992,21 @@ fn plain_input(plan: &LogicalPlan) -> Result<Option<TableScan>> {
 /// windows rows. The plan reads each input as a table of its name.
 ///
 /// Returns the plan and each input's table name and plan.
-fn split_inputs(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<(String, LogicalPlan)>)> {
+fn split_inputs(
+    plan: LogicalPlan,
+    cut_stages: bool,
+) -> Result<(LogicalPlan, Vec<(String, LogicalPlan)>)> {
     let mut inputs: Vec<(String, LogicalPlan)> = Vec::new();
+    // the binder merges these into the query that reads them
+    let merged: Vec<String> = crate::bind::merged_subqueries(&plan)
+        .into_iter()
+        .map(|(alias, ..)| alias)
+        .collect();
+    let mut root = true;
     let plan = plan
         .transform_down(|node| {
+            // a subquery at the root is the region itself
+            let at_root = std::mem::take(&mut root);
             if let Some(scan) = plain_input(&node)? {
                 return cut_input(node, &scan, &mut inputs);
             }
@@ -985,18 +1016,35 @@ fn split_inputs(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<(String, LogicalP
             let LogicalPlan::SubqueryAlias(alias) = &node else {
                 return Ok(Transformed::no(node));
             };
+            // a subquery the binder does not merge runs before the query
+            // that reads it, as an input: its own model region when it
+            // calls a model, or DataFusion's when it groups or windows
             let groups = alias.input.exists(|inner| {
                 Ok(matches!(
                     inner,
                     LogicalPlan::Aggregate(_) | LogicalPlan::Window(_)
                 ))
             })?;
-            if !groups {
+            let table = matches!(alias.input.as_ref(), LogicalPlan::TableScan(_));
+            let staged = cut_stages
+                && !at_root
+                && !table
+                && !merged.contains(&alias.alias.table().to_string());
+            if !groups && !staged {
                 return Ok(Transformed::no(node));
             }
-            let body = alias.input.as_ref().clone();
-            let mut name = alias.alias.table().to_string();
-            if inputs.iter().any(|(found, _)| *found == name) {
+            // `FROM clauses a` reads the CTE `clauses` under the alias `a`;
+            // every read of one CTE is one input, which runs once
+            let (mut name, body) = match alias.input.as_ref() {
+                LogicalPlan::SubqueryAlias(cte) => {
+                    (cte.alias.table().to_string(), cte.input.as_ref().clone())
+                }
+                body => (alias.alias.table().to_string(), body.clone()),
+            };
+            let read_before = inputs
+                .iter()
+                .any(|(found, plan)| *found == name && *plan == body);
+            if !read_before && inputs.iter().any(|(found, _)| *found == name) {
                 name = format!("{name}_{}", inputs.len());
             }
             let schema = Arc::new(body.schema().as_arrow().clone());
@@ -1007,7 +1055,9 @@ fn split_inputs(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<(String, LogicalP
                 LogicalPlanBuilder::scan(name.as_str(), provider_as_source(Arc::new(table)), None)?
                     .alias(alias.alias.clone())?
                     .build()?;
-            inputs.push((name, body));
+            if !read_before {
+                inputs.push((name, body));
+            }
             Ok(Transformed::new(read, true, TreeNodeRecursion::Jump))
         })?
         .data;

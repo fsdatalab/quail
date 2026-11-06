@@ -17,7 +17,7 @@ from quail.backends.quail.executor.extract.candidates import (
 def test_first_tokens_follow_the_models_spelling():
     tables = make_vocabulary()
     text = RANKED
-    ids, offsets = tables.tokenizer.encode(text)
+    ids, offsets = tables.encode_batch([text])[0]
     scan = DocumentTokens.from_tokens(tables, ids, offsets, 1)
     the = tables.tokenizer("The")[0]
     march = tables.tokenizer("March")[0]
@@ -56,27 +56,23 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(
     expected = []
     word = tables.tokenizer("word")[0]
     for text in texts:
-        ids, offsets = tables.tokenizer.encode(text)
+        ids, offsets = tables.encode_batch([text])[0]
         scan = DocumentTokens.from_tokens(tables, ids, offsets)
         starts = first_tokens(tables, _scores(tables, {word: -0.5}), scan)
         streams.append(make_streams(tables, text, starts, word,
                                     first_window_chars=first_window,
                                     window_chars=window)[0])
         rest, ends = squeezed(text)
-        ids, offsets = tables.tokenizer.encode(rest)
+        ids, offsets = tables.encode_batch([rest])[0]
         expected.append(([int(t) for t in ids], [int(ends[b - 1]) for _, b in offsets]))
     batches = []
-    encode_batch = tables.tokenizer.encode_batch
+    encode_batch = tables.encode_batch
 
     def recorded(texts):
         batches.append(tuple(texts))
         return encode_batch(texts)
 
-    def scalar(text):
-        raise AssertionError("stream windows must be tokenized together")
-
-    monkeypatch.setattr(tables.tokenizer, "encode_batch", recorded)
-    monkeypatch.setattr(tables.tokenizer, "encode", scalar)
+    monkeypatch.setattr(tables, "encode_batch", recorded)
     ensure_tokens(streams, 80, tables)
     assert len(batches[0]) == 2
     largest_window = max(len(text) for batch in batches for text in batch)

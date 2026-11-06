@@ -864,13 +864,6 @@ struct Tokenizer {
     stop_ids: Vec<u32>,
 }
 
-/// Token ids and each token's character range.
-type TokensAndRanges = (Vec<u32>, Vec<(i64, i64)>);
-
-/// Several texts' token ids and character ranges, flat, then each text's
-/// first token, with one past the last.
-type Packed = (Vec<u32>, Vec<(i64, i64)>, Vec<i64>);
-
 fn arrow_error(error: datafusion::arrow::error::ArrowError) -> PyErr {
     python_error(error.into())
 }
@@ -910,35 +903,44 @@ impl Tokenizer {
         self.inner.eos_token_id()
     }
 
-    /// A text's token ids and each token's character range.
-    fn encode(&self, text: &str) -> PyResult<TokensAndRanges> {
-        let found = self
-            .inner
-            .encode_with_offsets(&[text])
-            .map_err(arrow_error)?;
-        Ok((found.ids, found.offsets))
-    }
-
-    /// Each text's token ids and character ranges, encoded together.
-    fn encode_batch(&self, texts: Vec<String>) -> PyResult<Vec<TokensAndRanges>> {
-        let (ids, offsets, boundaries) = self.encode_packed(texts)?;
-        Ok(boundaries
-            .windows(2)
-            .map(|range| {
-                let (start, end) = (range[0] as usize, range[1] as usize);
-                (ids[start..end].to_vec(), offsets[start..end].to_vec())
-            })
-            .collect())
-    }
-
-    /// Every text's token ids and character ranges, encoded together.
-    fn encode_packed(&self, texts: Vec<String>) -> PyResult<Packed> {
+    /// Every text's token ids, encoded together, with each token's
+    /// character range: three buffers of little-endian int64, the ids,
+    /// the (start, end) pairs, and each text's first token with one past
+    /// the last.
+    fn encode_packed<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<String>,
+    ) -> PyResult<(
+        Bound<'py, pyo3::types::PyBytes>,
+        Bound<'py, pyo3::types::PyBytes>,
+        Bound<'py, pyo3::types::PyBytes>,
+    )> {
         let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
         let found = self
             .inner
             .encode_with_offsets(&texts)
             .map_err(arrow_error)?;
-        Ok((found.ids, found.offsets, found.boundaries))
+        let ids: Vec<u8> = found
+            .ids
+            .iter()
+            .flat_map(|id| i64::from(*id).to_le_bytes())
+            .collect();
+        let ranges: Vec<u8> = found
+            .offsets
+            .iter()
+            .flat_map(|(start, end)| [start.to_le_bytes(), end.to_le_bytes()].concat())
+            .collect();
+        let boundaries: Vec<u8> = found
+            .boundaries
+            .iter()
+            .flat_map(|boundary| boundary.to_le_bytes())
+            .collect();
+        Ok((
+            pyo3::types::PyBytes::new(py, &ids),
+            pyo3::types::PyBytes::new(py, &ranges),
+            pyo3::types::PyBytes::new(py, &boundaries),
+        ))
     }
 
     /// The tokens of each text in `table`'s first column, as a pyarrow

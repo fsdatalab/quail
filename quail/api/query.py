@@ -31,7 +31,6 @@ from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
 from quail.logical import (
     LogicalPlan,
-    WithCTE,
     filter_stop_keys,
     join_conditions,
 )
@@ -125,11 +124,6 @@ class Query:
             The physical plan, or a Refusal when no backend can run it.
         """
         if self._plan is not None:
-            return self._plan
-        if isinstance(self.logical.root, WithCTE):
-            from quail.api.stages import plan_stages
-
-            self._plan = plan_stages(self)
             return self._plan
         if not self.logical.operators().prompts:
             (scan,) = self.logical.operators().scans

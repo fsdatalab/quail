@@ -76,9 +76,6 @@ pub enum LogicalNode {
     /// One row per item of each listed list column.
     #[serde(rename = "quail.logical.nodes.unnest.Unnest")]
     Unnest(Unnest),
-    /// Named subqueries the input reads.
-    #[serde(rename = "quail.logical.nodes.with_cte.WithCTE")]
-    WithCte(WithCte),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,13 +159,6 @@ pub struct Unnest {
     pub input: Box<LogicalNode>,
     pub columns: Vec<String>,
     pub outer: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WithCte {
-    pub input: Box<LogicalNode>,
-    pub ctes: Vec<(String, LogicalNode)>,
 }
 
 tagged_struct! {

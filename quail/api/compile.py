@@ -2,8 +2,8 @@
 
 DataFusion parses and binds the statement, Quail's analyzer rule claims
 its model region, and the Rust binder reads the region into Quail's
-logical plan: one plan per statement, with any CTE that runs as its own
-stage in a WithCTE root.
+logical plan. A CTE or FROM subquery the binder does not merge is its
+own region, whose rows the reading region takes as an input.
 """
 
 from __future__ import annotations

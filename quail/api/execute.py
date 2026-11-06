@@ -7,7 +7,6 @@ import time
 from quail.backends import BackendExecutionContext
 from quail.execution.result import QueryResult
 from quail.execution.types import PhysicalRequest, PhysicalResponse
-from quail.logical import WithCTE
 from quail.physical import (
     ExecutionLocation,
     Scan,
@@ -182,13 +181,6 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
 def _execute_region(query, physical_executor, plan, on_backend_ready,
                     on_execution_ready):
     """Execute one model region's Query in its session's process."""
-    if isinstance(query.logical.root, WithCTE):
-        from quail.api.stages import execute_stages
-
-        if plan is not None:
-            raise RuntimeError("edited query stage plans are not supported")
-        return execute_stages(query, physical_executor, on_backend_ready,
-                              on_execution_ready)
     total_started = time.perf_counter()
     if plan is not None:
         if isinstance(plan, Refusal) or not hasattr(plan, "graph"):

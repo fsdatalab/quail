@@ -82,12 +82,6 @@ pub fn children(node: &LogicalNode) -> Vec<&LogicalNode> {
     match node {
         LogicalNode::Scan(_) => Vec::new(),
         LogicalNode::Join(join) => vec![&join.left, &join.right],
-        LogicalNode::WithCte(with) => with
-            .ctes
-            .iter()
-            .map(|(_, node)| node)
-            .chain(std::iter::once(with.input.as_ref()))
-            .collect(),
         other => vec![input(other)],
     }
 }
@@ -105,7 +99,6 @@ pub fn input(node: &LogicalNode) -> &LogicalNode {
         LogicalNode::Project(found) => &found.input,
         LogicalNode::Result(found) => &found.input,
         LogicalNode::Unnest(found) => &found.input,
-        LogicalNode::WithCte(found) => &found.input,
         LogicalNode::SemanticClassify(found)
         | LogicalNode::SemanticExtract(found)
         | LogicalNode::SemanticMap(found)
@@ -933,13 +926,6 @@ pub fn validate_node(node: &LogicalNode) -> Result<(), CompileError> {
         LogicalNode::Project(project) => validate_project(node, project),
         LogicalNode::Result(result) => validate_result(result),
         LogicalNode::Unnest(unnest) => validate_unnest(unnest),
-        LogicalNode::WithCte(with) => {
-            let names: BTreeSet<&String> = with.ctes.iter().map(|(name, _)| name).collect();
-            if names.len() != with.ctes.len() {
-                return compile_error("CTE names must be unique within a query");
-            }
-            Ok(())
-        }
         column => validate_column(column),
     }
 }

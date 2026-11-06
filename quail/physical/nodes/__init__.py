@@ -16,7 +16,6 @@ from .relational import (
 )
 from .sae_features import AiSaeFeatures, SaeFeaturesSpec
 from .scan import Scan
-from .stage import QueryStage
 
 __all__ = [
     "AiClassify",
@@ -41,7 +40,6 @@ __all__ = [
     "Recombine",
     "Scan",
     "SaeFeaturesSpec",
-    "QueryStage",
     "ScoreSpec",
     "Sort",
     "predicate_from_mapping",

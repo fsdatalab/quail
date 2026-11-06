@@ -29,13 +29,10 @@ ASSUMED_INPUT_TOKENS = 32
 def input_scans(logical: LogicalPlan, catalog) -> dict:
     """Return each Scan of a region input, by its table name.
 
-    A region input is a table the catalog does not hold and no CTE
-    stage defines.
+    A region input is a table the catalog does not hold.
     """
-    stages = {name for name, _ in logical.stages() if name}
     return {node.provider: node for node in logical.walk()
-            if isinstance(node, Scan) and node.provider not in catalog
-            and node.provider not in stages}
+            if isinstance(node, Scan) and node.provider not in catalog}
 
 
 def source_rows(catalog, name: str, table) -> pa.Array | None:

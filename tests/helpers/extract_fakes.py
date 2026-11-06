@@ -2,6 +2,8 @@
 
 import re
 
+import numpy as np
+
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.physical import ExtractSpec
 
@@ -54,23 +56,15 @@ class FakeTokenizer:
     def __call__(self, text):
         return [self.ids[piece] for piece, _ in self._pieces(text)]
 
-    def _encode(self, text):
-        found = list(self._pieces(text))
-        return [self.ids[piece] for piece, _ in found], [span for _, span in found]
-
-    def encode(self, text):
-        return self._encode(text)
-
-    def encode_batch(self, texts):
-        return [self._encode(text) for text in texts]
-
     def encode_packed(self, texts):
-        encoded = self.encode_batch(texts)
-        boundaries = [0]
-        for ids, _ in encoded:
-            boundaries.append(boundaries[-1] + len(ids))
-        return ([t for ids, _ in encoded for t in ids],
-                [span for _, spans in encoded for span in spans], boundaries)
+        ids, ranges, boundaries = [], [], [0]
+        for text in texts:
+            for piece, span in self._pieces(text):
+                ids.append(self.ids[piece])
+                ranges.extend(span)
+            boundaries.append(len(ids))
+        return tuple(np.asarray(values, dtype="<i8").tobytes()
+                     for values in (ids, ranges, boundaries))
 
     def token_bytes(self):
         return [token.encode() for token in self.tokens]

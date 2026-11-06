@@ -159,7 +159,6 @@ type = "layers"
 layers = [
     "quail.planner.sol",
     "quail.planner.optimize",
-    "quail.planner.stages",
     "quail.planner.native",
     "quail.planner.candidates",
     "quail.planner.context",

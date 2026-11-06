@@ -1591,10 +1591,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             }
         }
         result_inputs.extend(row_ports);
-        let root = match &self.plan.root {
-            LogicalNode::WithCte(with) => with.input.as_ref(),
-            other => other,
-        };
+        let root = &self.plan.root;
         let result = match root {
             LogicalNode::Result(result) => result.clone(),
             other => ResultNode {
@@ -1968,10 +1965,7 @@ pub fn relational_plan(
         unreachable!("a projection")
     };
     let columns: Vec<String> = project.columns.iter().map(projected_name).collect();
-    let root = match &plan.root {
-        LogicalNode::WithCte(with) => with.input.as_ref(),
-        other => other,
-    };
+    let root = &plan.root;
     let result = match root {
         LogicalNode::Result(result) => result.clone(),
         other => ResultNode {

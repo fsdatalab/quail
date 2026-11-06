@@ -55,11 +55,6 @@ TABLES = {
 
 # Queries whose logical plans hold the node types quail-b's plans do not.
 NODE_CASES = {
-    "WithCTE": ("qwen3-4b-fp8",
-                "WITH clauses AS (SELECT c.id, AI.EXTRACT(c.text, "
-                "{'terms': 'What is the termination clause?'}) AS clause "
-                "FROM contracts c) SELECT x.id, AI.SCORE(PROMPT("
-                "'Early? {0}', x.clause.terms)) AS score FROM clauses x"),
     "Unnest": ("qwen3.5-2b-sae-bf16",
                "SELECT r.id, f.feature FROM reviews r, UNNEST(AI.SAE_FEATURES("
                "PROMPT('{0} What is this about?', r.body), pooling => 'last')) AS f"),

@@ -1,16 +1,13 @@
 //! The built-in physical nodes.
 //!
 //! A node in a plan's graph is written `{"type": <type name>, "id",
-//! "inputs", "attributes"}`. A node inside a `QueryStage`'s graph is
-//! written as a plain dataclass instead: its class tag beside
-//! `node_id`, `inputs`, and its attributes. One field list per node
-//! defines both forms.
+//! "inputs", "attributes"}`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::expressions::{Condition, Projected, ValueExpression};
-use crate::graph::{InputPort, NestedGraph};
+use crate::graph::InputPort;
 use crate::specs::{ClassifySpec, ExtractSpec, MapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds};
 
 /// A node's id, inputs, and type-specific attributes.
@@ -25,7 +22,7 @@ pub struct Node<A> {
 macro_rules! physical_nodes {
     ($(
         $(#[$doc:meta])*
-        $variant:ident($attributes:ident, $flat:ident) = $type_name:literal, $class:literal {
+        $variant:ident($attributes:ident) = $type_name:literal {
             $($field:ident: $field_type:ty),* $(,)?
         }
     )*) => {
@@ -36,16 +33,6 @@ macro_rules! physical_nodes {
             pub struct $attributes {
                 $(pub $field: $field_type,)*
             }
-
-            $(#[$doc])*
-            /// This is the form a node takes inside a nested graph.
-            #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-            #[serde(deny_unknown_fields)]
-            pub struct $flat {
-                pub node_id: String,
-                pub inputs: Vec<InputPort>,
-                $(pub $field: $field_type,)*
-            }
         )*
 
         /// A node of a plan's graph, tagged with its type name.
@@ -53,13 +40,6 @@ macro_rules! physical_nodes {
         #[serde(tag = "type")]
         pub enum PhysicalNode {
             $(#[serde(rename = $type_name)] $variant(Node<$attributes>),)*
-        }
-
-        /// A node of a nested graph, tagged with its Python class.
-        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-        #[serde(tag = "type")]
-        pub enum NestedNode {
-            $(#[serde(rename = $class)] $variant($flat),)*
         }
 
         impl PhysicalNode {
@@ -96,7 +76,7 @@ macro_rules! physical_nodes {
 
 physical_nodes! {
     /// Reads one table's documents, after its regular predicates.
-    Scan(ScanAttributes, FlatScan) = "quail.scan", "quail.physical.nodes.scan.Scan" {
+    Scan(ScanAttributes) = "quail.scan" {
         alias: String,
         input_id: String,
         num_documents: i64,
@@ -106,20 +86,8 @@ physical_nodes! {
         predicates: Vec<Condition>,
         expected_rows: Option<f64>,
     }
-    /// Runs one stage of a query with CTEs, as its own graph.
-    QueryStage(QueryStageAttributes, FlatQueryStage) =
-        "quail.query_stage", "quail.physical.nodes.stage.QueryStage" {
-        name: String,
-        graph: Option<NestedGraph>,
-        settings: Map<String, Value>,
-        estimates: Map<String, Value>,
-        estimated_seconds: f64,
-        columns: Vec<String>,
-        assumptions: Vec<(String, String, i64, i64)>,
-    }
     /// An `AI.IF` over one table.
-    AiFilter(AiFilterAttributes, FlatAiFilter) =
-        "quail.ai_filter", "quail.physical.nodes.filter.AiFilter" {
+    AiFilter(AiFilterAttributes) = "quail.ai_filter" {
         alias: String,
         arena_writes: bool,
         keep_kv: bool,
@@ -139,8 +107,7 @@ physical_nodes! {
         document_ends: Value,
     }
     /// An `AI.SCORE` call.
-    AiScore(AiScoreAttributes, FlatAiScore) =
-        "quail.ai_score", "quail.physical.nodes.inference.AiScore" {
+    AiScore(AiScoreAttributes) = "quail.ai_score" {
         backend_name: String,
         model: String,
         spec: Option<ScoreSpec>,
@@ -149,7 +116,7 @@ physical_nodes! {
         document_ends: Value,
     }
     /// A condition that asks no model, on one or more tables' rows.
-    Filter(FilterAttributes, FlatFilter) = "quail.filter", "quail.physical.nodes.filter.Filter" {
+    Filter(FilterAttributes) = "quail.filter" {
         predicate: Option<Condition>,
         aliases: Vec<String>,
         selectivity: Option<f64>,
@@ -157,8 +124,7 @@ physical_nodes! {
         columns: Vec<String>,
     }
     /// An `AI.CLASSIFY` call.
-    AiClassify(AiClassifyAttributes, FlatAiClassify) =
-        "quail.ai_classify", "quail.physical.nodes.classify.AiClassify" {
+    AiClassify(AiClassifyAttributes) = "quail.ai_classify" {
         backend_name: String,
         model: String,
         spec: Option<ClassifySpec>,
@@ -167,8 +133,7 @@ physical_nodes! {
         document_ends: Value,
     }
     /// One `AI.EXTRACT` question.
-    AiExtract(AiExtractAttributes, FlatAiExtract) =
-        "quail.ai_extract", "quail.physical.nodes.extract.AiExtract" {
+    AiExtract(AiExtractAttributes) = "quail.ai_extract" {
         backend_name: String,
         model: String,
         spec: Option<ExtractSpec>,
@@ -178,7 +143,7 @@ physical_nodes! {
         attention: String,
     }
     /// An `AI.MAP` call.
-    AiMap(AiMapAttributes, FlatAiMap) = "quail.ai_map", "quail.physical.nodes.map.AiMap" {
+    AiMap(AiMapAttributes) = "quail.ai_map" {
         backend_name: String,
         model: String,
         spec: Option<MapSpec>,
@@ -188,8 +153,7 @@ physical_nodes! {
         attention: String,
     }
     /// An `AI.SAE_FEATURES` call.
-    AiSaeFeatures(AiSaeFeaturesAttributes, FlatAiSaeFeatures) =
-        "quail.ai_sae_features", "quail.physical.nodes.sae_features.AiSaeFeatures" {
+    AiSaeFeatures(AiSaeFeaturesAttributes) = "quail.ai_sae_features" {
         backend_name: String,
         model: String,
         spec: Option<SaeFeaturesSpec>,
@@ -198,18 +162,16 @@ physical_nodes! {
         document_ends: Value,
     }
     /// Prunes each table's survivors with the join answers so far.
-    Barrier(BarrierAttributes, FlatBarrier) = "quail.barrier", "quail.physical.nodes.join.Barrier" {
+    Barrier(BarrierAttributes) = "quail.barrier" {
         next_anchor: String,
         aliases: Vec<String>,
     }
     /// Routes a join's anchor ids to the GPUs that hold their KV.
-    Exchange(ExchangeAttributes, FlatExchange) =
-        "quail.exchange", "quail.physical.nodes.relational.Exchange" {
+    Exchange(ExchangeAttributes) = "quail.exchange" {
         anchor: String,
     }
     /// An equality join that asks no model.
-    HashJoin(HashJoinAttributes, FlatHashJoin) =
-        "quail.hash_join", "quail.physical.nodes.join.HashJoin" {
+    HashJoin(HashJoinAttributes) = "quail.hash_join" {
         left: String,
         right: String,
         on: Vec<(ValueExpression, ValueExpression)>,
@@ -217,7 +179,7 @@ physical_nodes! {
         pair_fraction: f64,
     }
     /// An `AI.IF` over the pairs of an anchor table and its partners.
-    AiJoin(AiJoinAttributes, FlatAiJoin) = "quail.ai_join", "quail.physical.nodes.join.AiJoin" {
+    AiJoin(AiJoinAttributes) = "quail.ai_join" {
         anchor: String,
         anchor_resident: String,
         keep_kv: bool,
@@ -243,19 +205,17 @@ physical_nodes! {
         document_ends: Value,
     }
     /// Joins each table's surviving rows into result rows.
-    Recombine(RecombineAttributes, FlatRecombine) =
-        "quail.recombine", "quail.physical.nodes.relational.Recombine" {
+    Recombine(RecombineAttributes) = "quail.recombine" {
         alias_order: Vec<String>,
     }
     /// The columns a query returns.
-    Project(ProjectAttributes, FlatProject) =
-        "quail.project", "quail.physical.nodes.relational.Project" {
+    Project(ProjectAttributes) = "quail.project" {
         columns: Vec<String>,
         structs: Value,
         expressions: Option<Vec<Projected>>,
     }
     /// An `ORDER BY`, with `DISTINCT`, `OFFSET`, and `FETCH`.
-    Sort(SortAttributes, FlatSort) = "quail.sort", "quail.physical.nodes.relational.Sort" {
+    Sort(SortAttributes) = "quail.sort" {
         keys: Vec<(String, bool, bool)>,
         columns: Vec<String>,
         distinct: bool,
@@ -263,12 +223,11 @@ physical_nodes! {
         fetch: Option<i64>,
     }
     /// A `LIMIT`.
-    Limit(LimitAttributes, FlatLimit) = "quail.limit", "quail.physical.nodes.relational.Limit" {
+    Limit(LimitAttributes) = "quail.limit" {
         count: i64,
     }
     /// One row per item of each listed list column.
-    Unnest(UnnestAttributes, FlatUnnest) =
-        "quail.unnest", "quail.physical.nodes.relational.Unnest" {
+    Unnest(UnnestAttributes) = "quail.unnest" {
         lists: Vec<String>,
         outer: bool,
         columns: Vec<String>,

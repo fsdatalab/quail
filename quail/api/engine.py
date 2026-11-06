@@ -157,11 +157,9 @@ def with_limit(logical: LogicalPlan, fetch: int) -> LogicalPlan:
     """
     from dataclasses import replace
 
-    from quail.logical import Result, WithCTE
+    from quail.logical import Result
 
     root = logical.root
-    if isinstance(root, WithCTE):
-        return logical
     if isinstance(root, Result):
         limit = fetch if root.limit is None else min(root.limit, fetch)
         return replace(logical, root=replace(root, limit=limit))

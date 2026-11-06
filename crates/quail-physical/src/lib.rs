@@ -16,7 +16,7 @@ pub use expressions::{
     GetField, Literal, ModelCall, Not, Projected, Prompt, RegularPredicate, ScalarFunction,
     SortExpression, SortKey, TaggedModelCall, ValueExpression,
 };
-pub use graph::{InputPort, NestedGraph, PhysicalGraph, PlanEnvelope, PortRef, ValueType};
+pub use graph::{InputPort, PhysicalGraph, PlanEnvelope, PortRef, ValueType};
 pub use nodes::*;
 pub use specs::{ClassifySpec, ExtractSpec, MapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds};
 pub use topology::{
