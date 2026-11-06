@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol
 
 from quail.physical import PhysicalNode
 from quail.specs import DeviceSpec, ModelSpec, SupportResult
-
-if TYPE_CHECKING:
-    from quail.planner.candidates import ModelRegion, PhysicalCandidate
-    from quail.planner.context import PlanningContext
 
 
 @dataclass(frozen=True)
@@ -46,7 +42,7 @@ class ModelExecution(Protocol):
 
 
 class ModelBackend(Protocol):
-    """Planner and execution factory for one model backend.
+    """Execution factory for one model backend; Rust's planner plans for it.
 
     A backend may leave out engine_name, which then equals name, and
     the prepare_request and release_request methods; without
@@ -60,6 +56,9 @@ class ModelBackend(Protocol):
             document as text, so the scan carries its text column.
         locates_answers_in_text: Whether the backend locates extracted
             answers by character offsets, so tokenization keeps them.
+        request_settings: For a request backend, such as stock vLLM, how
+            its operators are submitted, which Rust's planner reads; a
+            backend without it runs Quail's plan.
     """
 
     name: str
@@ -73,14 +72,6 @@ class ModelBackend(Protocol):
         device: DeviceSpec,
         gpus: int,
     ) -> SupportResult: ...
-
-    def plan(
-        self,
-        region: ModelRegion,
-        context: PlanningContext,
-    ) -> Sequence[PhysicalCandidate]:
-        """Lower one logical alternative into candidates; not called for Quail."""
-        ...
 
     def start(self, context: GpuContext) -> ModelExecution: ...
 

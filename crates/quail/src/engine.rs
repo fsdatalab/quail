@@ -25,7 +25,9 @@ use quail_datafusion::{
 use quail_planner::prompts::Turn;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::planning::{DOCUMENT_EXPRESSION, Planner, Settings, TableRows, planned_json};
+use crate::planning::{
+    DOCUMENT_EXPRESSION, PlanOutcome, Planner, Settings, TableRows, planned_json,
+};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 
 /// Runs each model region by calling the engine's
@@ -113,12 +115,15 @@ impl PythonRunner {
             );
         }
         match planner.plan(logical, &tables, settings) {
-            Ok(Ok(planned)) => Ok(Some(
+            Ok(PlanOutcome::Planned(planned)) => Ok(Some(
                 planned_json(&planned)
                     .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?
                     .to_string(),
             )),
-            Ok(Err(refused)) => Ok(Some(crate::planning::refused_json(&refused).to_string())),
+            Ok(PlanOutcome::Refused(refused)) => {
+                Ok(Some(crate::planning::refused_json(&refused).to_string()))
+            }
+            Ok(PlanOutcome::Fixed(plan)) => Ok(Some(plan.to_string())),
             Err(error) if error.0.starts_with(DOCUMENT_EXPRESSION) => Ok(None),
             Err(error) => Err(DataFusionError::Plan(format!("CompileError: {}", error.0))),
         }

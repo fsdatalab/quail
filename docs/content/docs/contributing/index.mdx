@@ -43,7 +43,7 @@ Include the tests and documentation needed to check and use your change.
 | `quail/catalog/` | Table providers and the tokenized inputs of a session. |
 | `crates/quail-planner/`, `quail/physical/` | Logical plan types (Rust) and physical plan definitions. |
 | `crates/` | SQL parsing and binding on DataFusion, the Rust planner, and the cost model, built into the `_quail_native` module. |
-| `quail/planner/`, `quail/specs/` | The bridge to the Rust planner, and model and device specifications. The cost model is in `crates/quail-cost/`. |
+| `quail/specs/` | Model and device specifications. The cost model is in `crates/quail-cost/`. |
 | `quail/execution/` | The runner and the CPU operators. |
 | `quail/backends/` | The Quail inference engine. |
 | `quail/baselines/` | The stock vLLM backends the benchmark compares against. |
@@ -57,16 +57,12 @@ Each package imports only the packages below it in the list in
 `pyproject.toml` under `[tool.importlinter]`; `uv run lint-imports`
 checks that.
 
-The planner runs in Rust. `quail/planner/` holds what Python needs
-around it:
-
-| Path | Contents |
-| --- | --- |
-| `native.py` | The bridge to `_quail_native`: logical alternatives, search, refinement, and the request backends' operator order. |
-| `optimize.py` | `plan_query` and `refine_plan`. |
-| `sol.py` | The speed-of-light estimate, searched in Rust over the caller's oracles. |
-| `stages.py` | The plan of a statement whose CTEs run as their own stages. |
-| `context.py`, `candidates.py` | The planning inputs, and the candidate plans a backend returns. |
+The planner runs in Rust: `NativePlanner.plan` binds, rewrites,
+searches, and prices each region, for Quail's backend and for the
+request backends. Python reads the plan it returns
+(`quail.physical.plan.plan_from_json`) and runs it.
+`quail.speed_of_light_estimate` calls the Rust estimate with the
+caller's oracles.
 
 `PhysicalPlan` and `Refusal` are in `quail/physical/plan.py`,
 `EngineConfig` in `quail/api/config.py`, and the rule names a registry

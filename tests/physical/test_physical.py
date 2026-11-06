@@ -8,13 +8,10 @@ from typing import ClassVar
 
 import pyarrow as pa
 import pytest
-from helpers.sessions import TOKENIZER
 
 import quail
-from quail.api.config import EngineConfig
 from quail.api.execute import _execute_physical
 from quail.builtins import built_in_registry
-from quail.catalog import DocumentProvider
 from quail.common.expressions import ColumnRef
 from quail.execution.metrics import NodeResult
 from quail.execution.runtimes import BarrierRuntime
@@ -35,8 +32,6 @@ from quail.physical import (
     plan_envelope,
 )
 from quail.physical.plan import PhysicalPlan
-from quail.planner.candidates import PhysicalCandidate
-from quail.specs import SupportResult
 
 
 @pytest.mark.parametrize("shape", ["cycle"])
@@ -117,63 +112,31 @@ class FirstDocumentsRuntime:
         return NodeResult({f"rows:{node.alias}": documents[:node.count]})
 
 
-def local_plan(context, *, count, estimate, source):
+def local_plan(*, num_documents, count):
     def ids_from(node_id):
         return (InputPort("input:0", ValueType.ROWS,
                           PortRef(node_id, "rows:d"), schema=("d",)),)
 
     scan = Scan(node_id="input:d", alias="d", input_id="d",
-                num_documents=len(context.document_tokens["d"]))
+                num_documents=num_documents)
     filtered = FirstDocuments(
         node_id="filter:d", inputs=ids_from("input:d"), alias="d", count=count)
     project = Project(
         node_id="project", inputs=ids_from("filter:d"), columns=("d.id",))
-    plan = PhysicalPlan(
-        model=context.model.name, device=context.device.name,
-        gpus=context.gpus, backend="local_filter",
-        estimated_seconds=estimate, nodes=(scan, filtered, project),
-        settings={"planner_source": source})
-    return PhysicalCandidate(plan.graph, plan, estimate)
+    return PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", gpus=1,
+                        nodes=(scan, filtered, project))
 
 
-class LocalFilterBackend:
-    name = "local_filter"
-
-    def __init__(self):
-        self.called = False
-
-    def supports(self, model, device, gpus):
-        return SupportResult.accept()
-
-    def plan(self, region, context):
-        self.called = True
-        return (local_plan(context, count=1, estimate=0.0, source="backend"),)
-
-
-def test_physical_extensions_plan_validate_and_execute(monkeypatch):
+def test_an_extension_node_encodes_validates_and_runs(monkeypatch):
     registry = quail.ExtensionRegistry.with_built_ins()
-    backend = LocalFilterBackend()
-    registry.register_backend(backend)
     registry.register_node(FirstDocuments, runtime=FirstDocumentsRuntime())
-    session = quail.Session(
-        EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
-                     device="h100-sxm"),
-        tokenizer=TOKENIZER,
-        registry=registry,
-    )
-    session.register("documents", DocumentProvider.from_table(
-        pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
-        id_col="id", identity="local-filter-docs"))
-    query = session.sql(
-        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
-    plan = query.plan()
+    plan = local_plan(num_documents=2, count=1)
     envelope = plan.to_envelope(registry.codecs)
-
-    assert backend.called
-    assert plan.settings["planner_source"] == "backend"
-    firsts = [node for node in plan.nodes if isinstance(node, FirstDocuments)]
-    assert firsts and all(node.count == 1 for node in firsts)
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
+    plan.graph.validate(runtime_keys=set(registry.runtimes))
+    result = FirstDocumentsRuntime().execute(
+        plan.nodes[1], {"input:0": ["a", "b"]}, None)
+    assert result.outputs == {"rows:d": ["a"]}
 
     registry = built_in_registry()
     scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=1,

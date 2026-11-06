@@ -6,8 +6,20 @@ from quail.baselines import register_baselines
 from quail.execution.runtimes import built_in_runtimes
 from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
 from quail.physical import built_in_codecs
-from quail.planner.native import LOGICAL_RULES, PHYSICAL_RULES
 from quail.specs import DEVICES, MODELS
+
+# the optimizer rules each model region runs, in order, as
+# quail_datafusion::REGION_RULES names them
+LOGICAL_RULES = (
+    "eliminate_distinct", "place_semantic_nodes", "push_down_distinct",
+    "push_down_filter", "optimize_projections",
+)
+# the built-in physical rules, in the order they apply
+PHYSICAL_RULES = (
+    "should_push_down_limit", "choose_classify_implementation", "pack_set_passes",
+    "join_document_ends", "should_retain_kv", "should_share_prefixes",
+    "choose_attention_path", "should_deduplicate",
+)
 
 
 def built_in_registry() -> ExtensionRegistry:

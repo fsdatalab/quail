@@ -49,6 +49,15 @@ MOVED_MODULES = {"quail.logical.expressions": "quail.common.expressions"}
 _SCALARS = (str, int, float, bool)
 
 
+def untagged(value):
+    """Encoded data without the codec's type tags, as the Rust specs read it."""
+    if isinstance(value, dict):
+        return {key: untagged(item) for key, item in value.items() if key != "type"}
+    if isinstance(value, list):
+        return [untagged(item) for item in value]
+    return value
+
+
 def encode_value(value):
     """Encode a dataclass, tuple, enum, or scalar as JSON-ready data."""
     if is_dataclass(value) and not isinstance(value, type):

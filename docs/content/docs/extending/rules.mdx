@@ -61,9 +61,10 @@ If initial planning used estimated token lengths, the search runs again
 when exact tokens are available. See [Optimizer](/docs/architecture/optimizer)
 for the built-in rule order.
 
-A backend other than Quail's, such as the stock vLLM baseline, plans
-each placement with its own `plan` method. The physical rules
-do not run on its plans.
+A request backend, such as stock vLLM, is planned in Rust too: its
+`request_settings` say how it submits each operator, Rust lowers each
+placement to one request node, and the first placement it does not
+refuse is selected. The physical rules do not run on its plans.
 
 ## Test a rule
 

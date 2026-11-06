@@ -9,12 +9,11 @@ from helpers.logical import (
     read_plan,
     walk,
 )
-from helpers.planning import compile_sql
+from helpers.planning import compile_sql, placements
 
 from quail.api.compile import SQLDialect
 from quail.catalog import Catalog, DocumentProvider
 from quail.common.expressions import ColumnRef, CompileError
-from quail.planner import native
 
 
 def compile_plan(*args, **options):
@@ -207,7 +206,7 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
     assert pairs.on[0].left == ColumnRef("r", "reviews", "id")
     assert pairs.on[0].right == ColumnRef("p", "products", "asin")
     # the equality columns are loaded as values for the pair table
-    candidate, = native.column_placements(compile_sql(PAIR_JOIN_SQL, catalog))
+    candidate, = placements(compile_sql(PAIR_JOIN_SQL, catalog))
     scans = {node.alias: node for node in walk(candidate.plan)
              if node.kind == "Scan"}
     assert "id" in scans["r"].columns and "asin" in scans["p"].columns

@@ -44,15 +44,58 @@ class PlanEditError(ValueError):
     """Raised by insert, remove, and move when an edit breaks a rule."""
 
 
+def _no_tokens(_text: str) -> list:
+    """Tokenize nothing: pricing an edited graph reads no new prompt."""
+    return []
+
+
+def _estimates(estimates: dict) -> dict:
+    """The per-node estimates with their member lists as tuples."""
+    return {node_id: {key: tuple(value) if isinstance(value, list) else value
+                      for key, value in entry.items()}
+            for node_id, entry in estimates.items()}
+
+
+def plan_from_json(found: dict, codecs: dict):
+    """Return the PhysicalPlan, or the Refusal, that Rust's planner wrote.
+
+    Args:
+        found: A planned region as ``NativePlanner.plan`` returns it, read
+            from JSON: the envelope, the estimates, the logical plan, and,
+            for Quail's backend, the pricer and the context fields.
+        codecs: The node codecs by type name, from the session registry.
+    """
+    if "refusal" in found:
+        return refusal_from_fields(found["refusal"])
+    from quail.physical.codec import decode_graph
+
+    envelope = found["envelope"]
+    graph = decode_graph(envelope["graph"], codecs)
+    settings = dict(envelope["settings"])
+    if "candidates" in settings:
+        settings["candidates"] = tuple(
+            {**candidate, "rewrites": tuple(candidate["rewrites"])}
+            for candidate in settings["candidates"])
+    pricing = ({"fields": found["fields"], "pricer": found["pricer"]}
+               if "pricer" in found else None)
+    return PhysicalPlan(
+        model=envelope["model"], device=envelope["device"], gpus=envelope["gpus"],
+        backend=envelope["backend"],
+        estimated_seconds=found.get("estimated_seconds", 0.0),
+        nodes=graph.nodes, settings=settings, root=graph.root,
+        estimates=_estimates(found.get("estimates", {})), pricing=pricing,
+        logical_plan=found.get("logical"))
+
+
 @dataclass(frozen=True)
 class PhysicalPlan:
     """A typed physical graph with its settings and estimates.
 
     estimates holds, per node id, the node's own estimated seconds
     and, for a filter sequence a later join anchors on, the recompute it
-    would pay if its KV were released instead of pinned. estimator, a
-    PlanPricer, recomputes them and the plan's seconds for an edited
-    graph; it is not compared or shown.
+    would pay if its KV were released instead of pinned. pricing holds
+    the planning context's fields and the pricer Rust wrote, which
+    price an edited graph again; a plan without it is not priced again.
     logical_plan records the selected tree for query execution and explain.
     """
 
@@ -66,7 +109,8 @@ class PhysicalPlan:
     root: PortRef | None = None
     estimates: Mapping[str, Mapping[str, float]] = field(
         default_factory=dict, repr=False)
-    estimator: Any = field(default=None, repr=False, compare=False)
+    pricing: Mapping[str, Any] | None = field(default=None, repr=False,
+                                              compare=False)
     # the logical plan the graph lowers, as Rust's JSON
     logical_plan: str | None = field(default=None, repr=False, compare=False)
     graph: PhysicalGraph = field(init=False, repr=False)
@@ -84,8 +128,6 @@ class PhysicalPlan:
         object.__setattr__(self, "nodes", graph.nodes)
         object.__setattr__(self, "root", graph.root)
         object.__setattr__(self, "graph", graph)
-        if self.estimator is not None and not self.estimates:
-            object.__setattr__(self, "estimates", self.estimator(graph)[1])
 
 
     def _edit(self, edit: dict) -> "PhysicalPlan":
@@ -103,13 +145,22 @@ class PhysicalPlan:
 
         from quail.physical.codec import built_in_codecs, decode_graph, encode_graph
 
-        edit_with = getattr(self.estimator, "edit", None)
-        if edit_with is not None:
-            retained = set(self.settings.get("retention", {}).get("initial", {}))
-            graph, seconds, estimates = edit_with(self.graph, edit, retained)
-            return replace(self, nodes=graph.nodes, root=graph.root,
-                           estimated_seconds=seconds, estimates=estimates)
         codecs = {codec.type_name: codec for codec in built_in_codecs()}
+        if self.pricing is not None:
+            retained = sorted(self.settings.get("retention", {}).get("initial", {}))
+            found, message = _quail_native.plan_operator(
+                "edit_plan", json.dumps(self.pricing["fields"]),
+                json.dumps({"pricer": self.pricing["pricer"],
+                            "graph": encode_graph(self.graph, codecs),
+                            "edit": edit, "retained": retained}),
+                _no_tokens)
+            if message is not None:
+                raise PlanEditError(message)
+            found = json.loads(found)
+            graph = decode_graph(found["graph"], codecs)
+            return replace(self, nodes=graph.nodes, root=graph.root,
+                           estimated_seconds=found["seconds"],
+                           estimates=_estimates(found["estimates"]))
         found, message = _quail_native.edit_graph(
             json.dumps(encode_graph(self.graph, codecs)), json.dumps(edit))
         if message is not None:

@@ -88,14 +88,13 @@ cache-keys = [
 testpaths = ["tests"]
 pythonpath = ["tests"]
 
-# Planning moves to Rust, so the executor imports no planning code.
+# Rust plans every query, so the executor reads no catalog.
 # Code both use lives in quail.common.
 [[tool.importlinter.contracts]]
-name = "The executor imports no planning code"
+name = "The executor imports no catalog code"
 type = "forbidden"
 source_modules = ["quail.backends", "quail.execution"]
 forbidden_modules = [
-    "quail.planner",
     "quail.catalog",
 ]
 allow_indirect_imports = false
@@ -143,24 +142,12 @@ layers = [
     "quail.remote",
     "quail.execution",
     "quail.explain",
-    "quail.planner",
     "quail.physical",
     "quail.catalog",
     "quail.common",
     "quail.specs | quail.labels | quail.progress | quail.deploy",
 ]
 ignore_imports = ["quail.extensions -> quail.builtins"]
-
-[[tool.importlinter.contracts]]
-name = "Planner stages import downward only"
-type = "layers"
-layers = [
-    "quail.planner.sol",
-    "quail.planner.optimize",
-    "quail.planner.native",
-    "quail.planner.candidates",
-    "quail.planner.context",
-]
 
 [tool.vulture]
 paths = ["quail", "bench", "calibrate"]

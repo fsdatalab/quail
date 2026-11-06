@@ -70,23 +70,14 @@ class Engine:
     def settings(self) -> str | None:
         """The configuration Rust plans regions for, as JSON.
 
-        None for a backend whose regions Python plans.
+        None when the session's backend refuses its configuration, so the
+        region's query reports the refusal.
         """
-        config = self.session.config
-        if config.backend != "quail":
-            return None
-        from quail.physical.codec import encode_value
-        from quail.planner import native
+        from quail.api.query import backend_refusal, planning_settings
 
-        return json.dumps({
-            "model": native.untagged(encode_value(self.session.model)),
-            "device": native.untagged(encode_value(self.session.device)),
-            "gpus": config.gpus, "canvas_draws": config.canvas_draws,
-            "attention": config.attention, "order": self._order,
-            "backend": config.backend,
-            "physical_rules": [rule.name for rule in
-                               self.session.registry.physical_rules.values()],
-        })
+        if backend_refusal(self.session) is not None:
+            return None
+        return json.dumps(planning_settings(self.session, self._order))
 
     def execute(self, planned: str, tables: dict | None = None) -> pa.Table:
         """Run a region Rust planned and return its rows.

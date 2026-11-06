@@ -13,6 +13,7 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlan;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use quail::planning::PlanOutcome;
 use quail::planning::pricer_fields;
 use quail::pyarrow::to_pyarrow;
 use quail_datafusion::{bind, region_sql};
@@ -339,8 +340,8 @@ fn prompt_lowering<'py>(
     }
 }
 
-/// The planning context's fields, as `tests/helpers/rust_builder.py`
-/// writes them.
+/// The planning context's fields, as `tests/helpers/planning.py` and
+/// `NativePlanner.plan` write them.
 #[derive(serde::Deserialize)]
 struct ContextFields {
     model: serde_json::Value,
@@ -372,7 +373,7 @@ fn quail_backend() -> String {
     "quail".to_string()
 }
 
-/// Run one operator planning function of `quail/planner/operators` in Rust.
+/// Run one planning function of `quail_planner` by name.
 ///
 /// `context` is the planning context's fields as JSON, and `arguments`
 /// the function's other arguments. Returns (the result as JSON, None),
@@ -1272,7 +1273,8 @@ impl NativePlanner {
     /// Returns (the plan as JSON, None) or (None, a CompileError's
     /// message). The plan holds the envelope, estimates, pricer, the
     /// chosen logical plan, the context fields, and each scan's files,
-    /// or the refusal.
+    /// or the refusal. A request backend's plan, or that of a region that
+    /// asks no model, holds the envelope, the logical plan, and the scans.
     fn plan(
         &self,
         py: Python<'_>,
@@ -1282,18 +1284,13 @@ impl NativePlanner {
     ) -> PyResult<(Option<String>, Option<String>)> {
         let (logical, rows, settings) = planning_inputs(logical, tables, settings)?;
         let found = py.detach(|| self.planner.plan(logical, &rows, &settings));
-        let planned = match found {
-            Ok(Ok(planned)) => planned,
-            Ok(Err(refused)) => {
-                return Ok((
-                    Some(quail::planning::refused_json(&refused).to_string()),
-                    None,
-                ));
-            }
+        let found = match found {
+            Ok(PlanOutcome::Planned(planned)) => quail::planning::planned_json(&planned)
+                .map_err(|error| PyRuntimeError::new_err(error.0))?,
+            Ok(PlanOutcome::Refused(refused)) => quail::planning::refused_json(&refused),
+            Ok(PlanOutcome::Fixed(plan)) => plan,
             Err(error) => return Ok((None, Some(error.0))),
         };
-        let found = quail::planning::planned_json(&planned)
-            .map_err(|error| PyRuntimeError::new_err(error.0))?;
         Ok((Some(found.to_string()), None))
     }
 }

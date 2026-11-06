@@ -159,7 +159,7 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
 
             def check(request, graph):
                 assert len(graph.nodes_by_type(AiJoin.type_name)) == 3
-                patch.setattr("quail.planner.native.search_plan",
+                patch.setattr("quail.api.query.plan_from_json",
                               unexpected_search)
                 return {}
 

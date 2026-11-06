@@ -51,9 +51,8 @@ from quail.common.pairs import pair_table, partner_map
 from quail.common.sol import SpeedOfLight, speed_of_light
 from quail.common.tokens import prefix_tree
 from quail.common.work import Work
-from quail.physical.codec import decode_value, encode_value
+from quail.physical.codec import decode_value, encode_value, untagged
 from quail.physical.lowering import Vocabulary
-from quail.planner.native import untagged
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias

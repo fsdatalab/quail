@@ -6,7 +6,7 @@ from dataclasses import asdict, fields, is_dataclass
 
 import _quail_native
 
-from quail.physical.codec import built_in_codecs, encode_value
+from quail.physical.codec import built_in_codecs, encode_value, untagged
 from quail.physical.plan import Refusal
 
 _BUILT_IN_MODULE = "quail.physical.nodes"
@@ -66,7 +66,6 @@ def _metrics(node_metrics) -> dict:
 
 
 def _model_spec(model: str):
-    from quail.planner.native import untagged
     from quail.specs import MODELS
 
     spec = MODELS.get(model)

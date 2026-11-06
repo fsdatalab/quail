@@ -47,6 +47,10 @@ pub struct Settings {
     pub backend: String,
     /// The physical rules, in the order they apply.
     pub physical_rules: Vec<String>,
+    /// How a request backend, such as stock vLLM, submits its operators;
+    /// None plans for Quail's backend.
+    #[serde(default)]
+    pub request: Option<quail_planner::request_plan::RequestSettings>,
 }
 
 /// The rows of one table a region scans.
@@ -82,6 +86,17 @@ pub struct Planned {
     /// price an edited plan the same way.
     pub fields: serde_json::Value,
     pub scans: Vec<ScanFiles>,
+}
+
+/// What [`Planner::plan`] returns for a region.
+pub enum PlanOutcome {
+    /// Quail's backend's plan, priced, which an edit prices again.
+    Planned(Box<Planned>),
+    /// The refusal of every alternative.
+    Refused(Refused),
+    /// A request backend's plan, which nothing prices, as JSON with its
+    /// scans' files.
+    Fixed(serde_json::Value),
 }
 
 /// A region's column placements, its scans' files, and the planning
@@ -304,7 +319,7 @@ impl Planner {
         logical: LogicalPlan,
         tables: &HashMap<String, TableRows>,
         settings: &Settings,
-    ) -> Result<Result<Planned, Refused>, CompileError> {
+    ) -> Result<PlanOutcome, CompileError> {
         let Prepared {
             alternatives,
             fields,
@@ -351,19 +366,22 @@ impl Planner {
             last_tokens: ends,
             backend: settings.backend.clone(),
         };
+        if let Some(request) = &settings.request {
+            return request_outcome(&alternatives, &context, request, &files);
+        }
         let found = quail_planner::optimize::search_plan(
             &alternatives,
             &context,
             &settings.physical_rules,
         )?;
         Ok(match found {
-            Ok(selected) => Ok(Planned {
+            Ok(selected) => PlanOutcome::Planned(Box::new(Planned {
                 logical: alternatives[selected.alternative].plan.clone(),
                 selected,
                 fields,
                 scans: files,
-            }),
-            Err(refusal) => Err(Refused {
+            })),
+            Err(refusal) => PlanOutcome::Refused(Refused {
                 refusal,
                 scans: files,
             }),
@@ -683,6 +701,72 @@ pub fn pricer_fields(pricer: &quail_planner::pricing::PlanPricer) -> serde_json:
             serde_json::Value::Object(work(found)))).collect::<serde_json::Map<String, serde_json::Value>>(),
         "expected_rows": pricer.expected_rows,
     })
+}
+
+/// A request backend's plan of the first alternative it does not refuse,
+/// as Python's backend search selected it: a request backend prices no
+/// plan, so ties go to the earlier alternative. The plan's settings list
+/// every alternative's outcome under `candidates`.
+fn request_outcome(
+    alternatives: &[quail_planner::rules::LogicalAlternative],
+    context: &PlanningContext,
+    request: &quail_planner::request_plan::RequestSettings,
+    files: &[ScanFiles],
+) -> Result<PlanOutcome, CompileError> {
+    let mut found = Vec::new();
+    for alternative in alternatives {
+        found.push(quail_planner::request_plan::request_plan(
+            &alternative.plan,
+            context,
+            request,
+        )?);
+    }
+    let Some(selected) = found.iter().position(|plan| plan.get("refusal").is_none()) else {
+        let mut refused = found.swap_remove(0);
+        refused["scans"] = scans_json(files);
+        return Ok(PlanOutcome::Fixed(refused));
+    };
+    let candidates: Vec<serde_json::Value> = alternatives
+        .iter()
+        .zip(&found)
+        .enumerate()
+        .map(|(index, (alternative, plan))| {
+            let refusal = plan.get("refusal").map(|refusal| refusal["constraint"].clone());
+            serde_json::json!({
+                "rewrites": alternative.rules,
+                "estimated_seconds": if refusal.is_some() { serde_json::Value::Null } else { 0.0.into() },
+                "refusal": refusal,
+                "selected": index == selected,
+            })
+        })
+        .collect();
+    let plan = &found[selected];
+    let mut plan_settings = plan["settings"].clone();
+    plan_settings["candidates"] = candidates.into();
+    let envelope = serde_json::json!({
+        "backend": request.backend_name, "model": context.model.name,
+        "device": context.device.name, "gpus": 1,
+        "settings": plan_settings, "graph": plan["graph"],
+    });
+    Ok(PlanOutcome::Fixed(fixed_json(
+        envelope,
+        &alternatives[selected].plan,
+        files,
+    )?))
+}
+
+/// A plan nothing prices as JSON: its envelope, the logical plan it
+/// lowers, and each scan's files.
+fn fixed_json(
+    envelope: serde_json::Value,
+    logical: &LogicalPlan,
+    files: &[ScanFiles],
+) -> Result<serde_json::Value, CompileError> {
+    Ok(serde_json::json!({
+        "envelope": envelope, "estimated_seconds": 0.0,
+        "logical": quail_planner::write_logical_plan(logical).map_err(arrow_error)?,
+        "scans": scans_json(files),
+    }))
 }
 
 /// Each scan's files as JSON, by alias.

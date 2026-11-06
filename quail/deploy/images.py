@@ -70,10 +70,7 @@ def _with_sources(image: modal.Image) -> modal.Image:
 
 
 def _with_native_planner(image: modal.Image) -> modal.Image:
-    """Build the _quail_native module, which plans queries in Rust, into an image.
-
-    Without it, Quail plans in Python (quail.planner.native).
-    """
+    """Build the _quail_native module, which plans queries in Rust, into an image."""
     return (image.apt_install("curl", "build-essential")
             .run_commands("curl -sSf https://sh.rustup.rs | sh -s -- -y "
                           "--profile minimal")

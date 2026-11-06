@@ -299,8 +299,8 @@ def aliased_call(expression, *kinds):
 class Prompt:
     """The text of one model call, laid out for a model's prompt format.
 
-    The planner lowers the text to token ids with the session's
-    tokenizer; see quail.planner.prompt_lowering. A classification
+    Rust's planner lowers the text to token ids with the session's
+    tokenizer. A classification
     prompt keeps the text before each label in label_prefix and what
     rendered its label list, so lowering can render it again with one
     letter per label.

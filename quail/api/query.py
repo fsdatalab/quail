@@ -29,16 +29,56 @@ from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
 from quail.physical import Scan, encode_graph
-from quail.physical.codec import decode_value, encode_value
-from quail.physical.plan import Refusal, RefusalError, refusal_from_fields
-from quail.planner import native, plan_query
-from quail.planner.candidates import LogicalAlternative
-from quail.planner.context import PlanningContext
+from quail.physical.codec import decode_value, encode_value, untagged
+from quail.physical.plan import Refusal, RefusalError, plan_from_json
 
 # the start of Rust's message for a document that is an expression
 
 if TYPE_CHECKING:
     from quail.api.session import Session
+
+
+def backend_refusal(session) -> Refusal | None:
+    """Return why the session's backend cannot run its configuration, or None."""
+    config = session.config
+    if config.canvas_draws < 1:
+        return Refusal(
+            reasons=(f"canvas_draws must be at least 1, got {config.canvas_draws}",),
+            constraint="canvas_draws", needed=1, available=config.canvas_draws,
+            unit="draws")
+    try:
+        backend = session.registry.backend(config.backend)
+    except ValueError as error:
+        return Refusal(reasons=(str(error),), constraint="unknown_backend",
+                       needed=1, available=0, unit="backends")
+    support = backend.supports(session.model, session.device, config.gpus)
+    if not support.supported:
+        return Refusal(
+            reasons=(support.reason or "unsupported backend configuration",),
+            constraint="unsupported_backend_configuration", needed=1,
+            available=0, unit="configurations")
+    return None
+
+
+def planning_settings(session, order: str | None) -> dict:
+    """The configuration Rust plans a region for.
+
+    Args:
+        session: The session whose model, device, and backend plan it.
+        order: The stage order rule, 'by_cost' or 'as_written', or None.
+    """
+    config = session.config
+    backend = session.registry.backend(config.backend)
+    return {
+        "model": untagged(encode_value(session.model)),
+        "device": untagged(encode_value(session.device)),
+        "gpus": config.gpus, "canvas_draws": config.canvas_draws,
+        "attention": config.attention, "order": order,
+        "backend": config.backend,
+        "physical_rules": [rule.name for rule in
+                           session.registry.physical_rules.values()],
+        "request": getattr(backend, "request_settings", None),
+    }
 
 
 @runtime_checkable
@@ -171,54 +211,15 @@ class Query:
                         if name in self.session.catalog
                         else self.input_identities.get(name))
             tables[name] = (identity, table)
-        config = self.session.config
-        settings = {
-            "model": native.untagged(encode_value(self.session.model)),
-            "device": native.untagged(encode_value(self.session.device)),
-            "gpus": config.gpus, "canvas_draws": config.canvas_draws,
-            "attention": config.attention, "order": self.order,
-            "backend": config.backend,
-            "physical_rules": [rule.name for rule in
-                               self.session.registry.physical_rules.values()],
-        }
-        planner = self.session.planner
-        call = planner.plan if config.backend == "quail" else planner.prepare
-        found, message = call(self._logical_input, tables, json.dumps(settings))
+        refusal = backend_refusal(self.session)
+        if refusal is not None:
+            return refusal
+        found, message = self.session.planner.plan(
+            self._logical_input, tables,
+            json.dumps(planning_settings(self.session, self.order)))
         if message is not None:
             raise CompileError(message)
-        if config.backend == "quail":
-            return self.adopt_plan(json.loads(found))
-        return self._lower_prepared(json.loads(found))
-
-    def _lower_prepared(self, found: dict):
-        """Lower a region Rust prepared with the session's backend.
-
-        Args:
-            found: What ``NativePlanner.prepare`` returns, read from JSON.
-
-        Returns:
-            The physical plan, or a Refusal.
-        """
-        self._adopt_scans(found)
-        config = self.session.config
-        alternatives = tuple(LogicalAlternative(text, tuple(rules))
-                             for text, rules in found["alternatives"])
-        pair_fractions = {int(position): fraction for position, fraction
-                          in found["fields"]["pair_fractions"].items()}
-        plan = plan_query(
-            self._logical_input, model=self.session.model,
-            device=self.session.device, document_tokens=self._document_tokens,
-            gpus=config.gpus, order=self.order, canvas_draws=config.canvas_draws,
-            attention=config.attention, backend=config.backend,
-            registry=self.session.registry, tokenizer=self.session.tokenizer,
-            pair_fractions=pair_fractions, catalog=self.catalog,
-            engine_config=config, logical_candidates=alternatives)
-        if not isinstance(plan, Refusal):
-            self.logical = plan.logical_plan
-            if config.gpu_timing:
-                plan = replace(plan, settings={**plan.settings, "gpu_timing": True})
-        self._plan = self._searched_plan = plan
-        return plan
+        return self.adopt_plan(json.loads(found))
 
     def _adopt_scans(self, found: dict) -> None:
         """Read the token store and column files Rust wrote as the inputs."""
@@ -240,11 +241,11 @@ class Query:
             The physical plan, or the Refusal.
         """
         self._adopt_scans(found)
-        if "refusal" in found:
-            refusal = refusal_from_fields(found["refusal"])
-            self._plan = self._searched_plan = refusal
-            return refusal
-        plan, self.logical = native.planned_region(found, self.session.tokenizer)
+        plan = plan_from_json(found, self.session.registry.codecs)
+        if isinstance(plan, Refusal):
+            self._plan = self._searched_plan = plan
+            return plan
+        self.logical = plan.logical_plan
         if self.session.config.gpu_timing:
             plan = replace(plan, settings={**plan.settings, "gpu_timing": True})
         if self._planning_started_at is None:
@@ -334,10 +335,22 @@ class Query:
     def _relational_plan(self, num_documents: int):
         """Plan a stage that asks no model."""
         config = self.session.config
-        context = PlanningContext(
-            model=self.session.model, device=self.session.device, gpus=config.gpus,
-            document_tokens={}, backend=config.backend)
-        return native.relational_plan(self.logical, context, num_documents)
+        fields = {
+            "model": untagged(encode_value(self.session.model)),
+            "device": untagged(encode_value(self.session.device)),
+            "gpus": config.gpus, "canvas_draws": config.canvas_draws,
+            "document_tokens": {}, "plan": None, "attention": None,
+            "backend": config.backend,
+        }
+        found, message = _quail_native.plan_operator(
+            "relational_plan", json.dumps(fields),
+            json.dumps({"plan": json.loads(self.logical),
+                        "num_documents": num_documents}),
+            lambda _text: [])
+        if message is not None:
+            raise CompileError(message)
+        return plan_from_json({"envelope": json.loads(found), "logical": self.logical},
+                              self.session.registry.codecs)
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
