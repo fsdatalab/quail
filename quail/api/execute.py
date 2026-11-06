@@ -240,12 +240,12 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
     model_wall_s = result.report["wall_s"]
     result.report.update(
         planning_s=round(query.planning_s, 4),
-        input_ready_s=round(query.input_ready_s, 4),
+        # the planner tokenizes the inputs, so they are ready once planned
+        input_ready_s=round(query.planning_s, 4),
         physical_prepare_s=round(physical_prepare_s, 4),
         model_wall_s=model_wall_s,
         finish_s=round(finish_s, 4),
     )
-    result.report["token_wait_s"] = round(query.token_wait_s, 4)
     result.report["worker_total_s"] = round(
         time.perf_counter() - total_started, 4)
     return result

@@ -21,7 +21,7 @@ ASSUMED_ANSWER_TOKENS = 32
 SUMMED_REPORT_FIELDS = (
     "wall_s", "model_wall_s", "coordinator_wall_s", "fresh_tokens",
     "cached_tokens", "estimated_seconds", "planning_s", "input_ready_s",
-    "physical_prepare_s", "finish_s", "token_wait_s", "gpu_s", "chunks",
+    "physical_prepare_s", "finish_s", "gpu_s", "chunks",
     "evaluated_documents", "evaluated_document_pairs", "usd_per_query")
 
 

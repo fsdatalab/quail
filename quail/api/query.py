@@ -13,18 +13,14 @@ from pyarrow import compute as pc
 
 from quail.api.execute import execute_query
 from quail.api.region_inputs import input_scans
-from quail.catalog import inputs
 from quail.catalog.providers import ScanRequest
 from quail.common.expressions import (
-    ColumnRef,
     CompileError,
-    GetField,
     column_references,
     evaluate_expression,
     source_columns,
 )
-from quail.common.pairs import FIRST_DOCUMENT, columns_key, estimate_pair_fraction
-from quail.common.selection import selected_rows
+from quail.common.pairs import FIRST_DOCUMENT, columns_key
 from quail.common.tokens import ColumnStore, ScanInput, TokenLengths, TokenStore
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
 from quail.execution.projection import projection_for
@@ -38,17 +34,15 @@ from quail.logical import (
     WithCTE,
     filter_stop_keys,
     join_conditions,
-    oriented_join_conditions,
 )
 from quail.physical import Scan, encode_graph
 from quail.physical.codec import decode_value, encode_value
 from quail.physical.plan import Refusal, RefusalError, refusal_from_fields
-from quail.planner import native, plan_query, refine_plan
+from quail.planner import native, plan_query
 from quail.planner.candidates import LogicalAlternative
 from quail.planner.context import PlanningContext
 
 # the start of Rust's message for a document that is an expression
-DOCUMENT_EXPRESSION = "a document must be a column or a struct field"
 
 if TYPE_CHECKING:
     from quail.api.session import Session
@@ -100,15 +94,8 @@ class Query:
         self._searched_plan = None
         self._document_tokens = None
         self._token_inputs = None
-        self._token_futures = {}
-        self._token_finished_at = {}
-        self._estimated = ()
         self._planning_started_at = None
         self._planning_finished_at = None
-        self._replanning_s = 0.0
-        self._scan_selectivities = {}
-        self._pair_selectivities = {}
-        self.token_wait_s = 0.0
         # each filtered input's rows' positions in its registered table
         self.source_rows = {}
         # each input that holds a registered table whole: its identity
@@ -150,139 +137,17 @@ class Query:
                     scan.provider, scan.column))
             self._plan = self._relational_plan(num_documents or 0)
             return self._plan
-        if self._plans_in_rust():
-            self._planning_started_at = time.perf_counter()
-            planned = self._plan_in_rust()
-            if planned is not None:
-                self._plan = planned
-                self._planning_finished_at = time.perf_counter()
-                self._searched_plan = self._plan
-                return self._plan
-        if self._plan is None:
-            self._planning_started_at = time.perf_counter()
-            config = self.session.config
-            operators = self.logical.operators()
-            self._document_tokens = {}
-            self._token_inputs = {}
-            estimated = []
-            for s in operators.scans:
-                exact = self.inputs.token_lengths(s.provider, s.column)
-                if exact is not None:
-                    self._document_tokens[s.alias] = exact
-                    continue
-                self._document_tokens[s.alias] = self.inputs.estimate_lengths(
-                    s.provider, s.column)
-                estimated.append(s.alias)
-            self._estimated = tuple(estimated)
-            # the planner estimates what the regular predicates and the join
-            # equalities keep from samples; the executor applies them
-            scan_fractions = self._scan_fractions(operators.scans)
-            pair_fractions = self._pair_fractions(
-                operators.scans, operators.joins)
-            self._scan_selectivities = scan_fractions
-            self._pair_selectivities = pair_fractions
-            context = PlanningContext(
-                catalog=self.catalog, engine_config=config,
-                model=self.session.model, device=self.session.device,
-                gpus=config.gpus, document_tokens=self._document_tokens,
-                backend=config.backend, order=self.order,
-                canvas_draws=config.canvas_draws,
-                attention=config.attention,
-                tokenizer=self.session.tokenizer,
-                pair_fractions=pair_fractions,
-                scan_fractions=scan_fractions)
-            candidates = native.column_placements(self._logical_input)
-            self.logical = candidates[0].plan
-            scans = {}
-            offset_aliases = set()
-            # an alias some plan scans without predicates reads every row
-            whole_aliases = set()
-            for candidate in candidates:
-                operators = candidate.plan.operators()
-                offset_aliases.update(alias for extract in operators.extracts
-                                      for alias in extract.call.aliases())
-                whole_aliases.update(scan.alias for scan in operators.scans
-                                     if not scan.predicates)
-                for scan in operators.scans:
-                    previous = scans.get(scan.alias, scan)
-                    scans[scan.alias] = replace(scan, columns=tuple(dict.fromkeys(
-                        (*previous.columns, *scan.columns))))
-            backend = self.session.registry.backend(config.backend)
-            # an extension backend may leave the capability flags unset
-            reads_text = getattr(backend, "reads_document_text", False)
-            locates_answers = getattr(backend, "locates_answers_in_text", False)
-            for s in scans.values():
-                if self.inputs.pending(s.provider):
-                    continue
-                columns = s.columns
-                # the extraction computes the offsets of the rows the
-                # predicates keep; computing them for every row of a
-                # large table costs far more than tokenizing it
-                with_offsets = (locates_answers and s.alias in offset_aliases
-                                and s.alias in whole_aliases)
-                if reads_text:
-                    columns = tuple(dict.fromkeys(
-                        (*columns, *source_columns(s.column))))
-                if s.alias not in self._estimated:
-                    self._token_inputs[s.alias] = self.inputs.tokenize(
-                        s.provider, s.column, columns, with_offsets=with_offsets)
-                    continue
-                future = self.inputs.tokenize_async(
-                    s.provider, s.column, columns, with_offsets=with_offsets)
-
-                def record_finished(_future, alias=s.alias):
-                    self._token_finished_at[alias] = time.perf_counter()
-
-                future.add_done_callback(record_finished)
-                self._token_futures[s.alias] = future
-            self._plan = plan_query(
-                self._logical_input, model=self.session.model,
-                device=self.session.device,
-                document_tokens=self._document_tokens,
-                gpus=config.gpus,
-                order=self.order,
-                canvas_draws=config.canvas_draws,
-                attention=config.attention,
-                backend=config.backend,
-                registry=self.session.registry,
-                tokenizer=self.session.tokenizer,
-                pair_fractions=pair_fractions,
-                scan_fractions=scan_fractions,
-                memo=context.memo, catalog=self.catalog,
-                engine_config=config, logical_candidates=candidates)
-            if not isinstance(self._plan, Refusal):
-                self.logical = self._plan.logical_plan
-            extra = {}
-            if config.gpu_timing:
-                extra["gpu_timing"] = True
-            if extra and not isinstance(self._plan, Refusal):
-                self._plan = replace(self._plan, settings={
-                    **self._plan.settings, **extra})
-            self._planning_finished_at = time.perf_counter()
-            self._searched_plan = self._plan
+        self._planning_started_at = time.perf_counter()
+        self._plan = self._plan_in_rust()
+        self._planning_finished_at = time.perf_counter()
+        self._searched_plan = self._plan
         return self._plan
-
-    def _plans_in_rust(self) -> bool:
-        """Whether Rust plans this region.
-
-        Rust plans the regions whose documents are columns or struct
-        fields; for a backend other than Quail's, it prepares them and the
-        backend lowers them.
-        """
-        def column(expression) -> bool:
-            if isinstance(expression, ColumnRef):
-                return True
-            return isinstance(expression, GetField) and column(expression.input)
-
-        return all(isinstance(scan.column, str) or column(scan.column)
-                   for scan in self.logical.operators().scans)
 
     def _plan_in_rust(self):
         """Tokenize, measure, and plan the region in Rust.
 
         Rust writes each scan's token store and value columns; the query
-        reads them as its inputs. Returns None for a region whose document
-        is an expression, which Python plans.
+        reads them as its inputs.
         """
         tables = {}
         for scan in self._logical_input.operators().scans:
@@ -312,9 +177,6 @@ class Query:
         found, message = call(json.dumps(encode_value(self._logical_input)), tables,
                               json.dumps(settings))
         if message is not None:
-            if message.startswith(DOCUMENT_EXPRESSION):
-                # Python tokenizes a document that is an expression
-                return None
             raise CompileError(message)
         if config.backend == "quail":
             return self.adopt_plan(json.loads(found))
@@ -390,67 +252,7 @@ class Query:
         if self._planning_started_at is None:
             return 0.0
         finished = self._planning_finished_at or time.perf_counter()
-        return finished - self._planning_started_at + self._replanning_s
-
-    @property
-    def input_ready_s(self) -> float:
-        """Return planning and tokenization time, excluding backend startup."""
-        if self._planning_started_at is None:
-            return 0.0
-        finished = [
-            self._planning_finished_at or time.perf_counter(),
-            *self._token_finished_at.values(),
-        ]
-        return max(finished) - self._planning_started_at + self._replanning_s
-
-    def _pair_fractions(self, scans, joins) -> dict:
-        """Estimated pairs over the cross product, per join with conditions."""
-        providers = {scan.alias: scan.provider for scan in scans}
-        samples = {}
-
-        def keys(expressions):
-            out = []
-            for expression in expressions:
-                refs = column_references(expression)
-                for ref in refs:
-                    if (ref.alias, ref.column) not in samples:
-                        samples[(ref.alias, ref.column)] = (
-                            self.inputs.sample_columns(
-                                providers[ref.alias], [ref.column])[ref.column])
-                out.append(evaluate_expression(expression, pa.table({
-                    ref.column: samples[(ref.alias, ref.column)] for ref in refs})))
-            return out
-
-        fractions = {}
-        for position, join in enumerate(joins):
-            oriented = oriented_join_conditions(join)
-            if oriented is None:
-                continue
-            _, _, conditions = oriented
-            fractions[position] = estimate_pair_fraction(
-                keys([left for left, _ in conditions]),
-                keys([right for _, right in conditions]))
-        return fractions
-
-    def _scan_fractions(self, scans) -> dict:
-        """Estimated fraction of each tested scan's documents its tests keep."""
-        fractions = {}
-        for scan in scans:
-            if not scan.predicates:
-                continue
-            columns = pa.table(self.inputs.sample_columns(
-                scan.provider,
-                list(dict.fromkeys(reference.column
-                                   for predicate in scan.predicates
-                                   for test in predicate.tests()
-                                   for reference in column_references(
-                                       test.expression)))))
-            sampled = columns.num_rows
-            kept = len(selected_rows(columns, scan.predicates))
-            # a sample that keeps nothing, or everything, says little
-            # about the rest, so the estimate stays off 0 and 1
-            fractions[scan.alias] = (kept + 1) / (sampled + 2)
-        return fractions
+        return finished - self._planning_started_at
 
     def explain(self, *, verbose: bool = False,
                 analyze: bool = False) -> str:
@@ -500,57 +302,15 @@ class Query:
                       else SessionContext(self.session).explain(
                           self.text, self.dialect))
             text = f"DataFusion:\n{around}\n\nmodel region:\n{text}"
-        if self._estimated:
-            text += ("\n\n  note: token counts for "
-                     + ", ".join(repr(a) for a in self._estimated)
-                     + f" are estimated from a {inputs.ESTIMATE_SAMPLE} document "
-                     "sample")
         return text
 
     def wait_for_tokens(self) -> None:
-        """Block until every background tokenization has finished.
+        """Read a relational stage's value columns.
 
-        A plan made on estimated lengths is searched again with exact inputs,
-        so prefix sharing can change which logical alternative wins.
+        A model region's token stores are written when it is planned.
         """
         if not self.logical.operators().prompts:
             self._prepare_relational()
-            return
-        started = time.perf_counter()
-        refine = bool(self._token_futures)
-        for alias, future in list(self._token_futures.items()):
-            self._token_inputs[alias] = future.result()
-            self._document_tokens[alias] = self._token_inputs[alias].lengths
-            self._token_finished_at.setdefault(alias, time.perf_counter())
-            del self._token_futures[alias]
-        self.token_wait_s += time.perf_counter() - started
-        if refine and self._plan is not None:
-            started = time.perf_counter()
-            options = dict(
-                model=self.session.model,
-                device=self.session.device, document_tokens=self._document_tokens,
-                gpus=self.session.config.gpus, order=self.order,
-                canvas_draws=self.session.config.canvas_draws,
-                attention=self.session.config.attention,
-                backend=self.session.config.backend,
-                registry=self.session.registry,
-                tokenizer=self.session.tokenizer,
-                pair_fractions=self._pair_selectivities)
-            if self._plan is self._searched_plan:
-                self._plan = plan_query(
-                    self._logical_input, scan_fractions=self._scan_selectivities,
-                    catalog=self.catalog, engine_config=self.session.config,
-                    **options)
-                if not isinstance(self._plan, Refusal):
-                    self.logical = self._plan.logical_plan
-            else:
-                # Explicit physical edits must survive exact tokenization.
-                self._plan = refine_plan(self._plan, **options)
-            if self.session.config.gpu_timing and not isinstance(self._plan, Refusal):
-                self._plan = replace(self._plan, settings={
-                    **self._plan.settings, "gpu_timing": True})
-            self._replanning_s += time.perf_counter() - started
-            self._estimated = ()
 
     def _prepare_relational(self):
         """Read a relational stage's value columns without tokenizing them."""
