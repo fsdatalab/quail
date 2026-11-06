@@ -42,7 +42,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     }
     assert set(QUERY_ORDER) == (
         expected | classify | extract | relational) - {"PRIV-1", "PRIV-2"}
-    for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
+    for backend in ("quail", "stock_vllm", "pipelined_vllm"):
         with quail.Session(
             EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
                          device="h100-sxm"),
@@ -50,9 +50,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
         ) as sess:
             register_tables(sess, tmp_path)
             qdefs = queries(sess)
-            # every backend lists every query; SGLang refuses the
-            # classification and extraction queries at plan time, since
-            # its engine returns no decoded answer text.
+            # every backend lists every query
             assert set(qdefs) == expected | classify | extract | relational, (
                 backend)
             for qid, (_, build) in qdefs.items():
@@ -69,15 +67,6 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                 root = query.logical.result
                 sorts = bool(root.order or root.distinct or root.offset)
                 assert sorts <= (qid in relational), case
-                # SGLang's engine returns no decoded answer text
-                if backend == "pipelined_sglang" and operators.classifies:
-                    assert isinstance(plan, Refusal), case
-                    assert plan.constraint == "classify_needs_quail_backend", case
-                    continue
-                if backend == "pipelined_sglang" and operators.extracts:
-                    assert isinstance(plan, Refusal), case
-                    assert plan.constraint == "extract_needs_quail_backend", case
-                    continue
                 if backend != "quail" and sorts:
                     # a request backend sorts returned rows on the coordinator
                     if isinstance(plan, Refusal):

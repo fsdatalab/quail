@@ -155,7 +155,6 @@ Built on:
 - **Hugging Face** (`transformers`, `huggingface_hub`, `datasets`):
   tokenizers, checkpoints, and benchmark data.
 - **Modal**: every GPU run and the result volumes.
-- **SGLang**: a second baseline.
 
 Learned from. Treat these as whole projects to study, not single
 features: their APIs, their code layout, their tests, their docs, and
@@ -221,14 +220,14 @@ how they release and explain changes.
       queries=$queries,IMDB-24,CUAD-20
       uv run modal run --detach -m bench.quailb_parallel \
         --model qwen3-4b-fp8 --scale-factor 0.1 --query "$queries" \
-        --no-include-baselines --no-include-sglang \
+        --no-include-baselines \
         2>&1 | tee "$run_log"
 
   Run more queries, or a larger scale factor, only when the change
   targets them or the user asks.
-- Do not run stock vLLM, pipelined vLLM, or SGLang by default.
+- Do not run stock vLLM or pipelined vLLM by default.
   `bench.quailb_parallel` runs them unless told not to, so pass
-  `--no-include-baselines --no-include-sglang`. Run a baseline only
+  `--no-include-baselines`. Run a baseline only
   for an experiment whose point is to compare Quail with it, or when
   the user asks. Reuse saved baseline results when the queries, scale
   factor, and model have not changed.

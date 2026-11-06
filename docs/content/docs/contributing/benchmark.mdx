@@ -37,7 +37,7 @@ mkdir -p results/benchmark
 run_log="results/benchmark/quailb-$(date -u +%Y%m%dT%H%M%SZ).log"
 uv run modal run --detach -m bench.quailb_parallel \
   --sf 0.1 --model qwen3-4b-fp8 --query IMDB-4 \
-  --no-include-baselines --no-include-sglang \
+  --no-include-baselines \
   --output-dir /results/benchmarks/quailb \
   2>&1 | tee "$run_log"
 ```

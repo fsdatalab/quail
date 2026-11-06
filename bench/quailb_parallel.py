@@ -1,8 +1,7 @@
 """Run Quail and vLLM on one physical GPU per query family.
 
 Quail runs in a fresh child process. Stock vLLM and pipelined vLLM run
-in a second child process and share one loaded model. SGLang runs in a
-separate container because its package version conflicts with vLLM.
+in a second child process and share one loaded model.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
     uv run modal run --detach -m bench.quailb_parallel \
@@ -22,12 +21,11 @@ from pathlib import Path
 import modal
 
 from bench.results import combine_measurements, write_json
-from quail.deploy.images import gpu_image, sglang_image
+from quail.deploy.images import gpu_image
 from quail.progress import LOG_TAG_ENV
 from quail.specs import modal_gpu_type
 
 image = gpu_image()
-sglang_gpu_image = sglang_image()
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
@@ -240,33 +238,6 @@ def run_query_family(
         kernel_cache.commit()
 
 
-@app.function(
-    image=sglang_gpu_image,
-    gpu=modal_gpu_type("h100-sxm"),
-    memory=98304,
-    timeout=36000,
-    max_containers=8,
-    volumes=VOLUMES,
-)
-def run_sglang_query_family(
-    model: str,
-    scale_factor: float,
-    query_ids_csv: str,
-    run_dir: str,
-    ground_truth_collection: str,
-    result_name: str = "-sglang",
-    device: str = "h100-sxm",
-) -> str:
-    """Run one query family through the SGLang backend."""
-    try:
-        return _run_family([("pipelined_sglang",)], result_name, model, scale_factor,
-                           query_ids_csv, run_dir, ground_truth_collection,
-                           device=device)
-    finally:
-        results_vol.commit()
-        kernel_cache.commit()
-
-
 def _merge_suites(parts, directories, query_ids, run_id, started, elapsed,
                   function_call_ids, methods):
     base = parts[0]
@@ -331,7 +302,6 @@ def run_all(
     query: str = "",
     ground_truth_collection: str = "",
     include_baselines: bool = True,
-    include_sglang: bool = True,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
@@ -381,7 +351,6 @@ def run_all(
         manifest["collection_id"] = ground_truth_collection
 
         family_calls = []
-        sglang_calls = []
         call_ids = manifest["function_call_ids"]
         for group, family_ids, result_name in _query_groups(query_ids):
             if include_quail or include_baselines or include_dumb_vllm:
@@ -413,31 +382,10 @@ def run_all(
                     f"({group}, Quail and vLLM, {','.join(family_ids)})",
                     flush=True,
                 )
-            if include_sglang:
-                sglang_result_name = f"{result_name}-sglang"
-                sglang_call = run_sglang_query_family.with_options(
-                    gpu=modal_gpu_type(device),
-                ).spawn(
-                    model=model,
-                    scale_factor=scale_factor,
-                    query_ids_csv=",".join(family_ids),
-                    run_dir=run_dir,
-                    ground_truth_collection=ground_truth_collection,
-                    result_name=sglang_result_name,
-                    device=device,
-                )
-                sglang_calls.append((group, sglang_call))
-                call_ids[f"{group}:sglang"] = sglang_call.object_id
-                print(
-                    f"function call id: {sglang_call.object_id} "
-                    f"({group}, SGLang, {','.join(family_ids)})",
-                    flush=True,
-                )
 
         write_json(manifest_path, manifest)
         results_vol.commit()
-        return _finish_run(directory, manifest, family_calls, sglang_calls,
-                           query_ids, started)
+        return _finish_run(directory, manifest, family_calls, query_ids, started)
     except Exception as error:
         manifest.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
@@ -447,12 +395,11 @@ def run_all(
         results_vol.commit()
 
 
-def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
-                started):
+def _finish_run(directory, manifest, family_calls, query_ids, started):
     """Wait for a run's family calls, merge their suites, write the reports.
 
-    family_calls and sglang_calls pair a family name with its Modal
-    function call. The manifest is updated in place and written.
+    family_calls pairs a family name with its Modal function call. The
+    manifest is updated in place and written.
     """
     manifest_path = directory / "manifest.json"
     call_ids = manifest["function_call_ids"]
@@ -461,21 +408,14 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
         print(f"waiting for {family} Quail and vLLM", flush=True)
         family_parts.append(json.loads(call.get()))
         print(f"{family} Quail and vLLM finished", flush=True)
-    sglang_parts = []
-    for family, call in sglang_calls:
-        print(f"waiting for {family} SGLang", flush=True)
-        sglang_parts.append(json.loads(call.get()))
-        print(f"{family} SGLang finished", flush=True)
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
 
     # the family results name the methods they ran
     methods = list(family_parts[0]["suites"]) if family_parts else []
-    if sglang_parts:
-        methods.append("pipelined_sglang")
     reports = {}
     paths = {}
     for method in methods:
-        parts = sglang_parts if method == "pipelined_sglang" else family_parts
+        parts = family_parts
         reports[method] = _merge_suites(
             [part["suites"][method] for part in parts],
             # a family split into groups saves each group in its own folder
@@ -494,12 +434,8 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
     manifest.update(
         status="complete",
         parallel_wall_s=round(elapsed, 1),
-        families={
-            **{Path(part["result_path"]).stem: part["result_path"]
-               for part in family_parts},
-            **{Path(part["result_path"]).stem: part["result_path"]
-               for part in sglang_parts},
-        },
+        families={Path(part["result_path"]).stem: part["result_path"]
+                  for part in family_parts},
         summaries=paths,
     )
     # several canvas draw counts save one Quail suite per count
@@ -532,17 +468,15 @@ def finish_run(run_dir: str) -> str:
     directory = Path(run_dir)
     manifest_path = directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    family_calls, sglang_calls = [], []
+    family_calls = []
     for name, call_id in manifest["function_call_ids"].items():
         family, _, kind = name.partition(":")
         if kind == "quail_vllm":
             family_calls.append((family, modal.FunctionCall.from_id(call_id)))
-        elif kind == "sglang":
-            sglang_calls.append((family, modal.FunctionCall.from_id(call_id)))
     started = datetime.fromisoformat(manifest["started_at"])
     manifest["status"] = "running"
     try:
-        return _finish_run(directory, manifest, family_calls, sglang_calls,
+        return _finish_run(directory, manifest, family_calls,
                            tuple(manifest["query_ids"]), started)
     except Exception as error:
         manifest.update(status="failed", error=f"{type(error).__name__}: {error}")
@@ -561,7 +495,6 @@ def main(
     query: str = "",
     ground_truth_collection: str = "",
     include_baselines: bool = True,
-    include_sglang: bool = True,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
@@ -595,7 +528,6 @@ def main(
         query=query,
         ground_truth_collection=ground_truth_collection,
         include_baselines=include_baselines,
-        include_sglang=include_sglang,
         include_quail=include_quail,
         include_dumb_vllm=include_dumb_vllm,
         baselines=baselines,

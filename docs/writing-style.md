@@ -9,7 +9,7 @@ Before drafting, state who the page is for and what they want to accomplish. Est
 - Answer the reader's question early. Choose that answer according to the page's purpose.
 - Respect the reader's existing knowledge. E.g., an audience that understands classification does not need another definition of classification.
 - Explain the behavior the reader needs to understand. Describe implementation details only when those details help the intended reader.
-- Do not mention vLLM or SGLang backends in the API documentation.
+- Do not mention the vLLM backends in the API documentation.
 - Choose the depth deliberately. E.g., an API user needs different information from an engineer changing execution code.
 
 ## Present an outline before writing

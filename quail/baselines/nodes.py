@@ -1,7 +1,7 @@
 """The physical node of the request backends: one engine run per query.
 
-A request backend submits one prompt per document or pair to vLLM or
-SGLang. Its whole model work is one ``RequestExecution`` node holding
+A request backend submits one prompt per document or pair to vLLM. Its
+whole model work is one ``RequestExecution`` node holding
 the filter, join, classification, and extraction specs, in the order
 the engine runs them. The Quail engine plans one node per operator
 instead; see ``quail.physical.nodes``.

@@ -112,8 +112,8 @@ def _warm_boot() -> dict:
     }
 
 
-# Architectures the request backends do not serve. vLLM 0.29 has no
-# LFM3 model; SGLang's support was not checked.
+# Architectures the request backends do not serve: vLLM 0.29 has no
+# LFM3 model.
 UNSERVED_ARCHS = frozenset({"lfm3"})
 
 
@@ -141,7 +141,7 @@ class LoadedRequestEngine:
 class RequestBackend:
     """A model backend that submits one request per prompt to an engine.
 
-    The engine adapter boots vLLM or SGLang and returns a client with
+    The engine adapter boots vLLM and returns a client with
     generate, reset_prefix_cache, and run_filter_sequence. The submission
     strategies decide how filter stages, join tuples, and maps become
     requests.

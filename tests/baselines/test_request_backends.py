@@ -1,6 +1,5 @@
-"""CPU tests for vLLM and SGLang backend interfaces."""
+"""CPU tests for the vLLM backend interfaces."""
 
-import asyncio
 import sys
 from types import SimpleNamespace
 
@@ -14,7 +13,6 @@ from helpers.baselines import (
 )
 
 from quail.baselines.nodes import RequestExecution
-from quail.baselines.sglang import SGLangClient, pipelined_sglang_backend
 from quail.baselines.vllm import stock_vllm_backend
 from quail.builtins import built_in_registry
 from quail.physical import decode_graph
@@ -42,11 +40,9 @@ def _filter_query(session):
 def test_request_backends_plan_validate_and_execute(monkeypatch):
     registry = built_in_registry()
     assert set(registry.backends) == {
-        "quail", "stock_vllm", "pipelined_vllm", "shuffled_vllm", "dumb_vllm",
-        "pipelined_sglang",
-    }
+        "quail", "stock_vllm", "pipelined_vllm", "shuffled_vllm", "dumb_vllm"}
 
-    for backend_name in ("stock_vllm", "pipelined_vllm", "pipelined_sglang"):
+    for backend_name in ("stock_vllm", "pipelined_vllm"):
         session = _session(backend_name, documents=DOCS)
         plan = _filter_query(session).plan()
         request_node = next(
@@ -59,10 +55,9 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
         assert decoded.node("request-model") == request_node
         session.close()
 
-    for backend in (stock_vllm_backend(), pipelined_sglang_backend()):
-        support = backend.supports(QWEN3_4B_FP8, H100_SXM, 2)
-        assert not support.supported
-        assert "one model copy on one GPU" in support.reason
+    support = stock_vllm_backend().supports(QWEN3_4B_FP8, H100_SXM, 2)
+    assert not support.supported
+    assert "one model copy on one GPU" in support.reason
 
     boot = {"client": _Client(), "sampling_params": object(), "capacity": CAPACITY}
     monkeypatch.setattr(
@@ -113,53 +108,6 @@ class _JoinedClient(_Client):
             output.outputs[0].text = " a" if 20 in output.prompt_token_ids else " b"
             output.outputs[0].token_ids = [1, 2]
         return outputs
-
-
-def test_sglang_submission_and_cancellation():
-    class Engine:
-        def __init__(self):
-            self.calls = []
-
-        def generate(self, *, input_ids, sampling_params):
-            self.calls.append(input_ids)
-            return [
-                {"output_ids": [prompt[0] % 2], "meta_info": {"cached_tokens": 1}}
-                for prompt in input_ids
-            ]
-
-    engine = Engine()
-    client = SGLangClient(engine, {})
-    prompts = [{"prompt_token_ids": [index, 9]} for index in range(17_000)]
-    result = client.generate(prompts, {})
-    assert engine.calls == [[prompt["prompt_token_ids"] for prompt in prompts]]
-    assert [output.outputs[0].token_ids[0] for output in result] == [
-        index % 2 for index in range(17_000)]
-    assert all(output.num_cached_tokens == 1 for output in result)
-    assert client.generate([], {}) == []
-    assert len(engine.calls) == 1
-
-    async def run():
-        started = asyncio.Event()
-        submitted = []
-        aborted = []
-
-        async def generate(**kwargs):
-            submitted.append(kwargs["rid"])
-            started.set()
-            await asyncio.Event().wait()
-
-        engine = SimpleNamespace(
-            async_generate=generate,
-            tokenizer_manager=SimpleNamespace(abort_request=aborted.append),
-        )
-        task = asyncio.create_task(SGLangClient(engine, {})._generate_one([1, 2], {}))
-        await started.wait()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        assert aborted == submitted
-        assert len(aborted) == 1
-
-    asyncio.run(run())
 
 
 class _Adapter:

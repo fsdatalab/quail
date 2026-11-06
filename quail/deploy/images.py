@@ -140,15 +140,6 @@ def pypi_gpu_image(*local_dirs: tuple[str, str]) -> modal.Image:
     return image
 
 
-def sglang_image() -> modal.Image:
-    """The GPU image with SGLang's serving stack in place of vLLM."""
-    image = (_cuda_base()
-             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-                      extra_options="--no-install-package vllm")
-             .uv_pip_install("sglang==0.5.18"))
-    return _with_sources(image)
-
-
 def cpu_image() -> modal.Image:
     """The CPU image: the locked dependencies without the GPU stack."""
     image = (modal.Image.debian_slim(python_version="3.12")
