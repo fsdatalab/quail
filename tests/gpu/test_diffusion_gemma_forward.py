@@ -66,7 +66,7 @@ def _device():
 
 
 def _prompt_ids():
-    from quail.common.prompts import bind_prompt
+    from quail.api.prompts import bind_prompt
     from quail.common.tokens import Tokenizer
     from quail.physical.lowering import (
         lower_prompt,

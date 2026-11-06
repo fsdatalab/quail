@@ -101,7 +101,7 @@ def _tokenizer():
 
 def _prompts():
     """Per question, the lowered prompt and the text and ids of each review."""
-    from quail.common.prompts import bind_prompt
+    from quail.api.prompts import bind_prompt
     from quail.physical.lowering import (
         lower_prompt,
         render_filter_prompt_ids,
@@ -241,8 +241,8 @@ def _ends(head, tail, documents):
 
 def _yes_no_questions(templates):
     """AI filter templates as the SetQuestions of one pass group."""
+    from quail.api.prompts import bind_prompt
     from quail.backends.quail.executor.pass_groups import SetQuestion
-    from quail.common.prompts import bind_prompt
     from quail.physical.lowering import lower_prompt, set_question_parts
 
     spec, ids = _spec(), _tokenizer()
@@ -305,11 +305,11 @@ def _join_passes():
     """
     from types import SimpleNamespace
 
+    from quail.api.prompts import bind_join_prompt
     from quail.backends.quail.executor.operators.join import join_pass_stage
     from quail.backends.quail.executor.stages import question_ends
     from quail.backends.quail.lowering import set_join_parts
     from quail.common.expressions import ColumnRef
-    from quail.common.prompts import bind_join_prompt
     from quail.physical.lowering import lower_prompt
 
     spec, ids = _spec(), _tokenizer()
@@ -510,9 +510,9 @@ def quail_joins(join_passes, answer_ids, loaded):
 
 def _choice_questions():
     """The CHOICES as SetQuestions, and each one's lone prompt."""
+    from quail.api.prompts import bind_classify_prompt
     from quail.backends.quail.executor.pass_groups import SetQuestion
     from quail.common.expressions import ColumnRef
-    from quail.common.prompts import bind_classify_prompt
     from quail.physical.lowering import lower_prompt, option_spellings
 
     spec, ids = _spec(), _tokenizer()
@@ -533,9 +533,10 @@ def _choice_questions():
 
 def _read_questions():
     """The READS as SetQuestions."""
+    from quail.api.prompts import bind_extract_prompt
     from quail.backends.quail.executor.pass_groups import SetQuestion
     from quail.common.expressions import ColumnRef
-    from quail.common.prompts import PROMPT_LAYOUTS, bind_extract_prompt
+    from quail.common.prompts import PROMPT_LAYOUTS
     from quail.physical.lowering import lower_prompt, read_slot_offsets
 
     spec, ids = _spec(), _tokenizer()

@@ -27,9 +27,9 @@ import quail
 import quail_b as benchmark
 from bench import substrait
 from bench.results import write_json
+from quail.api.prompts import bind_classify_prompt, bind_extract_prompt
 from quail.baselines.nodes import RequestExecution
 from quail.common.expressions import SPAN_SUFFIX, Prompt
-from quail.common.prompts import bind_classify_prompt, bind_extract_prompt
 from quail.execution.result import answer_values
 from quail.physical import AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore
 from quail.physical.codec import decode_value

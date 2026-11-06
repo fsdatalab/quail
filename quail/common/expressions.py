@@ -20,7 +20,6 @@ from quail.common.predicates import (
 )
 
 DESCRIPTION_WORDS = 25
-TASK_DESCRIPTION_WORDS = 50
 # the functions a ScalarFunction may compute, by name
 # the SQL names of the scalar functions whose Arrow compute function has
 # another name; every other scalar function of Arrow compute is called by
@@ -155,21 +154,6 @@ class ScalarFunction:
         return column_name(self)
 
 
-def column_expression(reference: ColumnRef, path: tuple = (),
-                      function: Optional[str] = None, name: Optional[str] = None):
-    """Build the expression tree a front end writes as fields, a function, and a name.
-
-    For example, ``col("r.details").field("body").length().named("n")``
-    becomes ``Alias(ScalarFunction("length", (GetField(ref, "body"),)), "n")``.
-    """
-    expression = reference
-    for field in path:
-        expression = GetField(expression, field)
-    if function is not None:
-        expression = ScalarFunction(function, (expression,))
-    return expression if name is None else Alias(expression, name)
-
-
 def evaluate_expression(expression, columns, *, qualified: bool = False):
     """Evaluate a value expression over the columns of one table.
 
@@ -293,8 +277,6 @@ def aliased_call(expression, *kinds):
     return call if not kinds or call.kind in kinds else None
 
 
-
-
 @dataclass(frozen=True)
 class Prompt:
     """The text of one model call, laid out for a model's prompt format.
@@ -358,8 +340,6 @@ SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 
 MODEL_CALL_KINDS = ("boolean", "score", "label", "extract", "features", "map")
-# the answer limit of an AI.MAP call written without one
-DEFAULT_MAP_ANSWER_TOKENS = 256
 # the token poolings of an AI.SAE_FEATURES call
 SAE_POOLINGS = ("last", "max")
 
@@ -553,19 +533,6 @@ def validate_labels(labels: tuple, descriptions: tuple = ()) -> None:
                 f"an AI.CLASSIFY description has at most {DESCRIPTION_WORDS} "
                 f"words, got {len(description.split())}"
             )
-
-
-def validate_task_description(text: str) -> None:
-    """Check an AI.CLASSIFY task description's length.
-
-    Raises:
-        CompileError: More than TASK_DESCRIPTION_WORDS words.
-    """
-    if len(text.split()) > TASK_DESCRIPTION_WORDS:
-        raise CompileError(
-            f"an AI.CLASSIFY task description has at most "
-            f"{TASK_DESCRIPTION_WORDS} words, got {len(text.split())}"
-        )
 
 
 def literal_value(value):
@@ -902,11 +869,6 @@ def condition_columns(condition) -> tuple[str, ...]:
         for reference in column_references(test.expression)))
 
 
-def conjuncts(condition) -> tuple:
-    """Return the conditions an AND combines, or the condition alone."""
-    return condition.operands if isinstance(condition, And) else (condition,)
-
-
 @dataclass(frozen=True)
 class Alias:
     """An expression returned under a name: a model call or a value expression."""
@@ -937,61 +899,6 @@ def model_call(expression) -> ModelCall:
             expression.expression, ModelCall):
         return expression.expression
     raise TypeError(f"{type(expression).__name__} holds no model call")
-
-
-def is_score(expression) -> bool:
-    """Return whether the expression computes an AI.SCORE value."""
-    return model_call(expression).kind == "score"
-
-
-def has_score(plan) -> bool:
-    """Return whether a logical plan computes an AI.SCORE value anywhere."""
-    operators = plan.operators()
-    return (
-        any(
-            is_score(predicate.expression)
-            for predicates in operators.filters.values()
-            for predicate in predicates
-        )
-        or any(is_score(join.predicate) for join in operators.joins)
-        or any(
-            aliased_call(expression, "score") is not None
-            for expression in operators.projections
-        )
-    )
-
-
-def validate_predicate(expression) -> None:
-    """Check that an expression asks the model yes or no for every row."""
-    if isinstance(expression, RegularPredicate) and isinstance(
-            expression.expression, ModelCall):
-        expression.validate()
-        return
-    if isinstance(expression, ModelCall):
-        expression.validate()
-        if expression.kind == "score":
-            raise CompileError(
-                "an AI.SCORE call is a predicate only when compared with a threshold"
-            )
-        if expression.kind == "label":
-            raise CompileError(
-                "an AI.CLASSIFY label is tested by a Filter on its "
-                "column, not by a SemanticFilter"
-            )
-        if expression.kind == "extract":
-            raise CompileError(
-                "an AI.EXTRACT answer is a result column, not a predicate"
-            )
-        if expression.kind in ("features", "map"):
-            function = "AI.SAE_FEATURES" if expression.kind == "features" else "AI.MAP"
-            raise CompileError(
-                f"an {function} answer is a result column, not a predicate"
-            )
-        return
-    raise CompileError(
-        f"a predicate is a model call or a comparison of an AI.SCORE call, "
-        f"got {expression}"
-    )
 
 
 @dataclass(frozen=True)

@@ -2,8 +2,7 @@
 
 import pytest
 
-from quail.common.expressions import ColumnRef, CompileError, GetField
-from quail.common.prompts import (
+from quail.api.prompts import (
     bind_classify_prompt,
     bind_extract_prompt,
     bind_join_prompt,
@@ -12,6 +11,7 @@ from quail.common.prompts import (
     bind_sae_features_prompt,
     bind_score_prompt,
 )
+from quail.common.expressions import ColumnRef, CompileError, GetField
 from quail.specs import MODELS
 
 REVIEW = ColumnRef("r", "reviews", "body")
@@ -56,8 +56,9 @@ def _bind(model, kind, template, args, *, labels=(), descriptions=(),
     if kind == "label":
         return bind_classify_prompt(template, args, labels, descriptions, turn,
                                     task_description=task_description, layout=layout)
-    binder = {"filter": bind_prompt, "join": bind_join_prompt,
-              "score": bind_score_prompt}[kind]
+    if kind == "score":
+        return bind_score_prompt(template, args)
+    binder = {"filter": bind_prompt, "join": bind_join_prompt}[kind]
     return binder(template, args, turn=turn, layout=layout)
 
 

@@ -12,7 +12,7 @@ from helpers.sessions import TOKENIZER, encoder
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.common.prompts import Prompt
+from quail.common.expressions import Prompt
 from quail.physical.codec import decode_value
 from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_USD_PER_HOUR
 

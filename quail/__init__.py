@@ -3,16 +3,11 @@
 from quail.api import Query, RefusalError, Session, SessionContext
 from quail.api.compile import SQLDialect
 from quail.api.config import EngineConfig
+from quail.api.prompts import bind_join_prompt, bind_prompt
 from quail.api.sol import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
 from quail.common.expressions import ColumnRef
-from quail.common.prompts import (
-    SHARED_PRE,
-    bind_join_prompt,
-    bind_prompt,
-    render_join_prompt_text,
-    true_false_ids,
-)
+from quail.common.prompts import SHARED_PRE, true_false_ids
 from quail.execution.result import QueryResult
 from quail.extensions import ExtensionRegistry
 from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
@@ -44,7 +39,6 @@ __all__ = [
     "bind_join_prompt",
     "bind_prompt",
     "lower_prompt",
-    "render_join_prompt_text",
     "speed_of_light_estimate",
     "true_false_ids",
 ]
