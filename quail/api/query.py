@@ -599,7 +599,11 @@ class Query:
                 ),
             )
         envelope = plan.to_envelope(self.session.registry.codecs)
-        return PhysicalRequest(envelope, inputs, self._column_tables())
+        source_rows = {scan.alias: self.source_rows[scan.provider]
+                       for scan in self.logical.operators().scans
+                       if scan.provider in self.source_rows}
+        return PhysicalRequest(envelope, inputs, self._column_tables(),
+                               source_rows)
 
     def _column_tables(self) -> dict:
         """One value table per alias whose columns the executor reads.

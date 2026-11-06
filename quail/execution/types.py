@@ -53,11 +53,15 @@ class PhysicalRequest:
 
     relations holds one value table per alias a HashJoin or an apply()
     function reads, keyed ``columns:<alias>``; see quail.common.pairs.
+    source_rows holds, by alias, the row in the registered table of each
+    document of a scan that reads some of the table's rows, found by the
+    table's id column.
     """
 
     plan: Mapping[str, Any]
     inputs: Mapping[str, TokenizedInput]
     relations: Mapping[str, pa.Table] = field(default_factory=dict)
+    source_rows: Mapping[str, pa.Array] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for input_id, value in self.inputs.items():

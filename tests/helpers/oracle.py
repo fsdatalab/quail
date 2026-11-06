@@ -22,7 +22,6 @@ from quail.backends.quail.reranker import (
     RerankerModelExecution,
     score_rows,
 )
-from quail.catalog import ScanRequest
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import true_answer_rows
 from quail.execution.rows import Rows, extraction_rows
@@ -99,9 +98,8 @@ class Oracle:
         self.arena = None
         self.texts = {}
         self.documents = {}
-        # the session's tables, to answer a filtered input's rows by their
-        # position in the registered table, which the planted truth uses
-        self.catalog = None
+        # by alias, each document's row in the registered table, which the
+        # planted truth uses, for an input that holds some of a table's rows
         self.source_rows = {}
         self.calls = []       # (spec name, rows) of every score or label call
         if pipelines:
@@ -115,36 +113,6 @@ class Oracle:
     def _sources(self, aliases, ids) -> tuple:
         return tuple(self._source(alias, document)
                      for alias, document in zip(aliases, ids))
-
-    def map_source_rows(self) -> None:
-        """Find each input's rows in the registered tables by their text.
-
-        An input DataFusion filtered holds some of a table's rows; each
-        is answered as the table's row with the same document text.
-        """
-        self.source_rows = {}
-        if self.catalog is None:
-            return
-        columns = []
-        for provider in self.catalog.providers.values():
-            request = ScanRequest(columns=tuple(provider.columns))
-            table = provider.scan(request).read_all()
-            columns.extend(table.column(name).to_pylist() for name in table.column_names
-                           if pa.types.is_string(table.schema.field(name).type)
-                           or pa.types.is_large_string(table.schema.field(name).type))
-        for alias, documents in self.documents.items():
-            texts = self.texts.get(alias)
-            texts = ([question_text(tokens) for tokens in documents] if texts is None
-                     else [None if text is None else str(text) for text in texts])
-            if any(values == texts for values in columns):
-                continue
-            for values in columns:
-                where = {}
-                for row, value in enumerate(values):
-                    where.setdefault(value, row)
-                if texts and all(text in where for text in texts):
-                    self.source_rows[alias] = [where[text] for text in texts]
-                    break
 
     # ---- the executor's model execution interface ----------------
 
@@ -398,7 +366,8 @@ def oracle_executor(oracle: Oracle, **report):
                             for node in scans}
         oracle.texts = {node.alias: request.inputs[node.input_id].texts
                         for node in scans}
-        oracle.map_source_rows()
+        oracle.source_rows = {alias: rows.to_pylist()
+                              for alias, rows in request.source_rows.items()}
         state = graph_state(oracle, oracle.documents)
         state["texts"] = oracle.texts
         oracle.arena = state["gpu"].arena
@@ -419,5 +388,4 @@ def finish(query, oracle: Oracle, **report):
     """Run a query to its result on the oracle."""
     from quail.api.execute import execute_query
 
-    oracle.catalog = query.session.catalog
     return execute_query(query, physical_executor=oracle_executor(oracle, **report))

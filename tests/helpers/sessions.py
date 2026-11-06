@@ -29,9 +29,6 @@ def encoder():
 def _run(query, execute):
     from quail.api.execute import execute_query
 
-    oracle = getattr(execute, "oracle", None)
-    if oracle is not None:
-        oracle.catalog = query.session.catalog
     return execute_query(query, physical_executor=execute)
 
 
