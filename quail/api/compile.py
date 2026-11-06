@@ -77,8 +77,7 @@ def _message(error: Exception, sql: str) -> str:
             shown = f"{call[1]} % {call[2]}" if call else "MOD"
             return (f"{shown}: Arrow compute has no remainder or integer "
                     f"division function")
-        return (f"unknown function {name!r}; a scalar function of Arrow compute "
-                f"is called by its name, such as abs or utf8_reverse")
+        return f"unknown function {name!r}"
     if found := re.search(r'column "([^"]+)" must appear in the GROUP BY clause', text):
         return f"{found[1]} is in SELECT but not in GROUP BY and not aggregated"
     non_boolean = r"Cannot create filter with non-boolean predicate '(.*)' returning"

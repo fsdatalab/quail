@@ -151,10 +151,10 @@ def test_an_or_over_two_tables_runs_on_the_result_rows(session):
     assert result.collect().column_names == ["r.id", "p.asin"]
 
 
-def test_any_arrow_scalar_function_runs_in_where_and_select(session):
+def test_datafusion_functions_run_in_where_and_select(session):
     # q1 keeps r0, r1, r3, and r4; their stars are 5, 2, None, and 3
     query = session.sql("""
-        SELECT r.id, UTF8_REVERSE(UPPER(r.lang)) AS backwards,
+        SELECT r.id, REVERSE(UPPER(r.lang)) AS backwards,
                ABS(r.stars - 4) AS gap
         FROM reviews r
         WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND ABS(r.stars - 4) <= 1
@@ -169,7 +169,7 @@ def test_any_arrow_scalar_function_runs_in_where_and_select(session):
                     "AND AI_FILTER(PROMPT('q1: {0}', r.review))")
 
 
-def test_where_takes_the_same_arrow_expressions_as_select(session):
+def test_where_takes_the_same_expressions_as_select(session):
     session.register("pairs", quail.DocumentProvider.from_table(pa.table({
         "id": [f"r{i}" for i in range(6)],
         "review": [f"review {i} " + "pad " * 20 for i in range(6)],
@@ -180,9 +180,9 @@ def test_where_takes_the_same_arrow_expressions_as_select(session):
     # q1 keeps r0, r1, r3, and r4
     first = "SELECT r.id FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
     cases = {
-        # a boolean function on its own, as SELECT returns it
-        "UTF8_IS_UPPER(r.lang)": ["r0", "r3"],
-        "NOT UTF8_IS_UPPER(r.lang)": ["r1", "r4"],
+        # a test of a function's value
+        "UPPER(r.lang) = r.lang": ["r0", "r3"],
+        "NOT (UPPER(r.lang) = r.lang)": ["r1", "r4"],
         # two columns of one table; r3's null stars is rejected
         "r.stars > r.floor": ["r0", "r4"],
         "r.stars - r.floor >= 1 OR r.lang = 'en'": ["r0", "r1", "r4"],
@@ -191,9 +191,8 @@ def test_where_takes_the_same_arrow_expressions_as_select(session):
     for test, kept in cases.items():
         query = session.sql(f"{first} AND ({test}) ORDER BY r.id")
         scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
-        # an Arrow function only Quail evaluates tests at Quail's scan;
-        # DataFusion runs every other test before the region
-        assert bool(scan.predicates) == ("UTF8_IS_UPPER" in test), test
+        # DataFusion runs every plain test before the region
+        assert scan.predicates == (), test
         assert [row[0] for row in _run(query, make_executor(TRUTH)).to_rows()] == (
             kept), test
     # SELECT returns the same comparison

@@ -50,9 +50,7 @@ pub use claim::ClaimModelRegions;
 pub use distinct::{EliminateDistinct, PushDownDistinct};
 pub use exec::{InputRows, ModelRegionExec, ModelRegionPlanner, RegionBatches, RegionRunner};
 pub use extension::QuailExtension;
-pub use functions::{
-    AI_FUNCTION_NAMES, arrow_functions, brace_structs, is_ai_call, quail_functions,
-};
+pub use functions::{AI_FUNCTION_NAMES, brace_structs, is_ai_call, quail_functions};
 pub use lower::{LowerAiCalls, lower_ai_calls};
 pub use optimize::{OptimizeModelRegions, REGION_RULES, optimize_region, region_rule};
 pub use placement::PlaceSemanticNodes;
@@ -98,14 +96,7 @@ pub fn session_context_with_rules(
     runner: Arc<dyn RegionRunner>,
     regions: OptimizeModelRegions,
 ) -> SessionContext {
-    let context = SessionContext::new_with_state(session_state_with_rules(runner, regions));
-    // Quail's own sessions also call Arrow compute functions by name
-    let state = context.state();
-    let taken = |name: &str| state.scalar_functions().contains_key(name);
-    for function in arrow_functions(&taken) {
-        context.register_udf(function.as_ref().clone());
-    }
-    context
+    SessionContext::new_with_state(session_state_with_rules(runner, regions))
 }
 
 /// Plan a SQL query that may call AI functions as `AI.<name>(...)`.

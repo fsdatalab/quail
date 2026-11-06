@@ -584,11 +584,7 @@ pub fn check_arrow_function(name: &str) -> Result<(), CompileError> {
         .unwrap_or(name);
     let Some((_, kind, attribute)) = ARROW_FUNCTIONS.iter().find(|(found, _, _)| *found == arrow)
     else {
-        return compile_error(format!(
-            "unknown function {}; a scalar function of Arrow compute is called by its \
-             name, such as abs or utf8_reverse",
-            repr_str(name)
-        ));
+        return compile_error(format!("unknown function {}", repr_str(name)));
     };
     if !["scalar", "meta"].contains(kind) || !attribute || (*kind == "meta" && arrow != "cast") {
         return compile_error(format!(

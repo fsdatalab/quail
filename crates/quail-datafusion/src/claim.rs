@@ -14,7 +14,7 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::AnalyzerRule;
 
 use crate::bind::UNSUPPORTED;
-use crate::functions::{is_ai_call, is_arrow_call};
+use crate::functions::is_ai_call;
 use crate::region::ModelRegion;
 use crate::table::RunnerTable;
 
@@ -677,7 +677,7 @@ fn push_plain_terms(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// model, has a subquery, or reads several tables or none.
 fn plain_table(term: &Expr) -> Option<TableReference> {
     let special = term
-        .exists(|inner| Ok(is_ai_call(inner) || is_arrow_call(inner) || is_subquery_expr(inner)))
+        .exists(|inner| Ok(is_ai_call(inner) || is_subquery_expr(inner)))
         .unwrap_or(true);
     if special {
         return None;

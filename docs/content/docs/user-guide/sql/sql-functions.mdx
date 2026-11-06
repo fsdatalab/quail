@@ -130,7 +130,7 @@ which rows to join. Both support the following conditions on table columns:
 | Keep null values | `IS NULL` |
 | Keep non-null values | `IS NOT NULL` |
 | Compare two columns of a table | `r.stars > r.min_stars` |
-| Keep rows where a boolean is true | `r.verified`, `UTF8_IS_UPPER(r.lang)` |
+| Keep rows where a boolean is true | `r.verified`, `STARTS_WITH(r.lang, 'en')` |
 
 Values can be numbers, strings, or booleans. Either side of a comparison
 can be an [expression](#column-expressions), such as
@@ -228,9 +228,8 @@ ORDER BY body_length;
   text, such as `length(p.details.body)`.
 - Functions can nest and take literals in every clause, such as
   `LOWER(TRIM(p.details.body))` or `ABS(r.stars - 3)`.
-- An expression can call any scalar function of Arrow compute, and the
-  common SQL functions keep their SQL meaning; see
-  [Arrow compute functions](#arrow-compute-functions).
+- An expression can call any of DataFusion's scalar functions; see
+  [Scalar functions](#scalar-functions).
 
 For example, the function entries below use a review row where `r.body`
 is `' Great Film '`, including the spaces at both ends.
@@ -259,26 +258,15 @@ Removes whitespace at both ends of the text.
 
 `TRIM(r.body)` returns `'Great Film'`.
 
-### Arrow compute functions
+### Scalar functions
 
-An expression can call any scalar function of
-[Arrow compute](https://arrow.apache.org/docs/python/api/compute.html) by its
-name, such as `UTF8_REVERSE`, `ABS`, or `UTF8_SLICE_CODEUNITS`.
-`+`, `-`, and `*` call `add`, `subtract`, and `multiply`; `/` divides
-integers exactly, as SQL does.
-
-The common SQL functions keep their SQL meaning in both dialects:
-`SUBSTRING` and `STRPOS` count from 1, `ROUND` rounds half away from zero,
-`GREATEST`, `LEAST`, and `IN` return NULL for a NULL input, and `CASE`,
-`IF`/`IFF`, `CAST`, `CONCAT`/`||`, `COALESCE`, `NULLIF`, `LOG`/`LOG10`,
-`LEFT`, `RIGHT`, `TRIM`/`LTRIM`/`RTRIM`, `LPAD`/`RPAD`, `REPLACE`,
-`EXTRACT`, `DATE_TRUNC`, `LIKE`, `BETWEEN`, `IS NULL`, `AND`, `OR`, and `NOT`
-work as written. `MOD`, `%`, and `TRY_CAST`/`SAFE_CAST` have no Arrow
-function and are refused.
-A literal after the first argument fills the function's option in that
-position, as in Python: `ROUND(r.score, 2)` rounds to two digits.
-`WHERE` takes the same expressions as `SELECT`: a function that returns a
-boolean, such as `STARTS_WITH(r.body, 'Great')`, is a condition by itself.
+An expression can call any of
+[DataFusion's scalar functions](https://datafusion.apache.org/user-guide/sql/scalar_functions.html),
+such as `ABS`, `REVERSE`, `SUBSTR`, or `REGEXP_LIKE`, with their SQL
+meaning. DataFusion evaluates them: a plain test or column runs before the
+model reads a row. `WHERE` takes the same expressions as `SELECT`: a
+function that returns a boolean, such as `STARTS_WITH(r.body, 'Great')`,
+is a condition by itself.
 
 For example, return the reviews whose star rating is within one of 4:
 
