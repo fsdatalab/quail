@@ -217,6 +217,14 @@ pub fn quail_functions() -> Vec<Arc<ScalarUDF>> {
 /// A scalar function of Arrow compute that DataFusion does not have,
 /// such as `utf8_is_upper`.
 ///
+/// Whether an expression calls one of Quail's functions: an AI
+/// function, `PROMPT`, `HINT`, or an `UNNEST` marker, which only a model
+/// region runs.
+pub fn is_quail_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::ScalarFunction(call)
+        if call.func.inner().downcast_ref::<QuailFunction>().is_some())
+}
+
 /// Whether an expression is a call to an AI function.
 pub fn is_ai_call(expr: &Expr) -> bool {
     matches!(expr, Expr::ScalarFunction(call) if AI_FUNCTION_NAMES.contains(&call.name()))

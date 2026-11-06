@@ -287,3 +287,27 @@ async fn a_plain_filter_runs_in_datafusion_as_the_regions_input() -> Result<()> 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_plain_expression_in_select_runs_in_datafusion_as_an_input_column() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT r.id, UPPER(r.body) AS loud FROM reviews r \
+        WHERE AI.IF(PROMPT('Is {0} kind?', r.body))";
+    let [region] =
+        <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
+    // the region reads the computed column; DataFusion computes it
+    assert!(
+        !lines(&region.plan)
+            .iter()
+            .any(|line| line.contains("upper(")),
+        "{:?}",
+        lines(&region.plan)
+    );
+    let [input] = <[LogicalPlan; 1]>::try_from(region.inputs.clone()).unwrap();
+    assert!(
+        lines(&input).iter().any(|line| line.contains("upper(")),
+        "{:?}",
+        lines(&input)
+    );
+    Ok(())
+}

@@ -75,8 +75,7 @@ def _message(error: Exception, sql: str) -> str:
             call = re.search(r"\bMOD\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)", sql,
                              re.IGNORECASE)
             shown = f"{call[1]} % {call[2]}" if call else "MOD"
-            return (f"{shown}: Arrow compute has no remainder or integer "
-                    f"division function")
+            return f"MOD is not a DataFusion function; write {shown}"
         return f"unknown function {name!r}"
     if found := re.search(r'column "([^"]+)" must appear in the GROUP BY clause', text):
         return f"{found[1]} is in SELECT but not in GROUP BY and not aggregated"

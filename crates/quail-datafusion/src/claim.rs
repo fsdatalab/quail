@@ -14,7 +14,7 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::AnalyzerRule;
 
 use crate::bind::UNSUPPORTED;
-use crate::functions::is_ai_call;
+use crate::functions::{is_ai_call, is_quail_call};
 use crate::region::ModelRegion;
 use crate::table::RunnerTable;
 
@@ -341,7 +341,7 @@ impl Extracted {
         }
         if quail_plans(&plan)? {
             let selected = select_list(plan.clone(), needed.clone())?;
-            let pushed = push_plain_terms(selected)?;
+            let pushed = precompute_plain_expressions(push_plain_terms(selected)?)?;
             let (bound, inputs) = split_inputs(pushed)?;
             match binder_refusal(&bound) {
                 None => {
@@ -673,11 +673,180 @@ fn push_plain_terms(plan: LogicalPlan) -> Result<LogicalPlan> {
     .map(|pushed| pushed.data)
 }
 
+/// Compute each plain expression of a region that reads one table as a
+/// column of that table's input, so DataFusion evaluates it.
+///
+/// A plain expression is not a column, calls no model, aggregate,
+/// window, or subquery, and reads columns of one table alias whose part
+/// of the plan calls no model. The alias's part gains a projection with
+/// the expression as `__quail_expr_<n>`, and the region reads that
+/// column; a SELECT item keeps its name.
+fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let mut tables: Vec<TableReference> = Vec::new();
+    plan.apply(|node| {
+        if let LogicalPlan::SubqueryAlias(alias) = node
+            && !calls_ai(node)?
+            && single_scan(node).is_some()
+        {
+            tables.push(alias.alias.clone());
+            return Ok(TreeNodeRecursion::Jump);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if tables.is_empty() {
+        return Ok(plan);
+    }
+    // (table, expression, column name), in the order first seen
+    let mut computed: Vec<(TableReference, Expr, String)> = Vec::new();
+    let mut find = |expr: &Expr| {
+        let _ = expr.apply(|inner| {
+            let Some(table) = plain_table(inner) else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            // a struct field is a column path the region reads as it is
+            let field = matches!(inner, Expr::ScalarFunction(call) if call.name() == "get_field");
+            if matches!(inner, Expr::Column(_) | Expr::Literal(..) | Expr::Alias(_))
+                || field
+                || !tables.contains(&table)
+                || inner.exists(|found| {
+                    Ok(matches!(
+                        found,
+                        Expr::AggregateFunction(_) | Expr::WindowFunction(_)
+                    ))
+                })?
+            {
+                return Ok(TreeNodeRecursion::Continue);
+            }
+            if !computed.iter().any(|(_, found, _)| found == inner) {
+                let name = format!("__quail_expr_{}", computed.len());
+                computed.push((table, inner.clone(), name));
+            }
+            Ok(TreeNodeRecursion::Jump)
+        });
+    };
+    plan.apply(|node| {
+        if let LogicalPlan::SubqueryAlias(alias) = node
+            && tables.contains(&alias.alias)
+        {
+            return Ok(TreeNodeRecursion::Jump);
+        }
+        for expr in node.expressions() {
+            if let LogicalPlan::Filter(_) = node {
+                // a whole plain term is the input's filter; only a model
+                // call's arguments are computed
+                for term in split_conjunction(&expr) {
+                    if plain_table(term).is_none() {
+                        find(term);
+                    }
+                }
+            } else {
+                find(&expr);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if computed.is_empty() {
+        return Ok(plan);
+    }
+    let replace_inner = |expr: Expr| -> Result<Transformed<Expr>> {
+        expr.transform_down(
+            |inner| match computed.iter().find(|(_, found, _)| *found == inner) {
+                Some((table, _, name)) => Ok(Transformed::new(
+                    Expr::Column(Column::new(Some(table.clone()), name)),
+                    true,
+                    TreeNodeRecursion::Jump,
+                )),
+                None => Ok(Transformed::no(inner)),
+            },
+        )
+    };
+    // a filter's whole plain terms stay as written; they are the input's
+    let replace = |expr: Expr, filter: bool| -> Result<Transformed<Expr>> {
+        if !filter {
+            return replace_inner(expr);
+        }
+        let mut changed = false;
+        let terms = split_conjunction(&expr)
+            .into_iter()
+            .cloned()
+            .map(|term| {
+                if plain_table(&term).is_some() {
+                    return Ok(term);
+                }
+                let found = replace_inner(term)?;
+                changed |= found.transformed;
+                Ok(found.data)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let joined = conjunction(terms).expect("a term");
+        Ok(if changed {
+            Transformed::yes(joined)
+        } else {
+            Transformed::no(expr)
+        })
+    };
+    plan.transform_up(|node| {
+        if let LogicalPlan::SubqueryAlias(alias) = &node
+            && tables.contains(&alias.alias)
+        {
+            let added: Vec<Expr> = computed
+                .iter()
+                .filter(|(table, _, _)| *table == alias.alias)
+                .map(|(_, expr, name)| expr.clone().alias(name))
+                .collect();
+            if added.is_empty() {
+                return Ok(Transformed::no(node));
+            }
+            let table = alias.alias.clone();
+            let mut exprs: Vec<Expr> = node
+                .schema()
+                .columns()
+                .into_iter()
+                .map(Expr::Column)
+                .collect();
+            exprs.extend(added);
+            let projected = LogicalPlanBuilder::from(node)
+                .project(exprs)?
+                .alias(table)?
+                .build()?;
+            return Ok(Transformed::yes(projected));
+        }
+        let is_projection = matches!(node, LogicalPlan::Projection(_));
+        let is_filter = matches!(node, LogicalPlan::Filter(_));
+        let mut changed = false;
+        let exprs = node
+            .expressions()
+            .into_iter()
+            .map(|expr| {
+                let name = expr.schema_name().to_string();
+                let found = replace(expr, is_filter)?;
+                changed |= found.transformed;
+                // a SELECT item keeps the name it had
+                Ok(
+                    if is_projection && found.transformed && !matches!(found.data, Expr::Alias(_)) {
+                        found.data.alias(name)
+                    } else {
+                        found.data
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inputs: Vec<LogicalPlan> = node.inputs().into_iter().cloned().collect();
+        let rebuilt = node.with_new_exprs(exprs, inputs)?;
+        Ok(Transformed::new(
+            rebuilt,
+            changed,
+            TreeNodeRecursion::Continue,
+        ))
+    })
+    .map(|done| done.data)
+}
+
 /// The one table a plain term reads, or None for a term that calls a
 /// model, has a subquery, or reads several tables or none.
 fn plain_table(term: &Expr) -> Option<TableReference> {
     let special = term
-        .exists(|inner| Ok(is_ai_call(inner) || is_subquery_expr(inner)))
+        .exists(|inner| Ok(is_quail_call(inner) || is_subquery_expr(inner)))
         .unwrap_or(true);
     if special {
         return None;

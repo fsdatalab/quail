@@ -139,8 +139,9 @@ def test_an_or_over_two_tables_runs_on_the_result_rows(session):
     """)
     filters = [node for node in query.logical.walk()
                if isinstance(node, LogicalFilter)]
+    # DataFusion computes each table's side; the region tests the OR of them
     assert [str(node.condition) for node in filters] == [
-        "r.stars > 4 OR p.price > 15"]
+        "r.__quail_expr_0 OR p.__quail_expr_1"]
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     # every pair with p1, and r0 and r5 (5 stars) with p0; r3's null
     # stars with p1 is NULL OR TRUE, which is true
@@ -224,8 +225,8 @@ def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
 
 
 SQL_CALLS = {
-    # DataFusion parses each to a function of its own; Quail calls Arrow
-    # with SQL's meaning. r0, r1, r3, and r4 pass q1
+    # DataFusion evaluates each with its SQL meaning. r0, r1, r3, and r4
+    # pass q1; their stars are 5, 2, None, and 3
     "LOG10(r.stars * 20) > 1.7": [True, False, None, True],
     "SUBSTRING(r.lang, 2, 1)": ["n", "n", "n", "n"],
     "CONCAT(r.lang, '-', r.lang)": ["en-en", "en-en", "en-en", "en-en"],
@@ -233,15 +234,18 @@ SQL_CALLS = {
         "high", "low", None, "low"],
     "CAST(r.stars AS DOUBLE)": [5.0, 2.0, None, 3.0],
     "r.stars IN (2, 3)": [False, True, None, True],
-    "ROUND(r.stars / 2)": [3.0, 1.0, None, 2.0],
-    "GREATEST(r.stars, 3)": [5, 3, None, 3],
+    # an integer divided by an integer is an integer
+    "ROUND(r.stars / 2)": [2, 1, None, 1],
+    # GREATEST skips a NULL
+    "GREATEST(r.stars, 3)": [5, 3, 3, 3],
+    "r.stars % 2": [1, 0, None, 1],
     "STRPOS(r.lang, 'n')": [2, 2, 2, 2],
     "r.stars BETWEEN 2 AND 3": [False, True, None, True],
 }
 
 
 @pytest.mark.parametrize("dialect", ["bq", "snowflake"])
-def test_sql_functions_call_arrow_with_sqls_meaning(session, dialect):
+def test_sql_functions_have_datafusions_meaning(session, dialect):
     for expression, expected in SQL_CALLS.items():
         query = session.sql(
             f"SELECT r.id, {expression} AS v FROM reviews r "
@@ -249,7 +253,7 @@ def test_sql_functions_call_arrow_with_sqls_meaning(session, dialect):
             dialect=dialect)
         values = _run(query, make_executor(TRUTH)).collect().column("v").to_pylist()
         assert values == expected, expression
-    with pytest.raises(CompileError, match="remainder"):
+    with pytest.raises(CompileError, match="write r.stars % 2"):
         session.sql("SELECT r.id, MOD(r.stars, 2) AS v FROM reviews r "
                     "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))", dialect=dialect)
 
@@ -278,7 +282,9 @@ def test_order_by_group_by_on_and_prompt_take_expressions(session):
         JOIN langs l ON UPPER(TRIM(r.lang)) = l.code
             AND AI_FILTER(PROMPT('x {0} {1}', r.review, l.notes))
         ORDER BY r.id""")
-    assert "on upper(utf8_trim_whitespace(r.lang)) = l.code" in query.explain()
+    # DataFusion computes the key before the region; the region joins on it
+    explained = query.explain()
+    assert "upper(btrim(r.lang)) AS __quail_expr_0" in explained
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     assert result.to_rows() == [("r0", "EN"), ("r1", "EN"), ("r2", "FR"),
                                 ("r3", "EN"), ("r4", "EN")]

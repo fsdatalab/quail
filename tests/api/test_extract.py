@@ -394,8 +394,9 @@ def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(sessio
     # an answer and a source column, or two extractions: after the last
     # extraction read, each other column read by document ID
     mixed = session.sql(head + "NOT (lease.ends IS NULL AND c.id = 2)")
+    # DataFusion computes the source column's test, c.id = 2
     assert placed(mixed) == [
-        ("SemanticExtract", "c.lease.ends IS NOT NULL OR NOT (c.id = 2)")]
+        ("SemanticExtract", "c.lease.ends IS NOT NULL OR NOT (c.__quail_expr_0)")]
     assert kept(mixed) == [1]
     fields = session.sql(head + "lease.ends = 'x' OR lease.rent IS NOT NULL")
     assert placed(fields) == [
