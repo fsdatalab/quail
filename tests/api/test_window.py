@@ -54,12 +54,13 @@ def test_windows_run_in_datafusion_on_the_model_regions_rows(session):
     assert "filter_limit" not in limited.plan().settings
     rows = _run(limited, oracle_executor(Oracle(filters=lambda *_: True)))
     assert rows.count() == 2
-    # a regular predicate on the partition column runs at the scan,
-    # below the model, so the window sees the survivors only
+    # a regular predicate on the partition column runs in DataFusion,
+    # before the model, so the window sees the survivors only
     filtered = session.sql(
         WINDOWS + "WHERE s.run_id = 'a' ORDER BY s.run_id, s.step_index")
     plan = filtered.plan()
-    assert [str(p) for p in plan.nodes[0].predicates] == ["s.run_id = 'a'"]
+    assert plan.nodes[0].predicates == ()
+    assert "run_id = Utf8(\"a\")" in filtered.explain()
     rows = _run(filtered, oracle_executor(Oracle(
         labels=lambda spec, ids: "good", probabilities=True)))
     assert rows.to_rows() == [("s1", "good", None, 1, None),

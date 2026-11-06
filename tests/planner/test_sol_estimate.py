@@ -317,6 +317,10 @@ def test_every_quail_b_query_gets_an_estimate_or_names_what_it_cannot_price():
             except NotImplementedError as error:
                 refused.add(str(error).split(";")[0])
                 continue
-            assert estimate.seconds > 0
+            # a table whose plain filters keep none of the stand-in rows
+            # leaves the model nothing to read
+            empty = any(len(store.lengths) == 0
+                        for store in query.token_inputs().values())
+            assert estimate.seconds > 0 or empty
             estimated += 1
     assert estimated >= 40, (estimated, sorted(refused))

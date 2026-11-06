@@ -22,6 +22,7 @@ from quail.backends.quail.reranker import (
     RerankerModelExecution,
     score_rows,
 )
+from quail.catalog import ScanRequest
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import true_answer_rows
 from quail.execution.rows import Rows, extraction_rows
@@ -98,9 +99,52 @@ class Oracle:
         self.arena = None
         self.texts = {}
         self.documents = {}
+        # the session's tables, to answer a filtered input's rows by their
+        # position in the registered table, which the planted truth uses
+        self.catalog = None
+        self.source_rows = {}
         self.calls = []       # (spec name, rows) of every score or label call
         if pipelines:
             self.execute_pipeline = self._execute_pipeline
+
+    def _source(self, alias, document) -> int:
+        """The registered table's row of an input's document position."""
+        rows = self.source_rows.get(alias)
+        return int(document) if rows is None else rows[int(document)]
+
+    def _sources(self, aliases, ids) -> tuple:
+        return tuple(self._source(alias, document)
+                     for alias, document in zip(aliases, ids))
+
+    def map_source_rows(self) -> None:
+        """Find each input's rows in the registered tables by their text.
+
+        An input DataFusion filtered holds some of a table's rows; each
+        is answered as the table's row with the same document text.
+        """
+        self.source_rows = {}
+        if self.catalog is None:
+            return
+        columns = []
+        for provider in self.catalog.providers.values():
+            request = ScanRequest(columns=tuple(provider.columns))
+            table = provider.scan(request).read_all()
+            columns.extend(table.column(name).to_pylist() for name in table.column_names
+                           if pa.types.is_string(table.schema.field(name).type)
+                           or pa.types.is_large_string(table.schema.field(name).type))
+        for alias, documents in self.documents.items():
+            texts = self.texts.get(alias)
+            texts = ([question_text(tokens) for tokens in documents] if texts is None
+                     else [None if text is None else str(text) for text in texts])
+            if any(values == texts for values in columns):
+                continue
+            for values in columns:
+                where = {}
+                for row, value in enumerate(values):
+                    where.setdefault(value, row)
+                if texts and all(text in where for text in texts):
+                    self.source_rows[alias] = [where[text] for text in texts]
+                    break
 
     # ---- the executor's model execution interface ----------------
 
@@ -182,7 +226,7 @@ class Oracle:
     def score(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
         rows = np.asarray(rows).reshape(-1, len(spec.aliases))
         self.calls.append((spec.name, rows.tolist()))
-        ids = [tuple(int(value) for value in row) for row in rows]
+        ids = [self._sources(spec.aliases, row) for row in rows]
         if isinstance(spec, ClassifySpec):
             values = np.asarray([self._label(spec, row) for row in ids], dtype=object)
             probabilities = None
@@ -226,6 +270,7 @@ class Oracle:
         return filter_result(node, answers, 10 * len(answers), document_ids)
 
     def _filter_answer(self, node, document) -> bool:
+        document = self._source(node.alias, document)
         if callable(self.filters):
             return bool(self.filters(node.alias, document, node.written_position))
         truth = self.filters[node.alias]
@@ -236,6 +281,8 @@ class Oracle:
         raise KeyError(f"no filter truth for {node.alias!r} matches {question[:40]!r}")
 
     def _join_answer(self, node, anchor_id, partner_ids) -> bool:
+        anchor_id, *partner_ids = self._sources(
+            (node.anchor, *node.partners), (anchor_id, *partner_ids))
         if callable(self.joins):
             assignment = dict(zip((node.anchor, *node.partners),
                                   (anchor_id, *partner_ids)))
@@ -281,7 +328,8 @@ class Oracle:
         spec = node.spec
         ids = [int(document) for document in inputs["document_ids"]]
         texts = self.texts.get(spec.alias)
-        found = [self._answer(spec, document) for document in ids]
+        found = [self._answer(spec, self._source(spec.alias, document))
+                 for document in ids]
         spans = [None if text is None or texts is None
                  else locate_span(str(texts[document]), text)
                  for document, text in zip(ids, found)]
@@ -294,7 +342,8 @@ class Oracle:
     def _sae_features(self, node, inputs) -> NodeResult:
         spec = node.spec
         ids = [int(document) for document in inputs["document_ids"]]
-        values = [self._feature_list(spec, document) for document in ids]
+        values = [self._feature_list(spec, self._source(spec.aliases[0], document))
+                  for document in ids]
         rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
         return NodeResult(
             {node.rows_port: score_rows(rows, spec.aliases, spec.name,
@@ -349,6 +398,7 @@ def oracle_executor(oracle: Oracle, **report):
                             for node in scans}
         oracle.texts = {node.alias: request.inputs[node.input_id].texts
                         for node in scans}
+        oracle.map_source_rows()
         state = graph_state(oracle, oracle.documents)
         state["texts"] = oracle.texts
         oracle.arena = state["gpu"].arena
@@ -361,6 +411,7 @@ def oracle_executor(oracle: Oracle, **report):
         return PhysicalResponse(outputs, {
             **result, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234, **report})
 
+    execute.oracle = oracle
     return execute
 
 
@@ -368,4 +419,5 @@ def finish(query, oracle: Oracle, **report):
     """Run a query to its result on the oracle."""
     from quail.api.execute import execute_query
 
+    oracle.catalog = query.session.catalog
     return execute_query(query, physical_executor=oracle_executor(oracle, **report))

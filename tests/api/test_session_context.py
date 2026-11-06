@@ -74,6 +74,7 @@ QUERIES = {
 @pytest.fixture()
 def context():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    ORACLE.catalog = session.catalog
     value = quail.SessionContext(session, physical_executor=oracle_executor(ORACLE))
     value.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     value.register("aspects", quail.DocumentProvider.from_table(ASPECTS, id_col="id"))

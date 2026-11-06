@@ -3,8 +3,9 @@
 use std::ops::ControlFlow;
 
 use datafusion::arrow::array::{Array, ListArray, StructArray};
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::sql::sqlparser::ast;
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::Dialect;
@@ -195,10 +196,36 @@ fn parse_expr(text: &str) -> Result<ast::Expr> {
 ///
 /// AI calls print with Quail's names, such as `AI.CLASSIFY`, and a
 /// `WHERE` call that equals an aliased `SELECT` call prints as the
-/// alias, as Quail's front end expects.
+/// alias, as Quail's front end expects. Each input the region reads
+/// prints as the query DataFusion computes it with.
 pub fn region_sql(region: &ModelRegion) -> Result<String> {
     let dialect = QuailDialect;
-    let mut statement = Unparser::new(&dialect).plan_to_sql(&region.bound)?;
+    let bound = region
+        .bound
+        .clone()
+        .transform_up(|node| {
+            let LogicalPlan::TableScan(scan) = &node else {
+                return Ok(Transformed::no(node));
+            };
+            let name = scan.table_name.table();
+            let Some(index) = region.input_names.iter().position(|found| found == name) else {
+                return Ok(Transformed::no(node));
+            };
+            let input = &region.inputs[index];
+            // an input holding another model region keeps its name
+            let regions = input.exists(|inner| {
+                Ok(matches!(inner, LogicalPlan::Extension(extension)
+                    if extension.node.as_any().downcast_ref::<ModelRegion>().is_some()))
+            })?;
+            if regions {
+                return Ok(Transformed::no(node));
+            }
+            Ok(Transformed::yes(crate::claim::lift_filters_above_aliases(
+                input,
+            )?))
+        })?
+        .data;
+    let mut statement = Unparser::new(&dialect).plan_to_sql(&bound)?;
     restore_select_aliases(&mut statement);
     remove_select_calls(&mut statement, EXTRACT_SPAN);
     let count_all = parse_expr("COUNT(*)")?;

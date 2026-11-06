@@ -270,6 +270,13 @@ pub fn arrow_functions(taken: &dyn Fn(&str) -> bool) -> Vec<Arc<ScalarUDF>> {
         .collect()
 }
 
+/// Whether an expression calls an Arrow compute function, which only
+/// Quail evaluates, inside a model region.
+pub fn is_arrow_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::ScalarFunction(call)
+        if call.func.inner().downcast_ref::<ArrowFunction>().is_some())
+}
+
 /// Whether an expression is a call to an AI function.
 pub fn is_ai_call(expr: &Expr) -> bool {
     matches!(expr, Expr::ScalarFunction(call) if AI_FUNCTION_NAMES.contains(&call.name()))

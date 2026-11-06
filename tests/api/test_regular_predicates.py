@@ -48,6 +48,7 @@ FILTER_SQL = """
 
 def test_regular_predicates_select_documents_before_the_model(session):
     seen = []
+    answer = make_executor(TRUTH)
 
     def execute(request):
         from quail.builtins import built_in_registry
@@ -58,23 +59,23 @@ def test_regular_predicates_select_documents_before_the_model(session):
         for node in graph.nodes:
             if isinstance(node, PhysicalScan):
                 seen.append(len(request.inputs[node.input_id].documents))
-        return make_executor(TRUTH)(request)
+        return answer(request)
+
+    execute.oracle = answer.oracle
 
     # the AI predicates keep r0 and r3 of all six; the regular predicates keep
-    # r0, r2, and r4. The planner only estimates that from a sample; the
-    # scan's runtime applies the tests, so the executor gets every
-    # document and the model sees three
+    # r0, r2, and r4. DataFusion applies them before the region, so the
+    # executor gets only those three documents
     query = session.sql(
         FILTER_SQL + " AND r.stars >= 3 AND r.lang IN ('en', 'fr') "
         "AND r.stars IS NOT NULL")
     plan = query.plan()
     scan = next(node for node in plan.nodes if type(node).__name__ == "Scan")
-    assert (scan.num_documents, scan.expected_rows) == (6, 3.0)
-    assert [str(predicate) for predicate in scan.predicates] == [
-        "r.stars >= 3", "r.lang IN ('en', 'fr')", "r.stars IS NOT NULL"]
-    assert "where r.stars >= 3 and r.lang IN ('en', 'fr')" in query.explain()
+    assert scan.num_documents == 3
+    explained = query.explain()
+    assert "stars >= Int64(3)" in explained
     result = _run(query, execute)
-    assert seen == [6]
+    assert seen == [3]
     assert result.to_rows() == [("r0",)]
     stage = next(s for s in result.report["stages"] if s["op"] == "filter")
     assert stage["evaluated"] == 3
@@ -111,20 +112,17 @@ def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
     # the AI predicates keep r0 (en, 5 stars) and r3 (en, no stars)
     query = session.sql(
         FILTER_SQL + " AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)")
+    # the test runs in DataFusion, before the region
     scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
-    assert [str(predicate) for predicate in scan.predicates] == [
-        "NOT (lower(r.lang) like '%e%') OR NOT (r.stars < 3)"]
-    # r3's NULL < 3 makes the OR null, so the scan rejects r3
+    assert scan.predicates == ()
+    # r3's NULL < 3 makes the OR null, so DataFusion rejects r3
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",)]
     query = session.sql(FILTER_SQL + " AND (r.stars IS NULL OR r.lang = 'de')")
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
-    # NOT (a OR b) is two tests at the scan, as NOT a AND NOT b
+    # DataFusion runs NOT (a OR b) before the region
     query = session.sql(
         "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) "
         "AND NOT (r.lang = 'fr' OR r.stars IS NULL)")
-    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
-    assert [str(predicate) for predicate in scan.predicates] == [
-        "NOT (r.lang = 'fr')", "r.stars IS NOT NULL"]
     assert _run(query, make_executor(TRUTH)).to_rows() == [
         ("r0",), ("r1",), ("r4",)]
 
@@ -161,8 +159,9 @@ def test_any_arrow_scalar_function_runs_in_where_and_select(session):
         FROM reviews r
         WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND ABS(r.stars - 4) <= 1
         ORDER BY r.id""")
+    # DataFusion's ABS runs the WHERE test before the region
     scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
-    assert [str(p) for p in scan.predicates] == ["abs(subtract(r.stars, 4)) <= 1"]
+    assert scan.predicates == ()
     assert _run(query, make_executor(TRUTH)).to_rows() == [
         ("r0", "NE", 1), ("r4", "NE", 1)]
     with pytest.raises(CompileError, match="unknown function 'nope'"):
@@ -192,19 +191,18 @@ def test_where_takes_the_same_arrow_expressions_as_select(session):
     for test, kept in cases.items():
         query = session.sql(f"{first} AND ({test}) ORDER BY r.id")
         scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
-        assert scan.predicates, test
+        # an Arrow function only Quail evaluates tests at Quail's scan;
+        # DataFusion runs every other test before the region
+        assert bool(scan.predicates) == ("UTF8_IS_UPPER" in test), test
         assert [row[0] for row in _run(query, make_executor(TRUTH)).to_rows()] == (
             kept), test
-    query = session.sql(f"{first} AND r.stars > r.floor")
-    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
-    assert [str(test) for test in scan.predicates] == ["greater(r.stars, r.floor)"]
     # SELECT returns the same comparison
     query = session.sql(
         "SELECT r.id, r.stars > r.floor AS above FROM pairs r "
         "WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) ORDER BY r.id")
     assert _run(query, make_executor(TRUTH)).to_rows() == [
         ("r0", True), ("r1", False), ("r3", None), ("r4", True)]
-    with pytest.raises(CompileError, match="true or false"):
+    with pytest.raises(CompileError, match="upper.r.lang. is not supported"):
         _run(session.sql(f"{first} AND UPPER(r.lang)"), make_executor(TRUTH))
 
 

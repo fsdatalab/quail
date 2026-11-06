@@ -140,11 +140,21 @@ class Session:
             from quail.api.context import DataFusionQuery
 
             return DataFusionQuery(self, text, SQLDialect(dialect).value, order=order)
-        from quail.api.region_inputs import region_query
+        from quail.api.region_inputs import input_scans, region_query
 
         logical, whole = compiled
+        tables = None
+        if input_scans(logical, self.catalog):
+            from quail.api.compile import DATAFUSION_DIALECTS
+            from quail.api.context import SessionContext
+
+            # DataFusion computes the region's plain inputs now, so the
+            # region plans on its real rows
+            (tables,) = SessionContext(self)._native.region_inputs(
+                text, DATAFUSION_DIALECTS[SQLDialect(dialect).value])
         return region_query(self, logical, order=order, text=text,
-                            dialect=SQLDialect(dialect).value, whole=whole)
+                            dialect=SQLDialect(dialect).value, whole=whole,
+                            tables=tables)
 
     def get_run(self, query_id: str):
         """Reattach to a query the server already accepted.

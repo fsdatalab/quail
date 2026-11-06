@@ -224,11 +224,11 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
 
 def test_each_part_of_a_where_clause_goes_to_the_operator_that_tests_it(catalog):
     sql = FILTER_JOIN_SQL + " AND r.id <> 'z'"
-    # the rule puts the column test in the Scan, the one-table AI.IF in a
-    # SemanticFilter, and the two-table AI.IF in a SemanticJoin
+    # DataFusion runs the column test before the region, the one-table
+    # AI.IF is a SemanticFilter, and the two-table AI.IF a SemanticJoin
     plan = compile_sql(sql, catalog)
     scans = {node.alias: node for node in plan.walk() if isinstance(node, Scan)}
-    assert [str(p) for p in scans["r"].predicates] == ["r.id <> 'z'"]
+    assert scans["r"].predicates == ()
     (gate,) = [node for node in plan.walk() if isinstance(node, SemanticFilter)]
     assert [p.selectivity for p in gate.predicates] == [0.3]
     (join,) = [node for node in plan.walk() if isinstance(node, SemanticJoin)]

@@ -196,13 +196,14 @@ async fn a_where_clause_asks_the_model_above_its_plain_terms() -> Result<()> {
         plan[1].contains("Kind?") && plan[1].contains("Long?"),
         "{plan:?}"
     );
-    // DataFusion pushed the plain test below the model's and the alias
-    let alias = plan
-        .iter()
-        .position(|line| line == "SubqueryAlias: r")
-        .unwrap();
-    let test = plan.iter().position(|line| line.contains("r9")).unwrap();
-    assert!(test > alias, "{plan:?}");
+    // the plain test runs in DataFusion, in the region's input
+    assert!(!plan.iter().any(|line| line.contains("r9")), "{plan:?}");
+    assert!(
+        region
+            .inputs
+            .iter()
+            .any(|input| lines(input).iter().any(|line| line.contains("r9")))
+    );
     Ok(())
 }
 
@@ -262,5 +263,27 @@ async fn a_test_of_a_label_reads_the_column_its_classification_adds() -> Result<
         .filter(|line| line.starts_with("SemanticColumn"))
         .count();
     assert_eq!(columns, 1, "{plan:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_plain_filter_runs_in_datafusion_as_the_regions_input() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT r.id FROM reviews r WHERE r.id <> 'r9' \
+        AND AI.IF(PROMPT('Is {0} kind?', r.body))";
+    let [region] =
+        <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
+    // the model reads only the rows the plain test keeps
+    assert!(
+        !lines(&region.plan).iter().any(|line| line.contains("r9")),
+        "{:?}",
+        lines(&region.plan)
+    );
+    let [input] = <[LogicalPlan; 1]>::try_from(region.inputs.clone()).unwrap();
+    assert!(
+        lines(&input).iter().any(|line| line.contains("r9")),
+        "{:?}",
+        lines(&input)
+    );
     Ok(())
 }

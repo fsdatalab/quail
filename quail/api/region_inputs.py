@@ -8,8 +8,12 @@ before a run.
 """
 
 import weakref
+from contextlib import closing
 
-from quail.catalog import Catalog, MemoryTableProvider
+import pyarrow as pa
+from pyarrow import compute as pc
+
+from quail.catalog import Catalog, MemoryTableProvider, ScanRequest
 from quail.common.tokens import TokenLengths
 from quail.logical import LogicalPlan, Scan
 
@@ -28,6 +32,25 @@ def input_scans(logical: LogicalPlan, catalog) -> dict:
     return {node.provider: node for node in logical.walk()
             if isinstance(node, Scan) and node.provider not in catalog
             and node.provider not in stages}
+
+
+def source_rows(catalog, name: str, table) -> pa.Array | None:
+    """Each row's position in the registered table an input filters.
+
+    DataFusion names an input that holds some of a registered table's
+    rows ``<table>__<alias>``; its rows are found in the table by the
+    table's id column. Returns None for any other input.
+    """
+    base = name.split("__", 1)[0]
+    if table is None or "__" not in name or base not in catalog:
+        return None
+    provider = catalog.get(base)
+    id_col = getattr(provider, "id_col", "")
+    if not id_col or id_col not in table.column_names:
+        return None
+    with closing(provider.scan(ScanRequest(columns=(id_col,)))) as reader:
+        ids = reader.read_all().column(id_col)
+    return pc.index_in(table.column(id_col), value_set=ids).cast(pa.int32())
 
 
 def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
@@ -51,9 +74,16 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
         return Query(session, logical, **options)
     providers = dict(session.catalog.providers)
     assumed = {}
+    rows = {}
     for name, scan in scans.items():
         if tables is not None and name in tables:
             table = tables[name]
+            found = source_rows(session.catalog, name, table)
+            if found is not None:
+                # DataFusion scans in parallel; the region reads the rows in
+                # the table's order
+                order = pc.sort_indices(found)
+                table, rows[name] = table.take(order), pc.take(found, order)
         else:
             table = scan.schema.empty_table()
             assumed[name] = lambda _column: TokenLengths(
@@ -63,6 +93,7 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
     catalog = Catalog(providers)
     store = session.inputs.over(catalog, assumed)
     query = Query(session, logical, catalog=catalog, inputs=store, **options)
+    query.source_rows = rows
     # the store's token files live as long as the query
     weakref.finalize(query, store.close)
     return query

@@ -354,6 +354,45 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Compute the inputs of a query's model regions that call no model,
+    /// each as its name, schema, and rows, region by region, so a region
+    /// can be planned on its real rows before the query runs.
+    ///
+    /// # Errors
+    ///
+    /// The query does not plan, or an input fails.
+    #[allow(clippy::type_complexity)]
+    pub fn region_inputs(
+        &self,
+        query: &str,
+        dialect: Option<&str>,
+    ) -> Result<Vec<Vec<(String, SchemaRef, Vec<RecordBatch>)>>> {
+        let regions = self.regions(query, dialect)?;
+        self.runtime.block_on(async {
+            let mut found = Vec::new();
+            for region in regions {
+                let mut inputs = Vec::new();
+                for (name, input) in region.input_names.iter().zip(&region.inputs) {
+                    let calls_model = input.exists(|node| {
+                        Ok(matches!(node, LogicalPlan::Extension(extension)
+                            if extension.node.as_any().downcast_ref::<ModelRegion>().is_some()))
+                    })?;
+                    if calls_model {
+                        continue;
+                    }
+                    let frame =
+                        datafusion::dataframe::DataFrame::new(self.context.state(), input.clone());
+                    let schema = Arc::new(input.schema().as_arrow().clone());
+                    inputs.push((name.clone(), schema, frame.collect().await?));
+                }
+                found.push(inputs);
+            }
+            Ok(found)
+        })
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         if self.owns_engine {

@@ -8,8 +8,10 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import pyarrow as pa
+from pyarrow import compute as pc
 
 from quail.api.execute import execute_query
+from quail.api.region_inputs import input_scans
 from quail.catalog import inputs
 from quail.catalog.providers import ScanRequest
 from quail.common.expressions import (
@@ -98,6 +100,8 @@ class Query:
         self._scan_selectivities = {}
         self._pair_selectivities = {}
         self.token_wait_s = 0.0
+        # each filtered input's rows' positions in its registered table
+        self.source_rows = {}
 
     def token_inputs(self) -> dict:
         """Return the token store of every scanned alias.
@@ -346,7 +350,8 @@ class Query:
                        rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
-        if not self.whole:
+        has_inputs = input_scans(self._logical_input, self.session.catalog)
+        if self.text is not None and (not self.whole or has_inputs):
             from quail.api.context import SessionContext
 
             around = (result.datafusion_plan if result is not None
@@ -588,4 +593,35 @@ class Query:
         (result.answer_tables, result.survivor_indices,
          result.true_join_tables, report["stages"]) = collect_answers(
              self.logical, plan, response.outputs, self._document_tokens)
+        self._to_source_rows(result)
         return result
+
+    def _to_source_rows(self, result) -> None:
+        """Number each document by its row in the registered table.
+
+        A filtered input holds some of a table's rows; answer tables and
+        survivors name its documents by their row in the table, as they
+        do for a table read whole.
+        """
+        rows = {scan.alias: self.source_rows[scan.provider]
+                for scan in self.logical.operators().scans
+                if scan.provider in self.source_rows}
+        if not rows:
+            return
+
+        def renumbered(table):
+            for alias, mapping in rows.items():
+                if alias in table.column_names:
+                    index = table.column_names.index(alias)
+                    table = table.set_column(index, alias, pc.take(
+                        mapping, table.column(alias)))
+            return table
+
+        result.answer_tables = {
+            kind: {name: renumbered(table) for name, table in tables.items()}
+            for kind, tables in result.answer_tables.items()}
+        result.survivor_indices = {
+            alias: (pc.take(rows[alias], survivors) if alias in rows else survivors)
+            for alias, survivors in result.survivor_indices.items()}
+        result.true_join_tables = {
+            name: renumbered(table) for name, table in result.true_join_tables.items()}

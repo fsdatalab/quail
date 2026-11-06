@@ -121,6 +121,30 @@ impl NativeSession {
         .map_err(python_error)
     }
 
+    /// Return the inputs of each model region of a query that call no
+    /// model, as dicts of pyarrow Tables by input name.
+    #[pyo3(signature = (query, dialect=None))]
+    fn region_inputs<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        dialect: Option<String>,
+    ) -> PyResult<Vec<Bound<'py, pyo3::types::PyDict>>> {
+        let regions = py
+            .detach(|| self.session.region_inputs(query, dialect.as_deref()))
+            .map_err(python_error)?;
+        regions
+            .into_iter()
+            .map(|inputs| {
+                let found = pyo3::types::PyDict::new(py);
+                for (name, schema, batches) in inputs {
+                    found.set_item(name, to_pyarrow(py, schema, batches)?)?;
+                }
+                Ok(found)
+            })
+            .collect()
+    }
+
     /// Return DataFusion's optimized logical plan for a query read in
     /// `dialect` ("Snowflake" by default).
     #[pyo3(signature = (query, dialect=None))]

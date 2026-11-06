@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DataFusionError, Result, plan_err};
+use datafusion::common::{Column, DataFusionError, Result, TableReference, plan_err};
 use datafusion::datasource::{MemTable, provider_as_source, source_as_provider};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
@@ -14,7 +14,7 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::AnalyzerRule;
 
 use crate::bind::UNSUPPORTED;
-use crate::functions::is_ai_call;
+use crate::functions::{is_ai_call, is_arrow_call};
 use crate::region::ModelRegion;
 use crate::table::RunnerTable;
 
@@ -340,7 +340,9 @@ impl Extracted {
             return plan.with_new_exprs(plan.expressions(), claimed);
         }
         if quail_plans(&plan)? {
-            let (bound, inputs) = split_inputs(select_list(plan.clone(), needed.clone())?)?;
+            let selected = select_list(plan.clone(), needed.clone())?;
+            let pushed = push_plain_terms(selected)?;
+            let (bound, inputs) = split_inputs(pushed)?;
             match binder_refusal(&bound) {
                 None => {
                     let mut region = ModelRegion::new(bound);
@@ -591,7 +593,18 @@ fn push_down_filters(plan: &LogicalPlan) -> LogicalPlan {
     ) else {
         return plan.clone();
     };
-    pushed
+    lift_filters_above_aliases(&pushed).unwrap_or_else(|_| plan.clone())
+}
+
+/// `plan` with each filter that DataFusion moved below a table's alias
+/// back above it, its columns named by the alias: Quail reads a table as
+/// an alias over its scan, and SQL names its columns by the alias.
+///
+/// # Errors
+///
+/// A lifted filter does not plan.
+pub(crate) fn lift_filters_above_aliases(plan: &LogicalPlan) -> Result<LogicalPlan> {
+    plan.clone()
         .transform_up(|node| {
             let LogicalPlan::SubqueryAlias(alias) = &node else {
                 return Ok(Transformed::no(node));
@@ -621,18 +634,182 @@ fn push_down_filters(plan: &LogicalPlan) -> LogicalPlan {
             Ok(Transformed::yes(read))
         })
         .map(|lifted| lifted.data)
-        .unwrap_or_else(|_| plan.clone())
 }
 
-/// Take each CTE or FROM subquery that groups or windows rows out of a
-/// region's plan: the plan reads it as a table of the same name, and
-/// DataFusion computes it as the region's input.
+/// Move each plain filter term about one table down to that table's
+/// alias, where it becomes part of the table's input.
+///
+/// A plain term calls no model and has no subquery. It moves down only
+/// through filters and inner joins, which keep a row whatever happens
+/// to the other tables' rows; a term about two tables stays.
+fn push_plain_terms(plan: LogicalPlan) -> Result<LogicalPlan> {
+    plan.transform_down(|node| {
+        let LogicalPlan::Filter(filter) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        let mut kept = Vec::new();
+        let mut moved: Vec<(TableReference, Expr)> = Vec::new();
+        for term in split_conjunction(&filter.predicate) {
+            match plain_table(term) {
+                Some(table) if reaches_alias(&filter.input, &table) => {
+                    moved.push((table, term.clone()))
+                }
+                _ => kept.push(term.clone()),
+            }
+        }
+        if moved.is_empty() {
+            return Ok(Transformed::no(node));
+        }
+        let mut input = filter.input.as_ref().clone();
+        for (table, term) in moved {
+            input = place_term(input, &table, term)?;
+        }
+        let placed = match conjunction(kept) {
+            Some(predicate) => LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?),
+            None => input,
+        };
+        Ok(Transformed::yes(placed))
+    })
+    .map(|pushed| pushed.data)
+}
+
+/// The one table a plain term reads, or None for a term that calls a
+/// model, has a subquery, or reads several tables or none.
+fn plain_table(term: &Expr) -> Option<TableReference> {
+    let special = term
+        .exists(|inner| Ok(is_ai_call(inner) || is_arrow_call(inner) || is_subquery_expr(inner)))
+        .unwrap_or(true);
+    if special {
+        return None;
+    }
+    let mut tables = term
+        .column_refs()
+        .into_iter()
+        .map(|column| column.relation.clone());
+    let first = tables.next()??;
+    tables
+        .all(|table| table.as_ref() == Some(&first))
+        .then_some(first)
+}
+
+/// Whether `plan` reaches the alias `table` through filters and inner
+/// joins only, and the alias's subtree calls no model.
+fn reaches_alias(plan: &LogicalPlan, table: &TableReference) -> bool {
+    match plan {
+        // a term moves only to a table DataFusion can compute as an input
+        LogicalPlan::SubqueryAlias(alias) => {
+            alias.alias == *table && !calls_ai(plan).unwrap_or(true)
+        }
+        LogicalPlan::Filter(filter) => reaches_alias(&filter.input, table),
+        LogicalPlan::Join(join) if join.join_type == datafusion::logical_expr::JoinType::Inner => {
+            reaches_alias(&join.left, table) || reaches_alias(&join.right, table)
+        }
+        _ => false,
+    }
+}
+
+/// `plan` with `term` as a filter directly above the alias `table`.
+fn place_term(plan: LogicalPlan, table: &TableReference, term: Expr) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::SubqueryAlias(ref alias) if alias.alias == *table => {
+            Ok(LogicalPlan::Filter(Filter::try_new(term, Arc::new(plan))?))
+        }
+        LogicalPlan::Filter(filter) => {
+            let input = place_term(filter.input.as_ref().clone(), table, term)?;
+            Ok(LogicalPlan::Filter(Filter::try_new(
+                filter.predicate,
+                Arc::new(input),
+            )?))
+        }
+        LogicalPlan::Join(join) => {
+            let (left, right) = if reaches_alias(&join.left, table) {
+                (
+                    place_term(join.left.as_ref().clone(), table, term)?,
+                    join.right.as_ref().clone(),
+                )
+            } else {
+                (
+                    join.left.as_ref().clone(),
+                    place_term(join.right.as_ref().clone(), table, term)?,
+                )
+            };
+            LogicalPlan::Join(join.clone())
+                .with_new_exprs(LogicalPlan::Join(join).expressions(), vec![left, right])
+        }
+        other => Ok(other),
+    }
+}
+
+fn is_subquery_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+    )
+}
+
+/// The one table a subtree reads, or None when it reads several or none.
+fn single_scan(plan: &LogicalPlan) -> Option<TableScan> {
+    let mut scans = Vec::new();
+    plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            scans.push(scan.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .ok()?;
+    match <[TableScan; 1]>::try_from(scans) {
+        Ok([scan]) => Some(scan),
+        Err(_) => None,
+    }
+}
+
+/// Whether a subtree is a table the runner reads by name: its scan,
+/// alone or under its alias.
+fn read_by_runner(plan: &LogicalPlan) -> bool {
+    let scan = match plan {
+        LogicalPlan::TableScan(scan) => scan,
+        LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
+            LogicalPlan::TableScan(scan) => scan,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    source_as_provider(&scan.source)
+        .is_ok_and(|provider| provider.downcast_ref::<RunnerTable>().is_some())
+}
+
+/// Whether DataFusion computes this part of a region as an input: it
+/// calls no model, reads one table, and is more than a table the runner
+/// reads by name.
+fn plain_input(plan: &LogicalPlan) -> Result<Option<TableScan>> {
+    if read_by_runner(plan) || calls_ai(plan)? {
+        return Ok(None);
+    }
+    let subquery = plan.exists(|node| {
+        Ok(node.expressions().iter().any(|expr| {
+            expr.exists(|inner| Ok(is_subquery_expr(inner)))
+                .unwrap_or(true)
+        }))
+    })?;
+    if subquery {
+        return Ok(None);
+    }
+    Ok(single_scan(plan))
+}
+
+/// Take out of a region's plan each part DataFusion computes as an
+/// input: a part that calls no model and reads one table, such as a
+/// table's plain filters, and each CTE or FROM subquery that groups or
+/// windows rows. The plan reads each input as a table of its name.
 ///
 /// Returns the plan and each input's table name and plan.
 fn split_inputs(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<(String, LogicalPlan)>)> {
     let mut inputs: Vec<(String, LogicalPlan)> = Vec::new();
     let plan = plan
         .transform_down(|node| {
+            if let Some(scan) = plain_input(&node)? {
+                return cut_input(node, &scan, &mut inputs);
+            }
             if let LogicalPlan::TableScan(scan) = &node {
                 return table_input(scan, &mut inputs);
             }
@@ -666,6 +843,60 @@ fn split_inputs(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<(String, LogicalP
         })?
         .data;
     Ok((plan, inputs))
+}
+
+/// Replace `node`, a plain part of a region that reads `scan`'s table,
+/// with a scan of an input DataFusion computes from it.
+///
+/// The input is named `<table>__<alias>`; its id column stays a primary
+/// key when the part returns it.
+fn cut_input(
+    node: LogicalPlan,
+    scan: &TableScan,
+    inputs: &mut Vec<(String, LogicalPlan)>,
+) -> Result<Transformed<LogicalPlan>> {
+    let schema = node.schema();
+    let qualifiers: Vec<_> = schema
+        .iter()
+        .map(|(qualifier, _)| qualifier.cloned())
+        .collect();
+    let Some(Some(qualifier)) = qualifiers.first().cloned() else {
+        return Ok(Transformed::no(node));
+    };
+    if qualifiers
+        .iter()
+        .any(|found| found.as_ref() != Some(&qualifier))
+    {
+        return Ok(Transformed::no(node));
+    }
+    // not the table's own name, which the runner would read whole
+    let name = format!("{}__{}", scan.table_name.table(), qualifier.table());
+    let fields = Arc::new(schema.as_arrow().clone());
+    let mut placeholder = MemTable::try_new(Arc::clone(&fields), vec![vec![]])?;
+    let provider = source_as_provider(&scan.source)?;
+    let key = provider.constraints().and_then(|constraints| {
+        constraints.iter().find_map(|constraint| match constraint {
+            datafusion::common::Constraint::PrimaryKey(indices) if indices.len() == 1 => {
+                Some(provider.schema().field(indices[0]).name().clone())
+            }
+            _ => None,
+        })
+    });
+    if let Some(index) = key.and_then(|column| fields.index_of(&column).ok()) {
+        placeholder =
+            placeholder.with_constraints(datafusion::common::Constraints::new_unverified(vec![
+                datafusion::common::Constraint::PrimaryKey(vec![index]),
+            ]));
+    }
+    let read = LogicalPlanBuilder::scan(
+        name.as_str(),
+        provider_as_source(Arc::new(placeholder)),
+        None,
+    )?
+    .alias(qualifier)?
+    .build()?;
+    inputs.push((name, node));
+    Ok(Transformed::new(read, true, TreeNodeRecursion::Jump))
 }
 
 /// A scan of a table the runner does not read itself, as a scan of a

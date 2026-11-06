@@ -173,11 +173,14 @@ def test_relational_plans_build_and_run(tmp_path):
         logical = grouped.logical
         scan = next(node for node in logical.walk()
                     if type(node).__name__ == "Scan")
-        tested = build_query(sess, get_query("REL-AGENT-1")).logical
-        scan = next(node for node in tested.walk()
+        # the plain tests run in DataFusion, before the model reads a row
+        tested = build_query(sess, get_query("REL-AGENT-1"))
+        scan = next(node for node in tested.logical.walk()
                     if type(node).__name__ == "Scan")
-        assert [str(p) for p in scan.predicates] == [
-            "t.turn_index >= 10", "t.token_count <= 6000"]
+        assert scan.predicates == ()
+        explained = tested.explain()
+        assert "turn_index >= Int64(10)" in explained
+        assert "token_count <= Int64(6000)" in explained
         paged = build_query(sess, get_query("REL-AGENT-2")).logical.root
         assert (paged.limit, paged.offset) == (10, 10)
         top = build_query(sess, get_query("REL-AGENT-4")).logical.root
