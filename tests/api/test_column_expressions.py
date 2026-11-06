@@ -35,7 +35,7 @@ def test_a_prompt_reads_a_struct_field_as_the_document(session):
     assert result.to_rows() == [("d0",), ("d2",)]
     # the field's text was tokenized, not the struct's
     bodies = ("one", "two words", "three words here")
-    assert list(session.inputs.token_lengths("docs", scan.column)) == [
+    assert list(query.token_inputs()["r"].lengths) == [
         len(encoder()(text)) for text in bodies]
     assert "details.body" in query.explain()
 

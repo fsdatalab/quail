@@ -18,6 +18,7 @@
 //! ```
 
 mod engine;
+pub mod planning;
 pub mod pyarrow;
 
 use std::path::PathBuf;

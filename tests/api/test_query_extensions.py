@@ -1,24 +1,16 @@
 """Query execution with custom providers and extensions."""
 
-from threading import Lock
-
 import pyarrow as pa
 import pyarrow.parquet as pq
-from helpers.sessions import TOKENIZER
+from helpers.sessions import TOKENIZER, encoder
 from modal._serialization import deserialize, serialize
 
 import quail
-from quail.api import Session
 from quail.api import execute as runtime
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.result import filter_answer_table
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.physical import AiFilter, Scan, decode_graph
-from quail.planner import optimize
-
-
-def _tokens(text):
-    return text.split()
 
 
 def test_query_scans_provider_and_preserves_extension_objects(
@@ -35,23 +27,10 @@ def test_query_scans_provider_and_preserves_extension_objects(
                            device="h100-sxm"),
         tokenizer=TOKENIZER,
     )
-    monkeypatch.setattr(Session, "tokenizer", property(lambda self: _tokens))
-    calls = ["initialize"]
-    lock = Lock()
-
-    searched = optimize.search_plan
-
-    def search_plan(*args, **kwargs):
-        with lock:
-            calls.append("plan")
-        return searched(*args, **kwargs)
-
-    monkeypatch.setattr(optimize, "search_plan", search_plan)
+    calls = []
 
     def execute(physical, registry):
         assert registry is session.registry
-        # planned once on estimated lengths, once more on the token store
-        assert calls == ["initialize", "plan", "plan"]
         calls.append("execute")
         assert "extensions" not in physical.plan
         assert physical.plan["device"] == session.config.device
@@ -59,9 +38,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
         source = next(node for node in graph.nodes if isinstance(node, Scan))
         documents = physical.inputs[source.input_id].documents
         assert [list(document) for document in documents] == [
-            ["first", "document"],
-            ["second", "document"],
-        ]
+            encoder()("first document"), encoder()("second document")]
         filter_node = next(node for node in graph.nodes if isinstance(node, AiFilter))
         run = RunResult(None, {filter_node.node_id: NodeResult({
             "rows:d": [0],
@@ -90,7 +67,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
 
     assert response.collect().to_pydict() == {"d.id": ["a"]}
     assert response.report["fresh_tokens"] == 4
-    assert calls == ["initialize", "plan", "plan", "execute"]
+    assert calls == ["execute"]
     assert received.collect().equals(response.collect())
     assert received.plan == response.plan
     assert received.node_metrics == response.node_metrics

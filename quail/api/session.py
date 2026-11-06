@@ -169,6 +169,24 @@ class Session:
         return self._remote.run(query_id)
 
     @property
+    def planner(self):
+        """Return the Rust planner of this session's regions, made when first used.
+
+        It tokenizes with the session's ``tokenizer.json`` and keeps the
+        token stores of the tables its queries read whole.
+        """
+        if getattr(self, "_planner", None) is None:
+            from pathlib import Path
+
+            import _quail_native
+
+            directory = self._tokenizer_directory or resolve_model_path(
+                self.model.hf_name, self.model.revision, include_weights=False)
+            self._planner = _quail_native.NativePlanner(
+                str(Path(directory) / "tokenizer.json"))
+        return self._planner
+
+    @property
     def tokenizer(self):
         """Return Gigatoken's encoder, loading it when first used.
 

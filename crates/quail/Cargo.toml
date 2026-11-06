@@ -10,11 +10,16 @@ publish = false
 async-trait = "0.1"
 datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
 # the Arrow C stream interface, to share buffers with pyarrow
-arrow = { version = "59.3.2", default-features = false, features = ["ffi"] }
+arrow = { version = "59.3.2", default-features = false, features = ["ffi", "ipc"] }
 # a Rust program links libpython and starts the interpreter; the Python
 # module's build sets PYO3_BUILD_EXTENSION_MODULE instead
 pyo3 = "0.30"
 quail-datafusion = { path = "../quail-datafusion" }
+quail-inputs = { path = "../quail-inputs" }
+quail-physical = { path = "../quail-physical" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tempfile = "3"
 quail-planner = { path = "../quail-planner" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 

@@ -213,6 +213,41 @@ def search_plan(alternatives, context, registry):
         logical_plan=alternatives[found["alternative"]].plan)
 
 
+def planned_region(found: dict, tokenizer):
+    """The PhysicalPlan, or Refusal, and chosen logical plan Rust planned.
+
+    Args:
+        found: What ``NativePlanner.plan`` returns, read from JSON.
+        tokenizer: The session's tokenizer, to price an edited plan.
+
+    Returns:
+        (the plan or refusal, the logical plan it lowers or None).
+    """
+    if "refusal" in found:
+        refusal = found["refusal"]
+        return Refusal(reasons=tuple(refusal["reasons"]),
+                       constraint=refusal["constraint"], needed=refusal["needed"],
+                       available=refusal["available"], unit=refusal["unit"]), None
+    logical = decode_value(LogicalPlan, json.loads(found["logical"]))
+    envelope = found["envelope"]
+    codecs = {codec.type_name: codec for codec in built_in_codecs()}
+    graph = decode_graph(envelope["graph"], codecs)
+    settings = dict(envelope["settings"])
+    settings["candidates"] = tuple(
+        {**candidate, "rewrites": tuple(candidate["rewrites"])}
+        for candidate in settings.get("candidates", ()))
+    vocabulary = Vocabulary(tokenizer)
+    plan = PhysicalPlan(
+        model=envelope["model"], device=envelope["device"], gpus=envelope["gpus"],
+        backend=envelope["backend"], estimated_seconds=found["estimated_seconds"],
+        nodes=graph.nodes, settings=settings, root=graph.root,
+        estimates=_estimates(found["estimates"]),
+        estimator=NativePricer(_quail_native, found["fields"], found["pricer"],
+                               vocabulary),
+        logical_plan=logical)
+    return plan, logical
+
+
 def column_placements(plan):
     """The placements of a plan's column operators that planning prices.
 

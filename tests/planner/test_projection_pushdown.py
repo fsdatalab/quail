@@ -50,19 +50,18 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     assert sorted(result.to_rows()) == [(3, "r2"), (5, "r0")]
     scan = _scans(query.logical)["r"]
     assert scan.columns == ("stars", "id")
-    store = query._token_inputs["r"]
-    assert store.projected_columns == ("stars", "id")
-    # later queries read the same token store instead of tokenizing again
-    tokenized = dict(session.inputs._token_stores)
-    assert len(tokenized) == 1
+    store = query.token_inputs()["r"]
+    # the projected columns, then the document, which locates answers
+    assert store.projected_columns == ("stars", "id", "review")
+    # a later query reads the same token store instead of tokenizing again
+    tokenized = store.tokens.path
 
-    second = _run(session.sql(
+    later = session.sql(
         "SELECT r.stars, r.review FROM reviews r WHERE "
-        "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
+        "AI_FILTER(PROMPT('q: {0}', r.review))")
+    second = _run(later, make_executor(truth))
     assert sorted(second.to_rows()) == [(3, "fine one"), (5, "good one")]
-    assert session.inputs._token_stores == tokenized
-    assert sorted(name for _, name in session.inputs._column_stores) == [
-        "id", "review", "stars"]
+    assert later.token_inputs()["r"].tokens.path == tokenized
 
     truth = {"r": {"q:": [0, 1, 0]}}
 
@@ -71,12 +70,13 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
         "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
     assert text.to_rows() == [("bad one",)]
 
-    star = _run(session.sql(
+    everything = session.sql(
         "SELECT * FROM reviews r WHERE "
-        "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
+        "AI_FILTER(PROMPT('q: {0}', r.review))")
+    star = _run(everything, make_executor(truth))
     assert star.columns == ["r.id", "r.review", "r.stars", "r.wide"]
     assert star.to_rows() == [("r1", "bad one", 1, "y" * 50)]
-    assert session.inputs._token_stores == tokenized
+    assert everything.token_inputs()["r"].tokens.path == tokenized
     session.close()
 
     session = _session(tmp_path)

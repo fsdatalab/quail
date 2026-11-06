@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from contextlib import closing
 from dataclasses import replace
@@ -15,13 +16,16 @@ from quail.api.region_inputs import input_scans
 from quail.catalog import inputs
 from quail.catalog.providers import ScanRequest
 from quail.common.expressions import (
+    ColumnRef,
+    CompileError,
+    GetField,
     column_references,
     evaluate_expression,
     source_columns,
 )
 from quail.common.pairs import FIRST_DOCUMENT, columns_key, estimate_pair_fraction
 from quail.common.selection import selected_rows
-from quail.common.tokens import TokenLengths
+from quail.common.tokens import ColumnStore, ScanInput, TokenLengths, TokenStore
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
 from quail.execution.projection import projection_for
 from quail.execution.reporting import collect_answers, execution_report
@@ -37,9 +41,13 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import Scan, encode_graph
+from quail.physical.codec import encode_value
 from quail.physical.plan import Refusal, RefusalError
 from quail.planner import native, plan_query, refine_plan
 from quail.planner.context import PlanningContext
+
+# the start of Rust's message for a document that is an expression
+DOCUMENT_EXPRESSION = "a document must be a column or a struct field"
 
 if TYPE_CHECKING:
     from quail.api.session import Session
@@ -139,6 +147,14 @@ class Query:
                     scan.provider, scan.column))
             self._plan = self._relational_plan(num_documents or 0)
             return self._plan
+        if self._plans_in_rust():
+            self._planning_started_at = time.perf_counter()
+            planned = self._plan_in_rust()
+            if planned is not None:
+                self._plan = planned
+                self._planning_finished_at = time.perf_counter()
+                self._searched_plan = self._plan
+                return self._plan
         if self._plan is None:
             self._planning_started_at = time.perf_counter()
             config = self.session.config
@@ -242,6 +258,77 @@ class Query:
             self._planning_finished_at = time.perf_counter()
             self._searched_plan = self._plan
         return self._plan
+
+    def _plans_in_rust(self) -> bool:
+        """Whether Rust plans this region.
+
+        Rust plans the Quail backend's regions whose documents are
+        columns or struct fields.
+        """
+        if self.session.config.backend != "quail":
+            return False
+
+        def column(expression) -> bool:
+            if isinstance(expression, ColumnRef):
+                return True
+            return isinstance(expression, GetField) and column(expression.input)
+
+        return all(isinstance(scan.column, str) or column(scan.column)
+                   for scan in self.logical.operators().scans)
+
+    def _plan_in_rust(self):
+        """Tokenize, measure, and plan the region in Rust.
+
+        Rust writes each scan's token store and value columns; the query
+        reads them as its inputs. Returns None for a region whose document
+        is an expression, which Python plans.
+        """
+        tables = {}
+        for scan in self._logical_input.operators().scans:
+            if scan.provider in tables:
+                continue
+            provider = self.catalog.get(scan.provider)
+            with closing(provider.scan(ScanRequest(
+                    columns=tuple(provider.columns)))) as reader:
+                table = reader.read_all()
+            # a registered table's rows are the same for every query
+            identity = (provider.content_identity()
+                        if scan.provider in self.session.catalog else None)
+            tables[scan.provider] = (identity, table)
+        config = self.session.config
+        settings = {
+            "model": native.untagged(encode_value(self.session.model)),
+            "device": native.untagged(encode_value(self.session.device)),
+            "gpus": config.gpus, "canvas_draws": config.canvas_draws,
+            "attention": config.attention, "order": self.order,
+            "backend": config.backend,
+            "physical_rules": [rule.name for rule in
+                               self.session.registry.physical_rules.values()],
+        }
+        found, message = self.session.planner.plan(
+            json.dumps(encode_value(self._logical_input)), tables,
+            json.dumps(settings))
+        if message is not None:
+            if message.startswith(DOCUMENT_EXPRESSION):
+                # Python tokenizes a document that is an expression
+                return None
+            raise CompileError(message)
+        found = json.loads(found)
+        plan, logical = native.planned_region(found, self.session.tokenizer)
+        if logical is None:
+            # a refused region takes Python's path, which still tokenizes
+            # its tables for the speed-of-light estimate
+            return None
+        self.logical = logical
+        self._token_inputs, self._document_tokens = {}, {}
+        for alias, files in found["scans"].items():
+            store = TokenStore(files["tokens"])
+            self._token_inputs[alias] = ScanInput(store, {
+                name: ColumnStore(path) for name, path in files["columns"]})
+            self._document_tokens[alias] = store.lengths
+        if config.gpu_timing:
+            plan = replace(plan, settings={**plan.settings, "gpu_timing": True})
+        return plan
 
     @property
     def planning_s(self) -> float:

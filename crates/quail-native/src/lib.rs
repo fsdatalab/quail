@@ -852,9 +852,100 @@ fn prefix_statistics<'py>(
     Ok(found)
 }
 
+/// Plans model regions in Rust for one session, with the session's
+/// tokenizer, keeping the token stores of tables read whole.
+#[pyclass(name = "NativePlanner", module = "_quail_native")]
+struct NativePlanner {
+    planner: quail::planning::Planner,
+}
+
+#[pymethods]
+impl NativePlanner {
+    /// A planner with the `tokenizer.json` at `tokenizer_file`.
+    #[new]
+    fn new(tokenizer_file: &str) -> PyResult<Self> {
+        Ok(Self {
+            planner: quail::planning::Planner::new(std::path::Path::new(tokenizer_file))
+                .map_err(|error| PyRuntimeError::new_err(error.0))?,
+        })
+    }
+
+    /// Plan a region's logical plan, as JSON, over `tables`: by provider
+    /// name, (content identity or None, the rows as a pyarrow Table).
+    /// `settings` is the configuration as JSON.
+    ///
+    /// Returns (the plan as JSON, None) or (None, a CompileError's
+    /// message). The plan holds the envelope, estimates, pricer, the
+    /// chosen logical plan, the context fields, and each scan's files,
+    /// or the refusal.
+    fn plan(
+        &self,
+        py: Python<'_>,
+        logical: &str,
+        tables: &Bound<'_, pyo3::types::PyDict>,
+        settings: &str,
+    ) -> PyResult<(Option<String>, Option<String>)> {
+        let logical = quail_planner::read_logical_plan(logical)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+        let settings: quail::planning::Settings = from_json(settings)?;
+        let mut rows = std::collections::HashMap::new();
+        for (name, entry) in tables.iter() {
+            let (identity, table): (Option<String>, Bound<'_, PyAny>) = entry.extract()?;
+            let reader = quail::pyarrow::stream_from_pyarrow(&table)?;
+            let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
+            let batches = reader
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| python_error(error.into()))?;
+            rows.insert(
+                name.extract::<String>()?,
+                quail::planning::TableRows {
+                    identity,
+                    schema,
+                    batches,
+                },
+            );
+        }
+        let found = py.detach(|| self.planner.plan(logical, &rows, &settings));
+        let planned = match found {
+            Ok(Ok(planned)) => planned,
+            Ok(Err(refusal)) => {
+                return Ok((Some(refusal_fields(&refusal).to_string()), None));
+            }
+            Err(error) => return Ok((None, Some(error.0))),
+        };
+        let scans: serde_json::Map<String, serde_json::Value> = planned
+            .scans
+            .iter()
+            .map(|scan| {
+                (
+                    scan.alias.clone(),
+                    serde_json::json!({
+                        "tokens": scan.tokens,
+                        "columns": scan.columns,
+                    }),
+                )
+            })
+            .collect();
+        let plan = &planned.selected.plan;
+        let found = serde_json::json!({
+            "envelope": plan.envelope(),
+            "estimated_seconds": plan.estimated_seconds,
+            "estimates": plan.estimates,
+            "alternative": planned.selected.alternative,
+            "pricer": pricer_fields(&plan.pricer),
+            "logical": quail_planner::write_logical_plan(&planned.logical)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+            "fields": planned.fields,
+            "scans": scans,
+        });
+        Ok((Some(found.to_string()), None))
+    }
+}
+
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSession>()?;
+    module.add_class::<NativePlanner>()?;
     module.add_class::<cost::CostModel>()?;
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;
