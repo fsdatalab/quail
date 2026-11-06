@@ -28,7 +28,7 @@ from quail.physical.codec import (
     encode_value,
 )
 from quail.physical.lowering import Vocabulary
-from quail.physical.plan import PhysicalPlan, Refusal
+from quail.physical.plan import PhysicalPlan, PlanEditError, Refusal
 from quail.planner.candidates import LogicalAlternative
 
 # the optimizer rules each model region runs, in order, as
@@ -155,6 +155,33 @@ class NativePricer:
             raise ValueError(message)
         found = json.loads(found)
         return found["seconds"], _estimates(found["estimates"])
+
+
+    def edit(self, graph, edit: dict, retained: set) -> tuple:
+        """Apply a plan edit and price the edited graph in Rust.
+
+        Returns:
+            (the edited graph, its seconds, its per-node estimates).
+
+        Raises:
+            PlanEditError: The edit fails.
+        """
+        codecs = {codec.type_name: codec for codec in built_in_codecs()}
+        intern = self._vocabulary.intern
+        encoded = _tokens_mapped(json.loads(json.dumps(encode_graph(graph, codecs))),
+                                 intern)
+        found, message = self._native.plan_operator(
+            "edit_plan", json.dumps(self._fields),
+            json.dumps({"pricer": self._pricer, "graph": encoded,
+                        "edit": _tokens_mapped(json.loads(json.dumps(edit)), intern),
+                        "retained": sorted(retained)}),
+            self._vocabulary.tokens, self._vocabulary.decoder())
+        if message is not None:
+            raise PlanEditError(message)
+        found = json.loads(found)
+        edited = decode_graph(_tokens_mapped(found["graph"], self._vocabulary.word),
+                              codecs)
+        return edited, found["seconds"], _estimates(found["estimates"])
 
 
 def _estimates(estimates: dict) -> dict:

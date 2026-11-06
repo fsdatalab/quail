@@ -637,6 +637,28 @@ fn plan_operator<'py>(
                 serde_json::json!({"seconds": seconds, "estimates": estimates})
             }))
         }
+        "edit_plan" => {
+            let pricer = read_pricer(&get("pricer"))?;
+            let graph: quail_physical::PhysicalGraph = json_value(get("graph"))?;
+            let edit: quail_planner::edits::Edit = json_value(get("edit"))?;
+            let retained: std::collections::BTreeSet<String> = json_value(get("retained"))?;
+            let graph = quail_planner::physical_rules::Graph {
+                nodes: graph.nodes,
+                root: graph.root,
+            };
+            let edited = quail_planner::edits::edit_graph(&graph, &edit)
+                .map_err(quail_planner::CompileError::new)
+                .and_then(|edited| {
+                    let (seconds, estimates) = pricer.price(&context, &edited.nodes)?;
+                    let recompute =
+                        quail_planner::edits::recompute_seconds(&edited, &estimates, &retained);
+                    Ok(serde_json::json!({
+                        "graph": {"nodes": edited.nodes, "root": edited.root},
+                        "seconds": seconds + recompute, "estimates": estimates,
+                    }))
+                });
+            lowering_result(edited)
+        }
         "request_order" => {
             let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
             lowering_result(quail_planner::request_order::request_order(&plan, &context))
@@ -1118,6 +1140,27 @@ fn execution_report(
     .to_string())
 }
 
+/// Apply an edit to a graph, set KV retention again, and validate it,
+/// without pricing: for a plan the planner did not price.
+///
+/// Returns (the graph as JSON, None) or (None, why the edit fails).
+#[pyfunction]
+fn edit_graph(graph: &str, edit: &str) -> PyResult<(Option<String>, Option<String>)> {
+    let graph: quail_physical::PhysicalGraph = from_json(graph)?;
+    let edit: quail_planner::edits::Edit = from_json(edit)?;
+    let graph = quail_planner::physical_rules::Graph {
+        nodes: graph.nodes,
+        root: graph.root,
+    };
+    Ok(match quail_planner::edits::edit_graph(&graph, &edit) {
+        Ok(edited) => (
+            Some(serde_json::json!({"nodes": edited.nodes, "root": edited.root}).to_string()),
+            None,
+        ),
+        Err(error) => (None, Some(error)),
+    })
+}
+
 /// A region's logical plan, its tables' rows, and the settings, read
 /// from what Python passes the planner.
 fn planning_inputs(
@@ -1243,6 +1286,7 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
     module.add_function(wrap_pyfunction!(write_token_store, module)?)?;
     module.add_function(wrap_pyfunction!(collect_answers, module)?)?;
+    module.add_function(wrap_pyfunction!(edit_graph, module)?)?;
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
     module.add_function(wrap_pyfunction!(prefix_statistics, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)

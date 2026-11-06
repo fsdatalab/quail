@@ -1,6 +1,7 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
 import pyarrow as pa
+import pytest
 from helpers.fakes import graph_state
 from helpers.oracle import Oracle
 from helpers.sessions import TOKENIZER
@@ -22,6 +23,7 @@ from quail.physical import (
     encode_graph,
 )
 from quail.physical.pipelines import build_pipelines
+from quail.physical.plan import PlanEditError
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
@@ -258,3 +260,22 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         # the classification ran first, over every claim
         labels = result.answer_tables["classifies"]["topic"]
         assert labels.column("topic").to_pylist() == ["science", "sport", "science"]
+
+
+def test_a_removed_barrier_restores_the_plan_and_a_filter_cannot_be_removed():
+    with _session() as session:
+        plan = quailb.queries(session)["FEV-9"][1]().plan()
+        join = next(node for node in plan.nodes if isinstance(node, AiJoin))
+        sequence = next(node for node in plan.nodes
+                        if isinstance(node, AiFilter) and node.alias == join.anchor)
+        barrier = f"barrier:{sequence.alias}"
+        edited = plan.insert(
+            Barrier(node_id=barrier, next_anchor=sequence.alias,
+                    aliases=(sequence.alias,)),
+            between=(sequence.node_id, join.node_id))
+        restored = edited.remove(barrier)
+        assert [node.node_id for node in restored.nodes] == [
+            node.node_id for node in plan.nodes]
+        assert not restored.graph.node(sequence.node_id).keep_kv
+        with pytest.raises(PlanEditError, match="would change what the query means"):
+            plan.remove(sequence.node_id)

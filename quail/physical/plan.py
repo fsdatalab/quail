@@ -1,22 +1,16 @@
 """A physical plan, a refusal to plan, and the pass that sets document KV lifetimes."""
 
+import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from quail.logical import LogicalPlan
 from quail.physical import (
-    AiFilter,
-    AiJoin,
-    Barrier,
-    Exchange,
-    GraphValidationError,
-    InputPort,
     PhysicalGraph,
     PhysicalNode,
     PortRef,
 )
 from quail.physical.codec import plan_envelope
-from quail.physical.pipelines import build_pipelines
 
 
 @dataclass(frozen=True)
@@ -94,55 +88,34 @@ class PhysicalPlan:
             object.__setattr__(self, "estimates", self.estimator(graph)[1])
 
 
-    def _edge(self, producer: str, consumer: str) -> tuple:
-        """The one input port of consumer that reads producer."""
-        try:
-            source = self.graph.node(producer)
-            target = self.graph.node(consumer)
-        except KeyError as error:
-            raise PlanEditError(
-                f"no node {error.args[0]!r} in the plan") from error
-        ports = [port for port in target.inputs
-                 if port.source.node_id == source.node_id]
-        if len(ports) != 1:
-            raise PlanEditError(
-                f"{consumer!r} reads {len(ports)} outputs of {producer!r}; "
-                f"an edit needs exactly one edge between them")
-        return source, target, ports[0]
+    def _edit(self, edit: dict) -> "PhysicalPlan":
+        """Apply an edit in Rust: rewire, set KV retention, validate, price.
 
-    def _rebuild(self, nodes) -> "PhysicalPlan":
-        """Validate the edited nodes and rebuild the plan with updated costs.
-
-        Args:
-            nodes: Replacement physical operators.
-
-        Returns:
-            A validated plan with updated KV retention and execution estimates.
-            The estimate includes recomputation when an edit separates filters
-            from a following join and their survivors were not already retained.
+        The estimate includes recomputation when an edit separates filters
+        from a following join and their survivors were not already retained.
 
         Raises:
-            PlanEditError: The edited operator graph is invalid.
+            PlanEditError: The edit names a missing node or edge, removes a
+                node that changes what the query means, or leaves an
+                invalid graph.
         """
-        nodes = plan_kv_retention(
-            PhysicalGraph(tuple(nodes), self.graph.root)).nodes
-        try:
-            edited = replace(self, nodes=nodes, root=None, estimates={})
-        except GraphValidationError as error:
-            raise PlanEditError(str(error)) from error
-        if self.estimator is None:
-            return edited
-        scheduled = set(self.settings.get("retention", {}).get("initial", {}))
-        pipelines = build_pipelines(edited.graph)
-        recompute = sum(
-            edited.estimates.get(node.node_id, {}).get(
-                "release_recompute_seconds", 0.0)
-            for node in edited.nodes
-            if isinstance(node, AiFilter) and node.alias not in scheduled
-            and not isinstance(pipelines[node.node_id][-1], AiJoin))
-        seconds, estimates = self.estimator(edited.graph)
-        return replace(edited, estimated_seconds=seconds + recompute,
-                       estimates=estimates)
+        import _quail_native
+
+        from quail.physical.codec import built_in_codecs, decode_graph, encode_graph
+
+        edit_with = getattr(self.estimator, "edit", None)
+        if edit_with is not None:
+            retained = set(self.settings.get("retention", {}).get("initial", {}))
+            graph, seconds, estimates = edit_with(self.graph, edit, retained)
+            return replace(self, nodes=graph.nodes, root=graph.root,
+                           estimated_seconds=seconds, estimates=estimates)
+        codecs = {codec.type_name: codec for codec in built_in_codecs()}
+        found, message = _quail_native.edit_graph(
+            json.dumps(encode_graph(self.graph, codecs)), json.dumps(edit))
+        if message is not None:
+            raise PlanEditError(message)
+        graph = decode_graph(json.loads(found), codecs)
+        return replace(self, nodes=graph.nodes, root=graph.root, estimates={})
 
     def insert(self, node: PhysicalNode, *, between: tuple) -> "PhysicalPlan":
         """Put node on the edge from producer to consumer.
@@ -152,34 +125,11 @@ class PhysicalPlan:
         changes. The node must have no inputs yet and exactly one
         output of the value type the edge carries.
         """
-        producer, consumer, port = self._edge(*between)
-        if any(existing.node_id == node.node_id for existing in self.nodes):
-            raise PlanEditError(
-                f"the plan already has a node {node.node_id!r}")
-        if node.inputs:
-            raise PlanEditError(
-                f"{node.node_id!r} already has inputs; insert wires its "
-                f"one input itself")
-        outputs = node.outputs
-        if len(outputs) != 1 or outputs[0].value_type is not port.value_type:
-            raise PlanEditError(
-                f"{node.node_id!r} needs exactly one output of type "
-                f"{port.value_type.value} to sit on the edge from "
-                f"{producer.node_id!r} to {consumer.node_id!r}")
-        wired = node.with_inputs((InputPort(
-            "input:0", port.value_type, port.source, port.schema),))
-        rewired = consumer.with_inputs(tuple(
-            replace(existing, source=PortRef(node.node_id, outputs[0].name))
-            if existing is port else existing
-            for existing in consumer.inputs))
-        nodes = []
-        for existing in self.nodes:
-            if existing.node_id == consumer.node_id:
-                nodes.append(wired)
-                nodes.append(rewired)
-            else:
-                nodes.append(existing)
-        return self._rebuild(nodes)
+        from quail.physical.codec import built_in_codecs
+
+        codecs = {codec.type_name: codec for codec in built_in_codecs()}
+        return self._edit({"op": "insert", "node": codecs[node.type_name].encode(node),
+                           "between": list(between)})
 
     def remove(self, node_id: str) -> "PhysicalPlan":
         """Take a node out; its consumers read its producer instead.
@@ -189,39 +139,12 @@ class PhysicalPlan:
         AiFilter, AiJoin, Recombine, Project, or Limit would change
         what the query means.
         """
-        try:
-            node = self.graph.node(node_id)
-        except KeyError as error:
-            raise PlanEditError(f"no node {node_id!r} in the plan") from error
-        if not isinstance(node, (Barrier, Exchange)):
-            raise PlanEditError(
-                f"{node_id!r} is a {type(node).__name__}; removing it would "
-                f"change what the query means (only Barrier and "
-                f"Exchange nodes can be removed)")
-        if len(node.inputs) != 1 or len(node.outputs) != 1 \
-                or node.inputs[0].value_type is not node.outputs[0].value_type:
-            raise PlanEditError(
-                f"{node_id!r} needs one input and one output of the same "
-                f"type to be removed; it has {len(node.inputs)} and "
-                f"{len(node.outputs)}")
-        upstream = node.inputs[0].source
-        gone = PortRef(node_id, node.outputs[0].name)
-        nodes = []
-        for existing in self.nodes:
-            if existing.node_id == node_id:
-                continue
-            if any(port.source == gone for port in existing.inputs):
-                existing = existing.with_inputs(tuple(
-                    replace(port, source=upstream) if port.source == gone
-                    else port for port in existing.inputs))
-            nodes.append(existing)
-        return self._rebuild(nodes)
+        return self._edit({"op": "remove", "node_id": node_id})
 
     def move(self, node_id: str, *, between: tuple) -> "PhysicalPlan":
         """Remove a node and insert it on another edge."""
-        node = self.graph.node(node_id)
-        return self.remove(node_id).insert(
-            node.with_inputs(()), between=between)
+        return self._edit({"op": "move", "node_id": node_id,
+                           "between": list(between)})
 
     def to_envelope(self, codecs) -> dict:
         """Encode the typed graph for a process boundary."""
@@ -234,40 +157,3 @@ class PhysicalPlan:
             codecs=codecs,
             settings=self.settings,
         )
-
-def plan_kv_retention(graph: PhysicalGraph) -> PhysicalGraph:
-    """Set operators' KV retention from the next compatible document consumer.
-
-    KV between operators on one path stays active in the scheduler. It stays
-    available after the path finishes when the next path reads the same
-    documents under the same prompt head. Every worker runs the same
-    paths over its own documents.
-    """
-    paths = build_pipelines(graph)
-    ordered = graph.topological_nodes()
-    starts = [node for node in ordered
-              if node.node_id in paths and paths[node.node_id][0] is node]
-    replacements = {}
-    for index, first in enumerate(starts):
-        members = paths[first.node_id]
-        alias = first.document_aliases[0]
-        following = next((later for later in starts[index + 1:]
-                          if later.document_aliases == (alias,)), None)
-        keep = (following is not None
-                and first.document_head == following.document_head)
-        model_nodes = [node for node in members if node.backend is not None]
-        # Joins settle anchors after any classification of their surviving pairs.
-        settling = next((node for node in reversed(model_nodes)
-                         if isinstance(node, AiJoin)), model_nodes[-1])
-        for position, node in enumerate(model_nodes):
-            retain = bool(keep and node is settling)
-            if isinstance(node, AiJoin):
-                retain |= any(isinstance(later, AiJoin)
-                              for later in model_nodes[position + 1:])
-            fields = {"keep_kv": retain}
-            if isinstance(node, AiFilter):
-                fields["arena_writes"] = (node.arena_writes or retain
-                                          or position < len(model_nodes) - 1)
-            replacements[node.node_id] = replace(node, **fields)
-    return PhysicalGraph(tuple(replacements.get(node.node_id, node)
-                               for node in graph.nodes), graph.root)
