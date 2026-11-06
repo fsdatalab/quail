@@ -43,7 +43,9 @@ In Python, import `quail`.
 uv pip install quail-engine
 ```
 
-You need Python 3.12 and a CUDA GPU.
+You need Python 3.12, a CUDA GPU, and the CUDA toolkit with `nvcc` and a C
+compiler: Quail compiles its GPU kernels the first time it runs, and keeps
+them in `~/.cache`.
 
 ## Example
 
