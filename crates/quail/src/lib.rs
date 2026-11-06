@@ -33,7 +33,7 @@ use datafusion::common::{Constraint, Constraints, DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use pyo3::prelude::*;
-use quail_datafusion::{IdentifiedTable, ModelRegion, RegionRunner, quail_schema};
+use quail_datafusion::{IdentifiedTable, InputRows, ModelRegion, RegionRunner, quail_schema};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -73,7 +73,8 @@ impl EngineConfig {
 /// thread that called `sql`.
 pub struct Session {
     context: SessionContext,
-    runtime: Runtime,
+    /// Taken when the session drops, to shut down without blocking.
+    runtime: Option<Runtime>,
     runner: Arc<PythonRunner>,
     /// Whether this session opened its engine, and closes it.
     owns_engine: bool,
@@ -168,8 +169,20 @@ impl Session {
     /// # Errors
     ///
     /// An attribute is missing or a rule name is unknown.
+    /// When the engine has a `tokenizer_file` attribute, the path of the
+    /// model's `tokenizer.json`, Rust plans each region with it.
     pub fn with_engine(engine: Py<PyAny>) -> Result<Self> {
-        Self::with_planner(engine, None)
+        let tokenizer_file = Python::attach(|py| match engine.bind(py).getattr("tokenizer_file") {
+            Ok(found) => found.extract::<Option<String>>(),
+            Err(_) => Ok(None),
+        })
+        .map_err(python_failure)?;
+        let planner = tokenizer_file
+            .map(|path| planning::Planner::new(std::path::Path::new(&path)))
+            .transpose()
+            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?
+            .map(Arc::new);
+        Self::with_planner(engine, planner)
     }
 
     /// A session as [`Session::with_engine`] describes, whose regions
@@ -225,7 +238,7 @@ impl Session {
         );
         Ok(Self {
             context,
-            runtime: Runtime::new()?,
+            runtime: Some(Runtime::new()?),
             runner,
             owns_engine: false,
         })
@@ -307,7 +320,7 @@ impl Session {
         dialect: Option<&str>,
     ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
         let runner = Arc::clone(&self.runner);
-        self.runtime.block_on(async {
+        self.runtime().block_on(async {
             let (sender, mut calls) = unbounded_channel::<RegionCall>();
             *runner.caller.lock().expect("the caller lock") =
                 Some((std::thread::current().id(), sender));
@@ -361,7 +374,7 @@ impl Session {
     ///
     /// The query does not plan.
     pub fn optimized_plan(&self, query: &str, dialect: Option<&str>) -> Result<LogicalPlan> {
-        self.runtime.block_on(async {
+        self.runtime().block_on(async {
             quail_datafusion::sql_in_dialect(&self.context, query, dialect)
                 .await?
                 .into_optimized_plan()
@@ -403,7 +416,7 @@ impl Session {
         dialect: Option<&str>,
     ) -> Result<Vec<Vec<(String, SchemaRef, Vec<RecordBatch>)>>> {
         let regions = self.regions(query, dialect)?;
-        self.runtime.block_on(async {
+        self.runtime().block_on(async {
             let mut found = Vec::new();
             for region in regions {
                 let mut inputs = Vec::new();
@@ -427,8 +440,65 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Plan each model region of a query without running it, region by
+    /// region: (its kind, its logical plan or SQL, its planned region
+    /// as JSON when Rust plans it). A region's inputs that call no model
+    /// are computed first, so it plans on their real rows.
+    ///
+    /// # Errors
+    ///
+    /// The query does not plan, an input fails, or a region does not bind.
+    #[allow(clippy::type_complexity)]
+    pub fn plans(
+        &self,
+        query: &str,
+        dialect: Option<&str>,
+    ) -> Result<Vec<(&'static str, String, Option<String>)>> {
+        let regions = self.regions(query, dialect)?;
+        let computed = self.region_inputs(query, dialect)?;
+        regions
+            .iter()
+            .zip(computed)
+            .map(|(region, computed)| {
+                let inputs: Vec<InputRows> = region
+                    .input_names
+                    .iter()
+                    .zip(&region.inputs)
+                    .map(|(name, input)| {
+                        let batches = computed
+                            .iter()
+                            .find(|(found, _, _)| found == name)
+                            .map(|(_, _, batches)| batches.clone())
+                            .unwrap_or_else(|| {
+                                vec![RecordBatch::new_empty(Arc::new(
+                                    input.schema().as_arrow().clone(),
+                                ))]
+                            });
+                        (name.clone(), batches)
+                    })
+                    .collect();
+                self.runner.plan_only(region, &inputs)
+            })
+            .collect()
+    }
+}
+
+impl Session {
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("a session's runtime until it drops")
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
+        // Python may free a session while another one runs a query, inside
+        // that one's runtime, where a blocking shutdown is not allowed
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
         if self.owns_engine {
             Python::attach(|py| {
                 // a close that fails leaves nothing this session can release

@@ -38,7 +38,6 @@ from starlette.routing import Route
 
 from quail.api import RefusalError, Session
 from quail.api.config import EngineConfig
-from quail.api.query import Query
 from quail.builtins import built_in_registry
 from quail.common.expressions import CompileError
 from quail.execution.result import iter_rows
@@ -242,11 +241,11 @@ class Server:
                 session.register(name, resolve(input_spec, snapshot_paths))
             query = session.sql(spec["sql"], order=spec.get("order"),
                                 dialect=spec.get("dialect") or "snowflake")
-            if not isinstance(query, Query):
+            if query.num_regions != 1:
                 raise CompileError(
-                    "Quail Server runs a query that is one model region; this "
-                    "one needs SQL around its regions, which Session.sql runs "
-                    "in your process")
+                    "Quail Server runs a query of one model region; this one "
+                    "needs SQL around its regions, which Session.sql runs in "
+                    "your process")
         except (CompileError, ValueError, RefusalError) as error:
             raise InvalidRequestError(
                 f"{type(error).__name__}: {error}") from error

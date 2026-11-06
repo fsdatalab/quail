@@ -4,23 +4,22 @@ from __future__ import annotations
 
 import json
 import time
-from contextlib import closing
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import _quail_native
 import pyarrow as pa
 
+from quail.api.compile import READ_AS_SQL
 from quail.api.execute import execute_query
 from quail.api.region_inputs import input_scans
-from quail.catalog.providers import ScanRequest
 from quail.common.expressions import (
     CompileError,
     evaluate_expression,
     source_columns,
 )
 from quail.common.pairs import FIRST_DOCUMENT, columns_key
-from quail.common.tokens import ColumnStore, ScanInput, TokenLengths, TokenStore
+from quail.common.tokens import ColumnStore, ScanInput, TokenStore
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
 from quail.execution.projection import projection_for
 from quail.execution.result import QueryResult
@@ -106,18 +105,197 @@ class QueryLike(Protocol):
 
 
 class Query:
-    """A compiled query that plans and executes in the current process."""
+    """A SQL query that DataFusion plans and runs, with Quail running its model regions.
 
-    def __init__(self, session: "Session", logical: str,
-                 order: str | None = None, *, catalog=None, assumed_rows=None,
-                 text: str | None = None, dialect: str = "snowflake",
-                 whole: bool = True):
+    Rust's session parses and binds the SQL, plans each model region in
+    Rust, and runs every operator outside the regions; the Python
+    executor runs each planned region. A query of one model region also
+    offers that region's ``RegionQuery`` attributes, such as ``logical``.
+
+    Args:
+        session: The session whose tables and model the query uses.
+        text: The SQL statement.
+        dialect: "snowflake" or "bq".
+        order: The stage order rule each region is planned with.
+    """
+
+    def __init__(self, session: "Session", text: str, dialect: str = "snowflake",
+                 order: str | None = None):
         self.session = session
-        # the SQL the plan was compiled from, which DataFusion runs; the
-        # plan is its one model region, the whole query or not
         self.text = text
         self.dialect = dialect
-        self.whole = whole
+        self.order = order
+        self._regions = None
+        self._whole = None
+        self._bound = None
+
+    def _native(self, run_query=None, physical_executor=None):
+        from quail.api.context import SessionContext
+
+        return SessionContext(self.session, physical_executor, order=self.order,
+                              run_query=run_query)._native
+
+    def _dialect(self) -> str:
+        from quail.api.compile import DATAFUSION_DIALECTS
+
+        return DATAFUSION_DIALECTS[self.dialect]
+
+    def bound_whole(self) -> bool:
+        """Bind the SQL and return whether one model region is the whole query.
+
+        Raises:
+            CompileError: The SQL does not bind.
+        """
+        if self._whole is None:
+            native = self._native()
+            model = self.session.model
+            try:
+                bound, self._whole = native.logical_plans(
+                    self.text, tuple(model.turn), model.prompt_layout, self._dialect())
+            except RuntimeError as error:
+                from quail.api.compile import compile_message
+
+                raise CompileError(compile_message(error, self.text)) from None
+            for _, message in bound:
+                if message is not None and READ_AS_SQL not in message:
+                    raise CompileError(message)
+            self._bound = bound
+        return self._whole
+
+    @property
+    def whole(self) -> bool:
+        """Whether the query is one model region, with no SQL around it."""
+        return self.bound_whole()
+
+    @property
+    def num_regions(self) -> int:
+        """The model regions DataFusion hands Quail, before any is planned."""
+        self.bound_whole()
+        return len(self._bound)
+
+    @property
+    def logical(self) -> str:
+        """The one model region's logical plan as bound, before planning."""
+        self.bound_whole()
+        if len(self._bound) != 1:
+            raise AttributeError(
+                f"the query has {len(self._bound)} model regions; use regions()")
+        ((plan, message),) = self._bound
+        if message is not None:
+            return self._region().logical
+        return plan
+
+    def regions(self) -> list["RegionQuery"]:
+        """Plan each model region once and return them, in plan order.
+
+        Raises:
+            CompileError: The SQL does not bind.
+        """
+        if self._regions is None:
+            from quail.api.region_inputs import region_query
+
+            self.bound_whole()
+            try:
+                found = self._native().plans(self.text, self._dialect())
+            except RuntimeError as error:
+                from quail.api.compile import compile_message
+
+                raise CompileError(compile_message(error, self.text)) from None
+            regions = []
+            for kind, payload, planned in found:
+                if kind == "sql":
+                    inner = self.session.sql(payload, order=self.order)
+                    regions.extend(inner.regions())
+                    continue
+                region = region_query(self.session, payload, order=self.order)
+                if planned is not None:
+                    region.adopt_plan(json.loads(planned))
+                regions.append(region)
+            self._regions = regions
+        return self._regions
+
+    def _region(self) -> "RegionQuery":
+        regions = self.regions()
+        if len(regions) != 1:
+            raise AttributeError(
+                f"the query has {len(regions)} model regions; use regions()")
+        return regions[0]
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self._region(), name)
+
+    def plan(self):
+        """Return the physical plan, or Refusal, of the query's model region.
+
+        A query with several model regions returns each one's, in a tuple.
+        """
+        plans = tuple(region.plan() for region in self.regions())
+        return plans[0] if len(plans) == 1 else plans
+
+    def explain(self, *, verbose: bool = False, analyze: bool = False) -> str:
+        """Return DataFusion's plan around the regions, then each region's plan.
+
+        Args:
+            verbose: Include runtime settings and internal node fields.
+            analyze: Run the query first, like EXPLAIN ANALYZE, and show
+                each node's measured rows, time, and tokens beside the
+                planner's estimates.
+        """
+        regions = self.regions()
+        result = self.run() if analyze else None
+        if result is not None and len(regions) == 1:
+            texts = [regions[0]._explain(result, verbose)]
+        else:
+            texts = [region._explain(None, verbose) for region in regions]
+        if len(regions) == 1 and self._whole and not regions[0].has_inputs():
+            return texts[0]
+        around = (result.datafusion_plan if result is not None
+                  and result.datafusion_plan is not None
+                  else self._native().explain(self.text, self._dialect()))
+        if len(texts) == 1:
+            return f"DataFusion:\n{around}\n\nmodel region:\n{texts[0]}"
+        return "\n\n".join([around, *(f"model region {index + 1}:\n{text}"
+                                       for index, text in enumerate(texts))])
+
+    def run(self, plan=None, *, physical_executor=None) -> QueryResult:
+        """Execute the query in the current process.
+
+        Args:
+            plan: An edited PhysicalPlan of the query's one model region,
+                from plan().insert(), remove(), or move(); the planner's
+                own plan when omitted.
+            physical_executor: Optional callable(PhysicalRequest) that
+                returns the PhysicalResponse, for tests without a GPU.
+        """
+        if physical_executor is None:
+            return execute_query(self, plan=plan)
+        return execute_query(self, physical_executor=physical_executor, plan=plan)
+
+    def submit(self, **_options):
+        """Submitting needs Quail Server; local queries use run()."""
+        raise RuntimeError(
+            "submit() needs a Session with an endpoint; this session runs "
+            "queries in the current process, so call run() or collect()")
+
+    def execute_stream(self, batch_rows: int = 65_536,
+                       limit: int | None = None) -> pa.RecordBatchReader:
+        """Execute the query and stream Arrow record batches."""
+        return self.run().execute_stream(batch_rows=batch_rows, limit=limit)
+
+    def collect(self, limit: int | None = None,
+                batch_rows: int = 65_536) -> pa.Table:
+        """Execute the query and collect one Arrow table."""
+        return self.run().collect(limit=limit, batch_rows=batch_rows)
+
+
+class RegionQuery:
+    """One model region of a query: its plan, and its run in this process."""
+
+    def __init__(self, session: "Session", logical: str,
+                 order: str | None = None, *, catalog=None, assumed_rows=None):
+        self.session = session
         self.catalog = session.catalog if catalog is None else catalog
         # rows of each input table not yet computed, as a CTE's before it
         # runs, by table name
@@ -162,7 +340,6 @@ class Query:
         planning and the speed of light estimate share these stores.
         """
         self.plan()
-        self.wait_for_tokens()
         return self._token_inputs
 
     def plan(self):
@@ -178,48 +355,12 @@ class Query:
         """
         if self._plan is not None:
             return self._plan
-        if not self.facts()["asks_model"]:
-            (scan,) = self.facts()["scans"]
-            num_documents = self.assumed_rows.get(
-                scan["provider"],
-                self.catalog.get(scan["provider"]).statistics().num_rows)
-            self._plan = self._relational_plan(num_documents or 0)
-            return self._plan
-        self._planning_started_at = time.perf_counter()
-        self._plan = self._plan_in_rust()
-        self._planning_finished_at = time.perf_counter()
-        self._searched_plan = self._plan
-        return self._plan
-
-    def _plan_in_rust(self):
-        """Tokenize, measure, and plan the region in Rust.
-
-        Rust writes each scan's token store and value columns; the query
-        reads them as its inputs.
-        """
-        tables = {}
-        for scan in self.facts(self._logical_input)["scans"]:
-            name = scan["provider"]
-            if name in tables:
-                continue
-            provider = self.catalog.get(name)
-            with closing(provider.scan(ScanRequest(
-                    columns=tuple(provider.columns)))) as reader:
-                table = reader.read_all()
-            # a registered table's rows are the same for every query
-            identity = (provider.content_identity()
-                        if name in self.session.catalog
-                        else self.input_identities.get(name))
-            tables[name] = (identity, table)
+        # Rust plans every region a backend accepts as the query runs
         refusal = backend_refusal(self.session)
-        if refusal is not None:
-            return refusal
-        found, message = self.session.planner.plan(
-            self._logical_input, tables,
-            json.dumps(planning_settings(self.session, self.order)))
-        if message is not None:
-            raise CompileError(message)
-        return self.adopt_plan(json.loads(found))
+        if refusal is None:
+            raise RuntimeError("a model region is planned by Rust's session")
+        self._plan = self._searched_plan = refusal
+        return refusal
 
     def _adopt_scans(self, found: dict) -> None:
         """Read the token store and column files Rust wrote as the inputs."""
@@ -300,57 +441,11 @@ class Query:
                        rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
-        has_inputs = input_scans(self.facts(self._logical_input), self.session.catalog)
-        if self.text is not None and (not self.whole or has_inputs):
-            from quail.api.context import SessionContext
-
-            around = (result.datafusion_plan if result is not None
-                      and result.datafusion_plan is not None
-                      else SessionContext(self.session).explain(
-                          self.text, self.dialect))
-            text = f"DataFusion:\n{around}\n\nmodel region:\n{text}"
         return text
 
-    def wait_for_tokens(self) -> None:
-        """Read a relational stage's value columns.
-
-        A model region's token stores are written when it is planned.
-        """
-        if not self.facts()["asks_model"]:
-            self._prepare_relational()
-
-    def _prepare_relational(self):
-        """Read a relational stage's value columns without tokenizing them."""
-        if self._token_inputs is not None:
-            return
-        (scan,) = self.facts()["scans"]
-        provider = self.catalog.get(scan["provider"])
-        columns = tuple(self.facts()["relational_columns"])
-        with closing(provider.scan(ScanRequest(columns=columns))) as reader:
-            table = reader.read_all()
-        self._token_inputs = {scan["alias"]: table}
-        self._document_tokens = {scan["alias"]: TokenLengths([0] * table.num_rows)}
-        self._plan = self._relational_plan(table.num_rows)
-
-    def _relational_plan(self, num_documents: int):
-        """Plan a stage that asks no model."""
-        config = self.session.config
-        fields = {
-            "model": untagged(encode_value(self.session.model)),
-            "device": untagged(encode_value(self.session.device)),
-            "gpus": config.gpus, "canvas_draws": config.canvas_draws,
-            "document_tokens": {}, "plan": None, "attention": None,
-            "backend": config.backend,
-        }
-        found, message = _quail_native.plan_operator(
-            "relational_plan", json.dumps(fields),
-            json.dumps({"plan": json.loads(self.logical),
-                        "num_documents": num_documents}),
-            lambda _text: [])
-        if message is not None:
-            raise CompileError(message)
-        return plan_from_json({"envelope": json.loads(found), "logical": self.logical},
-                              self.session.registry.codecs)
+    def has_inputs(self) -> bool:
+        """Whether the region reads a table the session did not register."""
+        return bool(input_scans(self.facts(self._logical_input), self.session.catalog))
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
@@ -362,28 +457,9 @@ class Query:
         """
         return execute_query(self, plan=plan)
 
-    def submit(self, **_options):
-        """Submitting needs Quail Server; local queries use run()."""
-        raise RuntimeError(
-            "submit() needs a Session with an endpoint; this session runs "
-            "queries in the current process, so call run() or collect()")
-
-    def execute_stream(self, batch_rows: int = 65_536,
-                       limit: int | None = None) -> pa.RecordBatchReader:
-        """Execute the query and stream Arrow record batches."""
-        return self.run().execute_stream(
-            batch_rows=batch_rows, limit=limit)
-
-    def collect(self, limit: int | None = None,
-                batch_rows: int = 65_536) -> pa.Table:
-        """Execute the query and explicitly collect one Arrow table."""
-        return self.run().collect(
-            limit=limit, batch_rows=batch_rows)
-
     def _prepare_physical(self):
         """Bind the query's tokenized inputs to its physical plan."""
         self.plan()
-        self.wait_for_tokens()
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)

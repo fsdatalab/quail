@@ -3,16 +3,14 @@
 
 use std::collections::BTreeMap;
 
-use quail_physical::{Projected, SortExpression, ValueExpression};
 use serde_json::{Value, json};
 
 use crate::LogicalPlan;
 use crate::costs::join_conditions;
 use crate::expressions::{argument_alias, call_aliases, column_references, tests};
 use crate::graph::filter_stop_keys;
-use crate::logical::LogicalNode;
 use crate::nodes::{asked_call, column_call};
-use crate::operators::{operators, projection};
+use crate::operators::operators;
 use crate::plan_statistics::plan_prompts;
 
 /// A region's facts as JSON:
@@ -23,8 +21,6 @@ use crate::plan_statistics::plan_prompts;
 /// - `value_columns`: alias -> the columns the executor reads by
 ///   document id: join equalities, regular predicates, tests of labels
 ///   and answers on the table's own columns, and DISTINCT stop keys;
-/// - `relational_columns`: the source columns a region that asks no
-///   model reads: its projection, sort keys, and predicates;
 /// - `stop_keys`: alias -> its DISTINCT stop key;
 /// - `join_conditions`: for each join with equalities, its written
 ///   position, its two aliases, and each equality's sides in that
@@ -159,39 +155,5 @@ pub fn region_facts(plan: &LogicalPlan) -> Value {
         "join_conditions": oriented,
         "scans": scans,
         "value_columns": value_columns,
-        "relational_columns": relational_columns(plan),
     })
-}
-
-/// The source columns a region that asks no model reads, in first-read
-/// order: its projection, its sort keys, and its scans' predicates.
-fn relational_columns(plan: &LogicalPlan) -> Vec<String> {
-    let mut expressions: Vec<&ValueExpression> = Vec::new();
-    if let LogicalNode::Project(project) = projection(plan) {
-        expressions.extend(project.columns.iter().filter_map(|column| match column {
-            Projected::Expression(expression) => Some(expression),
-            Projected::Name(_) => None,
-        }));
-    }
-    if let LogicalNode::Result(result) = &plan.root {
-        expressions.extend(result.order.iter().map(|key| {
-            let SortExpression::Value(value) = &key.expression;
-            value
-        }));
-    }
-    let found = operators(plan);
-    for scan in &found.scans {
-        for predicate in &scan.predicates {
-            expressions.extend(tests(predicate).into_iter().map(|test| &test.expression));
-        }
-    }
-    let mut columns: Vec<String> = Vec::new();
-    for expression in expressions {
-        for reference in column_references(expression) {
-            if !columns.contains(&reference.column) {
-                columns.push(reference.column);
-            }
-        }
-    }
-    columns
 }

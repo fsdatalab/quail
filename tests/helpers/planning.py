@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import _quail_native
 
-from quail.api.compile import compile_with_datafusion
+from quail.api.compile import DATAFUSION_DIALECTS
 from quail.builtins import PHYSICAL_RULES
 from quail.common.expressions import CompileError
 from quail.physical.codec import built_in_codecs, encode_value, untagged
@@ -78,6 +78,34 @@ def _plan(logical, document_tokens, model=QWEN3_4B_FP8, gpus=1, order=None,
     return search(placements(logical), fields)
 
 
+class _CompilingEngine:
+    """An engine that binds model regions and runs none."""
+
+    def __init__(self, model):
+        self.turn, self.layout = tuple(model.turn), model.prompt_layout
+        self.rules = None
+
+    def run_region(self, *_request):
+        raise RuntimeError("compiling a query runs no model region")
+
+
 def compile_sql(sql, catalog, dialect="snowflake", model=QWEN3_4B_FP8):
-    """Compile SQL against a catalog, as a session on the model does."""
-    return compile_with_datafusion(sql, catalog, model, dialect=dialect)
+    """Bind SQL against a catalog's schemas and return its one region's plan."""
+    import pyarrow as pa
+
+    def refuse(_columns):
+        raise RuntimeError("compiling a query scans no table")
+
+    native = _quail_native.NativeSession(_CompilingEngine(model))
+    for name, provider in catalog.providers.items():
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, provider.schema()):
+            pass
+        native.register(name, sink.getvalue().to_pybytes(), refuse,
+                        getattr(provider, "id_col", None) or None)
+    (region,), _ = native.logical_plans(sql, tuple(model.turn), model.prompt_layout,
+                                        DATAFUSION_DIALECTS[dialect])
+    plan, message = region
+    if message is not None:
+        raise CompileError(message)
+    return plan

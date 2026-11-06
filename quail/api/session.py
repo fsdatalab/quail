@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
 
 import _quail_native
 
-from quail.api.compile import SQLDialect, compile_region
+from quail.api.compile import SQLDialect
 from quail.api.config import EngineConfig, resolve_model
 from quail.api.query import QueryLike
 from quail.builtins import built_in_registry
@@ -120,39 +119,20 @@ class Session:
         """Compile SQL locally or prepare it for remote submission.
 
         Returns:
-            A local ``Query`` when the session has no endpoint, or a
-            ``DataFusionQuery`` when DataFusion runs SQL around the
-            query's model regions. A remote session returns
-            ``RemoteQuery`` and the server compiles the SQL.
+            A ``Query`` that this process plans and runs, or a
+            ``RemoteQuery`` the server compiles when the session has an
+            endpoint.
         """
         if self._remote is not None:
             from quail.remote.client import RemoteQuery
 
             return RemoteQuery(self, text, order=order,
                                dialect=SQLDialect(dialect).value)
-        compiled = compile_region(
-            text, self.catalog, self.model,
-            dialect=SQLDialect(dialect).value,
-            rules=[rule.name for rule in self.registry.logical_rules.values()])
-        if compiled is None:
-            from quail.api.context import DataFusionQuery
+        from quail.api.query import Query
 
-            return DataFusionQuery(self, text, SQLDialect(dialect).value, order=order)
-        from quail.api.region_inputs import input_scans, region_query
-
-        logical, whole = compiled
-        tables = None
-        if input_scans(json.loads(_quail_native.region_facts(logical)), self.catalog):
-            from quail.api.compile import DATAFUSION_DIALECTS
-            from quail.api.context import SessionContext
-
-            # DataFusion computes the region's plain inputs now, so the
-            # region plans on its real rows
-            (tables,) = SessionContext(self)._native.region_inputs(
-                text, DATAFUSION_DIALECTS[SQLDialect(dialect).value])
-        return region_query(self, logical, order=order, text=text,
-                            dialect=SQLDialect(dialect).value, whole=whole,
-                            tables=tables)
+        query = Query(self, text, SQLDialect(dialect).value, order=order)
+        query.bound_whole()     # a statement that does not bind fails here
+        return query
 
     def get_run(self, query_id: str):
         """Reattach to a query the server already accepted.
@@ -167,6 +147,15 @@ class Session:
         return self._remote.run(query_id)
 
     @property
+    def tokenizer_file(self) -> str:
+        """Return the path of the model's ``tokenizer.json``."""
+        from pathlib import Path
+
+        directory = self._tokenizer_directory or resolve_model_path(
+            self.model.hf_name, self.model.revision, include_weights=False)
+        return str(Path(directory) / "tokenizer.json")
+
+    @property
     def planner(self):
         """Return the Rust planner of this session's regions, made when first used.
 
@@ -174,14 +163,7 @@ class Session:
         token stores of the tables its queries read whole.
         """
         if getattr(self, "_planner", None) is None:
-            from pathlib import Path
-
-            import _quail_native
-
-            directory = self._tokenizer_directory or resolve_model_path(
-                self.model.hf_name, self.model.revision, include_weights=False)
-            self._planner = _quail_native.NativePlanner(
-                str(Path(directory) / "tokenizer.json"))
+            self._planner = _quail_native.NativePlanner(self.tokenizer_file)
         return self._planner
 
     @property

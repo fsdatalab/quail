@@ -1934,68 +1934,6 @@ pub fn plan_region(plan: &LogicalPlan, context: &PlanningContext) -> Result<Plan
     Ok(Ok(physical))
 }
 
-/// The plan of a stage that asks no model: its one table's scan and the
-/// result nodes, as `relational_plan`.
-///
-/// # Panics
-///
-/// The plan reads more or less than one table.
-pub fn relational_plan(
-    plan: &LogicalPlan,
-    num_documents: i64,
-    context: &PlanningContext,
-) -> quail_physical::PlanEnvelope {
-    let found = operators(plan);
-    let scan = &found.scans[0];
-    let scan_id = format!("scan:{}", scan.alias);
-    let mut nodes = vec![PhysicalNode::Scan(tagged_node(
-        &scan_id,
-        &[],
-        ScanAttributes {
-            alias: scan.alias.clone(),
-            input_id: scan.alias.clone(),
-            num_documents,
-            total_tokens: 0,
-            shard_ranges: Vec::new(),
-            shard_token_loads: Vec::new(),
-            predicates: scan.predicates.clone(),
-            expected_rows: None,
-        },
-    ))];
-    let LogicalNode::Project(project) = projection(plan) else {
-        unreachable!("a projection")
-    };
-    let columns: Vec<String> = project.columns.iter().map(projected_name).collect();
-    let root = &plan.root;
-    let result = match root {
-        LogicalNode::Result(result) => result.clone(),
-        other => ResultNode {
-            input: Box::new(other.clone()),
-            limit: None,
-            order: Vec::new(),
-            offset: 0,
-            distinct: false,
-        },
-    };
-    nodes.extend(result_nodes(
-        plan,
-        &result,
-        &[port_of(&scan_id, format!("rows:{}", scan.alias))],
-        &columns,
-        &packing(&project.structs),
-    ));
-    let last = nodes.last().expect("a node");
-    let root = port_of(last.id(), last.outputs()[0].0.clone());
-    quail_physical::PlanEnvelope {
-        backend: context.backend.clone(),
-        model: context.model.name.clone(),
-        device: context.device.name.clone(),
-        gpus: context.gpus,
-        settings: Map::new(),
-        graph: quail_physical::PhysicalGraph { nodes, root },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::contiguous_shards;

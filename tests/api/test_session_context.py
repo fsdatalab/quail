@@ -131,12 +131,12 @@ def test_session_sql_runs_a_query_that_needs_sql_around_its_model_region(context
     assert "Union" in query.explain() and "model region:" in query.explain()
     table = finish(query, ORACLE).collect()
     assert _rows(table) == [("a0",), ("a1",), ("r0",), ("r2",), ("r3",)]
-    # two model regions: a DataFusionQuery
+    # two model regions
     two = context.session.sql(
         "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
         "UNION ALL SELECT r.id FROM reviews r "
         "WHERE AI_FILTER(PROMPT('q2: {0}', r.body)) ORDER BY id")
-    assert isinstance(two, quail.api.context.DataFusionQuery)
+    assert two.num_regions == 2
     assert len(two.plan()) == 2
 
 

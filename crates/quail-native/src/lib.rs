@@ -127,6 +127,26 @@ impl NativeSession {
         .map_err(python_error)
     }
 
+    /// Plan each model region of a query without running it: per region,
+    /// (kind, its logical plan as JSON or its SQL, its planned region as
+    /// JSON or None when Python plans it).
+    #[pyo3(signature = (query, dialect=None))]
+    #[allow(clippy::type_complexity)]
+    fn plans(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        dialect: Option<String>,
+    ) -> PyResult<Vec<(String, String, Option<String>)>> {
+        let found = py
+            .detach(|| self.session.plans(query, dialect.as_deref()))
+            .map_err(python_error)?;
+        Ok(found
+            .into_iter()
+            .map(|(kind, payload, planned)| (kind.to_string(), payload, planned))
+            .collect())
+    }
+
     /// Return the inputs of each model region of a query that call no
     /// model, as dicts of pyarrow Tables by input name.
     #[pyo3(signature = (query, dialect=None))]
@@ -560,13 +580,6 @@ fn plan_operator<'py>(
                     }))
                 });
             lowering_result(edited)
-        }
-        "relational_plan" => {
-            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
-            let num_documents = get("num_documents").as_i64().unwrap_or_default();
-            lowering_result(Ok::<_, quail_planner::CompileError>(
-                quail_planner::graph::relational_plan(&plan, num_documents, &context),
-            ))
         }
         "search_plan" => {
             let alternatives: Vec<(quail_planner::LogicalPlan, Vec<String>)> =

@@ -13,8 +13,6 @@ from enum import StrEnum
 
 import pyarrow as pa
 
-from quail.common.expressions import CompileError
-
 
 class SQLDialect(StrEnum):
     """The SQL dialects Quail accepts."""
@@ -56,7 +54,7 @@ def _sql_text(expression: str) -> str:
     return re.sub(r"\bai_(\w+)\(", lambda match: f"AI_{match[1].upper()}(", expression)
 
 
-def _message(error: Exception, sql: str) -> str:
+def compile_message(error: Exception, sql: str) -> str:
     """A DataFusion error's message, in the front end's words where it has them."""
     lines = str(error).splitlines()
     # an optimizer rule's error names the rule, then its cause
@@ -81,83 +79,3 @@ def _message(error: Exception, sql: str) -> str:
         return (f"{_sql_text(found[1])} is not supported; a regular predicate is "
                 f"{REGULAR_PREDICATES}")
     return text
-
-
-def compile_with_datafusion(sql: str, catalog, model,
-                            dialect: str = "snowflake",
-                            rules=None) -> str | None:
-    """Compile AI SQL text into its model region's logical plan, as JSON.
-
-    Returns:
-        The plan of the query's one model region, or None when the query
-        has more than one (see ``DataFusionQuery``).
-
-    Raises:
-        CompileError: The query is invalid or uses unsupported SQL.
-    """
-    compiled = compile_region(sql, catalog, model, dialect, rules)
-    return None if compiled is None else compiled[0]
-
-
-class _CompilingEngine:
-    """The engine of a session that binds regions and runs none."""
-
-    def __init__(self, model, rules):
-        self.turn = tuple(model.turn)
-        self.layout = model.prompt_layout
-        self.rules = None if rules is None else list(rules)
-
-    def run_region(self, *_request):
-        raise RuntimeError("compiling a query runs no model region")
-
-
-def compile_region(sql: str, catalog, model, dialect: str = "snowflake",
-                   rules=None) -> tuple[str, bool] | None:
-    """Compile AI SQL text into the logical plan of its one model region.
-
-    The plan is Rust's JSON.
-
-    Args:
-        sql: The statement.
-        catalog: Registered tables and their schemas.
-        model: The model whose chat turn and prompt layout the prompts
-            are bound in.
-        dialect: "snowflake" or "bq".
-        rules: The names of the optimizer rules each model region runs,
-            in order, or None for the built-in rules.
-
-    Returns:
-        The region's plan and whether the region is the whole query, or
-        None when the query has no model region, which DataFusion runs
-        alone, or more than one.
-
-    Raises:
-        CompileError: The query is invalid or uses unsupported SQL.
-    """
-    import _quail_native
-
-    def refuse(columns):
-        raise RuntimeError("compiling a query scans no table")
-
-    context = _quail_native.NativeSession(_CompilingEngine(model, rules))
-    for name, provider in catalog.providers.items():
-        context.register(name, _schema_bytes(provider.schema()), refuse,
-                         getattr(provider, "id_col", None) or None)
-    try:
-        regions, whole = context.logical_plans(
-            sql, tuple(model.turn), model.prompt_layout,
-            DATAFUSION_DIALECTS[str(dialect).lower()])
-    except RuntimeError as error:
-        raise CompileError(_message(error, sql)) from None
-    if len(regions) != 1:
-        for _, message in regions:
-            # a region the binder does not read runs as SQL of its own
-            if message is not None and READ_AS_SQL not in message:
-                raise CompileError(message)
-        return None
-    plan, message = regions[0]
-    if message is not None:
-        if not whole and READ_AS_SQL in message:
-            return None
-        raise CompileError(message)
-    return plan, whole

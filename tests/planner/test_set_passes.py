@@ -193,7 +193,6 @@ def test_a_d1_filter_ends_each_document_joined_with_its_question(tmp_path):
         "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('Is it kind? {0}', r.body))")
     # the first plan estimates lengths; the plan over exact tokens ends documents
     query.plan()
-    query.wait_for_tokens()
     plan = query.plan()
 
     (node,) = [node for node in plan.nodes if isinstance(node, AiFilter)]

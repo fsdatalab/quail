@@ -25,9 +25,7 @@ use quail_datafusion::{
 use quail_planner::prompts::Turn;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::planning::{
-    DOCUMENT_EXPRESSION, PlanOutcome, Planner, Settings, TableRows, planned_json,
-};
+use crate::planning::{PlanOutcome, Planner, Settings, TableRows, planned_json};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 
 /// Runs each model region by calling the engine's
@@ -124,9 +122,31 @@ impl PythonRunner {
                 Ok(Some(crate::planning::refused_json(&refused).to_string()))
             }
             Ok(PlanOutcome::Fixed(plan)) => Ok(Some(plan.to_string())),
-            Err(error) if error.0.starts_with(DOCUMENT_EXPRESSION) => Ok(None),
             Err(error) => Err(DataFusionError::Plan(format!("CompileError: {}", error.0))),
         }
+    }
+
+    /// Plan a region without running it, over the rows of its inputs that
+    /// call no model; an input that calls a model plans as empty.
+    ///
+    /// Returns ("plan", the planned region as JSON), ("plan", the logical
+    /// plan) when Rust leaves the region to Python, or ("sql", its SQL).
+    pub(crate) fn plan_only(
+        &self,
+        region: &ModelRegion,
+        inputs: &[InputRows],
+    ) -> Result<(&'static str, String, Option<String>)> {
+        let (kind, payload) = self.request(region)?;
+        if kind != "plan" {
+            return Ok((kind, payload, None));
+        }
+        let sorted = inputs
+            .iter()
+            .zip(&region.inputs)
+            .map(|((name, batches), input)| Ok((name.clone(), in_source_order(input, batches)?)))
+            .collect::<Result<Vec<InputRows>>>()?;
+        let planned = self.plan_here(region, &sorted, &payload, None)?;
+        Ok((kind, payload, planned))
     }
 
     /// Run the region on this thread.

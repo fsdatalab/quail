@@ -42,7 +42,6 @@ def test_every_quailb_query_plans_as_its_snapshot(tmp_path):
             # a plan made before the tokens are counted uses a sample's
             # estimate; waiting re-plans it on the exact counts
             query.plan()
-            query.wait_for_tokens()
             text = query.explain() + "\n"
             path = SNAPSHOTS / f"{query_id}.txt"
             if update:

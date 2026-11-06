@@ -67,6 +67,11 @@ class Engine:
         return [rule.name for rule in self.session.registry.logical_rules.values()]
 
     @property
+    def tokenizer_file(self) -> str:
+        """The model's ``tokenizer.json``, which Rust plans regions with."""
+        return self.session.tokenizer_file
+
+    @property
     def settings(self) -> str | None:
         """The configuration Rust plans regions for, as JSON.
 

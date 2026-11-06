@@ -115,10 +115,9 @@ def execute_query(query, physical_executor=None, plan=None,
         on_execution_ready: Optional callback after backend preparation and
             immediately before query execution.
     """
-    if not hasattr(query, "logical"):
-        # a query DataFusion runs plans each model region as it runs
-        return query.run(plan, physical_executor=physical_executor)
-    if getattr(query, "text", None) is not None:
+    from quail.api.query import Query
+
+    if isinstance(query, Query):
         return _execute_in_datafusion(query, physical_executor, plan,
                                       on_backend_ready, on_execution_ready)
     return _execute_region(query, physical_executor, plan,
@@ -127,24 +126,22 @@ def execute_query(query, physical_executor=None, plan=None,
 
 def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
                            on_execution_ready):
-    """Run a query's SQL in DataFusion, whose model region runs this query.
+    """Run a query's SQL in DataFusion, which calls back for each model region.
 
-    DataFusion's ModelRegionExec calls back once, for the query's one
-    model region. The result holds DataFusion's rows with the region's
-    plan, metrics, and answers.
+    The result holds DataFusion's rows. A query of one model region also
+    carries that region's plan, metrics, and answers, and, when the region
+    is the whole query, the region's own rows, which keep Quail's added
+    columns such as a label's probabilities.
     """
     from quail.api.context import SessionContext
 
-    results = []
+    whole = query.bound_whole()
+    results, region_tables, region_s = [], [], []
     started = time.perf_counter()
-    region_s, region_tables = [], []
 
     def run_query(region):
-        if results:
-            raise RuntimeError("the query's one model region runs once")
-        if plan is not None:
-            # an edited plan runs over the rows the query was planned on
-            region = query
+        if plan is not None and results:
+            raise RuntimeError("an edited plan is for a query of one model region")
         region_started = time.perf_counter()
         result = _execute_region(region, physical_executor, plan,
                                  on_backend_ready, on_execution_ready)
@@ -154,26 +151,24 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
         region_tables.append(table)
         return table
 
-    context = SessionContext(query.session, run_query=run_query)
+    context = SessionContext(query.session, order=query.order, run_query=run_query)
     table = context.sql(query.text, query.dialect)
+    if len(results) != 1:
+        return QueryResult.from_table(table)
     (region,) = results
     # the time outside the region: building the context, planning the
     # SQL, gathering the region's rows, and the operators around it
     region.report["datafusion_s"] = round(
         time.perf_counter() - started - region_s[0], 4)
-    # the result is the rows already gathered, with the region's plan,
-    # metrics, and answers: the region's own when it is the whole query,
-    # which keep Quail's added columns such as a label's probabilities,
-    # or DataFusion's
-    returned = region_tables[0] if query.whole else table
-    result = QueryResult.from_table(returned, report=region.report)
+    result = QueryResult.from_table(region_tables[0] if whole else table,
+                                    report=region.report)
     result.plan = region.plan
     result.node_metrics = region.node_metrics
     result.answer_tables = region.answer_tables
     result.survivor_indices = region.survivor_indices
     result.true_join_tables = region.true_join_tables
     result.region_rows = region_tables[0].num_rows
-    if not query.whole:
+    if not whole:
         result.datafusion_plan = context.explain(query.text, query.dialect)
     return result
 
@@ -210,7 +205,6 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
         _prepare_backend(plan, query.session.registry)
     if has_compute and on_backend_ready is not None:
         on_backend_ready()
-    query.wait_for_tokens()
     physical_prepare_started = time.perf_counter()
     request = query._prepare_physical() if has_compute else None
     physical_prepare_s = time.perf_counter() - physical_prepare_started

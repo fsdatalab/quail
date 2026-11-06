@@ -36,7 +36,6 @@ def _session(bodies=BODIES, hotels=HOTELS):
 def _planned(query):
     """The plan over the exact tokens; the first plan estimates lengths."""
     query.plan()
-    query.wait_for_tokens()
     return query.plan()
 
 
