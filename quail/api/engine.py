@@ -94,12 +94,20 @@ class Engine:
 
         Args:
             planned: The planned region as JSON: its physical plan, the
-                logical plan it lowers, and each scan's files.
+                logical plan it lowers, and each scan's files; or its
+                refusal.
             tables: The rows of each table the region reads, by name.
+
+        Raises:
+            RefusalError: No configuration can run the region.
         """
         from quail.api.region_inputs import region_query
+        from quail.physical.plan import Refusal, RefusalError
 
         found = json.loads(planned)
+        if "refusal" in found:
+            fields = found["refusal"]
+            raise RefusalError(Refusal(**{**fields, "reasons": tuple(fields["reasons"])}))
         logical = decode_value(LogicalPlan, json.loads(found["logical"]))
         query = region_query(self.session, logical, order=self._order,
                              tables=tables, keep_order=True)

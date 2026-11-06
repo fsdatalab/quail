@@ -727,10 +727,7 @@ fn json_value<T: serde::de::DeserializeOwned>(found: serde_json::Value) -> PyRes
 
 /// A refusal, as the test helpers compare it.
 fn refusal_fields(refusal: &quail_planner::search::Refusal) -> serde_json::Value {
-    serde_json::json!({"refusal": {
-        "reasons": refusal.reasons, "constraint": refusal.constraint,
-        "needed": refusal.needed, "available": refusal.available, "unit": refusal.unit,
-    }})
+    serde_json::json!({"refusal": quail::planning::refusal_json(refusal)})
 }
 
 /// An operator order, or its refusal, as the test helpers compare it.
@@ -1003,8 +1000,11 @@ impl NativePlanner {
         let found = py.detach(|| self.planner.plan(logical, &rows, &settings));
         let planned = match found {
             Ok(Ok(planned)) => planned,
-            Ok(Err(refusal)) => {
-                return Ok((Some(refusal_fields(&refusal).to_string()), None));
+            Ok(Err(refused)) => {
+                return Ok((
+                    Some(quail::planning::refused_json(&refused).to_string()),
+                    None,
+                ));
             }
             Err(error) => return Ok((None, Some(error.0))),
         };

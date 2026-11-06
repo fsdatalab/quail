@@ -118,7 +118,7 @@ impl PythonRunner {
                     .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?
                     .to_string(),
             )),
-            Ok(Err(_)) => Ok(None),
+            Ok(Err(refused)) => Ok(Some(crate::planning::refused_json(&refused).to_string())),
             Err(error) if error.0.starts_with(DOCUMENT_EXPRESSION) => Ok(None),
             Err(error) => Err(DataFusionError::Plan(format!("CompileError: {}", error.0))),
         }

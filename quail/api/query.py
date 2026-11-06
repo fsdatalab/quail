@@ -316,31 +316,30 @@ class Query:
                 # Python tokenizes a document that is an expression
                 return None
             raise CompileError(message)
-        found = json.loads(found)
-        if "refusal" in found:
-            # a refused region takes Python's path, which still tokenizes
-            # its tables for the speed-of-light estimate
-            return None
-        return self.adopt_plan(found)
+        return self.adopt_plan(json.loads(found))
 
     def adopt_plan(self, found: dict):
         """Take the plan Rust made, and read its scans' files as the inputs.
 
         Args:
-            found: A planned region, as ``NativePlanner.plan`` returns it
-                and read from JSON.
+            found: A planned or refused region, as ``NativePlanner.plan``
+                returns it and read from JSON.
 
         Returns:
-            The physical plan.
+            The physical plan, or the Refusal.
         """
-        plan, logical = native.planned_region(found, self.session.tokenizer)
-        self.logical = logical
         self._token_inputs, self._document_tokens = {}, {}
         for alias, files in found["scans"].items():
             store = TokenStore(files["tokens"])
             self._token_inputs[alias] = ScanInput(store, {
                 name: ColumnStore(path) for name, path in files["columns"]})
             self._document_tokens[alias] = store.lengths
+        if "refusal" in found:
+            fields = found["refusal"]
+            refusal = Refusal(**{**fields, "reasons": tuple(fields["reasons"])})
+            self._plan = self._searched_plan = refusal
+            return refusal
+        plan, self.logical = native.planned_region(found, self.session.tokenizer)
         if self.session.config.gpu_timing:
             plan = replace(plan, settings={**plan.settings, "gpu_timing": True})
         if self._planning_started_at is None:

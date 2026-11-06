@@ -84,6 +84,14 @@ pub struct Planned {
     pub scans: Vec<ScanFiles>,
 }
 
+/// A region every alternative of which was refused, with the files of
+/// its scans, which the speed-of-light estimate still reads.
+#[derive(Debug)]
+pub struct Refused {
+    pub refusal: Refusal,
+    pub scans: Vec<ScanFiles>,
+}
+
 /// Plans regions for one session: holds the model's tokenizer, and the
 /// token stores and column files its queries wrote.
 pub struct Planner {
@@ -149,7 +157,7 @@ impl Planner {
         logical: LogicalPlan,
         tables: &HashMap<String, TableRows>,
         settings: &Settings,
-    ) -> Result<Result<Planned, Refusal>, CompileError> {
+    ) -> Result<Result<Planned, Refused>, CompileError> {
         let alternatives = quail_planner::rules::column_placements(logical.clone())?;
         let scans = scans_of(alternatives.iter().map(|alternative| &alternative.plan));
         if scans.iter().any(|scan| match &scan.column {
@@ -275,12 +283,18 @@ impl Planner {
             &context,
             &settings.physical_rules,
         )?;
-        Ok(found.map(|selected| Planned {
-            logical: alternatives[selected.alternative].plan.clone(),
-            selected,
-            fields,
-            scans: files,
-        }))
+        Ok(match found {
+            Ok(selected) => Ok(Planned {
+                logical: alternatives[selected.alternative].plan.clone(),
+                selected,
+                fields,
+                scans: files,
+            }),
+            Err(refusal) => Err(Refused {
+                refusal,
+                scans: files,
+            }),
+        })
     }
 
     /// The token store of a scan's document column: a table read whole
@@ -583,15 +597,9 @@ pub fn pricer_fields(pricer: &quail_planner::pricing::PlanPricer) -> serde_json:
     })
 }
 
-/// A planned region as JSON: the plan's envelope, estimates, and pricer,
-/// the chosen logical plan, the context fields, and each scan's files.
-///
-/// # Errors
-///
-/// The logical plan does not write.
-pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError> {
-    let scans: serde_json::Map<String, serde_json::Value> = planned
-        .scans
+/// Each scan's files as JSON, by alias.
+fn scans_json(scans: &[ScanFiles]) -> serde_json::Value {
+    scans
         .iter()
         .map(|scan| {
             (
@@ -599,7 +607,34 @@ pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError
                 serde_json::json!({"tokens": scan.tokens, "columns": scan.columns}),
             )
         })
-        .collect();
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into()
+}
+
+/// A refusal's fields as JSON.
+pub fn refusal_json(refusal: &Refusal) -> serde_json::Value {
+    serde_json::json!({
+        "reasons": refusal.reasons, "constraint": refusal.constraint,
+        "needed": refusal.needed, "available": refusal.available, "unit": refusal.unit,
+    })
+}
+
+/// A refused region as JSON: the refusal and each scan's files.
+pub fn refused_json(refused: &Refused) -> serde_json::Value {
+    serde_json::json!({
+        "refusal": refusal_json(&refused.refusal),
+        "scans": scans_json(&refused.scans),
+    })
+}
+
+/// A planned region as JSON: the plan's envelope, estimates, and pricer,
+/// the chosen logical plan, the context fields, and each scan's files.
+///
+/// # Errors
+///
+/// The logical plan does not write.
+pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError> {
+    let scans = scans_json(&planned.scans);
     let plan = &planned.selected.plan;
     Ok(serde_json::json!({
         "envelope": plan.envelope(),
