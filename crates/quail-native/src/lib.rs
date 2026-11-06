@@ -1161,6 +1161,17 @@ fn edit_graph(graph: &str, edit: &str) -> PyResult<(Option<String>, Option<Strin
     })
 }
 
+/// The columns a logical plan's result Project binds, as JSON
+/// `{"sources": [...], "answers": [...]}`, for a backend that builds its
+/// Project in Python.
+#[pyfunction]
+fn project_bindings(logical: &str) -> PyResult<String> {
+    let plan = quail_planner::read_logical_plan(logical)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    let (sources, answers) = quail_planner::results::project_bindings(&plan);
+    Ok(serde_json::json!({"sources": sources, "answers": answers}).to_string())
+}
+
 /// A region's logical plan, its tables' rows, and the settings, read
 /// from what Python passes the planner.
 fn planning_inputs(
@@ -1287,6 +1298,7 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(write_token_store, module)?)?;
     module.add_function(wrap_pyfunction!(collect_answers, module)?)?;
     module.add_function(wrap_pyfunction!(edit_graph, module)?)?;
+    module.add_function(wrap_pyfunction!(project_bindings, module)?)?;
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
     module.add_function(wrap_pyfunction!(prefix_statistics, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)

@@ -1603,6 +1603,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             },
         };
         let nodes = result_nodes(
+            self.plan,
             &result,
             &result_inputs,
             &columns,
@@ -1977,6 +1978,7 @@ pub fn relational_plan(
         },
     };
     nodes.extend(result_nodes(
+        plan,
         &result,
         &[port_of(&scan_id, format!("rows:{}", scan.alias))],
         &columns,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from quail.common.expressions import Expression, packed_columns
 
@@ -66,11 +66,19 @@ class Project(PhysicalNode):
             holds one field per member; the members leave the result.
         expressions: Value expressions over result rows. None projects
             source columns and model answers by document ID.
+        sources: (column, expression) for each column a source expression
+            computes, including a sort key the result does not return.
+        answers: (column, aliases, kind, labels, is the answer) for each
+            column a model call adds: the call's table aliases, kind, and
+            labels, and whether the column is the call's answer rather
+            than a label's probabilities or an answer's span.
     """
 
     columns: tuple[str, ...] = ()
     structs: tuple = ()
     expressions: tuple[str | Expression, ...] | None = None
+    sources: tuple[tuple[str, Expression], ...] = ()
+    answers: tuple[tuple[str, tuple[str, ...], str, Any, bool], ...] = ()
 
     type_name: ClassVar[str] = "quail.project"
     runtime_key: ClassVar[str] = type_name

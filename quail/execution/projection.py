@@ -7,8 +7,6 @@ from pyarrow import compute as pc
 
 from quail.common.expressions import (
     CompileError,
-    aliased_call,
-    column_name,
     column_references,
     evaluate_expression,
 )
@@ -22,31 +20,18 @@ from quail.execution.result import (
 from quail.physical import Project, ValueType
 
 
-def projection_for(logical, token_inputs, documents):
-    """Bind result projection to its scanned columns and classification calls."""
-    operators = logical.operators()
-    # a sort key over a source column the result does not return is
-    # projected as a hidden column
-    source_columns = {
-        column_name(column): column
-        for column in (*logical.projection.columns,
-                       *(key.expression for key in logical.result.order))
-        if column_references(column)}
-    # each column a model call adds, with whether it is the call's answer:
-    # a label beside its probability map, an extracted answer beside its span
-    model_columns = {column: (node.call, column == node.name)
-                     for node in (*operators.classifies, *operators.extracts,
-                                  *operators.sae_features, *operators.maps)
-                     for column in node.added_columns}
-    model_columns.update({column.name: (call, True)
-                          for column in logical.projection.columns
-                          if (call := aliased_call(column, "label", "extract",
-                                                   "score", "features", "map"))
-                          is not None})
+def projection_for(token_inputs, documents):
+    """Bind a Project to its scanned columns and model answers.
 
+    The Project node names each column's source expression and each model
+    answer column's call; the scans' value columns are in token_inputs.
+    """
     def project(node, value, labels=None):
         if not isinstance(node, Project):
             raise TypeError(type(node).__name__)
+        source_columns = dict(node.sources)
+        model_columns = {name: (aliases, kind, labels, is_answer)
+                         for name, aliases, kind, labels, is_answer in node.answers}
         if node.inputs[0].value_type is ValueType.JOIN_ANSWERS:
             value = true_answer_rows(value)
         relation = (
@@ -69,8 +54,8 @@ def projection_for(logical, token_inputs, documents):
                 continue
             table = next((table for table in (labels or {}).values()
                           if name in table.column_names), None)
-            call, is_answer = model_columns.get(name, (None, False))
-            aliases = () if call is None else call.aliases()
+            aliases, kind, call_labels, is_answer = model_columns.get(
+                name, ((), None, (), False))
             if table is not None and len(aliases) == 2:
                 # a label of joined rows: each result row looks its
                 # label up by its two ids; a row without one leaves
@@ -80,7 +65,7 @@ def projection_for(logical, token_inputs, documents):
                     raise CompileError(
                         f"label column {name!r} belongs to the joined "
                         f"rows of {aliases}, not all in the result")
-                order = pa.array(call.labels, pa.string())
+                order = pa.array(list(call_labels), pa.string())
                 keys = pair_keys(table.column(aliases[0]),
                                   table.column(aliases[1]))
                 declaration = acero.Declaration(
@@ -120,8 +105,8 @@ def projection_for(logical, token_inputs, documents):
                 widened = pc.take(
                     pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
                     pa.array(slots))
-                if call is not None and call.kind == "label" and is_answer:
-                    order = pa.array(call.labels, pa.string())
+                if kind == "label" and is_answer:
+                    order = pa.array(list(call_labels), pa.string())
                     values = pa.DictionaryArray.from_arrays(
                         pc.index_in(widened, order).cast(pa.int32()),
                         order)

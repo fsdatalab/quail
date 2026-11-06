@@ -461,8 +461,7 @@ class Query:
             ExecutionContext(
                 runtimes=self.session.registry.runtimes,
                 sources=sources,
-                project=projection_for(
-                    self.logical, self._token_inputs, self._document_tokens),
+                project=projection_for(self._token_inputs, self._document_tokens),
                 observers=observers,
             ),
             initial_outputs=response.outputs,

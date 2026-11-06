@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+from typing import get_type_hints
+
+import _quail_native
+
 from quail.baselines.lowering import (
     lower_answers,
     lower_classifications,
@@ -33,6 +38,7 @@ from quail.physical import (
     Sort,
 )
 from quail.physical.base import input_ports
+from quail.physical.codec import decode_value, encode_value
 from quail.physical.lowering import answer_ids
 from quail.physical.plan import PhysicalPlan, Refusal
 from quail.planner.candidates import PhysicalCandidate
@@ -305,11 +311,15 @@ def _result_nodes(region, request_node, aliases, join_specs, answer_specs,
         if aliased_call(column, "extract") is not None:
             columns.append(column.name + SPAN_SUFFIX)
     structs = region.logical_plan.projection.packing()
+    bound = json.loads(_quail_native.project_bindings(
+        json.dumps(encode_value(region.logical_plan))))
     nodes.append(Project(
         node_id="project",
         inputs=input_ports((sink_input, *label_ports)),
         columns=tuple(columns),
         structs=structs,
+        sources=decode_value(get_type_hints(Project)["sources"], bound["sources"]),
+        answers=decode_value(get_type_hints(Project)["answers"], bound["answers"]),
     ))
     root = region.logical_plan.result
     if root.order or root.distinct or root.offset:

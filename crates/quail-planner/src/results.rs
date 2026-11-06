@@ -2,14 +2,20 @@
 //! `quail/planner/graph/results.py` builds them.
 
 use quail_physical::{
-    FilterAttributes, LimitAttributes, Node, PhysicalNode, PortRef, ProjectAttributes, Projected,
-    SortAttributes, SortExpression, UnnestAttributes, input_ports, port,
+    FilterAttributes, LimitAttributes, ModelCall, Node, PhysicalNode, PortRef, ProjectAttributes,
+    Projected, SortAttributes, SortExpression, UnnestAttributes, ValueExpression, input_ports,
+    port,
 };
 use serde_json::Value;
 
-use crate::expressions::{projected_name, sort_name};
+use crate::LogicalPlan;
+use crate::expressions::{
+    PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_name, column_references,
+    projected_call, projected_name, sort_name,
+};
 use crate::logical::{LogicalNode, ResultNode};
-use crate::nodes::{above_projection, packed_columns, result_columns};
+use crate::nodes::{above_projection, column_call, packed_columns, result_columns};
+use crate::operators::{operators, projection};
 
 /// The struct columns a Project packs, as `Project.structs` encodes them.
 pub fn structs_value(structs: &[(String, Vec<(String, String)>)]) -> Value {
@@ -36,6 +42,101 @@ pub fn structs_value(structs: &[(String, Vec<(String, String)>)]) -> Value {
     )
 }
 
+/// A column a model call adds: its name, the call's table aliases, kind,
+/// and labels, and whether it is the call's answer.
+pub type AnswerColumn = (String, Vec<String>, String, Value, bool);
+
+/// The columns a plan's result Project binds: each source expression
+/// column and each model answer column, as `ProjectAttributes` holds
+/// them.
+pub fn project_bindings(plan: &LogicalPlan) -> (Vec<(String, ValueExpression)>, Vec<AnswerColumn>) {
+    let root = match &plan.root {
+        LogicalNode::Result(result) => result.clone(),
+        other => ResultNode {
+            input: Box::new(other.clone()),
+            limit: None,
+            order: Vec::new(),
+            offset: 0,
+            distinct: false,
+        },
+    };
+    (source_columns(plan, &root), answer_columns(plan))
+}
+
+/// Each result column a source expression computes, by name: the
+/// projected columns and the sort keys that read a table's columns.
+fn source_columns(plan: &LogicalPlan, root: &ResultNode) -> Vec<(String, ValueExpression)> {
+    let LogicalNode::Project(project) = projection(plan) else {
+        return Vec::new();
+    };
+    let projected = project.columns.iter().filter_map(|column| match column {
+        Projected::Expression(expression) => Some(expression),
+        Projected::Name(_) => None,
+    });
+    let sorted = root.order.iter().map(|key| {
+        let SortExpression::Value(value) = &key.expression;
+        value
+    });
+    let mut found: Vec<(String, ValueExpression)> = Vec::new();
+    for expression in projected.chain(sorted) {
+        if column_references(expression).is_empty() {
+            continue;
+        }
+        let name = column_name(expression, true);
+        match found.iter_mut().find(|(known, _)| *known == name) {
+            Some(entry) => entry.1 = expression.clone(),
+            None => found.push((name, expression.clone())),
+        }
+    }
+    found
+}
+
+/// Each column a model call adds: its name, the call's aliases, kind,
+/// and labels, and whether it is the call's answer, not a label's
+/// probabilities or an answer's span.
+fn answer_columns(plan: &LogicalPlan) -> Vec<AnswerColumn> {
+    let found = operators(plan);
+    let mut columns: Vec<AnswerColumn> = Vec::new();
+    let mut put = |name: String, call: &ModelCall, answer: bool| {
+        let entry = (
+            name.clone(),
+            call_aliases(call),
+            call.kind.clone(),
+            call.labels.clone(),
+            answer,
+        );
+        match columns.iter_mut().find(|known| known.0 == name) {
+            Some(known) => *known = entry,
+            None => columns.push(entry),
+        }
+    };
+    for node in &found.classifies {
+        let call = column_call(node);
+        put(node.name.clone(), call, true);
+        if call.probabilities {
+            put(format!("{}{PROBABILITIES_SUFFIX}", node.name), call, false);
+        }
+    }
+    for node in &found.extracts {
+        let call = column_call(node);
+        put(node.name.clone(), call, true);
+        put(format!("{}{SPAN_SUFFIX}", node.name), call, false);
+    }
+    for node in found.sae_features.iter().chain(&found.maps) {
+        put(node.name.clone(), column_call(node), true);
+    }
+    if let LogicalNode::Project(project) = projection(plan) {
+        for column in &project.columns {
+            if let Some(call) =
+                projected_call(column, &["label", "extract", "score", "features", "map"])
+            {
+                put(projected_name(column), call, true);
+            }
+        }
+    }
+    columns
+}
+
 fn node<A>(id: &str, inputs: &[PortRef], attributes: A) -> Node<A> {
     Node {
         id: id.to_string(),
@@ -50,6 +151,7 @@ fn node<A>(id: &str, inputs: &[PortRef], attributes: A) -> Node<A> {
 ///
 /// The root's input is not a projection.
 pub fn result_nodes(
+    plan: &LogicalPlan,
     root: &ResultNode,
     inputs: &[PortRef],
     columns: &[String],
@@ -93,6 +195,8 @@ pub fn result_nodes(
             columns: with_hidden(columns.to_vec()),
             structs: structs_value(structs),
             expressions: None,
+            sources: source_columns(plan, root),
+            answers: answer_columns(plan),
         },
     ))];
     let mut rows = port("project", "rows");
@@ -136,6 +240,8 @@ pub fn result_nodes(
                         columns: expressions.iter().map(projected_name).collect(),
                         structs: Value::Array(Vec::new()),
                         expressions: Some(expressions),
+                        sources: Vec::new(),
+                        answers: Vec::new(),
                     },
                 )));
                 node_id
