@@ -31,6 +31,11 @@ class Refusal:
     unit: str          # "cards" | "tokens" | "bytes" | "version"
 
 
+def refusal_from_fields(fields: dict) -> Refusal:
+    """Return the Refusal whose fields Rust's planner wrote as JSON."""
+    return Refusal(**{**fields, "reasons": tuple(fields["reasons"])})
+
+
 class RefusalError(RuntimeError):
     """Raised when run() is called on a refused plan."""
 

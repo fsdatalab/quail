@@ -42,7 +42,7 @@ from quail.logical import (
 )
 from quail.physical import Scan, encode_graph
 from quail.physical.codec import encode_value
-from quail.physical.plan import Refusal, RefusalError
+from quail.physical.plan import Refusal, RefusalError, refusal_from_fields
 from quail.planner import native, plan_query, refine_plan
 from quail.planner.context import PlanningContext
 
@@ -335,8 +335,7 @@ class Query:
                 name: ColumnStore(path) for name, path in files["columns"]})
             self._document_tokens[alias] = store.lengths
         if "refusal" in found:
-            fields = found["refusal"]
-            refusal = Refusal(**{**fields, "reasons": tuple(fields["reasons"])})
+            refusal = refusal_from_fields(found["refusal"])
             self._plan = self._searched_plan = refusal
             return refusal
         plan, self.logical = native.planned_region(found, self.session.tokenizer)
