@@ -136,45 +136,92 @@ impl HfTokenizer {
             ..Encoded::default()
         };
         for (text, encoding) in texts.iter().zip(&encodings) {
-            let bytes = text.as_bytes();
-            // the characters that start before each byte position
-            let mut starts_before = Vec::with_capacity(bytes.len() + 1);
-            let mut count = 0i64;
-            starts_before.push(0);
-            for &byte in bytes {
-                count += i64::from(byte & 0xC0 != 0x80);
-                starts_before.push(count);
-            }
-            let mut at = 0usize;
-            for &id in tokenizers::pipeline::PipelineToken::cast_slice(encoding.ids()) {
-                let piece = self
-                    .token_bytes
-                    .get(id as usize)
-                    .and_then(Option::as_deref)
-                    .unwrap_or_default();
-                let end = at + piece.len();
-                if bytes.get(at..end) != Some(piece) {
-                    return Err(external(
-                        "AI.EXTRACT requires token bytes that preserve the source text",
-                    ));
-                }
-                let first = if piece.is_empty() {
-                    starts_before[at]
-                } else {
-                    starts_before[at + 1] - 1
-                };
-                found.ids.push(id);
-                found.offsets.push((first, starts_before[end]));
-                at = end;
-            }
-            if at != bytes.len() {
-                return Err(external(
-                    "AI.EXTRACT requires token bytes that preserve the source text",
-                ));
-            }
+            let ids = tokenizers::pipeline::PipelineToken::cast_slice(encoding.ids());
+            let ranges = self.character_ranges(text, ids).ok_or_else(|| {
+                external("AI.EXTRACT requires token bytes that preserve the source text")
+            })?;
+            found.ids.extend_from_slice(ids);
+            found.offsets.extend(ranges);
             found.boundaries.push(found.ids.len() as i64);
         }
         Ok(found)
+    }
+
+    /// Each text's tokens, and their character ranges as a large list of
+    /// (start, end) pairs: null for a text whose tokens' bytes do not
+    /// spell it, and for a null text, which has no tokens.
+    ///
+    /// # Errors
+    ///
+    /// The tokenizer fails on a text.
+    pub fn encode_batch_with_offsets(
+        &self,
+        texts: &StringArray,
+    ) -> Result<(LargeListArray, LargeListArray), ArrowError> {
+        use arrow::array::{FixedSizeListBuilder, Int64Builder};
+        let tokens = self.encode_batch(texts)?;
+        let mut ranges = LargeListBuilder::new(FixedSizeListBuilder::new(Int64Builder::new(), 2));
+        for (index, text) in texts.iter().enumerate() {
+            let ids: Vec<u32> = tokens
+                .value(index)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .expect("int32 token ids")
+                .values()
+                .iter()
+                .map(|id| *id as u32)
+                .collect();
+            match self.character_ranges(text.unwrap_or(""), &ids) {
+                Some(found) => {
+                    for (start, end) in found {
+                        let pair = ranges.values();
+                        pair.values().append_value(start);
+                        pair.values().append_value(end);
+                        pair.append(true);
+                    }
+                    ranges.append(true);
+                }
+                None => ranges.append(false),
+            }
+        }
+        Ok((tokens, ranges.finish()))
+    }
+
+    /// The character range of each of a text's tokens: a token starts at
+    /// the character holding its first byte and ends after the character
+    /// holding its last. None when the tokens' bytes do not spell the
+    /// text.
+    fn character_ranges(&self, text: &str, ids: &[u32]) -> Option<Vec<(i64, i64)>> {
+        let bytes = text.as_bytes();
+        // the characters that start before each byte position
+        let mut starts_before = Vec::with_capacity(bytes.len() + 1);
+        let mut count = 0i64;
+        starts_before.push(0);
+        for &byte in bytes {
+            count += i64::from(byte & 0xC0 != 0x80);
+            starts_before.push(count);
+        }
+        let mut ranges = Vec::with_capacity(ids.len());
+        let mut at = 0usize;
+        for &id in ids {
+            let piece = self
+                .token_bytes
+                .get(id as usize)
+                .and_then(Option::as_deref)
+                .unwrap_or_default();
+            let end = at + piece.len();
+            if bytes.get(at..end) != Some(piece) {
+                return None;
+            }
+            let first = if piece.is_empty() {
+                starts_before[at]
+            } else {
+                starts_before[at + 1] - 1
+            };
+            ranges.push((first, starts_before[end]));
+            at = end;
+        }
+        (at == bytes.len()).then_some(ranges)
     }
 
     /// The id of an added token, such as `<|im_end|>`, or None.

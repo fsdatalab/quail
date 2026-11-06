@@ -7,7 +7,6 @@ the region runs, or an empty table of the input's schema for planning
 before a run.
 """
 
-import weakref
 from contextlib import closing
 
 import pyarrow as pa
@@ -20,7 +19,6 @@ from quail.catalog import (
     ScanRequest,
     table_name,
 )
-from quail.common.tokens import TokenLengths
 from quail.logical import LogicalPlan, Scan
 
 # planning before a run assumes this many rows of this many tokens each
@@ -101,15 +99,11 @@ def region_query(session, logical: LogicalPlan, *, tables: dict | None = None,
                     identities[name] = base.content_identity()
         else:
             table = scan.schema.empty_table()
-            assumed[name] = lambda _column: TokenLengths(
-                [ASSUMED_INPUT_TOKENS] * ASSUMED_INPUT_ROWS)
+            assumed[name] = ASSUMED_INPUT_ROWS
         providers[name] = MemoryTableProvider(table, id_col="",
                                               identity=f"input:{name}")
     catalog = Catalog(providers)
-    store = session.inputs.over(catalog, assumed)
-    query = Query(session, logical, catalog=catalog, inputs=store, **options)
+    query = Query(session, logical, catalog=catalog, assumed_rows=assumed, **options)
     query.source_rows = rows
     query.input_identities = identities
-    # the store's token files live as long as the query
-    weakref.finalize(query, store.close)
     return query

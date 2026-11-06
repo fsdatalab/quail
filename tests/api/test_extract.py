@@ -411,3 +411,15 @@ def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(sessio
             "SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind, "
             f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
             "FROM contracts c WHERE kind = 'lease' OR lease.ends IS NULL")
+
+
+def test_an_extracted_tables_token_store_holds_each_tokens_characters(session):
+    query = session.sql(
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+        "FROM contracts c")
+    query.plan()
+    (scan,) = query.token_inputs().values()
+    assert scan.tokens.has_offsets
+    view = scan.tokens[0]
+    assert view.character_offsets is not None
+    assert len(view.character_offsets) == len(view)

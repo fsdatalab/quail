@@ -76,7 +76,7 @@ class Query:
     """A compiled query that plans and executes in the current process."""
 
     def __init__(self, session: "Session", logical: LogicalPlan,
-                 order: str | None = None, *, catalog=None, inputs=None,
+                 order: str | None = None, *, catalog=None, assumed_rows=None,
                  text: str | None = None, dialect: str = "snowflake",
                  whole: bool = True):
         self.session = session
@@ -86,7 +86,9 @@ class Query:
         self.dialect = dialect
         self.whole = whole
         self.catalog = session.catalog if catalog is None else catalog
-        self.inputs = session.inputs if inputs is None else inputs
+        # rows of each input table not yet computed, as a CTE's before it
+        # runs, by table name
+        self.assumed_rows = {} if assumed_rows is None else dict(assumed_rows)
         self.logical = logical
         self._logical_input = logical
         self.order = order
@@ -131,10 +133,9 @@ class Query:
             return self._plan
         if not self.logical.operators().prompts:
             (scan,) = self.logical.operators().scans
-            num_documents = self.catalog.get(scan.provider).statistics().num_rows
-            if self.inputs.pending(scan.provider):
-                num_documents = len(self.inputs.estimate_lengths(
-                    scan.provider, scan.column))
+            num_documents = self.assumed_rows.get(
+                scan.provider,
+                self.catalog.get(scan.provider).statistics().num_rows)
             self._plan = self._relational_plan(num_documents or 0)
             return self._plan
         self._planning_started_at = time.perf_counter()
@@ -452,7 +453,7 @@ class Query:
         plan = self.plan()
         out = response.metrics
         report = execution_report(
-            plan, out, self.inputs.notes, coordinator_wall)
+            plan, out, (), coordinator_wall)
         sources = {
             node.input_id: range(node.num_documents)
             for node in plan.nodes

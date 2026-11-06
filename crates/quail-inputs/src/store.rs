@@ -2,8 +2,9 @@
 //!
 //! The file is the one Python's `quail.common.tokens.TokenStore` opens:
 //! a `__quail_token_ids` column of token lists and a
-//! `__quail_token_count` column of their lengths, with the schema
-//! metadata `quail.kind = token_store`.
+//! `__quail_token_count` column of their lengths, and optionally a
+//! `__quail_token_offsets` column of each token's character range, with
+//! the schema metadata `quail.kind = token_store`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -22,20 +23,29 @@ use crate::tokenizer::HfTokenizer;
 pub const TOKEN_COLUMN: &str = "__quail_token_ids";
 /// The column of each document's token count.
 pub const COUNT_COLUMN: &str = "__quail_token_count";
+/// The column of each document's tokens' character ranges.
+pub const OFFSET_COLUMN: &str = "__quail_token_offsets";
 
-fn store_schema() -> SchemaRef {
+fn store_schema(with_offsets: bool) -> SchemaRef {
     let metadata = HashMap::from([("quail.kind".to_string(), "token_store".to_string())]);
-    Arc::new(
-        Schema::new(vec![
-            Field::new(
-                TOKEN_COLUMN,
-                DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int32, true))),
-                false,
-            ),
-            Field::new(COUNT_COLUMN, DataType::Int64, false),
-        ])
-        .with_metadata(metadata),
-    )
+    let mut fields = vec![
+        Field::new(
+            TOKEN_COLUMN,
+            DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int32, true))),
+            false,
+        ),
+        Field::new(COUNT_COLUMN, DataType::Int64, false),
+    ];
+    if with_offsets {
+        let pair =
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int64, true)), 2);
+        fields.push(Field::new(
+            OFFSET_COLUMN,
+            DataType::LargeList(Arc::new(Field::new_list_field(pair, true))),
+            true,
+        ));
+    }
+    Arc::new(Schema::new(fields).with_metadata(metadata))
 }
 
 /// Writes a token store file batch by batch.
@@ -51,8 +61,22 @@ impl TokenStoreWriter {
     ///
     /// The file cannot be created.
     pub fn create(path: &Path) -> Result<Self, ArrowError> {
+        Self::create_with(path, false)
+    }
+
+    /// Start a token store at `path` that also holds each token's
+    /// character range, which `AI.EXTRACT` reads to place its answers.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be created.
+    pub fn create_with_offsets(path: &Path) -> Result<Self, ArrowError> {
+        Self::create_with(path, true)
+    }
+
+    fn create_with(path: &Path, with_offsets: bool) -> Result<Self, ArrowError> {
         let file = File::create(path)?;
-        let writer = FileWriter::try_new(file, &store_schema())?;
+        let writer = FileWriter::try_new(file, &store_schema(with_offsets))?;
         Ok(Self {
             path: path.to_path_buf(),
             writer: Some(writer),
@@ -65,6 +89,14 @@ impl TokenStoreWriter {
     ///
     /// The tokens are not int32 ids, or the write fails.
     pub fn write(&mut self, tokens: LargeListArray) -> Result<(), ArrowError> {
+        self.write_with(tokens, None)
+    }
+
+    fn write_with(
+        &mut self,
+        tokens: LargeListArray,
+        ranges: Option<LargeListArray>,
+    ) -> Result<(), ArrowError> {
         let writer = self
             .writer
             .as_mut()
@@ -74,10 +106,14 @@ impl TokenStoreWriter {
             .windows(2)
             .map(|pair| Some(pair[1] - pair[0]))
             .collect();
-        let batch = RecordBatch::try_new(
-            Arc::clone(writer.schema()),
-            vec![Arc::new(tokens), Arc::new(counts)],
-        )?;
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(tokens), Arc::new(counts)];
+        if writer.schema().fields().len() == 3 {
+            let ranges = ranges.ok_or_else(|| {
+                ArrowError::InvalidArgumentError("the store holds character ranges".into())
+            })?;
+            columns.push(Arc::new(ranges));
+        }
+        let batch = RecordBatch::try_new(Arc::clone(writer.schema()), columns)?;
         writer.write(&batch)
     }
 
@@ -91,7 +127,16 @@ impl TokenStoreWriter {
         tokenizer: &HfTokenizer,
         texts: &StringArray,
     ) -> Result<(), ArrowError> {
-        self.write(tokenizer.encode_batch(texts)?)
+        let with_offsets = self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.schema().fields().len() == 3);
+        if with_offsets {
+            let (tokens, ranges) = tokenizer.encode_batch_with_offsets(texts)?;
+            self.write_with(tokens, Some(ranges))
+        } else {
+            self.write(tokenizer.encode_batch(texts)?)
+        }
     }
 
     /// Close the file and open it as a token store.

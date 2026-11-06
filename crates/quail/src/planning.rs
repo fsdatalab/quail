@@ -118,9 +118,9 @@ pub struct Planner {
     tokenizer: HfTokenizer,
     directory: tempfile::TempDir,
     files: AtomicUsize,
-    /// (identity, document column) -> the token store of a table read
-    /// whole, kept for later queries.
-    stores: Mutex<HashMap<(String, String), PathBuf>>,
+    /// (identity, document column, whether it holds character ranges)
+    /// -> the token store of a table read whole, kept for later queries.
+    stores: Mutex<HashMap<(String, String, bool), PathBuf>>,
 }
 
 fn arrow_error(error: impl std::fmt::Display) -> CompileError {
@@ -179,6 +179,16 @@ impl Planner {
     ) -> Result<Prepared, CompileError> {
         let alternatives = quail_planner::rules::column_placements(logical.clone())?;
         let scans = scans_of(alternatives.iter().map(|alternative| &alternative.plan));
+        // AI.EXTRACT places its answers in its documents' text by the
+        // character range of each token
+        let extracted: Vec<String> = alternatives
+            .iter()
+            .flat_map(|alternative| quail_planner::operators::operators(&alternative.plan).extracts)
+            .flat_map(|extract| {
+                let quail_physical::TaggedModelCall::Call(call) = &extract.call;
+                quail_planner::expressions::call_aliases(call)
+            })
+            .collect();
         if scans.iter().any(|scan| match &scan.column {
             ScanColumn::Unnamed(_) => false,
             ScanColumn::Expression(expression) => !is_column(expression),
@@ -196,7 +206,7 @@ impl Planner {
             let rows = tables
                 .get(&scan.provider)
                 .ok_or_else(|| CompileError::new(format!("no rows for table {}", scan.provider)))?;
-            let (store, path) = self.token_store(scan, rows)?;
+            let (store, path) = self.token_store(scan, rows, extracted.contains(&scan.alias))?;
             let mut columns = Vec::new();
             let mut names = scan.columns.clone();
             // the executor reads the document's text to locate answers in it
@@ -366,18 +376,33 @@ impl Planner {
         &self,
         scan: &Scan,
         rows: &TableRows,
+        with_offsets: bool,
     ) -> Result<(TokenStore, PathBuf), CompileError> {
         let key = rows
             .identity
             .as_ref()
-            .map(|identity| (identity.clone(), format!("{:?}", scan.column)));
-        if let Some(key) = &key
-            && let Some(path) = self.stores.lock().expect("the stores lock").get(key)
-        {
-            return Ok((TokenStore::open(path).map_err(arrow_error)?, path.clone()));
+            .map(|identity| (identity.clone(), format!("{:?}", scan.column), with_offsets));
+        if let Some((identity, column, _)) = &key {
+            let stores = self.stores.lock().expect("the stores lock");
+            // a store with character ranges also serves a scan without
+            let found = stores
+                .get(&(identity.clone(), column.clone(), true))
+                .or_else(|| {
+                    (!with_offsets)
+                        .then(|| stores.get(&(identity.clone(), column.clone(), false)))
+                        .flatten()
+                });
+            if let Some(path) = found {
+                return Ok((TokenStore::open(path).map_err(arrow_error)?, path.clone()));
+            }
         }
         let path = self.file("tokens");
-        let mut writer = TokenStoreWriter::create(&path).map_err(arrow_error)?;
+        let mut writer = if with_offsets {
+            TokenStoreWriter::create_with_offsets(&path)
+        } else {
+            TokenStoreWriter::create(&path)
+        }
+        .map_err(arrow_error)?;
         for batch in &rows.batches {
             let texts = document_texts(&scan.column, batch)?;
             writer

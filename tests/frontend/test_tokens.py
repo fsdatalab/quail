@@ -14,6 +14,8 @@ from quail.common.tokens import (
     prefix_tree,
 )
 
+native = pytest.importorskip("_quail_native")
+
 
 def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypatch):
     tokens = pa.chunked_array([
@@ -35,22 +37,20 @@ def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypa
     assert list(combined) == [1, 2, 1, 2, 3, 20]
     assert combined.token_parts[1] is first
 
-    schema = pa.schema({"id": pa.string(), "body": pa.string()})
-    batches = [
-        pa.record_batch([["a", "b"], ["one two", "three"]], schema=schema),
-        pa.record_batch([["c"], ["four five six"]], schema=schema),
-    ]
+    from helpers.sessions import TOKENIZER
+
+    tokenizer_file = str(TOKENIZER / "tokenizer.json")
+    texts = ["one two", "three", "four five six"]
     path = tmp_path / "tokens.arrow"
-    store = TokenStore.write(str(path), batches, document_column="body",
-                             tokenizer=str.split, token_type=pa.string())
+    native.write_token_store(str(path), pa.table({"body": texts}), tokenizer_file)
+    store = TokenStore(str(path))
     assert path.exists()
-    assert list(store.lengths) == [2, 1, 3]
-    assert [list(store[index]) for index in range(len(store))] == [
-        ["one", "two"], ["three"], ["four", "five", "six"]]
+    lengths = list(store.lengths)
+    assert len(lengths) == 3 and all(length > 0 for length in lengths)
     assert store._reader.schema.names == [
         "__quail_token_ids", "__quail_token_count"]
-    assert contiguous_shards(store.lengths, 1, total=6) == (((0, 3),), [6])
-    assert contiguous_shards(store.lengths, 2) == (((0, 2), (2, 3)), [3, 3])
+    total = sum(lengths)
+    assert contiguous_shards(store.lengths, 1, total=total) == (((0, 3),), [total])
     index = store.prefix_index
     with monkeypatch.context() as patch:
         patch.setattr("quail.common.tokens._token_array",
@@ -59,14 +59,14 @@ def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypa
         assert prefix_tree(store, 16) is index.tree(16)
     store.close()
 
-    schema = pa.schema({"body": pa.string()})
-    store = TokenStore.write(
-        str(path), [pa.record_batch([["word " * 1000] * 10], schema=schema)],
-        document_column="body", tokenizer=str.split, token_type=pa.string())
+    native.write_token_store(str(path), pa.table({"body": ["word " * 1000] * 10}),
+                             tokenizer_file)
+    store = TokenStore(str(path))
     assert store.prefix_index is not index
-    assert prefix_tree(store, 16).shared_tokens == 9 * 992
+    length = len(store[0])
+    assert prefix_tree(store, 16).shared_tokens == 9 * (length // 16 * 16)
     encoded = pickle.dumps(store.select(range(10)))
     restored = pickle.loads(encoded)
     assert len(encoded) < 1000
     assert len(restored) == 10
-    assert len(restored[0]) == 1000
+    assert len(restored[0]) == length

@@ -41,12 +41,11 @@ class StageExecution:
         self.plans = {}
         self.results = {}
         self.assumptions = {}
-        self.pending = {name: (lambda _column, name=name: self.lengths(name))
-                        for name in self.schemas}
-        self.inputs = query.inputs.over(self.catalog, self.pending)
+        # the CTEs whose rows are not computed yet
+        self.pending = set(self.schemas)
 
     def close(self):
-        self.inputs.close()
+        """Nothing to release: Rust's planner owns the token files."""
 
     def lengths(self, name: str) -> TokenLengths:
         """Estimate an unexecuted relation from its producer's plan."""
@@ -58,9 +57,11 @@ class StageExecution:
         return TokenLengths([ASSUMED_ANSWER_TOKENS] * max(0, round(rows)))
 
     def stage(self, name):
+        assumed = {pending: len(self.lengths(pending)) for pending in self.pending
+                   if pending in self.plans}
         return type(self.query)(self.query.session, self.stages[name],
                                 order=self.query.order,
-                                catalog=self.catalog, inputs=self.inputs)
+                                catalog=self.catalog, assumed_rows=assumed)
 
     def plan(self):
         """Plan the dependency graph without executing a stage."""
@@ -104,7 +105,7 @@ def execute_stages(query, physical_executor=None, on_backend_ready=None,
                     execution.catalog.providers[name] = MemoryTableProvider(
                         cte_table(result.collect(), execution.schemas[name]),
                         id_col="", identity=f"cte:{name}")
-                    del execution.pending[name]
+                    execution.pending.discard(name)
             stage = execution.stage(node.name)
             result = execute_query(
                 stage, physical_executor=physical_executor,

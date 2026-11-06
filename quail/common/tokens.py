@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import bisect
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from contextlib import ExitStack
-from pathlib import Path
 
 import _quail_native
 import numpy as np
@@ -193,179 +192,9 @@ class TokenLengths(Sequence):
         return values if dtype is None else values.astype(dtype, copy=False)
 
 
-def _write_all(writer, batches):
-    """Write every batch through one store writer and open the store."""
-    with ExitStack() as rollback:
-        rollback.callback(writer.abort)
-        for batch in batches:
-            writer.write_batch(batch)
-        store = writer.finish()
-        rollback.pop_all()
-        return store
-
-
-class _StoreWriter:
-    """Write one memory mappable Arrow IPC file batch by batch."""
-
-    def __init__(self, path: str, schema: pa.Schema):
-        self.path = path
-        self._schema = schema
-        with ExitStack() as rollback, ExitStack() as resources:
-            self._sink = resources.enter_context(pa.OSFile(path, "wb"))
-            rollback.callback(Path(path).unlink, missing_ok=True)
-            self._writer = resources.enter_context(pa.ipc.new_file(self._sink, schema))
-            self._resources = resources.pop_all()
-            rollback.pop_all()
-
-    def _write(self, arrays) -> None:
-        self._writer.write_batch(
-            pa.RecordBatch.from_arrays(arrays, schema=self._schema)
-        )
-
-    def _close(self) -> None:
-        self._resources.close()
-
-    def abort(self) -> None:
-        """Close the file and delete it."""
-        try:
-            self._close()
-        finally:
-            Path(self.path).unlink(missing_ok=True)
-
-
 # a model's tokenizer, run in Rust: the planner writes token stores with it
 # and the GPU worker encodes continuations and decodes answers with it
 Tokenizer = _quail_native.Tokenizer
-
-
-class TokenOffsets:
-    """Map byte-preserving token sequences to original Unicode character ranges."""
-
-    def __init__(self, token_bytes):
-        self.vocabulary = pa.array(token_bytes, type=pa.binary())
-
-    def __call__(self, tokens, texts):
-        positions, exact = self.numpy(tokens, texts)
-        offsets = tokens.offsets.to_numpy() - tokens.offsets[0].as_py()
-        pairs = pa.FixedSizeListArray.from_arrays(pa.array(positions.reshape(-1)), 2)
-        return pa.LargeListArray.from_arrays(offsets, pairs, mask=pc.invert(exact))
-
-    def numpy(self, tokens, texts):
-        """Return flat character ranges and the rows that preserve source bytes."""
-        pieces = pc.take(self.vocabulary, tokens.flatten())
-        offsets = tokens.offsets.to_numpy() - tokens.offsets[0].as_py()
-        decoded = pc.binary_join(pa.LargeListArray.from_arrays(offsets, pieces), b"")
-        source = texts.cast(pa.large_binary())
-        exact = pc.fill_null(pc.equal(decoded, source), False)
-        lengths = pc.fill_null(pc.binary_length(pieces), 0).to_numpy()
-        _, boundaries, data = source.buffers()
-        boundaries = np.frombuffer(boundaries, dtype=np.int64)[
-            source.offset:source.offset + len(source) + 1]
-        raw = np.frombuffer(data, dtype=np.uint8)[boundaries[0]:boundaries[-1]]
-        boundaries = boundaries - boundaries[0]
-        counts = np.diff(offsets)
-        cumulative = np.concatenate(([0], np.cumsum(lengths, dtype=np.int64)))
-        ends = cumulative[1:] + np.repeat(
-            boundaries[:-1] - cumulative[offsets[:-1]], counts)
-        starts = ends - lengths
-        if np.all(raw < 128):
-            origin = np.repeat(boundaries[:-1], counts)
-            positions = np.column_stack((starts - origin, ends - origin))
-        else:
-            chars = np.concatenate((np.flatnonzero((raw & 0xC0) != 0x80), [len(raw)]))
-            origin = np.repeat(np.searchsorted(chars, boundaries[:-1]), counts)
-            positions = np.column_stack((
-                np.searchsorted(chars, starts, side="right") - 1 - origin,
-                np.searchsorted(chars, ends, side="left") - origin))
-        return positions, exact
-
-
-class TokenStoreWriter(_StoreWriter):
-    """Tokenize source batches into a token store file.
-
-    Args:
-        path: The token store file to write.
-        document_texts: Callable(record batch) -> the batch's document
-            texts, one string or null per row.
-        tokenizer: Callable text -> token ids.
-        token_type: The Arrow type of one token id.
-        offsets_encoder: Optional callable that also returns each
-            token's character offsets.
-        existing_tokens: Token lists already computed for the rows,
-            read instead of tokenizing.
-    """
-
-    def __init__(self, path: str, *, document_texts: Callable, tokenizer,
-                 token_type: pa.DataType, offsets_encoder=None, existing_tokens=None):
-        self._document_texts = document_texts
-        self._tokenizer = tokenizer
-        self._token_list_type = pa.large_list(token_type)
-        self._offsets_encoder = offsets_encoder
-        self._existing_tokens = existing_tokens
-        self._row = 0
-        self._offset_list_type = pa.large_list(pa.list_(pa.int64(), 2))
-        schema = pa.schema(
-            [
-                pa.field(TokenStore._token_column, self._token_list_type,
-                         nullable=False),
-                pa.field(TokenStore._count_column, pa.int64(),
-                         nullable=False),
-            ],
-            metadata={b"quail.kind": b"token_store"},
-        )
-        if offsets_encoder is not None:
-            schema = schema.append(pa.field(
-                TokenStore._offset_column, self._offset_list_type))
-        super().__init__(path, schema)
-
-    def write_batch(self, batch: pa.RecordBatch) -> None:
-        """Tokenize the document column of one source batch; a null is empty."""
-        texts = pc.fill_null(self._document_texts(batch), "")
-        offsets = None
-        encode_arrow = getattr(self._tokenizer, "encode_arrow", None)
-        if self._existing_tokens is not None:
-            selected = self._existing_tokens.slice(self._row, len(texts))
-            if len(selected) != len(texts):
-                raise ValueError("source rows no longer match the stored tokens")
-            tokens = (selected.chunk(0) if selected.num_chunks == 1
-                      else selected.combine_chunks())
-            self._row += len(texts)
-        elif encode_arrow is None:
-            tokens = pa.array(
-                [self._tokenizer(text) for text in texts.to_pylist()],
-                type=self._token_list_type)
-        else:
-            tokens = encode_arrow(pa.table({"text": texts.cast(pa.string())})).column(
-                "tokens").combine_chunks().cast(self._token_list_type)
-        if self._offsets_encoder is not None:
-            offsets = self._offsets_encoder(tokens, texts)
-        counts = pc.list_value_length(tokens).cast(pa.int64())
-        self._write([tokens, counts] if offsets is None else [tokens, counts, offsets])
-
-    def finish(self) -> "TokenStore":
-        """Close the file and open it as a token store."""
-        self._close()
-        return TokenStore(self.path)
-
-
-class ColumnStoreWriter(_StoreWriter):
-    """Copy one source column into a column store file."""
-
-    def __init__(self, path: str, field: pa.Field):
-        self._name = field.name
-        super().__init__(
-            path,
-            pa.schema([field], metadata={b"quail.kind": b"column_store"}),
-        )
-
-    def write_batch(self, batch: pa.RecordBatch) -> None:
-        """Copy the stored column out of one source batch."""
-        self._write([batch.column(batch.schema.get_field_index(self._name))])
-
-    def finish(self) -> "ColumnStore":
-        """Close the file and open it as a column store."""
-        self._close()
-        return ColumnStore(self.path)
 
 
 class ColumnStore:
@@ -379,11 +208,6 @@ class ColumnStore:
             self.name = self._reader.schema.names[0]
             self._values = None
             self._resources = resources.pop_all()
-
-    @classmethod
-    def write(cls, path: str, batches, field: pa.Field) -> "ColumnStore":
-        """Copy one column of bounded input batches into an Arrow IPC file."""
-        return _write_all(ColumnStoreWriter(path, field), batches)
 
     @property
     def values(self) -> pa.ChunkedArray:
@@ -460,27 +284,6 @@ class TokenStore(Sequence):
             self._prefix_index = None
             self._first_documents = None
             self._resources = resources.pop_all()
-
-    @classmethod
-    def write(
-        cls,
-        path: str,
-        batches,
-        *,
-        document_column: str,
-        tokenizer,
-        token_type: pa.DataType,
-        offsets_encoder=None,
-    ) -> "TokenStore":
-        """Tokenize bounded input batches into one Arrow IPC file."""
-        writer = TokenStoreWriter(
-            path,
-            document_texts=lambda batch: batch.column(document_column),
-            tokenizer=tokenizer,
-            token_type=token_type,
-            offsets_encoder=offsets_encoder,
-        )
-        return _write_all(writer, batches)
 
     @property
     def lengths(self) -> TokenLengths:

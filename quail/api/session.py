@@ -8,7 +8,7 @@ from quail.api.compile import SQLDialect, compile_region
 from quail.api.config import EngineConfig, resolve_model
 from quail.api.query import QueryLike
 from quail.builtins import built_in_registry
-from quail.catalog import Catalog, InputStore, TableProvider
+from quail.catalog import Catalog, TableProvider
 from quail.common.tokens import Tokenizer
 from quail.extensions import ExtensionRegistry
 from quail.physical.plan import Refusal, RefusalError
@@ -58,9 +58,6 @@ class Session:
         self.catalog = Catalog()
         self._tokenizer_directory = tokenizer
         self._tokenizer = None
-        self.inputs = InputStore(
-            self.catalog, tokenizer=lambda: self.tokenizer,
-            tokenizer_name="Hugging Face tokenizers")
         self._remote = None
         if endpoint is not None:
             from quail.remote.client import RemoteConnection
@@ -68,7 +65,6 @@ class Session:
             self._remote = RemoteConnection(endpoint, self.registry.codecs)
         else:
             _ = self.tokenizer
-            self.inputs.warm_tokenizer()
 
     @property
     def endpoint(self) -> str | None:
@@ -92,7 +88,6 @@ class Session:
         """
         if self._remote is not None:
             self._remote.close()
-        self.inputs.close()
 
     def __enter__(self):
         return self
