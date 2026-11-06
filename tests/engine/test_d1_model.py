@@ -7,7 +7,7 @@ from helpers.oracle import question_text
 from helpers.sessions import TOKENIZER
 
 from quail.baselines.request import RequestBackend
-from quail.logical import ColumnRef
+from quail.common.expressions import ColumnRef
 from quail.specs import D1_2B_BF16, H100_SXM
 
 REVIEW = ColumnRef(alias="r", provider="reviews", column="body")

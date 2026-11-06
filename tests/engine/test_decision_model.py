@@ -12,11 +12,8 @@ from helpers.sessions import TOKENIZER
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import Catalog, DocumentProvider
-from quail.common.prompts import answer_row_offsets
-from quail.logical import (
-    ColumnRef,
-    bind_prompt,
-)
+from quail.common.expressions import ColumnRef
+from quail.common.prompts import answer_row_offsets, bind_prompt
 from quail.physical.lowering import lower_prompt, render_filter_prompt_ids
 from quail.specs import DECISION_2_KAI_0_6B_BF16
 

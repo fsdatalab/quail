@@ -361,7 +361,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     from quail.backends.quail.executor.operators.filter import ConditionGate
     from quail.backends.quail.executor.operators.map import MapPart
     from quail.backends.quail.executor.parts import execute_parts
-    from quail.logical import ColumnRef, RegularPredicate
+    from quail.common.expressions import ColumnRef, RegularPredicate
     from quail.physical import AiExtract, Filter, PortRef
     from quail.physical.base import input_ports
 

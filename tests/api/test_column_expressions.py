@@ -3,10 +3,10 @@
 
 import pyarrow as pa
 import pytest
+from helpers.logical import nodes
 from helpers.sessions import CONFIG, TOKENIZER, _run, encoder, make_executor
 
 import quail
-from quail.logical import Scan
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ def session():
 def test_a_prompt_reads_a_struct_field_as_the_document(session):
     query = session.sql(
         "SELECT r.id FROM docs r WHERE AI_FILTER(PROMPT('q: {0}', r.details.body))")
-    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    (scan,) = nodes(query.logical, "Scan")
     assert str(scan.column) == "r.details.body"
     result = _run(query, make_executor({"r": {"q:": [1, 0, 1]}}))
     assert result.to_rows() == [("d0",), ("d2",)]

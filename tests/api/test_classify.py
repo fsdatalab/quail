@@ -4,6 +4,7 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from helpers.logical import kinds, nodes, read_plan
 from helpers.oracle import Oracle, finish
 from helpers.sessions import TOKENIZER
 
@@ -12,13 +13,14 @@ import quail
 # one token per word: refund=1, request=2, status=3, shipping=4
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.common.prompts import join_anchor_note
-from quail.logical import (
+from quail.common.expressions import (
     Alias,
     ColumnRef,
     CompileError,
     RegularPredicate,
+    column_references,
 )
+from quail.common.prompts import join_anchor_note
 from quail.physical import (
     AiClassify,
     AiJoin,
@@ -181,14 +183,14 @@ def test_sql_classifies_and_tests_labels(session):
     filtered = session.sql(
         f"SELECT d.id FROM documents d WHERE {call[:-1]}, "
         f"{{'selectivity': 0.5}}) IN ('praise')")
-    (predicate,) = filtered.logical.operators().column_filters["d"]
+    (predicate,) = nodes(filtered.logical, "Filter")
     assert predicate.selectivity == 0.5
     assert predicate.condition.value == ("praise",)
-    assert "d" not in filtered.logical.operators().filters
+    assert not nodes(filtered.logical, "SemanticFilter")
     # equality is membership in one label, on either side
     for form in (f"{call} = 'refund'", f"'refund' = {call}"):
         equal = session.sql(f"SELECT d.id FROM documents d WHERE {form}")
-        (predicate,) = equal.logical.operators().column_filters["d"]
+        (predicate,) = nodes(equal.logical, "Filter")
         assert predicate.condition.value == ("refund",)
     for bad in (f"SELECT d.id, {call} FROM documents d",
                 f"SELECT d.id FROM documents d WHERE {call} IN (1)"):
@@ -208,15 +210,16 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
         f"SELECT d.id, a.id, {stance} AS stance FROM documents d "
         f"JOIN aspects a ON AI_FILTER(PROMPT('Does {{0}} mention {{1}}?', "
         f"d.body, a.aspect))")
-    (call,) = [column.expression for column in query.logical.root.columns
+    root = read_plan(query.logical).root
+    (call,) = [column.expression for column in root.columns
                if isinstance(column, Alias)]
     assert call.kind == "label" and call.aliases() == ("d", "a")
     assert call.prompt.frame == join_anchor_note(0)
     assert call.prompt.tail.startswith("\n\nAnswer with exactly one")
     # the classification sits above the join of the two tables
-    assert [type(node).__name__ for node in query.logical.walk()] == [
+    assert kinds(query.logical) == [
         "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify", "Project"]
-    assert query.logical.root.input.call == call
+    assert root.input.call == call
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     (join,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
@@ -303,10 +306,13 @@ def test_plain_label_tests_share_the_classification_used_by_membership(session):
     query = session.sql(
         f"SELECT d.id FROM documents d WHERE {call} IN ('a', 'b') "
         f"AND {call} < 'b' AND {call} IS NOT NULL")
-    assert len(query.logical.operators().classifies) == 1
+    assert len(nodes(query.logical, "SemanticClassify")) == 1
     (classify,) = [node for node in query.plan().nodes if isinstance(node, AiClassify)]
-    tests = query.logical.operators().column_filters["d"]
-    assert {test.name for test in tests} == {classify.spec.name}
+    # every label test reads the one classification's column
+    tested = {reference.column for node in nodes(query.logical, "Filter")
+              for test in node.condition.tests()
+              for reference in column_references(test.expression)}
+    assert tested == {classify.spec.name}
     assert finish(query, _labels(["a", "b"])).collect().to_pylist() == [{"d.id": 7}]
 
 

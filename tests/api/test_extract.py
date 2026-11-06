@@ -7,6 +7,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from helpers import baselines as request_tests
+from helpers.logical import kinds, nodes, read_plan
 from helpers.oracle import Oracle, finish, oracle_executor, question_text
 from helpers.sessions import TOKENIZER
 
@@ -14,9 +15,7 @@ import quail
 from quail.api.config import EngineConfig
 from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
-from quail.logical import (
-    CompileError,
-)
+from quail.common.expressions import CompileError
 from quail.physical import (
     AiExtract,
     Filter,
@@ -293,7 +292,6 @@ def _answers_executor(answers):
 
 def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     from quail.api.execute import execute_query
-    from quail.logical import Filter as LogicalFilter
 
     tests = " AND ".join(f"HINT({test}, {{'selectivity': 0.5}})" for test in (
         "lease.ends IS NOT NULL", "lease.ends ILIKE '%march%'",
@@ -303,20 +301,18 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
         f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE {tests}")
     # each test follows its field's extraction; the span and length
     # tests use the same Filter node
-    kinds = [type(node).__name__ for node in query.logical.walk()]
-    assert kinds == ["Scan", "SemanticExtract", "Filter", "Filter", "Filter",
-                     "SemanticExtract", "Filter", "Project"]
-    tests = [node for node in query.logical.walk()
-             if isinstance(node, LogicalFilter)]
+    assert kinds(query.logical) == [
+        "Scan", "SemanticExtract", "Filter", "Filter", "Filter",
+        "SemanticExtract", "Filter", "Project"]
+    tests = nodes(query.logical, "Filter")
     assert [str(node.condition) for node in tests] == [
         "c.lease.ends IS NOT NULL", "c.lease.ends ilike '%march%'",
         "c.lease.ends_span.start < 20", "length(c.lease.rent) < 20"]
     assert [node.selectivity for node in tests] == [0.5, 0.5, 0.5, 0.5]
-    operators = query.logical.operators()
-    assert [(test.name, test.position)
-            for test in operators.column_filters["c"]] == [
-        ("lease.ends", 0), ("lease.ends", 1), ("lease.ends", 2),
-        ("lease.rent", 3)]
+    # the first three tests read the first field, the last the second
+    assert [nodes(query.logical, "SemanticExtract").index(node.input)
+            if node.input.kind == "SemanticExtract" else None
+            for node in tests] == [0, None, None, 1]
     plan = query.plan()
     assert not isinstance(plan, Refusal)
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
@@ -359,7 +355,7 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     negated = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
         "FROM contracts c WHERE NOT (lease.ends LIKE 'March%')")
-    assert str(negated.logical.root.input.condition) == (
+    assert str(read_plan(negated.logical).root.input.condition) == (
         "NOT (c.lease.ends like 'March%')")
     result = execute_query(negated, physical_executor=_answers_executor(
         {0: "March 3, 2027", 1: None}))
@@ -368,14 +364,13 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
 
 def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(session):
     from quail.api.execute import execute_query
-    from quail.logical import Filter as LogicalFilter
 
     head = (f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
             f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE ")
 
     def placed(query):
-        return [(type(node.input).__name__, str(node.condition))
-                for node in query.logical.walk() if isinstance(node, LogicalFilter)]
+        return [(node.input.kind, str(node.condition))
+                for node in nodes(query.logical, "Filter")]
 
     def kept(query):
         result = execute_query(query, physical_executor=_answers_executor(

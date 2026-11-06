@@ -18,7 +18,7 @@ from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.pages import PageArena
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
-from quail.logical import ColumnRef
+from quail.common.expressions import ColumnRef
 from quail.physical import (
     AiFilter,
     AiJoin,

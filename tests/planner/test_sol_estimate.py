@@ -6,11 +6,14 @@ from dataclasses import replace
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from helpers.logical import nodes
 from helpers.sessions import TOKENIZER, encoder
 
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
+from quail.common.prompts import Prompt
+from quail.physical.codec import decode_value
 from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_USD_PER_HOUR
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
@@ -67,8 +70,7 @@ def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
         query = sess.sql(
             f"SELECT r.id FROM reviews r "
             f"WHERE AI_FILTER(PROMPT({_quoted(FILTER)}, r.body))")
-        filters = query.logical.operators().filters
-        lowered = quail.lower_prompt(filters["r"][0].prompt, sess.tokenizer)
+        lowered = quail.lower_prompt(_filter_prompt(query, "r"), sess.tokenizer)
         question, preamble = lowered.tail_tokens, lowered.preamble_tokens
         distinct = quail.speed_of_light_estimate(query, _answer)
         per_document = quail.speed_of_light_estimate(
@@ -141,7 +143,7 @@ def test_planner_and_estimate_price_hybrid_queries_and_prefix_reuse(tmp_path):
             query, lambda *_: True, credit_shared_prefixes=False)
         shared = quail.speed_of_light_estimate(query, lambda *_: True)
         planned = query.plan()
-        pre = quail.lower_prompt(query.logical.operators().filters["r"][0].prompt,
+        pre = quail.lower_prompt(_filter_prompt(query, "r"),
                                  session.tokenizer).preamble_tokens
     assert exact.join_stages[0]["anchor"] == "r"
     # the plan credits the shared prefix as the estimate does, and prices
@@ -166,9 +168,15 @@ def _label(prompt, assignment):
     return "good" if assignment["r"] == 0 else "bad"
 
 
-def _classification(query):
-    ((call, _),) = query.logical.operators().labels.calls
-    return call
+def _filter_prompt(query, alias):
+    """Return the first AI.IF prompt on one table's documents."""
+    return decode_value(Prompt, query.facts()["prompts"]["filters"][alias][0])
+
+
+def _classification_prompt(query):
+    """Return the prompt of the query's one classification."""
+    (classify,) = query.facts()["prompts"]["classifies"].values()
+    return decode_value(Prompt, classify["prompt"])
 
 
 def test_classifications_and_label_filters_price_like_filters(tmp_path):
@@ -176,8 +184,7 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
         tone = (f"AI.CLASSIFY(PROMPT({_quoted(CLASSIFY)}, r.body), "
                 "['good', 'bad']) AS tone")
         query = sess.sql(f"SELECT r.id, {tone} FROM reviews r")
-        call = _classification(query)
-        lowered = quail.lower_prompt(call.prompt, sess.tokenizer)
+        lowered = quail.lower_prompt(_classification_prompt(query), sess.tokenizer)
         tail, preamble = lowered.tail_tokens, lowered.preamble_tokens
         distinct = quail.speed_of_light_estimate(query, _answer, label=_label)
         per_document = quail.speed_of_light_estimate(
@@ -193,8 +200,7 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
             f"ON AI_FILTER(PROMPT({_quoted(JOIN)}, r.body, a.aspect)) "
             f"WHERE AI_FILTER(PROMPT({_quoted(FILTER)}, r.body)) "
             "AND tone IN ('good')")
-        filters = query.logical.operators().filters
-        question = quail.lower_prompt(filters["r"][0].prompt,
+        question = quail.lower_prompt(_filter_prompt(query, "r"),
                                       sess.tokenizer).tail_tokens
         estimate = quail.speed_of_light_estimate(
             query, _answer, label=_label, credit_shared_prefixes=False)
@@ -247,7 +253,7 @@ def test_map_answers_decode_one_pass_per_token_and_share_their_document(tmp_path
             "SELECT r.id, AI.MAP(r.body, 'Retell the plot.') AS plot, "
             "AI.MAP(r.body, 'List the names.') AS names FROM reviews r")
         maps = {node.call.prompt: node.name
-                for node in query.logical.operators().maps}
+                for node in nodes(query.logical, "SemanticMap")}
         lowered = {name: quail.lower_prompt(prompt, sess.tokenizer)
                    for prompt, name in maps.items()}
 

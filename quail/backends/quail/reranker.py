@@ -19,7 +19,7 @@ from quail.execution.rows import Rows, rows_of
 from quail.physical import AiClassify, AiScore, ClassifySpec, ValueType
 from quail.progress import answer_sink
 
-# one kernel per entry of quail.logical.SCORE_COMPARISONS
+# one kernel per entry of quail.common.expressions.SCORE_COMPARISONS
 _COMPARE = {
     "<": pc.less, "<=": pc.less_equal,
     ">": pc.greater, ">=": pc.greater_equal,

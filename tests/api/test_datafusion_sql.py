@@ -11,7 +11,7 @@ from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
-from quail.logical import CompileError
+from quail.common.expressions import CompileError
 
 AI_IF = "AI_FILTER(PROMPT('q: {0}', r.body))"
 # the model keeps every review but r1

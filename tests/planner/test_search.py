@@ -1,14 +1,16 @@
 """Search lowers each logical alternative and keeps the cheapest refined plan."""
 
+from types import SimpleNamespace
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from helpers.logical import walk
 from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.logical import columns_above_joins
 from quail.planner import native
 from quail.planner.context import PlanningContext
 from quail.planner.optimize import search_plan
@@ -41,6 +43,17 @@ def context_for(query):
         tokenizer=query.session.tokenizer)
 
 
+COLUMN_KINDS = {"SemanticColumn", "SemanticClassify", "SemanticExtract", "SemanticMap"}
+
+
+def columns_above_joins(logical):
+    """Return the one-table column operators that sit above a SemanticJoin."""
+    return [node for node in walk(logical)
+            if node.kind in COLUMN_KINDS and len(node.call.aliases()) == 1
+            and any(below.kind == "SemanticJoin"
+                    for below in walk(SimpleNamespace(root=node.input)))]
+
+
 def alternative_plans(query):
     """The refined plan of each logical alternative, in search order."""
     context = context_for(query)
@@ -53,7 +66,8 @@ def test_search_compares_both_extraction_placements_and_keeps_the_cheaper(query)
     context = context_for(query)
     registry = query.session.registry
     original, lifted = native.column_placements(query._logical_input)
-    assert not columns_above_joins(original.plan.root)
+    assert not columns_above_joins(original.plan)
+    assert columns_above_joins(lifted.plan)
     assert "should_lift_column_operators" not in original.rules
     assert "should_lift_column_operators" in lifted.rules
     first, second = alternative_plans(query)

@@ -37,7 +37,7 @@ from quail.backends.quail.executor.state import LoadedModelState, QueryExecution
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_execute
 from quail.builtins import built_in_registry
-from quail.logical import And, ColumnRef, GetField, Not, Or, RegularPredicate
+from quail.common.expressions import And, ColumnRef, GetField, Not, Or, RegularPredicate
 from quail.physical import (
     AiExtract,
     AiFilter,

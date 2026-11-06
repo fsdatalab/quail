@@ -6,7 +6,7 @@ import pytest
 from helpers.sessions import CONFIG, TOKENIZER, _run, make_executor
 
 import quail
-from quail.logical import CompileError
+from quail.common.expressions import CompileError
 
 
 @pytest.fixture()

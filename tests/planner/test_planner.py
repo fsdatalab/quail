@@ -2,9 +2,11 @@
 
 from dataclasses import replace
 
+import _quail_native
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from helpers.logical import nodes, read_plan
 from helpers.planning import _optimize, _plan, compile_sql, node_kinds
 
 from quail.catalog import Catalog, DocumentProvider
@@ -12,7 +14,6 @@ from quail.common.sol import speed_of_light
 from quail.common.work import ask, scan, stream
 from quail.explain import explain
 from quail.extensions import LogicalRule, PhysicalRule
-from quail.logical import SemanticJoin
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -175,8 +176,9 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
         assert "tokens=40,000" in physical, sels
         assert "node_id=" not in text and "arena_writes" not in text, sels
         assert "KV=bf16, chunk budget=" in text and "KV rewind=on" in text, sels
+        predicates = read_plan(logical).root.input.predicates
         for stage in plan.graph.nodes_by_type(AiFilter.type_name):
-            predicate = logical.root.input.predicates[stage.written_position]
+            predicate = predicates[stage.written_position]
             assert (f"predicate {stage.written_position + 1}  "
                     f"PROMPT({predicate.prompt.template!r})") in physical, sels
         verbose = explain(logical, plan, verbose=True)
@@ -184,7 +186,7 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
         assert "admission_tokens=" in verbose and "expected_rows=" in verbose, sels
 
     logical = _five_filter_plan(catalog, (0.25,))
-    logical = replace(logical, root=replace(logical.result, limit=10))
+    logical = _quail_native.limited_plan(logical, 10)
     plan = _plan(logical, {"r": [400] * 100})
     physical = explain(logical, plan).split("physical:", 1)[1]
     assert _cell(physical, "Limit: 10") == ["10"]
@@ -301,7 +303,7 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     # the physical planner chooses the stage order and anchors; the
     # logical plan keeps the joins as written
     optimized, _ = _optimize(_join_sequence(catalog), tokens, order="as_written")
-    joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
+    joins = nodes(optimized, "SemanticJoin")
     assert [join.anchor for join in joins] == [None, None]
     assert [(s["exec_index"], s["anchor"]) for s in stages] == [(0, "r"), (1, "p")]
     text = explain(optimized, plan)

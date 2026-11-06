@@ -23,7 +23,7 @@ from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
-from quail.logical import ColumnRef, RegularPredicate
+from quail.common.expressions import ColumnRef, RegularPredicate
 from quail.physical import (
     AiClassify,
     AiFilter,

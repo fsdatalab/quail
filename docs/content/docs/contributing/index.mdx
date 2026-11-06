@@ -41,7 +41,7 @@ Include the tests and documentation needed to check and use your change.
 | --- | --- |
 | `quail/api/` | `Session`, `Query`, and running a query in this process. |
 | `quail/catalog/` | Table providers and the tokenized inputs of a session. |
-| `quail/logical/`, `quail/physical/` | Logical and physical plan definitions. |
+| `crates/quail-planner/`, `quail/physical/` | Logical plan types (Rust) and physical plan definitions. |
 | `crates/` | SQL parsing and binding on DataFusion, the Rust planner, and the cost model, built into the `_quail_native` module. |
 | `quail/planner/`, `quail/specs/` | The bridge to the Rust planner, and model and device specifications. The cost model is in `crates/quail-cost/`. |
 | `quail/execution/` | The runner and the CPU operators. |

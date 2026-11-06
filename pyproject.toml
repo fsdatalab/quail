@@ -96,7 +96,6 @@ type = "forbidden"
 source_modules = ["quail.backends", "quail.execution"]
 forbidden_modules = [
     "quail.planner",
-    "quail.logical",
     "quail.catalog",
 ]
 allow_indirect_imports = false
@@ -147,7 +146,6 @@ layers = [
     "quail.planner",
     "quail.physical",
     "quail.catalog",
-    "quail.logical",
     "quail.common",
     "quail.specs | quail.labels | quail.progress | quail.deploy",
 ]

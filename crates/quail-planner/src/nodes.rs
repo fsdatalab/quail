@@ -1,5 +1,4 @@
-//! What each logical node reads and returns, and its checks, as the
-//! node classes of `quail/logical/nodes` define them.
+//! What each logical node reads and returns, and its checks.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -4,6 +4,7 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from helpers.logical import nodes, read_plan
 from helpers.oracle import Oracle, finish
 from helpers.planning import compile_sql
 from helpers.sessions import TOKENIZER
@@ -11,7 +12,7 @@ from helpers.sessions import TOKENIZER
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import Catalog, DocumentProvider
-from quail.logical import ColumnRef, RegularPredicate, SemanticJoin
+from quail.common.expressions import ColumnRef, RegularPredicate
 from quail.physical import (
     AiClassify,
     AiScore,
@@ -110,11 +111,12 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
         "WHERE 0.5 <= AI.SCORE(PROMPT('Refund? {0}', d.body))",
         catalog,
     )
-    join = plan.root.input
-    assert isinstance(join, SemanticJoin)
+    join = read_plan(plan).root.input
+    assert join.kind == "SemanticJoin"
     assert (join.predicate.comparison, join.predicate.value) == ("<", 0.8)
     assert join.predicate.expression.aliases() == ("q", "d")
-    (predicate,) = plan.operators().filters["d"]
+    (semantic_filter,) = nodes(plan, "SemanticFilter")
+    (predicate,) = semantic_filter.predicates
     expression = predicate.expression
     assert (expression.comparison, expression.value) == (">=", 0.5)
 

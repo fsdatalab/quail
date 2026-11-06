@@ -7,10 +7,10 @@ gives a one-table SemanticFilter the selected columns as its stop key.
 
 import pyarrow as pa
 import pytest
+from helpers.logical import nodes
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
-from quail.logical import SemanticFilter
 
 REVIEWS = pa.table({"id": ["r0", "r1"], "stars": [5, 2], "body": ["good", "slow"]})
 
@@ -29,12 +29,14 @@ def session():
     "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) GROUP BY r.stars",
 ])
 def test_a_distinct_that_removes_no_row_is_eliminated(session, text):
-    assert not session.sql(text).logical.result.distinct
+    plan = session.sql(text).logical
+    assert not any(result.distinct for result in nodes(plan, "Result"))
 
 
 def test_a_distinct_on_one_tables_columns_stops_its_filter_at_the_first_match(session):
     plan = session.sql("SELECT DISTINCT r.stars FROM reviews r "
                        "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))").logical
-    assert plan.result.distinct
-    (found,) = [node for node in plan.walk() if isinstance(node, SemanticFilter)]
+    (result,) = nodes(plan, "Result")
+    assert result.distinct
+    (found,) = nodes(plan, "SemanticFilter")
     assert found.stop_key == ("stars",)

@@ -3,21 +3,17 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from helpers.logical import kinds, nodes, read_plan
 from helpers.planning import placements
 from helpers.sessions import TOKENIZER, _run, make_executor
 
 import quail
 from quail.api.config import EngineConfig
-from quail.logical import (
-    Scan,
-    SemanticJoin,
-)
 from quail.physical import Recombine
 
 
 def _scans(plan):
-    return {node.alias: node for node in plan.walk()
-            if isinstance(node, Scan)}
+    return {node.alias: node for node in nodes(plan, "Scan")}
 
 
 def _session(tmp_path, tokenizer=TOKENIZER):
@@ -128,16 +124,16 @@ LABELLED_JOIN_SQL = """
 def test_projection_pushdown_is_the_only_rewrite_of_a_join():
     session = _pair_session()
     plan = session.sql(JOIN_SQL).logical
-    assert isinstance(plan.root.input, SemanticJoin)
+    assert read_plan(plan).root.input.kind == "SemanticJoin"
 
     # only the projection moves
     candidate, = placements(plan)
     assert candidate.rules == ()
-    assert candidate.plan.root == plan.root
+    assert read_plan(candidate.plan).root == read_plan(plan).root
 
     labelled = session.sql(LABELLED_JOIN_SQL).logical
     # the placement rule offers the lifted plan for a full join
     *_, placed = placements(labelled)
-    assert [type(node).__name__ for node in placed.plan.walk()][-4:] == [
+    assert kinds(placed.plan)[-4:] == [
         "SemanticJoin", "SemanticClassify", "Filter", "Project"]
     session.close()

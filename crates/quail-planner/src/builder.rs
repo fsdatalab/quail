@@ -1,5 +1,4 @@
-//! Placing a bound query's conditions and building its logical plan, as
-//! `quail/logical/naive.py`, `placement.py`, and `builder.py` do.
+//! Placing a bound query's conditions and building its logical plan.
 //!
 //! The input is what the SQL front end binds: the scans in FROM and
 //! JOIN order, the ON equalities, the ON and WHERE parts in written

@@ -10,7 +10,7 @@ from quail.backends.quail.executor.operators.filter import ConditionGate
 from quail.backends.quail.executor.operators.sae_features import SaeFeaturesPart
 from quail.backends.quail.executor.sae import feature_lists_of_rows
 from quail.backends.quail.executor.stages import Stage
-from quail.logical import ColumnRef, RegularPredicate
+from quail.common.expressions import ColumnRef, RegularPredicate
 from quail.physical import AiSaeFeatures, Filter, SaeFeaturesSpec
 
 

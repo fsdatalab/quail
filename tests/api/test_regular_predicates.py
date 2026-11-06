@@ -2,22 +2,21 @@
 
 import pyarrow as pa
 import pytest
+from helpers.logical import nodes
 from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER, TRUTH, _run, make_executor
 
 import quail
-from quail.common.expressions import normalize
-from quail.common.selection import selected_rows
-from quail.logical import (
+from quail.common.expressions import (
     And,
     ColumnRef,
     CompileError,
     Not,
     Or,
     RegularPredicate,
-    Scan,
+    normalize,
 )
-from quail.logical import Filter as LogicalFilter
+from quail.common.selection import selected_rows
 
 REF = ColumnRef("r", "reviews", "stars")
 
@@ -113,7 +112,7 @@ def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
     query = session.sql(
         FILTER_SQL + " AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)")
     # the test runs in DataFusion, before the region
-    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    (scan,) = nodes(query.logical, "Scan")
     assert scan.predicates == ()
     # r3's NULL < 3 makes the OR null, so DataFusion rejects r3
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",)]
@@ -137,8 +136,7 @@ def test_an_or_over_two_tables_runs_on_the_result_rows(session):
         WHERE r.stars > 4 OR p.price > 15
         ORDER BY r.id, p.asin
     """)
-    filters = [node for node in query.logical.walk()
-               if isinstance(node, LogicalFilter)]
+    filters = nodes(query.logical, "Filter")
     # DataFusion computes each table's side; the region tests the OR of them
     assert [str(node.condition) for node in filters] == [
         "r.__quail_expr_0 OR p.__quail_expr_1"]
@@ -161,7 +159,7 @@ def test_datafusion_functions_run_in_where_and_select(session):
         WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND ABS(r.stars - 4) <= 1
         ORDER BY r.id""")
     # DataFusion's ABS runs the WHERE test before the region
-    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    (scan,) = nodes(query.logical, "Scan")
     assert scan.predicates == ()
     assert _run(query, make_executor(TRUTH)).to_rows() == [
         ("r0", "NE", 1), ("r4", "NE", 1)]
@@ -191,7 +189,7 @@ def test_where_takes_the_same_expressions_as_select(session):
     }
     for test, kept in cases.items():
         query = session.sql(f"{first} AND ({test}) ORDER BY r.id")
-        scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+        (scan,) = nodes(query.logical, "Scan")
         # DataFusion runs every plain test before the region
         assert scan.predicates == (), test
         assert [row[0] for row in _run(query, make_executor(TRUTH)).to_rows()] == (
@@ -216,8 +214,7 @@ def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
         WHERE r.stars > p.price
         ORDER BY r.id, p.asin
     """)
-    filters = [node for node in query.logical.walk()
-               if isinstance(node, LogicalFilter)]
+    filters = nodes(query.logical, "Filter")
     assert [str(node.condition) for node in filters] == ["greater(r.stars, p.price)"]
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     assert result.to_rows() == [

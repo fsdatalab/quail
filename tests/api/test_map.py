@@ -2,13 +2,14 @@
 
 import pyarrow as pa
 import pytest
+from helpers.logical import kinds, nodes
 from helpers.oracle import Oracle, finish, question_text
 from helpers.sessions import TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.logical import CompileError
+from quail.common.expressions import CompileError
 from quail.physical import AiMap
 from quail.physical.pipelines import build_pipelines
 
@@ -95,9 +96,8 @@ def test_a_malformed_map_is_refused(session, sql, message):
 
 
 def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
+    import _quail_native
     from helpers.planning import placements
-
-    from quail.logical import LogicalPlan
 
     session.register("films", DocumentProvider.from_table(
         pa.table({"id": [7, 8], "plot": ["a heist", "a romance"]}), id_col="id"))
@@ -105,17 +105,16 @@ def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
         f"SELECT r.id, f.id, AI.MAP(r.body, '{SUMMARY}', 32) AS summary "
         "FROM reviews r JOIN films f ON "
         "AI_FILTER(PROMPT('Is review {0} about film {1}?', r.body, f.plot))")
-    root = query.logical.root
     # as written the map runs below the join, on every review; the
     # placement rule also offers it above the join, like a classification
-    written = [type(node).__name__ for node in LogicalPlan(root).walk()]
+    written = kinds(query.logical)
     assert written.index("SemanticMap") < written.index("SemanticJoin")
     *_, placed = placements(query.logical)
     moved = placed.plan
     assert "should_lift_column_operators" in placed.rules
-    lifted = [type(node).__name__ for node in moved.walk()]
+    lifted = kinds(moved)
     assert lifted.index("SemanticJoin") < lifted.index("SemanticMap")
-    moved.validate()
+    assert _quail_native.validate_logical_plan(moved) is None
 
 
 @pytest.mark.parametrize("form,dialect", [("alias", "bq"), ("cte", "snowflake")])
@@ -157,21 +156,18 @@ def test_a_map_only_used_by_a_test_is_computed_once(session):
 ])
 def test_every_column_operator_supports_a_plain_result_test(session, kind, call,
                                                            operand):
-    from quail.logical.nodes.column import SemanticColumn
-
-    assert {node.call_kind for node in SemanticColumn.__subclasses__()} == {
-        "label", "extract", "map", "features"}
     model = "qwen3.5-2b-sae-bf16" if kind == "features" else "qwen3-4b-fp8"
     with quail.Session(EngineConfig(model=model, device="h100-sxm"),
                        tokenizer=TOKENIZER) as value:
         value.register("reviews", session.catalog.get("reviews"))
         query = value.sql(f"SELECT r.id, {call} AS value FROM reviews r "
                           f"WHERE HINT({operand} IS NOT NULL, {{'selectivity': 0.4}})")
-        (test,) = query.logical.operators().column_filters["r"]
-        assert test.call.kind == kind
+        (test,) = nodes(query.logical, "Filter")
+        # the test follows the column operator whose answer it reads
+        assert test.input.call.kind == kind
         assert test.selectivity == 0.4
         plan = query.plan()
         (condition,) = [node for node in plan.nodes if node.type_name == "quail.filter"]
         producer = next(node for node in plan.nodes
                         if node.node_id == condition.inputs[0].source.node_id)
-        assert producer.spec.name == test.name
+        assert producer.spec.name == test.input.name

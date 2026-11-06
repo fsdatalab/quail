@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 import pyarrow as pa
 
-from quail.logical import CompileError
+from quail.common.expressions import CompileError
 
 # separates a table's name from its alias in the name of a model region's
 # input that holds some of the table's rows, as in reviews__r

@@ -15,10 +15,10 @@ from quail.api.config import EngineConfig
 from quail.api.execute import _execute_physical
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
+from quail.common.expressions import ColumnRef
 from quail.execution.metrics import NodeResult
 from quail.execution.runtimes import BarrierRuntime
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
-from quail.logical import ColumnRef
 from quail.physical import (
     Barrier,
     ExecutionLocation,
