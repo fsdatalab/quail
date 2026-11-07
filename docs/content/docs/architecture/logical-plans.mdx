@@ -126,10 +126,15 @@ fetch of one row per selected key.
 
 Finally, `derive` (`crates/quail-datafusion/src/derive.rs`) reads the
 region's operators from the optimized plan. It walks the plan once,
-children first and the left input before the right, and binds each AI
-call's prompt and each condition in the order the query wrote them
-(`binding.rs`). It places each table's terms (`terms.rs`) and writes
-the region's `Operators`, with each operator where the rules left it.
+children first and the left input before the right. Each AI call's
+prompt and each condition is bound in the order the query wrote them
+(`binding.rs`), from each `AiNode`'s call, written place, and tests.
+Each column operator takes its SELECT alias or a name of its own, and
+each condition is placed at a table's scan, after the operator that
+computes the columns it reads, or on the result rows. Then `derive`
+writes the region's `Operators` in the plan's order: each `AiNode` is
+one AI filter, AI join, gate, or column operator where the rules left
+it.
 The physical planner reads only these operators. A region whose shape
 the operators cannot hold is refused when DataFusion claims it, and
 DataFusion runs that part of the query itself.

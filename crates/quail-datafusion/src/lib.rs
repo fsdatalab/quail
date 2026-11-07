@@ -31,7 +31,6 @@ mod lower;
 mod optimize;
 mod placement;
 mod region;
-mod terms;
 mod unnest;
 
 use std::sync::Arc;

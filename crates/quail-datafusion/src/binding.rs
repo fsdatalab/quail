@@ -1,29 +1,29 @@
-//! Bind the terms of a model region's DataFusion plan into Quail's
-//! expressions.
+//! Quail's expressions from the DataFusion expressions of a model
+//! region's plan.
 //!
-//! [`crate::derive`] hands the [`Binder`] each table, ON and WHERE term,
-//! AI call, and SELECT list item in the order the query wrote them. The
-//! binder binds each AI call's prompt in the session model's chat turn
-//! and layout, each condition as a [`Condition`], and the SELECT list as
-//! the region's projection, and refuses SQL outside Quail's language.
-
-use std::collections::BTreeMap;
+//! [`crate::derive`] hands the [`Binder`] each table, each ON and WHERE
+//! term, AI call, and SELECT list item as the query wrote it, in that
+//! order. The binder binds each AI call's prompt in the session model's
+//! chat turn and layout, each condition as a [`Condition`], and the
+//! SELECT list as the region's projection, and refuses SQL outside
+//! Quail's language.
 
 use crate::functions::function_name;
 use crate::functions::{ai_function_name, column_call_kind};
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use datafusion::common::tree_node::TreeNode;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::{InList, Like, ScalarFunction};
-use datafusion::logical_expr::{BinaryExpr, Distinct, Expr, LogicalPlan, Operator, SortExpr};
+use datafusion::logical_expr::utils::split_binary;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, SortExpr};
 use quail_physical::{
     Alias, ColumnRef, Condition, Connective, Equality, ExtractStruct, GetField, Literal, ModelCall,
     Not, RegularPredicate, ScalarFunction as QuailFunction, SortExpression, SortKey,
-    TaggedModelCall, ValueExpression,
+    ValueExpression,
 };
 use quail_planner::expressions::{
-    CompileError, SPAN_SUFFIX, aliased_call, call_aliases, column_alias_of, column_name,
-    column_references, compile_error, repr_str,
+    CompileError, SPAN_SUFFIX, UNSUPPORTED, aliased_call, call_aliases, column_alias_of,
+    column_name, compile_error, repr_str,
 };
 use quail_planner::operators::{Scan, ScanColumn, Schema};
 use quail_planner::prompts::{self, Turn};
@@ -32,125 +32,8 @@ use serde_json::Value;
 /// The answer limit of an AI.MAP call written without one.
 const DEFAULT_MAP_ANSWER_TOKENS: i64 = 256;
 
-// ---------------------------------------------------------------- the SELECT
-
-pub use quail_planner::expressions::UNSUPPORTED;
-
 pub(crate) fn unsupported<T>(what: &str) -> Result<T, CompileError> {
     compile_error(format!("{what} {UNSUPPORTED}"))
-}
-
-/// The LIMIT, OFFSET, ORDER BY, DISTINCT, and SELECT list of one SELECT,
-/// and the relation below them.
-pub(crate) struct Top<'a> {
-    pub(crate) limit: Option<i64>,
-    pub(crate) offset: i64,
-    pub(crate) distinct: bool,
-    pub(crate) order: Vec<SortExpr>,
-    /// The SELECT list, with an ORDER BY column it does not return read
-    /// through the outer SELECT list.
-    pub(crate) projection: Vec<Expr>,
-    /// The input of the SELECT list.
-    pub(crate) relation: &'a LogicalPlan,
-}
-
-/// Read the operators of a SELECT above its relation.
-///
-/// # Errors
-///
-/// The LIMIT or OFFSET is not a literal, the SELECT has a DISTINCT ON,
-/// or it has no SELECT list.
-pub(crate) fn read_top(plan: &LogicalPlan) -> Result<Top<'_>, CompileError> {
-    let mut node = plan;
-    let (mut limit, mut offset, mut distinct, mut order) = (None, 0, false, Vec::new());
-    let mut outer_projection: Option<&Vec<Expr>> = None;
-    loop {
-        match node {
-            LogicalPlan::Limit(found) => {
-                use datafusion::logical_expr::{FetchType, SkipType};
-                match found.get_skip_type() {
-                    Ok(SkipType::Literal(skip)) => offset = skip as i64,
-                    _ => return compile_error("OFFSET must be a nonnegative integer"),
-                }
-                match found.get_fetch_type() {
-                    Ok(FetchType::Literal(fetch)) => limit = fetch.map(|fetch| fetch as i64),
-                    _ => return compile_error("LIMIT must be a positive integer"),
-                }
-                node = &found.input;
-            }
-            LogicalPlan::Sort(found) => {
-                order = found.expr.clone();
-                node = &found.input;
-            }
-            LogicalPlan::Distinct(Distinct::All(input)) => {
-                distinct = true;
-                node = input;
-            }
-            LogicalPlan::Distinct(Distinct::On(_)) => {
-                return compile_error("DISTINCT ON is not supported; use DISTINCT");
-            }
-            LogicalPlan::Projection(found)
-                if outer_projection.is_none()
-                    && matches!(
-                        *found.input,
-                        LogicalPlan::Sort(_) | LogicalPlan::Distinct(_)
-                    ) =>
-            {
-                outer_projection = Some(&found.expr);
-                node = &found.input;
-            }
-            _ => break,
-        }
-    }
-    let LogicalPlan::Projection(projection) = node else {
-        return unsupported("a region without a SELECT list");
-    };
-    let mut expressions = projection.expr.clone();
-    if let Some(outer) = outer_projection {
-        // ORDER BY a column SELECT does not return: the inner
-        // projection adds it, the outer one drops it
-        expressions = outer
-            .iter()
-            .map(|expr| match expr {
-                Expr::Column(column) => projection
-                    .expr
-                    .iter()
-                    .find(|inner| output_name(inner) == column.name)
-                    .cloned()
-                    .unwrap_or_else(|| expr.clone()),
-                other => other.clone(),
-            })
-            .collect();
-    }
-    Ok(Top {
-        limit,
-        offset,
-        distinct,
-        order,
-        projection: expressions,
-        relation: projection.input.as_ref(),
-    })
-}
-
-/// Refuse a SELECT whose input is a GROUP BY or a window.
-///
-/// DataFusion runs a GROUP BY or window above the region, or as an input
-/// it computes for the region.
-///
-/// # Errors
-///
-/// The input groups or windows rows.
-pub(crate) fn refuse_grouped_input(relation: &LogicalPlan) -> Result<(), CompileError> {
-    let groups =
-        |plan: &LogicalPlan| matches!(plan, LogicalPlan::Aggregate(_) | LogicalPlan::Window(_));
-    if groups(relation) || matches!(relation, LogicalPlan::Filter(filter) if groups(&filter.input))
-    {
-        return compile_error(
-            "a model call that reads the result of a GROUP BY or a window is not \
-             supported; read it from a CTE or FROM subquery instead",
-        );
-    }
-    Ok(())
 }
 
 /// Each output column name of a SELECT list and its expression, but a
@@ -181,7 +64,7 @@ pub(crate) fn selected_calls(expressions: &[Expr]) -> Vec<(String, Expr)> {
         .collect()
 }
 
-fn output_name(expr: &Expr) -> String {
+pub(crate) fn output_name(expr: &Expr) -> String {
     match expr {
         Expr::Alias(alias) => alias.name.clone(),
         Expr::Column(column) => column.name.clone(),
@@ -236,20 +119,40 @@ fn is_call(expr: &Expr, name: &str) -> bool {
     function_name(expr) == Some(name)
 }
 
-/// The binder method a column-operator call takes, as `column_call`.
-fn walk(expr: &Expr, found: &mut dyn FnMut(&Expr) -> bool) -> bool {
-    if found(expr) {
-        return true;
+/// Whether `expr` or an expression inside it is one `found` accepts.
+fn contains(expr: &Expr, found: impl Fn(&Expr) -> bool) -> bool {
+    expr.exists(|inner| Ok(found(inner))).unwrap_or(false)
+}
+
+/// `name(args...)` as Quail's scalar function call.
+fn function(name: &str, args: Vec<ValueExpression>) -> ValueExpression {
+    ValueExpression::ScalarFunction(QuailFunction {
+        function: name.to_string(),
+        args,
+    })
+}
+
+fn literal(value: Value) -> ValueExpression {
+    ValueExpression::Literal(Literal { value })
+}
+
+/// `value` under the one-column SQL function a test applies to it, if any.
+fn applied(function: &Option<String>, value: ValueExpression) -> ValueExpression {
+    match function {
+        Some(name) => self::function(name, vec![value]),
+        None => value,
     }
-    let mut any = false;
-    let _ = expr.apply_children(|child| {
-        if walk(child, found) {
-            any = true;
-            return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
-        }
-        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
-    });
-    any
+}
+
+/// The test `expression <comparison> value` of a plain test.
+fn compare(expression: ValueExpression, test: &PlainTest) -> Result<Condition, CompileError> {
+    let predicate = RegularPredicate {
+        expression,
+        comparison: test.comparison.clone(),
+        value: test.value.clone(),
+    };
+    quail_planner::expressions::validate_test(&predicate)?;
+    Ok(Condition::Compare(Box::new(predicate)))
 }
 
 /// Whether a term asks the model, counting AI.EXTRACT only bare.
@@ -277,27 +180,26 @@ fn has_ai_call_under(expr: &Expr, in_field: bool) -> bool {
         other => {
             let mut any = false;
             let _ = other.apply_children(|child| {
-                if has_ai_call_under(child, false) {
-                    any = true;
-                    return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
-                }
-                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+                any = has_ai_call_under(child, false);
+                Ok(if any {
+                    TreeNodeRecursion::Stop
+                } else {
+                    TreeNodeRecursion::Continue
+                })
             });
             any
         }
     }
 }
 
-fn string_literal(expr: &Expr) -> Option<String> {
+pub(crate) fn string_literal(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(text)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(text)), _)
-        | Expr::Literal(ScalarValue::Utf8View(Some(text)), _) => Some(text.clone()),
+        Expr::Literal(value, _) => value.try_as_str().flatten().map(str::to_string),
         _ => None,
     }
 }
 
-/// A SQL literal as Python's `sql_literal` reads it, or None.
+/// A SQL literal as a JSON value, or None.
 fn literal_value(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Literal(value, _) => scalar_value(value),
@@ -330,17 +232,8 @@ fn scalar_value(value: &ScalarValue) -> Option<Value> {
             Value::from(*v as f64 / 10f64.powi(i32::from(*scale)))
         }
         other if other.is_null() => Value::Null,
-        other => Value::String(string_of(other)?),
+        other => Value::String(other.try_as_str().flatten()?.to_string()),
     })
-}
-
-fn string_of(value: &ScalarValue) -> Option<String> {
-    match value {
-        ScalarValue::Utf8(Some(text))
-        | ScalarValue::LargeUtf8(Some(text))
-        | ScalarValue::Utf8View(Some(text)) => Some(text.clone()),
-        _ => None,
-    }
 }
 
 /// The (key, value) pairs of an option object, `named_struct(k, v, ...)`.
@@ -410,49 +303,48 @@ fn parse_options(node: Option<&Expr>, allowed: &[&str]) -> Result<Options, Compi
 pub(crate) struct Binder {
     turn: Turn,
     layout: String,
-    /// (alias, provider) of each table in scope, in FROM and JOIN order.
-    tables: Vec<(String, String)>,
-    schemas: BTreeMap<String, SchemaRef>,
+    /// (alias, provider, schema) of each table in scope, in the order
+    /// they were added; an unnested list has no provider.
+    tables: Vec<(String, String, SchemaRef)>,
     /// alias -> the document expression its prompts read.
     document_columns: Vec<(String, ValueExpression)>,
-    /// A column operator only a WHERE test reads -> its name.
-    tested: Vec<(ModelCall, String)>,
-    /// alias -> the ON equalities of its JOIN, in JOIN order.
-    conditions: Vec<(String, Vec<Equality>)>,
+    /// A column operator a WHERE test reads other than as a label test
+    /// -> its name.
+    pub(crate) tested: Vec<(ModelCall, String)>,
     /// AS name -> the column-operator call SELECT gives it.
-    pub(crate) selected: Vec<(String, Expr)>,
+    selected: Vec<(String, Expr)>,
     /// Output column name -> the group, aggregate, or window expression.
-    pub(crate) outputs: Vec<(String, Expr)>,
+    outputs: Vec<(String, Expr)>,
 }
 
-/// A bound ON term that is no AI predicate.
-pub(crate) enum OnTerm {
-    Condition(Condition),
-    Equality(Box<Equality>),
+/// A bound SELECT list.
+pub(crate) struct Selected {
+    pub(crate) columns: Vec<ValueExpression>,
+    pub(crate) structs: Vec<ExtractStruct>,
+    /// The output column names, in SELECT order.
+    pub(crate) output: Vec<String>,
 }
 
 impl Binder {
     /// A binder with no table in scope yet, for prompts rendered with
-    /// `turn` and `layout`.
-    pub(crate) fn new(turn: &Turn, layout: &str) -> Self {
+    /// `turn` and `layout`, and the SELECT list `select`.
+    pub(crate) fn new(turn: &Turn, layout: &str, select: &[Expr]) -> Self {
         Self {
             turn: turn.clone(),
             layout: layout.to_string(),
             tables: Vec::new(),
-            schemas: BTreeMap::new(),
             document_columns: Vec::new(),
             tested: Vec::new(),
-            conditions: Vec::new(),
-            selected: Vec::new(),
-            outputs: Vec::new(),
+            selected: selected_calls(select),
+            outputs: select_outputs(select),
         }
     }
 
     fn provider(&self, alias: &str) -> Option<&str> {
         self.tables
             .iter()
-            .find(|(found, _)| found == alias)
-            .map(|(_, provider)| provider.as_str())
+            .find(|(found, _, _)| found == alias)
+            .map(|(_, provider, _)| provider.as_str())
     }
 
     pub(crate) fn add_table(
@@ -464,33 +356,18 @@ impl Binder {
         if self.provider(alias).is_some() {
             return compile_error(format!("duplicate table alias {}", repr_str(alias)));
         }
-        self.tables.push((alias.to_string(), provider.to_string()));
-        self.schemas.insert(provider.to_string(), schema);
+        self.tables
+            .push((alias.to_string(), provider.to_string(), schema));
         Ok(())
     }
 
-    /// Bind an ON term of the JOIN of `joined` that is no AI predicate:
-    /// a condition, or an equality of the join's keys.
-    pub(crate) fn bind_plain_on_term(
+    /// Bind `left = right`, an ON equality of the join of `joined` and a
+    /// table already in the query.
+    pub(crate) fn bind_equality(
         &mut self,
         term: &Expr,
         joined: &str,
-    ) -> Result<OnTerm, CompileError> {
-        if walk(term, &mut |inner| is_call(inner, "ai_score")) {
-            return compile_error("AI.SCORE must be compared with <, <=, >, or >=");
-        }
-        let condition = if has_ai_call(term) {
-            None
-        } else {
-            self.bind_condition(term, true)?
-        };
-        Ok(match condition {
-            Some(condition) => OnTerm::Condition(condition),
-            None => OnTerm::Equality(Box::new(self.parse_equality(term, joined)?)),
-        })
-    }
-
-    fn parse_equality(&mut self, term: &Expr, joined: &str) -> Result<Equality, CompileError> {
+    ) -> Result<Equality, CompileError> {
         let Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Eq,
@@ -527,11 +404,8 @@ impl Binder {
         term: &Expr,
     ) -> Result<Option<(Condition, Option<f64>)>, CompileError> {
         let (term, hint) = self.unwrap_hint(term)?;
-        if !has_ai_call(&term)
-            && label_test(&term).is_none()
-            && let Some(condition) = self.bind_condition(&term, false)?
-        {
-            return Ok(Some((condition, hint)));
+        if !has_ai_call(&term) && label_test(&term).is_none() {
+            return Ok(Some((self.bind_condition(&term)?, hint)));
         }
         Ok(None)
     }
@@ -566,12 +440,12 @@ impl Binder {
                 "NOT is only supported as NOT EXISTS, got NOT {node}"
             ));
         }
-        if walk(&term, &mut |inner| is_call(inner, "ai_classify")) {
+        if contains(&term, |inner| is_call(inner, "ai_classify")) {
             return compile_error(
                 "AI.CLASSIFY in WHERE is tested with = 'label' or IN ('label', ...)",
             );
         }
-        if walk(&term, &mut |inner| is_call(inner, "ai_extract")) {
+        if contains(&term, |inner| is_call(inner, "ai_extract")) {
             return compile_error(
                 "an AI.EXTRACT call is not a predicate; test one of its fields, such as \
                  AI.EXTRACT(...).end_date IS NOT NULL, or its AS name from SELECT",
@@ -580,7 +454,7 @@ impl Binder {
         if score_comparison(&term).is_some() {
             self.bind_ai_score_test(&term, &["selectivity"], None)?;
         } else {
-            if walk(&term, &mut |inner| is_call(inner, "ai_score")) {
+            if contains(&term, |inner| is_call(inner, "ai_score")) {
                 return compile_error("AI.SCORE must be compared with <, <=, >, or >=");
             }
             self.bind_ai_filter_call(&term, &["selectivity", "anchor"], None)?;
@@ -604,14 +478,10 @@ impl Binder {
 
     // ------------------------------------------------------------ conditions
 
-    /// Bind a term that asks no model as a condition; None for a join key.
-    fn bind_condition(
-        &mut self,
-        term: &Expr,
-        join_keys: bool,
-    ) -> Result<Option<Condition>, CompileError> {
+    /// Bind a term that asks no model as a condition.
+    fn bind_condition(&mut self, term: &Expr) -> Result<Condition, CompileError> {
         match term {
-            Expr::Not(inner) => Ok(Some(not(self.bind_operand(inner)?))),
+            Expr::Not(inner) => Ok(not(self.bind_condition(inner)?)),
             // x BETWEEN low AND high reads as x >= low AND x <= high
             Expr::Between(between) => {
                 let low = Expr::BinaryExpr(BinaryExpr::new(
@@ -630,68 +500,35 @@ impl Binder {
                 } else {
                     both
                 };
-                self.bind_condition(&rewritten, join_keys)
+                self.bind_condition(&rewritten)
             }
             Expr::BinaryExpr(BinaryExpr {
                 op: op @ (Operator::And | Operator::Or),
                 ..
             }) => {
                 let mut operands = Vec::new();
-                for part in flatten(term, *op) {
-                    operands.push(self.bind_operand(&part)?);
+                for part in split_binary(term, *op) {
+                    operands.push(self.bind_condition(part)?);
                 }
-                Ok(Some(if *op == Operator::And {
+                Ok(if *op == Operator::And {
                     Condition::And(Connective { operands })
                 } else {
                     Condition::Or(Connective { operands })
-                }))
+                })
             }
             _ => {
                 let test = self.parse_plain_test(term)?;
-                if join_keys && self.join_condition(&test) {
-                    return Ok(None);
-                }
                 let predicate = match self.column_test(&test)? {
                     Some(predicate) => predicate,
                     None => self.bind_plain_test(&test)?,
                 };
-                Ok(Some(if test.negated {
+                Ok(if test.negated {
                     not(predicate)
                 } else {
                     predicate
-                }))
+                })
             }
         }
-    }
-
-    fn bind_operand(&mut self, term: &Expr) -> Result<Condition, CompileError> {
-        Ok(self
-            .bind_condition(term, false)?
-            .expect("a condition outside ON is never a join key"))
-    }
-
-    fn join_condition(&mut self, test: &PlainTest) -> bool {
-        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = &test.operand else {
-            return false;
-        };
-        if comparison_function(*op).is_none() || test.comparison != "is true" {
-            return false;
-        }
-        let sides = [self.bind_value(left), self.bind_value(right)];
-        let [Ok(left), Ok(right)] = sides else {
-            return false;
-        };
-        let aliases = |side: &ValueExpression| -> Vec<String> {
-            let mut found: Vec<String> = column_references(side)
-                .into_iter()
-                .map(|reference| reference.alias)
-                .collect();
-            found.sort();
-            found.dedup();
-            found
-        };
-        let (left, right) = (aliases(&left), aliases(&right));
-        left.len() == 1 && right.len() == 1 && left != right
     }
 
     fn parse_plain_test(&mut self, term: &Expr) -> Result<PlainTest, CompileError> {
@@ -775,15 +612,17 @@ impl Binder {
                     Value::String(pattern),
                 ));
             }
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) if plain_comparison(*op).is_some() => {
-                let comparison = plain_comparison(*op).expect("a comparison");
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) if comparison(*op).is_some() => {
+                let (forward, _) = comparison(*op).expect("a comparison");
+                let (backward, _) =
+                    comparison(op.swap().expect("a comparison")).expect("a comparison");
                 let (found_left, found_right) = (operand_of(left), operand_of(right));
                 match (found_left, found_right) {
                     (Some((operand, function)), None) => {
                         return Ok(PlainTest::new(
                             operand,
                             function,
-                            comparison,
+                            forward,
                             sql_literal(right)?,
                         ));
                     }
@@ -791,7 +630,7 @@ impl Binder {
                         return Ok(PlainTest::new(
                             operand,
                             function,
-                            flipped(comparison),
+                            backward,
                             sql_literal(left)?,
                         ));
                     }
@@ -817,25 +656,8 @@ impl Binder {
     }
 
     fn bind_plain_test(&mut self, test: &PlainTest) -> Result<Condition, CompileError> {
-        let expression = self.operand_value(test)?;
-        let predicate = RegularPredicate {
-            expression,
-            comparison: test.comparison.clone(),
-            value: test.value.clone(),
-        };
-        quail_planner::expressions::validate_test(&predicate)?;
-        Ok(Condition::Compare(Box::new(predicate)))
-    }
-
-    fn operand_value(&mut self, test: &PlainTest) -> Result<ValueExpression, CompileError> {
         let value = self.bind_value(&test.operand)?;
-        Ok(match &test.function {
-            Some(function) => ValueExpression::ScalarFunction(QuailFunction {
-                function: function.clone(),
-                args: vec![value],
-            }),
-            None => value,
-        })
+        compare(applied(&test.function, value), test)
     }
 
     /// A test of a column operator's answer: an AI.CLASSIFY, AI.MAP, or
@@ -864,19 +686,6 @@ impl Binder {
                     name
                 }
             };
-            let reference = self.column_ref(&alias, &name);
-            let expression = match &test.function {
-                Some(function) => ValueExpression::ScalarFunction(QuailFunction {
-                    function: function.clone(),
-                    args: vec![reference],
-                }),
-                None => reference,
-            };
-            let predicate = RegularPredicate {
-                expression,
-                comparison: test.comparison.clone(),
-                value: test.value.clone(),
-            };
             if call.kind == "features"
                 && (test.function.is_some()
                     || !["is null", "is not null"].contains(&test.comparison.as_str()))
@@ -886,8 +695,8 @@ impl Binder {
                      to test its fields",
                 );
             }
-            quail_planner::expressions::validate_test(&predicate)?;
-            return Ok(Some(Condition::Compare(Box::new(predicate))));
+            let reference = self.column_ref(&alias, &name);
+            return compare(applied(&test.function, reference), test).map(Some);
         }
         self.extract_test(test)
     }
@@ -953,22 +762,10 @@ impl Binder {
                 field: part.clone(),
             });
         }
-        if let Some(function) = &test.function {
-            expression = ValueExpression::ScalarFunction(QuailFunction {
-                function: function.clone(),
-                args: vec![expression],
-            });
-        }
-        let predicate = RegularPredicate {
-            expression,
-            comparison: test.comparison.clone(),
-            value: test.value.clone(),
-        };
-        quail_planner::expressions::validate_test(&predicate)?;
-        Ok(Some(Condition::Compare(Box::new(predicate))))
+        compare(applied(&test.function, expression), test).map(Some)
     }
 
-    fn column_ref(&self, alias: &str, column: &str) -> ValueExpression {
+    pub(crate) fn column_ref(&self, alias: &str, column: &str) -> ValueExpression {
         ValueExpression::ColumnRef(ColumnRef {
             alias: alias.to_string(),
             provider: self.provider(alias).unwrap_or_default().to_string(),
@@ -982,12 +779,10 @@ impl Binder {
         let alias = match &column.relation {
             Some(relation) => relation.table().to_string(),
             None => {
-                let owners: Vec<&(String, String)> = self
+                let owners: Vec<&(String, String, SchemaRef)> = self
                     .tables
                     .iter()
-                    .filter(|(_, provider)| {
-                        self.schemas[provider].field_with_name(&column.name).is_ok()
-                    })
+                    .filter(|(_, _, schema)| schema.field_with_name(&column.name).is_ok())
                     .collect();
                 if owners.len() != 1 {
                     return compile_error(format!(
@@ -1019,13 +814,6 @@ impl Binder {
     }
 
     fn bind_value_at(&mut self, expr: &Expr, top: bool) -> Result<ValueExpression, CompileError> {
-        let function = |name: &str, args: Vec<ValueExpression>| {
-            ValueExpression::ScalarFunction(QuailFunction {
-                function: name.to_string(),
-                args,
-            })
-        };
-        let literal = |value: Value| ValueExpression::Literal(Literal { value });
         Ok(match expr {
             Expr::Column(column) => {
                 if column.relation.is_none()
@@ -1070,8 +858,8 @@ impl Binder {
                     }
                     Operator::And => function("and_kleene", vec![left, right]),
                     Operator::Or => function("or_kleene", vec![left, right]),
-                    op => match comparison_function(*op) {
-                        Some(name) => function(name, vec![left, right]),
+                    op => match comparison(*op) {
+                        Some((_, name)) => function(name, vec![left, right]),
                         None => return unsupported(&format!("the operator {op}")),
                     },
                 }
@@ -1351,17 +1139,7 @@ impl Binder {
         }
         let options = parse_options(args.get(1), allowed)?;
         let (prompt, _) = self.bind_ai_call(&args[0], "ai_filter", join, None)?;
-        let call = ModelCall {
-            prompt: Box::new(prompt),
-            kind: "boolean".to_string(),
-            labels: Value::Array(Vec::new()),
-            descriptions: Value::Array(Vec::new()),
-            probabilities: false,
-            question: String::new(),
-            pooling: String::new(),
-            max_answer_tokens: 0,
-        };
-        Ok((call, options))
+        Ok((model_call(prompt, "boolean"), options))
     }
 
     /// Bind a comparison of an `AI.SCORE` call with a threshold: the
@@ -1402,14 +1180,14 @@ impl Binder {
     }
 
     /// Bind a test of an `AI.CLASSIFY` call's label, `= 'label'` or
-    /// `IN ('label', ...)`: the test and its selectivity, the HINT's or
-    /// the call's own.
+    /// `IN ('label', ...)`: the classification, the labels it accepts,
+    /// and its selectivity, the HINT's or the call's own.
     pub(crate) fn bind_label_test(
         &mut self,
         classify: &Expr,
         items: &[&Expr],
         hint: Option<f64>,
-    ) -> Result<(RegularPredicate, Option<f64>), CompileError> {
+    ) -> Result<(ModelCall, Value, Option<f64>), CompileError> {
         let (call, options) = self.bind_ai_classify(classify)?;
         let mut accepted = Vec::new();
         for item in items {
@@ -1426,12 +1204,7 @@ impl Binder {
         if unique.len() != accepted.len() {
             return compile_error("a filter on a label lists a label twice");
         }
-        let test = RegularPredicate {
-            expression: ValueExpression::ModelCall(call),
-            comparison: "in".to_string(),
-            value: Value::Array(accepted),
-        };
-        Ok((test, hint.or(options.selectivity)))
+        Ok((call, Value::Array(accepted), hint.or(options.selectivity)))
     }
 
     fn bind_ai_classify(&mut self, node: &Expr) -> Result<(ModelCall, Options), CompileError> {
@@ -1504,7 +1277,7 @@ impl Binder {
         Ok((call, options))
     }
 
-    fn bind_ai_extract(
+    pub(crate) fn bind_ai_extract(
         &mut self,
         node: &Expr,
         name: &str,
@@ -1635,7 +1408,11 @@ impl Binder {
         Ok(call)
     }
 
-    fn bind_column_call(&mut self, node: &Expr, kind: &str) -> Result<ModelCall, CompileError> {
+    pub(crate) fn bind_column_call(
+        &mut self,
+        node: &Expr,
+        kind: &str,
+    ) -> Result<ModelCall, CompileError> {
         match kind {
             "label" => Ok(self.bind_ai_classify(node)?.0),
             "map" => self.bind_ai_map(node),
@@ -1737,7 +1514,7 @@ impl Binder {
                 if self
                     .tables
                     .iter()
-                    .any(|(_, provider)| self.schemas[provider].field_with_name(&name).is_ok())
+                    .any(|(_, _, schema)| schema.field_with_name(&name).is_ok())
                 {
                     return compile_error(format!(
                         "output name {} is also a column of a table in the query; pick another \
@@ -1774,7 +1551,11 @@ impl Binder {
     ///
     /// No table in scope has the alias.
     pub(crate) fn scan(&self, alias: &str) -> Scan {
-        let provider = self.provider(alias).expect("a table in scope").to_string();
+        let (_, provider, schema) = self
+            .tables
+            .iter()
+            .find(|(found, _, _)| found == alias)
+            .expect("a table in scope");
         Scan {
             column: match self
                 .document_columns
@@ -1784,159 +1565,119 @@ impl Binder {
                 Some((_, column)) => ScanColumn::Expression(column.clone()),
                 None => ScanColumn::Unnamed(String::new()),
             },
-            schema: Some(schema_of(&self.schemas[&provider])),
-            provider,
+            schema: Some(schema_of(schema)),
+            provider: provider.clone(),
             alias: alias.to_string(),
             columns: Vec::new(),
             predicates: Vec::new(),
         }
     }
 
-    /// alias -> the ON equalities of the JOIN of that table, last JOIN first.
-    pub(crate) fn equalities(&self) -> Vec<(String, Vec<Equality>)> {
-        let mut equalities = self.conditions.clone();
-        equalities.reverse();
-        equalities
-    }
-
-    /// Record the ON equalities of the JOIN of `alias`.
-    pub(crate) fn add_equalities(&mut self, alias: &str, equalities: Vec<Equality>) {
-        if !equalities.is_empty() {
-            self.conditions.push((alias.to_string(), equalities));
-        }
-    }
-
-    /// provider -> its schema, for each provider in scope.
-    pub(crate) fn provider_schemas(&self) -> BTreeMap<String, Option<Schema>> {
-        self.schemas
-            .iter()
-            .map(|(provider, schema)| (provider.clone(), Some(schema_of(schema))))
-            .collect()
-    }
-
     /// The unnested lists: the tables without a provider.
     pub(crate) fn unnested(&self) -> Vec<String> {
         self.tables
             .iter()
-            .filter(|(_, provider)| provider.is_empty())
-            .map(|(alias, _)| alias.clone())
+            .filter(|(_, provider, _)| provider.is_empty())
+            .map(|(alias, _, _)| alias.clone())
             .collect()
     }
 
-    /// (model call, column name) of each column operator only a test reads.
-    pub(crate) fn tested(&self) -> Vec<(TaggedModelCall, String)> {
-        self.tested
-            .iter()
-            .map(|(call, name)| (TaggedModelCall::Call(call.clone()), name.clone()))
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------- SELECT list
-
-/// Binds the SELECT list, as `SelectBinder` does.
-pub(crate) struct SelectBinder<'a> {
-    binder: &'a mut Binder,
-    pub(crate) columns: Vec<ValueExpression>,
-    plain: Vec<String>,
-    pub(crate) output: Vec<String>,
-    pub(crate) structs: Vec<ExtractStruct>,
-}
-
-impl<'a> SelectBinder<'a> {
-    pub(crate) fn new(binder: &'a mut Binder) -> Self {
-        Self {
-            binder,
-            columns: Vec::new(),
-            plain: Vec::new(),
-            output: Vec::new(),
-            structs: Vec::new(),
-        }
-    }
+    // ------------------------------------------------------------ SELECT list
 
     fn output_of(&self, expr: &Expr) -> Option<Expr> {
         let Expr::Column(column) = expr else {
             return None;
         };
-        self.binder
-            .outputs
+        self.outputs
             .iter()
             .find(|(name, _)| *name == column.name)
             .map(|(_, found)| found.clone())
     }
 
-    pub(crate) fn bind_projection(&mut self, projection: &[Expr]) -> Result<(), CompileError> {
+    /// Bind a SELECT list.
+    ///
+    /// # Errors
+    ///
+    /// An item does not bind, or two output columns share a name.
+    pub(crate) fn bind_select(&mut self, projection: &[Expr]) -> Result<Selected, CompileError> {
+        let mut selected = Selected {
+            columns: Vec::new(),
+            structs: Vec::new(),
+            output: Vec::new(),
+        };
         for item in projection {
             let (node, alias) = unalias(item);
             let node = self.output_of(node).unwrap_or_else(|| node.clone());
             if is_call(&node, "ai_extract_span") {
                 continue;
             }
-            let selected = self.compile_projection(&node, alias)?;
-            for column in &selected {
-                if !self.columns.contains(column) {
-                    self.columns.push(column.clone());
+            for column in self.bind_select_item(&node, alias, &mut selected.structs)? {
+                selected.output.push(column_name(&column, true));
+                if !selected.columns.contains(&column) {
+                    selected.columns.push(column);
                 }
-                self.plain.push(column_name(column, true));
-                self.output.push(column_name(column, true));
             }
         }
-        Ok(())
+        let mut unique = selected.output.clone();
+        unique.sort();
+        unique.dedup();
+        if unique.len() != selected.output.len() {
+            return compile_error(format!(
+                "projection names must be unique, got {}",
+                quail_planner::expressions::repr_list(&selected.output)
+            ));
+        }
+        Ok(selected)
     }
 
-    fn compile_projection(
+    fn bind_select_item(
         &mut self,
         node: &Expr,
         alias: Option<&str>,
+        structs: &mut Vec<ExtractStruct>,
     ) -> Result<Vec<ValueExpression>, CompileError> {
         let named = |expression: ValueExpression,
                      function: &str|
-         -> Result<ValueExpression, CompileError> {
+         -> Result<Vec<ValueExpression>, CompileError> {
             let Some(alias) = alias else {
                 return unsupported(&format!("{function} without an AS name in SELECT"));
             };
-            Ok(ValueExpression::Alias(Alias {
+            Ok(vec![ValueExpression::Alias(Alias {
                 expression: Box::new(expression),
                 name: alias.to_string(),
-            }))
+            })])
         };
         if is_call(node, "ai_score") {
-            let call = self.binder.bind_ai_value(node)?;
+            let call = self.bind_ai_value(node)?;
             if !(1..=2).contains(&call_aliases(&call).len()) {
                 return compile_error("projected AI.SCORE must reference one or two relations");
             }
-            return Ok(vec![named(ValueExpression::ModelCall(call), "AI.SCORE")?]);
+            return named(ValueExpression::ModelCall(call), "AI.SCORE");
         }
         if is_call(node, "ai_classify") {
-            let call = self.binder.bind_ai_value(node)?;
-            return Ok(vec![named(
-                ValueExpression::ModelCall(call),
-                "AI.CLASSIFY",
-            )?]);
+            let call = self.bind_ai_value(node)?;
+            return named(ValueExpression::ModelCall(call), "AI.CLASSIFY");
         }
         if is_call(node, "ai_extract") {
             let Some(alias) = alias else {
                 return unsupported("AI.EXTRACT without an AS name in SELECT");
             };
-            let (found, members) = self.binder.bind_ai_extract(node, alias)?;
-            self.structs.push(found);
+            let (found, members) = self.bind_ai_extract(node, alias)?;
+            structs.push(found);
             return Ok(members);
         }
         if is_call(node, "ai_sae_features") {
-            let call = self.binder.bind_ai_sae_features(node)?;
-            return Ok(vec![named(
-                ValueExpression::ModelCall(call),
-                "AI.SAE_FEATURES",
-            )?]);
+            let call = self.bind_ai_sae_features(node)?;
+            return named(ValueExpression::ModelCall(call), "AI.SAE_FEATURES");
         }
         if is_call(node, "ai_map") {
-            let call = self.binder.bind_ai_map(node)?;
-            return Ok(vec![named(ValueExpression::ModelCall(call), "AI.MAP")?]);
+            let call = self.bind_ai_map(node)?;
+            return named(ValueExpression::ModelCall(call), "AI.MAP");
         }
-        if has_ai_call(node) || walk(node, &mut |inner| column_call_kind(inner).is_some()) {
+        if has_ai_call(node) || contains(node, |inner| column_call_kind(inner).is_some()) {
             return unsupported("a model call inside a SELECT expression");
         }
-        let value = self.binder.bind_value(node)?;
+        let value = self.bind_value(node)?;
         Ok(vec![match alias {
             Some(alias) => ValueExpression::Alias(Alias {
                 expression: Box::new(value),
@@ -1944,20 +1685,6 @@ impl<'a> SelectBinder<'a> {
             }),
             None => value,
         }])
-    }
-
-    /// Refuse a SELECT list that names two columns alike.
-    pub(crate) fn check_output_names(&self) -> Result<(), CompileError> {
-        let mut unique = self.output.clone();
-        unique.sort();
-        unique.dedup();
-        if unique.len() != self.output.len() {
-            return compile_error(format!(
-                "projection names must be unique, got {}",
-                quail_planner::expressions::repr_list(&self.output)
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -2037,10 +1764,10 @@ fn computed_value(expr: &Expr) -> bool {
             | Expr::IsNotNull(_)
     );
     shape
-        && !walk(expr, &mut |inner| {
+        && !contains(expr, |inner| {
             function_name(inner).is_some_and(|name| name.starts_with("ai_"))
         })
-        && walk(expr, &mut |inner| {
+        && contains(expr, |inner| {
             matches!(inner, Expr::Column(_) | Expr::OuterReferenceColumn(..))
         })
 }
@@ -2053,39 +1780,17 @@ fn sql_literal(expr: &Expr) -> Result<Value, CompileError> {
     })
 }
 
-fn plain_comparison(op: Operator) -> Option<&'static str> {
+/// The SQL comparison `op` makes, and the Arrow function that computes it.
+fn comparison(op: Operator) -> Option<(&'static str, &'static str)> {
     Some(match op {
-        Operator::Eq => "=",
-        Operator::NotEq => "<>",
-        Operator::Lt => "<",
-        Operator::LtEq => "<=",
-        Operator::Gt => ">",
-        Operator::GtEq => ">=",
+        Operator::Eq => ("=", "equal"),
+        Operator::NotEq => ("<>", "not_equal"),
+        Operator::Lt => ("<", "less"),
+        Operator::LtEq => ("<=", "less_equal"),
+        Operator::Gt => (">", "greater"),
+        Operator::GtEq => (">=", "greater_equal"),
         _ => return None,
     })
-}
-
-fn comparison_function(op: Operator) -> Option<&'static str> {
-    Some(match op {
-        Operator::Eq => "equal",
-        Operator::NotEq => "not_equal",
-        Operator::Lt => "less",
-        Operator::LtEq => "less_equal",
-        Operator::Gt => "greater",
-        Operator::GtEq => "greater_equal",
-        _ => return None,
-    })
-}
-
-fn flipped(comparison: &str) -> &'static str {
-    match comparison {
-        "<" => ">",
-        "<=" => ">=",
-        ">" => "<",
-        ">=" => "<=",
-        "=" => "=",
-        _ => "<>",
-    }
 }
 
 /// (comparison, AI.SCORE call, threshold) of a compared score, or None.
@@ -2093,13 +1798,14 @@ fn score_comparison(expr: &Expr) -> Option<(&'static str, &Expr, &Expr)> {
     let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
         return None;
     };
-    let (forward, backward) = match op {
-        Operator::Lt => ("<", ">"),
-        Operator::LtEq => ("<=", ">="),
-        Operator::Gt => (">", "<"),
-        Operator::GtEq => (">=", "<="),
-        _ => return None,
-    };
+    if !matches!(
+        op,
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+    ) {
+        return None;
+    }
+    let forward = comparison(*op)?.0;
+    let backward = comparison(op.swap()?)?.0;
     if is_call(left, "ai_score") {
         return Some((forward, left, right));
     }
@@ -2131,25 +1837,6 @@ pub(crate) fn label_test(expr: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
             }
         }
         _ => None,
-    }
-}
-
-pub(crate) fn conjuncts(expr: &Expr) -> Vec<Expr> {
-    flatten(expr, Operator::And)
-}
-
-fn flatten(expr: &Expr, op: Operator) -> Vec<Expr> {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op: found,
-            right,
-        }) if *found == op => {
-            let mut terms = flatten(left, op);
-            terms.extend(flatten(right, op));
-            terms
-        }
-        other => vec![other.clone()],
     }
 }
 
@@ -2317,32 +2004,25 @@ fn translate(
     written: &[Expr],
     args: Vec<ValueExpression>,
 ) -> Result<ValueExpression, CompileError> {
-    let function = |name: &str, args: Vec<ValueExpression>| {
-        ValueExpression::ScalarFunction(QuailFunction {
-            function: name.to_string(),
-            args,
-        })
-    };
-    let constant = |value: Value| ValueExpression::Literal(Literal { value });
     let mut args = args;
     Ok(match name {
         "round" => {
             let decimals = if args.len() > 1 {
                 args.remove(1)
             } else {
-                constant(Value::from(0))
+                literal(Value::from(0))
             };
             function(
                 "round",
                 vec![
                     args.remove(0),
                     decimals,
-                    constant(Value::from("half_towards_infinity")),
+                    literal(Value::from("half_towards_infinity")),
                 ],
             )
         }
         "concat" => {
-            args.push(constant(Value::from("")));
+            args.push(literal(Value::from("")));
             function("binary_join_element_wise", args)
         }
         "greatest" | "least" => {
@@ -2361,18 +2041,18 @@ fn translate(
             };
             function(
                 "if_else",
-                vec![any_null, constant(Value::Null), function(extreme, args)],
+                vec![any_null, literal(Value::Null), function(extreme, args)],
             )
         }
         "strpos" | "instr" => function(
             "add",
-            vec![function("find_substring", args), constant(Value::from(1))],
+            vec![function("find_substring", args), literal(Value::from(1))],
         ),
         "nullif" => function(
             "if_else",
             vec![
                 function("equal", args.clone()),
-                constant(Value::Null),
+                literal(Value::Null),
                 args[0].clone(),
             ],
         ),
@@ -2381,10 +2061,10 @@ fn translate(
             if start < 1 {
                 return compile_error("SUBSTRING's start counts from 1");
             }
-            let mut call = vec![args.remove(0), constant(Value::from(start - 1))];
+            let mut call = vec![args.remove(0), literal(Value::from(start - 1))];
             if written.len() > 2 {
                 let length = integer_argument(&written[2], "SUBSTRING's length")?;
-                call.push(constant(Value::from(start - 1 + length)));
+                call.push(literal(Value::from(start - 1 + length)));
             }
             function("utf8_slice_codeunits", call)
         }
@@ -2392,15 +2072,15 @@ fn translate(
             "utf8_slice_codeunits",
             vec![
                 args.remove(0),
-                constant(Value::from(0)),
-                constant(Value::from(integer_argument(&written[1], "LEFT's length")?)),
+                literal(Value::from(0)),
+                literal(Value::from(integer_argument(&written[1], "LEFT's length")?)),
             ],
         ),
         "right" => function(
             "utf8_slice_codeunits",
             vec![
                 args.remove(0),
-                constant(Value::from(-integer_argument(
+                literal(Value::from(-integer_argument(
                     &written[1],
                     "RIGHT's length",
                 )?)),
@@ -2428,74 +2108,4 @@ fn translate(
         "log10" | "log2" | "ln" => function(name, args),
         other => function(other, args),
     })
-}
-
-/// Whether an expression calls an AI function anywhere.
-pub(crate) fn contains_ai_call(expr: &Expr) -> bool {
-    expr.exists(|node| Ok(crate::is_ai_call(node)))
-        .unwrap_or(false)
-}
-
-/// One `UNNEST` of `FROM`: each list's name and call, and whether a row
-/// with no elements stays as one row of nulls.
-pub(crate) struct Unnested {
-    pub(crate) lists: Vec<(String, Expr)>,
-    pub(crate) outer: bool,
-}
-
-/// The `UNNEST` a WHERE term of [`crate::take_unnests`] stands for, if it
-/// is one.
-pub(crate) fn unnest_term(term: &Expr) -> Option<Unnested> {
-    let Expr::ScalarFunction(call) = term else {
-        return None;
-    };
-    if call.name() != crate::UNNEST_TEST {
-        return None;
-    }
-    let outer = matches!(
-        call.args.first(),
-        Some(Expr::Literal(ScalarValue::Boolean(Some(true)), _))
-    );
-    let lists = call.args[1..]
-        .chunks(2)
-        .filter_map(|pair| string_literal(&pair[0]).map(|name| (name, pair[1].clone())))
-        .collect();
-    Some(Unnested { lists, outer })
-}
-
-/// `expr` reading each unnested field as a column of its list's
-/// relation: `quail_unnest_field(list, 'f', 'feature')` as `f.feature`.
-pub(crate) fn unnested_fields(expr: &Expr) -> Expr {
-    expr.clone()
-        .transform_up(|node| {
-            if let Expr::ScalarFunction(call) = &node
-                && call.name() == crate::UNNEST_FIELD
-                && let (Some(list), Some(field)) =
-                    (string_literal(&call.args[1]), string_literal(&call.args[2]))
-            {
-                return Ok(datafusion::common::tree_node::Transformed::yes(
-                    Expr::Column(Column::new(Some(list), field)),
-                ));
-            }
-            Ok(datafusion::common::tree_node::Transformed::no(node))
-        })
-        .map(|found| found.data)
-        .unwrap_or_else(|_| expr.clone())
-}
-
-/// The schema of an `AI.SAE_FEATURES` element, as Quail's `FEATURE_LIST`.
-pub(crate) fn feature_schema() -> SchemaRef {
-    std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-        datafusion::arrow::datatypes::Field::new("feature", DataType::Int32, true),
-        datafusion::arrow::datatypes::Field::new("strength", DataType::Float32, true),
-    ]))
-}
-
-/// Whether a plan reads a CTE or a FROM subquery.
-pub(crate) fn has_subqueries(plan: &LogicalPlan) -> bool {
-    plan.exists(|node| {
-        Ok(matches!(node, LogicalPlan::SubqueryAlias(alias)
-            if !matches!(alias.input.as_ref(), LogicalPlan::TableScan(_))))
-    })
-    .unwrap_or(false)
 }

@@ -13,10 +13,10 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::AnalyzerRule;
 
-use crate::derive::UNSUPPORTED;
 use crate::functions::{is_ai_call, is_quail_call};
 use crate::identified::IdentifiedTable;
 use crate::region::ModelRegion;
+use quail_planner::expressions::UNSUPPORTED;
 
 /// Replace each subtree of AI work that Quail can plan with one
 /// `ModelRegion`, and leave the relational operators above it to
