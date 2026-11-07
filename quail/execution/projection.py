@@ -5,7 +5,7 @@ import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
 
-from quail.common.expressions import CompileError, evaluate
+from quail.common.expressions import CompileError
 from quail.common.pairs import pair_keys
 from quail.execution.result import (
     IndexRelation,
@@ -130,7 +130,7 @@ def projection_for(token_inputs, documents):
                         f"projection column {name!r} was not loaded by the "
                         f"scan of {source.alias!r}; the "
                         f"should_push_down_projection rule is not registered")
-            values = evaluate(source_columns[name], store)
+            values = source_columns[name].evaluate(store)
             projection.append((source.alias, values))
             fields.append(pa.field(
                 name,

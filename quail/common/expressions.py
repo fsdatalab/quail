@@ -2,9 +2,9 @@
 
 The expression classes are Rust's, from ``_quail_native``: a value is a
 ColumnRef, a GetField of one, an Alias, or an Expression, which holds a
-DataFusion expression; a condition is an Expression. ``evaluate`` hands
-one to DataFusion with the rows it reads; Python never reads an
-Expression's form.
+DataFusion expression; a condition is an Expression. Each is built for
+DataFusion once, when it is read from a plan, and its ``evaluate(rows)``
+method only evaluates it; Python never reads an Expression's form.
 """
 
 from __future__ import annotations
@@ -52,6 +52,8 @@ def effective_selectivity(selectivity: float | None) -> float:
 def parse_expression(sql: str, rows, alias: str = "", provider: str = ""):
     """Return the Expression of SQL text over the columns of rows.
 
+    The Expression is built for evaluation once, here.
+
     For example, ``parse_expression("stars > 3", reviews, "r", "reviews")``
     is the condition a scan of reviews as ``r`` tests.
 
@@ -67,38 +69,7 @@ def parse_expression(sql: str, rows, alias: str = "", provider: str = ""):
     found, message = _quail_native.parse_expression(sql, rows, alias, provider)
     if message is not None:
         raise CompileError(message)
-    return _quail_native.decode_plan_value(found)
-
-
-def evaluate(expression, rows, *, qualified: bool = False) -> pa.Array:
-    """Evaluate a value or condition over rows with DataFusion.
-
-    Args:
-        expression: A ColumnRef, GetField, Alias, or Expression.
-        rows: A table or record batch holding the columns it reads, or
-            an object that reads them with ``column(name)``, such as a
-            scan's input.
-        qualified: Whether the rows name each column with its table
-            alias, as result rows do.
-
-    Returns:
-        One value per row; a condition's are booleans, null where SQL's
-        three-valued logic leaves a row unknown.
-
-    Raises:
-        CompileError: The rows lack a column the expression reads, or
-            DataFusion cannot evaluate it on the columns' types.
-    """
-    if not isinstance(rows, (pa.Table, pa.RecordBatch)):
-        names = dict.fromkeys(
-            f"{reference.alias}.{reference.column}"
-            if qualified and reference.alias else reference.column
-            for reference in expression.references)
-        rows = pa.table({name: rows.column(name) for name in names})
-    values, message = _quail_native.evaluate(expression, rows, qualified)
-    if message is not None:
-        raise CompileError(message)
-    return values
+    return found
 
 
 def accepted_rows(mask) -> pa.Array:
@@ -109,4 +80,4 @@ def accepted_rows(mask) -> pa.Array:
 
 def accepts(condition, rows, *, qualified: bool = False) -> pa.Array:
     """Return the rows a condition accepts, with every null rejected."""
-    return accepted_rows(evaluate(condition, rows, qualified=qualified))
+    return accepted_rows(condition.evaluate(rows, qualified=qualified))

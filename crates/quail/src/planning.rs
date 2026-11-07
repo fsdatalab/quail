@@ -19,6 +19,7 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Schema};
 use arrow::ipc::writer::FileWriter;
 use arrow::row::{RowConverter, SortField};
+use quail_datafusion::expressions::PhysicalValue;
 use quail_inputs::{HfTokenizer, PrefixIndex, TokenStore, TokenStoreWriter, last_tokens};
 use quail_physical::ValueExpression;
 use quail_planner::context::PlanningContext;
@@ -424,8 +425,12 @@ impl Planner {
             TokenStoreWriter::create(&path)
         }
         .map_err(arrow_error)?;
+        let built = match &scan.column {
+            ScanColumn::Expression(expression) => Some(PhysicalValue::new(expression)?),
+            ScanColumn::Unnamed(_) => None,
+        };
         for batch in &rows.batches {
-            let texts = document_texts(&scan.column, batch)?;
+            let texts = document_texts(&scan.column, built.as_ref(), batch)?;
             writer
                 .write_texts(&self.tokenizer, &texts)
                 .map_err(arrow_error)?;
@@ -489,19 +494,22 @@ fn scans_of<'a>(alternatives: impl Iterator<Item = &'a Operators>) -> Vec<Scan> 
     found
 }
 
-/// A value of each row of `batch`, as DataFusion evaluates it.
-fn value(expression: &ValueExpression, batch: &RecordBatch) -> Result<ArrayRef, CompileError> {
-    quail_datafusion::expressions::evaluate(expression, batch, false)
-}
-
-/// The text of a scan's document column in one batch.
-fn document_texts(column: &ScanColumn, batch: &RecordBatch) -> Result<StringArray, CompileError> {
-    let values = match column {
-        ScanColumn::Unnamed(name) => batch
+/// The text of a scan's document column in one batch, the column
+/// built as `built` when it is an expression.
+fn document_texts(
+    column: &ScanColumn,
+    built: Option<&PhysicalValue>,
+    batch: &RecordBatch,
+) -> Result<StringArray, CompileError> {
+    let values = match (column, built) {
+        (_, Some(built)) => built.evaluate(batch, false)?,
+        (ScanColumn::Unnamed(name), None) => batch
             .column_by_name(name)
             .cloned()
             .ok_or_else(|| CompileError::new(format!("no column {name}")))?,
-        ScanColumn::Expression(expression) => value(expression, batch)?,
+        (ScanColumn::Expression(_), None) => {
+            return Err(CompileError::new("a document expression is not built"));
+        }
     };
     let text = cast(&values, &DataType::Utf8).map_err(arrow_error)?;
     Ok(text.as_string::<i32>().clone())
@@ -540,7 +548,9 @@ fn pair_fractions(
                 .ok_or_else(|| CompileError::new(format!("no scan {alias}")))?;
             let rows = &tables[&scan.provider];
             let batch = first_rows(rows)?;
-            side.iter().map(|key| value(key, &batch)).collect()
+            side.iter()
+                .map(|key| PhysicalValue::new(key)?.evaluate(&batch, false))
+                .collect()
         };
         fractions.insert(
             position,

@@ -8,7 +8,6 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.common.expressions import evaluate
 from quail.common.pairs import columns_key
 from quail.common.selection import equality_keys
 from quail.execution.ids import document_ids
@@ -71,7 +70,7 @@ class ProjectRuntime:
         if node.expressions is not None:
             batches = [pa.RecordBatch.from_arrays(
                 [batch.column(expression) if isinstance(expression, str)
-                 else evaluate(expression, batch, qualified=True)
+                 else expression.evaluate(batch, qualified=True)
                  for expression in node.expressions], names=list(node.columns))
                 if node.expressions else batch.select([])
                 for batch in row_batches(value)]

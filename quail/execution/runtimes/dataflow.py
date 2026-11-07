@@ -5,7 +5,6 @@ from __future__ import annotations
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.common.expressions import evaluate
 from quail.common.pairs import columns_key, pair_table
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
@@ -66,7 +65,7 @@ def relation_values(columns, expression):
         if columns is None or ref.column not in columns.column_names:
             raise KeyError(f"column {ref.alias}.{ref.column} is not among the "
                            f"request's relations")
-    return evaluate(expression, columns)
+    return expression.evaluate(columns)
 
 
 class RecombineRuntime:

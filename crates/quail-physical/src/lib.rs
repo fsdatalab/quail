@@ -74,6 +74,7 @@ mod tests {
         let expression = Expression {
             encoded: String::new(),
             columns: vec![column("r", "stars"), column("", "label")],
+            types: vec!["Int64".into(), "Utf8".into()],
             text: "{0} > 3 AND {1} = '{{x}}'".into(),
         };
         assert_eq!(expression.text_with(true), "r.stars > 3 AND label = '{x}'");

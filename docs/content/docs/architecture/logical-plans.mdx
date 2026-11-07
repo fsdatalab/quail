@@ -207,7 +207,7 @@ every other value and every condition.
 | --- | --- |
 | `ColumnRef(alias, provider, column)` | A reference to a table column. |
 | `GetField(input, field)` | A field read from a struct. |
-| `Expression(encoded, columns, text)` | A value or condition DataFusion computes for each row, such as `length(r.body) < 40`. |
+| `Expression(encoded, columns, types, text)` | A value or condition DataFusion computes for each row, such as `length(r.body) < 40`. |
 | `ModelCall(prompt, kind, labels, descriptions)` | An AI operation. The kind is `boolean`, `score`, `label`, `extract`, `features`, or `map`. |
 | `ScoreTest(call, test)` | An `AI.SCORE` call compared with a threshold. |
 | `Alias(expression, name)` | An expression returned under a specified column name. |
@@ -215,20 +215,39 @@ every other value and every condition.
 An `Expression` holds DataFusion's logical expression, encoded with
 datafusion-proto. It reads its columns by position: `columns[i]` names
 the column it reads as `#i`, so the planner can rename a column, such as
-the score column a score filter reads, without DataFusion. `text` is
-how `explain()` shows it, with `{i}` for `columns[i]`.
+the score column a score filter reads, without DataFusion. `types[i]` is
+that column's Arrow type, as Arrow writes it, such as `Int64` or
+`Struct("start": Int32, "end": Int32)`. The binder takes it from the
+table's schema, or from the answer's type for an answer column: `Utf8`
+for a label, a map's text, or an extracted answer, `Float64` for a score.
+`text` is how `explain()` shows the expression, with `{i}` for
+`columns[i]`.
 
 For example, `LENGTH(r.details.body) < 40` reads the `details` column of
-`reviews` as `r`. Its expression has `columns` `[r.details]` and the
-text `character_length({0}.body) < 40`.
+`reviews` as `r`. Its expression has `columns` `[r.details]`, `types`
+`[Struct("body": Utf8)]` when `body` is its one field, and the text
+`character_length({0}.body) < 40`.
 
-The executor evaluates an expression with `_quail_native.evaluate`,
-which takes the expression and a pyarrow table, evaluates it with
-DataFusion, and returns a pyarrow array over the same buffers: a
-condition gives booleans, null where SQL's three-valued logic leaves a
-row unknown. Python reads only an expression's `references`, the
-columns it gathers for it; `quail.common.expressions.evaluate` wraps the
-call.
+The encoded form exists only to cross a process boundary, such as a plan
+sent to a GPU worker or to Quail Server's client. A process that reads a
+plan builds each expression once, when it makes the Python object: it
+decodes the expression and builds DataFusion's physical expression over
+the columns' types, applying DataFusion's type coercion then. The object
+holds the built expression, and `expression.evaluate(rows)` only reads
+the columns and evaluates it. It takes a pyarrow table, record batch, or
+an object that reads columns with `column(name)`, and returns a pyarrow
+array over the same buffers: a condition gives booleans, null where SQL's
+three-valued logic leaves a row unknown. Pass `qualified=True` for
+result rows, which name each column with its table alias.
+
+Evaluation reads each column by name. A dotted name the rows do not hold
+reads a struct field, as result rows hold an extraction's answers, and a
+field of a null struct reads as null. A dictionary column reads as its
+values, as result rows hold labels. A column whose type is not the one
+the plan gives raises `CompileError`; Quail does not rebuild the
+expression for the rows. `ColumnRef`, `GetField`, and `Alias` objects
+have the same `evaluate` method. Python reads only an expression's
+`references`, the columns it gathers for it.
 
 The operators use these expressions as follows:
 

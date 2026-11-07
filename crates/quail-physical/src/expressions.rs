@@ -74,13 +74,16 @@ pub struct GetField {
 /// `encoded` is DataFusion's logical expression as datafusion-proto
 /// bytes in base64. It reads the column named `#i` where the rows hold
 /// `columns[i]`, so a planner can rename the columns it reads without
-/// DataFusion. `text` is how `explain()` writes it, with `{i}` for the
-/// name of `columns[i]` and `{{` and `}}` for braces.
+/// DataFusion. `types` holds the Arrow type of each column as Arrow
+/// writes it, such as `Int64` or `Utf8`. `text` is how `explain()`
+/// writes the expression, with `{i}` for the name of `columns[i]` and
+/// `{{` and `}}` for braces.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expression {
     pub encoded: String,
     pub columns: Vec<ColumnRef>,
+    pub types: Vec<String>,
     pub text: String,
 }
 

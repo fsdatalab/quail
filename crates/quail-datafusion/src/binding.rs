@@ -13,8 +13,8 @@
 use std::collections::BTreeSet;
 
 use crate::functions::function_name;
-use crate::functions::{ai_function_name, column_call_kind};
-use datafusion::arrow::datatypes::SchemaRef;
+use crate::functions::{ai_function_name, column_call_kind, sae_features_type, span_type};
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::{InList, ScalarFunction};
@@ -317,6 +317,8 @@ pub(crate) struct Binder {
     selected: Vec<(String, Expr)>,
     /// Output column name -> the group, aggregate, or window expression.
     outputs: Vec<(String, Expr)>,
+    /// (alias, column, type) of each answer column a test reads.
+    answer_types: Vec<(String, String, DataType)>,
 }
 
 /// A bound SELECT list.
@@ -339,6 +341,7 @@ impl Binder {
             tested: Vec::new(),
             selected: selected_calls(select),
             outputs: select_outputs(select),
+            answer_types: Vec::new(),
         }
     }
 
@@ -587,10 +590,14 @@ impl Binder {
     fn answer_column(&mut self, node: &Expr, kind: &str) -> Result<Expr, CompileError> {
         let call = self.bind_column_call(node, kind)?;
         let name = self.answer_name(node, &call)?;
-        Ok(Expr::Column(Column::new(
-            Some(call_aliases(&call)[0].clone()),
-            name,
-        )))
+        let alias = call_aliases(&call)[0].clone();
+        let data_type = match kind {
+            "features" => sae_features_type(),
+            _ => DataType::Utf8,
+        };
+        self.answer_types
+            .push((alias.clone(), name.clone(), data_type));
+        Ok(Expr::Column(Column::new(Some(alias), name)))
     }
 
     /// The name of the answer column of `call`, the call `node` makes.
@@ -675,6 +682,9 @@ impl Binder {
             .expect("a member per field");
         let alias = call_aliases(aliased_call(member, &[]).expect("an extraction"))[0].clone();
         let column = format!("{name}.{field}{}", if span { SPAN_SUFFIX } else { "" });
+        let data_type = if span { span_type() } else { DataType::Utf8 };
+        self.answer_types
+            .push((alias.clone(), column.clone(), data_type));
         let mut read = Expr::Column(Column::new(Some(alias), column));
         for part in rest {
             read = datafusion::functions::core::expr_fn::get_field(read, part.as_str());
@@ -684,7 +694,7 @@ impl Binder {
 
     /// The condition `alias.column IN (labels)` on a label's column.
     pub(crate) fn label_condition(
-        &self,
+        &mut self,
         alias: &str,
         column: &str,
         labels: &Value,
@@ -696,6 +706,8 @@ impl Binder {
             .filter_map(Value::as_str)
             .map(|label| Expr::Literal(ScalarValue::Utf8(Some(label.to_string())), None))
             .collect();
+        self.answer_types
+            .push((alias.to_string(), column.to_string(), DataType::Utf8));
         let test = Expr::InList(InList::new(
             Box::new(Expr::Column(Column::new(Some(alias), column))),
             list,
@@ -817,8 +829,35 @@ impl Binder {
         }) {
             return compile_error(format!("{expr} is not a value expression"));
         }
-        crate::expressions::expression(&expr, |column| self.resolve_column(column))
-            .map(ValueExpression::Value)
+        crate::expressions::expression(&expr, |column| {
+            let reference = self.resolve_column(column)?;
+            let data_type = self.column_type(&reference)?;
+            Ok((reference, data_type))
+        })
+        .map(ValueExpression::Value)
+    }
+
+    /// The Arrow type of a column a computed value reads: an answer's,
+    /// or a table's column's.
+    fn column_type(&self, reference: &ColumnRef) -> Result<DataType, CompileError> {
+        if let Some((_, _, data_type)) = self
+            .answer_types
+            .iter()
+            .find(|(alias, column, _)| *alias == reference.alias && *column == reference.column)
+        {
+            return Ok(data_type.clone());
+        }
+        self.tables
+            .iter()
+            .find(|(alias, _, _)| *alias == reference.alias)
+            .and_then(|(_, _, schema)| schema.field_with_name(&reference.column).ok())
+            .map(|field| field.data_type().clone())
+            .ok_or_else(|| {
+                CompileError::new(format!(
+                    "column {} has no type the planner knows",
+                    repr_str(&reference.name(true))
+                ))
+            })
     }
 
     // ------------------------------------------------------------ AI calls
@@ -1009,7 +1048,8 @@ impl Binder {
             comparison.1,
             Box::new(Expr::Literal(ScalarValue::Float64(Some(value)), None)),
         ));
-        let test = crate::expressions::expression(&compared, |_| Ok(score.clone()))?;
+        let test =
+            crate::expressions::expression(&compared, |_| Ok((score.clone(), DataType::Float64)))?;
         let test = ValueExpression::Value(test);
         Ok((ScoreTest { call, test }, options))
     }

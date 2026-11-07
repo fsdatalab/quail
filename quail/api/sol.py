@@ -38,10 +38,8 @@ from typing import Callable, Mapping
 
 import _quail_native
 import numpy as np
-import pyarrow as pa
 
 from quail.common import budgets
-from quail.common.expressions import accepts, evaluate
 from quail.common.pairs import pair_table, partner_map
 from quail.common.tokens import prefix_tree
 from quail.common.work import Work
@@ -314,13 +312,6 @@ class _Oracles:
     def label(self, prompt, assignment):
         return str(self._label(self._prompt(prompt), dict(json.loads(assignment))))
 
-    def accepts(self, condition, values):
-        condition = decode_plan_value(condition)
-        (column,) = dict.fromkeys(ref.column for ref in condition.references)
-        kept = accepts(condition, pa.table({column: pa.array(json.loads(values),
-                                                             pa.string())}))
-        return json.dumps(kept.to_pylist())
-
     def subset_shared(self, alias, rows):
         return json.dumps(_shared_tokens(self._stores[alias].tokens, json.loads(rows)))
 
@@ -356,9 +347,9 @@ def _estimate_inputs(query, stores, chunk: int, credit: bool) -> dict:
                        decode_plan_value(json.dumps(right)))
                       for left, right in join["pairs"]]
         pairs = pair_table(
-            left_alias, [evaluate(left, stores[left_alias])
+            left_alias, [left.evaluate(stores[left_alias])
                          for left, _ in conditions],
-            right_alias, [evaluate(right, stores[right_alias])
+            right_alias, [right.evaluate(stores[right_alias])
                           for _, right in conditions])
         allowed_pairs[str(position)] = {
             alias: [[int(key), [int(row) for row in groups.rows[

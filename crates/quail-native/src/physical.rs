@@ -17,6 +17,7 @@ use pyo3::exceptions::{PyAttributeError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyString, PyTuple};
+use quail_datafusion::expressions::PhysicalValue;
 use quail_physical as physical;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -370,7 +371,8 @@ static KINDS: &[Kind] = &[
         class: "Expression",
         tag: "quail.common.expressions.Expression",
         node: false,
-        fields: fields!(; "encoded" = REQUIRED, "columns" = REQUIRED, "text" = REQUIRED),
+        fields: fields!(; "encoded" = REQUIRED, "columns" = REQUIRED, "types" = REQUIRED,
+            "text" = REQUIRED),
     },
     Kind {
         class: "Alias",
@@ -672,14 +674,118 @@ pub fn from_python(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 pub struct Tagged {
     held: Held,
     filled: AtomicBool,
+    /// A value or condition built for evaluation when the object is
+    /// made; None for any other value and for one a model answers.
+    physical: Option<PhysicalValue>,
 }
 
 impl Tagged {
-    fn new(held: Held) -> Self {
-        Self {
+    fn new(held: Held) -> PyResult<Self> {
+        let physical = match &held {
+            Held::Value(value) => physical_value(value)?,
+            Held::Node(_) => None,
+        };
+        Ok(Self {
             held,
             filled: AtomicBool::new(false),
+            physical,
+        })
+    }
+}
+
+/// The classes whose values DataFusion evaluates.
+const EVALUATED: [&str; 4] = ["ColumnRef", "GetField", "Alias", "Expression"];
+
+/// Whether a value asks the model anywhere.
+fn asks_model(value: &physical::ValueExpression) -> bool {
+    match value {
+        physical::ValueExpression::ModelCall(_) => true,
+        physical::ValueExpression::Alias(alias) => asks_model(&alias.expression),
+        physical::ValueExpression::GetField(field) => asks_model(&field.input),
+        physical::ValueExpression::ColumnRef(_) | physical::ValueExpression::Value(_) => false,
+    }
+}
+
+/// A value of a class DataFusion evaluates, built for evaluation; None
+/// for another value or one that asks the model.
+fn physical_value(value: &Value) -> PyResult<Option<PhysicalValue>> {
+    let class = value
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(kind_of_value)
+        .map(|kind| kind.class);
+    if !class.is_some_and(|class| EVALUATED.contains(&class)) {
+        return Ok(None);
+    }
+    let expression: physical::ValueExpression = serde_json::from_value(value.clone())
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    if asks_model(&expression) {
+        return Ok(None);
+    }
+    PhysicalValue::new(&expression)
+        .map(Some)
+        .map_err(|error| PyValueError::new_err(error.0))
+}
+
+/// Quail's `CompileError` with a message.
+fn compile_error(py: Python<'_>, message: String) -> PyErr {
+    match py
+        .import(EXPRESSIONS)
+        .and_then(|module| module.getattr("CompileError"))
+    {
+        Ok(class) => PyErr::from_type(class.cast_into().expect("an exception type"), message),
+        Err(error) => error,
+    }
+}
+
+/// Evaluate a value's built form over rows, as `evaluate` documents.
+fn evaluate_rows<'py>(
+    object: &Bound<'py, PyAny>,
+    rows: &Bound<'py, PyAny>,
+    qualified: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchReader};
+    let py = object.py();
+    let Some(built) = &object.cast::<Tagged>()?.get().physical else {
+        return Err(compile_error(
+            py,
+            "a model call is the model's to answer, not an expression to evaluate".into(),
+        ));
+    };
+    let rows = if rows.hasattr("__arrow_c_stream__")? {
+        rows.clone()
+    } else {
+        // an object that reads its columns by name, such as a scan's input
+        let columns = PyDict::new(py);
+        for column in built.columns() {
+            let name = column.name(qualified);
+            columns.set_item(&name, rows.call_method1("column", (&name,))?)?;
         }
+        py.import("pyarrow")?.call_method1("table", (columns,))?
+    };
+    let reader = quail::pyarrow::stream_from_pyarrow(&rows)?;
+    let schema = reader.schema();
+    let mut batches = reader
+        .collect::<Result<Vec<RecordBatch>, _>>()
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(schema));
+    }
+    let found = py.detach(|| -> Result<ArrayRef, quail_planner::CompileError> {
+        let arrays = batches
+            .iter()
+            .map(|batch| built.evaluate(batch, qualified))
+            .collect::<Result<Vec<_>, _>>()?;
+        if arrays.len() == 1 {
+            return Ok(arrays.into_iter().next().expect("one array"));
+        }
+        let parts: Vec<&dyn Array> = arrays.iter().map(AsRef::as_ref).collect();
+        datafusion::arrow::compute::concat(&parts)
+            .map_err(|error| quail_planner::CompileError::new(error.to_string()))
+    });
+    match found {
+        Ok(array) => quail::pyarrow::array_to_pyarrow(py, &array),
+        Err(error) => Err(compile_error(py, error.0)),
     }
 }
 
@@ -1205,7 +1311,7 @@ macro_rules! leaf_classes {
                     args: &Bound<'_, PyTuple>,
                     kwargs: Option<&Bound<'_, PyDict>>,
                 ) -> PyResult<PyClassInitializer<Self>> {
-                    Ok(Self::initializer(args_constructor($class, args, kwargs)?))
+                    Self::initializer(args_constructor($class, args, kwargs)?)
                 }
 
                 #[classattr]
@@ -1222,17 +1328,17 @@ macro_rules! leaf_classes {
             }
 
             impl $name {
-                fn initializer(held: Held) -> PyClassInitializer<Self> {
-                    PyClassInitializer::from(Tagged::new(held))
+                fn initializer(held: Held) -> PyResult<PyClassInitializer<Self>> {
+                    Ok(PyClassInitializer::from(Tagged::new(held)?)
                         $(.add_subclass($parent))*
-                        .add_subclass($name)
+                        .add_subclass($name))
                 }
             }
         )*
 
         fn create_class<'py>(py: Python<'py>, class: &str, held: Held) -> PyResult<Bound<'py, PyAny>> {
             match class {
-                $($class => Ok(Bound::new(py, $name::initializer(held))?.into_any()),)*
+                $($class => Ok(Bound::new(py, $name::initializer(held)?)?.into_any()),)*
                 _ => Err(PyTypeError::new_err(format!("no class {class:?}"))),
             }
         }
@@ -1305,10 +1411,126 @@ leaf_classes! {
     InputPort = "InputPort": Tagged [] {},
     OutputPort = "OutputPort": Tagged [] {},
     AnswerOutput = "AnswerOutput": Tagged [] {},
-    ColumnRef = "ColumnRef": Tagged [] {},
-    GetField = "GetField": Tagged [] {},
-    Expression = "Expression": Tagged [] {},
-    Alias = "Alias": Tagged [] {},
+    ColumnRef = "ColumnRef": Tagged [] {
+    /// Evaluate the value over rows with DataFusion.
+    ///
+    /// The value was built when this object was made; this only reads
+    /// its columns and evaluates it.
+    ///
+    /// Args:
+    ///     rows: A table or record batch holding the columns it reads,
+    ///         or an object that reads them with ``column(name)``, such
+    ///         as a scan's input.
+    ///     qualified: Whether the rows name each column with its table
+    ///         alias, as result rows do.
+    ///
+    /// Returns:
+    ///     One value per row; a condition's are booleans, null where
+    ///     SQL's three-valued logic leaves a row unknown.
+    ///
+    /// Raises:
+    ///     CompileError: The rows lack a column the value reads, hold it
+    ///         with another type than the plan gives it, or DataFusion
+    ///         cannot evaluate the value.
+    #[pyo3(signature = (rows, qualified=false))]
+    fn evaluate<'py>(
+        slf: &Bound<'py, Self>,
+        rows: &Bound<'py, PyAny>,
+        qualified: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        evaluate_rows(slf.as_any(), rows, qualified)
+    }
+    },
+    GetField = "GetField": Tagged [] {
+    /// Evaluate the value over rows with DataFusion.
+    ///
+    /// The value was built when this object was made; this only reads
+    /// its columns and evaluates it.
+    ///
+    /// Args:
+    ///     rows: A table or record batch holding the columns it reads,
+    ///         or an object that reads them with ``column(name)``, such
+    ///         as a scan's input.
+    ///     qualified: Whether the rows name each column with its table
+    ///         alias, as result rows do.
+    ///
+    /// Returns:
+    ///     One value per row; a condition's are booleans, null where
+    ///     SQL's three-valued logic leaves a row unknown.
+    ///
+    /// Raises:
+    ///     CompileError: The rows lack a column the value reads, hold it
+    ///         with another type than the plan gives it, or DataFusion
+    ///         cannot evaluate the value.
+    #[pyo3(signature = (rows, qualified=false))]
+    fn evaluate<'py>(
+        slf: &Bound<'py, Self>,
+        rows: &Bound<'py, PyAny>,
+        qualified: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        evaluate_rows(slf.as_any(), rows, qualified)
+    }
+    },
+    Expression = "Expression": Tagged [] {
+    /// Evaluate the value over rows with DataFusion.
+    ///
+    /// The value was built when this object was made; this only reads
+    /// its columns and evaluates it.
+    ///
+    /// Args:
+    ///     rows: A table or record batch holding the columns it reads,
+    ///         or an object that reads them with ``column(name)``, such
+    ///         as a scan's input.
+    ///     qualified: Whether the rows name each column with its table
+    ///         alias, as result rows do.
+    ///
+    /// Returns:
+    ///     One value per row; a condition's are booleans, null where
+    ///     SQL's three-valued logic leaves a row unknown.
+    ///
+    /// Raises:
+    ///     CompileError: The rows lack a column the value reads, hold it
+    ///         with another type than the plan gives it, or DataFusion
+    ///         cannot evaluate the value.
+    #[pyo3(signature = (rows, qualified=false))]
+    fn evaluate<'py>(
+        slf: &Bound<'py, Self>,
+        rows: &Bound<'py, PyAny>,
+        qualified: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        evaluate_rows(slf.as_any(), rows, qualified)
+    }
+    },
+    Alias = "Alias": Tagged [] {
+    /// Evaluate the value over rows with DataFusion.
+    ///
+    /// The value was built when this object was made; this only reads
+    /// its columns and evaluates it.
+    ///
+    /// Args:
+    ///     rows: A table or record batch holding the columns it reads,
+    ///         or an object that reads them with ``column(name)``, such
+    ///         as a scan's input.
+    ///     qualified: Whether the rows name each column with its table
+    ///         alias, as result rows do.
+    ///
+    /// Returns:
+    ///     One value per row; a condition's are booleans, null where
+    ///     SQL's three-valued logic leaves a row unknown.
+    ///
+    /// Raises:
+    ///     CompileError: The rows lack a column the value reads, hold it
+    ///         with another type than the plan gives it, or DataFusion
+    ///         cannot evaluate the value.
+    #[pyo3(signature = (rows, qualified=false))]
+    fn evaluate<'py>(
+        slf: &Bound<'py, Self>,
+        rows: &Bound<'py, PyAny>,
+        qualified: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        evaluate_rows(slf.as_any(), rows, qualified)
+    }
+    },
     Prompt = "Prompt": Tagged [] {},
     ModelCall = "ModelCall": Tagged [] {
     /// Return the table aliases the prompt reads, in placeholder order.
@@ -1374,15 +1596,15 @@ impl ExtensionNode {
         if let Some(location) = location {
             fields.insert("location".into(), from_python(location)?);
         }
-        Ok(Self::initializer(build_extension(fields)?))
+        Self::initializer(build_extension(fields)?)
     }
 }
 
 impl ExtensionNode {
-    fn initializer(held: Held) -> PyClassInitializer<Self> {
-        PyClassInitializer::from(Tagged::new(held))
+    fn initializer(held: Held) -> PyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(Tagged::new(held)?)
             .add_subclass(NodeBase)
-            .add_subclass(ExtensionNode)
+            .add_subclass(ExtensionNode))
     }
 }
 
@@ -1393,7 +1615,7 @@ fn create<'py>(py: Python<'py>, class: &str, held: Held) -> PyResult<Bound<'py, 
 /// The Python object of a node.
 fn node_object(py: Python<'_>, node: Arc<physical::PhysicalNode>) -> PyResult<Bound<'_, PyAny>> {
     if let physical::PhysicalNode::Extension(_) = node.as_ref() {
-        return Ok(Bound::new(py, ExtensionNode::initializer(Held::Node(node)))?.into_any());
+        return Ok(Bound::new(py, ExtensionNode::initializer(Held::Node(node))?)?.into_any());
     }
     let tag = node.type_name().to_string();
     let kind = kind_of_value(&tag).expect("a known node has a kind");

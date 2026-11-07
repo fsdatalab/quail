@@ -158,7 +158,7 @@ fn unnest_field_type(args: &ReturnFieldArgs) -> Result<DataType> {
 
 /// The type of `AI.SAE_FEATURES`: one struct per nonzero feature, as
 /// Quail's `FEATURE_LIST`.
-fn sae_features_type() -> DataType {
+pub(crate) fn sae_features_type() -> DataType {
     let feature = Fields::from(vec![
         Field::new("feature", DataType::Int32, true),
         Field::new("strength", DataType::Float32, true),
@@ -188,7 +188,7 @@ fn extract_type(arg_fields: &[FieldRef], answer: DataType) -> Result<DataType> {
 }
 
 /// The position of one answer: its first and past-the-end characters.
-fn span_type() -> DataType {
+pub(crate) fn span_type() -> DataType {
     DataType::Struct(Fields::from(vec![
         Field::new("start", DataType::Int32, true),
         Field::new("end", DataType::Int32, true),

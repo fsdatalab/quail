@@ -478,12 +478,7 @@ fn plan_operator<'py>(
             };
             let accepts = |condition: &quail_physical::ValueExpression,
                            values: &[serde_json::Value]| {
-                let found = parse(text(
-                    "accepts",
-                    (encode(condition), encode(&values.to_vec())),
-                )?)?;
-                serde_json::from_value::<Vec<bool>>(found)
-                    .map_err(|error| quail_planner::CompileError::new(error.to_string()))
+                accepted_answers(condition, values)
             };
             let subset_shared = |alias: &str, rows: &[i64]| {
                 let found = parse(text(
@@ -1044,74 +1039,27 @@ impl NativePlanner {
     }
 }
 
-/// Evaluate a value or condition over rows with DataFusion: (values,
-/// None), or (None, why it does not evaluate).
-///
-/// `expression` is a `ColumnRef`, `GetField`, `Alias`, or `Expression`;
-/// `rows` is a pyarrow Table or RecordBatch. A column is read by its
-/// name, with its table alias when `qualified`. The values are a
-/// pyarrow Array with one value per row; a condition's are booleans,
-/// null where SQL's three-valued logic leaves a row unknown.
-#[pyfunction]
-#[pyo3(signature = (expression, rows, qualified=false))]
-fn evaluate<'py>(
-    py: Python<'py>,
-    expression: &Bound<'py, PyAny>,
-    rows: &Bound<'py, PyAny>,
-    qualified: bool,
-) -> PyResult<(Option<Bound<'py, PyAny>>, Option<String>)> {
-    use datafusion::arrow::array::{ArrayRef, RecordBatch, RecordBatchReader};
-    let text: String = expression.call_method0("to_json")?.extract()?;
-    let expression: quail_physical::ValueExpression = serde_json::from_str(&text)
-        .map_err(|error| pyo3::exceptions::PyTypeError::new_err(error.to_string()))?;
-    let reader = quail::pyarrow::stream_from_pyarrow(rows)?;
-    let schema = reader.schema();
-    let mut batches = reader
-        .collect::<Result<Vec<RecordBatch>, _>>()
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(schema));
-    }
-    let found = py.detach(|| -> Result<ArrayRef, quail_planner::CompileError> {
-        let arrays = batches
-            .iter()
-            .map(|batch| quail_datafusion::expressions::evaluate(&expression, batch, qualified))
-            .collect::<Result<Vec<_>, _>>()?;
-        if arrays.len() == 1 {
-            return Ok(arrays.into_iter().next().expect("one array"));
-        }
-        let parts: Vec<&dyn datafusion::arrow::array::Array> =
-            arrays.iter().map(AsRef::as_ref).collect();
-        datafusion::arrow::compute::concat(&parts)
-            .map_err(|error| quail_planner::CompileError::new(error.to_string()))
-    });
-    match found {
-        Ok(array) => Ok((Some(quail::pyarrow::array_to_pyarrow(py, &array)?), None)),
-        Err(error) => Ok((None, Some(error.0))),
-    }
-}
-
 /// An `Expression` of SQL text over the columns of `rows`, a pyarrow
 /// Table or RecordBatch, each a column of table `alias` from `provider`:
-/// (its JSON, None), or (None, why it does not parse).
+/// (the Expression, built for evaluation, None), or (None, why it does
+/// not parse).
 #[pyfunction]
 #[pyo3(signature = (sql, rows, alias="", provider=""))]
-fn parse_expression(
+fn parse_expression<'py>(
+    py: Python<'py>,
     sql: &str,
-    rows: &Bound<'_, PyAny>,
+    rows: &Bound<'py, PyAny>,
     alias: &str,
     provider: &str,
-) -> PyResult<(Option<String>, Option<String>)> {
+) -> PyResult<(Option<Bound<'py, PyAny>>, Option<String>)> {
     use datafusion::arrow::array::RecordBatchReader;
     let schema = quail::pyarrow::stream_from_pyarrow(rows)?.schema();
     match quail_datafusion::expressions::parse(sql, &schema, alias, provider) {
-        Ok(found) => Ok((
-            Some(
-                serde_json::to_string(&quail_physical::ValueExpression::Value(found))
-                    .expect("an expression writes"),
-            ),
-            None,
-        )),
+        Ok(found) => {
+            let value = serde_json::to_value(quail_physical::ValueExpression::Value(found))
+                .expect("an expression writes");
+            Ok((Some(physical::to_python(py, &value)?), None))
+        }
         Err(error) => Ok((None, Some(error.0))),
     }
 }
@@ -1125,7 +1073,6 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<cost::CostModel>()?;
     budgets::register(module)?;
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
-    module.add_function(wrap_pyfunction!(evaluate, module)?)?;
     module.add_function(wrap_pyfunction!(parse_expression, module)?)?;
     module.add_function(wrap_pyfunction!(model_answers, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_layout, module)?)?;
@@ -1143,6 +1090,41 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
     module.add_function(wrap_pyfunction!(prefix_statistics, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
+}
+
+/// Which answers a one-column condition accepts, each answer text or
+/// null, with every null rejected.
+fn accepted_answers(
+    condition: &quail_physical::ValueExpression,
+    values: &[serde_json::Value],
+) -> Result<Vec<bool>, quail_planner::CompileError> {
+    use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StringArray};
+    let built = quail_datafusion::expressions::PhysicalValue::new(condition)?;
+    let [column] = built.columns()[..] else {
+        return Err(quail_planner::CompileError::new(
+            "an answer test reads one column",
+        ));
+    };
+    let texts = values
+        .iter()
+        .map(|value| match value {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(text) => Ok(Some(text.as_str())),
+            other => Err(quail_planner::CompileError::new(format!(
+                "an answer test reads text, not {other}"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let answers: ArrayRef = std::sync::Arc::new(StringArray::from(texts));
+    let batch = RecordBatch::try_from_iter([(column.name(false), answers)])
+        .map_err(|error| quail_planner::CompileError::new(error.to_string()))?;
+    let mask = built.evaluate(&batch, false)?;
+    let mask = mask.as_boolean_opt().ok_or_else(|| {
+        quail_planner::CompileError::new("an answer test gives a boolean per answer")
+    })?;
+    Ok((0..mask.len())
+        .map(|index| mask.is_valid(index) && mask.value(index))
+        .collect())
 }
 
 /// Values the speed of light callbacks pass to Python as JSON text.

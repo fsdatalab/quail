@@ -4,12 +4,16 @@
 //! The binder reads each value or condition the executor computes, such
 //! as a scan's predicate or a test of a label, as an [`Expression`]: the
 //! DataFusion expression, encoded with datafusion-proto, with each
-//! column read by its position. [`evaluate`] decodes it and evaluates it
-//! with DataFusion over the executor's rows.
+//! column read by its position and its Arrow type. A process that reads
+//! a plan builds each one once as a [`PhysicalValue`], DataFusion's
+//! physical expression over those types, and evaluates it over the
+//! executor's rows as often as it needs.
 //!
 //! For example, `r.stars > 3` becomes an `Expression` that reads column
-//! `#0` where `columns` is `[r.stars]`, with the text `{0} > 3`.
+//! `#0` where `columns` is `[r.stars]` and `types` is `[Int64]`, with the
+//! text `{0} > 3`.
 
+use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
 use base64::Engine;
@@ -17,10 +21,12 @@ use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, StructArray, make_array,
 };
 use datafusion::arrow::buffer::NullBuffer;
-use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::logical_expr::{BinaryExpr, Cast, Expr, Like, Operator, TryCast};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_proto::bytes::Serializeable;
 use quail_physical::{ColumnRef, Expression, ValueExpression};
@@ -36,14 +42,34 @@ fn position_name(index: usize) -> String {
     format!("#{index}")
 }
 
-/// The DataFusion session whose functions decode and evaluate
+/// The DataFusion session whose functions decode and build
 /// expressions.
 fn session() -> &'static SessionContext {
     static SESSION: OnceLock<SessionContext> = OnceLock::new();
     SESSION.get_or_init(SessionContext::new)
 }
 
-/// An [`Expression`] of `expr`, each column resolved by `resolve`.
+/// `data_type` with every nested field nullable and without metadata,
+/// as an expression's `types` hold it.
+fn plain_type(data_type: &DataType) -> DataType {
+    let plain = |field: &FieldRef| -> FieldRef {
+        Arc::new(Field::new(
+            field.name(),
+            plain_type(field.data_type()),
+            true,
+        ))
+    };
+    match data_type {
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(plain).collect()),
+        DataType::List(item) => DataType::List(plain(item)),
+        DataType::LargeList(item) => DataType::LargeList(plain(item)),
+        DataType::FixedSizeList(item, size) => DataType::FixedSizeList(plain(item), *size),
+        other => other.clone(),
+    }
+}
+
+/// An [`Expression`] of `expr`, each column resolved by `resolve` to the
+/// column it reads and that column's Arrow type.
 ///
 /// # Errors
 ///
@@ -51,9 +77,10 @@ fn session() -> &'static SessionContext {
 /// expression.
 pub fn expression(
     expr: &Expr,
-    mut resolve: impl FnMut(&Column) -> Result<ColumnRef, CompileError>,
+    mut resolve: impl FnMut(&Column) -> Result<(ColumnRef, DataType), CompileError>,
 ) -> Result<Expression, CompileError> {
     let mut columns: Vec<ColumnRef> = Vec::new();
+    let mut types: Vec<String> = Vec::new();
     let mut failed: Option<CompileError> = None;
     let positional = expr
         .clone()
@@ -61,8 +88,8 @@ pub fn expression(
             let (Expr::Column(column) | Expr::OuterReferenceColumn(_, column)) = &node else {
                 return Ok(Transformed::no(node));
             };
-            let reference = match resolve(column) {
-                Ok(reference) => reference,
+            let (reference, data_type) = match resolve(column) {
+                Ok(found) => found,
                 Err(error) => {
                     failed.get_or_insert(error);
                     return Ok(Transformed::no(node));
@@ -72,6 +99,7 @@ pub fn expression(
                 Some(index) => index,
                 None => {
                     columns.push(reference);
+                    types.push(plain_type(&data_type).to_string());
                     columns.len() - 1
                 }
             };
@@ -92,6 +120,7 @@ pub fn expression(
     Ok(Expression {
         encoded: base64::engine::general_purpose::STANDARD.encode(bytes),
         columns,
+        types,
         text: template(&positional),
     })
 }
@@ -114,21 +143,23 @@ pub fn parse(
         .parse_sql_expr(sql, &columns)
         .map_err(|error| CompileError::new(error.to_string()))?;
     expression(&expr, |column| {
-        Ok(ColumnRef {
-            alias: alias.to_string(),
-            provider: provider.to_string(),
-            column: column.name.clone(),
-        })
+        let field = schema
+            .field_with_name(&column.name)
+            .map_err(|error| CompileError::new(error.to_string()))?;
+        Ok((
+            ColumnRef {
+                alias: alias.to_string(),
+                provider: provider.to_string(),
+                column: column.name.clone(),
+            },
+            field.data_type().clone(),
+        ))
     })
 }
 
 /// The DataFusion expression an [`Expression`] encodes, reading column
 /// `#i` for its `i`th column.
-///
-/// # Errors
-///
-/// The encoded bytes do not decode.
-pub fn decode(expression: &Expression) -> Result<Expr, CompileError> {
+fn decode(expression: &Expression) -> Result<Expr, CompileError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&expression.encoded)
         .map_err(|error| CompileError::new(error.to_string()))?;
@@ -166,9 +197,13 @@ fn with_field_nulls(array: ArrayRef) -> ArrayRef {
 
 /// The rows' column `name`; a dotted name the rows do not hold reads a
 /// field of a struct column, as result rows hold an extraction's
-/// answers.
+/// answers. A dictionary column reads as its values, as result rows
+/// hold labels.
 fn column_of(batch: &RecordBatch, name: &str) -> Result<ArrayRef, CompileError> {
     if let Some(found) = batch.column_by_name(name) {
+        if let DataType::Dictionary(_, values) = found.data_type() {
+            return cast(found, values).map_err(|error| CompileError::new(error.to_string()));
+        }
         return Ok(with_field_nulls(Arc::clone(found)));
     }
     if let Some((owner, field)) = name.rsplit_once('.')
@@ -183,82 +218,174 @@ fn column_of(batch: &RecordBatch, name: &str) -> Result<ArrayRef, CompileError> 
     )))
 }
 
-/// Evaluate a value or condition over `batch`, one result per row.
-///
-/// A column is read by its name, with its table alias when `qualified`,
-/// as result rows name their columns. A condition gives a boolean
-/// array, null where SQL's three-valued logic leaves it unknown.
-///
-/// # Errors
-///
-/// The rows lack a column the expression reads, or DataFusion cannot
-/// evaluate it on the columns' types.
-pub fn evaluate(
-    value: &ValueExpression,
-    batch: &RecordBatch,
-    qualified: bool,
-) -> Result<ArrayRef, CompileError> {
-    match value {
-        ValueExpression::ColumnRef(column) => column_of(batch, &column.name(qualified)),
-        ValueExpression::Alias(alias) => evaluate(&alias.expression, batch, qualified),
-        ValueExpression::GetField(field) => {
-            let input = evaluate(&field.input, batch, qualified)?;
-            let Some(structs) = input.as_struct_opt() else {
-                return Err(CompileError::new(format!(
-                    "field {} reads a value of type {}, which has no fields",
-                    repr_str(&field.field),
-                    input.data_type()
-                )));
-            };
-            structs
-                .column_by_name(&field.field)
-                .cloned()
-                .ok_or_else(|| {
-                    CompileError::new(format!(
-                        "the struct has no field {}",
-                        repr_str(&field.field)
-                    ))
-                })
+/// An [`Expression`] built for evaluation: DataFusion's physical
+/// expression over the types of the columns it reads, with DataFusion's
+/// type coercion applied once, when it is built.
+#[derive(Debug, Clone)]
+pub struct PhysicalExpression {
+    expression: Expression,
+    schema: SchemaRef,
+    physical: Arc<dyn PhysicalExpr>,
+}
+
+impl PhysicalExpression {
+    /// Decode `expression` and build it over the types it names.
+    ///
+    /// # Errors
+    ///
+    /// The encoded bytes do not decode, a type does not read, or
+    /// DataFusion cannot build the expression over those types.
+    pub fn new(expression: &Expression) -> Result<Self, CompileError> {
+        let failed = |error: String| {
+            CompileError::new(format!(
+                "{} cannot be built: {error}",
+                expression.text_with(true)
+            ))
+        };
+        if expression.types.len() != expression.columns.len() {
+            return Err(failed(format!(
+                "it reads {} columns but names {} types",
+                expression.columns.len(),
+                expression.types.len()
+            )));
         }
-        ValueExpression::Value(expression) => evaluate_expression(expression, batch, qualified),
-        ValueExpression::ModelCall(_) => Err(CompileError::new(
-            "a model call is the model's to answer, not an expression to evaluate",
-        )),
+        let fields = expression
+            .types
+            .iter()
+            .enumerate()
+            .map(|(index, written)| {
+                DataType::from_str(written)
+                    .map(|data_type| Field::new(position_name(index), data_type, true))
+                    .map_err(|error| failed(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let schema = Arc::new(Schema::new(fields));
+        let columns = DFSchema::try_from(schema.as_ref().clone())
+            .map_err(|error| failed(error.to_string()))?;
+        let physical = session()
+            .create_physical_expr(decode(expression)?, &columns)
+            .map_err(|error| failed(error.to_string()))?;
+        Ok(Self {
+            expression: expression.clone(),
+            schema,
+            physical,
+        })
+    }
+
+    /// Evaluate the expression over `batch`, one result per row.
+    ///
+    /// A column is read by its name, with its table alias when
+    /// `qualified`, as result rows name their columns.
+    ///
+    /// # Errors
+    ///
+    /// The rows lack a column the expression reads, a column's type is
+    /// not the one the expression was built for, or DataFusion cannot
+    /// evaluate it.
+    pub fn evaluate(&self, batch: &RecordBatch, qualified: bool) -> Result<ArrayRef, CompileError> {
+        let text = || self.expression.text_with(qualified);
+        let mut arrays = Vec::new();
+        for (column, field) in self.expression.columns.iter().zip(self.schema.fields()) {
+            let name = column.name(qualified);
+            let values = column_of(batch, &name)?;
+            if plain_type(values.data_type()) != *field.data_type() {
+                return Err(CompileError::new(format!(
+                    "{} reads {} as {}, but the rows hold {}",
+                    text(),
+                    repr_str(&name),
+                    field.data_type(),
+                    values.data_type()
+                )));
+            }
+            arrays.push(values);
+        }
+        let failed = |error: datafusion::error::DataFusionError| {
+            CompileError::new(format!("{} cannot be evaluated: {error}", text()))
+        };
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        let bound = RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
+            .map_err(|error| failed(error.into()))?;
+        self.physical
+            .evaluate(&bound)
+            .and_then(|values| values.into_array(bound.num_rows()))
+            .map_err(failed)
     }
 }
 
-fn evaluate_expression(
-    expression: &Expression,
-    batch: &RecordBatch,
-    qualified: bool,
-) -> Result<ArrayRef, CompileError> {
-    let failed = |error: datafusion::error::DataFusionError| {
-        CompileError::new(format!(
-            "{} cannot be evaluated: {error}",
-            expression.text_with(qualified)
-        ))
-    };
-    let mut fields = Vec::new();
-    let mut arrays = Vec::new();
-    for (index, column) in expression.columns.iter().enumerate() {
-        let values = column_of(batch, &column.name(qualified))?;
-        fields.push(Field::new(
-            position_name(index),
-            values.data_type().clone(),
-            true,
-        ));
-        arrays.push(values);
+/// A value or condition built for evaluation: a column, a field of a
+/// value, or a [`PhysicalExpression`].
+#[derive(Debug, Clone)]
+pub enum PhysicalValue {
+    Column(ColumnRef),
+    Field(Box<PhysicalValue>, String),
+    Expression(PhysicalExpression),
+}
+
+impl PhysicalValue {
+    /// Build `value` for evaluation, an alias as the value it names.
+    ///
+    /// # Errors
+    ///
+    /// The value is a model call, which the model answers, or an
+    /// expression DataFusion cannot build.
+    pub fn new(value: &ValueExpression) -> Result<Self, CompileError> {
+        Ok(match value {
+            ValueExpression::ColumnRef(column) => Self::Column(column.clone()),
+            ValueExpression::Alias(alias) => Self::new(&alias.expression)?,
+            ValueExpression::GetField(field) => {
+                Self::Field(Box::new(Self::new(&field.input)?), field.field.clone())
+            }
+            ValueExpression::Value(expression) => {
+                Self::Expression(PhysicalExpression::new(expression)?)
+            }
+            ValueExpression::ModelCall(_) => {
+                return Err(CompileError::new(
+                    "a model call is the model's to answer, not an expression to evaluate",
+                ));
+            }
+        })
     }
-    let schema = Arc::new(Schema::new(fields));
-    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    let bound = RecordBatch::try_new_with_options(Arc::clone(&schema), arrays, &options)
-        .map_err(|error| failed(error.into()))?;
-    let columns = DFSchema::try_from(schema.as_ref().clone()).map_err(failed)?;
-    session()
-        .create_physical_expr(decode(expression)?, &columns)
-        .and_then(|physical| physical.evaluate(&bound))
-        .and_then(|values| values.into_array(bound.num_rows()))
-        .map_err(failed)
+
+    /// The columns the value reads.
+    pub fn columns(&self) -> Vec<&ColumnRef> {
+        match self {
+            Self::Column(column) => vec![column],
+            Self::Field(input, _) => input.columns(),
+            Self::Expression(built) => built.expression.columns.iter().collect(),
+        }
+    }
+
+    /// Evaluate the value over `batch`, one result per row.
+    ///
+    /// A column is read by its name, with its table alias when
+    /// `qualified`, as result rows name their columns. A condition
+    /// gives a boolean array, null where SQL's three-valued logic leaves
+    /// it unknown.
+    ///
+    /// # Errors
+    ///
+    /// The rows lack a column the value reads, hold it with another
+    /// type than the value was built for, or DataFusion cannot evaluate
+    /// it.
+    pub fn evaluate(&self, batch: &RecordBatch, qualified: bool) -> Result<ArrayRef, CompileError> {
+        match self {
+            Self::Column(column) => column_of(batch, &column.name(qualified)),
+            Self::Field(input, field) => {
+                let input = input.evaluate(batch, qualified)?;
+                let Some(structs) = input.as_struct_opt() else {
+                    return Err(CompileError::new(format!(
+                        "field {} reads a value of type {}, which has no fields",
+                        repr_str(field),
+                        input.data_type()
+                    )));
+                };
+                structs.column_by_name(field).cloned().ok_or_else(|| {
+                    CompileError::new(format!("the struct has no field {}", repr_str(field)))
+                })
+            }
+            Self::Expression(built) => built.evaluate(batch, qualified),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- text
@@ -444,9 +571,17 @@ mod tests {
 
     fn bound(expr: &Expr) -> Expression {
         expression(expr, |column| {
-            Ok(reference(
-                column.relation.as_ref().map_or("", |found| found.table()),
-                &column.name,
+            let data_type = if column.name == "stars" {
+                DataType::Int64
+            } else {
+                DataType::Utf8
+            };
+            Ok((
+                reference(
+                    column.relation.as_ref().map_or("", |found| found.table()),
+                    &column.name,
+                ),
+                data_type,
             ))
         })
         .unwrap()
@@ -463,6 +598,7 @@ mod tests {
             found.columns,
             vec![reference("r", "stars"), reference("r", "title")]
         );
+        assert_eq!(found.types, ["Int64", "Utf8"]);
         assert_eq!(
             found.text_with(true),
             "r.stars > 3 AND (r.title like 'a%' OR r.stars IS NULL)"
@@ -487,7 +623,8 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mask = evaluate(&ValueExpression::Value(found), &batch, false).unwrap();
+        let built = PhysicalValue::new(&ValueExpression::Value(found)).unwrap();
+        let mask = built.evaluate(&batch, false).unwrap();
         assert_eq!(
             mask.as_boolean(),
             &BooleanArray::from(vec![Some(true), Some(false), None])

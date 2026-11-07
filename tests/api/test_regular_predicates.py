@@ -8,8 +8,9 @@ from helpers.planning import operators_of, row_tests
 from helpers.sessions import CONFIG, TOKENIZER, TRUTH, _run, make_executor
 
 import quail
-from quail.common.expressions import CompileError, evaluate
+from quail.common.expressions import CompileError
 from quail.common.selection import selected_rows
+from quail.physical import decode_plan_value
 from quail.physical.plan import graph_from_envelope
 
 
@@ -84,8 +85,22 @@ def test_not_and_or_keep_sqls_nulls():
         "NOT (stars > 4 AND (stars < 3 OR NOT (stars IS NULL)))",
         {"stars": pa.int64()}, "r", "reviews")
     # the null row stays null through NOT, AND, and OR, so it is rejected
-    assert evaluate(written, stars).to_pylist() == [False, None, True]
+    assert written.evaluate(stars).to_pylist() == [False, None, True]
     assert selected_rows(stars, (written,)).to_pylist() == [2]
+
+
+def test_a_condition_refuses_a_column_of_another_type_than_its_plan_gives():
+    written = condition("stars > 4", {"stars": pa.int64()}, "r", "reviews")
+    assert written.types == ("Int64",)
+    with pytest.raises(CompileError, match="reads 'stars' as Int64"):
+        written.evaluate(pa.table({"stars": ["5", "1"]}))
+
+
+def test_a_condition_read_from_a_plan_evaluates_as_built():
+    written = condition("stars > 4", {"stars": pa.int64()}, "r", "reviews")
+    read = decode_plan_value(written.to_json())
+    rows = pa.table({"stars": [5, 1, None]})
+    assert read.evaluate(rows).to_pylist() == [True, False, None]
 
 
 def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
