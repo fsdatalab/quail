@@ -253,7 +253,7 @@ def execute_alone(state, nodes, inputs, build, *, label: str) -> dict:
 
 def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
-                  paged=True, on_answers=None) -> dict:
+                  paged=True, on_answers=None, num_key_survivors=1) -> dict:
     """Run prepared operator work together and collect per-node results.
 
     A limit ends the run once that many documents passed every part;
@@ -309,7 +309,8 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
                                 attention),
             staging=input_staging(state), label=label, limit=limit,
             survival=survival(parts),
-            stop_groups=stop_groups, paged=paged,
+            stop_groups=stop_groups, num_key_survivors=num_key_survivors,
+            paged=paged,
             on_chunk=transition_reporter(parts), on_answers=on_answers,
             appended_tokens=max(part.appended_tokens for part in parts) or None,
             decoder=decoder, dependencies=dependencies,

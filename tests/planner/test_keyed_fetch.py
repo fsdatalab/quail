@@ -1,9 +1,10 @@
 """An AI filter stops each key once the operator above has enough rows.
 
 push_down_semi_join_fetch gives the AI filter on an IN subquery's side
-of a semi-join one row per join key (R13). Each test runs a query with
-the rule on and off, checks that both return the same rows, and counts
-the documents the model read.
+of a semi-join one row per join key (R13); push_down_count_threshold
+gives the AI filter under HAVING COUNT(*) >= k k rows per group key
+(R14). Each test runs a query with the rule on and off, checks that both
+return the same rows, and counts the documents the model read.
 """
 
 import pyarrow as pa
@@ -15,6 +16,7 @@ import quail
 from quail.builtins import LOGICAL_RULES, built_in_registry
 
 SEMI_JOIN_RULE = "push_down_semi_join_fetch"
+COUNT_RULE = "push_down_count_threshold"
 # two reviews of each product; the model passes r0 to r3
 REVIEWS = pa.table({
     "id": [f"r{index}" for index in range(6)],
@@ -25,26 +27,26 @@ PRODUCTS = pa.table({"sku": ["p1", "p2", "p3", "p4"], "number": [1, 2, 3, 4]})
 AI_IF = "AI_FILTER(PROMPT('kind: {0}', r.body))"
 
 
-def _session(rules) -> quail.Session:
+def _session(rules, reviews=REVIEWS) -> quail.Session:
     session = quail.Session(CONFIG, tokenizer=TOKENIZER,
                             registry=built_in_registry(logical_rules=rules))
     session.register("reviews",
-                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+                     quail.DocumentProvider.from_table(reviews, id_col="id"))
     session.register("products",
                      quail.DocumentProvider.from_table(PRODUCTS, id_col="sku"))
     return session
 
 
-def _rows_and_read(rule, sql) -> list:
+def _rows_and_read(rule, sql, reviews=REVIEWS, passing=(0, 1, 2, 3)) -> list:
     """Return, with the rule on and off, the rows, sorted, and the documents read."""
     found = []
     for rules in (LOGICAL_RULES, [name for name in LOGICAL_RULES if name != rule]):
-        session = _session(rules)
+        session = _session(rules, reviews)
         read = []
 
         def passes(alias, document, position, read=read):
             read.append(document)
-            return document in (0, 1, 2, 3)
+            return document in passing
 
         result = finish(session.sql(sql), Oracle(filters=passes)).collect()
         found.append((sorted(tuple(row.values()) for row in result.to_pylist()),
@@ -80,3 +82,29 @@ def test_an_in_subquery_of_another_ai_operator_has_no_per_key_fetch(subquery):
     query = session.sql(f"SELECT p.sku FROM products p WHERE p.number IN ({subquery})")
     assert "per [" not in query.explain()
     session.close()
+
+
+# three reviews of each product; the model passes r0, r1, r3, and r6
+THREE_EACH = pa.table({
+    "id": [f"r{index}" for index in range(9)],
+    "body": [f"b{index}" for index in range(9)],
+    "product": [1, 1, 1, 2, 2, 2, 3, 3, 3],
+})
+
+
+@pytest.mark.parametrize("having", ["COUNT(*) >= 2", "COUNT(*) > 1", "2 <= COUNT(*)"])
+def test_a_count_threshold_stops_each_key_once_it_has_enough_matches(having):
+    sql = (f"SELECT r.product FROM reviews r WHERE {AI_IF} "
+           f"GROUP BY r.product HAVING {having}")
+    on, off = _rows_and_read(COUNT_RULE, sql, THREE_EACH, passing=(0, 1, 3, 6))
+    assert on[0] == off[0] == [(1,)]
+    # product 1 has two matches after r0 and r1, so r2 is not read
+    assert (on[1], off[1]) == ([0, 1, 3, 4, 5, 6, 7, 8], list(range(9)))
+
+
+def test_a_count_threshold_the_select_list_reads_reads_every_document():
+    sql = (f"SELECT r.product, COUNT(*) AS c FROM reviews r WHERE {AI_IF} "
+           "GROUP BY r.product HAVING COUNT(*) >= 2")
+    on, off = _rows_and_read(COUNT_RULE, sql, THREE_EACH, passing=(0, 1, 3, 6))
+    assert on == off
+    assert on[0] == [(1, 2)]

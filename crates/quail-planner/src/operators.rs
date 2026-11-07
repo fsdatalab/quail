@@ -204,6 +204,11 @@ pub struct Operators {
     pub fetch: Option<i64>,
     /// alias -> the DISTINCT stop key of its AI.IF predicates.
     pub stop_keys: BTreeMap<String, Vec<String>>,
+    /// alias -> how many documents of each stop key must pass its AI.IF
+    /// predicates before the key's other documents are skipped, when
+    /// more than one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub num_key_survivors: BTreeMap<String, i64>,
 }
 
 impl Operators {

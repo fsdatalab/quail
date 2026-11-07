@@ -1662,17 +1662,20 @@ impl<'w, 'a> Assembly<'w, 'a> {
         let before_joins = !self.walk.get(below).ai_join;
         let stop_key = run.iter().find_map(|id| match &self.walk.get(*id).kind {
             Kind::Ai(AiNode {
-                fetch: Some(Fetch::PerKey { key, n: 1 }),
+                fetch: Some(Fetch::PerKey { key, n }),
                 ..
-            }) if self.stops_per_key(&alias) => Some(key.clone()),
+            }) if self.stops_per_key(&alias) => Some((key.clone(), *n)),
             _ => None,
         });
         for predicate in predicates {
             push(&mut self.found.filters, &alias, predicate);
             push(&mut self.found.filters_before_joins, &alias, before_joins);
         }
-        if let Some(key) = stop_key {
+        if let Some((key, n)) = stop_key {
             self.found.stop_keys.insert(alias.clone(), key);
+            if n > 1 {
+                self.found.num_key_survivors.insert(alias.clone(), n as i64);
+            }
         }
         note(&mut self.noted, &alias);
         push(&mut self.stacks, &alias, StackItem::Filters);

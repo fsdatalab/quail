@@ -129,7 +129,8 @@ def _positions(ids, chosen) -> np.ndarray:
 
 
 def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
-                      context=None, limit=None, stop_groups=None) -> dict:
+                      context=None, limit=None, stop_groups=None,
+                      num_key_survivors=1) -> dict:
     """Run a pipeline's steps under set attention, in order.
 
     The operators of one pass group (PackSetPasses) are asked in one
@@ -156,6 +157,8 @@ def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
         limit: When the last pass group ends the pipeline, stop once this
             many rows passed its filters.
         stop_groups: Per position in ids, its stop key group, with the limit.
+        num_key_survivors: How many rows of a stop key group must pass
+            before the rest of the group is skipped.
     """
     ids = np.asarray(ids, dtype=np.int64)
     alias = nodes[0].document_aliases[0]
@@ -175,6 +178,7 @@ def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
                     limit=limit if ends else None,
                     stop_groups=(None if stop_groups is None or not ends
                                  else [stop_groups[int(p)] for p in kept]),
+                    num_key_survivors=num_key_survivors,
                     label=f"pass group ({len(members)} questions)")
                 groups[node.pass_group] = (members, group, kept[group.positions])
             members, group, answered = groups[node.pass_group]
@@ -256,9 +260,11 @@ def execute_set_pipeline(state, nodes, inputs, context) -> dict:
     first_filter = next((node for node in nodes if isinstance(node, AiFilter)), None)
     stops = (None if first_filter is None else filter_inputs(
         context.state, first_filter, ids)["stop_groups"])
+    num_key_survivors = (1 if first_filter is None
+                         else first_filter.num_key_survivors)
     return execute_set_steps(
         state, nodes, ids, DocumentPrefixes(head, context.state["documents"][alias],
                                             ids),
         texts=context.state.get("texts", {}).get(alias), inputs=inputs,
         context=context, limit=context.state.get("filter_limit"),
-        stop_groups=stops)
+        stop_groups=stops, num_key_survivors=num_key_survivors)

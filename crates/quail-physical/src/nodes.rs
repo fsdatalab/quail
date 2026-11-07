@@ -190,6 +190,7 @@ physical_nodes! {
         state_tail_tokens: i64,
         question_header_token_ids: TokenIds,
         document_ends: Value,
+        num_key_survivors: i64,
     }
     /// An `AI.SCORE` call.
     AiScore(AiScoreAttributes) = "quail.ai_score" {

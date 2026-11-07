@@ -1192,7 +1192,13 @@ impl TreeRows<'_> {
                 } else {
                     "KV: not stored".to_string()
                 });
-                if !filter.stop_key.is_empty() {
+                if !filter.stop_key.is_empty() && filter.num_key_survivors > 1 {
+                    details.push(format!(
+                        "stop per key: {} (the rest skipped once {} survive)",
+                        filter.stop_key.join(", "),
+                        filter.num_key_survivors
+                    ));
+                } else if !filter.stop_key.is_empty() {
                     details.push(format!(
                         "stop per key: {} (one document at a time, the rest skipped once one \
                          survives)",

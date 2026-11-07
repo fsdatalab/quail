@@ -67,7 +67,7 @@ pub use extension::QuailExtension;
 pub use functions::{AI_FUNCTION_NAMES, brace_structs, is_ai_call, quail_functions};
 pub use guards::PushDownCaseGuards;
 pub use identified::IdentifiedTable;
-pub use keyed::PushDownSemiJoinFetch;
+pub use keyed::{PushDownCountThreshold, PushDownSemiJoinFetch};
 pub use limit::PushDownLimitIntoAiNodes;
 pub use lower::{LowerAiCalls, lower_ai_calls};
 pub use or_guards::PushDownOrGuards;

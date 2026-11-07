@@ -701,7 +701,9 @@ impl<'a, 'c> Estimate<'a, 'c> {
         Ok(work)
     }
 
-    /// Per stage, the rows read when each key stops at its first survivor.
+    /// Per stage, the rows read when each key stops once its number of
+    /// survivors pass: its shortest survivors, or every row of a key
+    /// with too few.
     fn stop_key_rows(
         &self,
         alias: &str,
@@ -737,13 +739,18 @@ impl<'a, 'c> Estimate<'a, 'c> {
                     survivors.push(*row);
                 }
             }
-            if let Some(shortest) = survivors
-                .iter()
+            let needed = self
+                .found
+                .num_key_survivors
+                .get(alias)
                 .copied()
-                .min_by_key(|row| tokens[*row as usize])
-            {
-                for stage in &mut reached {
-                    stage.push(shortest);
+                .unwrap_or(1);
+            if survivors.len() as i64 >= needed {
+                survivors.sort_by_key(|row| tokens[*row as usize]);
+                for shortest in survivors.into_iter().take(needed as usize) {
+                    for stage in &mut reached {
+                        stage.push(shortest);
+                    }
                 }
                 continue;
             }

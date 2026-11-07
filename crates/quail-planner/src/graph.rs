@@ -617,6 +617,12 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     share_prefixes: false,
                     attention: String::new(),
                     stop_key: self.stop_keys.get(alias).cloned().unwrap_or_default(),
+                    num_key_survivors: self
+                        .operators
+                        .num_key_survivors
+                        .get(alias)
+                        .copied()
+                        .unwrap_or(1),
                     pass_group: -1,
                     state_tail_tokens: 0,
                     question_header_token_ids: Vec::new(),

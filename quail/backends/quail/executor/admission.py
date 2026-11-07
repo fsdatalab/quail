@@ -204,10 +204,13 @@ class JoinAdmission:
             None admits every anchor that fits.
         stop_groups: Per anchor, its stop key group, or None. At most
             stop_width anchors of a group are admitted at a time, and
-            once one survives the last stage the group's queued anchors
-            are skipped: they never run and take_skipped() lists them.
+            once num_key_survivors of them survive the last stage the
+            group's queued anchors are skipped: they never run and
+            take_skipped() lists them.
         stop_width: Anchors of one group in flight at once; the caller
             widens it when the groups are too few to fill a chunk.
+        num_key_survivors: How many anchors of a stop key group must
+            survive before its queued anchors are skipped.
         extra_tokens: Rows past the prefix an anchor's pages must
             cover, when more than its largest frame: a stage whose
             one suffix is written into the anchor's own pages.
@@ -244,7 +247,7 @@ class JoinAdmission:
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
                  stop_groups=None, stop_width=1, reserve=None, dependencies=None,
-                 gated=()):
+                 gated=(), num_key_survivors=1):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -268,7 +271,9 @@ class JoinAdmission:
             raise ValueError("stop_groups must match prefix_tokens")
         self._group_width = max(1, int(stop_width))
         self._group_busy = {}       # group -> its anchors admitted, unsettled
-        self._group_done = set()    # groups with a survivor
+        self._group_done = set()    # groups with num_key_survivors survivors
+        self._group_survivors = {}  # group -> its anchors that survived
+        self._num_key_survivors = max(1, int(num_key_survivors))
         self._group_members = {}    # group -> its anchors still queued
         self._skipped = []          # queued anchors a done group skipped
         self._dead = 0              # skipped anchors still in the pending deque
@@ -855,6 +860,10 @@ class JoinAdmission:
         else:
             self._group_busy.pop(group, None)
         if not survived or group in self._group_done:
+            return
+        survivors = self._group_survivors.get(group, 0) + 1
+        self._group_survivors[group] = survivors
+        if survivors < self._num_key_survivors:
             return
         self._group_done.add(group)
         skipped = sorted(self._group_members.pop(group, ()))

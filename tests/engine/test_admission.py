@@ -189,7 +189,7 @@ def test_ready_requests_fill_remaining_tokens_without_starving_skipped_requests(
 
 def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
                  pages=64, cap=None, order=(0, 1, 2), attention_mode=None,
-                 documents=None, tree=None, stop_groups=None):
+                 documents=None, tree=None, stop_groups=None, num_key_survivors=1):
     """Run a one-question filter over three documents.
 
     By default, document 1 shares its first 32 tokens with document 0.
@@ -229,9 +229,27 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
         documents, budget, anchor_keys=keys, prefix_tree=tree, limit=limit,
         on_settled=settle_documents(arena, keys, documents, bool(retain), budget),
         attention_mode=attention_mode, stats=stats, stop_groups=stop_groups,
-        default_attention="unified")
+        num_key_survivors=num_key_survivors, default_attention="unified")
     got = {document: list(row) for document, row in got[0].items()}
     return got, tokens, stats["borrowed_tokens"], arena
+
+
+@pytest.mark.parametrize("num_key_survivors", [1, 2])
+def test_a_stop_key_group_skips_its_rest_once_enough_documents_survive(
+        monkeypatch, num_key_survivors):
+    from helpers.fakes import DOC
+
+    # a chunk holds one document, every document passes, and the group
+    # keeps num_key_survivors documents in flight
+    documents = [[DOC + index] * 64 for index in range(5)]
+    tree = PrefixTree(order=list(range(5)), parent=[None] * 5, shared=[0] * 5)
+    got, _, _, _ = _tree_filter(
+        monkeypatch, truth={index: [1] for index in range(5)}, budget=80,
+        documents=documents, tree=tree, stop_groups=[7] * 5,
+        num_key_survivors=num_key_survivors)
+    # with two in flight, a third starts while the second's answer is
+    # pending; the last two never run
+    assert sorted(got) == {1: [0], 2: [0, 1, 2]}[num_key_survivors]
 
 
 def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):

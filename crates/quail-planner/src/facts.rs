@@ -155,6 +155,7 @@ pub fn region_facts(found: &Operators) -> Value {
         "prompts": {"filters": filters, "joins": joins, "classifies": classifies},
         "asks_model": !plan_prompts(found).is_empty(),
         "stop_keys": found.stop_keys,
+        "num_key_survivors": found.num_key_survivors,
         "join_conditions": oriented,
         "scans": scans,
         "value_columns": value_columns,

@@ -115,7 +115,7 @@ class StageExecutor:
                  default_attention, on_chunk, on_answers, stop_groups=None,
                  appended_tokens=None, gpu_timing=False, survival=None,
                  decoder=None, dependencies=None, knee_rows=0, decode_cost=None,
-                 summary=True):
+                 summary=True, num_key_survivors=1):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -274,7 +274,8 @@ class StageExecutor:
             frame_writes=self.writes,
             limit=limit, survival=survival,
             stop_groups=stop_groups,
-            stop_width=self._stop_width(stop_groups, budget),
+            stop_width=max(self._stop_width(stop_groups, budget), num_key_survivors),
+            num_key_survivors=num_key_survivors,
             extra_tokens=self.capacity_extra,
             gated=[j for j, stage in enumerate(self.stages)
                    if stage.prepare is not None],

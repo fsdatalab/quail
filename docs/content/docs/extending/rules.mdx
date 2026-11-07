@@ -100,6 +100,7 @@ names the rule that makes each rewrite and when it applies.
 | R11 | `Limit_k(R ⊎ S) ⇒ Limit_k(Limit_k(R) ⊎ Limit_k(S))` | DataFusion's `push_down_limit`, then `push_down_limit_into_ai_nodes` | `⊎` is UNION ALL. Each branch's LIMIT becomes its `AiNode`'s fetch as R9 allows. |
 | R12 | `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))` | `push_down_distinct` | `K` is input columns or a classification's label, and the node has no fetch. |
 | R13 | `S ⋉_{J=K} AI(R) ⇒ S ⋉_{J=K} AI(R; n = 1 per K)` | `push_down_semi_join_fetch` | `J = K` is the whole join condition, `K` are input columns of the node, each name once; only projections and aliases are between the join and the node; the node, and every `AiNode` below it, is an AI.IF over the same one table, with no join, fetch, `HINT`, or guard. |
+| R14 | `π_K(σ_{c ≥ k}(γ_{K; count(*)→c}(AI(R)))) ⇒ π_K(σ_{c ≥ k}(γ_{K; count(*)→c}(AI(R; n = k per K))))` | `push_down_count_threshold` | The HAVING is `COUNT(*) >= k`, `> k - 1`, or written the other way round, with `k` a positive integer; the GROUP BY keys `K` are columns; `count(*)` is the only aggregate and only the HAVING reads it; the node is under the GROUP BY as for R13. |
 | R17 | `AI_{f→b}(AI_{f→a}(R)) ⇒ π_{*, a→b}(AI_{f→a}(R))` | `merge_repeated_ai_calls` | Same call and guard, only filters and other `AiNode`s of the same rows between them, no fetch on the upper node, each test of the upper node's answer already a test of the lower node's, and the lower node returns each column the upper one returns. The lowering already gives calls written the same way in one SELECT list and WHERE one node. |
 
 R4 relies on `AI.EXTRACT` copying each answer from its document, so an
@@ -143,6 +144,12 @@ asks one table's AI.IF filters and joins nothing; the rule's conditions
 are that region's. A correlated `EXISTS` with an AI call on the
 subquery's table alone is still refused: its semi-join is inside the
 region, which Quail does not bind.
+
+R14 uses the same stop as R13 with `n = k`: the executor skips a key's
+remaining documents once `k` of them pass the table's AI filters. With
+more than one document of a key in flight, a few more than `k` may
+pass; the count threshold keeps the same keys either way. Explain shows
+`stop per key: <key> (the rest skipped once k survive)`.
 
 R1 needs no rule of its own. Quail moves each plain filter term to its
 table while it finds the model regions, before DataFusion's optimizer

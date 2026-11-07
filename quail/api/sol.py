@@ -184,9 +184,9 @@ class SpeedOfLightEstimate:
             "gpus": 1,
             "survivors": "exact, from the caller's answers and labels",
             "stop_key": (
-                "a filter under a DISTINCT over its table's columns reads "
-                "only each key's shortest survivor, or every document of "
-                "a key with none"),
+                "a filter under a DISTINCT, a semi-join, or a count "
+                "threshold reads only each key's shortest survivors, as "
+                "many as it needs, or every document of a key with fewer"),
             "filter_order": (
                 "the planner's rule for this query; an alias's "
                 "classifications follow its AI.IF filters"),

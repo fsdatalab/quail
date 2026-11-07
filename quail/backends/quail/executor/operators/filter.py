@@ -43,6 +43,7 @@ def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
         keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
         attention=node.attention or "unified",
         limit=inputs.get("limit"), stop_groups=inputs.get("stop_groups"),
+        num_key_survivors=inputs.get("num_key_survivors", 1),
         paged=node.arena_writes or len(nodes) > 1,
         label=f"filter ({len(nodes)} predicates)")
 
@@ -293,7 +294,8 @@ def stop_groups(node, columns, document_ids) -> list | None:
 
     Documents with equal values in the node's ``stop_key`` columns
     share a group number; the scheduler reads one document of a group
-    at a time and skips the rest once one survives.
+    at a time and skips the rest once the node's num_key_survivors
+    survive.
 
     Args:
         node: The AiFilter.
@@ -320,5 +322,6 @@ def filter_inputs(state, node, document_ids) -> dict:
         "limit": state["filter_limit"],
         "stop_groups": stop_groups(
             node, state.get("columns", {}).get(node.alias), document_ids),
+        "num_key_survivors": node.num_key_survivors,
         "document_done": filter_document_sink(node, document_ids),
     }

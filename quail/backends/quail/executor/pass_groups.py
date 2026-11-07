@@ -177,7 +177,7 @@ def _decode(values, places, code_width, width, temperature):
 
 
 def run_pass_group(state, questions, prefixes, *, limit=None, stop_groups=None,
-                   label="pass group") -> GroupAnswers:
+                   label="pass group", num_key_survivors=1) -> GroupAnswers:
     """Ask every question of a pass group of each document.
 
     Each document's pass reads its prompt head and document, the state
@@ -193,6 +193,8 @@ def run_pass_group(state, questions, prefixes, *, limit=None, stop_groups=None,
             yes/no question; None asks every document.
         stop_groups: Per document, its stop key group, or None.
         label: The progress label.
+        num_key_survivors: How many documents of a stop key group must
+            pass before the rest of the group is skipped.
 
     Raises:
         ValueError: The questions differ in prompt head or state tail.
@@ -253,7 +255,8 @@ def run_pass_group(state, questions, prefixes, *, limit=None, stop_groups=None,
             torch, state.loaded_model.arena, state.loaded_model.pipeline, [stage],
             states, state.chunk_tokens, staging=input_staging(state),
             gpu_timing=state.gpu_timing, paged=False, label=label,
-            limit=limit, stop_groups=stop_groups)
+            limit=limit, stop_groups=stop_groups,
+            num_key_survivors=num_key_survivors)
         positions = np.fromiter(sorted(found[0]), dtype=np.int64,
                                 count=len(found[0]))
         values = (np.stack([np.asarray(found[0][int(p)][0], dtype=np.float64)
