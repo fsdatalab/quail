@@ -88,6 +88,13 @@ def _rows(table: pa.Table) -> list[tuple]:
     return list(zip(*(column.to_pylist() for column in table.columns)))
 
 
+def _same_rows(table: pa.Table, expected: pa.Table, ordered: bool) -> bool:
+    """Whether two tables hold the same rows, in the same order if `ordered`."""
+    if ordered:
+        return _rows(table) == _rows(expected)
+    return sorted(_rows(table), key=repr) == sorted(_rows(expected), key=repr)
+
+
 @pytest.mark.parametrize("name", QUERIES)
 def test_a_region_answers_as_the_written_query(context, name):
     text = QUERIES[name]
@@ -95,7 +102,7 @@ def test_a_region_answers_as_the_written_query(context, name):
     expected = finish(session.sql(text), ORACLE).collect()
     table = context.sql(text)
     assert table.column_names == expected.column_names
-    assert _rows(table) == _rows(expected)
+    assert _same_rows(table, expected, ordered="ORDER BY" in text)
 
 
 @pytest.mark.parametrize("name", QUERIES)
@@ -141,7 +148,7 @@ def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
     expected = finish(context.session.sql(text), ORACLE).collect()
     table = context.sql(text)
     assert table.column_names == ["c.id", "lease", "lease_span"]
-    assert _rows(table) == _rows(expected)
+    assert _same_rows(table, expected, ordered=False)
     assert len(_rows(table)) == 2
 
 

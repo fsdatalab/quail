@@ -4,17 +4,19 @@ SortPreservingMergeExec: [test_steps@1 DESC NULLS LAST, trace_id@0 ASC NULLS LAS
     SortExec: TopK(fetch=50), expr=[count(Int64(1))@1 DESC NULLS LAST, trace_id@0 ASC NULLS LAST], preserve_partitioning=[true]
       FilterExec: count(Int64(1))@1 >= 3
         AggregateExec: mode=FinalPartitioned, gby=[trace_id@0 as trace_id], aggr=[count(Int64(1))]
-          RepartitionExec: partitioning=Hash([trace_id@0], 4), input_partitions=1
+          RepartitionExec: partitioning=Hash([trace_id@0], 4), input_partitions=4
             AggregateExec: mode=Partial, gby=[trace_id@0 as trace_id], aggr=[count(Int64(1))]
-              HashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(__quail_key_m@0, id@0)], projection=[trace_id@1]
-                ProjectionExec: expr=[id@2 as __quail_key_m, trace_id@0 as trace_id]
-                  SharedInputExec
-                    FilterExec: role@1 = assistant, projection=[trace_id@0, content@2, id@3]
-                      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-                ModelRegionExec
-                  SharedInputExec
-                    FilterExec: role@1 = assistant, projection=[trace_id@0, content@2, id@3]
-                      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+              HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(__quail_key_m@0, id@0)], projection=[trace_id@1]
+                RepartitionExec: partitioning=Hash([__quail_key_m@0], 4), input_partitions=1
+                  ProjectionExec: expr=[id@2 as __quail_key_m, trace_id@0 as trace_id]
+                    SharedInputExec
+                      FilterExec: role@1 = assistant, projection=[trace_id@0, content@2, id@3]
+                        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+                RepartitionExec: partitioning=Hash([id@0], 4), input_partitions=1
+                  ModelRegionExec
+                    SharedInputExec
+                      FilterExec: role@1 = assistant, projection=[trace_id@0, content@2, id@3]
+                        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

@@ -89,7 +89,7 @@ def test_datafusion_unnests_the_feature_lists_the_region_returns(session):
     assert "output=__quail_column_1" in explained
     rows = finish(query, _unnest_oracle()).collect()
     assert rows.column_names == ["r.id", "f.feature"]
-    assert rows.to_pylist() == [
+    assert sorted(rows.to_pylist(), key=lambda row: tuple(row.values())) == [
         {"r.id": 7, "f.feature": 0}, {"r.id": 7, "f.feature": 100},
         {"r.id": 9, "f.feature": 1}, {"r.id": 9, "f.feature": 100},
         {"r.id": 11, "f.feature": 2}, {"r.id": 11, "f.feature": 100}]

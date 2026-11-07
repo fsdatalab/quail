@@ -95,13 +95,7 @@ pub fn session_state_with_rules(
     runner: Arc<dyn RegionRunner>,
     rules: Vec<String>,
 ) -> Result<SessionState> {
-    // the join that adds a region's tables' columns back keeps the
-    // region's row order only when one partition of the region's rows
-    // probes the whole table: no round-robin split, no partitioned join
-    let config = SessionConfig::from_env()?
-        .set_str("datafusion.sql_parser.dialect", "Snowflake")
-        .set_bool("datafusion.optimizer.enable_round_robin_repartition", false)
-        .set_bool("datafusion.optimizer.repartition_joins", false);
+    let config = SessionConfig::from_env()?.set_str("datafusion.sql_parser.dialect", "Snowflake");
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()

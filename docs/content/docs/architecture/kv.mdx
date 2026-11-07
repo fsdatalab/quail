@@ -113,7 +113,9 @@ Sharing has these limits:
 - If the parent is skipped or its required KV is unavailable, the
   document computes the prefix again.
 - Documents can share KV only on the same GPU.
-- A filter with a row limit disables sharing to preserve row order.
+- Under a row limit, admission follows the sharing order, so a query
+  without ORDER BY can return different qualifying rows than it would
+  without sharing.
 
 See
 [`Borrowing`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/admission.py)

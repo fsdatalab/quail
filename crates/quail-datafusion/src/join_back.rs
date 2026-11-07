@@ -90,8 +90,10 @@ impl JoinBack {
         if self.unchanged {
             return Ok(region);
         }
-        // each table is the join's build side and the region's rows its
-        // probe side, so the rows keep the region's order
+        // each table is the join's left side, the one DataFusion builds
+        // its hash table on unless statistics favor the other side. With
+        // the region on the left, DataFusion 55.2 swaps the sides of a
+        // join back of two tables and its dynamic filters drop every row
         let mut plan = region;
         for joined in self
             .joined

@@ -72,10 +72,6 @@ runner that calls Quail's Python executor.
   `ModelRegionExec`, and each `SharedInput`, a region input that the
   join above the region reads too, as a `SharedInputExec` that
   computes its rows once.
-- Two settings that keep the region's row order through that join:
-  `datafusion.optimizer.enable_round_robin_repartition` and
-  `datafusion.optimizer.repartition_joins` are off, in the session
-  `quail_datafusion::session_state` builds.
 
 A session with its own `QueryPlanner` calls `register_rules` instead,
 and adds `extension_planner()` to the extension planners its planner

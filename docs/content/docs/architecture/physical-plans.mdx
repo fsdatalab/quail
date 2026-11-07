@@ -111,15 +111,22 @@ that returns each review's `stars` beside a classification:
 ```text
 DataFusion:
 HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(__quail_key_r@0, id@0)], projection=[id@2, stars@1, kind@3]
-  ProjectionExec: expr=[id@0 as __quail_key_r, stars@1 as stars]
-    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-  ModelRegionExec
+  CoalescePartitionsExec
+    ProjectionExec: expr=[id@0 as __quail_key_r, stars@1 as stars]
+      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+  RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+    ModelRegionExec
 ```
 
-The table is the join's build side, so the rows keep the region's
-order. When DataFusion computes a table's rows for the region, the
-join reads them through the same `SharedInputExec` as the region, so
-they are computed once.
+DataFusion plans the join with its default settings: it splits the
+region's rows across partitions and picks the join's build side from
+the statistics it has. When DataFusion computes a table's rows for the
+region, the join reads them through the same `SharedInputExec` as the
+region, so they are computed once.
+
+Only an ORDER BY sets the order of the result rows. Without one, the
+rows can come back in any order, and a LIMIT returns any of the rows
+that qualify.
 
 ## Inspect the plan
 

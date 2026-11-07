@@ -174,8 +174,8 @@ runs the rest of the part above the region
 
 - for each table whose other columns the SELECT list reads, an inner
   join of the region's rows with the table on its id, which adds those
-  columns back. The table is the join's build side and the region's
-  rows the probe side, so the rows keep the region's order. The join
+  columns back. The join does not keep the region's row order;
+  only an ORDER BY sets the order of the result. The join
   reads a region input through the same `SharedInput` as the region,
   so DataFusion computes the input's rows once; it scans an identified
   table the region reads by name again;

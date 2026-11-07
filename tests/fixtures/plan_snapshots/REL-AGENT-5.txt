@@ -14,7 +14,7 @@ SortPreservingMergeExec: [n@1 DESC NULLS LAST, test_result@0 ASC NULLS LAST]
 {0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))], aggr=[count(Int64(1)), count(DISTINCT t.trajectory_id)]
           RepartitionExec: partitioning=Hash([AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
 
-{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))@0], 4), input_partitions=1
+{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))@0], 4), input_partitions=4
             AggregateExec: mode=Partial, gby=[test_result@1 as AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
 
 {0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))], aggr=[count(Int64(1)), count(DISTINCT t.trajectory_id)]
@@ -22,7 +22,8 @@ SortPreservingMergeExec: [n@1 DESC NULLS LAST, test_result@0 ASC NULLS LAST]
                 CoalescePartitionsExec
                   ProjectionExec: expr=[id@0 as __quail_key_t, trajectory_id@1 as trajectory_id]
                     DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-                ModelRegionExec
+                RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                  ModelRegionExec
 
 model region:
 logical:

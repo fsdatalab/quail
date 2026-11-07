@@ -4,13 +4,14 @@ SortPreservingMergeExec: [flagged_steps@1 DESC NULLS LAST, run_id@0 ASC NULLS LA
     SortExec: TopK(fetch=50), expr=[count(Int64(1))@1 DESC NULLS LAST, run_id@0 ASC NULLS LAST], preserve_partitioning=[true]
       FilterExec: count(Int64(1))@1 >= 2
         AggregateExec: mode=FinalPartitioned, gby=[run_id@0 as run_id], aggr=[count(Int64(1))]
-          RepartitionExec: partitioning=Hash([run_id@0], 4), input_partitions=1
+          RepartitionExec: partitioning=Hash([run_id@0], 4), input_partitions=4
             AggregateExec: mode=Partial, gby=[run_id@0 as run_id], aggr=[count(Int64(1))]
               HashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(__quail_key_s@0, id@0)], projection=[run_id@1]
                 CoalescePartitionsExec
                   ProjectionExec: expr=[id@0 as __quail_key_s, run_id@1 as run_id]
                     DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-                ModelRegionExec
+                RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                  ModelRegionExec
 
 model region:
 logical:

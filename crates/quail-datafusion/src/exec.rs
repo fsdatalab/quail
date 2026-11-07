@@ -121,6 +121,11 @@ impl ExecutionPlan for ModelRegionExec {
         self.inputs.iter().collect()
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // `execute` collects each input into one partition
+        vec![false; self.inputs.len()]
+    }
+
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         let mut exec = Self::new(
             self.region.clone(),

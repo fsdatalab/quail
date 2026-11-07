@@ -75,16 +75,18 @@ def test_extraction_then_score_sends_the_extracted_text_to_the_scorer(session):
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     scores=lambda spec, ids: 0.9 if ids[0] == 0 else 0.1)
     result, recorder = run(query, oracle)
-    rows = result.collect()
+    rows = result.collect().sort_by("x.id")
     assert rows.column("x.id").to_pylist() == [1, 2, 3]
     assert rows.column("x.clause").to_pylist() == [
         {"terms": clause} for clause in CLAUSES.values()]
-    assert rows.column("score").to_pylist() == [0.9, 0.1, 0.1]
+    # the oracle scores the scorer's first document 0.9; which row that
+    # is follows the order the first region returned its rows in
+    assert sorted(rows.column("score").to_pylist()) == [0.1, 0.1, 0.9]
     # the scorer read the extracted clauses, not the contracts; a null
     # answer reaches it as empty text
     (scored,) = recorder.documents["x"]
-    assert [[int(token) for token in tokens] for tokens in scored] == [
-        encoder()(CLAUSES[0]), [], encoder()(CLAUSES[2])]
+    assert sorted([int(token) for token in tokens] for tokens in scored) == sorted(
+        [encoder()(CLAUSES[0]), [], encoder()(CLAUSES[2])])
     assert len(recorder.requests) == 2
 
 
@@ -111,7 +113,7 @@ def test_a_cte_runs_once_however_many_times_it_is_read(session):
     # the extraction once, though the join reads it twice, and the join;
     # the CTE nothing reads never runs
     assert len(recorder.requests) == 2
-    rows = result.collect()
+    rows = result.collect().sort_by("a.id")
     assert rows.column("a.id").to_pylist() == [1, 2, 3]
     assert rows.column("other").to_pylist() == [1, 2, 3]
     # both aliases read the one result table
@@ -129,7 +131,7 @@ def test_relational_stages_before_and_after_ai_return_the_selected_rows(session,
                            Oracle(filters=lambda *args: True,
                                   joins=lambda node, assignment:
                                   len(set(assignment.values())) == 1))
-    assert result.collect().column("result_id").to_pylist() == [1, 2]
+    assert sorted(result.collect().column("result_id").to_pylist()) == [1, 2]
     assert "Project" in result.explain()
     assert len(recorder.requests) == 1
 
@@ -145,7 +147,8 @@ def test_a_filtered_cte_on_the_right_of_a_join_keeps_its_filter(session):
     result, recorder = run(query, Oracle(
         filters=lambda alias, document, position: document != 1,
         joins=lambda node, assignment: len(set(assignment.values())) == 1))
-    assert result.collect().to_pydict() == {"a.id": [1, 3], "other": [1, 3]}
+    assert result.collect().sort_by("a.id").to_pydict() == {
+        "a.id": [1, 3], "other": [1, 3]}
     assert len(recorder.requests) == 1
 
 
@@ -158,7 +161,7 @@ def test_a_cte_that_classifies_returns_the_columns_its_reader_names(session):
     """)
     result, _ = run(query, Oracle(labels=lambda spec, ids: spec.labels[ids[0] % 2]))
     # the CTE is its own model region; DataFusion names the reader's columns
-    assert result.collect().to_pydict() == {
+    assert result.collect().sort_by("k.id").to_pydict() == {
         "k.id": [1, 3], "k.kind": ["lease", "lease"]}
 
 

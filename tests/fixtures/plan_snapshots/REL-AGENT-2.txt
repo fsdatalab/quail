@@ -1,12 +1,13 @@
 DataFusion:
 GlobalLimitExec: skip=10, fetch=10
-  SortExec: TopK(fetch=20), expr=[token_count@1 ASC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[false]
-    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(__quail_key_t@0, id@0)], projection=[id@2, token_count@1]
-      CoalescePartitionsExec
-        ProjectionExec: expr=[id@0 as __quail_key_t, token_count@1 as token_count]
-          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-      CooperativeExec
-        ModelRegionExec
+  SortPreservingMergeExec: [token_count@1 ASC NULLS LAST, id@0 ASC NULLS LAST], fetch=20
+    SortExec: TopK(fetch=20), expr=[token_count@1 ASC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[true]
+      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(__quail_key_t@0, id@0)], projection=[id@2, token_count@1]
+        CoalescePartitionsExec
+          ProjectionExec: expr=[id@0 as __quail_key_t, token_count@1 as token_count]
+            DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+        RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+          ModelRegionExec
 
 model region:
 logical:

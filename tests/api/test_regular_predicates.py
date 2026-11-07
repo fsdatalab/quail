@@ -73,7 +73,7 @@ def test_regular_predicates_select_documents_before_the_model(session):
     first = "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
     query = session.sql(f"SELECT r.id, r.stars FROM reviews r {first} "
                         "AND r.stars < 4 AND r.lang = 'en'")
-    assert _run(query, make_executor(TRUTH)).to_rows() == [("r1", 2), ("r4", 3)]
+    assert sorted(_run(query, make_executor(TRUTH)).to_rows()) == [("r1", 2), ("r4", 3)]
     # a function on a source column reaches the scan as written
     query = session.sql(f"SELECT r.id FROM reviews r {first} AND LENGTH(r.lang) > 2")
     assert _run(query, make_executor(TRUTH)).to_rows() == []

@@ -83,7 +83,7 @@ def test_a_document_column_beside_an_ai_answer_is_joined_back_on_the_id(session)
     assert "Projection: r.id, kind" in query.logical
     assert "HashJoinExec" in query.explain()
     rows = finish(query, ORACLE).collect()
-    assert rows.to_pylist() == [
+    assert rows.sort_by("r.id").to_pylist() == [
         {"r.id": "r0", "r.stars": 5, "kind": "a"},
         {"r.id": "r1", "r.stars": 2, "kind": "a"},
         {"r.id": "r2", "r.stars": 4, "kind": "a"}]

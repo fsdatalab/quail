@@ -163,7 +163,10 @@ need a join key or an AI predicate in `ON`. See
 ### ORDER BY
 
 `ORDER BY` sorts result rows by columns or
-[column expressions](#column-expressions). To sort by a score or
+[column expressions](#column-expressions). Only `ORDER BY` sets the
+order of the result rows: without it, rows can come back in any order,
+and the order can differ between runs. A `LIMIT` without `ORDER BY`
+returns any of the rows that qualify, up to the limit. To sort by a score or
 classification label or window output, use its `AS` name. AI calls cannot appear
 directly in `ORDER BY`.
 Sorting columns need not appear in `SELECT`, except when using
