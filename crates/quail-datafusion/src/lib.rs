@@ -31,6 +31,7 @@ mod identified;
 mod joins;
 mod lower;
 mod placement;
+mod regexps;
 mod region;
 pub mod rules;
 mod unnest;
@@ -117,7 +118,8 @@ pub fn session_context_with_rules(
 /// Plan a SQL query that may call AI functions as `AI.<name>(...)`.
 ///
 /// The query is parsed in the session's SQL dialect. Before DataFusion
-/// binds it, each extraction gets its answer positions column (see
+/// binds it, each regular expression test matches as the dialect says
+/// (see [`regexps`]), each extraction gets its answer positions column (see
 /// [`add_extract_spans`]), and `SELECT` aliases named in `WHERE` are
 /// replaced by their expressions (see [`inline_select_aliases`]).
 pub async fn sql(context: &SessionContext, query: &str) -> Result<DataFrame> {
@@ -150,6 +152,11 @@ pub async fn sql_in_dialect(
     }
     let mut statement = state.sql_to_statement(&text, &dialect)?;
     if let Statement::Statement(inner) = &mut statement {
+        match dialect {
+            datafusion::config::Dialect::Snowflake => regexps::anchor_snowflake_regexps(inner),
+            datafusion::config::Dialect::BigQuery => regexps::bigquery_regexp_contains(inner),
+            _ => {}
+        }
         joins::flatten_joins(inner);
         take_unnests(inner);
         positional_ai_arguments(inner);

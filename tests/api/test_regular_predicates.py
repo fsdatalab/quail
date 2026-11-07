@@ -103,6 +103,32 @@ def test_a_condition_read_from_a_plan_evaluates_as_built():
     assert read.evaluate(rows).to_pylist() == [True, False, None]
 
 
+@pytest.mark.parametrize(("test", "expected"), [
+    # Snowflake matches the whole value: 'e' is not 'en'
+    ("REGEXP_LIKE(r.lang, 'e')", []),
+    ("REGEXP_LIKE(r.lang, 'e.')", [("r0",), ("r3",)]),
+    ("RLIKE(r.lang, 'e')", []),
+    ("r.lang RLIKE 'e'", []),
+    ("r.lang NOT REGEXP 'e'", [("r0",), ("r3",)]),
+    ("REGEXP_LIKE(r.lang, r.lang || '?')", [("r0",), ("r3",)]),
+])
+def test_a_snowflake_regexp_matches_the_whole_value(session, test, expected):
+    # the AI predicates keep r0 and r3, both in English
+    query = session.sql(FILTER_SQL + f" AND {test}")
+    assert _run(query, make_executor(TRUTH)).to_rows() == expected
+
+
+@pytest.mark.parametrize("test", [
+    "REGEXP_CONTAINS(r.lang, 'e')", "REGEXP_LIKE(r.lang, 'e')"])
+def test_a_bigquery_regexp_matches_anywhere_in_the_value(session, test):
+    query = session.sql(f"""
+        SELECT r.id FROM reviews r
+        WHERE AI.IF(PROMPT('q1: {{0}}', r.review))
+          AND AI.IF(PROMPT('q2: {{0}}', r.review)) AND {test}
+    """, dialect="bq")
+    assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",), ("r3",)]
+
+
 def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
     # the AI predicates keep r0 (en, 5 stars) and r3 (en, no stars)
     query = session.sql(
