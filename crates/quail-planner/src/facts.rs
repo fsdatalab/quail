@@ -18,7 +18,8 @@ use crate::plan_statistics::plan_prompts;
 ///   its table's schema;
 /// - `value_columns`: alias -> the columns the executor reads by
 ///   document id: join equalities, regular predicates, tests of labels
-///   and answers on the table's own columns, and DISTINCT stop keys;
+///   and answers on the table's own columns, DISTINCT stop keys, and
+///   the guards of column operators;
 /// - `stop_keys`: alias -> its DISTINCT stop key;
 /// - `join_conditions`: for each join with equalities, its written
 ///   position, its two aliases, and each equality's sides in that
@@ -77,6 +78,11 @@ pub fn region_facts(found: &Operators) -> Value {
     for (alias, key) in &found.stop_keys {
         for column in key {
             add(alias, column);
+        }
+    }
+    for guard in found.columns().filter_map(|column| column.guard.as_ref()) {
+        for reference in column_references(guard) {
+            add(&reference.alias, &reference.column);
         }
     }
     let scans: Vec<Value> = found

@@ -2,7 +2,7 @@
 //!
 //! DataFusion's optimizer runs its own rules over the whole plan, each
 //! `AiNode` included, with Quail's rules among them. [`LOGICAL_RULES`]
-//! is the default order: DataFusion's default rules, with Quail's seven
+//! is the default order: DataFusion's default rules, with Quail's eight
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
 //! GROUP BY. Then
 //! [`crate::ClaimModelRegions`] runs last: it runs the listed rules
@@ -19,7 +19,7 @@ use datafusion::common::{Result, plan_err};
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 
 /// Quail's own rules, in the order they run.
-pub const QUAIL_RULES: [&str; 7] = [
+pub const QUAIL_RULES: [&str; 8] = [
     "eliminate_distinct",
     "place_ai_nodes",
     "absorb_into_ai_nodes",
@@ -27,6 +27,7 @@ pub const QUAIL_RULES: [&str; 7] = [
     "push_down_distinct",
     "push_down_limit_into_ai_nodes",
     "push_down_projection_into_ai_nodes",
+    "push_down_case_guards",
 ];
 
 /// The rule Quail's rules run before.
@@ -34,7 +35,7 @@ const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
 
 /// The logical optimizer rules a session runs by default, in order: each
 /// name is an `OptimizerRule`'s `name()`.
-pub const LOGICAL_RULES: [&str; 32] = [
+pub const LOGICAL_RULES: [&str; 33] = [
     "rewrite_set_comparison",
     "optimize_unions",
     "unions_to_filter",
@@ -46,6 +47,7 @@ pub const LOGICAL_RULES: [&str; 32] = [
     "push_down_distinct",
     "push_down_limit_into_ai_nodes",
     "push_down_projection_into_ai_nodes",
+    "push_down_case_guards",
     "replace_distinct_aggregate",
     "eliminate_join",
     "decorrelate_predicate_subquery",
@@ -80,6 +82,7 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
         "push_down_projection_into_ai_nodes" => {
             Arc::new(crate::projection::PushDownProjectionIntoAiNodes)
         }
+        "push_down_case_guards" => Arc::new(crate::guards::PushDownCaseGuards),
         _ => return None,
     })
 }

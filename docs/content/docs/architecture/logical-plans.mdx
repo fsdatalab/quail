@@ -54,7 +54,9 @@ AI(R; g, p, h, P, n) = π_P(Limit_n(σ_p(π_{*, f_g → a}(R))))
 f_g = CASE WHEN g THEN f END
 ```
 
-- `g`, the guard, says which rows the model is asked about.
+- `g`, the guard, says which rows the model is asked about. The
+  executor asks about the rows where `g` is TRUE and answers NULL for
+  the rest.
 - `p`, the filter, is an exact test of the input's columns and `a`.
 - `h`, the hint, is the query's inexact `HINT` options, such as
   `{'selectivity': 0.4}`.

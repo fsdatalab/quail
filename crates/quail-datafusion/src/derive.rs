@@ -1608,6 +1608,13 @@ impl<'w, 'a> Assembly<'w, 'a> {
             return None;
         }
         for id in self.walk.ids() {
+            // only a column node's executor reads a guard
+            if let Kind::Ai(node) = &self.walk.get(id).kind
+                && node.guard.is_some()
+                && (node.is_predicate() || node.semantics != Semantics::Rows)
+            {
+                return None;
+            }
             match &self.walk.get(id).kind {
                 Kind::Scan(table) => {
                     let alias = &self.walk.tables[*table].alias;
@@ -1736,6 +1743,18 @@ impl<'w, 'a> Assembly<'w, 'a> {
         Some((kind, named))
     }
 
+    /// A column node's guard as a condition; the outer None when it does
+    /// not bind.
+    fn bound_guard(&mut self, node: &AiNode) -> Option<Option<ValueExpression>> {
+        match &node.guard {
+            None => Some(None),
+            Some(guard) => {
+                let written = self.walk.written(guard, &[]);
+                self.binder.bind_condition(&written).ok().map(Some)
+            }
+        }
+    }
+
     fn place_column(&mut self, id: usize, node: &AiNode) -> Option<()> {
         let read: Vec<String> = self.call_tables(id).into_iter().collect();
         let is_column = |kind: &Kind| matches!(kind, Kind::Ai(found) if !found.is_predicate() && found.semantics == Semantics::Rows);
@@ -1762,12 +1781,14 @@ impl<'w, 'a> Assembly<'w, 'a> {
             }
             let above_joins = self.walk.get(below).ai_join;
             for (at, found) in run {
+                let guard = self.bound_guard(found)?;
                 let (_, columns) = self.bound_columns(found)?;
                 for (call, name) in columns {
                     self.found.classifies.push(SemanticColumn {
                         call,
                         name,
                         above_joins,
+                        guard: guard.clone(),
                     });
                     let position = self.found.classifies.len() - 1;
                     self.columns_at
@@ -1780,6 +1801,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
         let [alias] = <[String; 1]>::try_from(read).ok()?;
         let above_joins = self.walk.get(self.walk.get(id).inputs[0]).ai_join;
+        let guard = self.bound_guard(node)?;
         let (kind, columns) = self.bound_columns(node)?;
         for (call, name) in columns {
             let list = self.list(kind);
@@ -1787,6 +1809,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 call,
                 name,
                 above_joins,
+                guard: guard.clone(),
             });
             let position = list.len() - 1;
             self.columns_at
@@ -2013,6 +2036,12 @@ fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly
     for column in found.extracts.iter().chain(&found.maps) {
         value(call_refs(&column.call));
     }
+    let guards: Vec<ColumnRef> = found
+        .columns()
+        .filter_map(|column| column.guard.as_ref())
+        .flat_map(column_references)
+        .collect();
+    value(guards.clone());
     let scan_ids: Vec<usize> = walk
         .ids()
         .filter(|id| matches!(walk.get(*id).kind, Kind::Scan(_)))
@@ -2119,6 +2148,13 @@ fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly
                 if !columns.contains(column) {
                     columns.push(column.clone());
                 }
+            }
+        }
+        // a guard reads its columns' values where its operator runs
+        for reference in guards.iter().filter(|reference| reference.alias == alias) {
+            let columns = needed.by_alias.entry(alias.clone()).or_default();
+            if !columns.contains(&reference.column) {
+                columns.push(reference.column.clone());
             }
         }
         let sources = source_columns(&scan.column);

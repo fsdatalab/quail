@@ -1140,6 +1140,12 @@ impl TreeRows<'_> {
             }
             return (title, details, predicates);
         };
+        if let Some(guard) = known.guard() {
+            details.push(format!(
+                "asks only where {}; every other row's answer is NULL",
+                condition_text(guard)
+            ));
+        }
         let title = match known {
             PhysicalNode::Scan(scan) => {
                 let scan = &scan.attributes;

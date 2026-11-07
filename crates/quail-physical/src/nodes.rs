@@ -215,6 +215,7 @@ physical_nodes! {
         keep_kv: bool,
         pass_group: i64,
         document_ends: Value,
+        guard: Option<ValueExpression>,
     }
     /// One `AI.EXTRACT` question.
     AiExtract(AiExtractAttributes) = "quail.ai_extract" {
@@ -225,6 +226,7 @@ physical_nodes! {
         pass_group: i64,
         document_ends: Value,
         attention: String,
+        guard: Option<ValueExpression>,
     }
     /// An `AI.MAP` call.
     AiMap(AiMapAttributes) = "quail.ai_map" {
@@ -235,6 +237,7 @@ physical_nodes! {
         pass_group: i64,
         document_ends: Value,
         attention: String,
+        guard: Option<ValueExpression>,
     }
     /// An `AI.SAE_FEATURES` call.
     AiSaeFeatures(AiSaeFeaturesAttributes) = "quail.ai_sae_features" {
@@ -244,6 +247,7 @@ physical_nodes! {
         keep_kv: bool,
         pass_group: i64,
         document_ends: Value,
+        guard: Option<ValueExpression>,
     }
     /// Prunes each table's survivors with the join answers so far.
     Barrier(BarrierAttributes) = "quail.barrier" {

@@ -91,6 +91,7 @@ names the rule that makes each rewrite and when it applies.
 | R1 | `σ_q(AI(R)) ⇒ AI(σ_q(R))` | Quail's region claim, then DataFusion's `push_down_filter` | `q` reads only columns of `R`, and the node has no fetch. Above a per-key fetch, only a test of the key columns moves. |
 | R2 | `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)` | `absorb_into_ai_nodes` | `q` tests the node's answer, and the node has no fetch. |
 | R5 | `π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))` | `push_down_projection_into_ai_nodes` | `Q` is a projection directly above a node of rows; the node keeps its answer, and drops each other added column `Q` does not read, such as an extraction's spans under a FROM subquery. DataFusion's `optimize_projections` already prunes the input columns the node reads. |
+| R6 | `π_{B, (CASE WHEN c THEN a END)→z}(AI_{f→a}(R)) ⇒ π_{B, a→z}(AI_{f→a}(R; g = g ∧ c))` | `push_down_case_guards` | The node is a classification, map, or SAE features of rows with no filter, `HINT`, or fetch; the projection is directly above it; every item that reads an added column is `CASE WHEN c THEN <column> END` with the same `c`; `c` reads only columns of the one table the call reads. |
 | R8 | `Limit_k(π(R)) ⇒ π(Limit_k(R))` | DataFusion's `push_down_limit`; `push_down_limit_into_ai_nodes` also reads through projections | The projection keeps one row per row. Over an `AiNode`, the LIMIT becomes the node's fetch (R9). |
 | R9 | `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))` | `push_down_limit_into_ai_nodes` | Only projections and aliases are between them, the node has no `HINT` and no per-key fetch, and `k > 0`. |
 | R10 | `Limit_{k,m}(AI(R; n)) ⇒ Limit_{k,m}(AI(R; n = min(k + m, n)))` | `push_down_limit_into_ai_nodes` | As R9, for a LIMIT with an OFFSET of `m`. |
@@ -104,6 +105,14 @@ reads one field of an extraction, such as `x.e.w`, still asks every
 question of the extraction; a classification asked for probabilities
 under a FROM subquery still computes them. Neither is a column of the
 node's `P` today.
+
+For R6, the executor evaluates the guard over the rows a column
+operator reads, asks the model about the rows where it is TRUE, and
+gives every other row a NULL answer. A guarded operator runs in a
+pipeline of its own, and stock vLLM refuses a plan with a guard. An
+extraction keeps its `CASE`: its answer is a struct of one answer per
+question, and an unasked row would read as a struct of NULL answers
+rather than NULL.
 
 R1 needs no rule of its own. Quail moves each plain filter term to its
 table while it finds the model regions, before DataFusion's optimizer

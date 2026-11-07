@@ -1097,6 +1097,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 inputs,
                 spec,
                 model,
+                column.guard.clone(),
             ));
         }
         let spec = column_spec(context, column, expected_rows, resident)?;
@@ -1114,6 +1115,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         pass_group: -1,
                         document_ends: Value::Array(Vec::new()),
                         attention: String::new(),
+                        guard: column.guard.clone(),
                     },
                 ))
             }
@@ -1130,6 +1132,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         pass_group: -1,
                         document_ends: Value::Array(Vec::new()),
                         attention: String::new(),
+                        guard: column.guard.clone(),
                     },
                 ))
             }
@@ -1145,6 +1148,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         keep_kv: false,
                         pass_group: -1,
                         document_ends: Value::Array(Vec::new()),
+                        guard: column.guard.clone(),
                     },
                 ))
             }
@@ -1367,6 +1371,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 )],
                 spec,
                 context.model.name.clone(),
+                None,
             );
             self.nodes.push(node);
         }
@@ -1555,7 +1560,13 @@ fn port_of(node_id: &str, name: impl Into<String>) -> PortRef {
     port(node_id, name)
 }
 
-fn classify_node(id: &str, inputs: &[PortRef], spec: ClassifySpec, model: String) -> PhysicalNode {
+fn classify_node(
+    id: &str,
+    inputs: &[PortRef],
+    spec: ClassifySpec,
+    model: String,
+    guard: Option<ValueExpression>,
+) -> PhysicalNode {
     PhysicalNode::AiClassify(tagged_node(
         id,
         inputs,
@@ -1566,6 +1577,7 @@ fn classify_node(id: &str, inputs: &[PortRef], spec: ClassifySpec, model: String
             keep_kv: false,
             pass_group: -1,
             document_ends: Value::Array(Vec::new()),
+            guard,
         },
     ))
 }

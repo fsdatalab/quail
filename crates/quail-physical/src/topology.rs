@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::expressions::ValueExpression;
 use crate::graph::{AnswerOutput, InputPort, OutputPort, PortRef, ValueType};
 use crate::nodes::*;
 use crate::specs::ExtractSpec;
@@ -463,6 +464,10 @@ impl PhysicalNode {
 
     /// Whether this node can use the KV the node before it left.
     pub fn can_follow(&self, previous: &PhysicalNode, first: &PhysicalNode) -> bool {
+        // the executor asks a guarded node about its guard's rows alone
+        if self.guard().is_some() {
+            return false;
+        }
         match self {
             PhysicalNode::Filter(_) => true,
             PhysicalNode::AiClassify(node) => {
@@ -491,6 +496,9 @@ impl PhysicalNode {
 
     /// Whether a consumer can run before other documents finish.
     pub fn can_precede(&self, consumer: &PhysicalNode) -> bool {
+        if self.guard().is_some() {
+            return false;
+        }
         match self {
             PhysicalNode::AiJoin(node) => match consumer {
                 PhysicalNode::AiJoin(next) => {
@@ -502,6 +510,18 @@ impl PhysicalNode {
                 _ => false,
             },
             _ => true,
+        }
+    }
+
+    /// A column node's guard: the condition that says which rows the
+    /// model is asked about. None for every other node.
+    pub fn guard(&self) -> Option<&ValueExpression> {
+        match self {
+            PhysicalNode::AiClassify(node) => node.attributes.guard.as_ref(),
+            PhysicalNode::AiExtract(node) => node.attributes.guard.as_ref(),
+            PhysicalNode::AiMap(node) => node.attributes.guard.as_ref(),
+            PhysicalNode::AiSaeFeatures(node) => node.attributes.guard.as_ref(),
+            _ => None,
         }
     }
 

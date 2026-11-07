@@ -242,6 +242,13 @@ fn refusal(
             "backends",
         ));
     }
+    if found.columns().any(|column| column.guard.is_some()) {
+        return Ok(refuse(
+            format!("a guarded AI column asks only some rows, which {backend} does not"),
+            "guard_needs_quail_backend".into(),
+            "backends",
+        ));
+    }
     let has_extract = !found.extracts.is_empty();
     for (function, present) in [
         ("AI.EXTRACT", has_extract),

@@ -124,6 +124,11 @@ pub struct SemanticColumn {
     pub name: String,
     /// Whether it runs above a join.
     pub above_joins: bool,
+    /// The condition, an `Expression` over the table's columns, that
+    /// says which rows the model is asked about; every other row's
+    /// answer is NULL. None asks about every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<ValueExpression>,
 }
 
 impl SemanticColumn {

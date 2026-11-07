@@ -494,7 +494,7 @@ impl Binder {
 
     /// Bind a term that asks no model as a condition, each answer it
     /// tests read as the answer's column.
-    fn bind_condition(&mut self, term: &Expr) -> Result<ValueExpression, CompileError> {
+    pub(crate) fn bind_condition(&mut self, term: &Expr) -> Result<ValueExpression, CompileError> {
         let read = self.answer_columns(term)?;
         self.computed(&read)
     }

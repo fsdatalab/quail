@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.execution.deduplicate import deduplicate
+from quail.execution.guard import guarded
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.physical import (
     ExecutionLocation,
@@ -119,6 +120,10 @@ class GenericRunner:
                         for port in member.inputs
                         if port.source.node_id not in inside}
                     for member in pipeline}
+                # a guarded node runs in a pipeline of its own
+                guard = guarded(node, inputs[node.node_id], context)
+                if guard is not None:
+                    inputs[node.node_id] = guard.inputs(inputs[node.node_id])
                 deduplicated = deduplicate(graph, pipeline, inputs, context)
                 started = time.perf_counter()
                 results = context.run_pipeline(
@@ -127,6 +132,9 @@ class GenericRunner:
                     context)
                 if deduplicated is not None:
                     results = deduplicated.expanded(results)
+                if guard is not None:
+                    results = {**results,
+                               node.node_id: guard.expanded(results[node.node_id])}
                 # a pipeline's wall is charged once, to its first member
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
@@ -154,6 +162,9 @@ class GenericRunner:
                     ]
                     for input_port in node.inputs
                 }
+                guard = guarded(node, inputs, context)
+                if guard is not None:
+                    inputs = guard.inputs(inputs)
                 deduplicated = deduplicate(
                     graph, (node,), {node.node_id: inputs}, context)
                 started = time.perf_counter()
@@ -165,6 +176,8 @@ class GenericRunner:
                 if deduplicated is not None:
                     result = deduplicated.expanded(
                         {node.node_id: result})[node.node_id]
+                if guard is not None:
+                    result = guard.expanded(result)
                 record(node, result, started)
                 continue
             record(node, result)

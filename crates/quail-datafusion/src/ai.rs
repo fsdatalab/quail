@@ -250,7 +250,8 @@ impl AiNode {
         }
     }
 
-    fn is_field(&self, name: &str) -> bool {
+    /// Whether `name` is a column the node adds.
+    pub(crate) fn is_field(&self, name: &str) -> bool {
         self.fields.iter().any(|field| field.name() == name)
     }
 
