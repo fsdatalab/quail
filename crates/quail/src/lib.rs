@@ -352,17 +352,23 @@ impl Session {
         })
     }
 
-    /// Return DataFusion's optimized logical plan for a query, with each
-    /// model region as one `ModelRegion` node.
+    /// Return DataFusion's physical plan for a query, with each model
+    /// region as one `ModelRegionExec` operator.
     ///
     /// # Errors
     ///
     /// The query does not plan.
     pub fn explain(&self, query: &str, dialect: Option<&str>) -> Result<String> {
-        Ok(self
-            .optimized_plan(query, dialect)?
-            .display_indent()
-            .to_string())
+        self.runtime().block_on(async {
+            let plan = quail_datafusion::sql_in_dialect(&self.context, query, dialect)
+                .await?
+                .create_physical_plan()
+                .await?;
+            let text = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(false)
+                .to_string();
+            Ok(text.trim_end().to_string())
+        })
     }
 
     /// Return DataFusion's optimized logical plan for a query.

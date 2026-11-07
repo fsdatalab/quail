@@ -5,8 +5,7 @@
 use std::fmt;
 
 use quail_physical::{
-    Alias, Asked, ColumnRef, Equality, ExtractStruct, ModelCall, Projected, SortExpression,
-    SortKey, ValueExpression,
+    Alias, Asked, ColumnRef, Equality, ExtractStruct, ModelCall, Projected, ValueExpression,
 };
 use serde_json::Value;
 
@@ -288,13 +287,6 @@ pub fn projected_name(column: &Projected) -> String {
     }
 }
 
-/// The name a sort key sorts on.
-pub fn sort_name(expression: &SortExpression) -> String {
-    match expression {
-        SortExpression::Value(value) => column_name(value, true),
-    }
-}
-
 /// The model call an Alias projects, if any and of one of `kinds`.
 pub fn aliased_call<'a>(expression: &'a ValueExpression, kinds: &[&str]) -> Option<&'a ModelCall> {
     let ValueExpression::Alias(alias) = expression else {
@@ -453,13 +445,6 @@ pub fn equality_refs(equality: &Equality) -> Vec<ColumnRef> {
     let mut found = value_refs(&equality.left);
     push_unique(&mut found, value_refs(&equality.right));
     found
-}
-
-/// The columns a sort key reads, in first use order.
-pub fn sort_refs(key: &SortKey) -> Vec<ColumnRef> {
-    match &key.expression {
-        SortExpression::Value(value) => value_refs(value),
-    }
 }
 
 // ---------------------------------------------------------------- conditions

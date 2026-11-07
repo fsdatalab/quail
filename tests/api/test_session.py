@@ -214,7 +214,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     assert not hasattr(result, "rows")
 
 
-def test_order_by_offset_and_distinct_run_on_the_result():
+def test_order_by_offset_and_distinct_run_in_datafusion_on_the_regions_rows():
     registry = quail.ExtensionRegistry.with_built_ins().register_observer(
         NodeTypes)
     session = quail.Session(CONFIG, tokenizer=TOKENIZER, registry=registry)
@@ -230,8 +230,8 @@ def test_order_by_offset_and_distinct_run_on_the_result():
     assert result.count() == 1
     assert result.observer(NodeTypes)["types"] == [
         "quail.scan", "quail.ai_filter", "quail.ai_filter",
-        "quail.project", "quail.sort"]
-    assert "Sort: r.stars DESC NULLS FIRST" in result.explain()
+        "quail.project"]
+    assert "SortExec: TopK(fetch=1), expr=[stars@1 DESC]" in result.explain()
 
     result = _run(session.sql(
         "SELECT r.id, r.stars FROM reviews r WHERE AI_FILTER(PROMPT("

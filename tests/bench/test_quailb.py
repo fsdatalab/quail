@@ -65,17 +65,11 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                 assert all((s is None) == qid.startswith("PRIV-")
                            for s in selectivities), case
                 plan = query.plan()
-                sorts = bool(found.result.order or found.result.distinct
-                             or found.result.offset)
-                assert sorts <= (qid in relational), case
-                if backend != "quail" and sorts:
-                    # a request backend sorts returned rows on the coordinator
-                    if isinstance(plan, Refusal):
-                        # refused for its AI functions, not its sort
-                        assert plan.constraint != "sort_needs_quail_backend", case
-                    else:
-                        assert any(node.type_name == "quail.sort"
-                                   for node in plan.graph.nodes), case
+                if backend != "quail" and qid in relational and isinstance(
+                        plan, Refusal):
+                    # refused for its AI functions; DataFusion runs the
+                    # relational operators above the region on any backend
+                    assert plan.constraint != "sort_needs_quail_backend", case
                     continue
                 assert not isinstance(plan, Refusal), f"{case} refused: {plan}"
                 assert plan.settings["order_rule"] == "by_cost", case

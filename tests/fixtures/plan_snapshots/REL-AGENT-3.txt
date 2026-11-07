@@ -1,25 +1,29 @@
+DataFusion:
+AggregateExec: mode=FinalPartitioned, gby=[trajectory_id@0 as trajectory_id], aggr=[]
+  RepartitionExec: partitioning=Hash([trajectory_id@0], 4), input_partitions=4
+    AggregateExec: mode=Partial, gby=[trajectory_id@0 as trajectory_id], aggr=[]
+      RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+        ModelRegionExec
+
+model region:
 logical:
   Projection: t.trajectory_id
-    Distinct:
-      Projection: t.trajectory_id
-        AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3030474040632054))), filter: __quail_answer_1, fetch: 1 per [trajectory_id], returns: []
-          SubqueryAlias: t
-            TableScan: agent_traces projection=[trace, trajectory_id]
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3030474040632054))), filter: __quail_answer_1, fetch: 1 per [trajectory_id], returns: []
+      SubqueryAlias: t
+        TableScan: agent_traces projection=[trace, trajectory_id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                   est. rows   est. pass   est. time
-  Sort:                                                                                                  1.8
-    distinct
-    Project: t.trajectory_id                                                                             1.8
-      AiFilter: t                                                                                        1.8                 13.9 ms
-        KV: not stored
-        stop per key: trajectory_id (one document at a time, the rest skipped once one survives)
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                        6       30.3%
-        Scan agent_traces as t                                                                             6
-          tokens=66, mean_document_tokens=11
+                                                                                                 est. rows   est. pass   est. time
+  Project: t.trajectory_id                                                                             1.8
+    AiFilter: t                                                                                        1.8                 13.9 ms
+      KV: not stored
+      stop per key: trajectory_id (one document at a time, the rest skipped once one survives)
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                        6       30.3%
+      Scan agent_traces as t                                                                             6
+        tokens=66, mean_document_tokens=11
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

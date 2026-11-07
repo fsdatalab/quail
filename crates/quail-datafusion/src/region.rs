@@ -23,6 +23,9 @@ pub struct ModelRegion {
     pub inputs: Vec<LogicalPlan>,
     /// The table name `plan` reads each input by.
     pub input_names: Vec<String>,
+    /// The most rows the operators above read, when a LIMIT above passes
+    /// them on unchanged; the region may stop the model once it has them.
+    pub fetch: Option<usize>,
 }
 
 impl ModelRegion {
@@ -32,6 +35,7 @@ impl ModelRegion {
             plan,
             inputs: Vec::new(),
             input_names: Vec::new(),
+            fetch: None,
         }
     }
 }
@@ -65,7 +69,11 @@ impl UserDefinedLogicalNodeCore for ModelRegion {
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Quail's explain shows the region's plan
-        write!(f, "ModelRegion")
+        write!(f, "ModelRegion")?;
+        if let Some(fetch) = self.fetch {
+            write!(f, ": fetch={fetch}")?;
+        }
+        Ok(())
     }
 
     fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {

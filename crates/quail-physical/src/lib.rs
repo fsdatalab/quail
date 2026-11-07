@@ -13,8 +13,7 @@ mod topology;
 
 pub use expressions::{
     Alias, Asked, ColumnRef, Equality, Expression, ExtractStruct, FilterPredicate, GetField,
-    ModelCall, Projected, Prompt, ScoreTest, SortExpression, SortKey, TaggedModelCall,
-    ValueExpression,
+    ModelCall, Projected, Prompt, ScoreTest, TaggedModelCall, ValueExpression,
 };
 pub use graph::{
     AnswerOutput, InputPort, OutputPort, PhysicalGraph, PlanEnvelope, PortRef, ValueType,

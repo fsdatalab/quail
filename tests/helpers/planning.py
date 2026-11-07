@@ -1,6 +1,7 @@
 """Plan a region's operators with Rust's planner, as a session does."""
 
 import json
+import re
 from dataclasses import asdict
 from types import SimpleNamespace
 
@@ -57,10 +58,16 @@ def column_tests(found):
     return [test for _, tests in found.column_filters for test in tests]
 
 
-def row_tests(found):
-    """The conditions tested on result rows above the SELECT list, lowest first."""
-    return [operator.Filter.condition for operator in found.after_projection
-            if hasattr(operator, "Filter")]
+def row_tests(query):
+    """The tests DataFusion runs on a region's rows, as explain() shows them.
+
+    Each is the predicate of a FilterExec above the ModelRegionExec, with
+    its columns named without their positions, outermost first.
+    """
+    above = query.explain().split("ModelRegionExec")[0]
+    return [re.sub(r"@\d+", "", line.strip().removeprefix("FilterExec: ")
+                   .split(", projection=")[0])
+            for line in above.splitlines() if line.strip().startswith("FilterExec: ")]
 
 
 def _read(value):

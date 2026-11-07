@@ -19,10 +19,9 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::{InList, ScalarFunction};
 use datafusion::logical_expr::utils::split_conjunction;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, SortExpr};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use quail_physical::{
-    Alias, ColumnRef, Equality, ExtractStruct, GetField, ModelCall, ScoreTest, SortExpression,
-    SortKey, ValueExpression,
+    Alias, ColumnRef, Equality, ExtractStruct, GetField, ModelCall, ScoreTest, ValueExpression,
 };
 use quail_planner::expressions::{
     CompileError, SPAN_SUFFIX, UNSUPPORTED, aliased_call, call_aliases, column_alias_of,
@@ -1308,56 +1307,6 @@ impl Binder {
         };
         let (prompt, _) = self.bind_ai_call(prompt, "ai_score", None, None)?;
         Ok(model_call(prompt, "score"))
-    }
-
-    // ------------------------------------------------------------ ORDER BY
-
-    pub(crate) fn bind_order(
-        &mut self,
-        order: &[SortExpr],
-        columns: &[ValueExpression],
-        structs: &[ExtractStruct],
-    ) -> Result<Vec<SortKey>, CompileError> {
-        let named: Vec<(String, SortExpression)> = columns
-            .iter()
-            .map(|column| {
-                (
-                    column_name(column, true),
-                    SortExpression::Value(column.clone()),
-                )
-            })
-            .collect();
-        let mut keys = Vec::new();
-        for sort in order {
-            let target = &sort.expr;
-            if let Expr::Column(column) = target
-                && column.relation.is_none()
-            {
-                if structs.iter().any(|found| found.name == column.name) {
-                    return compile_error(format!(
-                        "ORDER BY does not compare the AI.EXTRACT struct column {}; extract the \
-                         field as its own column",
-                        repr_str(&column.name)
-                    ));
-                }
-                if let Some((_, found)) = named.iter().rev().find(|(name, _)| *name == column.name)
-                {
-                    keys.push(SortKey {
-                        expression: found.clone(),
-                        descending: !sort.asc,
-                        nulls_first: sort.nulls_first,
-                    });
-                    continue;
-                }
-            }
-            let expression = self.bind_value(target)?;
-            keys.push(SortKey {
-                expression: SortExpression::Value(expression),
-                descending: !sort.asc,
-                nulls_first: sort.nulls_first,
-            });
-        }
-        Ok(keys)
     }
 
     // ------------------------------------------------------------ checks

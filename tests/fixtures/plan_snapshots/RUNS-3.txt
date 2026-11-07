@@ -1,13 +1,9 @@
 DataFusion:
-ModelRegion
-  SubqueryAlias: s
-    Projection: issue_runs.id, issue_runs.patch, issue_runs.instance_id
-      Filter: issue_runs.resolved = Int32(1)
-        TableScan: issue_runs projection=[id, patch, instance_id, resolved]
-  SubqueryAlias: f
-    Projection: issue_runs.id, issue_runs.patch, issue_runs.instance_id
-      Filter: issue_runs.resolved = Int32(0)
-        TableScan: issue_runs projection=[id, patch, instance_id, resolved]
+ModelRegionExec
+  FilterExec: resolved@3 = 1, projection=[id@0, patch@1, instance_id@2]
+    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+  FilterExec: resolved@3 = 0, projection=[id@0, patch@1, instance_id@2]
+    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

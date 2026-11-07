@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::expressions::{Projected, ValueExpression};
+use crate::expressions::ValueExpression;
 use crate::graph::{InputPort, OutputPort};
 use crate::specs::{
     ClassifySpec, ExtractSpec, MapSpec, RequestClassifySpec, RequestExtractSpec, RequestFilterSpec,
@@ -200,13 +200,12 @@ physical_nodes! {
         pass_group: i64,
         document_ends: Value,
     }
-    /// A condition that asks no model, on one or more tables' rows.
+    /// A condition that asks no model, on one or more tables' documents.
     Filter(FilterAttributes) = "quail.filter" {
         predicate: Option<ValueExpression>,
         aliases: Vec<String>,
         selectivity: Option<f64>,
         written_position: i64,
-        columns: Vec<String>,
     }
     /// An `AI.CLASSIFY` call.
     AiClassify(AiClassifyAttributes) = "quail.ai_classify" {
@@ -293,34 +292,19 @@ physical_nodes! {
     Recombine(RecombineAttributes) = "quail.recombine" {
         alias_order: Vec<String>,
     }
-    /// The columns a query returns. `sources` names each column a source
+    /// The columns a region returns. `sources` names each column a source
     /// expression computes; `answers` names each column a model call adds,
     /// with the call's table aliases, kind, and labels, and whether it is
     /// the call's answer.
     Project(ProjectAttributes) = "quail.project" {
         columns: Vec<String>,
         structs: Value,
-        expressions: Option<Vec<Projected>>,
         sources: Vec<(String, ValueExpression)>,
         answers: Vec<(String, Vec<String>, String, Value, bool)>,
     }
-    /// An `ORDER BY`, with `DISTINCT`, `OFFSET`, and `FETCH`.
-    Sort(SortAttributes) = "quail.sort" {
-        keys: Vec<(String, bool, bool)>,
-        columns: Vec<String>,
-        distinct: bool,
-        offset: i64,
-        fetch: Option<i64>,
-    }
-    /// A `LIMIT`.
+    /// The first rows a region returns: its fetch.
     Limit(LimitAttributes) = "quail.limit" {
         count: i64,
-    }
-    /// One row per item of each listed list column.
-    Unnest(UnnestAttributes) = "quail.unnest" {
-        lists: Vec<String>,
-        outer: bool,
-        columns: Vec<String>,
     }
     /// A request backend's whole model work: each document or pair
     /// submitted to an engine such as vLLM.

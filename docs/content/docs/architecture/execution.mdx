@@ -17,8 +17,11 @@ The *runner* coordinates the operators in the plan. It runs an operator
 when the operator's required inputs are available.
 
 - Model operators, such as classification, use the GPU.
-- Operations that test computed labels or select result columns use
-  Apache Arrow on the CPU.
+- Operations that test computed labels or build the region's rows from
+  document IDs and answers use Apache Arrow on the CPU.
+- DataFusion runs the relational operators above the region, such as
+  ORDER BY, LIMIT, DISTINCT, and GROUP BY, on the region's rows. The
+  region hands DataFusion its rows once all its operators finish.
 - Compatible operators can pass documents to one another before they
   finish processing the whole input table.
 

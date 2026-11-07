@@ -1,54 +1,72 @@
-"""ORDER BY, OFFSET, and DISTINCT: the Sort node, its runtime, and the limit rule."""
+"""ORDER BY, LIMIT, OFFSET, and DISTINCT run in DataFusion above the model region."""
 
 import pyarrow as pa
+import pytest
+from helpers.oracle import Oracle, finish
+from helpers.sessions import TOKENIZER
 
-from quail.execution.metrics import NodeResult
-from quail.execution.result import QueryResult
-from quail.execution.runtimes import SortRuntime
-from quail.physical import Sort, input_ports
+import quail
+from quail.api.config import EngineConfig
+from quail.catalog import DocumentProvider
+from quail.physical import Limit
 
-
-def _sort(**fields):
-    return Sort(node_id="sort", inputs=input_ports(()), **fields)
-
-
-def _rows(node, table):
-    result = SortRuntime().execute(node, {"rows": table}, None)
-    assert isinstance(result, NodeResult)
-    value = result.outputs["rows"]
-    assert isinstance(value, QueryResult)
-    return value.to_rows(), result.metrics
+BODIES = ["refund now", "fine", "refund please", "great", "refund", "ok"]
+# the score of each document, by its position
+SCORES = [0.9, 0.1, 0.7, None, 0.8, 0.2]
 
 
-def test_sort_runtime_orders_bounds_and_deduplicates_rows():
-    table = pa.table({
-        "r.id": ["a", "b", "c", "d", "e"],
-        "score": [0.2, None, 0.9, 0.2, 0.5],
-        "label": pa.array(["x", "y", "x", "x", "y"]).dictionary_encode(),
-    })
-    rows, metrics = _rows(_sort(keys=(("score", True, False),),
-                                columns=("r.id",)), table)
-    assert rows == [("c",), ("e",), ("a",), ("d",), ("b",)]
-    assert (metrics.input_rows, metrics.output_rows) == (5, 5)
-    rows, _ = _rows(_sort(keys=(("score", True, True),),
-                          columns=("r.id", "score"), offset=1, fetch=2), table)
-    assert rows == [("c", 0.9), ("e", 0.5)]
-    rows, _ = _rows(_sort(keys=(("score", False, False), ("r.id", True, False)),
-                          columns=("r.id",)), table)
-    assert rows == [("d",), ("a",), ("e",), ("c",), ("b",)]
-    rows, _ = _rows(_sort(keys=(("label", False, False), ("score", True, True)),
-                          columns=("r.id",)), table)
-    assert rows == [("c",), ("a",), ("d",), ("b",), ("e",)]
-    rows, metrics = _rows(_sort(keys=(("label", True, False),),
-                                columns=("label",), distinct=True), table)
-    assert rows == [("y",), ("x",)]
-    assert (metrics.input_rows, metrics.output_rows) == (5, 2)
-    rows, _ = _rows(_sort(columns=("label", "score"), distinct=True), table)
-    assert rows == [("x", 0.2), ("y", None), ("x", 0.9), ("y", 0.5)]
-    rows, _ = _rows(_sort(columns=("r.id",), offset=4), table)
-    assert rows == [("e",)]
-    materialized = QueryResult.from_table(table)
-    result = SortRuntime().execute(
-        _sort(keys=(("r.id", True, False),), columns=("r.id",), fetch=1),
-        {"rows": materialized}, None)
-    assert result.outputs["rows"].to_rows() == [("e",)]
+@pytest.fixture()
+def session():
+    value = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+                          tokenizer=TOKENIZER)
+    value.register("reviews", DocumentProvider.from_table(
+        pa.table({"id": [10, 11, 12, 13, 14, 15], "body": BODIES,
+                  "stars": [1, 2, 1, 2, 1, 2]}), id_col="id"))
+    yield value
+    value.close()
+
+
+def _scores():
+    return Oracle(scores=lambda spec, ids: SCORES[ids[0]])
+
+
+SCORE = "AI.SCORE(PROMPT('Asks for a refund: {0}', r.body))"
+
+
+def test_an_order_by_limit_over_an_ai_score_returns_the_top_k(session):
+    query = session.sql(f"SELECT r.id, {SCORE} AS score FROM reviews r "
+                        "ORDER BY score DESC NULLS LAST LIMIT 2")
+    rows = finish(query, _scores()).collect().to_pylist()
+    assert rows == [{"r.id": 10, "score": 0.9}, {"r.id": 14, "score": 0.8}]
+    # the region scores every review; DataFusion keeps the top two
+    assert not any(isinstance(node, Limit) for node in query.plan().nodes)
+    assert "filter_limit" not in query.plan().settings
+    assert "SortExec: TopK(fetch=2)" in query.explain()
+
+
+def test_an_offset_skips_the_sorted_rows_with_nulls_highest(session):
+    query = session.sql(f"SELECT r.id FROM reviews r ORDER BY {SCORE} DESC "
+                        "LIMIT 2 OFFSET 3")
+    rows = finish(query, _scores()).collect().to_pylist()
+    assert rows == [{"r.id": 12}, {"r.id": 15}]
+    last = session.sql(f"SELECT r.id FROM reviews r ORDER BY {SCORE} LIMIT 1 OFFSET 5")
+    assert finish(last, _scores()).collect().to_pylist() == [{"r.id": 13}]
+
+
+def test_a_limit_without_order_stops_the_region_at_its_rows(session):
+    query = session.sql("SELECT r.id FROM reviews r "
+                        "WHERE AI.IF(PROMPT('Asks for a refund: {0}', r.body)) LIMIT 2")
+    assert query.plan().settings["filter_limit"] == 2
+    rows = finish(query, Oracle(filters=lambda alias, document, position:
+                                "refund" in BODIES[document])).collect()
+    assert rows.column("r.id").to_pylist() == [10, 12]
+
+
+def test_a_distinct_over_an_ai_filters_columns_returns_each_value_once(session):
+    query = session.sql("SELECT DISTINCT r.stars FROM reviews r "
+                        "WHERE AI.IF(PROMPT('Asks for a refund: {0}', r.body)) "
+                        "ORDER BY r.stars")
+    rows = finish(query, Oracle(filters=lambda alias, document, position:
+                                "refund" in BODIES[document] or document == 5))
+    assert rows.collect().to_pylist() == [{"r.stars": 1}, {"r.stars": 2}]
+    assert "AggregateExec" in query.explain()

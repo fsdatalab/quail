@@ -151,7 +151,7 @@ static KINDS: &[Kind] = &[
         tag: "quail.filter",
         node: true,
         fields: fields!(NODE; "predicate" = NONE, "aliases" = EMPTY, "selectivity" = NONE,
-            "written_position" = ZERO, "columns" = EMPTY),
+            "written_position" = ZERO),
     },
     Kind {
         class: "AiClassify",
@@ -220,27 +220,14 @@ static KINDS: &[Kind] = &[
         class: "Project",
         tag: "quail.project",
         node: true,
-        fields: fields!(NODE; "columns" = EMPTY, "structs" = EMPTY, "expressions" = NONE,
-            "sources" = EMPTY, "answers" = EMPTY),
-    },
-    Kind {
-        class: "Sort",
-        tag: "quail.sort",
-        node: true,
-        fields: fields!(NODE; "keys" = EMPTY, "columns" = EMPTY, "distinct" = NO,
-            "offset" = ZERO, "fetch" = NONE),
+        fields: fields!(NODE; "columns" = EMPTY, "structs" = EMPTY, "sources" = EMPTY,
+            "answers" = EMPTY),
     },
     Kind {
         class: "Limit",
         tag: "quail.limit",
         node: true,
         fields: fields!(NODE; "count" = ZERO),
-    },
-    Kind {
-        class: "Unnest",
-        tag: "quail.unnest",
-        node: true,
-        fields: fields!(NODE; "lists" = EMPTY, "outer" = NO, "columns" = EMPTY),
     },
     Kind {
         class: "RequestExecution",
@@ -418,12 +405,6 @@ static KINDS: &[Kind] = &[
         fields: fields!(; "left" = REQUIRED, "right" = REQUIRED),
     },
     Kind {
-        class: "SortKey",
-        tag: "quail.common.expressions.SortKey",
-        node: false,
-        fields: fields!(; "expression" = REQUIRED, "descending" = NO, "nulls_first" = NO),
-    },
-    Kind {
         class: "ExtractStruct",
         tag: "quail.common.expressions.ExtractStruct",
         node: false,
@@ -492,7 +473,6 @@ fn canonical(kind: &Kind, value: Value) -> Result<Value, String> {
         "Prompt" => round::<Prompt>(value),
         "FilterPredicate" => round::<FilterPredicate>(value),
         "Equality" => round::<Equality>(value),
-        "SortKey" => round::<SortKey>(value),
         "ExtractStruct" => round::<ExtractStruct>(value),
         "ScoreTest" => round::<Asked>(value),
         _ => round::<ValueExpression>(value),
@@ -976,14 +956,6 @@ fn fill_value(py: Python<'_>, dict: &Bound<'_, PyDict>, value: &Value) -> PyResu
                 .collect();
             dict.set_item("members", tuple_of(py, &members)?)?;
         }
-        "SortKey" => {
-            let key: physical::SortKey = serde_json::from_value(value.clone())
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            dict.set_item(
-                "name",
-                quail_planner::expressions::sort_name(&key.expression),
-            )?;
-        }
         "FilterPredicate" => {
             let predicate: physical::FilterPredicate = serde_json::from_value(value.clone())
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -1244,16 +1216,6 @@ impl Tagged {
                         quail_planner::expressions::column_name(&pair.right, true)
                     )
                 }),
-            "SortKey" => serde_json::from_value::<physical::SortKey>(value)
-                .ok()
-                .map(|key| {
-                    format!(
-                        "{} {} NULLS {}",
-                        quail_planner::expressions::sort_name(&key.expression),
-                        if key.descending { "DESC" } else { "ASC" },
-                        if key.nulls_first { "FIRST" } else { "LAST" }
-                    )
-                }),
             _ => None,
         };
         match text {
@@ -1376,9 +1338,7 @@ leaf_classes! {
     },
     Recombine = "Recombine": NodeBase [NodeBase] {},
     Project = "Project": NodeBase [NodeBase] {},
-    Sort = "Sort": NodeBase [NodeBase] {},
     Limit = "Limit": NodeBase [NodeBase] {},
-    Unnest = "Unnest": NodeBase [NodeBase] {},
     RequestExecution = "RequestExecution": NodeBase [NodeBase] {},
     AiScore = "AiScore": AiInference [NodeBase, AiInference] {},
     AiClassify = "AiClassify": AiInference [NodeBase, AiInference] {
@@ -1553,7 +1513,6 @@ leaf_classes! {
     ScoreTest = "ScoreTest": Tagged [] {},
     FilterPredicate = "FilterPredicate": Tagged [] {},
     Equality = "Equality": Tagged [] {},
-    SortKey = "SortKey": Tagged [] {},
     ExtractStruct = "ExtractStruct": Tagged [] {},
 }
 

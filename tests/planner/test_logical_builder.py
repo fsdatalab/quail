@@ -16,16 +16,12 @@ TABLES = {
 
 CLASSIFY = ("AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
             "['positive', 'negative']) AS sentiment")
-EXTRACT = "AI.EXTRACT(c.text, {'end': 'When does it end?'}) AS lease"
 
 REFUSED = {
     "a score beside a generative filter": (
         "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
         "AND AI.SCORE(PROMPT('q2: {0}', r.body)) > 0.5",
         "AI.SCORE cannot be mixed with generative AI predicates"),
-    "DISTINCT over an extraction": (
-        f"SELECT DISTINCT {EXTRACT} FROM contracts c",
-        "DISTINCT does not compare AI.EXTRACT struct columns"),
     "a label filter on an unknown label": (
         f"SELECT r.id, {CLASSIFY} FROM reviews r WHERE sentiment = 'mixed'",
         r"lists \['mixed'\], which are not among its labels"),

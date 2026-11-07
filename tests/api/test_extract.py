@@ -7,7 +7,7 @@ import pyarrow.parquet as pq
 import pytest
 from helpers import baselines as request_tests
 from helpers.oracle import Oracle, finish, oracle_executor, question_text
-from helpers.planning import column_tests, operators_of, row_tests
+from helpers.planning import column_tests, operators_of
 from helpers.sessions import TOKENIZER
 
 import quail
@@ -231,7 +231,7 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     session.close()
 
 
-def test_stock_vllm_sorts_and_limits_extracted_rows(monkeypatch):
+def test_stock_vllm_extracts_every_row_a_top_k_reads(monkeypatch):
     session = request_tests._session(
         "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
     query = session.sql(
@@ -243,11 +243,14 @@ def test_stock_vllm_sorts_and_limits_extracted_rows(monkeypatch):
         "quail.baselines.vllm.VLLMEngine.boot",
         lambda self, spec, allowed_ids, *, device, resources: (
             boot, {"kind": "cold", "boot_s": 0.1}))
+    # the region extracts every row; DataFusion sorts them and keeps two
     rows = request_tests._run_stock_vllm(session, query).collect()
     assert rows.column_names == ["c.id", "lease", "lease_span"]
-    assert rows.column("c.id").to_pylist() == ["d", "c"]
-    assert rows.column("lease").to_pylist() == [{"ends": None},
-                                                {"ends": "five years"}]
+    leases = dict(zip(rows.column("c.id").to_pylist(),
+                      rows.column("lease").to_pylist(), strict=True))
+    assert len(leases) == 4
+    assert (leases["d"], leases["c"]) == ({"ends": None}, {"ends": "five years"})
+    assert "SortExec: TopK(fetch=2)" in query.explain()
     session.close()
 
 
@@ -366,7 +369,7 @@ def test_a_datafusion_function_arrow_compute_lacks_tests_an_answer(session):
         {0: "March 3, 2027", 1: "June 1, 2030"}))
     assert result.collect().column("c.id").to_pylist() == [1]
 
-def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(session):
+def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
     from quail.api.execute import execute_query
 
     head = (f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
@@ -374,8 +377,7 @@ def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(sessio
 
     def placed(query):
         found = operators_of(query)
-        return ([("extraction", str(test.condition)) for test in column_tests(found)]
-                + [("rows", str(condition)) for condition in row_tests(found)])
+        return [("extraction", str(test.condition)) for test in column_tests(found)]
 
     def kept(query):
         result = execute_query(query, physical_executor=_answers_executor(

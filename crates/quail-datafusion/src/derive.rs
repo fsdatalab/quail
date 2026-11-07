@@ -25,32 +25,27 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::utils::split_conjunction;
-use datafusion::logical_expr::{Distinct, Expr, Join, JoinType, LogicalPlan, SortExpr};
+use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan};
 use quail_physical::{
-    Asked, ColumnRef, Equality, Expression, FilterPredicate, GetField, ModelCall, Projected,
-    SortExpression, SortKey, ValueExpression,
+    Asked, ColumnRef, Equality, FilterPredicate, ModelCall, Projected, ValueExpression,
 };
 use quail_planner::expressions::{
-    CompileError, FEATURE_FIELDS, UNSUPPORTED, aliased_call, asked_call, asked_refs, call_aliases,
-    call_refs, column_alias_of, column_name, column_references, compile_error, condition_columns,
-    condition_text, equality_refs, equality_text, packed_columns, packing, projected_call,
-    reference_name, repr_list, repr_str, sort_refs, value_refs,
+    CompileError, UNSUPPORTED, aliased_call, asked_call, asked_refs, call_aliases, call_refs,
+    column_alias_of, column_name, column_references, compile_error, condition_columns,
+    condition_text, equality_refs, equality_text, projected_call, repr_list, repr_str, value_refs,
 };
 use quail_planner::operators::{
-    ColumnTest, Operators, Projection, ResultModifiers, RowOperator, Scan, SemanticColumn,
-    SemanticJoin, source_columns,
+    ColumnTest, Operators, Projection, Scan, SemanticColumn, SemanticJoin, source_columns,
 };
 use quail_planner::prompts::Turn;
 
 use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Fetch, Semantics, WrittenTest};
-use crate::binding::{
-    Binder, Selected, check_labels, label_test, output_name, string_literal, unsupported,
-};
+use crate::binding::{Binder, Selected, check_labels, label_test, unsupported};
 use crate::extension::as_node;
 use crate::functions::column_call_kind;
 use crate::lower::quail_function;
@@ -74,7 +69,11 @@ pub fn derive_region(
 ) -> Result<(Operators, LogicalPlan), CompileError> {
     let plan =
         as_bound(region.plan.clone()).map_err(|error| CompileError::new(error.to_string()))?;
-    Ok((derive_operators(&plan, turn, layout)?, plan))
+    let mut operators = derive_operators(&plan, turn, layout)?;
+    if let Some(fetch) = region.fetch {
+        operators = operators.limited(fetch as i64);
+    }
+    Ok((operators, plan))
 }
 
 /// `plan` with each struct or list literal in an `AiNode`'s expressions
@@ -190,35 +189,16 @@ fn derive_operators(
     }
     let allow_relational = has_subqueries(plan);
     let answers = walk.answers();
-    let unnests = walk.unnests(&answers);
     let select: Vec<Expr> = top
         .projection
         .iter()
-        .map(|expr| unnested_fields(&walk.selected(expr, &answers)))
-        .collect();
-    let order: Vec<SortExpr> = top
-        .order
-        .iter()
-        .map(|key| SortExpr {
-            expr: unnested_fields(&walk.written(&key.expr, &[])),
-            ..key.clone()
-        })
+        .map(|expr| walk.selected(expr, &answers))
         .collect();
     let mut binder = Binder::new(turn, layout, &select);
-    let relation = Relation::bind(&walk, &mut binder, &answers, &unnests)?;
+    let relation = Relation::bind(&walk, &mut binder, &answers)?;
     let Selected {
-        mut columns,
-        structs,
-        output,
+        columns, structs, ..
     } = binder.bind_select(&select)?;
-    for (name, list) in unnests.iter().flat_map(|unnest| &unnest.lists) {
-        let call = binder.bind_ai_sae_features(list)?;
-        columns.push(ValueExpression::Alias(quail_physical::Alias {
-            expression: Box::new(ValueExpression::ModelCall(call)),
-            name: name.clone(),
-        }));
-    }
-    let order = binder.bind_order(&order, &columns, &structs)?;
     binder.validate_query(&columns, &structs)?;
     let unplaced_term = relation.unplaced;
     let mut assembly = Assembly::new(&walk, &mut binder, relation, &columns, allow_relational)?;
@@ -232,25 +212,17 @@ fn derive_operators(
     if columns.is_empty() {
         return compile_error("Project needs at least one column");
     }
-    if !structs.is_empty() && top.distinct {
-        return compile_error(
-            "DISTINCT does not compare AI.EXTRACT struct columns; extract each field as \
-             its own column",
-        );
+    if let Some(test) = assembly.conditions.rows.first() {
+        // DataFusion runs a test of the result rows above the region
+        return unsupported(&format!(
+            "the test {} of the result rows inside a model region",
+            condition_text(test)
+        ));
     }
-    let rows = ResultRows {
-        unnests: unnests
-            .iter()
-            .map(|unnest| unnest.lists.iter().map(|(name, _)| name.clone()).collect())
-            .collect(),
-        outer: unnests.iter().map(|unnest| unnest.outer).collect(),
-        output,
-        tests: assembly.conditions.rows.clone(),
+    found.projection = Projection {
+        columns: columns.iter().cloned().map(Projected::Expression).collect(),
+        structs,
     };
-    let (projection, after_projection) =
-        rows.operators(&columns, &structs, &order, top.distinct)?;
-    found.projection = projection;
-    found.after_projection = after_projection;
     found.projections = found
         .projection
         .columns
@@ -261,23 +233,9 @@ fn derive_operators(
             Projected::Name(_) => None,
         })
         .collect();
-    found.result = ResultModifiers {
-        limit: top.limit,
-        order,
-        offset: top.offset,
-        distinct: top.distinct,
-    };
     found.fetch = fetch;
-    if found
-        .result
-        .limit
-        .or(found.fetch)
-        .is_some_and(|limit| limit <= 0)
-    {
+    if found.fetch.is_some_and(|limit| limit <= 0) {
         return compile_error("LIMIT must be a positive integer");
-    }
-    if found.result.offset < 0 {
-        return compile_error("OFFSET must be a nonnegative integer");
     }
     if allow_relational && quail_planner::plan_statistics::plan_prompts(&found).is_empty() {
         return compile_error("the query has no AI predicate");
@@ -294,151 +252,51 @@ fn unplaced(plan: &LogicalPlan) -> CompileError {
     ))
 }
 
-/// Whether an operator is one that [`read_top`] reads above a SELECT
-/// list: DataFusion's `push_down_limit` moves a LIMIT below the outer
-/// SELECT list, and an ORDER BY of a column the SELECT list does not
-/// return has one above it.
-fn above_select_list(plan: &LogicalPlan) -> bool {
-    matches!(
-        plan,
-        LogicalPlan::Limit(_) | LogicalPlan::Sort(_) | LogicalPlan::Distinct(_)
-    )
-}
-
-/// `plan` with a SELECT list under its LIMIT, ORDER BY, and DISTINCT:
-/// DataFusion removes one that returns its input's columns as they are.
+/// `plan` with a SELECT list at its root: DataFusion removes one that
+/// returns its input's columns as they are.
 fn with_select_list(plan: &LogicalPlan) -> LogicalPlan {
-    let listed = |input: &LogicalPlan| -> LogicalPlan {
-        if matches!(input, LogicalPlan::Projection(_)) {
-            return input.clone();
-        }
-        let columns: Vec<Expr> = input
-            .schema()
-            .iter()
-            .map(|(qualifier, field)| {
-                Expr::Column(Column::new(qualifier.cloned(), field.name().clone()))
-            })
-            .collect();
-        datafusion::logical_expr::Projection::try_new(columns, std::sync::Arc::new(input.clone()))
-            .map(LogicalPlan::Projection)
-            .unwrap_or_else(|_| input.clone())
-    };
-    match plan {
-        LogicalPlan::Limit(_) | LogicalPlan::Sort(_) | LogicalPlan::Distinct(_) => {
-            let inputs: Vec<LogicalPlan> =
-                plan.inputs().into_iter().map(with_select_list).collect();
-            plan.with_new_exprs(plan.expressions(), inputs)
-                .unwrap_or_else(|_| plan.clone())
-        }
-        LogicalPlan::Projection(projection) if above_select_list(&projection.input) => {
-            let input = with_select_list(&projection.input);
-            plan.with_new_exprs(plan.expressions(), vec![input])
-                .unwrap_or_else(|_| plan.clone())
-        }
-        other => listed(other),
+    if matches!(plan, LogicalPlan::Projection(_)) {
+        return plan.clone();
     }
+    let columns: Vec<Expr> = plan
+        .schema()
+        .iter()
+        .map(|(qualifier, field)| {
+            Expr::Column(Column::new(qualifier.cloned(), field.name().clone()))
+        })
+        .collect();
+    datafusion::logical_expr::Projection::try_new(columns, std::sync::Arc::new(plan.clone()))
+        .map(LogicalPlan::Projection)
+        .unwrap_or_else(|_| plan.clone())
 }
 
 // ---------------------------------------------------------------- the SELECT
 
-/// The LIMIT, OFFSET, ORDER BY, DISTINCT, and SELECT list of one SELECT,
-/// and the relation below them.
+/// The SELECT list of a region and the relation below it.
 struct Top<'a> {
-    limit: Option<i64>,
-    offset: i64,
-    distinct: bool,
-    order: Vec<SortExpr>,
-    /// The SELECT list, with an ORDER BY column it does not return read
-    /// through the outer SELECT list.
     projection: Vec<Expr>,
-    /// The input of the SELECT list.
     relation: &'a LogicalPlan,
 }
 
-/// Read the operators of a SELECT above its relation.
+/// Read the SELECT list at a region's root.
 ///
 /// # Errors
 ///
-/// The LIMIT or OFFSET is not a literal, the SELECT has a DISTINCT ON,
-/// or it has no SELECT list.
+/// The region has no SELECT list at its root, such as a LIMIT, ORDER
+/// BY, or DISTINCT, which DataFusion runs above the region.
 fn read_top(plan: &LogicalPlan) -> Result<Top<'_>, CompileError> {
-    let mut node = plan;
-    let (mut limit, mut offset, mut distinct, mut order) = (None, 0, false, Vec::new());
-    let mut outer_projection: Option<&Vec<Expr>> = None;
-    loop {
-        match node {
-            LogicalPlan::Limit(found) => {
-                use datafusion::logical_expr::{FetchType, SkipType};
-                match found.get_skip_type() {
-                    Ok(SkipType::Literal(skip)) => offset = skip as i64,
-                    _ => return compile_error("OFFSET must be a nonnegative integer"),
-                }
-                match found.get_fetch_type() {
-                    Ok(FetchType::Literal(fetch)) => limit = fetch.map(|fetch| fetch as i64),
-                    _ => return compile_error("LIMIT must be a positive integer"),
-                }
-                node = &found.input;
-            }
-            LogicalPlan::Sort(found) => {
-                // DataFusion moves a LIMIT over an ORDER BY into the sort
-                if let Some(fetch) = found.fetch {
-                    let fetch = fetch as i64;
-                    limit = Some(limit.map_or(fetch, |found: i64| found.min(fetch)));
-                }
-                order = found.expr.clone();
-                node = &found.input;
-            }
-            LogicalPlan::Distinct(Distinct::All(input)) => {
-                distinct = true;
-                node = input;
-            }
-            LogicalPlan::Distinct(Distinct::On(_)) => {
-                return compile_error("DISTINCT ON is not supported; use DISTINCT");
-            }
-            LogicalPlan::Projection(found)
-                if outer_projection.is_none() && above_select_list(&found.input) =>
-            {
-                outer_projection = Some(&found.expr);
-                node = &found.input;
-            }
-            _ => break,
-        }
-    }
-    let LogicalPlan::Projection(projection) = node else {
+    let LogicalPlan::Projection(projection) = plan else {
         return unsupported("a region without a SELECT list");
     };
-    let mut expressions = projection.expr.clone();
-    if let Some(outer) = outer_projection {
-        // ORDER BY a column SELECT does not return: the inner
-        // projection adds it, the outer one drops it; or a LIMIT that
-        // DataFusion moved below the SELECT list
-        expressions = outer
-            .iter()
-            .map(|expr| match expr {
-                Expr::Column(column) => projection
-                    .expr
-                    .iter()
-                    .find(|inner| output_name(inner) == column.name)
-                    .cloned()
-                    .unwrap_or_else(|| expr.clone()),
-                other => other.clone(),
-            })
-            .collect();
-    }
     Ok(Top {
-        limit,
-        offset,
-        distinct,
-        order,
-        projection: expressions,
+        projection: projection.expr.clone(),
         relation: projection.input.as_ref(),
     })
 }
 
 /// The global fetch of the region's last `AiNode`, which a LIMIT became
 /// (`PushDownLimitIntoAiNodes`); None, in the outer Option, when another
-/// node has one, or an ORDER BY or DISTINCT reads the node's rows, as the
-/// region's operators cannot place a LIMIT there.
+/// node has one, as the region's operators cannot place a LIMIT there.
 fn read_fetch(top: &Top<'_>) -> Option<Option<i64>> {
     let mut last = top.relation;
     while let LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) = last {
@@ -458,8 +316,7 @@ fn read_fetch(top: &Top<'_>) -> Option<Option<i64>> {
         }
         Ok(TreeNodeRecursion::Continue)
     });
-    let reordered = fetch.is_some() && (!top.order.is_empty() || top.distinct);
-    (!elsewhere && !reordered).then_some(fetch)
+    (!elsewhere).then_some(fetch)
 }
 
 /// Refuse a SELECT whose input is a GROUP BY or a window.
@@ -489,61 +346,6 @@ fn refuse_grouped_input(relation: &LogicalPlan) -> Result<(), CompileError> {
 fn contains_ai_call(expr: &Expr) -> bool {
     expr.exists(|node| Ok(crate::is_ai_call(node)))
         .unwrap_or(false)
-}
-
-/// One `UNNEST` of `FROM`: each list's name and call, and whether a row
-/// with no elements stays as one row of nulls.
-struct Unnested {
-    lists: Vec<(String, Expr)>,
-    outer: bool,
-}
-
-/// The `UNNEST` a WHERE term of [`crate::take_unnests`] stands for, if it
-/// is one.
-fn unnest_term(term: &Expr) -> Option<Unnested> {
-    let Expr::ScalarFunction(call) = term else {
-        return None;
-    };
-    if call.name() != crate::UNNEST_TEST {
-        return None;
-    }
-    let outer = matches!(
-        call.args.first(),
-        Some(Expr::Literal(ScalarValue::Boolean(Some(true)), _))
-    );
-    let lists = call.args[1..]
-        .chunks(2)
-        .filter_map(|pair| string_literal(&pair[0]).map(|name| (name, pair[1].clone())))
-        .collect();
-    Some(Unnested { lists, outer })
-}
-
-/// `expr` reading each unnested field as a column of its list's
-/// relation: `quail_unnest_field(list, 'f', 'feature')` as `f.feature`.
-fn unnested_fields(expr: &Expr) -> Expr {
-    expr.clone()
-        .transform_up(|node| {
-            if let Expr::ScalarFunction(call) = &node
-                && call.name() == crate::UNNEST_FIELD
-                && let (Some(list), Some(field)) =
-                    (string_literal(&call.args[1]), string_literal(&call.args[2]))
-            {
-                return Ok(datafusion::common::tree_node::Transformed::yes(
-                    Expr::Column(Column::new(Some(list), field)),
-                ));
-            }
-            Ok(datafusion::common::tree_node::Transformed::no(node))
-        })
-        .map(|found| found.data)
-        .unwrap_or_else(|_| expr.clone())
-}
-
-/// The schema of an `AI.SAE_FEATURES` element, as Quail's `FEATURE_LIST`.
-fn feature_schema() -> SchemaRef {
-    std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-        datafusion::arrow::datatypes::Field::new("feature", DataType::Int32, true),
-        datafusion::arrow::datatypes::Field::new("strength", DataType::Float32, true),
-    ]))
 }
 
 /// Whether a plan reads a CTE or a FROM subquery.
@@ -905,14 +707,6 @@ impl<'a> Walk<'a> {
         terms
     }
 
-    /// The query's `UNNEST`s, in written order.
-    fn unnests(&self, answers: &[Answer]) -> Vec<Unnested> {
-        self.where_terms(answers)
-            .iter()
-            .filter_map(unnest_term)
-            .collect()
-    }
-
     /// The answer columns the plan's AI columns add, with their calls.
     fn answers(&self) -> Vec<Answer> {
         let mut found = Vec::new();
@@ -1075,7 +869,6 @@ impl Relation {
         walk: &Walk<'_>,
         binder: &mut Binder,
         answers: &[Answer],
-        unnests: &[Unnested],
     ) -> Result<Self, CompileError> {
         let mut relation = Self::default();
         for table in walk.tables.iter().filter(|table| !table.gate) {
@@ -1150,16 +943,15 @@ impl Relation {
         for (id, node) in on {
             relation.bind_asked(walk, binder, id, node)?;
         }
-        for (name, _) in unnests.iter().flat_map(|unnest| &unnest.lists) {
-            binder.add_table(name, "", feature_schema())?;
-        }
         for (id, node) in rest {
             relation.bind_asked(walk, binder, id, node)?;
         }
         for term in walk.where_terms(answers) {
-            if unnest_term(&term).is_none() {
-                relation.bind_where_term(binder, &unnested_fields(&term))?;
+            if crate::functions::function_name(&term) == Some(crate::UNNEST_TEST) {
+                // DataFusion unnests a list column the region returns
+                return unsupported("an UNNEST of a list that is not a model call's answer");
             }
+            relation.bind_where_term(binder, &term)?;
         }
         Ok(relation)
     }
@@ -2161,379 +1953,6 @@ fn note(aliases: &mut Vec<String>, alias: &str) {
     }
 }
 
-// ---------------------------------------------------------------- result rows
-
-/// What runs on result rows above the SELECT list.
-struct ResultRows {
-    /// The list names of each `UNNEST`, in written order.
-    unnests: Vec<Vec<String>>,
-    /// Whether each `UNNEST` keeps a row with no elements.
-    outer: Vec<bool>,
-    /// The SELECT list's output column names.
-    output: Vec<String>,
-    /// The tests of more than one table's columns.
-    tests: Vec<ValueExpression>,
-}
-
-impl ResultRows {
-    /// The SELECT list the scans' rows are read into, and the operators on
-    /// result rows above it, lowest first: each test where the columns it
-    /// reads exist, each `UNNEST`, and the outer SELECT list.
-    ///
-    /// # Errors
-    ///
-    /// The SELECT list compares feature lists, an `UNNEST` does not read
-    /// a list column, or a test reads a column no result row holds.
-    fn operators(
-        &self,
-        columns: &[ValueExpression],
-        structs: &[quail_physical::ExtractStruct],
-        order: &[quail_physical::SortKey],
-        distinct: bool,
-    ) -> Result<(Projection, Vec<RowOperator>), CompileError> {
-        let unnested: BTreeSet<String> = self.unnests.iter().flatten().cloned().collect();
-        check_feature_lists(columns, order, distinct, &unnested)?;
-        let reads_unnested = |expression: &ValueExpression| {
-            column_references(expression)
-                .iter()
-                .any(|found| unnested.contains(&found.alias))
-        };
-        let mut expanded: Vec<(String, ValueExpression)> = Vec::new();
-        for column in columns.iter().filter(|column| reads_unnested(column)) {
-            let name = column_name(column, true);
-            match expanded.iter_mut().find(|(found, _)| *found == name) {
-                Some(entry) => entry.1 = column.clone(),
-                None => expanded.push((name, column.clone())),
-            }
-        }
-        let mut source: Vec<ValueExpression> = columns
-            .iter()
-            .filter(|column| {
-                let name = column_name(column, true);
-                !expanded.iter().any(|(found, _)| *found == name)
-            })
-            .cloned()
-            .collect();
-        let packing = packing(structs);
-        let returned = packed_columns(
-            source.iter().map(|column| column_name(column, true)),
-            &packing,
-        );
-        let tests: Vec<ValueExpression> = self
-            .tests
-            .iter()
-            .map(|test| result_row_condition(test, &packing))
-            .collect();
-        let has_rows = !self.unnests.is_empty() || !tests.is_empty();
-        if has_rows {
-            for key in order {
-                let SortExpression::Value(expression) = &key.expression;
-                if !column_references(expression).is_empty()
-                    && !reads_unnested(expression)
-                    && !source.contains(expression)
-                {
-                    source.push(expression.clone());
-                }
-            }
-        }
-        source.extend(row_test_columns(&tests, &unnested, &source, &returned));
-        let projection = Projection {
-            columns: source.iter().cloned().map(Projected::Expression).collect(),
-            structs: structs.to_vec(),
-        };
-        let mut names = packed_columns(
-            source.iter().map(|column| column_name(column, true)),
-            &packing,
-        );
-        let mut lists: BTreeMap<String, Vec<String>> = source
-            .iter()
-            .filter(|column| aliased_call(column, &["features"]).is_some())
-            .map(|column| {
-                (
-                    column_name(column, true),
-                    FEATURE_FIELDS.iter().map(ToString::to_string).collect(),
-                )
-            })
-            .collect();
-        let readable = |names: &[String]| -> BTreeSet<String> {
-            let mut found: BTreeSet<String> = names.iter().cloned().collect();
-            for (name, fields) in &packing {
-                if found.contains(name) {
-                    for (field, _) in fields {
-                        found.insert(format!("{name}.{field}"));
-                    }
-                }
-            }
-            found
-        };
-        let mut chain: Vec<RowOperator> = Vec::new();
-        let mut remaining = tests;
-        let place = |chain: &mut Vec<RowOperator>,
-                     names: &[String],
-                     remaining: &mut Vec<ValueExpression>| {
-            let available = readable(names);
-            let mut index = 0;
-            while index < remaining.len() {
-                if result_columns_read(&remaining[index])
-                    .iter()
-                    .all(|name| available.contains(name))
-                {
-                    chain.push(RowOperator::Filter {
-                        condition: remaining.remove(index),
-                        columns: names.to_vec(),
-                    });
-                } else {
-                    index += 1;
-                }
-            }
-        };
-        place(&mut chain, &names, &mut remaining);
-        let outer = if self.outer.is_empty() {
-            vec![false; self.unnests.len()]
-        } else {
-            self.outer.clone()
-        };
-        for (unnest, keep_empty) in self.unnests.iter().zip(&outer) {
-            names = unnest_columns(unnest, &names, &lists)?;
-            lists.retain(|name, _| !unnest.contains(name));
-            chain.push(RowOperator::Unnest {
-                lists: unnest.clone(),
-                outer: *keep_empty,
-                columns: names.clone(),
-            });
-            place(&mut chain, &names, &mut remaining);
-        }
-        if let Some(test) = remaining.first() {
-            let available = readable(&names);
-            let mut missing: Vec<String> = result_columns_read(test)
-                .into_iter()
-                .filter(|name| !available.contains(name))
-                .collect();
-            missing.sort();
-            missing.dedup();
-            return compile_error(format!(
-                "{} reads {}, which no result row holds",
-                condition_text(test),
-                repr_list(&missing)
-            ));
-        }
-        if has_rows {
-            let selected = if self.unnests.is_empty() {
-                returned
-            } else {
-                self.output.clone()
-            };
-            chain.push(RowOperator::Projection {
-                expressions: selected
-                    .iter()
-                    .map(
-                        |name| match expanded.iter().find(|(found, _)| found == name) {
-                            Some((_, column)) => Projected::Expression(column.clone()),
-                            None => Projected::Name(name.clone()),
-                        },
-                    )
-                    .collect(),
-                columns: selected,
-            });
-        }
-        Ok((projection, chain))
-    }
-}
-
-/// The result columns after an `UNNEST` of `unnested`: each list column
-/// as its field columns.
-///
-/// # Errors
-///
-/// The `UNNEST` names no list, a list twice, a column that is not a list
-/// the rows below return, or makes a column name repeat.
-fn unnest_columns(
-    unnested: &[String],
-    names: &[String],
-    lists: &BTreeMap<String, Vec<String>>,
-) -> Result<Vec<String>, CompileError> {
-    if unnested.is_empty() {
-        return compile_error("UNNEST needs at least one list column");
-    }
-    if unnested.iter().collect::<BTreeSet<_>>().len() != unnested.len() {
-        return compile_error(format!(
-            "UNNEST names a list twice, got {}",
-            repr_tuple(unnested)
-        ));
-    }
-    for column in unnested {
-        if !lists.contains_key(column) {
-            let mut known: Vec<String> = lists.keys().cloned().collect();
-            known.sort();
-            return compile_error(format!(
-                "UNNEST reads a list column the rows below return, got {}; the list columns \
-                 are {}",
-                repr_str(column),
-                repr_list(&known)
-            ));
-        }
-    }
-    let expanded: Vec<String> = names
-        .iter()
-        .flat_map(
-            |name| match lists.get(name).filter(|_| unnested.contains(name)) {
-                Some(fields) => fields
-                    .iter()
-                    .map(|field| format!("{name}.{field}"))
-                    .collect(),
-                None => vec![name.clone()],
-            },
-        )
-        .collect();
-    if expanded.iter().collect::<BTreeSet<_>>().len() != expanded.len() {
-        let listed: Vec<String> = expanded.iter().map(|name| repr_str(name)).collect();
-        return compile_error(format!(
-            "UNNEST field columns must not repeat a column name, got ({})",
-            listed.join(", ")
-        ));
-    }
-    Ok(expanded)
-}
-
-/// A column of the rows below as result rows hold it: a member of a
-/// struct column as the struct's field.
-fn result_reference(
-    reference: &ColumnRef,
-    members: &BTreeMap<String, (String, String)>,
-) -> ColumnRef {
-    match members.get(&reference.column) {
-        Some((owner, name)) => ColumnRef {
-            alias: owner.clone(),
-            provider: String::new(),
-            column: name.clone(),
-        },
-        None => reference.clone(),
-    }
-}
-
-fn rewrite_reference(
-    expression: &ValueExpression,
-    members: &BTreeMap<String, (String, String)>,
-) -> ValueExpression {
-    match expression {
-        ValueExpression::ColumnRef(found) => {
-            ValueExpression::ColumnRef(result_reference(found, members))
-        }
-        ValueExpression::GetField(field) => ValueExpression::GetField(GetField {
-            input: Box::new(rewrite_reference(&field.input, members)),
-            field: field.field.clone(),
-        }),
-        ValueExpression::Value(value) => ValueExpression::Value(Expression {
-            columns: value
-                .columns
-                .iter()
-                .map(|found| result_reference(found, members))
-                .collect(),
-            ..value.clone()
-        }),
-        ValueExpression::Alias(alias) => ValueExpression::Alias(quail_physical::Alias {
-            expression: Box::new(rewrite_reference(&alias.expression, members)),
-            name: alias.name.clone(),
-        }),
-        other => other.clone(),
-    }
-}
-
-/// Rewrite a condition to read result rows, where struct columns hold answers.
-pub(crate) fn result_row_condition(
-    condition: &ValueExpression,
-    packing: &[(String, Vec<(String, String)>)],
-) -> ValueExpression {
-    let members: BTreeMap<String, (String, String)> = packing
-        .iter()
-        .flat_map(|(owner, names)| {
-            names
-                .iter()
-                .map(move |(name, member)| (member.clone(), (owner.clone(), name.clone())))
-        })
-        .collect();
-    rewrite_reference(condition, &members)
-}
-
-/// The result row columns a rewritten condition reads, by name.
-pub(crate) fn result_columns_read(condition: &ValueExpression) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    for reference in column_references(condition) {
-        let name = reference_name(&reference, true);
-        if !found.contains(&name) {
-            found.push(name);
-        }
-    }
-    found
-}
-
-/// The source columns the row tests read that the SELECT list does not
-/// return, which it adds for them.
-pub(crate) fn row_test_columns(
-    row_tests: &[ValueExpression],
-    unnested: &BTreeSet<String>,
-    source: &[ValueExpression],
-    returned: &[String],
-) -> Vec<ValueExpression> {
-    let mut present: BTreeSet<String> = returned.iter().cloned().collect();
-    present.extend(source.iter().map(|column| column_name(column, true)));
-    let mut extra = Vec::new();
-    for test in row_tests {
-        for reference in column_references(test) {
-            let name = reference_name(&reference, true);
-            if !reference.provider.is_empty()
-                && !unnested.contains(&reference.alias)
-                && !present.contains(&name)
-            {
-                present.insert(name);
-                extra.push(ValueExpression::ColumnRef(reference));
-            }
-        }
-    }
-    extra
-}
-
-/// Refuse a DISTINCT or ORDER BY that compares AI.SAE_FEATURES lists.
-///
-/// # Errors
-///
-/// The query compares a feature list that is not unnested.
-pub(crate) fn check_feature_lists(
-    columns: &[ValueExpression],
-    order: &[SortKey],
-    distinct: bool,
-    unnested: &BTreeSet<String>,
-) -> Result<(), CompileError> {
-    let names: BTreeSet<String> = columns
-        .iter()
-        .filter(|column| aliased_call(column, &["features"]).is_some())
-        .map(|column| column_name(column, true))
-        .filter(|name| !unnested.contains(name))
-        .collect();
-    if names.is_empty() {
-        return Ok(());
-    }
-    if distinct {
-        return compile_error("DISTINCT does not compare AI.SAE_FEATURES list columns");
-    }
-    for key in order {
-        let refused = match &key.expression {
-            SortExpression::Value(expression) => {
-                let named = matches!(expression, ValueExpression::Alias(alias)
-                    if names.contains(&alias.name));
-                named
-                    || aliased_call(expression, &["features"]).is_some()
-                    || matches!(expression, ValueExpression::ModelCall(call)
-                        if call.kind == "features")
-            }
-        };
-        if refused {
-            return compile_error("ORDER BY does not compare AI.SAE_FEATURES list columns");
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------- scan columns
 
 /// The columns each table's operators read, by alias, in first use
@@ -2565,22 +1984,6 @@ impl Needed {
 fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly<'_, '_>) {
     let mut valued: BTreeSet<(String, String)> = BTreeSet::new();
     let mut top = Needed::default();
-    for key in &found.result.order {
-        top.add(sort_refs(key));
-    }
-    for operator in found.after_projection.iter().rev() {
-        match operator {
-            RowOperator::Projection { expressions, .. } => {
-                for column in expressions {
-                    if let Projected::Expression(expression) = column {
-                        top.add(value_refs(expression));
-                    }
-                }
-            }
-            RowOperator::Filter { condition, .. } => top.add(column_references(condition)),
-            RowOperator::Unnest { .. } => {}
-        }
-    }
     for column in &found.projection.columns {
         if let Projected::Expression(expression) = column {
             top.add(value_refs(expression));
@@ -2591,27 +1994,11 @@ fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly
             valued.insert((reference.alias, reference.column));
         }
     };
-    // the columns the outermost SELECT list returns or computes
-    let outermost = match found.after_projection.last() {
-        Some(RowOperator::Projection { expressions, .. }) => expressions,
-        _ => &found.projection.columns,
-    };
-    for column in outermost {
-        match column {
-            Projected::Expression(expression) => value(value_refs(expression)),
-            Projected::Name(name) => {
-                for inner in &found.projection.columns {
-                    if let Projected::Expression(ValueExpression::ColumnRef(reference)) = inner
-                        && reference_name(reference, true) == *name
-                    {
-                        value(vec![reference.clone()]);
-                    }
-                }
-            }
+    // the columns the region returns or computes
+    for column in &found.projection.columns {
+        if let Projected::Expression(expression) = column {
+            value(value_refs(expression));
         }
-    }
-    for key in &found.result.order {
-        value(sort_refs(key));
     }
     for on in assembly.join_on.values() {
         for equality in on {

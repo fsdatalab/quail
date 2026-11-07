@@ -5,7 +5,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from helpers.oracle import Oracle, finish
-from helpers.planning import column_tests, operators_of
+from helpers.planning import column_tests, operators_of, row_tests
 from helpers.sessions import TOKENIZER
 
 import quail
@@ -237,13 +237,16 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     pipeline = spread.graph.pipelines()[classify.inputs[0].source.node_id]
     assert classify.node_id in {member.node_id for member in pipeline}
     distributed.close()
-    # a joined row's label is not tested in WHERE
-    with pytest.raises(CompileError, match="one table|filter on a label"):
-        session.sql(
-            f"SELECT d.id, a.id FROM documents d JOIN aspects a "
-            f"ON AI_FILTER(PROMPT('Does {{0}} mention {{1}}?', d.body, "
-            f"a.aspect)) "
-            f"WHERE {stance} = 'praise'")
+    # DataFusion tests a joined row's label on the region's rows
+    tested = session.sql(
+        f"SELECT d.id, a.id FROM documents d JOIN aspects a "
+        f"ON AI_FILTER(PROMPT('Does {{0}} mention {{1}}?', d.body, "
+        f"a.aspect)) "
+        f"WHERE {stance} = 'praise'")
+    assert row_tests(tested) == ["__quail_column_1 = praise"]
+    oracle = Oracle(joins=lambda *_: True, labels=lambda spec, ids: (
+        "praise" if tuple(ids) == (0, 1) else "complaint"))
+    assert finish(tested, oracle).collect().to_pylist() == [{"d.id": 7, "a.id": 2}]
 
 
 def test_streamed_classifications_share_one_pipeline(session):

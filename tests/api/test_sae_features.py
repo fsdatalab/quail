@@ -82,9 +82,17 @@ def test_not_and_or_of_unnested_fields_and_source_columns_filter_rows(session):
         {"f.feature": 0}, {"f.feature": 2}, {"f.feature": 100}]
 
 
-def test_explain_shows_the_columns_an_unnest_returns(session):
+def test_datafusion_unnests_the_feature_lists_the_region_returns(session):
     query = session.sql(f"SELECT r.id, f.feature FROM reviews r, {UNNEST}")
-    assert "Project: r.id, f.feature" in query.explain()
+    explained = query.explain()
+    assert "UnnestExec" in explained
+    assert "Project: r.id, __quail_column_1" in explained
+    rows = finish(query, _unnest_oracle()).collect()
+    assert rows.column_names == ["r.id", "f.feature"]
+    assert rows.to_pylist() == [
+        {"r.id": 7, "f.feature": 0}, {"r.id": 7, "f.feature": 100},
+        {"r.id": 9, "f.feature": 1}, {"r.id": 9, "f.feature": 100},
+        {"r.id": 11, "f.feature": 2}, {"r.id": 11, "f.feature": 100}]
 @pytest.mark.parametrize("comparison, num_rows", [("IS NULL", 0), ("IS NOT NULL", 3)])
 def test_feature_list_null_tests_keep_empty_lists(session, comparison, num_rows):
     query = session.sql(
@@ -104,3 +112,14 @@ def test_feature_lists_must_be_unnested_before_testing_their_fields(session, tes
             f"WHERE {test}")
 
 
+
+
+def test_a_left_join_unnest_keeps_a_row_with_no_features(session):
+    query = session.sql(
+        f"SELECT r.id, f.feature FROM reviews r "
+        f"LEFT JOIN UNNEST({FEATURES}) AS f ON TRUE ORDER BY r.id")
+    oracle = Oracle(features=lambda spec, document: (
+        [] if document == 1 else [{"feature": document, "strength": 1.0}]))
+    assert finish(query, oracle).collect().to_pylist() == [
+        {"r.id": 7, "f.feature": 0}, {"r.id": 9, "f.feature": None},
+        {"r.id": 11, "f.feature": 2}]

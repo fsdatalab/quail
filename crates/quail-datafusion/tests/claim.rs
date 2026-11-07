@@ -138,7 +138,7 @@ async fn datafusion_groups_the_answers_a_region_returns() -> Result<()> {
 }
 
 #[tokio::test]
-async fn an_ai_join_and_its_distinct_stay_in_one_region() -> Result<()> {
+async fn an_ai_join_stays_in_one_region_under_its_distinct() -> Result<()> {
     let context = context()?;
     let query = "SELECT DISTINCT r.id FROM reviews r JOIN aspects a \
         ON AI.IF(PROMPT('Does the review discuss {1}?\n\n{0}', r.body, a.aspect))";
@@ -146,8 +146,14 @@ async fn an_ai_join_and_its_distinct_stay_in_one_region() -> Result<()> {
     let found = regions(&plan);
     assert_eq!(found.len(), 1, "{}", plan.display_indent());
     let inner = found[0].plan.display_indent().to_string();
-    assert!(inner.contains("Distinct"), "{inner}");
+    assert!(!inner.contains("Distinct"), "{inner}");
     assert!(inner.contains("Join"), "{inner}");
+    // DataFusion's DISTINCT, a GROUP BY, reads the region's rows
+    let shape = lines(&plan);
+    assert!(
+        shape.iter().any(|line| line.starts_with("Aggregate:")),
+        "{shape:?}"
+    );
     Ok(())
 }
 

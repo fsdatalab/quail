@@ -39,7 +39,8 @@ def test_a_distinct_that_removes_no_row_is_eliminated(session, text):
 def test_a_distinct_on_one_tables_columns_stops_its_filter_at_the_first_match(session):
     query = session.sql("SELECT DISTINCT r.stars FROM reviews r "
                         "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))")
-    assert "Distinct" in query.logical
+    # DataFusion runs the DISTINCT above the region
+    assert "AggregateExec" in query.explain()
     assert "fetch: 1 per [stars]" in query.logical
     assert query.facts()["stop_keys"] == {"r": ["stars"]}
 

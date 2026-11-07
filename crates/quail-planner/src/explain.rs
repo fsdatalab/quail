@@ -1012,13 +1012,6 @@ impl Graph {
                 Some(PhysicalNode::Limit(limit)) => {
                     single.map(|value| value.min(limit.attributes.count as f64))
                 }
-                Some(PhysicalNode::Sort(sort)) => single.map(|value| {
-                    let value = (value - sort.attributes.offset as f64).max(0.0);
-                    match sort.attributes.fetch {
-                        Some(fetch) => value.min(fetch as f64),
-                        None => value,
-                    }
-                }),
                 _ => None,
             };
             for output in node.outputs() {
@@ -1188,38 +1181,6 @@ impl TreeRows<'_> {
                 format!("Project: {}", result.join(", "))
             }
             PhysicalNode::Limit(limit) => format!("Limit: {}", commas_int(limit.attributes.count)),
-            PhysicalNode::Unnest(unnest) => {
-                details.push(format!("returns {}", unnest.attributes.columns.join(", ")));
-                format!("Unnest: {}", unnest.attributes.lists.join(", "))
-            }
-            PhysicalNode::Sort(sort) => {
-                let sort = &sort.attributes;
-                let keys: Vec<String> = sort
-                    .keys
-                    .iter()
-                    .map(|(column, descending, nulls_first)| {
-                        format!(
-                            "{column} {} NULLS {}",
-                            if *descending { "DESC" } else { "ASC" },
-                            if *nulls_first { "FIRST" } else { "LAST" }
-                        )
-                    })
-                    .collect();
-                let mut bounds = Vec::new();
-                if sort.distinct {
-                    bounds.push("distinct".to_string());
-                }
-                if sort.offset != 0 {
-                    bounds.push(format!("offset={}", commas_int(sort.offset)));
-                }
-                if let Some(fetch) = sort.fetch {
-                    bounds.push(format!("fetch={}", commas_int(fetch)));
-                }
-                if !bounds.is_empty() {
-                    details.push(bounds.join(", "));
-                }
-                format!("Sort: {}", keys.join(", "))
-            }
             PhysicalNode::AiFilter(filter) => {
                 let filter = &filter.attributes;
                 let mut kv = Vec::new();

@@ -67,13 +67,34 @@ can pass batches to each other before they finish processing all rows.
 See [Execution](/docs/architecture/execution#pipelines-and-batches) for
 how Quail groups and schedules these operators.
 
-## Windows and aggregates
+## Operators above the region
 
-DataFusion runs [window functions](/docs/user-guide/sql/sql-functions#window-functions)
-and `GROUP BY` on the rows a model region returns, so they are not in
-Quail's physical plan. They reuse the region's AI outputs and do not
-call the model again. A `LIMIT` above a window reduces the rows
-DataFusion returns, not the rows the model evaluates.
+DataFusion runs the relational operators on the rows a model region
+returns, so they are not in Quail's physical plan: ORDER BY, LIMIT and
+OFFSET, DISTINCT, GROUP BY, [window functions](/docs/user-guide/sql/sql-functions#window-functions),
+each `UNNEST`, each test of more than one table's columns, and the
+SELECT list's expressions. They reuse the region's AI outputs and do not
+call the model again.
+
+A LIMIT stops the model early only when it becomes the region's fetch:
+with no ORDER BY, DISTINCT, or other row filter between the LIMIT and
+the AI operator it reads. An ORDER BY with a LIMIT is a top-k sort,
+DataFusion's `SortExec` with a fetch, over every row the region returns.
+
+For example, `explain()` of a query that scores filtered sales calls
+and keeps the top 25 starts with DataFusion's physical plan, then the
+region's:
+
+```text
+DataFusion:
+SortExec: TopK(fetch=25), expr=[commit_score@1 DESC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[false]
+  ModelRegionExec
+    FilterExec: deal_stage@1 = Negotiation, projection=[id@0, transcript@2]
+      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+```
+
+`ModelRegionExec` runs the region. Its inputs below it are the rows
+DataFusion computes for it, here the calls in the Negotiation stage.
 
 ## Inspect the plan
 

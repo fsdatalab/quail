@@ -1,41 +1,37 @@
 DataFusion:
-ModelRegion
-  SubqueryAlias: c
-    Projection: sales_calls.id, sales_calls.transcript
-      Filter: sales_calls.deal_stage = Utf8("Negotiation")
-        TableScan: sales_calls projection=[id, deal_stage, transcript]
+SortExec: TopK(fetch=25), expr=[commit_score@1 DESC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[false]
+  ModelRegionExec
+    FilterExec: deal_stage@1 = Negotiation, projection=[id@0, transcript@2]
+      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:
-  Sort: commit_score DESC NULLS LAST, c.id ASC NULLS LAST, fetch=25
-    Projection: c.id, ai_score(prompt(Utf8("Judge strictly from the sales call above whether the customer commits to buying, such as accepting the terms, agreeing to sign, or asking for the contract or paperwork. Interest, questions, or agreeing to another meeting do not count.
+  Projection: c.id, ai_score(prompt(Utf8("Judge strictly from the sales call above whether the customer commits to buying, such as accepting the terms, agreeing to sign, or asking for the contract or paperwork. Interest, questions, or agreeing to another meeting do not count.
   
   {0}
   
   Instruction: answer TRUE if the customer commits to buying, FALSE otherwise."), c.transcript)) AS commit_score
-      SubqueryAlias: c
-        TableScan: sales_calls__c
+    SubqueryAlias: c
+      TableScan: sales_calls__c
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                            est. rows   est. time
-  Sort: commit_score DESC NULLS LAST, c.id ASC NULLS LAST
-    fetch=25
-    Project: c.id, commit_score
-      quail.ai_score                                                        <1 ms
-        backend=quail
-        keep_kv=False
-        model=qwen3-4b-fp8
-        batching=token_based_admission
-        output=commit_score
-        aliases=['c']
-        expected_rows=0.0
-        estimated_seconds=0.0
-        share_prefixes=False
-        Scan sales_calls as c                                       0
-          tokens=0, mean_document_tokens=0
+                                           est. rows   est. time
+  Project: c.id, commit_score
+    quail.ai_score                                         <1 ms
+      backend=quail
+      keep_kv=False
+      model=qwen3-4b-fp8
+      batching=token_based_admission
+      output=commit_score
+      aliases=['c']
+      expected_rows=0.0
+      estimated_seconds=0.0
+      share_prefixes=False
+      Scan sales_calls as c                        0
+        tokens=0, mean_document_tokens=0
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

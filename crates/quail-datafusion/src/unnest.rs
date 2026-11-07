@@ -8,8 +8,9 @@
 //! types. [`take_unnests`] moves each `UNNEST` out of `FROM`: a
 //! `quail_unnest(...)` test in `WHERE` records the lists, and
 //! `quail_unnest_field(<list>, 'f', 'feature')` stands for each field
-//! the query reads. The Rust binder reads both back as the front end
-//! reads the `UNNEST`.
+//! the query reads. When the region is claimed, both become DataFusion's
+//! `Unnest` of the list column the region returns, and `get_field` of
+//! its elements, above the region (see `lift.rs`).
 
 use std::ops::ControlFlow;
 

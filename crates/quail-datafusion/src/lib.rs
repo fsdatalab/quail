@@ -29,6 +29,7 @@ mod extension;
 mod functions;
 mod identified;
 mod joins;
+mod lift;
 mod limit;
 mod lower;
 mod placement;
@@ -80,14 +81,18 @@ pub fn session_state(runner: Arc<dyn RegionRunner>) -> SessionState {
 /// optimizer runs `rules`, names [`logical_rule`] knows, in order, then
 /// [`ClaimModelRegions`].
 ///
+/// DataFusion's `DATAFUSION_*` environment variables set its options,
+/// such as `DATAFUSION_EXECUTION_TARGET_PARTITIONS`.
+///
 /// # Errors
 ///
-/// A rule name is unknown.
+/// A rule name is unknown, or an environment variable holds a value its
+/// option does not take.
 pub fn session_state_with_rules(
     runner: Arc<dyn RegionRunner>,
     rules: Vec<String>,
 ) -> Result<SessionState> {
-    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Snowflake");
+    let config = SessionConfig::from_env()?.set_str("datafusion.sql_parser.dialect", "Snowflake");
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()

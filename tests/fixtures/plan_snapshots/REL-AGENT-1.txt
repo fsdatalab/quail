@@ -1,9 +1,7 @@
 DataFusion:
-ModelRegion
-  SubqueryAlias: t
-    Projection: agent_traces.id, agent_traces.trace
-      Filter: agent_traces.turn_index >= Int64(10) AND agent_traces.token_count <= Int64(6000)
-        TableScan: agent_traces projection=[id, trace, turn_index, token_count]
+ModelRegionExec
+  FilterExec: turn_index@2 >= 10 AND token_count@3 <= 6000, projection=[id@0, trace@1]
+    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

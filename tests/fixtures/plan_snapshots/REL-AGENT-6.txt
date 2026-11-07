@@ -1,9 +1,13 @@
 DataFusion:
-Sort: first_fix ASC NULLS LAST, t.trajectory_id ASC NULLS LAST, fetch=50
-  Projection: t.trajectory_id, count(Int64(1)) AS count(*) AS fixes, min(t.turn_index) AS first_fix, max(t.token_count) AS longest
-    Filter: count(Int64(1)) >= Int64(2)
-      Aggregate: groupBy=[[t.trajectory_id]], aggr=[[count(Int64(1)), min(t.turn_index), max(t.token_count)]]
-        ModelRegion
+SortPreservingMergeExec: [first_fix@2 ASC NULLS LAST, trajectory_id@0 ASC NULLS LAST], fetch=50
+  ProjectionExec: expr=[trajectory_id@0 as trajectory_id, count(Int64(1))@1 as fixes, min(t.turn_index)@2 as first_fix, max(t.token_count)@3 as longest]
+    SortExec: TopK(fetch=50), expr=[min(t.turn_index)@2 ASC NULLS LAST, trajectory_id@0 ASC NULLS LAST], preserve_partitioning=[true]
+      FilterExec: count(Int64(1))@1 >= 2
+        AggregateExec: mode=FinalPartitioned, gby=[trajectory_id@0 as trajectory_id], aggr=[count(Int64(1)), min(t.turn_index), max(t.token_count)]
+          RepartitionExec: partitioning=Hash([trajectory_id@0], 4), input_partitions=4
+            AggregateExec: mode=Partial, gby=[trajectory_id@0 as trajectory_id], aggr=[count(Int64(1)), min(t.turn_index), max(t.token_count)]
+              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                ModelRegionExec
 
 model region:
 logical:

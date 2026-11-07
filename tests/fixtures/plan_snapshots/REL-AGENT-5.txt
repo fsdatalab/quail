@@ -1,13 +1,25 @@
 DataFusion:
-Sort: n DESC NULLS LAST, test_result ASC NULLS LAST
-  Projection: AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
+SortPreservingMergeExec: [n@1 DESC NULLS LAST, test_result@0 ASC NULLS LAST]
+  ProjectionExec: expr=[AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
 
-{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything")))) AS test_result, count(Int64(1)) AS count(*) AS n, count(DISTINCT t.trajectory_id) AS trajectories
-    Filter: count(Int64(1)) >= Int64(50)
-      Aggregate: groupBy=[[test_result AS AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
+{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))@0 as test_result, count(Int64(1))@1 as n, count(DISTINCT t.trajectory_id)@2 as trajectories]
+    SortExec: expr=[count(Int64(1))@1 DESC NULLS LAST, AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
 
-{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))]], aggr=[[count(Int64(1)), count(DISTINCT t.trajectory_id)]]
-        ModelRegion
+{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))@0 ASC NULLS LAST], preserve_partitioning=[true]
+      FilterExec: count(Int64(1))@1 >= 50
+        AggregateExec: mode=FinalPartitioned, gby=[AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
+
+{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))@0 as AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
+
+{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))], aggr=[count(Int64(1)), count(DISTINCT t.trajectory_id)]
+          RepartitionExec: partitioning=Hash([AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
+
+{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))@0], 4), input_partitions=4
+            AggregateExec: mode=Partial, gby=[test_result@1 as AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
+
+{0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))], aggr=[count(Int64(1)), count(DISTINCT t.trajectory_id)]
+              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                ModelRegionExec
 
 model region:
 logical:

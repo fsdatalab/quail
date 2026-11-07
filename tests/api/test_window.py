@@ -39,7 +39,7 @@ def test_windows_run_in_datafusion_on_the_model_regions_rows(session):
     assert [node.node_id for node in query.plan().nodes] == [
         "scan:s", "ai-classify:0", "project"]
     explained = query.explain()
-    assert "WindowAggr:" in explained and "Sort:" in explained
+    assert "WindowAggExec:" in explained and "SortExec:" in explained
     labels = ["good", "bad", "good", "bad", "good"]
     rows = _run(query, oracle_executor(Oracle(
         labels=lambda spec, ids: labels[ids[0]], probabilities=True)))
@@ -60,7 +60,7 @@ def test_windows_run_in_datafusion_on_the_model_regions_rows(session):
         WINDOWS + "WHERE s.run_id = 'a' ORDER BY s.run_id, s.step_index")
     plan = filtered.plan()
     assert plan.nodes[0].predicates == ()
-    assert "run_id = Utf8(\"a\")" in filtered.explain()
+    assert "FilterExec: run_id@1 = a" in filtered.explain()
     rows = _run(filtered, oracle_executor(Oracle(
         labels=lambda spec, ids: "good", probabilities=True)))
     assert rows.to_rows() == [("s1", "good", None, 1, None),
@@ -83,7 +83,7 @@ def test_a_window_a_later_model_call_reads_runs_in_datafusion_between_regions(se
         "AND w.n <= 2 ORDER BY w.n")
     # the inner filter's region feeds DataFusion's window, whose rows the
     # outer region reads as the table w
-    assert "WindowAggr:" in query.explain()
+    assert "WindowAggExec:" in query.explain()
     # 'q:' drops "one"; the window numbers the rest by step_index
     rows = _run(query, oracle_executor(Oracle(
         filters=lambda alias, document, position: document != 0 or alias != "s")))

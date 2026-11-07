@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use quail_physical::{
-    Asked, Equality, ExtractStruct, FilterPredicate, ModelCall, Projected, SortKey,
-    ValueExpression, tagged_struct,
+    Asked, Equality, ExtractStruct, FilterPredicate, ModelCall, Projected, ValueExpression,
+    tagged_struct,
 };
 use serde_json::Value;
 
@@ -163,58 +163,12 @@ pub struct SemanticJoin {
     pub outer_aliases: Vec<String>,
 }
 
-/// The query's SELECT list.
+/// The columns a region returns.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Projection {
-    /// Value expressions, Aliases, and the names of columns an unnest adds.
+    /// Value expressions and Aliases.
     pub columns: Vec<Projected>,
     pub structs: Vec<ExtractStruct>,
-}
-
-/// `ORDER BY`, `DISTINCT`, `OFFSET`, and `LIMIT`, as the region runs
-/// them on its result rows.
-///
-/// A LIMIT that DataFusion's rules made the fetch of the region's last
-/// AI operator is `Operators::fetch` instead.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ResultModifiers {
-    pub limit: Option<i64>,
-    pub order: Vec<SortKey>,
-    pub offset: i64,
-    pub distinct: bool,
-}
-
-/// An operator on result rows, above the SELECT list. Each holds the
-/// names of the result columns it returns.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum RowOperator {
-    /// One row per item of each listed list column.
-    Unnest {
-        lists: Vec<String>,
-        outer: bool,
-        columns: Vec<String>,
-    },
-    /// A regular condition on result rows.
-    Filter {
-        condition: ValueExpression,
-        columns: Vec<String>,
-    },
-    /// A SELECT list over result rows.
-    Projection {
-        expressions: Vec<Projected>,
-        columns: Vec<String>,
-    },
-}
-
-impl RowOperator {
-    /// The names of the result columns it returns.
-    pub fn columns(&self) -> &[String] {
-        match self {
-            RowOperator::Unnest { columns, .. }
-            | RowOperator::Filter { columns, .. }
-            | RowOperator::Projection { columns, .. } => columns,
-        }
-    }
 }
 
 /// The operators of one plan, in the order the plan was written.
@@ -235,14 +189,14 @@ pub struct Operators {
     pub maps: Vec<SemanticColumn>,
     /// alias -> its label tests, then its answer tests.
     pub column_filters: Vec<(String, Vec<ColumnTest>)>,
+    /// The columns the region returns: the operators above it in
+    /// DataFusion read them.
     pub projection: Projection,
-    pub result: ResultModifiers,
-    /// The fetch of the region's last AI operator: the first rows that
-    /// pass it, which a LIMIT and its OFFSET need. The executor stops
-    /// asking the model once that many rows pass.
+    /// The most rows the region returns: the fetch of its last AI
+    /// operator, or of a LIMIT above the region, which a LIMIT and its
+    /// OFFSET need. The executor stops asking the model once that many
+    /// rows pass.
     pub fetch: Option<i64>,
-    /// The operators on result rows above the SELECT list, lowest first.
-    pub after_projection: Vec<RowOperator>,
     /// alias -> the DISTINCT stop key of its AI.IF predicates.
     pub stop_keys: BTreeMap<String, Vec<String>>,
 }
@@ -252,18 +206,8 @@ impl Operators {
     /// passes a LIMIT above the region down to it, so the model can stop
     /// once enough rows pass.
     pub fn limited(mut self, fetch: i64) -> Self {
-        self.result.limit = Some(self.result.limit.map_or(fetch, |limit| limit.min(fetch)));
+        self.fetch = Some(self.fetch.map_or(fetch, |found| found.min(fetch)));
         self
-    }
-
-    /// The rows a Limit after the SELECT list keeps, when no ORDER BY,
-    /// DISTINCT, or OFFSET runs there: the smaller of the region's LIMIT
-    /// and its last AI operator's fetch.
-    pub fn limit(&self) -> Option<i64> {
-        match (self.result.limit, self.fetch) {
-            (Some(limit), Some(fetch)) => Some(limit.min(fetch)),
-            (limit, fetch) => limit.or(fetch),
-        }
     }
 
     /// The column operators of every kind: classifications,

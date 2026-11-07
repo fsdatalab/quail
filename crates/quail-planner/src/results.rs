@@ -1,19 +1,17 @@
-//! The result nodes a physical plan ends with, as
-//! `quail/planner/graph/results.py` builds them.
+//! The result nodes a physical plan ends with: the Project that reads the
+//! region's rows, and the Limit of the region's fetch.
 
 use quail_physical::{
-    FilterAttributes, LimitAttributes, ModelCall, Node, PhysicalNode, PortRef, ProjectAttributes,
-    Projected, SortAttributes, SortExpression, UnnestAttributes, ValueExpression, input_ports,
-    port,
+    LimitAttributes, ModelCall, Node, PhysicalNode, PortRef, ProjectAttributes, Projected,
+    ValueExpression, input_ports,
 };
 use serde_json::Value;
 
-use crate::expressions::packed_columns;
 use crate::expressions::{
     PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_name, column_references,
-    projected_call, projected_name, sort_name,
+    projected_call, projected_name,
 };
-use crate::operators::{Operators, RowOperator};
+use crate::operators::Operators;
 
 /// The struct columns a Project packs, as `Project.structs` encodes them.
 pub fn structs_value(structs: &[(String, Vec<(String, String)>)]) -> Value {
@@ -51,8 +49,7 @@ pub fn project_bindings(found: &Operators) -> (Vec<(String, ValueExpression)>, V
     (source_columns(found), answer_columns(found))
 }
 
-/// Each result column a source expression computes, by name: the
-/// projected columns and the sort keys that read a table's columns.
+/// Each result column a source expression computes, by name.
 fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
     let projected = found
         .projection
@@ -62,12 +59,8 @@ fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
             Projected::Expression(expression) => Some(expression),
             Projected::Name(_) => None,
         });
-    let sorted = found.result.order.iter().map(|key| {
-        let SortExpression::Value(value) = &key.expression;
-        value
-    });
     let mut found: Vec<(String, ValueExpression)> = Vec::new();
-    for expression in projected.chain(sorted) {
+    for expression in projected {
         if column_references(expression).is_empty() {
             continue;
         }
@@ -135,142 +128,28 @@ fn node<A>(id: &str, inputs: &[PortRef], attributes: A) -> Node<A> {
     }
 }
 
-/// The Project, the operators above it, and the nodes ending a plan, as
-/// `result_nodes`.
+/// The Project that reads the region's rows, and the Limit of the
+/// region's fetch, which `should_push_down_limit` stops the model at.
 pub fn result_nodes(
     found: &Operators,
     inputs: &[PortRef],
     columns: &[String],
     structs: &[(String, Vec<(String, String)>)],
 ) -> Vec<PhysicalNode> {
-    let root = &found.result;
-    let chain = &found.after_projection;
-    let mut hidden: Vec<String> = Vec::new();
-    if chain.is_empty() {
-        for key in &root.order {
-            let name = sort_name(&key.expression);
-            if !columns.contains(&name) && !hidden.contains(&name) {
-                hidden.push(name);
-            }
-        }
-    }
-    let with_hidden = |names: Vec<String>| {
-        let mut names = names;
-        names.extend(hidden.iter().cloned());
-        names
-    };
     let mut nodes = vec![PhysicalNode::Project(node(
         "project",
         inputs,
         ProjectAttributes {
-            columns: with_hidden(columns.to_vec()),
+            columns: columns.to_vec(),
             structs: structs_value(structs),
-            expressions: None,
             sources: source_columns(found),
             answers: answer_columns(found),
         },
     ))];
-    let mut rows = port("project", "rows");
-    let mut result = packed_columns(columns.iter().cloned(), structs);
-    let mut available =
-        packed_columns(found.projection.columns.iter().map(projected_name), structs);
-    for (index, operator) in chain.iter().enumerate() {
-        result = operator.columns().to_vec();
-        let node_id = match operator {
-            RowOperator::Unnest { lists, outer, .. } => {
-                let node_id = format!("unnest_{index}");
-                nodes.push(PhysicalNode::Unnest(node(
-                    &node_id,
-                    std::slice::from_ref(&rows),
-                    UnnestAttributes {
-                        lists: lists.clone(),
-                        outer: *outer,
-                        columns: with_hidden(result.clone()),
-                    },
-                )));
-                node_id
-            }
-            RowOperator::Projection {
-                expressions: written,
-                ..
-            } => {
-                let node_id = format!("project_{index}");
-                let mut expressions = written.clone();
-                for key in &root.order {
-                    let name = sort_name(&key.expression);
-                    if result.contains(&name) {
-                        continue;
-                    }
-                    expressions.push(if available.contains(&name) {
-                        Projected::Name(name)
-                    } else {
-                        let SortExpression::Value(value) = &key.expression;
-                        Projected::Expression(value.clone())
-                    });
-                }
-                nodes.push(PhysicalNode::Project(node(
-                    &node_id,
-                    std::slice::from_ref(&rows),
-                    ProjectAttributes {
-                        columns: expressions.iter().map(projected_name).collect(),
-                        structs: Value::Array(Vec::new()),
-                        expressions: Some(expressions),
-                        sources: Vec::new(),
-                        answers: Vec::new(),
-                    },
-                )));
-                node_id
-            }
-            RowOperator::Filter { condition, .. } => {
-                let node_id = format!("filter_{index}");
-                nodes.push(PhysicalNode::Filter(node(
-                    &node_id,
-                    std::slice::from_ref(&rows),
-                    FilterAttributes {
-                        predicate: Some(condition.clone()),
-                        aliases: Vec::new(),
-                        selectivity: None,
-                        written_position: 0,
-                        columns: with_hidden(result.clone()),
-                    },
-                )));
-                node_id
-            }
-        };
-        available = result.clone();
-        rows = port(&node_id, "rows");
-    }
-    let sorted = !root.order.is_empty() || root.distinct;
-    if sorted || root.offset != 0 {
-        if let (false, Some(count)) = (sorted, found.fetch) {
-            // the rows the OFFSET skips and the LIMIT keeps, which
-            // `should_push_down_limit` stops the model at
-            nodes.push(PhysicalNode::Limit(node(
-                "limit",
-                std::slice::from_ref(&rows),
-                LimitAttributes { count },
-            )));
-            rows = port("limit", "rows");
-        }
-        nodes.push(PhysicalNode::Sort(node(
-            "sort",
-            std::slice::from_ref(&rows),
-            SortAttributes {
-                keys: root
-                    .order
-                    .iter()
-                    .map(|key| (sort_name(&key.expression), key.descending, key.nulls_first))
-                    .collect(),
-                columns: result,
-                distinct: root.distinct,
-                offset: root.offset,
-                fetch: root.limit,
-            },
-        )));
-    } else if let Some(count) = found.limit() {
+    if let Some(count) = found.fetch {
         nodes.push(PhysicalNode::Limit(node(
             "limit",
-            std::slice::from_ref(&rows),
+            &[quail_physical::port("project", "rows")],
             LimitAttributes { count },
         )));
     }

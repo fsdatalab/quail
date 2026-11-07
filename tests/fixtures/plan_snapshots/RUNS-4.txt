@@ -1,13 +1,15 @@
 DataFusion:
-Sort: test_steps DESC NULLS LAST, m.trace_id ASC NULLS LAST, fetch=50
-  Projection: m.trace_id, count(Int64(1)) AS count(*) AS test_steps
-    Filter: count(Int64(1)) >= Int64(3)
-      Aggregate: groupBy=[[m.trace_id]], aggr=[[count(Int64(1))]]
-        ModelRegion
-          SubqueryAlias: m
-            Projection: issue_messages.trace_id, issue_messages.content, issue_messages.id
-              Filter: issue_messages.role = Utf8("assistant")
-                TableScan: issue_messages projection=[trace_id, role, content, id]
+SortPreservingMergeExec: [test_steps@1 DESC NULLS LAST, trace_id@0 ASC NULLS LAST], fetch=50
+  ProjectionExec: expr=[trace_id@0 as trace_id, count(Int64(1))@1 as test_steps]
+    SortExec: TopK(fetch=50), expr=[count(Int64(1))@1 DESC NULLS LAST, trace_id@0 ASC NULLS LAST], preserve_partitioning=[true]
+      FilterExec: count(Int64(1))@1 >= 3
+        AggregateExec: mode=FinalPartitioned, gby=[trace_id@0 as trace_id], aggr=[count(Int64(1))]
+          RepartitionExec: partitioning=Hash([trace_id@0], 4), input_partitions=4
+            AggregateExec: mode=Partial, gby=[trace_id@0 as trace_id], aggr=[count(Int64(1))]
+              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                ModelRegionExec
+                  FilterExec: role@1 = assistant, projection=[trace_id@0, content@2, id@3]
+                    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

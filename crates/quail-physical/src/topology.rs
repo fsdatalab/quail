@@ -300,7 +300,6 @@ impl PhysicalNode {
             PhysicalNode::Filter(node) => {
                 let attributes = &node.attributes;
                 match attributes.aliases.as_slice() {
-                    [] => vec![rows("rows".into(), attributes.columns.clone())],
                     [alias] => vec![
                         rows(format!("rows:{alias}"), Vec::new()),
                         output(
@@ -354,10 +353,9 @@ impl PhysicalNode {
                     ),
                 ]
             }
-            PhysicalNode::Project(_)
-            | PhysicalNode::Sort(_)
-            | PhysicalNode::Unnest(_)
-            | PhysicalNode::Limit(_) => vec![rows("rows".into(), self.output_schema())],
+            PhysicalNode::Project(_) | PhysicalNode::Limit(_) => {
+                vec![rows("rows".into(), self.output_schema())]
+            }
             PhysicalNode::Recombine(_) => vec![rows("tuples".into(), self.output_schema())],
             PhysicalNode::RequestExecution(node) => request_outputs(&node.attributes),
             PhysicalNode::Extension(node) => node.outputs.clone(),
@@ -395,9 +393,6 @@ impl PhysicalNode {
     /// the GPU executor; every other node on the coordinator.
     pub fn location(&self) -> Location {
         match self {
-            PhysicalNode::Filter(node) if node.attributes.aliases.is_empty() => {
-                Location::Coordinator
-            }
             PhysicalNode::Filter(_)
             | PhysicalNode::AiFilter(_)
             | PhysicalNode::AiJoin(_)
@@ -434,11 +429,6 @@ impl PhysicalNode {
                     }
                 }
                 out
-            }
-            PhysicalNode::Sort(node) => node.attributes.columns.clone(),
-            PhysicalNode::Unnest(node) => node.attributes.columns.clone(),
-            PhysicalNode::Filter(node) if node.attributes.aliases.is_empty() => {
-                node.attributes.columns.clone()
             }
             PhysicalNode::Recombine(node) => node.attributes.alias_order.clone(),
             _ => Vec::new(),

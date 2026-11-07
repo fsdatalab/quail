@@ -1,12 +1,14 @@
 DataFusion:
-Sort: flagged DESC NULLS LAST, w.model ASC NULLS LAST
-  Projection: w.model, count(Int64(1)) AS count(*) AS flagged
-    Aggregate: groupBy=[[w.model]], aggr=[[count(Int64(1))]]
-      ModelRegion
-        SubqueryAlias: w
-          Projection: wrench_runs.model, wrench_runs.transcript, wrench_runs.id
-            Filter: wrench_runs.mode = Utf8("baseline")
-              TableScan: wrench_runs projection=[model, mode, transcript, id]
+SortPreservingMergeExec: [flagged@1 DESC NULLS LAST, model@0 ASC NULLS LAST]
+  ProjectionExec: expr=[model@0 as model, count(Int64(1))@1 as flagged]
+    SortExec: expr=[count(Int64(1))@1 DESC NULLS LAST, model@0 ASC NULLS LAST], preserve_partitioning=[true]
+      AggregateExec: mode=FinalPartitioned, gby=[model@0 as model], aggr=[count(Int64(1))]
+        RepartitionExec: partitioning=Hash([model@0], 4), input_partitions=4
+          AggregateExec: mode=Partial, gby=[model@0 as model], aggr=[count(Int64(1))]
+            RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+              ModelRegionExec
+                FilterExec: mode@1 = baseline, projection=[model@0, transcript@2, id@3]
+                  DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

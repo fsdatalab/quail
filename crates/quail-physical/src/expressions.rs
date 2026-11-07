@@ -233,22 +233,6 @@ tagged_struct! {
     }
 }
 
-/// What a sort key orders by.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SortExpression {
-    Value(ValueExpression),
-}
-
-tagged_struct! {
-    /// One `ORDER BY` key.
-    SortKey(SortKeyFields, SortKeyTagged) = "quail.common.expressions.SortKey" | "quail.logical.expressions.SortKey" {
-        expression: SortExpression,
-        descending: bool,
-        nulls_first: bool,
-    }
-}
-
 tagged_struct! {
     /// The struct column of an `AI.EXTRACT` call and its fields.
     ExtractStruct(ExtractStructFields, ExtractStructTagged) = "quail.common.expressions.ExtractStruct" | "quail.logical.expressions.ExtractStruct" {

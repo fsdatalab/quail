@@ -71,10 +71,10 @@ literal as `\n`, so each node stays on one line.
 DataFusion parses and binds the SQL. Quail's analyzer rule
 `lower_ai_calls` runs first. It finds each part of the query that
 Quail plans: the operators that call the model, with the filters and
-joins below them and a LIMIT or DISTINCT that can stop the model early
-(`crates/quail-datafusion/src/claim.rs`). DataFusion keeps the
-operators above that part, such as GROUP BY, windows, and an ORDER BY
-without a LIMIT, and moves their AI calls into the part's SELECT list.
+joins below them (`crates/quail-datafusion/src/claim.rs`). DataFusion
+keeps the operators above that part, such as GROUP BY, windows, ORDER
+BY, LIMIT, and DISTINCT, and moves their AI calls into the part's
+SELECT list.
 The rule then lowers each AI call in the part into one `AiNode`
 (`crates/quail-datafusion/src/lower.rs`):
 
@@ -158,10 +158,29 @@ Each `AiNode` tells DataFusion's rules what they may do around it:
 
 The last optimizer rule, `claim_model_regions`, runs the rules before
 it until the plan stops changing, then replaces each part that holds
-`AiNode`s with one `ModelRegion`: the `AiNode`s and the operators
-around them that Quail plans. A part DataFusion computes for the
-region, such as a table's plain filters or a CTE that groups rows,
-becomes one of the region's inputs.
+`AiNode`s with one `ModelRegion`: the `AiNode`s and the operators that
+run with them on the GPU. These are the row-at-a-time expressions
+between AI calls, the joins the AI operators need, and the scans. A
+part DataFusion computes for the region, such as a table's plain
+filters or a CTE that groups rows, becomes one of the region's inputs.
+
+The region returns its rows: ids, answers, and the input columns the
+operators above it read. DataFusion runs the rest of the part above
+the region (`crates/quail-datafusion/src/lift.rs`):
+
+- each `UNNEST` of an `AI.SAE_FEATURES` list, as DataFusion's `Unnest`
+  of the list column the region returns;
+- each test of the result rows: a test of more than one table's
+  columns, which needs every model call's answer first, or of an
+  unnested list's fields;
+- the SELECT list's expressions other than its columns and model calls;
+- every ORDER BY, LIMIT, OFFSET, DISTINCT, GROUP BY, and window.
+
+A LIMIT stops the model early only through a fetch. Either the rules
+above made it the fetch of the region's last `AiNode`, or it sits
+directly above the region with only projections between, and the
+region gets it as its own fetch (`ModelRegion: fetch=k`). An ORDER BY
+with a LIMIT reads every row the region returns.
 
 Finally, `derive` (`crates/quail-datafusion/src/derive.rs`) reads the
 region's operators from the optimized plan. It walks the plan once,
@@ -170,7 +189,7 @@ prompt and each condition is bound in the order the query wrote them
 (`binding.rs`), from each `AiNode`'s call, written place, and tests.
 Each column operator takes its SELECT alias or a name of its own, and
 each condition is placed at a table's scan, after the operator that
-computes the columns it reads, or on the result rows. Then `derive`
+computes the columns it reads. Then `derive`
 writes the region's `Operators` in the plan's order: each `AiNode` is
 one AI filter, AI join, gate, or column operator where the rules left
 it.
@@ -196,18 +215,17 @@ cross into Python as JSON (`Query.operators`).
 | `joins` | Each AI join or EXISTS gate: its predicate, semantics (`full`, `exists`, or `anti`), selectivity, anchor, and the ON equalities below it. |
 | `classifies`, `extracts`, `sae_features`, `maps` | Each column operator: its model call, its answer column, and whether it runs above a join. |
 | `column_filters` | Each table's tests of answer columns, such as `sentiment IN ('negative')`. |
-| `projection` | The SELECT list, with each extraction's struct columns. |
-| `result` | ORDER BY, DISTINCT, OFFSET, and a LIMIT that is not a fetch. |
-| `fetch` | The fetch of the region's last `AiNode`: the rows a LIMIT and its OFFSET need, after which the executor stops. |
+| `projection` | The columns the region returns, with each extraction's struct columns. |
+| `fetch` | The most rows the region returns: the fetch of its last `AiNode`, or of a LIMIT directly above it, with its OFFSET. The executor stops once that many rows pass. |
 | `stop_keys` | Each table's per-key fetch, when the region asks only that table's AI.IF filters. |
-| `after_projection` | The operators on result rows above the SELECT list: each `UNNEST`, each test of more than one table's columns, and the outer SELECT list. |
 
 A query joining three or more tables has one join for each binary
 join. A classification may read one document or both documents of a
-joined pair. Conditions on labels of joined pairs are unsupported.
+joined pair. DataFusion tests the label of a joined pair on the rows
+the region returns.
 
-GROUP BY, HAVING, and windows have no operator here: DataFusion runs
-them on the rows a model region returns, or computes them as a region's
+ORDER BY, LIMIT, DISTINCT, GROUP BY, HAVING, and windows have no
+operator here: DataFusion runs them on the rows a model region returns, or computes them as a region's
 input. For example, a CTE that numbers a filter's survivors with
 `ROW_NUMBER()`, read by a second AI filter, becomes two regions: the
 first filter, then DataFusion's window, then the second filter, which

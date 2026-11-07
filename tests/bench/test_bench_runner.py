@@ -166,8 +166,8 @@ def test_relational_plans_build_and_run(tmp_path):
         grouped = build_query(sess, get_query("REL-AGENT-6"))
         assert not grouped.whole
         explained = grouped.explain()
-        assert "Aggregate: groupBy=[[t.trajectory_id]]" in explained
-        assert "Filter: count(Int64(1)) >= Int64(2)" in explained
+        assert "gby=[trajectory_id@0 as trajectory_id]" in explained
+        assert "FilterExec: count(Int64(1))@1 >= 2" in explained
         assert "fetch=50" in explained
         assert operators_of(grouped).scans
         # the plain tests run in DataFusion, before the model reads a row
@@ -175,23 +175,26 @@ def test_relational_plans_build_and_run(tmp_path):
         (scan,) = operators_of(tested).scans
         assert scan.predicates == ()
         explained = tested.explain()
-        assert "turn_index >= Int64(10)" in explained
-        assert "token_count <= Int64(6000)" in explained
-        paged = operators_of(build_query(sess, get_query("REL-AGENT-2"))).result
-        assert (paged.limit, paged.offset) == (10, 10)
-        top = operators_of(build_query(sess, get_query("REL-AGENT-4")))
-        assert [column.name for column in top.projection.columns
+        assert "turn_index@2 >= 10" in explained
+        assert "token_count@3 <= 6000" in explained
+        # DataFusion sorts, skips, and limits the region's rows
+        paged = build_query(sess, get_query("REL-AGENT-2"))
+        assert operators_of(paged).fetch is None
+        explained = paged.explain()
+        assert "GlobalLimitExec: skip=10, fetch=10" in explained
+        assert "SortExec: TopK(fetch=20)" in explained
+        top = build_query(sess, get_query("REL-AGENT-4"))
+        assert [column.name for column in operators_of(top).projection.columns
                 if hasattr(column, "name")] == ["recovered_score"]
-        assert top.result.order[0].name == "recovered_score"
-        assert top.result.limit == 20
+        assert "TopK(fetch=20), expr=[recovered_score@1 DESC" in top.explain()
         # an aggregate with no measures is a DISTINCT, which the filter
         # stops per trajectory
         query = build_query(sess, get_query("REL-AGENT-3"))
-        distinct = operators_of(query)
-        assert distinct.result.distinct and [
-            column.column for column in distinct.projection.columns
-        ] == ["trajectory_id"]
-        assert "stop per key: trajectory_id" in query.explain()
+        assert [column.column for column in operators_of(query).projection.columns
+                ] == ["trajectory_id"]
+        explained = query.explain()
+        assert "gby=[trajectory_id@0 as trajectory_id], aggr=[]" in explained
+        assert "stop per key: trajectory_id" in explained
 
         # the fixes: s0, s1 (A), s2, s4 (B), s5 (C): A and B twice
         oracle = Oracle(filters=lambda alias, document, position: document != 3)

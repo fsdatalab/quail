@@ -1,4 +1,4 @@
-"""The Filter runtime: documents on the GPU executor, result rows on the coordinator."""
+"""The Filter runtime: a condition on documents, on the GPU executor."""
 
 from __future__ import annotations
 
@@ -9,45 +9,27 @@ from pyarrow import compute as pc
 from quail.common.expressions import accepts
 from quail.common.pairs import columns_key
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import QueryResult, answer_table, filter_answer_table
+from quail.execution.result import answer_table, filter_answer_table
 from quail.execution.rows import Rows
-from quail.execution.runtimes.relational import row_batches
 from quail.physical import Filter
 
 
 class FilterRuntime:
     """Keep the rows that pass the predicate.
 
-    A filter with aliases reads a score, label, or answer table and also
-    returns its answers; one without reads result rows.
+    It reads a score, label, or answer table and also returns its answers.
     """
 
     def execute(self, node, inputs, context) -> NodeResult:
         if not isinstance(node, Filter):
             raise TypeError(type(node).__name__)
         values = [inputs[port.name] for port in node.inputs]
-        if not node.aliases:
-            if len(values) != 1:
-                raise ValueError("a Filter on result rows needs one input")
-            return filter_result_rows(node, values[0])
         rows, others = values[0], values[1:]
         if all(name in rows.column_names for name in node.tested_columns):
             return filter_scores(node, rows)
         sources = context.sources.get(columns_key(node.aliases[0]))
         return filter_scores(node, rows, tested_table(
             node, rows, lambda name, ids: _read(name, ids, node, others, sources)))
-
-
-def filter_result_rows(node, value) -> NodeResult:
-    """Keep the result rows whose predicate holds, one batch at a time."""
-    num_rows, batches = 0, []
-    for batch in row_batches(value):
-        num_rows += batch.num_rows
-        kept = accepts(node.predicate, batch, qualified=True)
-        batches.append(batch.filter(kept).select(list(node.columns)))
-    table = pa.Table.from_batches(batches)
-    return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
-        input_rows=num_rows, output_rows=table.num_rows))
 
 
 def _filter_answer_table(node: Filter, rows: Rows, answers) -> pa.Table:

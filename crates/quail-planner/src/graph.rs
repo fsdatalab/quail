@@ -781,7 +781,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 aliases: aliases.to_vec(),
                 selectivity,
                 written_position: position as i64,
-                columns: Vec::new(),
             },
         )));
         port_of(&node_id, rows_port)
@@ -1036,7 +1035,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         aliases: vec![alias.to_string()],
                         selectivity: test.selectivity,
                         written_position: test.position as i64,
-                        columns: Vec::new(),
                     },
                 }));
                 port = port_of(&filter_id, format!("rows:{alias}"));

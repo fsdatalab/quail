@@ -1,9 +1,7 @@
 DataFusion:
-ModelRegion
-  SubqueryAlias: u
-    Projection: support_messages.id, support_messages.content, support_messages.prev_assistant_id
-      Filter: support_messages.role = Utf8("user")
-        TableScan: support_messages projection=[id, role, content, prev_assistant_id]
+ModelRegionExec
+  FilterExec: role@1 = user, projection=[id@0, content@2, prev_assistant_id@3]
+    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

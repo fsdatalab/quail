@@ -39,7 +39,7 @@ def test_group_by_runs_on_the_result(session):
                                 ("fr", 1, 4.0, 4)]
     # DataFusion groups the rows the model region returns
     explained = result.explain()
-    assert "Aggregate: groupBy=[[r.lang]]" in explained
+    assert "AggregateExec: mode=FinalPartitioned, gby=[lang@0 as lang]" in explained
     assert explained.index("ModelRegion") < explained.index("model region:")
 
     whole = _run(session.sql("""

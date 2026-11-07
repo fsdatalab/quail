@@ -8,16 +8,16 @@
 
 use quail_physical::{
     LimitAttributes, Node, PhysicalNode, PortRef, ProjectAttributes, RecombineAttributes,
-    ScanAttributes, SortAttributes, input_ports, port,
+    ScanAttributes, input_ports, port,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::context::PlanningContext;
 use crate::expressions::{
-    CompileError, Refusal, aliased_call, argument_alias, call_aliases, projected_name, sort_name,
+    CompileError, Refusal, aliased_call, argument_alias, call_aliases, projected_name,
 };
-use crate::expressions::{asked_call, packed_columns, packing};
+use crate::expressions::{asked_call, packing};
 use crate::graph::has_label;
 use crate::lowering::answer_ids;
 use crate::operators::{Operators, SemanticColumn};
@@ -239,20 +239,6 @@ fn refusal(
     decides: bool,
 ) -> Result<Option<Refusal>, CompileError> {
     let backend = &settings.backend_name;
-    let root = &found.result;
-    let columns = &found.projection.columns;
-    let projected: Vec<String> = columns.iter().map(projected_name).collect();
-    if root
-        .order
-        .iter()
-        .any(|key| !projected.contains(&sort_name(&key.expression)))
-    {
-        return Ok(refuse(
-            "ORDER BY on a column the query does not return runs on the Quail backend only".into(),
-            "sort_needs_quail_backend".into(),
-            "backends",
-        ));
-    }
     let tests = || found.column_filters.iter().flat_map(|(_, tests)| tests);
     if tests().any(|test| test.call.kind == "label" && test.labels.is_none()) {
         return Ok(refuse(
@@ -296,7 +282,7 @@ fn refusal(
             return Ok(refusal);
         }
     }
-    if columns.iter().any(|column| match column {
+    if found.projection.columns.iter().any(|column| match column {
         quail_physical::Projected::Expression(expression) => {
             aliased_call(expression, &[]).is_some_and(|call| call.probabilities)
         }
@@ -749,32 +735,12 @@ fn result_nodes(
         attributes: ProjectAttributes {
             columns: columns.clone(),
             structs: structs_value(&structs),
-            expressions: None,
             sources,
             answers,
         },
     }));
-    let root = &found.result;
     let mut last = port("project", "rows");
-    if !root.order.is_empty() || root.distinct || root.offset != 0 {
-        // the coordinator sorts the returned rows, as on the Quail backend
-        nodes.push(PhysicalNode::Sort(Node {
-            id: "sort".into(),
-            inputs: input_ports(&[port("project", "rows")]),
-            attributes: SortAttributes {
-                keys: root
-                    .order
-                    .iter()
-                    .map(|key| (sort_name(&key.expression), key.descending, key.nulls_first))
-                    .collect(),
-                columns: packed_columns(columns, &structs),
-                distinct: root.distinct,
-                offset: root.offset,
-                fetch: root.limit,
-            },
-        }));
-        last = port("sort", "rows");
-    } else if let Some(limit) = found.limit() {
+    if let Some(limit) = found.fetch {
         nodes.push(PhysicalNode::Limit(Node {
             id: "limit".into(),
             inputs: input_ports(&[port("project", "rows")]),

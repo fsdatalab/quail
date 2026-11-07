@@ -96,7 +96,11 @@ impl DisplayAs for ModelRegionExec {
     fn fmt_as(&self, format: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ModelRegionExec")
+                write!(f, "ModelRegionExec")?;
+                match self.fetch.or(self.region.fetch) {
+                    Some(fetch) => write!(f, ": fetch={fetch}"),
+                    None => Ok(()),
+                }
             }
             DisplayFormatType::TreeRender => write!(f, ""),
         }

@@ -59,7 +59,7 @@ def test_regular_predicates_select_documents_before_the_model(session):
     scan = next(node for node in plan.nodes if type(node).__name__ == "Scan")
     assert scan.num_documents == 3
     explained = query.explain()
-    assert "stars >= Int64(3)" in explained
+    assert "stars@2 >= 3" in explained
     result = _run(query, execute)
     assert seen == [3]
     assert result.to_rows() == [("r0",)]
@@ -158,9 +158,9 @@ def test_an_or_over_two_tables_runs_on_the_result_rows(session):
         WHERE r.stars > 4 OR p.price > 15
         ORDER BY r.id, p.asin
     """)
-    # DataFusion computes each table's side; the region tests the OR of them
-    assert [str(condition) for condition in row_tests(operators_of(query))] == [
-        "r.__quail_expr_0 OR p.__quail_expr_1"]
+    # DataFusion computes each table's side, and tests the OR of them on
+    # the region's rows
+    assert row_tests(query) == ["__quail_expr_0 OR __quail_expr_1"]
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     # every pair with p1, and r0 and r5 (5 stars) with p0; r3's null
     # stars with p1 is NULL OR TRUE, which is true
@@ -235,8 +235,7 @@ def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
         WHERE r.stars > p.price
         ORDER BY r.id, p.asin
     """)
-    assert [str(condition) for condition in row_tests(operators_of(query))] == [
-        "r.stars > p.price"]
+    assert row_tests(query) == ["stars > price"]
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     assert result.to_rows() == [
         ("r0", "p0"), ("r0", "p1"), ("r2", "p0"), ("r5", "p0"), ("r5", "p1")]
@@ -329,7 +328,7 @@ def test_order_by_group_by_on_and_prompt_take_expressions(session):
         ORDER BY r.id""")
     # DataFusion computes the key before the region; the region joins on it
     explained = query.explain()
-    assert "upper(btrim(r.lang)) AS __quail_expr_0" in explained
+    assert "upper(btrim(lang@2)) as __quail_expr_0" in explained
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     assert result.to_rows() == [("r0", "EN"), ("r1", "EN"), ("r2", "FR"),
                                 ("r3", "EN"), ("r4", "EN")]
