@@ -2,23 +2,11 @@ logical:
   Projection: d.id, s.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Is the passage in DOCUMENT {1} cited by the legal excerpt in DOCUMENT {0}?"), d.destination_context, s.passage_text), named_struct(Utf8("selectivity"), Float64(0.0023094688221709007))), filter: __quail_answer_1, returns: []
       Cross Join:
-        AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the excerpt above whether it discusses a procedural or jurisdictional issue.
-  
-  {0}
-  
-  Instruction: answer TRUE if the excerpt discusses a procedural or jurisdictional issue, FALSE otherwise."), d.destination_context), named_struct(Utf8("selectivity"), Float64(0.458))), filter: __quail_answer_3, returns: []
-          AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the excerpt above whether it argues that the cited case's reasoning does not apply here.
-  
-  {0}
-  
-  Instruction: answer TRUE if the excerpt argues the cited case's reasoning does not apply here, FALSE otherwise."), d.destination_context), named_struct(Utf8("selectivity"), Float64(0.028))), filter: __quail_answer_2, returns: []
+        AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the excerpt above whether it discusses a procedural or jurisdictional issue.\n\n{0}\n\nInstruction: answer TRUE if the excerpt discusses a procedural or jurisdictional issue, FALSE otherwise."), d.destination_context), named_struct(Utf8("selectivity"), Float64(0.458))), filter: __quail_answer_3, returns: []
+          AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the excerpt above whether it argues that the cited case's reasoning does not apply here.\n\n{0}\n\nInstruction: answer TRUE if the excerpt argues the cited case's reasoning does not apply here, FALSE otherwise."), d.destination_context), named_struct(Utf8("selectivity"), Float64(0.028))), filter: __quail_answer_2, returns: []
             SubqueryAlias: d
               TableScan: citation_contexts projection=[id, destination_context]
-        AiNode: __quail_answer_4 = ai_filter(prompt(Utf8("Judge strictly from the passage above whether it states a general legal rule.
-  
-  {0}
-  
-  Instruction: answer TRUE if the passage states a general legal rule, FALSE otherwise."), s.passage_text), named_struct(Utf8("selectivity"), Float64(0.8106235565819861))), filter: __quail_answer_4, returns: []
+        AiNode: __quail_answer_4 = ai_filter(prompt(Utf8("Judge strictly from the passage above whether it states a general legal rule.\n\n{0}\n\nInstruction: answer TRUE if the passage states a general legal rule, FALSE otherwise."), s.passage_text), named_struct(Utf8("selectivity"), Float64(0.8106235565819861))), filter: __quail_answer_4, returns: []
           SubqueryAlias: s
             TableScan: citation_passages projection=[id, passage_text]
 

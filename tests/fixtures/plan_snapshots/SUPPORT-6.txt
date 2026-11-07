@@ -12,9 +12,7 @@ Sort: mean_reward DESC NULLS LAST, outcome ASC NULLS LAST
 model region:
 logical:
   Projection: t.reward, outcome
-    AiNode: outcome = ai_classify(prompt(Utf8("Judge strictly from the conversation above how the agent handled the customer's request.
-  
-  {0}"), t.transcript), make_array(struct(Utf8("completed the request"), Utf8("did what the customer asked")), struct(Utf8("refused under policy"), Utf8("declined the request citing policy and did nothing else")), struct(Utf8("offered an alternative"), Utf8("did not do what was asked but proposed and carried out something else")), struct(Utf8("transferred to a human"), Utf8("handed the customer to a human agent")), struct(Utf8("unresolved"), Utf8("the conversation ended with the request neither handled nor refused"))))
+    AiNode: outcome = ai_classify(prompt(Utf8("Judge strictly from the conversation above how the agent handled the customer's request.\n\n{0}"), t.transcript), make_array(struct(Utf8("completed the request"), Utf8("did what the customer asked")), struct(Utf8("refused under policy"), Utf8("declined the request citing policy and did nothing else")), struct(Utf8("offered an alternative"), Utf8("did not do what was asked but proposed and carried out something else")), struct(Utf8("transferred to a human"), Utf8("handed the customer to a human agent")), struct(Utf8("unresolved"), Utf8("the conversation ended with the request neither handled nor refused"))))
       SubqueryAlias: t
         TableScan: support_traces projection=[transcript, reward]
 

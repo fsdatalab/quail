@@ -3,9 +3,7 @@ logical:
     Sort: c.id ASC NULLS LAST
       Projection: c.id, contract, contract_span
         AiNode: contract = ai_extract(c.text, named_struct(Utf8("expiration_date"), Utf8("On what date will the contract's initial term expire?")))
-          AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}
-  
-  Can a party terminate this  contract without cause (solely by giving a notice and allowing a waiting  period to expire)?"), c.text), named_struct(Utf8("selectivity"), Float64(0.3273942093541203))), filter: __quail_answer_1, returns: []
+          AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nCan a party terminate this  contract without cause (solely by giving a notice and allowing a waiting  period to expire)?"), c.text), named_struct(Utf8("selectivity"), Float64(0.3273942093541203))), filter: __quail_answer_1, returns: []
             SubqueryAlias: c
               TableScan: contracts projection=[id, text]
 

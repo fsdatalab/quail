@@ -2,9 +2,7 @@ logical:
   Projection: c.id, k.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("DOCUMENT {1} names a clause type and the question its labelers answered. Judge strictly from the contract in DOCUMENT {0} whether the answer to that question for this contract is yes."), c.text, k.question), named_struct(Utf8("selectivity"), Float64(0.19281905918876965))), filter: __quail_answer_1, returns: []
       Cross Join:
-        AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}
-  
-  Does one party have the right to terminate or is consent or notice required of the counterparty if such party undergoes a change of control, such as a merger, stock sale, transfer of all or substantially all of its assets or business, or assignment by operation of law?"), c.text), named_struct(Utf8("selectivity"), Float64(0.19599109131403117))), filter: __quail_answer_2, returns: []
+        AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}\n\nDoes one party have the right to terminate or is consent or notice required of the counterparty if such party undergoes a change of control, such as a merger, stock sale, transfer of all or substantially all of its assets or business, or assignment by operation of law?"), c.text), named_struct(Utf8("selectivity"), Float64(0.19599109131403117))), filter: __quail_answer_2, returns: []
           SubqueryAlias: c
             TableScan: contracts projection=[id, text]
         SubqueryAlias: k

@@ -63,7 +63,8 @@ f_g = CASE WHEN g THEN f END
 
 The call's function names the node's kind: `ai_filter` (`AI.IF`),
 `ai_score`, `ai_classify`, `ai_extract`, `ai_map`, or
-`ai_sae_features`.
+`ai_sae_features`. The plan's text writes a line break in a prompt
+literal as `\n`, so each node stays on one line.
 
 ## From SQL to a plan
 

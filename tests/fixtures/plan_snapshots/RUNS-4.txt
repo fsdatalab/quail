@@ -11,11 +11,7 @@ Sort: test_steps DESC NULLS LAST, m.trace_id ASC NULLS LAST, fetch=50
 model region:
 logical:
   Projection: m.trace_id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent step above whether it runs the project's tests or a reproduction script.
-  
-  {0}
-  
-  Instruction: answer TRUE if the step runs tests or a reproduction script, FALSE otherwise."), m.content), named_struct(Utf8("selectivity"), Float64(0.2946534217550425))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent step above whether it runs the project's tests or a reproduction script.\n\n{0}\n\nInstruction: answer TRUE if the step runs tests or a reproduction script, FALSE otherwise."), m.content), named_struct(Utf8("selectivity"), Float64(0.2946534217550425))), filter: __quail_answer_1, returns: []
       SubqueryAlias: m
         TableScan: issue_messages__m projection=[trace_id, content]
 

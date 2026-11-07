@@ -1,12 +1,8 @@
 logical:
   Projection: c.id, contract, contract_span
     AiNode: contract = ai_extract(c.text, named_struct(Utf8("liability_cap"), Utf8("Does the contract include a cap on liability upon the breach of a party’s obligation? This includes time limitation for the counterparty to bring claims or maximum amount for recovery.")))
-      AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}
-  
-  Is there a requirement for insurance that must be maintained by one party for the benefit of the counterparty?"), c.text), named_struct(Utf8("selectivity"), Float64(0.26280623608017817))), filter: __quail_answer_2, returns: []
-        AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}
-  
-  Does the contract include a cap on liability upon the breach of a party’s obligation? This includes time limitation for the counterparty to bring claims or maximum amount for recovery."), c.text), named_struct(Utf8("selectivity"), Float64(0.48997772828507796))), filter: __quail_answer_1, returns: []
+      AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}\n\nIs there a requirement for insurance that must be maintained by one party for the benefit of the counterparty?"), c.text), named_struct(Utf8("selectivity"), Float64(0.26280623608017817))), filter: __quail_answer_2, returns: []
+        AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nDoes the contract include a cap on liability upon the breach of a party’s obligation? This includes time limitation for the counterparty to bring claims or maximum amount for recovery."), c.text), named_struct(Utf8("selectivity"), Float64(0.48997772828507796))), filter: __quail_answer_1, returns: []
           SubqueryAlias: c
             TableScan: contracts projection=[id, text]
 

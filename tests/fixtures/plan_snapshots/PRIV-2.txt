@@ -2,16 +2,8 @@ logical:
   Projection: p.id, s.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Based on the privacy policy in DOCUMENT {0}, could the situation described in DOCUMENT {1} happen to a user of this service?"), p.policy_text, s.scenario)), filter: __quail_answer_1, returns: []
       Cross Join:
-        AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the policy above whether this service would keep track of the user's physical location, even when the user is not actively using the service.
-  
-  {0}
-  
-  Instruction: answer TRUE if the service would track the user's location while they are not using it, FALSE otherwise."), p.policy_text)), filter: __quail_answer_3, returns: []
-          AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the policy above whether, if a user sent a private message through this service, an employee of the company could read it.
-  
-  {0}
-  
-  Instruction: answer TRUE if an employee could read the user's private messages, FALSE otherwise."), p.policy_text)), filter: __quail_answer_2, returns: []
+        AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the policy above whether this service would keep track of the user's physical location, even when the user is not actively using the service.\n\n{0}\n\nInstruction: answer TRUE if the service would track the user's location while they are not using it, FALSE otherwise."), p.policy_text)), filter: __quail_answer_3, returns: []
+          AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the policy above whether, if a user sent a private message through this service, an employee of the company could read it.\n\n{0}\n\nInstruction: answer TRUE if an employee could read the user's private messages, FALSE otherwise."), p.policy_text)), filter: __quail_answer_2, returns: []
             SubqueryAlias: p
               TableScan: policies projection=[id, policy_text]
         SubqueryAlias: s

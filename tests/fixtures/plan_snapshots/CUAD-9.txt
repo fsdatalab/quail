@@ -1,12 +1,8 @@
 logical:
   Projection: c.id, contract, contract_span
     AiNode: contract = ai_extract(c.text, named_struct(Utf8("license_grant"), Utf8("Does the contract contain a license granted by one party to its counterparty?")))
-      AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}
-  
-  Does the contract limit the ability of a party to transfer the license being granted to a third party?"), c.text), named_struct(Utf8("selectivity"), Float64(0.24053452115812918))), filter: __quail_answer_2, returns: []
-        AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}
-  
-  Does the contract contain a license granted by one party to its counterparty?"), c.text), named_struct(Utf8("selectivity"), Float64(0.46547884187082406))), filter: __quail_answer_1, returns: []
+      AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}\n\nDoes the contract limit the ability of a party to transfer the license being granted to a third party?"), c.text), named_struct(Utf8("selectivity"), Float64(0.24053452115812918))), filter: __quail_answer_2, returns: []
+        AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nDoes the contract contain a license granted by one party to its counterparty?"), c.text), named_struct(Utf8("selectivity"), Float64(0.46547884187082406))), filter: __quail_answer_1, returns: []
           SubqueryAlias: c
             TableScan: contracts projection=[id, text]
 

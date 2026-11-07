@@ -1,13 +1,7 @@
 logical:
   Projection: t.id, progress
-    AiNode: progress = ai_classify(prompt(Utf8("Judge strictly from the agent trace above how far the agent has gotten so far.
-  
-  {0}"), t.trace), make_array(struct(Utf8("has not located the relevant code"), Utf8("has not yet found the code that causes the issue")), struct(Utf8("located the relevant code"), Utf8("found the code that causes the issue but has not changed it")), struct(Utf8("changed the code, not checked"), Utf8("edited the code but has not run a test or reproduction since")), struct(Utf8("changed the code, check passes"), Utf8("edited the code and the latest test or reproduction run succeeds")), struct(Utf8("changed the code, check fails"), Utf8("edited the code and the latest test or reproduction run still fails"))))
-      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether the agent recovered after pursuing an approach that did not work. Recovery means the agent recognized or moved past the unsuccessful approach and then made useful progress with a different or corrected approach.
-  
-  {0}
-  
-  Instruction: answer TRUE if the trace shows the agent recovering after an unsuccessful approach, FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3216704288939052))), filter: __quail_answer_1, returns: []
+    AiNode: progress = ai_classify(prompt(Utf8("Judge strictly from the agent trace above how far the agent has gotten so far.\n\n{0}"), t.trace), make_array(struct(Utf8("has not located the relevant code"), Utf8("has not yet found the code that causes the issue")), struct(Utf8("located the relevant code"), Utf8("found the code that causes the issue but has not changed it")), struct(Utf8("changed the code, not checked"), Utf8("edited the code but has not run a test or reproduction since")), struct(Utf8("changed the code, check passes"), Utf8("edited the code and the latest test or reproduction run succeeds")), struct(Utf8("changed the code, check fails"), Utf8("edited the code and the latest test or reproduction run still fails"))))
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether the agent recovered after pursuing an approach that did not work. Recovery means the agent recognized or moved past the unsuccessful approach and then made useful progress with a different or corrected approach.\n\n{0}\n\nInstruction: answer TRUE if the trace shows the agent recovering after an unsuccessful approach, FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3216704288939052))), filter: __quail_answer_1, returns: []
         SubqueryAlias: t
           TableScan: agent_traces projection=[id, trace]
 

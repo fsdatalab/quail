@@ -245,6 +245,39 @@ impl AiNode {
     fn is_field(&self, name: &str) -> bool {
         self.fields.iter().any(|field| field.name() == name)
     }
+
+    /// Write the node's line in a plan's text, before line breaks are
+    /// escaped.
+    fn write_explain(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write!(f, "AiNode: ")?;
+        if self.semantics != Semantics::Rows {
+            write!(f, "{} ", self.semantics_name())?;
+        }
+        write!(f, "{} = {}", self.answer, self.call)?;
+        if let Some(guard) = &self.guard {
+            write!(f, ", guard: {guard}")?;
+        }
+        if let Some(filter) = &self.filter {
+            write!(f, ", filter: {filter}")?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(f, ", hint: {hint}")?;
+        }
+        match &self.fetch {
+            Some(Fetch::Global(n)) => write!(f, ", fetch: {n}")?,
+            Some(Fetch::PerKey { key, n }) => write!(f, ", fetch: {n} per [{}]", key.join(", "))?,
+            None => {}
+        }
+        if self.projection.is_some() {
+            let names: Vec<String> = self
+                .returned_fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect();
+            write!(f, ", returns: [{}]", names.join(", "))?;
+        }
+        Ok(())
+    }
 }
 
 impl PartialOrd for AiNode {
@@ -315,34 +348,10 @@ impl UserDefinedLogicalNodeCore for AiNode {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "AiNode: ")?;
-        if self.semantics != Semantics::Rows {
-            write!(f, "{} ", self.semantics_name())?;
-        }
-        write!(f, "{} = {}", self.answer, self.call)?;
-        if let Some(guard) = &self.guard {
-            write!(f, ", guard: {guard}")?;
-        }
-        if let Some(filter) = &self.filter {
-            write!(f, ", filter: {filter}")?;
-        }
-        if let Some(hint) = &self.hint {
-            write!(f, ", hint: {hint}")?;
-        }
-        match &self.fetch {
-            Some(Fetch::Global(n)) => write!(f, ", fetch: {n}")?,
-            Some(Fetch::PerKey { key, n }) => write!(f, ", fetch: {n} per [{}]", key.join(", "))?,
-            None => {}
-        }
-        if self.projection.is_some() {
-            let names: Vec<String> = self
-                .returned_fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect();
-            write!(f, ", returns: [{}]", names.join(", "))?;
-        }
-        Ok(())
+        // a prompt literal's line break would break the plan's indentation
+        let mut text = String::new();
+        self.write_explain(&mut text)?;
+        write!(f, "{}", text.replace('\r', "\\r").replace('\n', "\\n"))
     }
 
     fn with_exprs_and_inputs(

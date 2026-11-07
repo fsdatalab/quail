@@ -2,9 +2,7 @@ logical:
   Projection: d.id, area, s.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Is the passage in DOCUMENT {1} cited by the legal excerpt in DOCUMENT {0}?"), d.destination_context, s.passage_text), named_struct(Utf8("selectivity"), Float64(0.0023094688221709007))), filter: __quail_answer_1, returns: []
       Cross Join:
-        AiNode: area = ai_classify(prompt(Utf8("Judge strictly from the excerpt above which area of law it concerns.
-  
-  {0}"), d.destination_context), make_array(Utf8("constitutional law"), Utf8("criminal law"), Utf8("civil procedure"), Utf8("civil rights"), Utf8("contracts"), Utf8("torts"), Utf8("property"), Utf8("administrative law"), Utf8("employment law"), Utf8("intellectual property"), Utf8("tax law"), Utf8("family law"), Utf8("immigration law"), Utf8("bankruptcy"), Utf8("antitrust"))), filter: hint(area IN ([Utf8("constitutional law"), Utf8("criminal law")]), named_struct(Utf8("selectivity"), Float64(0.318)))
+        AiNode: area = ai_classify(prompt(Utf8("Judge strictly from the excerpt above which area of law it concerns.\n\n{0}"), d.destination_context), make_array(Utf8("constitutional law"), Utf8("criminal law"), Utf8("civil procedure"), Utf8("civil rights"), Utf8("contracts"), Utf8("torts"), Utf8("property"), Utf8("administrative law"), Utf8("employment law"), Utf8("intellectual property"), Utf8("tax law"), Utf8("family law"), Utf8("immigration law"), Utf8("bankruptcy"), Utf8("antitrust"))), filter: hint(area IN ([Utf8("constitutional law"), Utf8("criminal law")]), named_struct(Utf8("selectivity"), Float64(0.318)))
           SubqueryAlias: d
             TableScan: citation_contexts projection=[id, destination_context]
         SubqueryAlias: s

@@ -1,15 +1,7 @@
 logical:
   Projection: c.id
-    AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the sales call above whether the customer commits to buying, such as accepting the terms, agreeing to sign, or asking for the contract or paperwork. Interest, questions, or agreeing to another meeting do not count.
-  
-  {0}
-  
-  Instruction: answer TRUE if the customer commits to buying, FALSE otherwise."), c.transcript), named_struct(Utf8("selectivity"), Float64(0.03350253807106599))), filter: __quail_answer_2, returns: []
-      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the sales call above whether the sales rep offers the customer a discount, a lower price, or another price concession, such as free add-ons or better financing terms.
-  
-  {0}
-  
-  Instruction: answer TRUE if the sales rep offers a discount or price concession, FALSE otherwise."), c.transcript), named_struct(Utf8("selectivity"), Float64(0.10558375634517767))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the sales call above whether the customer commits to buying, such as accepting the terms, agreeing to sign, or asking for the contract or paperwork. Interest, questions, or agreeing to another meeting do not count.\n\n{0}\n\nInstruction: answer TRUE if the customer commits to buying, FALSE otherwise."), c.transcript), named_struct(Utf8("selectivity"), Float64(0.03350253807106599))), filter: __quail_answer_2, returns: []
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the sales call above whether the sales rep offers the customer a discount, a lower price, or another price concession, such as free add-ons or better financing terms.\n\n{0}\n\nInstruction: answer TRUE if the sales rep offers a discount or price concession, FALSE otherwise."), c.transcript), named_struct(Utf8("selectivity"), Float64(0.10558375634517767))), filter: __quail_answer_1, returns: []
         SubqueryAlias: c
           TableScan: sales_calls projection=[id, transcript]
 

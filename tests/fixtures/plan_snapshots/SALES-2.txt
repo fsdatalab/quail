@@ -11,9 +11,7 @@ Sort: n DESC NULLS LAST, concern ASC NULLS LAST
 model region:
 logical:
   Projection: concern
-    AiNode: concern = ai_classify(prompt(Utf8("Judge strictly from the sales call above which concern the customer raises most about the purchase.
-  
-  {0}"), c.transcript), make_array(struct(Utf8("price"), Utf8("the price, discounts, financing, or total cost")), struct(Utf8("security or compliance"), Utf8("data protection, security features, or regulatory compliance")), struct(Utf8("integration"), Utf8("working with the customer's existing systems, tools, or vehicles")), struct(Utf8("reliability or performance"), Utf8("whether the product scales, performs, or holds up over time")), struct(Utf8("support or service"), Utf8("support, maintenance, warranty, or after-sale service")), struct(Utf8("ease of use"), Utf8("how easy the product is to learn and use")), struct(Utf8("no concern"), Utf8("the customer raises no concern"))))
+    AiNode: concern = ai_classify(prompt(Utf8("Judge strictly from the sales call above which concern the customer raises most about the purchase.\n\n{0}"), c.transcript), make_array(struct(Utf8("price"), Utf8("the price, discounts, financing, or total cost")), struct(Utf8("security or compliance"), Utf8("data protection, security features, or regulatory compliance")), struct(Utf8("integration"), Utf8("working with the customer's existing systems, tools, or vehicles")), struct(Utf8("reliability or performance"), Utf8("whether the product scales, performs, or holds up over time")), struct(Utf8("support or service"), Utf8("support, maintenance, warranty, or after-sale service")), struct(Utf8("ease of use"), Utf8("how easy the product is to learn and use")), struct(Utf8("no concern"), Utf8("the customer raises no concern"))))
       SubqueryAlias: c
         TableScan: sales_calls projection=[transcript]
 

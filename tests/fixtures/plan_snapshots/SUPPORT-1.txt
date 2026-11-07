@@ -7,11 +7,7 @@ ModelRegion
 model region:
 logical:
   Projection: u.id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the customer message above whether the customer expresses frustration or dissatisfaction with the agent, such as repeating a request, objecting to a refusal, or complaining about the service.
-  
-  {0}
-  
-  Instruction: answer TRUE if the customer expresses frustration or dissatisfaction with the agent, FALSE otherwise."), u.content), named_struct(Utf8("selectivity"), Float64(0.022080185938407902))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the customer message above whether the customer expresses frustration or dissatisfaction with the agent, such as repeating a request, objecting to a refusal, or complaining about the service.\n\n{0}\n\nInstruction: answer TRUE if the customer expresses frustration or dissatisfaction with the agent, FALSE otherwise."), u.content), named_struct(Utf8("selectivity"), Float64(0.022080185938407902))), filter: __quail_answer_1, returns: []
       SubqueryAlias: u
         TableScan: support_messages__u projection=[id, content]
 

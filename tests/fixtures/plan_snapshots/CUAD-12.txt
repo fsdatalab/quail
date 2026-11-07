@@ -11,12 +11,8 @@ Sort: contracts DESC NULLS LAST, governing_law_state ASC NULLS LAST
 model region:
 logical:
   Projection: governing_law_state
-    AiNode: governing_law_state = ai_classify(prompt(Utf8("Judge strictly from the contract above which state's or country's law governs its interpretation.
-  
-  {0}"), c.text), make_array(struct(Utf8("New York"), Utf8("")), struct(Utf8("California"), Utf8("")), struct(Utf8("Delaware"), Utf8("")), struct(Utf8("Texas"), Utf8("")), struct(Utf8("Florida"), Utf8("")), struct(Utf8("another state or country"), Utf8("a governing law other than those five")), struct(Utf8("not stated"), Utf8("the contract names no governing law"))))
-      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}
-  
-  Is there a requirement for insurance that must be maintained by one party for the benefit of the counterparty?"), c.text), named_struct(Utf8("selectivity"), Float64(0.26280623608017817))), filter: __quail_answer_1, returns: []
+    AiNode: governing_law_state = ai_classify(prompt(Utf8("Judge strictly from the contract above which state's or country's law governs its interpretation.\n\n{0}"), c.text), make_array(struct(Utf8("New York"), Utf8("")), struct(Utf8("California"), Utf8("")), struct(Utf8("Delaware"), Utf8("")), struct(Utf8("Texas"), Utf8("")), struct(Utf8("Florida"), Utf8("")), struct(Utf8("another state or country"), Utf8("a governing law other than those five")), struct(Utf8("not stated"), Utf8("the contract names no governing law"))))
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nIs there a requirement for insurance that must be maintained by one party for the benefit of the counterparty?"), c.text), named_struct(Utf8("selectivity"), Float64(0.26280623608017817))), filter: __quail_answer_1, returns: []
         SubqueryAlias: c
           TableScan: contracts projection=[text]
 

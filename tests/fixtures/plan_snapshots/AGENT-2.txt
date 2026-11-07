@@ -1,10 +1,6 @@
 logical:
   Projection: t.id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.
-  
-  {0}
-  
-  Instruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3030474040632054))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3030474040632054))), filter: __quail_answer_1, returns: []
       SubqueryAlias: t
         TableScan: agent_traces projection=[id, trace]
 

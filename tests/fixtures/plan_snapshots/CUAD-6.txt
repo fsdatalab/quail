@@ -1,11 +1,7 @@
 logical:
   Projection: c.id
-    AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}
-  
-  Is there an exclusive dealing  commitment with the counterparty? This includes a commitment to procure all “requirements” from one party of certain technology, goods, or services or a prohibition on licensing or selling technology, goods or services to third parties, or a prohibition on  collaborating or working with other parties), whether during the contract or  after the contract ends (or both)."), c.text), named_struct(Utf8("selectivity"), Float64(0.3207126948775056))), filter: __quail_answer_2, returns: []
-      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}
-  
-  Is there a restriction on the ability of a party to compete with the counterparty or operate in a certain geography or business or technology sector?"), c.text), named_struct(Utf8("selectivity"), Float64(0.20044543429844097))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}\n\nIs there an exclusive dealing  commitment with the counterparty? This includes a commitment to procure all “requirements” from one party of certain technology, goods, or services or a prohibition on licensing or selling technology, goods or services to third parties, or a prohibition on  collaborating or working with other parties), whether during the contract or  after the contract ends (or both)."), c.text), named_struct(Utf8("selectivity"), Float64(0.3207126948775056))), filter: __quail_answer_2, returns: []
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nIs there a restriction on the ability of a party to compete with the counterparty or operate in a certain geography or business or technology sector?"), c.text), named_struct(Utf8("selectivity"), Float64(0.20044543429844097))), filter: __quail_answer_1, returns: []
         SubqueryAlias: c
           TableScan: contracts projection=[id, text]
 

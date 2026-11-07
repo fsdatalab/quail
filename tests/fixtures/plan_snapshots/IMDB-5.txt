@@ -2,21 +2,9 @@ logical:
   Projection: r.id, a.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?"), r.body, a.aspect), named_struct(Utf8("selectivity"), Float64(0.2947166666666667))), filter: __quail_answer_1, returns: []
       Cross Join:
-        AiNode: __quail_answer_4 = ai_filter(prompt(Utf8("Judge strictly from the review above whether it mentions any specific actor or actress by name.
-  
-  {0}
-  
-  Instruction: answer TRUE if the review mentions a specific actor or actress by name, FALSE otherwise."), r.body), named_struct(Utf8("selectivity"), Float64(0.5706))), filter: __quail_answer_4, returns: []
-          AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the review above whether it discusses the ending of the movie.
-  
-  {0}
-  
-  Instruction: answer TRUE if the review discusses the ending of the movie, FALSE otherwise."), r.body), named_struct(Utf8("selectivity"), Float64(0.2436))), filter: __quail_answer_3, returns: []
-            AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the review above whether it mentions at least one positive aspect of the movie.
-  
-  {0}
-  
-  Instruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise."), r.body), named_struct(Utf8("selectivity"), Float64(0.8008))), filter: __quail_answer_2, returns: []
+        AiNode: __quail_answer_4 = ai_filter(prompt(Utf8("Judge strictly from the review above whether it mentions any specific actor or actress by name.\n\n{0}\n\nInstruction: answer TRUE if the review mentions a specific actor or actress by name, FALSE otherwise."), r.body), named_struct(Utf8("selectivity"), Float64(0.5706))), filter: __quail_answer_4, returns: []
+          AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the review above whether it discusses the ending of the movie.\n\n{0}\n\nInstruction: answer TRUE if the review discusses the ending of the movie, FALSE otherwise."), r.body), named_struct(Utf8("selectivity"), Float64(0.2436))), filter: __quail_answer_3, returns: []
+            AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the review above whether it mentions at least one positive aspect of the movie.\n\n{0}\n\nInstruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise."), r.body), named_struct(Utf8("selectivity"), Float64(0.8008))), filter: __quail_answer_2, returns: []
               SubqueryAlias: r
                 TableScan: reviews projection=[id, body]
         SubqueryAlias: a

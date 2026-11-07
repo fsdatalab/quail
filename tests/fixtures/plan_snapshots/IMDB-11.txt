@@ -1,8 +1,6 @@
 logical:
   Projection: r.id, sentiment
-    AiNode: sentiment = ai_classify(prompt(Utf8("Judge strictly from the review above which category best describes the overall sentiment it expresses about the movie.
-  
-  {0}"), r.body), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed")))
+    AiNode: sentiment = ai_classify(prompt(Utf8("Judge strictly from the review above which category best describes the overall sentiment it expresses about the movie.\n\n{0}"), r.body), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed")))
       SubqueryAlias: r
         TableScan: reviews projection=[id, body]
 

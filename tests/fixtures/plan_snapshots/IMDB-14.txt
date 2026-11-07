@@ -1,11 +1,7 @@
 logical:
   Projection: r.id, sentiment, complaint
-    AiNode: complaint = ai_classify(prompt(Utf8("Judge strictly from the review above what it criticizes most about the movie.
-  
-  {0}"), r.body), make_array(Utf8("poor acting"), Utf8("poor writing"), Utf8("poor visual effects"), Utf8("slow pacing"), Utf8("weak ending"), Utf8("too long"), Utf8("too violent"), Utf8("no specific complaint")))
-      AiNode: sentiment = ai_classify(prompt(Utf8("Judge strictly from the review above which category best describes the overall sentiment it expresses about the movie.
-  
-  {0}"), r.body), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed"))), filter: hint(sentiment IN ([Utf8("negative"), Utf8("mixed")]), named_struct(Utf8("selectivity"), Float64(0.5846)))
+    AiNode: complaint = ai_classify(prompt(Utf8("Judge strictly from the review above what it criticizes most about the movie.\n\n{0}"), r.body), make_array(Utf8("poor acting"), Utf8("poor writing"), Utf8("poor visual effects"), Utf8("slow pacing"), Utf8("weak ending"), Utf8("too long"), Utf8("too violent"), Utf8("no specific complaint")))
+      AiNode: sentiment = ai_classify(prompt(Utf8("Judge strictly from the review above which category best describes the overall sentiment it expresses about the movie.\n\n{0}"), r.body), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed"))), filter: hint(sentiment IN ([Utf8("negative"), Utf8("mixed")]), named_struct(Utf8("selectivity"), Float64(0.5846)))
         SubqueryAlias: r
           TableScan: reviews projection=[id, body]
 

@@ -1,10 +1,6 @@
 logical:
   Projection: c.id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the claim above whether it asserts something about a person, rather than an organization, place, or event.
-  
-  {0}
-  
-  Instruction: answer TRUE if the claim asserts something about a person, FALSE otherwise."), c.claim), named_struct(Utf8("selectivity"), Float64(0.592))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the claim above whether it asserts something about a person, rather than an organization, place, or event.\n\n{0}\n\nInstruction: answer TRUE if the claim asserts something about a person, FALSE otherwise."), c.claim), named_struct(Utf8("selectivity"), Float64(0.592))), filter: __quail_answer_1, returns: []
       SubqueryAlias: c
         TableScan: claims projection=[id, claim]
 

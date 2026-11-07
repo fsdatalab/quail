@@ -1,10 +1,6 @@
 logical:
   Projection: d.id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the excerpt above whether it argues that the cited case's reasoning does not apply here.
-  
-  {0}
-  
-  Instruction: answer TRUE if the excerpt argues the cited case's reasoning does not apply here, FALSE otherwise."), d.destination_context), named_struct(Utf8("selectivity"), Float64(0.028))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the excerpt above whether it argues that the cited case's reasoning does not apply here.\n\n{0}\n\nInstruction: answer TRUE if the excerpt argues the cited case's reasoning does not apply here, FALSE otherwise."), d.destination_context), named_struct(Utf8("selectivity"), Float64(0.028))), filter: __quail_answer_1, returns: []
       SubqueryAlias: d
         TableScan: citation_contexts projection=[id, destination_context]
 

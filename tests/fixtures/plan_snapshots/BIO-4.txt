@@ -5,11 +5,7 @@ logical:
         Projection: r.id, r.report, n.id
           AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?"), r.report, n.term), named_struct(Utf8("selectivity"), Float64(0.03397338065661047))), filter: __quail_answer_1, returns: []
             Cross Join:
-              AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the report above whether it describes a serious or life-threatening adverse event.
-  
-  {0}
-  
-  Instruction: answer TRUE if the report describes a serious or life-threatening adverse event, FALSE otherwise."), r.report), named_struct(Utf8("selectivity"), Float64(0.638))), filter: __quail_answer_3, returns: []
+              AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the report above whether it describes a serious or life-threatening adverse event.\n\n{0}\n\nInstruction: answer TRUE if the report describes a serious or life-threatening adverse event, FALSE otherwise."), r.report), named_struct(Utf8("selectivity"), Float64(0.638))), filter: __quail_answer_3, returns: []
                 SubqueryAlias: r
                   TableScan: reports projection=[id, report]
               AiNode: __quail_answer_4 = ai_filter(prompt(Utf8("Is this reaction neurological, affecting the nervous system? {0}"), n.term), named_struct(Utf8("selectivity"), Float64(0.44809228039041704))), filter: __quail_answer_4, returns: []
