@@ -13,19 +13,18 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                             est. rows   est. pass   est. time
-  Project: c.id, k.id
-    AiJoin: anchor=c                                                                                                   3.76 ms
-      KV: anchor=from filters, retain after join=no
-      join 1 full (c, k)  PROMPT('DOCUMENT {1} names a clause type…')                              7.1       19.3%
-      AiFilter: c                                                                                  1.2                 9.87 ms
-        KV rewind=on
-        expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nDoes one party ha…')                                  6       19.6%
-        Scan contracts as c                                                                          6
-          tokens=78, mean_document_tokens=13
-      Scan clause_types as k                                                                         6
-        tokens=126, mean_document_tokens=21
+                                                                                           est. rows   est. pass   est. time
+  AiJoin: anchor=c                                                                                                   3.76 ms
+    KV: anchor=from filters, retain after join=no
+    join 1 full (c, k)  PROMPT('DOCUMENT {1} names a clause type…')                              7.1       19.3%
+    AiFilter: c                                                                                  1.2                 9.87 ms
+      KV rewind=on
+      expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nDoes one party ha…')                                  6       19.6%
+      Scan contracts as c                                                                          6
+        tokens=78, mean_document_tokens=13
+    Scan clause_types as k                                                                         6
+      tokens=126, mean_document_tokens=21
   Pipeline on c: ai_filter:c -> ai_join:c (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

@@ -10,15 +10,14 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                      est. rows   est. pass   est. time
-  Project: w.id, exploit_kind
-    AiClassify: exploit_kind over w                                                             13.7 ms
-      rule=trie_decode, labels=11, label tokens=186
-      AiFilter: w                                                           3.1                 9.51 ms
-        KV rewind=on
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       51.5%
-        Scan wrench_runs as w                                                 6
-          tokens=132, mean_document_tokens=22
+                                                                    est. rows   est. pass   est. time
+  AiClassify: exploit_kind over w                                                             13.7 ms
+    rule=trie_decode, labels=11, label tokens=186
+    AiFilter: w                                                           3.1                 9.51 ms
+      KV rewind=on
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       51.5%
+      Scan wrench_runs as w                                                 6
+        tokens=132, mean_document_tokens=22
   Pipeline on w: ai_filter:w -> ai-classify:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

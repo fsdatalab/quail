@@ -116,8 +116,8 @@ def test_classify_plans_filters_and_returns_labels(session):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.probabilities
     assert classify.spec.scoring != "trie_decode"
-    assert plan.nodes[-1].columns == ("d.id", "topic", "topic_probabilities")
     rows = finish(probable, _labels(["praise", "shipping"])).collect()
+    assert rows.column_names == ["d.id", "topic", "topic_probabilities"]
     assert rows.column("topic_probabilities").to_pylist() == [
         [("refund", 0.1), ("shipping", 0.1), ("praise", 0.8)],
         [("refund", 0.1), ("shipping", 0.8), ("praise", 0.1)]]

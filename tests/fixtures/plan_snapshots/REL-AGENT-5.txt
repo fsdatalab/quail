@@ -34,15 +34,14 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                                                      est. rows   est. time
-  Project: t.trajectory_id, test_result
-    AiClassify: test_result over t                                                                                                                  3.87 ms
-      rule=trie_decode, labels=4, label tokens=55
-      Filter: t.__label_t_0 IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails')
-        AiClassify: __label_t_0 over t                                                                                                              16.2 ms
-          rule=trie_decode, labels=5, label tokens=106
-          Scan agent_traces as t                                                                                                              6
-            tokens=66, mean_document_tokens=11
+                                                                                                                                    est. rows   est. time
+  AiClassify: test_result over t                                                                                                                  3.87 ms
+    rule=trie_decode, labels=4, label tokens=55
+    Filter: t.__label_t_0 IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails')
+      AiClassify: __label_t_0 over t                                                                                                              16.2 ms
+        rule=trie_decode, labels=5, label tokens=106
+        Scan agent_traces as t                                                                                                              6
+          tokens=66, mean_document_tokens=11
   Pipeline on t: ai-classify:0 -> filter:t:0 -> ai-classify:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

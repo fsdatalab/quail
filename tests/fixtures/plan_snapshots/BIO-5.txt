@@ -9,11 +9,10 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                      est. rows   est. time
-  Project: m.id, organ_class
-    AiClassify: organ_class over m                                  27.5 ms
-      rule=trie_decode, labels=26, label tokens=662
-      Scan terms as m                                         6
-        tokens=60, mean_document_tokens=10
+                                                    est. rows   est. time
+  AiClassify: organ_class over m                                  27.5 ms
+    rule=trie_decode, labels=26, label tokens=662
+    Scan terms as m                                         6
+      tokens=60, mean_document_tokens=10
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

@@ -86,7 +86,7 @@ def test_datafusion_unnests_the_feature_lists_the_region_returns(session):
     query = session.sql(f"SELECT r.id, f.feature FROM reviews r, {UNNEST}")
     explained = query.explain()
     assert "UnnestExec" in explained
-    assert "Project: r.id, __quail_column_1" in explained
+    assert "output=__quail_column_1" in explained
     rows = finish(query, _unnest_oracle()).collect()
     assert rows.column_names == ["r.id", "f.feature"]
     assert rows.to_pylist() == [

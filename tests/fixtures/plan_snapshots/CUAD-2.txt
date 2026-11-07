@@ -9,13 +9,10 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                    est. rows   est. time
-  Project: c.id, contract, contract_span
-    contract = struct(contract.agreement_date)
-    contract_span = struct(contract.agreement_date_span)
-    AiExtract: contract.agreement_date over c                                       10 ms
-      question='The date of the contract', up to 64 answer tokens
-      Scan contracts as c                                                   6
-        tokens=78, mean_document_tokens=13
+                                                                  est. rows   est. time
+  AiExtract: contract.agreement_date over c                                       10 ms
+    question='The date of the contract', up to 64 answer tokens
+    Scan contracts as c                                                   6
+      tokens=78, mean_document_tokens=13
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

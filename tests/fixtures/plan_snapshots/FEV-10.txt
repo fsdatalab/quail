@@ -14,26 +14,25 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                      est. rows   est. pass   est. time
-  Project: c.id, e.id
-    AiJoin: anchor=e                                                                                                            1.59 ms
-      KV: anchor=from filters, retain after join=no
-      join 1 full (e, c) over pairs from hash_join:c-e  PROMPT('Does the Wikipedia passage in DO…')           2      0.217%
-      AiFilter: e                                                                                           3.3                 8.35 ms
-        KV rewind=on
-        expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                           6       55.4%
-        Scan evidence as e [2]                                                                                6
-          tokens=102, mean_document_tokens=17
-      AiFilter: c                                                                                           3.6                 8.94 ms
-        KV: not stored
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                           6       59.2%
-        Scan claims as c [1]                                                                                  6
-          tokens=42, mean_document_tokens=7
-      HashJoin: c.evidence_wiki_url = e.id
-        pairs kept: 0.1667 of the cross product
-        Reuse [1]
-        Reuse [2]
+                                                                                                    est. rows   est. pass   est. time
+  AiJoin: anchor=e                                                                                                            1.59 ms
+    KV: anchor=from filters, retain after join=no
+    join 1 full (e, c) over pairs from hash_join:c-e  PROMPT('Does the Wikipedia passage in DO…')           2      0.217%
+    AiFilter: e                                                                                           3.3                 8.35 ms
+      KV rewind=on
+      expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                           6       55.4%
+      Scan evidence as e [2]                                                                                6
+        tokens=102, mean_document_tokens=17
+    AiFilter: c                                                                                           3.6                 8.94 ms
+      KV: not stored
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                           6       59.2%
+      Scan claims as c [1]                                                                                  6
+        tokens=42, mean_document_tokens=7
+    HashJoin: c.evidence_wiki_url = e.id
+      pairs kept: 0.1667 of the cross product
+      Reuse [1]
+      Reuse [2]
   Pipeline on e: ai_filter:e -> ai_join:e (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

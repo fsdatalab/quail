@@ -15,21 +15,18 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
                                                                         est. rows   est. pass   est. time
-  Project: r.id, sentiment, a.id, aspect_sentiment
-    AiJoin: anchor=r [2]                                                                          31.9 ms
+  AiClassify: aspect_sentiment over r                                                             35.9 ms
+    rule=letters, labels=4, label tokens=4
+    AiJoin: anchor=r                                                                              31.9 ms
       KV: anchor=from filters, retain after join=no
       join 1 full (r, a)  PROMPT('Does the review in DOCUMENT {0} …')        84.2       29.5%
       Filter: r.sentiment IN ('negative', 'mixed')
-        AiClassify: sentiment over r [1]                                                          18.2 ms
+        AiClassify: sentiment over r                                                              18.2 ms
           rule=trie_decode, labels=4, label tokens=27
           Scan reviews as r                                                    12
             tokens=134, mean_document_tokens=11.2
       Scan aspects as a                                                        12
         tokens=135, mean_document_tokens=11.2
-    Reuse [1]
-    AiClassify: aspect_sentiment over r                                                           35.9 ms
-      rule=letters, labels=4, label tokens=4
-      Reuse [2]
   Pipeline on r: ai-classify:0 -> filter:r:0 -> ai_join:r -> ai-classify:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

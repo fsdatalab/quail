@@ -824,17 +824,7 @@ fn collect_answers<'py>(
 )> {
     use pyo3::IntoPyObjectExt;
     let request: quail::results::AnswerRequest = from_json(request)?;
-    let mut relations = std::collections::HashMap::new();
-    for (key, table) in outputs {
-        let reader = quail::pyarrow::stream_from_pyarrow(&table)?;
-        let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
-        let batches = reader
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| python_error(error.into()))?;
-        let batch = datafusion::arrow::compute::concat_batches(&schema, &batches)
-            .map_err(|error| python_error(error.into()))?;
-        relations.insert(key, batch);
-    }
+    let relations = read_relations(outputs)?;
     let found = quail::results::collect_answers(&request, &relations)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let table = |batch: datafusion::arrow::array::RecordBatch| -> PyResult<Py<PyAny>> {
@@ -870,6 +860,57 @@ fn collect_answers<'py>(
         true_joins,
         serde_json::Value::from(found.stages).to_string(),
     ))
+}
+
+/// Each pyarrow Table of `outputs` as one record batch, by (node id, port).
+fn read_relations(
+    outputs: std::collections::HashMap<(String, String), Bound<'_, PyAny>>,
+) -> PyResult<std::collections::HashMap<(String, String), datafusion::arrow::array::RecordBatch>> {
+    let mut relations = std::collections::HashMap::new();
+    for (key, table) in outputs {
+        relations.insert(key, one_batch(&table)?);
+    }
+    Ok(relations)
+}
+
+/// A pyarrow Table as one record batch.
+fn one_batch(table: &Bound<'_, PyAny>) -> PyResult<datafusion::arrow::array::RecordBatch> {
+    let reader = quail::pyarrow::stream_from_pyarrow(table)?;
+    let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
+    let batches = reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| python_error(error.into()))?;
+    datafusion::arrow::compute::concat_batches(&schema, &batches)
+        .map_err(|error| python_error(error.into()))
+}
+
+/// Build a region's rows from its run's output relations, as
+/// `quail::results::region_rows` does.
+///
+/// `request` is the AnswerRequest as JSON; `outputs` maps (node id,
+/// port) to a pyarrow Table; `evaluate(name, expression)` returns a
+/// one-column pyarrow Table of the values a source column's expression,
+/// as JSON, computes for each document. Returns the rows as a pyarrow
+/// Table.
+#[pyfunction]
+fn region_rows<'py>(
+    py: Python<'py>,
+    request: &str,
+    outputs: std::collections::HashMap<(String, String), Bound<'py, PyAny>>,
+    evaluate: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let request: quail::results::AnswerRequest = from_json(request)?;
+    let found: quail_planner::operators::Operators = from_json(&request.operators)?;
+    let mut sources = std::collections::HashMap::new();
+    for (name, expression) in quail_planner::results::source_columns(&found) {
+        let expression = serde_json::to_string(&expression)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+        let values = one_batch(&evaluate.call1((&name, expression))?)?;
+        sources.insert(name, std::sync::Arc::clone(values.column(0)));
+    }
+    let rows = quail::results::region_rows(&request, &read_relations(outputs)?, &sources)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    quail::pyarrow::to_pyarrow(py, rows.schema(), vec![rows])
 }
 
 /// The report of one region's run, as `quail::results::execution_report`
@@ -1084,6 +1125,7 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
     module.add_function(wrap_pyfunction!(write_token_store, module)?)?;
     module.add_function(wrap_pyfunction!(collect_answers, module)?)?;
+    module.add_function(wrap_pyfunction!(region_rows, module)?)?;
     module.add_function(wrap_pyfunction!(edit_graph, module)?)?;
     module.add_function(wrap_pyfunction!(region_facts, module)?)?;
     module.add_function(wrap_pyfunction!(limited_operators, module)?)?;

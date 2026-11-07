@@ -12,18 +12,17 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                          est. rows   est. pass   est. time
-  Project: c1.id, c2.id
-    AiJoin: anchor=c1                                                                                                               2.18 ms
-      KV: anchor=not resident, retain after join=no
-      join 1 full (c1, c2) over pairs from hash_join:c1-c2  PROMPT('DOCUMENT {1} is the next call ab…')           1       8.76%
-      Scan sales_calls as c1 [1]                                                                                  6
-        tokens=132, mean_document_tokens=22
-      Scan sales_calls as c2 [2]                                                                                  6
-        tokens=132, mean_document_tokens=22
-      HashJoin: c1.id = c2.prev_call_id
-        pairs kept: 0.02778 of the cross product
-        Reuse [1]
-        Reuse [2]
+                                                                                                        est. rows   est. pass   est. time
+  AiJoin: anchor=c1                                                                                                               2.18 ms
+    KV: anchor=not resident, retain after join=no
+    join 1 full (c1, c2) over pairs from hash_join:c1-c2  PROMPT('DOCUMENT {1} is the next call ab…')           1       8.76%
+    Scan sales_calls as c1 [1]                                                                                  6
+      tokens=132, mean_document_tokens=22
+    Scan sales_calls as c2 [2]                                                                                  6
+      tokens=132, mean_document_tokens=22
+    HashJoin: c1.id = c2.prev_call_id
+      pairs kept: 0.02778 of the cross product
+      Reuse [1]
+      Reuse [2]
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

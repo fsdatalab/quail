@@ -16,14 +16,12 @@ from quail.api.region_inputs import input_scans
 from quail.common.expressions import CompileError
 from quail.common.pairs import FIRST_DOCUMENT, columns_key
 from quail.common.tokens import ColumnStore, ScanInput, TokenStore
-from quail.execution.metrics import NodeMetrics, scalar_node_metrics
-from quail.execution.projection import projection_for
+from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
 from quail.execution.result import QueryResult
 from quail.execution.rows import as_table
-from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
-from quail.physical import Scan, decode_plan_value
+from quail.physical import Limit, Scan, decode_plan_value
 from quail.physical.plan import Refusal, RefusalError, plan_from_json
 
 # the start of Rust's message for a document that is an expression
@@ -525,61 +523,63 @@ class RegionQuery:
         return tables
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
-        """Finish the physical graph and attach execution details."""
+        """Build the region's rows from the run's outputs, with its report."""
         plan = self.plan()
         out = response.metrics
         report = json.loads(_quail_native.execution_report(
             plan.backend, plan.estimated_seconds, plan.settings.get("order_rule"),
             json.dumps(out, default=str), coordinator_wall))
-        sources = {
-            node.input_id: range(node.num_documents)
-            for node in plan.nodes
-            if isinstance(node, Scan)
-        }
-        sources.update(self._column_tables())
-        observers = self.session.registry.new_observers()
-        run = GenericRunner().run(
-            plan.graph,
-            ExecutionContext(
-                runtimes=self.session.registry.runtimes,
-                sources=sources,
-                project=projection_for(self._token_inputs, self._document_tokens),
-                observers=observers,
-            ),
-            initial_outputs=response.outputs,
-            initial_metrics={
-                node_id: NodeMetrics.from_scalars(metrics)
-                for node_id, metrics in out.get("node_metrics", {}).items()
-            },
-        )
-        if not isinstance(run.value, QueryResult):
-            raise TypeError("physical graph root must return QueryResult")
-        result = run.value
+        tables = _output_tables(response.outputs)
+        rows = _quail_native.region_rows(
+            json.dumps(self._answer_request(plan)), tables, self._source_values)
+        result = QueryResult.from_table(rows, report=report)
         result.plan = plan.graph
+        measured = dict(out.get("node_metrics", {}))
+        for node in plan.nodes:
+            if isinstance(node, Limit):
+                # Rust keeps the region's first rows as it builds them
+                measured[node.node_id] = scalar_node_metrics({node.node_id: NodeResult(
+                    {}, NodeMetrics(output_rows=rows.num_rows))})[node.node_id]
         result.node_metrics = {
-            node_id: node_result.metrics
-            for node_id, node_result in run.nodes.items()
-        }
+            node_id: NodeMetrics.from_scalars(metrics)
+            for node_id, metrics in measured.items()}
         # Saved reports need the graph and metrics without Python objects.
         report["executed_plan"] = json.loads(plan.graph.to_json())
-        report["node_metrics"] = scalar_node_metrics(run.nodes)
+        report["node_metrics"] = {
+            node_id: dict(metrics) for node_id, metrics in measured.items()}
+        observers = self.session.registry.new_observers()
+        _observe(plan.graph, response.outputs, result.node_metrics, observers)
         observer_reports = {
             observer.name: dict(observer.report())
             for observer in observers
         }
         if observer_reports:
             report["observers"] = observer_reports
-        result.report = report
-
-        self._collect_answers(result, plan, response.outputs)
+        self._collect_answers(result, plan, tables)
         return result
 
-    def _collect_answers(self, result, plan, outputs) -> None:
-        """Attach the answers, survivors, and stages Rust reads from outputs.
+    def _source_values(self, name: str, expression: str) -> pa.Table:
+        """Return a source column's values for each document of its table.
 
-        Each model operator's answers, the surviving documents, and each
-        predicate's measured selectivity; documents are numbered by their
-        row in the registered table.
+        Args:
+            name: The column's name in the region's rows.
+            expression: The column's source expression, as Rust's JSON.
+        """
+        source = decode_plan_value(expression)
+        alias = source.references[0].alias
+        store = self._token_inputs[alias]
+        loaded = (store.column_names if isinstance(store, pa.Table)
+                  else store.projected_columns)
+        for ref in source.references:
+            if ref.column not in loaded:
+                raise CompileError(
+                    f"the column {name!r} was not loaded by the scan of {alias!r}")
+        return pa.table({name: source.evaluate(store)})
+
+    def _answer_request(self, plan) -> dict:
+        """Return what Rust reads besides the output relations.
+
+        The operators, every output port, and each scan's documents.
         """
         ports = [
             {"node_type": node.type_name, "node": node.node_id,
@@ -590,16 +590,26 @@ class RegionQuery:
             for node in plan.graph.topological_nodes() for output in node.outputs]
         source_rows = {alias: rows.to_pylist()
                        for alias, rows in self._alias_source_rows().items()}
-        request = {
+        return {
             "operators": self.operators, "ports": ports,
             "num_documents": {alias: len(tokens)
                               for alias, tokens in self._document_tokens.items()},
             "source_rows": source_rows}
-        tables = {(ref.node_id, ref.port): as_table(value)
-                  for ref, value in outputs.items()
-                  if isinstance(as_table(value), pa.Table)}
+
+    def _collect_answers(self, result, plan, tables) -> None:
+        """Attach the answers, survivors, and stages Rust reads from outputs.
+
+        Each model operator's answers, the surviving documents, and each
+        predicate's measured selectivity; documents are numbered by their
+        row in the registered table.
+
+        Args:
+            result: The QueryResult to attach them to.
+            plan: The executed physical plan.
+            tables: Each output relation, by (node id, port).
+        """
         answers, survivors, true_joins, stages = _quail_native.collect_answers(
-            json.dumps(request), tables)
+            json.dumps(self._answer_request(plan)), tables)
         result.answer_tables = {kind: {} for kind in (
             "filters", "joins", "classifies", "scores", "extracts", "features",
             "maps")}
@@ -610,3 +620,29 @@ class RegionQuery:
                                    for alias, table in survivors}
         result.true_join_tables = dict(true_joins)
         result.report["stages"] = json.loads(stages)
+
+
+def _output_tables(outputs) -> dict:
+    """Return each output relation that is an Arrow table, by (node id, port)."""
+    tables = {}
+    for ref, value in outputs.items():
+        table = as_table(value)
+        if isinstance(table, pa.Table):
+            tables[(ref.node_id, ref.port)] = table
+    return tables
+
+
+def _observe(graph, outputs, metrics, observers) -> None:
+    """Show each observer every node whose outputs the run returned."""
+    if not observers:
+        return
+    values = {(ref.node_id, ref.port): value for ref, value in outputs.items()}
+    for node in graph.topological_nodes():
+        found = {output.name: values[(node.node_id, output.name)]
+                 for output in node.outputs
+                 if (node.node_id, output.name) in values}
+        if not found or len(found) != len(node.outputs):
+            continue
+        result = NodeResult(found, metrics.get(node.node_id, NodeMetrics()))
+        for observer in observers:
+            observer.after_node(node, result)

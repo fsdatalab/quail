@@ -1,56 +1,52 @@
-//! The result nodes a physical plan ends with: the Project that reads the
-//! region's rows, and the Limit of the region's fetch.
+//! What a region returns: the columns its rows hold, as its operators
+//! name them, and the Limit of the region's fetch that a physical plan
+//! ends with.
 
 use quail_physical::{
-    LimitAttributes, ModelCall, Node, PhysicalNode, PortRef, ProjectAttributes, Projected,
-    ValueExpression, input_ports,
+    LimitAttributes, ModelCall, Node, PhysicalNode, PortRef, Projected, ValueExpression,
+    input_ports,
 };
 use serde_json::Value;
 
 use crate::expressions::{
-    PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_name, column_references,
+    PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_name, column_references, packing,
     projected_call, projected_name,
 };
 use crate::operators::Operators;
-
-/// The struct columns a Project packs, as `Project.structs` encodes them.
-pub fn structs_value(structs: &[(String, Vec<(String, String)>)]) -> Value {
-    Value::Array(
-        structs
-            .iter()
-            .map(|(name, members)| {
-                Value::Array(vec![
-                    Value::from(name.clone()),
-                    Value::Array(
-                        members
-                            .iter()
-                            .map(|(field, member)| {
-                                Value::Array(vec![
-                                    Value::from(field.clone()),
-                                    Value::from(member.clone()),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ])
-            })
-            .collect(),
-    )
-}
 
 /// A column a model call adds: its name, the call's table aliases, kind,
 /// and labels, and whether it is the call's answer.
 pub type AnswerColumn = (String, Vec<String>, String, Value, bool);
 
-/// The columns a plan's result Project binds: each source expression
-/// column and each model answer column, as `ProjectAttributes` holds
-/// them.
-pub fn project_bindings(found: &Operators) -> (Vec<(String, ValueExpression)>, Vec<AnswerColumn>) {
-    (source_columns(found), answer_columns(found))
+/// The columns of a region's rows, in order, before struct packing.
+///
+/// Each SELECT list column, then a label's probabilities and an
+/// extraction's spans after the column they belong to.
+pub fn region_columns(found: &Operators) -> Vec<String> {
+    let mut columns = Vec::new();
+    for column in &found.projection.columns {
+        let name = projected_name(column);
+        columns.push(name.clone());
+        if let Some(call) = projected_call(column, &[]) {
+            if call.probabilities {
+                columns.push(format!("{name}{PROBABILITIES_SUFFIX}"));
+            }
+            if call.kind == "extract" {
+                columns.push(format!("{name}{SPAN_SUFFIX}"));
+            }
+        }
+    }
+    columns
 }
 
-/// Each result column a source expression computes, by name.
-fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
+/// The struct columns of a region's rows: (struct column, [(field,
+/// member column)]).
+pub fn region_structs(found: &Operators) -> Vec<(String, Vec<(String, String)>)> {
+    packing(&found.projection.structs)
+}
+
+/// Each region column a source expression computes, by name.
+pub fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
     let projected = found
         .projection
         .columns
@@ -76,7 +72,7 @@ fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
 /// Each column a model call adds: its name, the call's aliases, kind,
 /// and labels, and whether it is the call's answer, not a label's
 /// probabilities or an answer's span.
-fn answer_columns(found: &Operators) -> Vec<AnswerColumn> {
+pub fn answer_columns(found: &Operators) -> Vec<AnswerColumn> {
     let mut columns: Vec<AnswerColumn> = Vec::new();
     let mut put = |name: String, call: &ModelCall, answer: bool| {
         let entry = (
@@ -120,38 +116,14 @@ fn answer_columns(found: &Operators) -> Vec<AnswerColumn> {
     columns
 }
 
-fn node<A>(id: &str, inputs: &[PortRef], attributes: A) -> Node<A> {
-    Node {
-        id: id.to_string(),
-        inputs: input_ports(inputs),
-        attributes,
-    }
-}
-
-/// The Project that reads the region's rows, and the Limit of the
-/// region's fetch, which `should_push_down_limit` stops the model at.
-pub fn result_nodes(
-    found: &Operators,
-    inputs: &[PortRef],
-    columns: &[String],
-    structs: &[(String, Vec<(String, String)>)],
-) -> Vec<PhysicalNode> {
-    let mut nodes = vec![PhysicalNode::Project(node(
-        "project",
-        inputs,
-        ProjectAttributes {
-            columns: columns.to_vec(),
-            structs: structs_value(structs),
-            sources: source_columns(found),
-            answers: answer_columns(found),
-        },
-    ))];
-    if let Some(count) = found.fetch {
-        nodes.push(PhysicalNode::Limit(node(
-            "limit",
-            &[quail_physical::port("project", "rows")],
-            LimitAttributes { count },
-        )));
-    }
-    nodes
+/// The Limit of the region's fetch, reading the region's rows at
+/// `input`; `should_push_down_limit` stops the model at it.
+pub fn limit_node(found: &Operators, input: &PortRef) -> Option<PhysicalNode> {
+    found.fetch.map(|count| {
+        PhysicalNode::Limit(Node {
+            id: "limit".to_string(),
+            inputs: input_ports(std::slice::from_ref(input)),
+            attributes: LimitAttributes { count },
+        })
+    })
 }

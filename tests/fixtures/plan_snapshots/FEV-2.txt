@@ -12,14 +12,13 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                        est. rows   est. pass   est. time
-  Project: c.id, e.id
-    AiJoin: anchor=e                                                                              17.4 ms
-      KV: anchor=not resident, retain after join=no
-      join 1 full (e, c)  PROMPT('Does the Wikipedia passage in DO…')          36      0.217%
-      Scan evidence as e                                                        6
-        tokens=102, mean_document_tokens=17
-      Scan claims as c                                                          6
-        tokens=42, mean_document_tokens=7
+                                                                      est. rows   est. pass   est. time
+  AiJoin: anchor=e                                                                              17.4 ms
+    KV: anchor=not resident, retain after join=no
+    join 1 full (e, c)  PROMPT('Does the Wikipedia passage in DO…')          36      0.217%
+    Scan evidence as e                                                        6
+      tokens=102, mean_document_tokens=17
+    Scan claims as c                                                          6
+      tokens=42, mean_document_tokens=7
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

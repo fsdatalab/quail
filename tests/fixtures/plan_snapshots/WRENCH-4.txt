@@ -21,12 +21,11 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                    est. rows   est. pass   est. time
-  Project: s.run_id                                                       2.3
-    AiFilter: s                                                           2.3                   10 ms
-      KV rewind=on
-      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       38.8%
-      Scan wrench_steps as s                                                6
-        tokens=102, mean_document_tokens=17
+                                                                  est. rows   est. pass   est. time
+  AiFilter: s                                                           2.3                   10 ms
+    KV rewind=on
+    predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       38.8%
+    Scan wrench_steps as s                                                6
+      tokens=102, mean_document_tokens=17
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

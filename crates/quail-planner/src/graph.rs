@@ -11,8 +11,8 @@ use quail_physical::{
     AiClassifyAttributes, AiExtractAttributes, AiFilterAttributes, AiJoinAttributes,
     AiMapAttributes, AiSaeFeaturesAttributes, AiScoreAttributes, Asked, BarrierAttributes,
     ClassifySpec, ColumnRef, ExchangeAttributes, Expression, FilterAttributes, HashJoinAttributes,
-    ModelCall, Node, PhysicalNode, PortRef, Prompt, RecombineAttributes, ScanAttributes, ScoreSpec,
-    ValueExpression, input_ports, port,
+    ModelCall, Node, PhysicalNode, PortRef, Prompt, ScanAttributes, ScoreSpec, ValueExpression,
+    input_ports, port,
 };
 use serde_json::{Map, Value};
 
@@ -20,14 +20,13 @@ use crate::classify::classify_statistics;
 use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
 use crate::costs::question_tokens;
+use crate::expressions::asked_call;
 use crate::expressions::{
-    CompileError, PROBABILITIES_SUFFIX, Refusal, SPAN_SUFFIX, argument_alias, call_aliases,
-    condition_columns, projected_call, projected_name, repr_str,
+    CompileError, Refusal, SPAN_SUFFIX, argument_alias, call_aliases, condition_columns, repr_str,
 };
-use crate::expressions::{asked_call, packing};
 use crate::operators::{ColumnTest, Operators, SemanticColumn};
 use crate::pricing::PlanPricer;
-use crate::results::result_nodes;
+use crate::results::limit_node;
 use crate::retention::{group_sequence, streamed_aliases};
 use crate::scores::score_spec;
 use crate::search::{
@@ -269,7 +268,6 @@ struct GraphBuilder<'a, 'c> {
     emitted_tests: Vec<ColumnTest>,
     scoring: Option<ScoreLowering>,
     pairs_src: BTreeMap<usize, String>,
-    label_projected: Vec<ModelCall>,
     label_names: Vec<(ModelCall, String)>,
 }
 
@@ -300,13 +298,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             .filter(|(_, positions)| !positions.is_empty())
             .map(|(alias, _)| alias.clone())
             .collect();
-        let label_projected = found
-            .projections
-            .iter()
-            .filter_map(|expression| {
-                crate::expressions::aliased_call(expression, &["label"]).cloned()
-            })
-            .collect();
         let label_names = found
             .classifies
             .iter()
@@ -333,7 +324,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             emitted_tests: Vec::new(),
             scoring: None,
             pairs_src: BTreeMap::new(),
-            label_projected,
             label_names,
         })
     }
@@ -342,20 +332,19 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         self.prepare()?;
         let ports = self.emit_scans();
         let emitted = (|| -> Result<_, CompileError> {
-            let (ports, mut row_ports) = self.emit_documents(ports)?;
-            let (ports, joins) = self.emit_joins(ports)?;
-            row_ports.extend(self.emit_join_answers(&ports, &joins)?);
-            let mut ports = ports;
-            row_ports.extend(self.emit_after_joins(&mut ports)?);
+            let ports = self.emit_documents(ports)?;
+            let (mut ports, joins) = self.emit_joins(ports)?;
+            self.emit_join_answers(&joins)?;
+            self.emit_after_joins(&mut ports)?;
             let score_pairs = self.emit_pair_scores(&ports, &joins)?;
-            Ok((ports, row_ports, joins, score_pairs))
+            Ok((ports, joins, score_pairs))
         })();
-        let (ports, row_ports, joins, score_pairs) = match emitted {
+        let (ports, joins, score_pairs) = match emitted {
             Ok(found) => found,
             Err(CompileError(_, Some(refusal))) => return Ok(Err(*refusal)),
             Err(error) => return Err(error),
         };
-        self.emit_result(&ports, row_ports, &joins, score_pairs);
+        self.emit_result(&ports, &joins, score_pairs);
         self.finish().map(Ok)
     }
 
@@ -464,9 +453,8 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
     fn emit_documents(
         &mut self,
         ports: BTreeMap<String, PortRef>,
-    ) -> Result<(BTreeMap<String, PortRef>, Vec<PortRef>), CompileError> {
+    ) -> Result<BTreeMap<String, PortRef>, CompileError> {
         let mut ports = ports;
-        let mut row_ports = Vec::new();
         let aliases: Vec<String> = self
             .operators
             .scans
@@ -481,11 +469,10 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 .filter(|kind| !lifted.contains(kind))
                 .collect();
             let rows = self.order.statistics.stats[&alias].num_documents as f64;
-            let (after, rows) = self.emit_steps(&alias, rows, &kinds, ports[&alias].clone())?;
+            let after = self.emit_steps(&alias, rows, &kinds, ports[&alias].clone())?;
             ports.insert(alias, after);
-            row_ports.extend(rows);
         }
-        Ok((ports, row_ports))
+        Ok(ports)
     }
 
     /// Emit the given kinds of a table's steps in run order.
@@ -495,7 +482,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         expected_rows: f64,
         kinds: &Kinds,
         port: PortRef,
-    ) -> Result<(PortRef, Vec<PortRef>), CompileError> {
+    ) -> Result<PortRef, CompileError> {
         let steps: Vec<TableStep> = self
             .order
             .step_orders
@@ -518,7 +505,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         }
         let mut port = port;
         let mut expected_rows = expected_rows;
-        let mut row_ports = Vec::new();
         // the scores SELECT returns follow the score predicates, before
         // the classifications and extractions read the rows
         let mut scores_pending = kinds.contains(ASK) && self.scoring.is_some();
@@ -558,10 +544,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         StepKey::Position(_) => unreachable!("a column step has a name"),
                     })
                     .collect();
-                let (after, rows) =
-                    self.emit_columns(alias, expected_rows, port, &columns, resident)?;
-                port = after;
-                row_ports.extend(rows);
+                port = self.emit_columns(alias, expected_rows, port, &columns, resident)?;
             }
             for index in run {
                 expected_rows *= steps[*index].selectivity;
@@ -571,7 +554,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         if scores_pending {
             port = self.emit_projected_scores(alias, expected_rows, port)?;
         }
-        Ok((port, row_ports))
+        Ok(port)
     }
 
     fn filter_order(&self, alias: &str) -> &[usize] {
@@ -945,13 +928,12 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         port: PortRef,
         columns: &[SemanticColumn],
         resident: bool,
-    ) -> Result<(PortRef, Vec<PortRef>), CompileError> {
+    ) -> Result<PortRef, CompileError> {
         let computed = self
             .computed_columns
             .get(alias)
             .cloned()
             .unwrap_or_default();
-        let mut row_ports = Vec::new();
         let mut port = port;
         let mut expected_rows = expected_rows;
         for (index, column) in columns.iter().enumerate() {
@@ -993,13 +975,8 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 }
                 _ => unreachable!("a column operator"),
             }
-            let projected =
-                column.call.kind != "label" || self.label_projected.contains(&column.call);
             self.nodes.push(node);
             port = port_of(&node_id, rows_port);
-            if projected {
-                row_ports.push(port.clone());
-            }
             for name in &names {
                 self.set_computed(alias, name, port.clone());
             }
@@ -1045,7 +1022,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 self.set_computed(alias, name, port.clone());
             }
         }
-        Ok((port, row_ports))
+        Ok(port)
     }
 
     fn set_computed(&mut self, alias: &str, name: &str, port: PortRef) {
@@ -1329,13 +1306,8 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
 
     /// Append the classifications of joined rows after their joins, as
     /// `emit_joined_classify`.
-    fn emit_join_answers(
-        &mut self,
-        _ports: &BTreeMap<String, PortRef>,
-        joins: &JoinPorts,
-    ) -> Result<Vec<PortRef>, CompileError> {
+    fn emit_join_answers(&mut self, joins: &JoinPorts) -> Result<(), CompileError> {
         let context = self.context;
-        let mut row_ports = Vec::new();
         for (call, _) in label_calls(self.operators) {
             let aliases = call_aliases(&call);
             if aliases.len() != 2 {
@@ -1396,21 +1368,16 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 spec,
                 context.model.name.clone(),
             );
-            let rows = port_of(node.id(), node.rows_port());
             self.nodes.push(node);
-            if self.label_projected.contains(&call) {
-                row_ports.push(rows);
-            }
         }
-        Ok(row_ports)
+        Ok(())
     }
 
     /// Create the column operators the planner lifted above the joins.
     fn emit_after_joins(
         &mut self,
         ports: &mut BTreeMap<String, PortRef>,
-    ) -> Result<Vec<PortRef>, CompileError> {
-        let mut row_ports = Vec::new();
+    ) -> Result<(), CompileError> {
         // a column operator after the joins runs over the documents the
         // joins matched: a document with at least one true pair, expected as the
         // join selectivity times the partners it met, at most every document
@@ -1444,11 +1411,10 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 },
             ));
             let rows = expected[&alias] * met.min(1.0);
-            let (after, rows) = self.emit_steps(&alias, rows, &kinds, ports[&alias].clone())?;
+            let after = self.emit_steps(&alias, rows, &kinds, ports[&alias].clone())?;
             ports.insert(alias, after);
-            row_ports.extend(rows);
         }
-        Ok(row_ports)
+        Ok(())
     }
 
     /// Create the pair scores SELECT returns.
@@ -1470,97 +1436,21 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(score_pairs)
     }
 
-    /// Connect result operators to surviving rows and answers.
+    /// End the plan with the Limit of the region's fetch, which reads
+    /// the region's rows: the scored pairs, the one full join's answers,
+    /// or the surviving rows of the first table.
     fn emit_result(
         &mut self,
         ports: &BTreeMap<String, PortRef>,
-        row_ports: Vec<PortRef>,
         joins: &JoinPorts,
         score_pairs: Option<PortRef>,
     ) {
-        let filtered_after: BTreeSet<&String> = self
-            .after_joins
-            .iter()
-            .filter(|(_, kinds)| kinds.iter().any(|kind| *kind != "classify"))
-            .map(|(alias, _)| alias)
-            .filter(|alias| {
-                self.operators
-                    .column_filters
-                    .iter()
-                    .any(|(found, _)| found == *alias)
-            })
-            .collect();
-        let sink_inputs: Vec<PortRef> = if let Some(pairs) = score_pairs {
-            vec![pairs]
-        } else if joins.answers.len() == 1
-            && self.order.join_sequence.len() == 1
-            && self.classified_after.is_empty()
-            && filtered_after.is_empty()
-        {
-            // a later classification or column filter can remove joined rows
-            vec![joins.answers[0].clone()]
-        } else if !joins.answers.is_empty() {
-            let mut inputs = joins.answers.clone();
-            inputs.extend(joins.aliases.iter().map(|alias| ports[alias].clone()));
-            self.nodes.push(PhysicalNode::Recombine(tagged_node(
-                "recombine",
-                &inputs,
-                RecombineAttributes {
-                    alias_order: joins.aliases.clone(),
-                },
-            )));
-            vec![port_of("recombine", "tuples")]
-        } else {
-            vec![ports[&self.operators.scans[0].alias].clone()]
+        let rows = match (score_pairs, joins.answers.first()) {
+            (Some(pairs), _) => pairs,
+            (None, Some(answers)) => answers.clone(),
+            (None, None) => ports[&self.operators.scans[0].alias].clone(),
         };
-        let project = &self.operators.projection;
-        let mut columns = Vec::new();
-        for column in &project.columns {
-            columns.push(projected_name(column));
-            if let Some(call) = projected_call(column, &[]) {
-                let name = projected_name(column);
-                if call.probabilities {
-                    columns.push(format!("{name}{PROBABILITIES_SUFFIX}"));
-                }
-                if call.kind == "extract" {
-                    columns.push(format!("{name}{SPAN_SUFFIX}"));
-                }
-            }
-        }
-        let projected_names: Vec<String> = self
-            .scoring
-            .as_ref()
-            .map(|scoring| {
-                scoring
-                    .projected
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut result_inputs = sink_inputs.clone();
-        for node in &self.nodes {
-            if let PhysicalNode::AiScore(score) = node
-                && score
-                    .attributes
-                    .spec
-                    .as_ref()
-                    .is_some_and(|spec| projected_names.contains(&spec.name))
-            {
-                let found = port_of(node.id(), node.rows_port());
-                if !sink_inputs.contains(&found) {
-                    result_inputs.push(found);
-                }
-            }
-        }
-        result_inputs.extend(row_ports);
-        let nodes = result_nodes(
-            self.operators,
-            &result_inputs,
-            &columns,
-            &packing(&project.structs),
-        );
-        self.nodes.extend(nodes);
+        self.nodes.extend(limit_node(self.operators, &rows));
     }
 
     /// Build the plan and price it.

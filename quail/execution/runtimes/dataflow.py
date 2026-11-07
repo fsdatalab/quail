@@ -1,4 +1,4 @@
-"""Runtimes for the dataflow nodes: exchange, barrier, recombine, and join."""
+"""Runtimes for the dataflow nodes: exchange, barrier, and join."""
 
 from __future__ import annotations
 
@@ -8,20 +8,9 @@ import pyarrow.compute as pc
 from quail.common.pairs import columns_key, pair_table
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import (
-    IndexRelation,
-    build_result_declaration,
-    joined_survivors,
-    true_answer_rows,
-)
-from quail.execution.rows import Rows, as_table
-from quail.physical import (
-    Barrier,
-    Exchange,
-    HashJoin,
-    Recombine,
-    ValueType,
-)
+from quail.execution.result import joined_survivors, true_answer_rows
+from quail.execution.rows import Rows
+from quail.physical import Barrier, Exchange, HashJoin, ValueType
 
 
 class ExchangeRuntime:
@@ -66,41 +55,6 @@ def relation_values(columns, expression):
             raise KeyError(f"column {ref.alias}.{ref.column} is not among the "
                            f"request's relations")
     return expression.evaluate(columns)
-
-
-class RecombineRuntime:
-    """Run the configured exact answer relation join."""
-
-    def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, Recombine):
-            raise TypeError(type(node).__name__)
-        if context.recombine is None:
-            answer_tables = []
-            survivors = {}
-            for input_port in node.inputs:
-                value = as_table(inputs[input_port.name])
-                if not isinstance(value, pa.Table):
-                    raise TypeError(
-                        "Recombine inputs must be Arrow tables"
-                    )
-                if input_port.value_type is ValueType.JOIN_ANSWERS:
-                    answer_tables.append(true_answer_rows(value))
-                elif input_port.value_type is ValueType.ROWS:
-                    alias = input_port.source.port.split(":", 1)[1]
-                    survivors[alias] = value.column(alias).combine_chunks()
-                else:
-                    raise TypeError(
-                        f"Recombine cannot read {input_port.value_type.value}"
-                    )
-            declaration, schema = build_result_declaration(
-                answer_tables,
-                survivors,
-                node.alias_order[0],
-            )
-            value = IndexRelation(declaration, schema)
-        else:
-            value = context.recombine(node, inputs)
-        return NodeResult({"tuples": value})
 
 
 class ModelNodeRuntime:

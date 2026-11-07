@@ -16,12 +16,11 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                    est. rows   est. pass   est. time
-  Project: t.id, t.token_count                                            1.9
-    AiFilter: t                                                           1.9                 12.2 ms
-      KV: not stored
-      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       32.2%
-      Scan agent_traces as t                                                6
-        tokens=66, mean_document_tokens=11
+                                                                  est. rows   est. pass   est. time
+  AiFilter: t                                                           1.9                 12.2 ms
+    KV: not stored
+    predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       32.2%
+    Scan agent_traces as t                                                6
+      tokens=66, mean_document_tokens=11
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

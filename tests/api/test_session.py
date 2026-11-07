@@ -13,7 +13,6 @@ from quail.api.config import EngineConfig
 from quail.execution.result import (
     QueryResult,
     build_result_declaration,
-    count_rows,
     document_index_table,
 )
 
@@ -100,7 +99,6 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
                        text, re.M)
     assert first and second and first[1] != second[1]
     assert re.search(r"Scan reviews as r\s+6\s+6\s+\S+ ms$", text, re.M)
-    assert re.search(r"Project: r\.id\s+1\.5\s+2\s+<1 ms$", text, re.M)
     assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", text, re.M)
     assert "run:" in text
     assert "query time   1 s (model startup excluded)" in text
@@ -152,7 +150,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
         "AI_FILTER(PROMPT('q: {0}', r.review)) LIMIT 1"
     ), make_executor({"r": {"q:": [1, 0]}}))
     assert result.observer(NodeTypes)["types"] == [
-        "quail.scan", "quail.ai_filter", "quail.project", "quail.limit"]
+        "quail.scan", "quail.ai_filter"]
     assert result.observer(NodeTypes) is result.observer("test.node_types")
     with pytest.raises(KeyError):
         result.observer("example.missing")
@@ -189,19 +187,12 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     survivors = {alias: pa.array(rows, type=pa.int32()) for alias, rows in
                  {"r1": [0, 1], "r2": [0, 1], "a1": [0], "a2": [0, 1]}.items()}
     declaration, _ = build_result_declaration(true_join_tables, survivors, "r1")
-    assert count_rows(declaration) == 6
+    assert declaration.to_table().num_rows == 6
 
     relation = document_index_table({"r": list(range(5))}, "filter_survivors")
     assert relation.schema.metadata[b"quail.kind"] == b"filter_survivors"
-    survivors = {"r": pa.array(range(5), type=pa.int32())}
-    declaration, index_schema = build_result_declaration([], survivors, "r")
-    schema = pa.schema([pa.field("r.id", pa.string(), nullable=False)],
-                       metadata={b"quail.kind": b"query_result"})
-    result = QueryResult(
-        columns=["r.id"], declaration=declaration,
-        document_index_schema=index_schema, output_schema=schema,
-        projection=[("r", pa.array([f"r{i}" for i in range(5)]))],
-        report={}, survivor_indices=survivors, true_join_tables={})
+    result = QueryResult.from_table(
+        pa.table({"r.id": [f"r{i}" for i in range(5)]}))
 
     reader = result.execute_stream(batch_rows=2)
     batches = list(reader)
@@ -229,8 +220,7 @@ def test_order_by_offset_and_distinct_run_in_datafusion_on_the_regions_rows():
     assert result.to_rows() == [("r3",)]
     assert result.count() == 1
     assert result.observer(NodeTypes)["types"] == [
-        "quail.scan", "quail.ai_filter", "quail.ai_filter",
-        "quail.project"]
+        "quail.scan", "quail.ai_filter", "quail.ai_filter"]
     assert "SortExec: TopK(fetch=1), expr=[stars@1 DESC]" in result.explain()
 
     result = _run(session.sql(

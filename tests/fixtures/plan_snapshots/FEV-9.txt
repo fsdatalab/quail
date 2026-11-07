@@ -27,8 +27,10 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
                                                                                                est. rows   est. pass   est. time
-  Project: c1.id, e1.id, c2.id, e2.id
-    Recombine: c1, e1, c2, e2
+  AiJoin: anchor=c2                                                                                                      1.08 ms
+    KV: anchor=from filters, retain after join=no
+    join 3 full (c2, e2)  PROMPT('Does the Wikipedia passage in DO…')                                  0      0.217%
+    Barrier: next_anchor=c2
       AiJoin: anchor=e1 [3]                                                                                              5.72 ms
         KV: anchor=from filters, retain after join=yes
         join 1 full (e1, c1)  PROMPT('Does the Wikipedia passage in DO…')                           11.8      0.217%
@@ -43,7 +45,7 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
           predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       59.2%
           Scan claims as c1                                                                            6
             tokens=42, mean_document_tokens=7
-      AiJoin: anchor=e1 [4]                                                                                              1.09 ms
+      AiJoin: anchor=e1                                                                                                  1.09 ms
         KV: anchor=from an earlier join, retain after join=no
         join 2 full (e1, c2)  PROMPT('Does the Wikipedia passage in DO…')                            0.1      0.332%
         Reuse [3]
@@ -53,20 +55,13 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
           predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       59.2%
           Scan claims as c2                                                                            6
             tokens=42, mean_document_tokens=7
-      AiJoin: anchor=c2                                                                                                  1.08 ms
-        KV: anchor=from filters, retain after join=no
-        join 3 full (c2, e2)  PROMPT('Does the Wikipedia passage in DO…')                              0      0.217%
-        Barrier: next_anchor=c2 [5]
-          Reuse [3]
-          Reuse [4]
-          Reuse [1]
-          Reuse [2]
-          AiFilter: e2                                                                               3.3                 8.35 ms
-            KV rewind=on
-            predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                6       55.4%
-            Scan evidence as e2                                                                        6
-              tokens=102, mean_document_tokens=17
-      Reuse [5]
+      Reuse [1]
+      Reuse [2]
+      AiFilter: e2                                                                                   3.3                 8.35 ms
+        KV rewind=on
+        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                    6       55.4%
+        Scan evidence as e2                                                                            6
+          tokens=102, mean_document_tokens=17
   Pipeline on e1: ai_filter:e1 -> ai_join:e1 -> ai_join:e1:predicate:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

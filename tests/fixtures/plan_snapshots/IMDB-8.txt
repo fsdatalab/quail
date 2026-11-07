@@ -17,24 +17,19 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                           est. rows   est. pass   est. time
-  Project: r.id, a.id, a2.id
-    Recombine: r, a2, a
-      AiJoin: anchor=r [3]                                                                           60.6 ms
-        KV: anchor=not resident, retain after join=yes
-        join 2 full (r, a2)  PROMPT('Does the review in DOCUMENT {0} …')         144       16.1%
-        Scan reviews as r                                                         12
-          tokens=134, mean_document_tokens=11.2
-        Scan aspects as a2 [2]                                                    12
-          tokens=135, mean_document_tokens=11.2
-      AiJoin: anchor=r                                                                               47.9 ms
-        KV: anchor=from an earlier join, retain after join=no
-        join 1 full (r, a)  PROMPT('Does the review in DOCUMENT {0} …')        126.4       29.5%
-        Reuse [3]
-        Scan aspects as a [1]                                                     12
-          tokens=135, mean_document_tokens=11.2
-      Reuse [2]
-      Reuse [1]
+                                                                         est. rows   est. pass   est. time
+  AiJoin: anchor=r                                                                                 47.9 ms
+    KV: anchor=from an earlier join, retain after join=no
+    join 1 full (r, a)  PROMPT('Does the review in DOCUMENT {0} …')          126.4       29.5%
+    AiJoin: anchor=r                                                                               60.6 ms
+      KV: anchor=not resident, retain after join=yes
+      join 2 full (r, a2)  PROMPT('Does the review in DOCUMENT {0} …')         144       16.1%
+      Scan reviews as r                                                         12
+        tokens=134, mean_document_tokens=11.2
+      Scan aspects as a2                                                        12
+        tokens=135, mean_document_tokens=11.2
+    Scan aspects as a                                                           12
+      tokens=135, mean_document_tokens=11.2
   Pipeline on r: ai_join:r -> ai_join:r:predicate:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

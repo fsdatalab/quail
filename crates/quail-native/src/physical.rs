@@ -211,19 +211,6 @@ static KINDS: &[Kind] = &[
             "question_header_token_ids" = EMPTY, "document_ends" = EMPTY),
     },
     Kind {
-        class: "Recombine",
-        tag: "quail.recombine",
-        node: true,
-        fields: fields!(NODE; "alias_order" = EMPTY),
-    },
-    Kind {
-        class: "Project",
-        tag: "quail.project",
-        node: true,
-        fields: fields!(NODE; "columns" = EMPTY, "structs" = EMPTY, "sources" = EMPTY,
-            "answers" = EMPTY),
-    },
-    Kind {
         class: "Limit",
         tag: "quail.limit",
         node: true,
@@ -885,9 +872,6 @@ fn fill_node(
                 .collect::<PyResult<Vec<_>>>()?;
             dict.set_item("shards", PyTuple::new(py, shards)?)?;
         }
-        physical::PhysicalNode::Project(_) => {
-            dict.set_item("result_columns", tuple_of(py, &node.output_schema())?)?;
-        }
         physical::PhysicalNode::Extension(extension) => {
             dict.set_item("type_name", &extension.type_name)?;
             dict.set_item("runtime_key", &extension.type_name)?;
@@ -1336,8 +1320,6 @@ leaf_classes! {
         )
     }
     },
-    Recombine = "Recombine": NodeBase [NodeBase] {},
-    Project = "Project": NodeBase [NodeBase] {},
     Limit = "Limit": NodeBase [NodeBase] {},
     RequestExecution = "RequestExecution": NodeBase [NodeBase] {},
     AiScore = "AiScore": AiInference [NodeBase, AiInference] {},

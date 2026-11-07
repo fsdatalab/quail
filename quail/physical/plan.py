@@ -181,7 +181,7 @@ class PhysicalPlan:
 
         Allowed only for Barrier and Exchange nodes with one
         input and one output of the same value type. Removing a Scan,
-        AiFilter, AiJoin, Recombine, Project, or Limit would change
+        AiFilter, AiJoin, or Limit would change
         what the query means.
         """
         return self._edit({"op": "remove", "node_id": node_id})

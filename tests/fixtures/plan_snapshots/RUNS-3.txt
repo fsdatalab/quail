@@ -20,18 +20,17 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                      est. rows   est. pass   est. time
-  Project: s.id, f.id
-    AiJoin: anchor=s                                                                                                            1.89 ms
-      KV: anchor=not resident, retain after join=no
-      join 1 full (s, f) over pairs from hash_join:s-f  PROMPT('DOCUMENT {0} and DOCUMENT {1} ar…')           1       6.84%
-      Scan issue_runs as s [1]                                                                                3
-        tokens=48, mean_document_tokens=16
-      Scan issue_runs as f [2]                                                                                3
-        tokens=48, mean_document_tokens=16
-      HashJoin: s.instance_id = f.instance_id
-        pairs kept: 0.1111 of the cross product
-        Reuse [1]
-        Reuse [2]
+                                                                                                    est. rows   est. pass   est. time
+  AiJoin: anchor=s                                                                                                            1.89 ms
+    KV: anchor=not resident, retain after join=no
+    join 1 full (s, f) over pairs from hash_join:s-f  PROMPT('DOCUMENT {0} and DOCUMENT {1} ar…')           1       6.84%
+    Scan issue_runs as s [1]                                                                                3
+      tokens=48, mean_document_tokens=16
+    Scan issue_runs as f [2]                                                                                3
+      tokens=48, mean_document_tokens=16
+    HashJoin: s.instance_id = f.instance_id
+      pairs kept: 0.1111 of the cross product
+      Reuse [1]
+      Reuse [2]
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

@@ -16,7 +16,6 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     Barrier,
-    Project,
     Scan,
 )
 from quail.physical.plan import Refusal
@@ -31,11 +30,6 @@ def filter_sequence(plan, alias=None):
 def join_stages(plan):
     return [json.loads(node.to_json())["attributes"]
             for node in plan.nodes if isinstance(node, AiJoin)]
-
-
-def _sink_source(plan):
-    sink = next(node for node in plan.nodes if isinstance(node, Project))
-    return sink.inputs[0].source
 
 
 def _parquet(path, columns):
@@ -170,7 +164,6 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
         plan = _plan(operators, {"r": [400] * 100})
         text = explain(operators, plan)
         physical = text.split("physical:", 1)[1]
-        assert _cell(physical, "Project: r.id") == [expected], sels
         assert _cell(physical, "AiFilter: r")[0] == expected, sels
         assert _cell(physical, "AiFilter: r")[-1] in ("ms", "s"), sels
         assert _cell(physical, "Scan reviews as r") == ["100"], sels
@@ -191,7 +184,6 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     plan = _plan(operators, {"r": [400] * 100})
     physical = explain(operators, plan).split("physical:", 1)[1]
     assert _cell(physical, "Limit: 10") == ["10"]
-    assert _cell(physical, "Project: r.id") == ["25"]
     assert "KV: not stored" in physical
 
     rules = (LogicalRule("eliminate_distinct"),
@@ -293,7 +285,7 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     as_written = _plan(operators, tokens, order="as_written")
     assert join_stages(as_written)[0]["selectivity"] == 0.9
 
-    assert _sink_source(plan).node_id == "recombine"
+    assert not [node for node in plan.nodes if node.type_name == "quail.recombine"]
     groups = plan.graph.nodes_by_type(AiJoin.type_name)
     assert len(groups) == 2
     assert [group.anchor for group in groups] == ["r", "r"]

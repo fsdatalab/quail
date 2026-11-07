@@ -6,24 +6,19 @@
 //! The request node and its specs are written as the JSON their Python
 //! codecs read, since only the request executor reads them.
 
-use quail_physical::{
-    LimitAttributes, Node, PhysicalNode, PortRef, ProjectAttributes, RecombineAttributes,
-    ScanAttributes, input_ports, port,
-};
+use quail_physical::{Node, PhysicalNode, PortRef, ScanAttributes, input_ports, port};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::context::PlanningContext;
-use crate::expressions::{
-    CompileError, Refusal, aliased_call, argument_alias, call_aliases, projected_name,
-};
-use crate::expressions::{asked_call, packing};
+use crate::expressions::asked_call;
+use crate::expressions::{CompileError, Refusal, aliased_call, argument_alias, call_aliases};
 use crate::graph::has_label;
 use crate::lowering::answer_ids;
 use crate::operators::{Operators, SemanticColumn};
 use crate::prompts::{LABEL_PREFIX, join_label, prompt_layout, render_join_frame};
 use crate::request_order::request_order;
-use crate::results::{project_bindings, structs_value};
+use crate::results::limit_node;
 use crate::search::label_calls;
 use crate::validation::columns_above_joins;
 
@@ -149,7 +144,7 @@ pub fn request_plan(
             "extracts": extracts, "maps": maps,
         },
     }));
-    let (results, root) = result_nodes(found, request_id, &aliases, &joins, &extracts, &maps)?;
+    let (results, root) = result_nodes(found, request_id, &aliases, &joins);
     for node in results {
         nodes.push(node_value(node)?);
     }
@@ -630,125 +625,29 @@ fn request_preamble(
     Ok((preamble, without_bos(&text, &context.model.bos_text)))
 }
 
-/// The nodes that turn the request node's answers into result rows, and
-/// the port that returns them.
+/// The Limit of the region's fetch, reading the request node's result
+/// rows, and the port that ends the plan.
 fn result_nodes(
     found: &Operators,
     request: &str,
     aliases: &[String],
     joins: &[Value],
-    extracts: &[Value],
-    maps: &[Value],
-) -> Result<(Vec<PhysicalNode>, PortRef), CompileError> {
-    let mut nodes = Vec::new();
-    let full: Vec<&Value> = joins
-        .iter()
-        .filter(|spec| spec["semantics"] == "full")
-        .collect();
-    let position = |spec: &Value| spec["written_position"].as_i64().unwrap_or_default();
-    let sink = if full.len() == 1 && joins.len() == 1 {
-        // one full join and no gates: its true pairs are the result rows
-        port(request, format!("join_answers:{}", position(full[0])))
-    } else if !full.is_empty() {
-        let mut result_aliases: Vec<String> = Vec::new();
-        for spec in &full {
-            for alias in spec["aliases"].as_array().into_iter().flatten() {
-                let alias = alias.as_str().unwrap_or_default().to_string();
-                if !result_aliases.contains(&alias) {
-                    result_aliases.push(alias);
-                }
-            }
-        }
-        let mut edges: Vec<PortRef> = full
-            .iter()
-            .map(|spec| port(request, format!("join_answers:{}", position(spec))))
-            .collect();
-        edges.extend(
-            result_aliases
-                .iter()
-                .map(|alias| port(request, format!("rows:{alias}"))),
-        );
-        nodes.push(PhysicalNode::Recombine(Node {
-            id: "recombine".into(),
-            inputs: input_ports(&edges),
-            attributes: RecombineAttributes {
-                alias_order: result_aliases,
-            },
-        }));
-        port("recombine", "tuples")
-    } else {
-        port(request, format!("rows:{}", aliases[0]))
+) -> (Vec<PhysicalNode>, PortRef) {
+    let full = joins.iter().find(|spec| spec["semantics"] == "full");
+    let rows = match full {
+        Some(spec) => port(
+            request,
+            format!(
+                "join_answers:{}",
+                spec["written_position"].as_i64().unwrap_or_default()
+            ),
+        ),
+        None => port(request, format!("rows:{}", aliases[0])),
     };
-
-    let columns_written = &found.projection.columns;
-    let projected_labels: Vec<String> = columns_written
-        .iter()
-        .filter_map(|column| match column {
-            quail_physical::Projected::Expression(expression) => {
-                aliased_call(expression, &["label"]).map(|_| projected_name(column))
-            }
-            _ => None,
-        })
-        .collect();
-    let mut label_ports: Vec<PortRef> = projected_labels
-        .iter()
-        .map(|name| port(request, format!("label_answers:{name}")))
-        .collect();
-    for spec in extracts {
-        label_ports.push(port(
-            request,
-            format!(
-                "extract_answers:{}",
-                spec["output"].as_str().unwrap_or_default()
-            ),
-        ));
+    match limit_node(found, &rows) {
+        Some(limit) => (vec![limit], port("limit", "rows")),
+        None => (Vec::new(), rows),
     }
-    for spec in maps {
-        label_ports.push(port(
-            request,
-            format!(
-                "map_answers:{}",
-                spec["output"].as_str().unwrap_or_default()
-            ),
-        ));
-    }
-    let mut columns: Vec<String> = Vec::new();
-    for column in columns_written {
-        columns.push(projected_name(column));
-        if let quail_physical::Projected::Expression(expression) = column
-            && aliased_call(expression, &["extract"]).is_some()
-        {
-            columns.push(format!(
-                "{}{}",
-                projected_name(column),
-                crate::expressions::SPAN_SUFFIX
-            ));
-        }
-    }
-    let structs = packing(&found.projection.structs);
-    let mut inputs = vec![sink];
-    inputs.extend(label_ports);
-    let (sources, answers) = project_bindings(found);
-    nodes.push(PhysicalNode::Project(Node {
-        id: "project".into(),
-        inputs: input_ports(&inputs),
-        attributes: ProjectAttributes {
-            columns: columns.clone(),
-            structs: structs_value(&structs),
-            sources,
-            answers,
-        },
-    }));
-    let mut last = port("project", "rows");
-    if let Some(limit) = found.fetch {
-        nodes.push(PhysicalNode::Limit(Node {
-            id: "limit".into(),
-            inputs: input_ports(&[port("project", "rows")]),
-            attributes: LimitAttributes { count: limit },
-        }));
-        last = port("limit", "rows");
-    }
-    Ok((nodes, last))
 }
 
 /// A string as Python's repr writes it.

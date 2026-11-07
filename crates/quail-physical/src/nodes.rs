@@ -288,20 +288,6 @@ physical_nodes! {
         question_header_token_ids: TokenIds,
         document_ends: Value,
     }
-    /// Joins each table's surviving rows into result rows.
-    Recombine(RecombineAttributes) = "quail.recombine" {
-        alias_order: Vec<String>,
-    }
-    /// The columns a region returns. `sources` names each column a source
-    /// expression computes; `answers` names each column a model call adds,
-    /// with the call's table aliases, kind, and labels, and whether it is
-    /// the call's answer.
-    Project(ProjectAttributes) = "quail.project" {
-        columns: Vec<String>,
-        structs: Value,
-        sources: Vec<(String, ValueExpression)>,
-        answers: Vec<(String, Vec<String>, String, Value, bool)>,
-    }
     /// The first rows a region returns: its fetch.
     Limit(LimitAttributes) = "quail.limit" {
         count: i64,

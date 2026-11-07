@@ -12,14 +12,13 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                        est. rows   est. pass   est. time
-  Project: c.id, k.id
-    AiJoin: anchor=k                                                                              20.6 ms
-      KV: anchor=not resident, retain after join=no
-      join 1 full (k, c)  PROMPT('DOCUMENT {1} names a clause type…')          36       19.3%
-      Scan clause_types as k                                                    6
-        tokens=126, mean_document_tokens=21
-      Scan contracts as c                                                       6
-        tokens=78, mean_document_tokens=13
+                                                                      est. rows   est. pass   est. time
+  AiJoin: anchor=k                                                                              20.6 ms
+    KV: anchor=not resident, retain after join=no
+    join 1 full (k, c)  PROMPT('DOCUMENT {1} names a clause type…')          36       19.3%
+    Scan clause_types as k                                                    6
+      tokens=126, mean_document_tokens=21
+    Scan contracts as c                                                       6
+      tokens=78, mean_document_tokens=13
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

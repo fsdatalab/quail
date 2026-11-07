@@ -211,7 +211,7 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
                             f"WHERE {PLAUSIBLE_SQL}")
         plan = query.plan()
         assert [type(node).__name__ for node in plan.nodes] == [
-            "Scan", "AiFilter", "AiClassify", "Project"]
+            "Scan", "AiFilter", "AiClassify"]
         classify = plan.nodes[2]
         assert classify.inputs[0].source == PortRef(plan.nodes[1].node_id,
                                                     "rows:c")
@@ -236,9 +236,8 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         # filter on its label, and the sequence run as one pipeline,
         # and the join joins it only when it anchors on the claims
         assert [type(node).__name__ for node in plan.nodes] == [
-            "Scan", "Scan", "AiClassify", "Filter", "AiFilter", "AiJoin",
-            "Project"]
-        test, ask, join, project = plan.nodes[3:7]
+            "Scan", "Scan", "AiClassify", "Filter", "AiFilter", "AiJoin"]
+        test, ask, join = plan.nodes[3:6]
         members = tuple(
             member.node_id for member in plan.graph.pipelines()["ai-classify:0"])
         assert members == (("ai-classify:0", test.node_id, ask.node_id)
@@ -246,8 +245,6 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         (claims_port,) = [port.source for port in join.inputs
                           if port.source.port == "rows:c"]
         assert claims_port == PortRef(ask.node_id, "rows:c")
-        assert [port.source.port for port in project.inputs] == [
-            "join_answers:0", "rows:c"]
         execute = fever_executor(session, monkeypatch, 1, capacity=10)
         result = execute_query(query, physical_executor=execute)
         assert result.collect().to_pylist() == [

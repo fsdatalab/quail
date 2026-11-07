@@ -11,18 +11,15 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                         est. rows   est. time
-  Project: t.id, progress, domain, root_cause
-    AiClassify: root_cause over t                                      16.3 ms
-      rule=trie_decode, labels=8, label tokens=93
-      AiClassify: domain over t [2]                                    26.2 ms
-        rule=trie_decode, labels=27, label tokens=666
-        AiClassify: progress over t [1]                                16.2 ms
-          rule=trie_decode, labels=5, label tokens=106
-          Scan agent_traces as t                                 6
-            tokens=66, mean_document_tokens=11
-    Reuse [1]
-    Reuse [2]
+                                                       est. rows   est. time
+  AiClassify: root_cause over t                                      16.3 ms
+    rule=trie_decode, labels=8, label tokens=93
+    AiClassify: domain over t                                        26.2 ms
+      rule=trie_decode, labels=27, label tokens=666
+      AiClassify: progress over t                                    16.2 ms
+        rule=trie_decode, labels=5, label tokens=106
+        Scan agent_traces as t                                 6
+          tokens=66, mean_document_tokens=11
   Pipeline on t: ai-classify:0 -> ai-classify:1 -> ai-classify:2 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

@@ -365,25 +365,6 @@ pub fn packing(structs: &[ExtractStruct]) -> Vec<(String, Vec<(String, String)>)
     found
 }
 
-/// Result column names after packing members into struct columns.
-pub fn packed_columns(
-    columns: impl IntoIterator<Item = String>,
-    packing: &[(String, Vec<(String, String)>)],
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for column in columns {
-        let name = packing
-            .iter()
-            .find(|(_, fields)| fields.iter().any(|(_, member)| *member == column))
-            .map(|(name, _)| name.clone())
-            .unwrap_or(column);
-        if !out.contains(&name) {
-            out.push(name);
-        }
-    }
-    out
-}
-
 /// The one table alias a value expression of an equality reads.
 pub fn column_alias_of(expression: &ValueExpression) -> String {
     column_references(expression)

@@ -9,20 +9,15 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                                       est. rows   est. time
-  Project: c.id, contract, contract_span
-    contract = struct(contract.agreement_date, contract.expiration_date, contract.governing_law)
-    contract_span = struct(contract.agreement_date_span, contract.expiration_date_span, contract.governing_law_span)
-    AiExtract: contract.governing_law over c                                                                                         8.54 ms
-      question="Which state/country's law governs the interpretation of the contract?", up to 64 answer tokens
-      AiExtract: contract.expiration_date over c [2]                                                                                 8.12 ms
-        question="On what date will the contract's initial term expire?", up to 64 answer tokens
-        AiExtract: contract.agreement_date over c [1]                                                                                  10 ms
-          question='The date of the contract', up to 64 answer tokens
-          Scan contracts as c                                                                                                  6
-            tokens=78, mean_document_tokens=13
-    Reuse [1]
-    Reuse [2]
+                                                                                                               est. rows   est. time
+  AiExtract: contract.governing_law over c                                                                                   8.54 ms
+    question="Which state/country's law governs the interpretation of the contract?", up to 64 answer tokens
+    AiExtract: contract.expiration_date over c                                                                               8.12 ms
+      question="On what date will the contract's initial term expire?", up to 64 answer tokens
+      AiExtract: contract.agreement_date over c                                                                                10 ms
+        question='The date of the contract', up to 64 answer tokens
+        Scan contracts as c                                                                                            6
+          tokens=78, mean_document_tokens=13
   Pipeline on c: ai-extract:0 -> ai-extract:1 -> ai-extract:2 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

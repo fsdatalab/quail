@@ -13,8 +13,6 @@ from quail.physical import (
     PhysicalGraph,
     PhysicalNode,
     PortRef,
-    Project,
-    Recombine,
 )
 
 
@@ -46,8 +44,6 @@ class ExecutionContext:
     runtimes: Mapping[str, NodeRuntime]
     model_execution: Any = None
     sources: Mapping[str, Any] = field(default_factory=dict)
-    project: Callable[[Project, Any], Any] | None = None
-    recombine: Callable[[Recombine, Mapping[str, Any]], Any] | None = None
     model_inputs: Callable[
         [PhysicalNode, Mapping[str, Any], "ExecutionContext"],
         Mapping[str, Any],

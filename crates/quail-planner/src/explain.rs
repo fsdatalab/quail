@@ -1008,7 +1008,7 @@ impl Graph {
                     .copied()
                     .flatten()
                     .map(|value| value * effective_selectivity(filter.attributes.selectivity)),
-                Some(PhysicalNode::Project(_) | PhysicalNode::Exchange(_)) => single,
+                Some(PhysicalNode::Exchange(_)) => single,
                 Some(PhysicalNode::Limit(limit)) => {
                     single.map(|value| value.min(limit.attributes.count as f64))
                 }
@@ -1168,17 +1168,6 @@ impl TreeRows<'_> {
                     details.push(format!("where {}", predicates.join(" and ")));
                 }
                 title
-            }
-            PhysicalNode::Project(project) => {
-                let project = &project.attributes;
-                let packing = struct_packing(&project.structs);
-                let result = crate::expressions::packed_columns(project.columns.clone(), &packing);
-                for (name, members) in &packing {
-                    let members: Vec<&str> =
-                        members.iter().map(|(_, member)| member.as_str()).collect();
-                    details.push(format!("{name} = struct({})", members.join(", ")));
-                }
-                format!("Project: {}", result.join(", "))
             }
             PhysicalNode::Limit(limit) => format!("Limit: {}", commas_int(limit.attributes.count)),
             PhysicalNode::AiFilter(filter) => {
@@ -1340,9 +1329,6 @@ impl TreeRows<'_> {
             PhysicalNode::Barrier(barrier) => {
                 format!("Barrier: next_anchor={}", barrier.attributes.next_anchor)
             }
-            PhysicalNode::Recombine(recombine) => {
-                format!("Recombine: {}", recombine.attributes.alias_order.join(", "))
-            }
             _ => {
                 if !self.verbose {
                     details.extend(node.field_lines(Vec::new(), 0));
@@ -1500,29 +1486,6 @@ impl TreeRows<'_> {
     }
 }
 
-/// A Project's struct packing: (struct column, [(field, member column)]).
-fn struct_packing(structs: &Value) -> Vec<(String, Vec<(String, String)>)> {
-    structs
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let entry = entry.as_array()?;
-            let name = py_str(entry.first()?);
-            let members = entry
-                .get(1)?
-                .as_array()?
-                .iter()
-                .filter_map(|pair| {
-                    let pair = pair.as_array()?;
-                    Some((py_str(pair.first()?), py_str(pair.get(1)?)))
-                })
-                .collect();
-            Some((name, members))
-        })
-        .collect()
-}
-
 /// Lay out (text, cells) rows as a tree column and aligned columns.
 fn table(rows: &[(String, Cells)]) -> Vec<String> {
     let columns: Vec<(&str, &str)> = COLUMNS
@@ -1624,8 +1587,14 @@ fn physical_tree(
         rows: Vec::new(),
         used_default: false,
     };
-    tree.visit(graph.by_id[&graph.root.node_id], 0);
-    for index in &topological {
+    // each node no other node reads heads one tree: the root first, then
+    // the latest first
+    let root = graph.by_id[&graph.root.node_id];
+    let sinks = topological
+        .iter()
+        .rev()
+        .filter(|index| **index != root && !uses.contains_key(graph.nodes[**index].id.as_str()));
+    for index in std::iter::once(&root).chain(sinks) {
         if !tree.visited.contains(&graph.nodes[*index].id) {
             tree.visit(*index, 0);
         }

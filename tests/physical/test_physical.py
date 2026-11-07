@@ -22,7 +22,6 @@ from quail.physical import (
     OutputPort,
     PhysicalGraph,
     PortRef,
-    Project,
     Scan,
     ValueType,
     decode_plan_value,
@@ -107,10 +106,8 @@ def local_plan(*, num_documents, count):
         FIRST_DOCUMENTS, "filter:d", inputs=ids_from("input:d"),
         outputs=(OutputPort("rows:d", ValueType.ROWS, schema=("d",)),),
         alias="d", count=count)
-    project = Project(
-        node_id="project", inputs=ids_from("filter:d"), columns=("d.id",))
     return PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", gpus=1,
-                        nodes=(scan, filtered, project))
+                        nodes=(scan, filtered))
 
 
 def test_an_extension_node_encodes_validates_and_runs(monkeypatch):

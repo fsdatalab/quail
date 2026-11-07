@@ -19,19 +19,18 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                           est. rows   est. time
-  Project: c.id, commit_score
-    quail.ai_score                                         <1 ms
-      backend=quail
-      keep_kv=False
-      model=qwen3-4b-fp8
-      batching=token_based_admission
-      output=commit_score
-      aliases=['c']
-      expected_rows=0.0
-      estimated_seconds=0.0
-      share_prefixes=False
-      Scan sales_calls as c                        0
-        tokens=0, mean_document_tokens=0
+                                         est. rows   est. time
+  quail.ai_score                                         <1 ms
+    backend=quail
+    keep_kv=False
+    model=qwen3-4b-fp8
+    batching=token_based_admission
+    output=commit_score
+    aliases=['c']
+    expected_rows=0.0
+    estimated_seconds=0.0
+    share_prefixes=False
+    Scan sales_calls as c                        0
+      tokens=0, mean_document_tokens=0
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

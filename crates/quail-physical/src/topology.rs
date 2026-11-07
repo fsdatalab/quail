@@ -104,7 +104,7 @@ fn request_outputs(attributes: &RequestExecutionAttributes) -> Vec<OutputPort> {
 
 /// The value type a port name carries.
 pub fn value_type_for_port(name: &str) -> ValueType {
-    if name == "rows" || name.starts_with("rows:") || name == "tuples" {
+    if name == "rows" || name.starts_with("rows:") {
         ValueType::Rows
     } else if name.starts_with("filter_answers:") {
         ValueType::FilterAnswers
@@ -353,10 +353,7 @@ impl PhysicalNode {
                     ),
                 ]
             }
-            PhysicalNode::Project(_) | PhysicalNode::Limit(_) => {
-                vec![rows("rows".into(), self.output_schema())]
-            }
-            PhysicalNode::Recombine(_) => vec![rows("tuples".into(), self.output_schema())],
+            PhysicalNode::Limit(_) => vec![rows("rows".into(), Vec::new())],
             PhysicalNode::RequestExecution(node) => request_outputs(&node.attributes),
             PhysicalNode::Extension(node) => node.outputs.clone(),
             _ if self.has_spec() => {
@@ -401,37 +398,6 @@ impl PhysicalNode {
             PhysicalNode::Extension(node) => node.location,
             _ if self.is_inference() => Location::GpuExecutor,
             _ => Location::Coordinator,
-        }
-    }
-
-    /// The column schema of the node's first output, for the relational
-    /// nodes; empty for any other.
-    pub fn output_schema(&self) -> Vec<String> {
-        match self {
-            PhysicalNode::Project(node) => {
-                let attributes = &node.attributes;
-                let mut out: Vec<String> = Vec::new();
-                for column in &attributes.columns {
-                    let mut name = column.clone();
-                    if let serde_json::Value::Array(structs) = &attributes.structs {
-                        for entry in structs {
-                            let packs = entry[1].as_array().is_some_and(|members| {
-                                members.iter().any(|pair| pair[1].as_str() == Some(column))
-                            });
-                            if packs {
-                                name = entry[0].as_str().unwrap_or_default().to_string();
-                                break;
-                            }
-                        }
-                    }
-                    if !out.contains(&name) {
-                        out.push(name);
-                    }
-                }
-                out
-            }
-            PhysicalNode::Recombine(node) => node.attributes.alias_order.clone(),
-            _ => Vec::new(),
         }
     }
 

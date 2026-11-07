@@ -37,7 +37,7 @@ def test_windows_run_in_datafusion_on_the_model_regions_rows(session):
     query = session.sql(SQL)
     # the region classifies; DataFusion runs the window and the sort
     assert [node.node_id for node in query.plan().nodes] == [
-        "scan:s", "ai-classify:0", "project"]
+        "scan:s", "ai-classify:0"]
     explained = query.explain()
     assert "WindowAggExec:" in explained and "SortExec:" in explained
     labels = ["good", "bad", "good", "bad", "good"]

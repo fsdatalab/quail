@@ -8,7 +8,6 @@ from helpers.sessions import TOKENIZER, _run, make_executor
 
 import quail
 from quail.api.config import EngineConfig
-from quail.physical import Recombine
 
 
 def _session(tmp_path, tokenizer=TOKENIZER):
@@ -83,7 +82,6 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
         "AI_FILTER(PROMPT('m {0} {1}', r.review, p.description)) "
         "WHERE AI_FILTER(PROMPT('q: {0}', r.review))")
     result = _run(query, make_executor(truth, join_truth))
-    assert not [n for n in result.plan.nodes if isinstance(n, Recombine)]
     assert sorted(result.to_rows()) == [("r0", "p0"), ("r2", "p0")]
     assert result.count() == 2
     session.close()

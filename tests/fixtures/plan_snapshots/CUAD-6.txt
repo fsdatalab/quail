@@ -10,16 +10,15 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                      est. rows   est. pass   est. time
-  Project: c.id                                                           0.386
-    AiFilter: c                                                           0.386                 2.13 ms
+                                                                    est. rows   est. pass   est. time
+  AiFilter: c                                                           0.386                 2.13 ms
+    KV rewind=on
+    predicate 2  PROMPT('DOCUMENT:\n{0}\n\nIs there an exclu…')           1.2       32.1%
+    AiFilter: c                                                           1.2                 7.75 ms
       KV rewind=on
-      predicate 2  PROMPT('DOCUMENT:\n{0}\n\nIs there an exclu…')           1.2       32.1%
-      AiFilter: c                                                           1.2                 7.75 ms
-        KV rewind=on
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs there a restri…')           6         20%
-        Scan contracts as c                                                   6
-          tokens=78, mean_document_tokens=13
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs there a restri…')           6         20%
+      Scan contracts as c                                                   6
+        tokens=78, mean_document_tokens=13
   Pipeline on c: ai_filter:c -> ai_filter:c:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

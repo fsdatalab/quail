@@ -1,4 +1,4 @@
-"""Arrow tables and Acero execution for query results."""
+"""Query results, and the id relations the executor joins with Acero."""
 
 from __future__ import annotations
 
@@ -6,43 +6,12 @@ import itertools
 import json
 import weakref
 from collections.abc import Callable, Iterable
-from copy import copy
-from dataclasses import dataclass
 
 import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
 
-from quail.common.pairs import pair_keys
-
 DEFAULT_BATCH_ROWS = 65_536
-
-
-@dataclass(frozen=True)
-class StructEntry:
-    """Projection entries a result packs into one struct column.
-
-    Attributes:
-        entries: The (alias, values) projection entry of each field.
-        fields: The Arrow field of each field, named as the struct
-            field.
-    """
-
-    entries: tuple
-    fields: tuple
-
-
-@dataclass(frozen=True)
-class IndexRelation:
-    """A lazy Arrow relation over document index columns."""
-
-    declaration: acero.Declaration
-    schema: pa.Schema
-
-    @classmethod
-    def from_table(cls, table: pa.Table) -> "IndexRelation":
-        """Create a lazy relation from one Arrow table."""
-        return cls(_table_source(table), table.schema)
 
 
 def document_index_schema(aliases: Iterable[str], kind: str) -> pa.Schema:
@@ -265,16 +234,6 @@ def build_result_declaration(
     return declaration, schema
 
 
-def count_rows(declaration: acero.Declaration) -> int:
-    """Count rows inside Acero without returning the rows to Python."""
-    options = acero.AggregateNodeOptions(
-        [([], "count_all", None, "num_rows")])
-    count_declaration = acero.Declaration(
-        "aggregate", options, [declaration])
-    table = count_declaration.to_table()
-    return int(table.column("num_rows")[0].as_py())
-
-
 def bounded_reader(source: pa.RecordBatchReader, limit: int | None = None,
                    batch_rows: int = DEFAULT_BATCH_ROWS, *,
                    schema: pa.Schema | None = None,
@@ -328,72 +287,21 @@ def iter_rows(table: pa.Table):
     return zip(*(column.to_pylist() for column in table.columns))
 
 
-def projected_column(batch: pa.RecordBatch, alias, values) -> pa.Array:
-    """Return one result column for a batch of document index rows.
-
-    Args:
-        batch: The index rows.
-        alias: The index column that selects the values, the two ids
-            of a joined label, or None for a struct column.
-        values: The values by document index, None for a column the
-            batch carries, a joined label's lookup, or a StructEntry.
-    """
-    if isinstance(values, StructEntry):
-        return pa.StructArray.from_arrays(
-            [projected_column(batch, *entry) for entry in values.entries],
-            fields=list(values.fields))
-    if isinstance(alias, tuple):
-        # a label of joined rows, looked up by the row's ids
-        keys, table, order = values
-        positions = pc.index_in(
-            pair_keys(*(batch.column(batch.schema.get_field_index(name))
-                        for name in alias)),
-            value_set=keys)
-        labels = pc.take(
-            table.column(table.column_names[2]).combine_chunks().cast(pa.string()),
-            positions)
-        if order is not None:
-            labels = pa.DictionaryArray.from_arrays(
-                pc.index_in(labels, order).cast(pa.int32()), order)
-        return labels
-    column = batch.column(batch.schema.get_field_index(alias))
-    # a computed column such as a score is carried as is
-    selected = column if values is None else pc.take(values, column)
-    if isinstance(selected, pa.ChunkedArray):
-        selected = selected.combine_chunks()
-    return selected
-
-
 class QueryResult:
-    """A lazy Arrow result backed by an Acero execution plan."""
+    """A query's rows as one Arrow table, with the run's plan, report, and answers."""
 
-    def __init__(self, columns: list[str],
-                 declaration: acero.Declaration,
-                 document_index_schema: pa.Schema,
-                 output_schema: pa.Schema,
-                 projection: list[tuple[str, pa.Array | pa.ChunkedArray]],
-                 report: dict,
-                 answer_tables: dict | None = None,
-                 limit: int | None = None,
-                 survivor_indices: dict[str, pa.Array] | None = None,
-                 true_join_tables: dict[int, pa.Table] | None = None,
-                 num_rows: int | None = None):
-        self.columns = columns
-        self.schema = output_schema
-        self.report = report
+    def __init__(self, table: pa.Table, report: dict | None = None):
+        self.columns = list(table.column_names)
+        self.schema = table.schema
+        self.report = report or {}
         # the executed physical graph and each node's measured metrics,
         # filled in by Query.finish
         self.plan = None
         self.node_metrics: dict = {}
-        self.answer_tables = answer_tables or {"filters": {}, "joins": {}}
-        self.limit = limit
-        self._declaration = declaration
-        self._document_index_schema = document_index_schema
-        self._projection = projection
-        self.survivor_indices = survivor_indices or {}
-        self.true_join_tables = true_join_tables or {}
-        self._num_rows = num_rows
-        self._materialized = None
+        self.answer_tables = {"filters": {}, "joins": {}}
+        self.survivor_indices: dict[str, pa.Array] = {}
+        self.true_join_tables: dict[int, pa.Table] = {}
+        self._table = table
         # DataFusion's plan around the model region, when it ran one
         self.datafusion_plan: str | None = None
         self.region_rows: int | None = None
@@ -401,30 +309,13 @@ class QueryResult:
     @classmethod
     def from_table(cls, table: pa.Table,
                    report: dict | None = None) -> "QueryResult":
-        """Create a result from a table produced by a local runtime."""
-        result = cls.__new__(cls)
-        result.columns = list(table.column_names)
-        result.schema = table.schema
-        result.report = report or {}
-        result.answer_tables = {"filters": {}, "joins": {}}
-        result.plan = None
-        result.node_metrics = {}
-        result.limit = None
-        result._declaration = None
-        result._document_index_schema = None
-        result._projection = []
-        result.survivor_indices = {}
-        result.true_join_tables = {}
-        result._num_rows = len(table)
-        result._materialized = table
-        result.datafusion_plan = None
-        result.region_rows = None
-        return result
+        """Create a result over a table of rows."""
+        return cls(table, report)
 
     def execute_stream(self, batch_rows: int = DEFAULT_BATCH_ROWS,
                        limit: int | None = None
                        ) -> pa.RecordBatchReader:
-        """Stream projected result rows as Arrow record batches.
+        """Stream result rows as Arrow record batches.
 
         Args:
             batch_rows: Maximum rows in each returned batch.
@@ -435,34 +326,15 @@ class QueryResult:
         """
         if batch_rows <= 0:
             raise ValueError("batch_rows must be positive")
-        effective_limit = self.limit
-        if limit is not None:
-            if limit < 0:
-                raise ValueError("limit must be nonnegative")
-            effective_limit = (limit if effective_limit is None
-                               else min(limit, effective_limit))
-        if self._materialized is not None:
-            table = self._materialized
-            if effective_limit is not None:
-                table = table[:effective_limit]
-            return table.to_reader(max_chunksize=batch_rows)
-
-        def project(batch):
-            if not self._projection:
-                return batch.select([]).replace_schema_metadata(self.schema.metadata)
-            return pa.RecordBatch.from_arrays(
-                [projected_column(batch, alias, values)
-                 for alias, values in self._projection], schema=self.schema)
-
-        # a threaded Acero reader can stall when closed before its end
-        return bounded_reader(
-            self._declaration.to_reader(use_threads=False), effective_limit,
-            batch_rows, schema=self.schema, project=project)
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be nonnegative")
+        table = self._table if limit is None else self._table[:limit]
+        return table.to_reader(max_chunksize=batch_rows)
 
     def collect(self, limit: int | None = None,
                 batch_rows: int = DEFAULT_BATCH_ROWS
                 ) -> pa.Table:
-        """Collect projected result rows into one Arrow table.
+        """Collect result rows into one Arrow table.
 
         Args:
             limit: Maximum rows to collect, or all rows when omitted.
@@ -519,30 +391,12 @@ class QueryResult:
         return reports[name]
 
     def to_rows(self, limit: int | None = None) -> list[tuple]:
-        """Collect projected result rows as Python tuples."""
+        """Collect result rows as Python tuples."""
         return list(iter_rows(self.collect(limit=limit)))
 
-    def known_num_rows(self) -> int | None:
-        """Return the row count when it is known without running the plan."""
-        return self._num_rows
-
     def count(self) -> int:
-        """Return the result row count, computing it when needed."""
-        if self._num_rows is None:
-            count = count_rows(self._declaration)
-            self._num_rows = (count if self.limit is None
-                               else min(count, self.limit))
-        return self._num_rows
-
-    def with_limit(self, limit: int) -> "QueryResult":
-        """Return the same result with a smaller row limit."""
-        if limit <= 0:
-            raise ValueError("limit must be positive")
-        result = copy(self)
-        result.limit = limit if self.limit is None else min(self.limit, limit)
-        if self._num_rows is not None:
-            result._num_rows = min(self._num_rows, result.limit)
-        return result
+        """Return the result row count."""
+        return self._table.num_rows
 
     def __len__(self) -> int:
         return self.count()

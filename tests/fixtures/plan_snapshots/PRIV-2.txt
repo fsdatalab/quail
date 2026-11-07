@@ -14,22 +14,21 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                             est. rows   est. pass   est. time
-  Project: p.id, s.id
-    AiJoin: anchor=p                                                                                                   22.9 ms
-      KV: anchor=from filters, retain after join=no
-      join 1 full (p, s)  PROMPT('Based on the privacy policy in D…')                               32        20%*
-      AiFilter: p                                                                                 0.32                 2.04 ms
+                                                                                           est. rows   est. pass   est. time
+  AiJoin: anchor=p                                                                                                   22.9 ms
+    KV: anchor=from filters, retain after join=no
+    join 1 full (p, s)  PROMPT('Based on the privacy policy in D…')                               32        20%*
+    AiFilter: p                                                                                 0.32                 2.04 ms
+      KV rewind=on
+      expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+      predicate 2  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                1.6        20%*
+      AiFilter: p                                                                                1.6                 9.69 ms
         KV rewind=on
-        expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
-        predicate 2  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                1.6        20%*
-        AiFilter: p                                                                                1.6                 9.69 ms
-          KV rewind=on
-          predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                8        20%*
-          Scan policies as p                                                                         8
-            tokens=136, mean_document_tokens=17
-      Scan scenarios as s                                                                          100
-        tokens=9,183, mean_document_tokens=91.8
+        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                8        20%*
+        Scan policies as p                                                                         8
+          tokens=136, mean_document_tokens=17
+    Scan scenarios as s                                                                          100
+      tokens=9,183, mean_document_tokens=91.8
   Pipeline on p: ai_filter:p -> ai_filter:p:1 -> ai_join:p (each document runs every operator with its KV resident)
   * no selectivity was given; the planner assumes 20%
   est. time is each node's work alone; node times do not add up to the plan estimate

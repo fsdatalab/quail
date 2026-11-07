@@ -16,17 +16,14 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                 est. rows   est. pass   est. time
-  Project: c.id, contract, contract_span
-    contract = struct(contract.expiration_date)
-    contract_span = struct(contract.expiration_date_span)
-    AiExtract: contract.expiration_date over c                                                                             2.66 ms
-      question="On what date will the contract's initial term expire?", up to 64 answer tokens
-      AiFilter: c                                                                                        2                 7.41 ms
-        KV rewind=on
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nCan a party termi…')                                      6       32.7%
-        Scan contracts as c                                                                              6
-          tokens=78, mean_document_tokens=13
+                                                                                               est. rows   est. pass   est. time
+  AiExtract: contract.expiration_date over c                                                                             2.66 ms
+    question="On what date will the contract's initial term expire?", up to 64 answer tokens
+    AiFilter: c                                                                                        2                 7.41 ms
+      KV rewind=on
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nCan a party termi…')                                      6       32.7%
+      Scan contracts as c                                                                              6
+        tokens=78, mean_document_tokens=13
   Pipeline on c: ai_filter:c -> ai-extract:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

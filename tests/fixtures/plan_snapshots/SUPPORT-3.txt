@@ -20,8 +20,9 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
                                                                                                       est. rows   est. pass   est. time
-  Project: u.id, a.id, disagreement
-    AiJoin: anchor=a [3]                                                                                                          <1 ms
+  AiClassify: disagreement over a                                                                                                 <1 ms
+    rule=letters, labels=6, label tokens=6
+    AiJoin: anchor=a                                                                                                              <1 ms
       KV: anchor=not resident, retain after join=no
       join 1 full (a, u) over pairs from hash_join:a-u  PROMPT("Does the customer's reply in DOC…")           0       5.26%
       Scan support_messages as a [1]                                                                          6
@@ -32,9 +33,6 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
         pairs kept: 0 of the cross product
         Reuse [1]
         Reuse [2]
-    AiClassify: disagreement over a                                                                                               <1 ms
-      rule=letters, labels=6, label tokens=6
-      Reuse [3]
   Pipeline on a: ai_join:a -> ai-classify:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes
