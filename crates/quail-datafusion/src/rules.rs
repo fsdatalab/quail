@@ -83,6 +83,8 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
             Arc::new(crate::projection::PushDownProjectionIntoAiNodes)
         }
         "push_down_case_guards" => Arc::new(crate::guards::PushDownCaseGuards),
+        // off by default: a session lists it to run it
+        "push_down_or_guards" => Arc::new(crate::or_guards::PushDownOrGuards),
         _ => return None,
     })
 }
@@ -177,5 +179,14 @@ mod tests {
         let listed: Vec<String> = LOGICAL_RULES.iter().map(ToString::to_string).collect();
         let rules = logical_rules(&listed).unwrap();
         assert_eq!(rules.last().unwrap().name(), crate::claim::CLAIM_RULE);
+    }
+
+    #[test]
+    fn a_rule_off_by_default_is_known_by_name() {
+        assert!(!LOGICAL_RULES.contains(&"push_down_or_guards"));
+        assert_eq!(
+            logical_rule("push_down_or_guards").unwrap().name(),
+            "push_down_or_guards"
+        );
     }
 }

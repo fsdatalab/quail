@@ -92,6 +92,7 @@ names the rule that makes each rewrite and when it applies.
 | R2 | `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)` | `absorb_into_ai_nodes` | `q` tests the node's answer, and the node has no fetch. |
 | R5 | `π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))` | `push_down_projection_into_ai_nodes` | `Q` is a projection directly above a node of rows; the node keeps its answer, and drops each other added column `Q` does not read, such as an extraction's spans under a FROM subquery. DataFusion's `optimize_projections` already prunes the input columns the node reads. |
 | R6 | `π_{B, (CASE WHEN c THEN a END)→z}(AI_{f→a}(R)) ⇒ π_{B, a→z}(AI_{f→a}(R; g = g ∧ c))` | `push_down_case_guards` | The node is a classification, map, or SAE features of rows with no filter, `HINT`, or fetch; the projection is directly above it; every item that reads an added column is `CASE WHEN c THEN <column> END` with the same `c`; `c` reads only columns of the one table the call reads. |
+| R7 | `π_Q(σ_{a ∨ b}(AI_{f→b}(R))) ⇒ π_Q(σ_{a ∨ b}(AI_{f→b}(R; g = g ∧ (a IS NOT TRUE))))` | `push_down_or_guards`, off by default | The filter is directly above the node and one of its OR terms is the answer `b`; the other terms `a` read only columns of the one table the call reads; `Q` does not read `b`; the node has no filter, `HINT`, or fetch, and returns every column it adds. |
 | R8 | `Limit_k(π(R)) ⇒ π(Limit_k(R))` | DataFusion's `push_down_limit`; `push_down_limit_into_ai_nodes` also reads through projections | The projection keeps one row per row. Over an `AiNode`, the LIMIT becomes the node's fetch (R9). |
 | R9 | `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))` | `push_down_limit_into_ai_nodes` | Only projections and aliases are between them, the node has no `HINT` and no per-key fetch, and `k > 0`. |
 | R10 | `Limit_{k,m}(AI(R; n)) ⇒ Limit_{k,m}(AI(R; n = min(k + m, n)))` | `push_down_limit_into_ai_nodes` | As R9, for a LIMIT with an OFFSET of `m`. |
@@ -113,6 +114,15 @@ pipeline of its own, and stock vLLM refuses a plan with a guard. An
 extraction keeps its `CASE`: its answer is a struct of one answer per
 question, and an unasked row would read as a struct of NULL answers
 rather than NULL.
+
+R7's rule is off by default. Quail's lowering refuses an AI call in an
+OR, such as `WHERE r.flagged OR AI.IF(...)`, so no plan has the shape
+yet. Running it needs two more pieces: a lowering that gives the AI.IF
+its own `AiNode` returning `b`, under a filter of `a ∨ b`, and an AI
+filter in the physical plan that passes the rows its guard leaves out
+without asking the model. Until then, derive refuses an AI filter with
+a guard. Add the rule to a session's list to run it:
+`built_in_registry(logical_rules=(*LOGICAL_RULES, "push_down_or_guards"))`.
 
 R1 needs no rule of its own. Quail moves each plain filter term to its
 table while it finds the model regions, before DataFusion's optimizer

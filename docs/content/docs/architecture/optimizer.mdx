@@ -132,6 +132,7 @@ region.
 | `push_down_limit_into_ai_nodes` | Logical | Make a LIMIT, with its OFFSET, the fetch of the AI operator whose rows it reads, through projections, when the node has no `HINT` (R9, R10). | No |
 | `push_down_projection_into_ai_nodes` | Logical | Make an AI operator return only its answer and the added columns the SELECT list above it reads, such as an extraction's spans (R5). | No |
 | `push_down_case_guards` | Logical | Make the test of a `CASE WHEN c THEN <answer> END` the guard of the classification, map, or SAE features below it, so the model is asked only where `c` is TRUE (R6). | No |
+| `push_down_or_guards` | Logical | Off by default. Guard an AI test that is one term of an OR with the other terms, so the model is asked only where they are not TRUE (R7). | No |
 | `decorrelate_predicate_subquery` | Logical | DataFusion's rule: run an IN or EXISTS subquery as a semi or anti join. | No |
 | `push_down_limit` | Logical | DataFusion's rule: move a LIMIT below operators that keep one row per row, but not below an AI operator. | No |
 | `push_down_filter` | Logical | DataFusion's rule: move plain filters to the scans. A filter of an AI operator's input columns moves below an operator with no fetch (R1). | No |

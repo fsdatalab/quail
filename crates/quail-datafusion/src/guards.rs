@@ -140,7 +140,7 @@ fn guarded_answer<'a>(expr: &'a Expr, node: &AiNode) -> Option<(&'a Expr, Column
 
 /// Whether `test` reads columns of the node's input, of the one table its
 /// call reads, and calls no AI function.
-fn reads_call_table(test: &Expr, node: &AiNode) -> bool {
+pub(crate) fn reads_call_table(test: &Expr, node: &AiNode) -> bool {
     let tables = |expr: &Expr| -> Vec<String> {
         let mut found: Vec<String> = Vec::new();
         for column in expr.column_refs() {

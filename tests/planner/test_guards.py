@@ -15,6 +15,7 @@ from helpers.sessions import CONFIG, TOKENIZER
 import quail
 from quail.api.config import EngineConfig
 from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.common.expressions import CompileError
 from quail.physical.plan import Refusal
 
 CASE_RULE = "push_down_case_guards"
@@ -105,3 +106,15 @@ def test_stock_vllm_refuses_a_guarded_classification():
     session.close()
     assert isinstance(plan, Refusal)
     assert plan.constraint == "guard_needs_quail_backend"
+
+
+def test_an_or_of_a_column_and_an_ai_filter_is_refused_with_its_guard_rule_on():
+    # R7's rule, push_down_or_guards, is off by default: the lowering
+    # refuses an AI call in an OR before the rule could guard it
+    sql = ("SELECT r.id FROM reviews r "
+           "WHERE r.long OR AI_FILTER(PROMPT('kind: {0}', r.body))")
+    for rules in (LOGICAL_RULES, (*LOGICAL_RULES, "push_down_or_guards")):
+        session = _session(rules)
+        with pytest.raises(CompileError, match="an OR of a model call"):
+            session.sql(sql)
+        session.close()
