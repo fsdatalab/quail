@@ -97,3 +97,14 @@ def test_fewer_passing_rows_than_the_limit_returns_every_passing_row(sessions):
     sql = f"SELECT r.id FROM reviews r WHERE {AI_IF} LIMIT 10"
     for rows in _rows_on_and_off(sessions, sql):
         assert sorted(rows) == PASSING
+
+
+def test_a_limit_over_a_projection_of_an_answer_becomes_the_fetch(sessions):
+    # Limit_k(π(AI(R))) = π(Limit_k(AI(R))): the projection keeps one row per row
+    sql = ("SELECT r.id, CONCAT(AI_CLASSIFY(PROMPT('tone: {0}', r.body), "
+           "['a', 'b']), '!') AS t FROM reviews r LIMIT 2")
+    assert "fetch: 2" in sessions[0].sql(sql).logical
+    assert "fetch: 2" not in sessions[1].sql(sql).logical
+    labeled = [(f"r{index}", "a!" if index % 2 == 0 else "b!") for index in range(6)]
+    for rows in _rows_on_and_off(sessions, sql):
+        _assert_some_of(rows, labeled, 2)

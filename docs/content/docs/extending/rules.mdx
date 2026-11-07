@@ -90,6 +90,7 @@ names the rule that makes each rewrite and when it applies.
 | --- | --- | --- | --- |
 | R1 | `σ_q(AI(R)) ⇒ AI(σ_q(R))` | Quail's region claim, then DataFusion's `push_down_filter` | `q` reads only columns of `R`, and the node has no fetch. Above a per-key fetch, only a test of the key columns moves. |
 | R2 | `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)` | `absorb_into_ai_nodes` | `q` tests the node's answer, and the node has no fetch. |
+| R8 | `Limit_k(π(R)) ⇒ π(Limit_k(R))` | DataFusion's `push_down_limit`; `push_down_limit_into_ai_nodes` also reads through projections | The projection keeps one row per row. Over an `AiNode`, the LIMIT becomes the node's fetch (R9). |
 | R9 | `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))` | `push_down_limit_into_ai_nodes` | Only projections and aliases are between them, the node has no `HINT` and no per-key fetch, and `k > 0`. |
 | R10 | `Limit_{k,m}(AI(R; n)) ⇒ Limit_{k,m}(AI(R; n = min(k + m, n)))` | `push_down_limit_into_ai_nodes` | As R9, for a LIMIT with an OFFSET of `m`. |
 | R12 | `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))` | `push_down_distinct` | `K` is input columns or a classification's label, and the node has no fetch. |
