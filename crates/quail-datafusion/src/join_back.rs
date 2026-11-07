@@ -90,17 +90,29 @@ impl JoinBack {
         if self.unchanged {
             return Ok(region);
         }
-        // each table is the join's left side, the one DataFusion builds
-        // its hash table on unless statistics favor the other side. With
-        // the region on the left, DataFusion 55.2 swaps the sides of a
-        // join back of two tables and its dynamic filters drop every row
-        let mut plan = region;
-        for joined in self
+        let joined: Vec<&Joined> = self
             .joined
             .iter()
             .filter(|joined| !joined.columns.is_empty())
-        {
-            let key = key_name(&joined.alias);
+            .collect();
+        // each joined table's id leaves the region under a name of its
+        // own. DataFusion 55.2 maps a dynamic join filter's columns into
+        // a probe side by name, so two region columns of one name, such
+        // as `r.id` and `p.id`, would send one table's ids to the other's
+        // column (tests/dynamic_filter.rs)
+        let renamed = region
+            .schema()
+            .iter()
+            .map(|(qualifier, field)| {
+                let column = Expr::Column(Column::new(qualifier.cloned(), field.name()));
+                match id_of(&joined, qualifier, field.name()) {
+                    Some(alias) => column.alias(key_name(alias)),
+                    None => column,
+                }
+            })
+            .collect();
+        let mut plan = LogicalPlan::Projection(Projection::try_new(renamed, Arc::new(region))?);
+        for joined in &joined {
             let table = match &joined.source {
                 Source::Named(scan) => {
                     let schema = source_as_provider(&scan.source)?.schema();
@@ -120,30 +132,35 @@ impl JoinBack {
                     let Some((_, input)) = inputs.iter().find(|(found, _)| found == name) else {
                         return datafusion::common::internal_err!("no region input {name}");
                     };
-                    LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                    let column =
+                        |name: &str| Expr::Column(Column::new(Some(joined.alias.clone()), name));
+                    let read = std::iter::once(&joined.key)
+                        .chain(&joined.columns)
+                        .map(|name| column(name))
+                        .collect();
+                    let table = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
                         Arc::new(input.clone()),
                         joined.alias.clone(),
-                    )?)
+                    )?);
+                    LogicalPlan::Projection(Projection::try_new(read, Arc::new(table))?)
                 }
             };
-            // the table's id under a name of its own, as the region's
-            // rows hold the id under the table's
-            let column = |name: &str| Expr::Column(Column::new(Some(joined.alias.clone()), name));
-            let mut read = vec![column(&joined.key).alias(key.clone())];
-            read.extend(joined.columns.iter().map(|name| column(name)));
-            let table = LogicalPlan::Projection(Projection::try_new(read, Arc::new(table))?);
-            plan = LogicalPlanBuilder::from(table)
+            // DataFusion builds its hash table on the side its statistics
+            // say is smaller, and on the region's rows when it cannot tell
+            plan = LogicalPlanBuilder::from(plan)
                 .join(
-                    plan,
+                    table,
                     JoinType::Inner,
                     (
-                        vec![Column::from_name(key)],
+                        vec![Column::from_name(key_name(&joined.alias))],
                         vec![Column::new(Some(joined.alias.clone()), &joined.key)],
                     ),
                     None,
                 )?
                 .build()?;
         }
+        // a joined table's id comes from the table, as the region's rows
+        // hold it under another name
         let exprs: Vec<Expr> = self
             .columns
             .into_iter()
@@ -156,8 +173,20 @@ impl JoinBack {
     }
 }
 
-/// The name the join gives a table's id, which the region's rows hold
-/// under the table's own name.
+/// The alias of the joined table whose id is the column `qualifier.name`.
+fn id_of<'a>(
+    joined: &[&'a Joined],
+    qualifier: Option<&TableReference>,
+    name: &str,
+) -> Option<&'a TableReference> {
+    joined
+        .iter()
+        .find(|joined| qualifier == Some(&joined.alias) && name == joined.key)
+        .map(|joined| &joined.alias)
+}
+
+/// The name the region's rows give a joined table's id above the
+/// region; the table holds the id under its own name.
 fn key_name(alias: &TableReference) -> String {
     format!("__quail_key_{}", alias.table())
 }

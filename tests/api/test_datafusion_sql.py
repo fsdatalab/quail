@@ -92,8 +92,14 @@ def test_a_document_column_beside_an_ai_answer_is_joined_back_on_the_id(session)
     assert rows.schema.field("kind").type == pa.string()
 
 
+# DataFusion builds the join back's hash table on the small tables, or,
+# without join reordering, on the region's rows; either way its dynamic
+# filters must keep every pair
+@pytest.mark.parametrize("reordering", ["true", "false"])
 def test_an_ai_join_returns_each_matching_pair_once_with_both_tables_columns(
-        session):
+        session, monkeypatch, reordering):
+    monkeypatch.setenv("DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN", "true")
+    monkeypatch.setenv("DATAFUSION_OPTIMIZER_JOIN_REORDERING", reordering)
     query = session.sql(
         "SELECT r.id, r.stars, p.id, p.text FROM reviews r JOIN products p "
         "ON AI_FILTER(PROMPT('m {0} {1}', r.body, p.text)) ORDER BY r.id, p.id")
