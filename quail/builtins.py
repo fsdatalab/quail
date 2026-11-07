@@ -8,7 +8,7 @@ from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
 from quail.specs import DEVICES, MODELS
 
 # the logical optimizer rules, in order, as quail_datafusion::LOGICAL_RULES
-# names them: DataFusion's default rules with Quail's eight before
+# names them: DataFusion's default rules with Quail's nine before
 # replace_distinct_aggregate; claim_model_regions always runs after them
 LOGICAL_RULES = (
     "rewrite_set_comparison", "optimize_unions", "unions_to_filter",
@@ -16,6 +16,7 @@ LOGICAL_RULES = (
     "eliminate_distinct", "place_ai_nodes", "absorb_into_ai_nodes",
     "merge_repeated_ai_calls", "push_down_distinct", "push_down_limit_into_ai_nodes",
     "push_down_projection_into_ai_nodes", "push_down_case_guards",
+    "push_down_substring_prechecks",
     "replace_distinct_aggregate", "eliminate_join",
     "decorrelate_predicate_subquery", "scalar_subquery_to_join",
     "decorrelate_lateral_join", "extract_equijoin_predicate",

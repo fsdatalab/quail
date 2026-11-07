@@ -90,6 +90,7 @@ names the rule that makes each rewrite and when it applies.
 | --- | --- | --- | --- |
 | R1 | `σ_q(AI(R)) ⇒ AI(σ_q(R))` | Quail's region claim, then DataFusion's `push_down_filter` | `q` reads only columns of `R`, and the node has no fetch. Above a per-key fetch, only a test of the key columns moves. |
 | R2 | `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)` | `absorb_into_ai_nodes` | `q` tests the node's answer, and the node has no fetch. |
+| R4 | `σ_{a LIKE x}(AI_{extract(d)→a}(R)) ⇒ σ_{a LIKE x}(AI_{extract(d)→a}(σ_{d ILIKE '%s%'}(R)))` | `push_down_substring_prechecks` | The node is an extraction of rows with no fetch; its filter has a term `a.f LIKE x` or `ILIKE x`, not negated, with a literal pattern; `s` is the longest word of the longest literal run of `x`. The test of the answer stays. |
 | R5 | `π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))` | `push_down_projection_into_ai_nodes` | `Q` is a projection directly above a node of rows; the node keeps its answer, and drops each other added column `Q` does not read, such as an extraction's spans under a FROM subquery. DataFusion's `optimize_projections` already prunes the input columns the node reads. |
 | R6 | `π_{B, (CASE WHEN c THEN a END)→z}(AI_{f→a}(R)) ⇒ π_{B, a→z}(AI_{f→a}(R; g = g ∧ c))` | `push_down_case_guards` | The node is a classification, map, or SAE features of rows with no filter, `HINT`, or fetch; the projection is directly above it; every item that reads an added column is `CASE WHEN c THEN <column> END` with the same `c`; `c` reads only columns of the one table the call reads. |
 | R7 | `π_Q(σ_{a ∨ b}(AI_{f→b}(R))) ⇒ π_Q(σ_{a ∨ b}(AI_{f→b}(R; g = g ∧ (a IS NOT TRUE))))` | `push_down_or_guards`, off by default | The filter is directly above the node and one of its OR terms is the answer `b`; the other terms `a` read only columns of the one table the call reads; `Q` does not read `b`; the node has no filter, `HINT`, or fetch, and returns every column it adds. |
@@ -99,6 +100,13 @@ names the rule that makes each rewrite and when it applies.
 | R11 | `Limit_k(R ⊎ S) ⇒ Limit_k(Limit_k(R) ⊎ Limit_k(S))` | DataFusion's `push_down_limit`, then `push_down_limit_into_ai_nodes` | `⊎` is UNION ALL. Each branch's LIMIT becomes its `AiNode`'s fetch as R9 allows. |
 | R12 | `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))` | `push_down_distinct` | `K` is input columns or a classification's label, and the node has no fetch. |
 | R17 | `AI_{f→b}(AI_{f→a}(R)) ⇒ π_{*, a→b}(AI_{f→a}(R))` | `merge_repeated_ai_calls` | Same call and guard, only filters and other `AiNode`s of the same rows between them, no fetch on the upper node, each test of the upper node's answer already a test of the lower node's, and the lower node returns each column the upper one returns. The lowering already gives calls written the same way in one SELECT list and WHERE one node. |
+
+R4 relies on `AI.EXTRACT` copying each answer from its document, so an
+answer is NULL or a substring of `d`. A decoded answer may differ from
+the document in case and whitespace, which `locate_span` forgives, so
+the precheck ignores case and reads one word of the pattern's literal
+text. `push_down_filter` then moves the precheck to the table, where
+DataFusion runs it before the model region.
 
 R5 changes what the node returns, not what the model is asked: the
 executor still locates each extracted answer's span. A SELECT list that

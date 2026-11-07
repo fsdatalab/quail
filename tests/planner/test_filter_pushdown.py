@@ -84,3 +84,49 @@ def test_a_filter_above_a_classification_runs_before_the_model(sessions):
         rows, read = _rows_and_read(session, sql)
         assert rows == [("r0", "a"), ("r2", "a"), ("r4", "a")]
         assert read == STARRED
+
+
+# R4: an extraction whose answer must contain a literal reads only the
+# documents that contain it (push_down_substring_prechecks)
+SUBSTRING_RULE = "push_down_substring_prechecks"
+LEASES = pa.table({
+    "id": ["c0", "c1", "c2", "c3", "c4"],
+    "text": ["Ends in 2027.", "Ends in 2026.", "2027 start", "No date.",
+             "ENDS 2027"],
+})
+
+
+def _leases_session(rules) -> quail.Session:
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER,
+                            registry=built_in_registry(logical_rules=rules))
+    session.register("leases", quail.DocumentProvider.from_table(LEASES, id_col="id"))
+    return session
+
+
+def _end_dates(session, sql) -> tuple[list, int]:
+    """Return the query's ids, sorted, and how many documents the model read."""
+    asked = []
+
+    def copy_year(spec, document):
+        asked.append(document)
+        words = LEASES.column("text")[document].as_py().rstrip(".").split()
+        return next((word for word in words if word.isdigit()), None)
+
+    result = finish(session.sql(sql), Oracle(answers=copy_year)).collect()
+    return sorted(row["l.id"] for row in result.to_pylist()), len(asked)
+
+
+@pytest.mark.parametrize("test", ["e.year LIKE '%2027%'", "e.year ILIKE '20_7'"])
+def test_an_extraction_tested_with_like_reads_only_documents_with_its_literal(test):
+    sql = ("SELECT l.id, AI_EXTRACT(l.text, {'year': 'When does it end?'}) AS e "
+           f"FROM leases l WHERE {test}")
+    on = _leases_session(LOGICAL_RULES)
+    off = _leases_session([name for name in LOGICAL_RULES if name != SUBSTRING_RULE])
+    found = [_end_dates(session, sql) for session in (on, off)]
+    on.close()
+    off.close()
+    assert found[0][0] == found[1][0] == ["c0", "c2", "c4"]
+    # LIKE '%2027%' needs "2027", and ILIKE '20_7' needs "20": the model
+    # reads the documents that contain it
+    num_read = {"e.year LIKE '%2027%'": 3, "e.year ILIKE '20_7'": 4}[test]
+    assert (found[0][1], found[1][1]) == (num_read, 5)

@@ -42,6 +42,7 @@ mod region;
 mod repeated;
 pub mod rules;
 mod shared;
+mod substring;
 mod unnest;
 
 use std::sync::Arc;
@@ -74,6 +75,7 @@ pub use region::ModelRegion;
 pub use repeated::MergeRepeatedAiCalls;
 pub use rules::{LOGICAL_RULES, logical_rule};
 pub use shared::{ROW_COLUMN, SharedInput, SharedInputExec};
+pub use substring::PushDownSubstringPrechecks;
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 
 /// Build a DataFusion session state with Quail registered.
