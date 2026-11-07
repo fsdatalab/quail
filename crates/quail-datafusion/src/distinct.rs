@@ -23,6 +23,7 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Fetch, Semantics};
+use crate::extension::as_node;
 
 /// Remove a region's `DISTINCT` when it removes no row, as the module
 /// explains.
@@ -101,13 +102,6 @@ fn edit_distinct(
         Some(edited) => Transformed::yes(edited),
         None => Transformed::no(plan),
     })
-}
-
-fn as_node<T: 'static>(plan: &LogicalPlan) -> Option<&T> {
-    match plan {
-        LogicalPlan::Extension(extension) => extension.node.as_any().downcast_ref::<T>(),
-        _ => None,
-    }
 }
 
 /// The (qualifier, name) of each plain column a SELECT list returns.

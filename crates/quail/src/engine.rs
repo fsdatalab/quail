@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use quail_datafusion::{
     IdentifiedTable, InputRows, ModelRegion, RegionBatches, RegionRunner, derive,
-    quail_column_names, region_sql,
+    quail_column_names,
 };
 use quail_planner::operators::Operators;
 use quail_planner::prompts::Turn;
@@ -30,14 +30,14 @@ use crate::planning::{PlanOutcome, Planner, Settings, TableRows, planned_json};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 
 /// Runs each model region by calling the engine's
-/// `run_region(kind, payload, tables, fetch)`, which returns the rows
+/// `run_region(payload, tables, fetch)`, which returns the rows
 /// as a pyarrow Table or RecordBatchReader.
 #[derive(Debug)]
 pub(crate) struct PythonRunner {
     pub(crate) engine: Py<PyAny>,
-    /// The model's chat-turn text and prompt layout, to derive regions in
-    /// Rust; None sends each region's SQL instead.
-    pub(crate) prompting: Option<(Turn, String)>,
+    /// The model's chat-turn text and prompt layout, which each region's
+    /// prompts are bound in.
+    pub(crate) prompting: (Turn, String),
     /// While a query runs: the thread that called DataFusion, and where
     /// a worker sends it a region to run.
     pub(crate) caller: Mutex<Option<(ThreadId, UnboundedSender<RegionCall>)>>,
@@ -56,18 +56,13 @@ pub(crate) struct RegionCall {
 }
 
 impl PythonRunner {
-    /// The request for one region: ("plan", its operators and DataFusion
-    /// plan, as [`region_json`] writes them), or ("sql", its SQL) for a
-    /// region whose shape Quail's operators do not read.
-    fn request(&self, region: &ModelRegion) -> Result<(&'static str, String)> {
-        let Some((turn, layout)) = &self.prompting else {
-            return Ok(("sql", region_sql(region)?));
-        };
-        match derive::derive_region(region, turn, layout) {
-            Ok((operators, plan)) => Ok(("plan", region_json(&operators, &plan)?)),
-            Err(error) if error.0.contains(derive::UNSUPPORTED) => Ok(("sql", region_sql(region)?)),
-            Err(error) => Err(DataFusionError::Plan(format!("CompileError: {}", error.0))),
-        }
+    /// One region's operators and DataFusion plan, as [`region_json`]
+    /// writes them.
+    fn request(&self, region: &ModelRegion) -> Result<String> {
+        let (turn, layout) = &self.prompting;
+        let (operators, plan) = derive::derive_region(region, turn, layout)
+            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?;
+        region_json(&operators, &plan)
     }
 
     /// Plan a region in Rust, or None when Python plans it: a region that
@@ -125,25 +120,21 @@ impl PythonRunner {
     /// Plan a region without running it, over the rows of its inputs that
     /// call no model; an input that calls a model plans as empty.
     ///
-    /// Returns ("plan", the region as [`region_json`] writes it, the
-    /// planned region as JSON or None when Python plans it), or ("sql",
-    /// its SQL, None).
+    /// Returns the region as [`region_json`] writes it, and the planned
+    /// region as JSON or None when Python plans it.
     pub(crate) fn plan_only(
         &self,
         region: &ModelRegion,
         inputs: &[InputRows],
-    ) -> Result<(&'static str, String, Option<String>)> {
-        let (kind, payload) = self.request(region)?;
-        if kind != "plan" {
-            return Ok((kind, payload, None));
-        }
+    ) -> Result<(String, Option<String>)> {
+        let payload = self.request(region)?;
         let sorted = inputs
             .iter()
             .zip(&region.inputs)
             .map(|((name, batches), input)| Ok((name.clone(), in_source_order(input, batches)?)))
             .collect::<Result<Vec<InputRows>>>()?;
         let planned = self.plan_here(region, &sorted, &payload, None)?;
-        Ok((kind, payload, planned))
+        Ok((payload, planned))
     }
 
     /// Run the region on this thread.
@@ -153,9 +144,9 @@ impl PythonRunner {
         inputs: &[InputRows],
         fetch: Option<usize>,
     ) -> Result<RegionBatches> {
-        let (kind, payload) = self.request(region)?;
+        let payload = self.request(region)?;
         let sorted;
-        let (planned, inputs) = if kind == "plan" && self.planning.is_some() {
+        let (planned, inputs) = if self.planning.is_some() {
             sorted = inputs
                 .iter()
                 .zip(&region.inputs)
@@ -180,10 +171,9 @@ impl PythonRunner {
             let tables = tables.into_py_dict(py)?;
             let answer = match &planned {
                 Some(found) => self.engine.call_method1(py, "execute", (found, tables))?,
-                None => {
-                    self.engine
-                        .call_method1(py, "run_region", (kind, payload, tables, fetch))?
-                }
+                None => self
+                    .engine
+                    .call_method1(py, "run_region", (&payload, tables, fetch))?,
             };
             stream_from_pyarrow(answer.bind(py))
         })

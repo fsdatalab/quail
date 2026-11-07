@@ -50,7 +50,7 @@ raises `TypeError`.
 Rules run in registration order within each step:
 
 1. DataFusion applies the logical rules inside each model region, and
-   the binder reads the result into Quail's logical plan.
+   Quail reads the region's operators from the result.
 2. Build an executable graph for each placement of the column
    operators: the plan as placed, and each plan with a classification,
    extraction, or map moved above a join.

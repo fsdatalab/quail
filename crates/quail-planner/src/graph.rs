@@ -24,7 +24,7 @@ use crate::expressions::{
     CompileError, PROBABILITIES_SUFFIX, Refusal, SPAN_SUFFIX, argument_alias, call_aliases,
     condition_columns, projected_call, projected_name, repr_str,
 };
-use crate::nodes::{asked_call, packing};
+use crate::expressions::{asked_call, packing};
 use crate::operators::{ColumnTest, Operators, SemanticColumn};
 use crate::pricing::PlanPricer;
 use crate::results::result_nodes;

@@ -1140,7 +1140,7 @@ fn cut_input(
     let name = format!(
         "{}{}{}",
         scan.table_name.table(),
-        quail_planner::logical::INPUT_SEPARATOR,
+        quail_planner::operators::INPUT_SEPARATOR,
         qualifier.table()
     );
     let fields = Arc::new(schema.as_arrow().clone());

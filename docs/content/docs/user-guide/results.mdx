@@ -84,24 +84,27 @@ The output contains a logical plan and a physical plan.
 ### Read the logical plan
 
 A *logical plan* describes the operations requested by the query.
-For the review query, the logical plan has this structure:
+Quail's logical plan is DataFusion's plan of the query, with each AI
+call as an `AiNode`. For the review query, the logical plan is:
 
 ```text
-Project: r.id
-  SemanticFilter
-    PROMPT('DOCUMENT:\n{0}\n\nDoes this review discuss the ending?', r.body)
-    Scan reviews as r [body, id]
+logical:
+  Projection: r.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does this review discuss the ending? {0}"), r.body)), filter: __quail_answer_1, returns: []
+      SubqueryAlias: r
+        TableScan: reviews projection=[id, body]
 ```
 
 Read the plan from the bottom upward:
 
-- `Scan` reads the review text and IDs.
-- `SemanticFilter` uses the model to answer the question and keeps reviews
-  with a `TRUE` answer.
-- `Project` selects the ID column for the result.
+- `TableScan` reads the review IDs and text.
+- `AiNode` asks the model the question about each review, adds the
+  answer as the column `__quail_answer_1`, and keeps the reviews with
+  a `TRUE` answer. It returns none of the columns it adds.
+- `Projection` selects the ID column for the result.
 
-The planner can change the order of operations while preserving the
-query's meaning. See [Logical plans](/docs/architecture/logical-plans)
+DataFusion's rules can change the order of operations while preserving
+the query's meaning. See [Logical plans](/docs/architecture/logical-plans)
 for more detail.
 
 ### Read the physical plan

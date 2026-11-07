@@ -12,9 +12,9 @@ use serde::Serialize;
 
 use crate::context::PlanningContext;
 use crate::costs::{join_specs, prepare_filter_costs};
+use crate::expressions::asked_call;
 use crate::expressions::{CompileError, repr_str};
 use crate::graph::hash_join_nodes;
-use crate::nodes::asked_call;
 use crate::operators::Operators;
 use crate::plan_statistics::CorpusStats;
 use crate::search::{StepCost, StepKey, TableStep, default_order_rule, order_steps, search_joins};

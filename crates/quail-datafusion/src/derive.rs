@@ -25,34 +25,34 @@ use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan, SortExpr};
 use quail_physical::{
     Asked, ColumnRef, Condition, ModelCall, Projected, SortExpression, ValueExpression,
 };
-use quail_planner::builder::{RelationContent, RelationTerms};
-use quail_planner::builder::{result_columns_read, result_row_condition, row_test_columns};
 use quail_planner::expressions::{
-    CompileError, aliased_call, call_aliases, column_name, column_references, compile_error,
-    condition_columns, condition_text, projected_call, reference_name, repr_list, repr_str,
+    CompileError, FEATURE_FIELDS, aliased_call, asked_call, asked_refs, call_aliases, call_refs,
+    column_name, column_references, compile_error, condition_columns, condition_refs,
+    condition_text, equality_refs, packed_columns, packing, projected_call, reference_name,
+    repr_list, repr_str, sort_refs, value_refs,
 };
-use quail_planner::logical::Scan;
-use quail_planner::nodes::{FEATURE_FIELDS, packed_columns, packing};
-use quail_planner::nodes::{asked_call, source_columns};
 use quail_planner::operators::{
-    ColumnTest, Operators, Projection, ResultModifiers, RowOperator, SemanticColumn, SemanticJoin,
+    ColumnTest, Operators, Projection, ResultModifiers, RowOperator, Scan, SemanticColumn,
+    SemanticJoin, source_columns,
 };
 use quail_planner::prompts::Turn;
-use quail_planner::rules::{
-    asked_refs, call_refs, condition_refs, equality_refs, sort_refs, value_refs,
-};
 
 use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Fetch, Semantics, WrittenTest};
-use crate::bind::{
+use crate::binding::{
     Binder, OnTerm, SelectBinder, Unnested, conjuncts, contains_ai_call, feature_schema,
     has_subqueries, read_top, refuse_grouped_input, select_outputs, selected_calls, unnest_term,
     unnested_fields, unsupported,
 };
+use crate::functions::column_call_kind;
 use crate::lower::quail_function;
 use crate::region::ModelRegion;
+use crate::terms::{
+    RelationContent, RelationTerms, TableContent, check_feature_lists, push, repr_tuple,
+    result_columns_read, result_row_condition, row_test_columns,
+};
 
-pub use crate::bind::UNSUPPORTED;
+pub use crate::binding::UNSUPPORTED;
 
 /// Derive a model region's operators from its plan after DataFusion's
 /// rules, running [`crate::OptimizeModelRegions`]' default rules first on a
@@ -138,7 +138,7 @@ pub fn derive_operators(
         })
         .collect();
     let mut binding = Binding {
-        binder: Binder::new(turn, layout, &[], allow_relational),
+        binder: Binder::new(turn, layout),
         bound: Vec::new(),
         unplaced: false,
     };
@@ -933,7 +933,7 @@ impl Binding {
             return Ok(());
         }
         let (unhinted, hint) = self.binder.unwrap_hint(term)?;
-        if let Some((classify, items)) = crate::bind::label_test(&unhinted) {
+        if let Some((classify, items)) = crate::binding::label_test(&unhinted) {
             let (test, selectivity) = self.binder.bind_label_test(classify, &items, hint)?;
             self.bound
                 .push(Bound::Asked(Asked::Compare(test), selectivity, None));
@@ -941,7 +941,7 @@ impl Binding {
         }
         // the binder's refusal of the term, or a term it reads that the
         // lowering left in place
-        self.binder.bind_where_term(term)?;
+        self.binder.refuse_where_term(term)?;
         self.unplaced = true;
         Ok(())
     }
@@ -1019,17 +1019,6 @@ struct Placement<'w, 'a> {
     columns_at: BTreeMap<usize, Vec<(&'static str, usize)>>,
 }
 
-/// The column kind of an AI column's call.
-fn column_kind(node: &AiNode) -> Option<&'static str> {
-    match node.function() {
-        "ai_classify" => Some("label"),
-        "ai_extract" => Some("extract"),
-        "ai_map" => Some("map"),
-        "ai_sae_features" => Some("features"),
-        _ => None,
-    }
-}
-
 impl<'w, 'a> Placement<'w, 'a> {
     fn new(walk: &'w Walk<'a>, content: &'w RelationContent) -> Self {
         Self {
@@ -1045,7 +1034,7 @@ impl<'w, 'a> Placement<'w, 'a> {
         }
     }
 
-    fn table(&self, alias: &str) -> Option<&'w quail_planner::builder::TableContent> {
+    fn table(&self, alias: &str) -> Option<&'w TableContent> {
         self.content
             .tables
             .iter()
@@ -1171,8 +1160,12 @@ impl<'w, 'a> Placement<'w, 'a> {
             _ => None,
         });
         for predicate in predicates {
-            push(&mut self.found.filters, &alias, predicate);
-            push(&mut self.found.filters_before_joins, &alias, before_joins);
+            push(&mut self.found.filters, alias.clone(), predicate);
+            push(
+                &mut self.found.filters_before_joins,
+                alias.clone(),
+                before_joins,
+            );
         }
         if let Some(key) = stop_key {
             self.found.stop_keys.insert(alias.clone(), key);
@@ -1262,7 +1255,7 @@ impl<'w, 'a> Placement<'w, 'a> {
     }
 
     fn place_column(&mut self, id: usize, node: &AiNode) -> Option<()> {
-        let kind = column_kind(node)?;
+        let kind = column_call_kind(&node.call)?;
         let read: Vec<String> = self.call_tables(id).into_iter().collect();
         let above_joins = self.walk.get(self.walk.get(id).inputs[0]).ai_join;
         if read.len() == 2 {
@@ -1496,13 +1489,6 @@ impl<'w, 'a> Placement<'w, 'a> {
     }
 }
 
-fn push<T>(map: &mut Vec<(String, Vec<T>)>, alias: &str, value: T) {
-    match map.iter_mut().find(|(found, _)| found == alias) {
-        Some((_, values)) => values.push(value),
-        None => map.push((alias.to_string(), vec![value])),
-    }
-}
-
 fn note(aliases: &mut Vec<String>, alias: &str) {
     if !aliases.iter().any(|found| found == alias) {
         aliases.push(alias.to_string());
@@ -1540,7 +1526,7 @@ impl ResultRows {
         distinct: bool,
     ) -> Result<(Projection, Vec<RowOperator>), CompileError> {
         let unnested: BTreeSet<String> = self.unnests.iter().flatten().cloned().collect();
-        quail_planner::builder::check_feature_lists(columns, order, distinct, &unnested)?;
+        check_feature_lists(columns, order, distinct, &unnested)?;
         let reads_unnested = |expression: &ValueExpression| {
             column_references(expression)
                 .iter()
@@ -1699,21 +1685,13 @@ fn unnest_columns(
     names: &[String],
     lists: &BTreeMap<String, Vec<String>>,
 ) -> Result<Vec<String>, CompileError> {
-    let tuple = |items: &[String]| {
-        let listed: Vec<String> = items.iter().map(|name| repr_str(name)).collect();
-        if listed.len() == 1 {
-            format!("({},)", listed[0])
-        } else {
-            format!("({})", listed.join(", "))
-        }
-    };
     if unnested.is_empty() {
         return compile_error("UNNEST needs at least one list column");
     }
     if unnested.iter().collect::<BTreeSet<_>>().len() != unnested.len() {
         return compile_error(format!(
             "UNNEST names a list twice, got {}",
-            tuple(unnested)
+            repr_tuple(unnested)
         ));
     }
     for column in unnested {
@@ -1801,7 +1779,7 @@ impl Needed {
 }
 
 /// Each scan's columns: the column values the operators above it read,
-/// nearest the result first, as `push_down_projection` loads them.
+/// nearest the result first.
 fn push_down_columns(
     found: &mut Operators,
     walk: &Walk<'_>,

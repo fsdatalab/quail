@@ -15,9 +15,9 @@ use quail_physical::{PhysicalNode, PortRef};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::expressions::asked_call;
 use crate::expressions::{column_name, condition_text, repr_float, repr_str};
-use crate::logical::table_name;
-use crate::nodes::asked_call;
+use crate::operators::table_name;
 use crate::operators::{Operators, SemanticJoin};
 use crate::statistics::{DEFAULT_SELECTIVITY, effective_selectivity};
 
@@ -1102,7 +1102,7 @@ struct TreeRows<'a> {
     metrics: Option<&'a HashMap<String, Vec<(String, Value)>>>,
     estimates: HashMap<&'a str, &'a Value>,
     stages: Stages,
-    scans: HashMap<String, crate::logical::Scan>,
+    scans: HashMap<String, crate::operators::Scan>,
     filters: HashMap<String, Vec<quail_physical::FilterPredicate>>,
     joins: Vec<SemanticJoin>,
     rows_estimate: HashMap<(String, String), Option<f64>>,
@@ -1179,7 +1179,7 @@ impl TreeRows<'_> {
             PhysicalNode::Project(project) => {
                 let project = &project.attributes;
                 let packing = struct_packing(&project.structs);
-                let result = crate::nodes::packed_columns(project.columns.clone(), &packing);
+                let result = crate::expressions::packed_columns(project.columns.clone(), &packing);
                 for (name, members) in &packing {
                     let members: Vec<&str> =
                         members.iter().map(|(_, member)| member.as_str()).collect();

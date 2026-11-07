@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use quail::planning::PlanOutcome;
 use quail::planning::pricer_fields;
 use quail::pyarrow::to_pyarrow;
-use quail_datafusion::{derive, region_sql};
+use quail_datafusion::derive;
 
 fn python_error(error: DataFusionError) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
@@ -79,18 +79,6 @@ impl NativeSession {
         to_pyarrow(py, schema, batches)
     }
 
-    /// Return the SQL each model region of a query sends to Quail.
-    fn region_sql(&self, py: Python<'_>, query: &str) -> PyResult<Vec<String>> {
-        py.detach(|| {
-            self.session
-                .regions(query, None)?
-                .iter()
-                .map(region_sql)
-                .collect::<Result<Vec<_>>>()
-        })
-        .map_err(python_error)
-    }
-
     /// Derive each model region of a query's operators from its plan.
     ///
     /// Returns one (the region as JSON, None) or (None, CompileError
@@ -124,23 +112,17 @@ impl NativeSession {
     }
 
     /// Plan each model region of a query without running it: per region,
-    /// (kind, the region as JSON or its SQL, its planned region as JSON or
-    /// None when Python plans it).
+    /// (the region as JSON, its planned region as JSON or None when
+    /// Python plans it).
     #[pyo3(signature = (query, dialect=None))]
-    #[allow(clippy::type_complexity)]
     fn plans(
         &self,
         py: Python<'_>,
         query: &str,
         dialect: Option<String>,
-    ) -> PyResult<Vec<(String, String, Option<String>)>> {
-        let found = py
-            .detach(|| self.session.plans(query, dialect.as_deref()))
-            .map_err(python_error)?;
-        Ok(found
-            .into_iter()
-            .map(|(kind, payload, planned)| (kind.to_string(), payload, planned))
-            .collect())
+    ) -> PyResult<Vec<(String, Option<String>)>> {
+        py.detach(|| self.session.plans(query, dialect.as_deref()))
+            .map_err(python_error)
     }
 
     /// Return the inputs of each model region of a query that call no

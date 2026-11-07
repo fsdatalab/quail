@@ -37,13 +37,15 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
-    Expr, ExprSchemable, Extension, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
-    UserDefinedLogicalNode,
+    Expr, ExprSchemable, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
 };
 use datafusion::optimizer::AnalyzerRule;
 
 use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Semantics, Written, WrittenTest};
+use crate::extension::{as_node, extension_node};
+use crate::functions::column_call_kind;
+use crate::functions::function_name;
 use crate::region::ModelRegion;
 
 /// Rewrite each model region's AI calls into Quail's plan nodes, as the
@@ -69,19 +71,6 @@ impl AnalyzerRule for LowerAiCalls {
                 Ok(Transformed::no(node))
             })?
             .data)
-    }
-}
-
-fn extension_node(node: impl UserDefinedLogicalNode + 'static) -> LogicalPlan {
-    LogicalPlan::Extension(Extension {
-        node: Arc::new(node),
-    })
-}
-
-fn function_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::ScalarFunction(call) => Some(call.name()),
-        _ => None,
     }
 }
 
@@ -126,13 +115,6 @@ fn is_asked(term: &Expr) -> bool {
         }
         other => function_name(other) == Some("ai_filter"),
     }
-}
-
-fn is_column_call(expr: &Expr) -> bool {
-    matches!(
-        function_name(expr),
-        Some("ai_classify" | "ai_extract" | "ai_map" | "ai_sae_features")
-    )
 }
 
 /// Terms of one WHERE or ON, each with its position among them.
@@ -263,7 +245,7 @@ fn selected_calls(plan: &LogicalPlan) -> Vec<(Expr, String)> {
         if let LogicalPlan::Projection(projection) = node {
             for expr in &projection.expr {
                 if let Expr::Alias(alias) = expr
-                    && is_column_call(&alias.expr)
+                    && column_call_kind(&alias.expr).is_some()
                 {
                     found.push((alias.expr.as_ref().clone(), alias.name.clone()));
                 }
@@ -322,7 +304,7 @@ fn is_span_call(expr: &Expr) -> bool {
 fn column_calls(term: &Expr) -> Vec<Expr> {
     let mut found: Vec<Expr> = Vec::new();
     let _ = term.apply(|expr| {
-        if is_column_call(expr) || is_span_call(expr) {
+        if column_call_kind(expr).is_some() || is_span_call(expr) {
             let call = base_call(expr);
             if !found.contains(&call) {
                 found.push(call);
@@ -386,7 +368,7 @@ fn add_column(input: LogicalPlan, call: Expr, name: &str) -> Result<LogicalPlan>
 fn read_columns(term: Expr, columns: &[(Expr, String)]) -> Result<Expr> {
     Ok(term
         .transform_down(|expr| {
-            if !(is_column_call(&expr) || is_span_call(&expr)) {
+            if !(column_call_kind(&expr).is_some() || is_span_call(&expr)) {
                 return Ok(Transformed::no(expr));
             }
             let call = base_call(&expr);
@@ -596,7 +578,7 @@ fn lower_projection(
             exprs.push(expr.clone());
             continue;
         };
-        if !(is_column_call(&alias.expr) || is_span_call(&alias.expr))
+        if !(column_call_kind(&alias.expr).is_some() || is_span_call(&alias.expr))
             || alias.relation.is_some()
             || alias.metadata.is_some()
         {
@@ -643,13 +625,6 @@ fn lower_projection(
     Ok(Transformed::yes(LogicalPlan::Projection(
         Projection::try_new(exprs, Arc::new(input))?,
     )))
-}
-
-fn as_node<T: 'static>(plan: &LogicalPlan) -> Option<&T> {
-    match plan {
-        LogicalPlan::Extension(extension) => extension.node.as_any().downcast_ref::<T>(),
-        _ => None,
-    }
 }
 
 /// Rewrite a region's AI calls into Quail's plan nodes, as the module

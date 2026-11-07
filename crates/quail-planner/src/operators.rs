@@ -10,18 +10,87 @@ use serde::{Deserialize, Serialize};
 
 use quail_physical::{
     Asked, Condition, Equality, ExtractStruct, FilterPredicate, ModelCall, Projected, SortKey,
-    ValueExpression,
+    ValueExpression, tagged_struct,
 };
 
-use crate::expressions::{
-    PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, condition_aliases, condition_columns,
-    projected_call,
-};
-use crate::logical::{LogicalNode, LogicalPlan, Scan};
-use crate::nodes::{
-    above_projection, added_columns, as_column, asked_call, column_call, input, output_schema,
-    result_columns, subtree,
-};
+use crate::expressions::{PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_references};
+
+tagged_struct! {
+    /// An Arrow schema, as IPC bytes in base64.
+    Schema(SchemaFields, SchemaTagged) = "pyarrow.Schema" {
+        ipc: String,
+    }
+}
+
+impl Schema {
+    /// The schema's column names.
+    ///
+    /// # Panics
+    ///
+    /// The IPC bytes do not hold a schema.
+    pub fn names(&self) -> Vec<String> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.ipc)
+            .expect("base64 schema bytes");
+        let schema =
+            arrow_ipc::convert::try_schema_from_ipc_buffer(&bytes).expect("an IPC schema message");
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+}
+
+/// The document column of a scan: an expression, or empty before a
+/// prompt names one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ScanColumn {
+    Unnamed(String),
+    Expression(ValueExpression),
+}
+
+/// What separates a table's name from its alias in the name of a model
+/// region's input that holds some of the table's rows, as in
+/// `reviews__r`.
+pub const INPUT_SEPARATOR: &str = "__";
+
+/// The registered table a scanned provider reads: the provider itself,
+/// or the table a region's input `<table>__<alias>` holds rows of.
+pub fn table_name(provider: &str) -> &str {
+    provider.split(INPUT_SEPARATOR).next().unwrap_or(provider)
+}
+
+/// The names of the source columns a document column reads.
+pub fn source_columns(column: &ScanColumn) -> Vec<String> {
+    match column {
+        ScanColumn::Unnamed(name) => vec![name.clone()],
+        ScanColumn::Expression(expression) => {
+            let mut found: Vec<String> = Vec::new();
+            for reference in column_references(expression) {
+                if !found.contains(&reference.column) {
+                    found.push(reference.column);
+                }
+            }
+            found
+        }
+    }
+}
+
+/// One table a region reads, with its regular predicates and the
+/// columns its operators read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scan {
+    pub provider: String,
+    pub alias: String,
+    pub column: ScanColumn,
+    pub columns: Vec<String>,
+    pub predicates: Vec<Condition>,
+    pub schema: Option<Schema>,
+}
 
 /// A Filter on the columns that column operators compute.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,234 +249,4 @@ impl Operators {
             .chain(&self.sae_features)
             .chain(&self.maps)
     }
-}
-
-/// The first projection over source columns and model answers.
-///
-/// # Panics
-///
-/// The plan has no Project.
-fn projection(plan: &LogicalPlan) -> &LogicalNode {
-    let root = &plan.root;
-    subtree(root)
-        .into_iter()
-        .find(|node| matches!(node, LogicalNode::Project(_)))
-        .expect("a query plan needs a projection")
-}
-
-/// The last column operator below a Filter whose columns it reads.
-fn producer(filter: &LogicalNode) -> &crate::logical::SemanticColumn {
-    let LogicalNode::Filter(found) = filter else {
-        panic!("a Filter")
-    };
-    let read = condition_columns(&found.condition);
-    let mut node = found.input.as_ref();
-    loop {
-        if as_column(node).is_some() && added_columns(node).iter().any(|name| read.contains(name)) {
-            return as_column(node).expect("a column operator");
-        }
-        node = input(node);
-    }
-}
-
-fn push<T>(map: &mut Vec<(String, Vec<T>)>, alias: &str, value: T) {
-    match map.iter_mut().find(|(found, _)| found == alias) {
-        Some((_, values)) => values.push(value),
-        None => map.push((alias.to_string(), vec![value])),
-    }
-}
-
-fn joins_below(node: &LogicalNode) -> bool {
-    subtree(node)
-        .iter()
-        .any(|below| matches!(below, LogicalNode::SemanticJoin(_)))
-}
-
-fn column_operator(column: &crate::logical::SemanticColumn) -> SemanticColumn {
-    SemanticColumn {
-        call: column_call(column).clone(),
-        name: column.name.clone(),
-        above_joins: joins_below(&column.input),
-    }
-}
-
-fn join_operator(join: &crate::logical::SemanticJoin) -> SemanticJoin {
-    fn visit(node: &LogicalNode, found: &mut Vec<Equality>) {
-        if let LogicalNode::Join(join) = node {
-            visit(&join.left, found);
-            found.extend(join.on.iter().cloned());
-        }
-    }
-    let mut on = Vec::new();
-    visit(&join.input, &mut on);
-    let mut outer = join.input.as_ref();
-    while let LogicalNode::Join(inner) = outer {
-        outer = &inner.left;
-    }
-    let mut outer_aliases: Vec<String> = Vec::new();
-    for field in output_schema(outer) {
-        if !outer_aliases.contains(&field.alias) {
-            outer_aliases.push(field.alias);
-        }
-    }
-    SemanticJoin {
-        predicate: join.predicate.clone(),
-        semantics: join.semantics.clone(),
-        selectivity: join.selectivity,
-        anchor: join.anchor.clone(),
-        on,
-        outer_aliases,
-    }
-}
-
-/// The operators on result rows between the root and the first projection.
-fn row_operators(root: &LogicalNode) -> Vec<RowOperator> {
-    let mut chain: Vec<RowOperator> = Vec::new();
-    let mut walked = match root {
-        LogicalNode::Result(result) => result.input.as_ref(),
-        other => other,
-    };
-    loop {
-        let (operator, next) = match walked {
-            LogicalNode::Unnest(unnest) => (
-                RowOperator::Unnest {
-                    lists: unnest.columns.clone(),
-                    outer: unnest.outer,
-                    columns: result_columns(walked),
-                },
-                &unnest.input,
-            ),
-            LogicalNode::Filter(filter) => (
-                RowOperator::Filter {
-                    condition: filter.condition.clone(),
-                    columns: result_columns(walked),
-                },
-                &filter.input,
-            ),
-            LogicalNode::Project(project) => {
-                if !above_projection(&project.input) {
-                    break;
-                }
-                (
-                    RowOperator::Projection {
-                        expressions: project.columns.clone(),
-                        columns: result_columns(walked),
-                    },
-                    &project.input,
-                )
-            }
-            _ => break,
-        };
-        chain.insert(0, operator);
-        walked = next;
-    }
-    chain
-}
-
-/// The plan's operators as the planner reads them.
-pub fn operators(plan: &LogicalPlan) -> Operators {
-    let top = projection(plan);
-    let nodes = subtree(top);
-    let mut found = Operators::default();
-    let mut tested: Vec<(String, Vec<&LogicalNode>)> = Vec::new();
-    let mut aliases: Vec<String> = Vec::new();
-    let note = |aliases: &mut Vec<String>, alias: &str| {
-        if !aliases.iter().any(|found| found == alias) {
-            aliases.push(alias.to_string());
-        }
-    };
-    for node in &nodes {
-        match node {
-            LogicalNode::Scan(scan) => found.scans.push(scan.clone()),
-            LogicalNode::SemanticFilter(filter) => {
-                let before_joins = !joins_below(&filter.input);
-                for predicate in &filter.predicates {
-                    let alias = call_aliases(asked_call(&predicate.expression))[0].clone();
-                    push(&mut found.filters, &alias, predicate.clone());
-                    push(&mut found.filters_before_joins, &alias, before_joins);
-                    note(&mut aliases, &alias);
-                }
-            }
-            LogicalNode::Filter(filter) => {
-                let alias = condition_aliases(&filter.condition)[0].clone();
-                push(&mut tested, &alias, *node);
-                note(&mut aliases, &alias);
-            }
-            LogicalNode::SemanticJoin(join) => found.joins.push(join_operator(join)),
-            LogicalNode::SemanticClassify(column) => {
-                found.classifies.push(column_operator(column));
-            }
-            LogicalNode::SemanticExtract(column) => found.extracts.push(column_operator(column)),
-            LogicalNode::SemanticSaeFeatures(column) => {
-                found.sae_features.push(column_operator(column));
-            }
-            LogicalNode::SemanticMap(column) => found.maps.push(column_operator(column)),
-            _ => {}
-        }
-    }
-    for alias in &aliases {
-        let Some((_, filters)) = tested.iter().find(|(found, _)| found == alias) else {
-            continue;
-        };
-        let mut ordered: Vec<&LogicalNode> = filters.clone();
-        ordered.sort_by_key(|filter| column_call(producer(filter)).kind != "label");
-        let asks = found
-            .filters
-            .iter()
-            .find(|(found, _)| found == alias)
-            .map(|(_, predicates)| predicates.len())
-            .unwrap_or(0);
-        let column_tests = ordered
-            .iter()
-            .enumerate()
-            .map(|(index, filter)| {
-                let LogicalNode::Filter(test) = filter else {
-                    unreachable!("a Filter")
-                };
-                let made_by = producer(filter);
-                ColumnTest {
-                    name: made_by.name.clone(),
-                    call: column_call(made_by).clone(),
-                    condition: test.condition.clone(),
-                    selectivity: test.selectivity,
-                    position: asks + index,
-                    before_joins: !joins_below(&test.input),
-                }
-            })
-            .collect();
-        found.column_filters.push((alias.clone(), column_tests));
-    }
-    if let LogicalNode::Project(project) = top {
-        found.projections = project
-            .columns
-            .iter()
-            .filter(|column| projected_call(column, &[]).is_some())
-            .filter_map(|column| match column {
-                Projected::Expression(expression) => Some(expression.clone()),
-                Projected::Name(_) => None,
-            })
-            .collect();
-        found.projection = Projection {
-            columns: project.columns.clone(),
-            structs: project.structs.clone(),
-        };
-    }
-    if let LogicalNode::Result(result) = &plan.root {
-        found.result = ResultModifiers {
-            limit: result.limit,
-            order: result.order.clone(),
-            offset: result.offset,
-            distinct: result.distinct,
-        };
-    }
-    found.after_projection = row_operators(&plan.root);
-    for node in subtree(&plan.root) {
-        if let LogicalNode::SemanticFilter(filter) = node
-            && !filter.stop_key.is_empty()
-        {
-            let alias = call_aliases(asked_call(&filter.predicates[0].expression))[0].clone();
-            found.stop_keys.insert(alias, filter.stop_key.clone());
-        }
-    }
-    found
 }

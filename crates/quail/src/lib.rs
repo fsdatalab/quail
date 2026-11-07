@@ -155,15 +155,14 @@ impl Session {
     }
 
     /// A session whose model regions run on `engine`, a Python object
-    /// with `run_region(kind, payload, tables, fetch)` and the
-    /// attributes `turn`, `layout`, and `rules`.
+    /// with `run_region(payload, tables, fetch)` and the attributes
+    /// `turn`, `layout`, and `rules`.
     ///
-    /// `run_region` takes ("plan", a region's operators and DataFusion
-    /// plan as [`region_json`] writes them) or ("sql", the region's SQL)
-    /// for a region whose shape Quail's operators do not read, the rows of each input the region reads by table name, and
-    /// the region's row limit, and returns a pyarrow Table or
-    /// RecordBatchReader. `turn` and `layout` are the model's chat-turn
-    /// text and prompt layout, or None to send every region as SQL.
+    /// `run_region` takes a region's operators and DataFusion plan as
+    /// [`region_json`] writes them, the rows of each input the region
+    /// reads by table name, and the region's row limit, and returns a
+    /// pyarrow Table or RecordBatchReader. `turn` and `layout` are the
+    /// model's chat-turn text and prompt layout.
     /// `rules` names the optimizer rules each model region runs, in
     /// order, or is None for the built-in rules.
     ///
@@ -200,14 +199,14 @@ impl Session {
     ) -> Result<Self> {
         let (prompting, rules, settings) = Python::attach(|py| {
             let bound = engine.bind(py);
-            let turn: Option<(String, String)> = bound.getattr("turn")?.extract()?;
-            let layout: Option<String> = bound.getattr("layout")?.extract()?;
+            let turn: (String, String) = bound.getattr("turn")?.extract()?;
+            let layout: String = bound.getattr("layout")?.extract()?;
             let rules: Option<Vec<String>> = bound.getattr("rules")?.extract()?;
             let settings: Option<String> = match bound.getattr("settings") {
                 Ok(found) => found.extract()?,
                 Err(_) => None,
             };
-            Ok::<_, PyErr>((turn.zip(layout), rules, settings))
+            Ok::<_, PyErr>(((turn, layout), rules, settings))
         })
         .map_err(python_failure)?;
         let planning = match (planner, settings) {
@@ -443,9 +442,9 @@ impl Session {
 
 impl Session {
     /// Plan each model region of a query without running it, region by
-    /// region: (its kind, the region as [`region_json`] writes it or its
-    /// SQL, its planned region as JSON when Rust plans it). A region's inputs that call no model
-    /// are computed first, so it plans on their real rows.
+    /// region: (the region as [`region_json`] writes it, its planned
+    /// region as JSON when Rust plans it). A region's inputs that call no
+    /// model are computed first, so it plans on their real rows.
     ///
     /// # Errors
     ///
@@ -455,7 +454,7 @@ impl Session {
         &self,
         query: &str,
         dialect: Option<&str>,
-    ) -> Result<Vec<(&'static str, String, Option<String>)>> {
+    ) -> Result<Vec<(String, Option<String>)>> {
         let regions = self.regions(query, dialect)?;
         let computed = self.region_inputs(query, dialect)?;
         regions

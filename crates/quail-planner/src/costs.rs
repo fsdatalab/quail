@@ -10,9 +10,9 @@ use quail_cost::score::ScoreCost;
 use quail_physical::{Equality, FilterPredicate, Prompt};
 
 use crate::context::PlanningContext;
+use crate::expressions::asked_call;
 use crate::expressions::{CompileError, argument_alias, column_name, compile_error};
 use crate::lowering::LoweredPrompt;
-use crate::nodes::asked_call;
 use crate::operators::SemanticJoin;
 use crate::scores::{prompt_aliases, score_statistics};
 use crate::statistics::effective_selectivity;

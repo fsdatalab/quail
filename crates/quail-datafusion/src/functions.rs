@@ -214,9 +214,6 @@ pub fn quail_functions() -> Vec<Arc<ScalarUDF>> {
     .collect()
 }
 
-/// A scalar function of Arrow compute that DataFusion does not have,
-/// such as `utf8_is_upper`.
-///
 /// Whether an expression calls one of Quail's functions: an AI
 /// function, `PROMPT`, `HINT`, or an `UNNEST` marker, which only a model
 /// region runs.
@@ -228,6 +225,30 @@ pub fn is_quail_call(expr: &Expr) -> bool {
 /// Whether an expression is a call to an AI function.
 pub fn is_ai_call(expr: &Expr) -> bool {
     matches!(expr, Expr::ScalarFunction(call) if AI_FUNCTION_NAMES.contains(&call.name()))
+}
+
+/// The function name of a scalar function call, if the expression is one.
+pub(crate) fn function_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::ScalarFunction(call) => Some(call.name()),
+        _ => None,
+    }
+}
+
+/// The model call kind of a column operator's call: `label`
+/// (`AI.CLASSIFY`), `extract`, `map`, or `features` (`AI.SAE_FEATURES`);
+/// None for any other expression.
+pub(crate) fn column_call_kind(expr: &Expr) -> Option<&'static str> {
+    let Expr::ScalarFunction(call) = expr else {
+        return None;
+    };
+    match call.name() {
+        "ai_classify" => Some("label"),
+        "ai_extract" => Some("extract"),
+        "ai_map" => Some("map"),
+        "ai_sae_features" => Some("features"),
+        _ => None,
+    }
 }
 
 /// Write each `{'key': value, ...}` literal outside quotes as

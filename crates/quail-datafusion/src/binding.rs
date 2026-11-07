@@ -1,271 +1,38 @@
-//! Bind a model region's DataFusion plan into Quail's logical plan.
+//! Bind the terms of a model region's DataFusion plan into Quail's
+//! expressions.
 //!
-//! This is the Rust counterpart of Quail's SQL front end
-//! (`quail/frontend/sql.py` and `quail/frontend/sql_binding`): it reads
-//! the tables, ON and WHERE parts, and SELECT list a region holds, binds
-//! each AI function call's prompt, and hands the result to the logical
-//! plan builder of `quail-planner`. A region holds the plan as
-//! DataFusion's SQL planner bound it, before type coercion, so each
-//! condition is still as written.
+//! [`crate::derive`] hands the [`Binder`] each table, ON and WHERE term,
+//! AI call, and SELECT list item in the order the query wrote them. The
+//! binder binds each AI call's prompt in the session model's chat turn
+//! and layout, each condition as a [`Condition`], and the SELECT list as
+//! the region's projection, and refuses SQL outside Quail's language.
 
 use std::collections::BTreeMap;
 
-use crate::functions::ai_function_name;
+use crate::functions::function_name;
+use crate::functions::{ai_function_name, column_call_kind};
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{Column, ScalarValue};
-use datafusion::logical_expr::expr::{Exists, InList, Like, ScalarFunction};
-use datafusion::logical_expr::{
-    BinaryExpr, Distinct, Expr, Join, JoinType, LogicalPlan, Operator, SortExpr,
-};
+use datafusion::logical_expr::expr::{InList, Like, ScalarFunction};
+use datafusion::logical_expr::{BinaryExpr, Distinct, Expr, LogicalPlan, Operator, SortExpr};
 use quail_physical::{
     Alias, ColumnRef, Condition, Connective, Equality, ExtractStruct, GetField, Literal, ModelCall,
     Not, RegularPredicate, ScalarFunction as QuailFunction, SortExpression, SortKey,
     TaggedModelCall, ValueExpression,
 };
-use quail_planner::builder::{
-    Exists as ExistsGate, Hint, Part, PlaceRelationArguments, ProjectArguments,
-};
 use quail_planner::expressions::{
-    CompileError, SPAN_SUFFIX, aliased_call, call_aliases, column_name, column_references,
-    compile_error, repr_str,
+    CompileError, SPAN_SUFFIX, aliased_call, call_aliases, column_alias_of, column_name,
+    column_references, compile_error, repr_str,
 };
-use quail_planner::logical::{LogicalNode, Scan, ScanColumn, Schema};
+use quail_planner::operators::{Scan, ScanColumn, Schema};
 use quail_planner::prompts::{self, Turn};
 use serde_json::Value;
 
 /// The answer limit of an AI.MAP call written without one.
 const DEFAULT_MAP_ANSWER_TOKENS: i64 = 256;
 
-/// Bind a model region into Quail's logical plan.
-///
-/// The binder reads the region's plan as DataFusion's SQL planner bound
-/// it, for each operator's content and for whether the query is
-/// refused. Each SELECT's operators, the main query's and each CTE
-/// stage's, are placed where DataFusion's rules leave them (`place_select`).
-/// `turn` and `layout` are the session model's chat-turn text and
-/// prompt layout.
-///
-/// # Errors
-///
-/// The region uses SQL outside Quail's language, or the logical plan
-/// builder refuses it.
-pub fn bind_model_region(
-    region: &crate::ModelRegion,
-    turn: &Turn,
-    layout: &str,
-) -> Result<quail_planner::LogicalPlan, CompileError> {
-    if region.optimized {
-        bind_plans(
-            &region.bound,
-            Some(&region.plan),
-            &region.rules,
-            turn,
-            layout,
-        )
-    } else {
-        bind_plans(&region.bound, None, &default_rules(), turn, layout)
-    }
-}
-
-/// Place a SELECT's relation as DataFusion's rules order it, then add
-/// its projection.
-///
-/// `plan` is the SELECT as DataFusion's SQL planner bound it; its AI
-/// calls are lowered ([`crate::lower_ai_calls`]), the plan goes through
-/// [`crate::optimize_region`], and [`crate::translate_relation`] reads
-/// the operators' places from the result. `optimized` is that result
-/// when the caller has it, such as a region after
-/// [`crate::OptimizeModelRegions`].
-///
-/// # Errors
-///
-/// A DataFusion rule fails, the translation does not read the plan, or
-/// the logical plan builder refuses the projection.
-fn place_select(
-    plan: &LogicalPlan,
-    optimized: Option<&LogicalPlan>,
-    rules: &[String],
-    place: PlaceRelationArguments,
-    project: &ProjectArguments,
-) -> Result<quail_planner::LogicalPlan, CompileError> {
-    let content = quail_planner::builder::relation_content(place)?;
-    let optimized = match optimized {
-        Some(optimized) => optimized.clone(),
-        None => crate::lower_ai_calls(plan.clone())
-            .and_then(|lowered| crate::optimize_region(&lowered, rules))
-            .map_err(|error| CompileError::new(error.to_string()))?,
-    };
-    let Some(relation) = crate::translate_relation(&optimized, &content) else {
-        return Err(CompileError::new(format!(
-            "the placement of these operators {UNSUPPORTED}:\n{}",
-            optimized.display_indent()
-        )));
-    };
-    let mut placed = quail_planner::builder::LogicalPlanBuilder::over(relation)
-        .project(project, &content.rows)?;
-    // crate::EliminateDistinct removed a DISTINCT that removes no row
-    if let LogicalNode::Result(result) = &mut placed.root
-        && result.distinct
-        && !has_distinct(&optimized)
-    {
-        result.distinct = false;
-    }
-    Ok(placed)
-}
-
-/// Whether a SELECT's plan keeps its DISTINCT, under its LIMIT, ORDER BY,
-/// and outer SELECT list.
-fn has_distinct(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Distinct(_) => true,
-        LogicalPlan::Limit(found) => has_distinct(&found.input),
-        LogicalPlan::Sort(found) => has_distinct(&found.input),
-        LogicalPlan::Projection(found) => has_distinct(&found.input),
-        _ => false,
-    }
-}
-
-/// Bind a model region's plan, as DataFusion's SQL planner bound it,
-/// into Quail's logical plan.
-///
-/// # Errors
-///
-/// The region uses SQL outside Quail's language.
-pub fn bind_region(
-    plan: &LogicalPlan,
-    turn: &Turn,
-    layout: &str,
-) -> Result<quail_planner::LogicalPlan, CompileError> {
-    bind_plans(plan, None, &default_rules(), turn, layout)
-}
-
-fn default_rules() -> Vec<String> {
-    crate::REGION_RULES
-        .iter()
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn bind_plans(
-    plan: &LogicalPlan,
-    optimized: Option<&LogicalPlan>,
-    rules: &[String],
-    turn: &Turn,
-    layout: &str,
-) -> Result<quail_planner::LogicalPlan, CompileError> {
-    let (place, project, stages) = bind_with_stages(plan, turn, layout, rules)?;
-    let built = place_select(plan, optimized, rules, place, &project)?;
-    if has_subqueries(plan) {
-        let asks = |root: &LogicalNode| {
-            let stage = quail_planner::LogicalPlan { root: root.clone() };
-            !quail_planner::plan_statistics::plan_prompts(&quail_planner::operators::operators(
-                &stage,
-            ))
-            .is_empty()
-        };
-        if !asks(&built.root) && !stages.iter().any(|(_, root)| asks(root)) {
-            return compile_error("the query has no AI predicate");
-        }
-    }
-    if !stages.is_empty() {
-        return compile_error(STAGED);
-    }
-    // each scan loads the column values the plan reads
-    Ok(quail_planner::LogicalPlan {
-        root: quail_planner::rules::push_down_projection(&built.root),
-    })
-}
-
-/// The binder's refusal of a region that reads a subquery it does not
-/// merge: `ClaimModelRegions` runs such a subquery as its own region, an
-/// input of the region that reads it.
-pub(crate) const STAGED: &str = "the region reads a subquery that runs before it";
-
-/// A CTE or FROM subquery that runs as its own stage: its name and plan.
-type Stage = (String, LogicalNode);
-
-fn bind_with_stages(
-    plan: &LogicalPlan,
-    turn: &Turn,
-    layout: &str,
-    rules: &[String],
-) -> Result<(PlaceRelationArguments, ProjectArguments, Vec<Stage>), CompileError> {
-    let staged_query = has_subqueries(plan);
-    let (merged, lifted) = merge_join_subqueries(plan)?;
-    let plan = &merged;
-    let mut select = Select::read(plan)?;
-    if !lifted.is_empty() {
-        // a merged subquery's WHERE runs before its reader's
-        let mut terms = lifted;
-        terms.extend(select.condition.take());
-        select.condition = terms.into_iter().reduce(Expr::and);
-    }
-    let unnests = select.take_unnests();
-    let mut binder = Binder::new(turn, layout, rules, staged_query);
-    binder.outputs = select.outputs.clone();
-    binder.selected = selected_calls(&select.projection);
-    let scans = binder.bind_tables(select.relation)?;
-    for unnest in &unnests {
-        for (name, _) in &unnest.lists {
-            binder.add_table(name, "", feature_schema())?;
-        }
-    }
-    if let Some(condition) = &select.condition {
-        binder.bind_where(condition)?;
-    }
-    let mut selection = SelectBinder::new(&mut binder);
-    selection.bind_projection(&select.projection)?;
-    selection.check_output_names()?;
-    let SelectBinder {
-        mut columns,
-        structs,
-        output,
-        ..
-    } = selection;
-    for unnest in &unnests {
-        for (name, list) in &unnest.lists {
-            let call = binder.bind_ai_sae_features(list)?;
-            columns.push(ValueExpression::Alias(quail_physical::Alias {
-                expression: Box::new(ValueExpression::ModelCall(call)),
-                name: name.clone(),
-            }));
-        }
-    }
-    let order = binder.bind_order(&select.order, &columns, &structs)?;
-    binder.validate_query(&columns, &structs)?;
-    let place = binder.place_arguments(scans, &columns);
-    let project = ProjectArguments {
-        columns: columns.clone(),
-        limit: select.limit,
-        order,
-        offset: select.offset,
-        distinct: select.distinct,
-        structs,
-        output,
-        unnests: unnests
-            .iter()
-            .map(|unnest| unnest.lists.iter().map(|(name, _)| name.clone()).collect())
-            .collect(),
-        unnest_outer: unnests.iter().map(|unnest| unnest.outer).collect(),
-    };
-    Ok((place, project, binder.stages))
-}
-
 // ---------------------------------------------------------------- the SELECT
-
-/// The parts of one SELECT, read off the region's plan.
-struct Select<'a> {
-    limit: Option<i64>,
-    offset: i64,
-    distinct: bool,
-    order: Vec<SortExpr>,
-    projection: Vec<Expr>,
-    condition: Option<Expr>,
-    relation: &'a LogicalPlan,
-    /// Output column name -> the SELECT list's expression.
-    outputs: Vec<(String, Expr)>,
-}
 
 pub use quail_planner::expressions::UNSUPPORTED;
 
@@ -386,185 +153,6 @@ pub(crate) fn refuse_grouped_input(relation: &LogicalPlan) -> Result<(), Compile
     Ok(())
 }
 
-impl<'a> Select<'a> {
-    fn read(plan: &'a LogicalPlan) -> Result<Self, CompileError> {
-        let Top {
-            limit,
-            offset,
-            distinct,
-            order,
-            projection: expressions,
-            relation,
-        } = read_top(plan)?;
-        let mut node = relation;
-        refuse_grouped_input(node)?;
-        let outputs = select_outputs(&expressions);
-        let mut condition = None;
-        if let LogicalPlan::Filter(filter) = node {
-            condition = Some(filter.predicate.clone());
-            node = &filter.input;
-        }
-        let mut select = Self {
-            limit,
-            offset,
-            distinct,
-            order,
-            projection: expressions,
-            condition,
-            relation: node,
-            outputs,
-        };
-        select.merge_subquery();
-        Ok(select)
-    }
-
-    /// Take the `UNNEST` tests out of `WHERE`, and read each unnested
-    /// field as a column of its list's relation; see
-    /// [`crate::take_unnests`].
-    fn take_unnests(&mut self) -> Vec<Unnested> {
-        let mut unnests = Vec::new();
-        if let Some(condition) = &self.condition {
-            let mut kept = Vec::new();
-            for term in conjuncts(condition) {
-                match unnest_term(&term) {
-                    Some(unnest) => unnests.push(unnest),
-                    None => kept.push(term),
-                }
-            }
-            self.condition = kept.into_iter().reduce(Expr::and);
-        }
-        if unnests.is_empty() {
-            return unnests;
-        }
-        let field = unnested_fields;
-        self.projection = self.projection.iter().map(field).collect();
-        self.condition = self.condition.as_ref().map(field);
-        for key in &mut self.order {
-            key.expr = field(&key.expr);
-        }
-        for (_, expr) in &mut self.outputs {
-            *expr = field(expr);
-        }
-        unnests
-    }
-
-    /// Merge a FROM subquery that only selects and filters into this
-    /// SELECT, as sqlglot's `merge_subqueries` does for Quail's front end.
-    ///
-    /// For example, `WITH m AS (SELECT r.id, AI.MAP(...) AS topic FROM
-    /// reviews r) SELECT m.id, m.topic FROM m WHERE m.topic = 'x'`
-    /// reads as `SELECT r.id, AI.MAP(...) AS topic FROM reviews r WHERE
-    /// AI.MAP(...) = 'x'`. The subquery's WHERE runs first.
-    fn merge_subquery(&mut self) {
-        let LogicalPlan::SubqueryAlias(alias) = self.relation else {
-            return;
-        };
-        let LogicalPlan::Projection(inner) = alias.input.as_ref() else {
-            return;
-        };
-        let (mut input, mut inner_condition) = (inner.input.as_ref(), None);
-        if let LogicalPlan::Filter(filter) = input {
-            inner_condition = Some(filter.predicate.clone());
-            input = &filter.input;
-        }
-        let plain = input
-            .exists(|node| {
-                Ok(!matches!(
-                    node,
-                    LogicalPlan::Join(_)
-                        | LogicalPlan::TableScan(_)
-                        | LogicalPlan::SubqueryAlias(_)
-                ))
-            })
-            .unwrap_or(true);
-        let nested = input
-            .exists(|node| {
-                Ok(matches!(node, LogicalPlan::SubqueryAlias(found)
-                    if !matches!(found.input.as_ref(), LogicalPlan::TableScan(_))))
-            })
-            .unwrap_or(true);
-        if plain || nested {
-            return;
-        }
-        let name = alias.alias.table().to_string();
-        let definitions: Vec<(String, Expr)> = inner
-            .expr
-            .iter()
-            .map(|expr| (output_name(expr), unalias(expr).0.clone()))
-            .collect();
-        // an AI call that reads a column another AI call computes runs
-        // the subquery as its own stage
-        let computed: Vec<&String> = definitions
-            .iter()
-            .filter(|(_, definition)| contains_ai_call(definition))
-            .map(|(found, _)| found)
-            .collect();
-        let reads_computed = |expr: &Expr| {
-            expr.exists(|node| {
-                Ok(crate::is_ai_call(node)
-                    && node
-                        .column_refs()
-                        .iter()
-                        .any(|column| computed.contains(&&column.name)))
-            })
-            .unwrap_or(true)
-        };
-        if self.projection.iter().any(reads_computed)
-            || self.condition.as_ref().is_some_and(reads_computed)
-        {
-            return;
-        }
-        let substitute = |expr: &Expr| -> Expr {
-            expr.clone()
-                .transform_up(|node| {
-                    if let Expr::Column(column) = &node
-                        && column
-                            .relation
-                            .as_ref()
-                            .is_none_or(|relation| relation.table() == name)
-                        && let Some((_, definition)) =
-                            definitions.iter().find(|(found, _)| *found == column.name)
-                    {
-                        return Ok(datafusion::common::tree_node::Transformed::yes(
-                            definition.clone(),
-                        ));
-                    }
-                    Ok(datafusion::common::tree_node::Transformed::no(node))
-                })
-                .map(|found| found.data)
-                .unwrap_or_else(|_| expr.clone())
-        };
-        self.projection = self
-            .projection
-            .iter()
-            .map(|item| {
-                let name = output_name(item);
-                let merged = substitute(unalias(item).0);
-                let keeps_name = matches!(&merged, Expr::Column(column) if column.name == name);
-                if keeps_name && !matches!(item, Expr::Alias(_)) {
-                    merged
-                } else {
-                    merged.alias(name)
-                }
-            })
-            .collect();
-        for (_, expr) in &mut self.outputs {
-            *expr = substitute(expr);
-        }
-        self.outputs
-            .retain(|(name, expr)| !matches!(expr, Expr::Column(column) if column.name == *name));
-        for key in &mut self.order {
-            key.expr = substitute(&key.expr);
-        }
-        let outer = self.condition.as_ref().map(substitute);
-        self.condition = match (inner_condition, outer) {
-            (Some(first), Some(second)) => Some(first.and(second)),
-            (first, second) => first.or(second),
-        };
-        self.relation = input;
-    }
-}
-
 /// Each output column name of a SELECT list and its expression, but a
 /// column the list passes on under its own name.
 pub(crate) fn select_outputs(expressions: &[Expr]) -> Vec<(String, Expr)> {
@@ -585,7 +173,7 @@ pub(crate) fn selected_calls(expressions: &[Expr]) -> Vec<(String, Expr)> {
     expressions
         .iter()
         .filter_map(|expr| match expr {
-            Expr::Alias(alias) if column_call(&alias.expr).is_some() => {
+            Expr::Alias(alias) if column_call_kind(&alias.expr).is_some() => {
                 Some((alias.name.clone(), (*alias.expr).clone()))
             }
             _ => None,
@@ -637,14 +225,6 @@ fn unalias(expr: &Expr) -> (&Expr, Option<&str>) {
 
 // ---------------------------------------------------------------- calls
 
-/// The function name of a scalar function call, if the expression is one.
-fn function_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::ScalarFunction(call) => Some(call.name()),
-        _ => None,
-    }
-}
-
 fn arguments(expr: &Expr) -> &[Expr] {
     match expr {
         Expr::ScalarFunction(ScalarFunction { args, .. }) => args,
@@ -657,16 +237,6 @@ fn is_call(expr: &Expr, name: &str) -> bool {
 }
 
 /// The binder method a column-operator call takes, as `column_call`.
-fn column_call(expr: &Expr) -> Option<&'static str> {
-    match function_name(expr)? {
-        "ai_classify" => Some("classify"),
-        "ai_extract" => Some("extract"),
-        "ai_map" => Some("map"),
-        "ai_sae_features" => Some("features"),
-        _ => None,
-    }
-}
-
 fn walk(expr: &Expr, found: &mut dyn FnMut(&Expr) -> bool) -> bool {
     if found(expr) {
         return true;
@@ -845,7 +415,6 @@ pub(crate) struct Binder {
     schemas: BTreeMap<String, SchemaRef>,
     /// alias -> the document expression its prompts read.
     document_columns: Vec<(String, ValueExpression)>,
-    parts: Vec<Part>,
     /// A column operator only a WHERE test reads -> its name.
     tested: Vec<(ModelCall, String)>,
     /// alias -> the ON equalities of its JOIN, in JOIN order.
@@ -854,15 +423,6 @@ pub(crate) struct Binder {
     pub(crate) selected: Vec<(String, Expr)>,
     /// Output column name -> the group, aggregate, or window expression.
     pub(crate) outputs: Vec<(String, Expr)>,
-    /// The stages FROM reads, in dependency order.
-    stages: Vec<Stage>,
-    /// Each stage's result schema, by its name.
-    stage_schemas: Vec<(String, SchemaRef)>,
-    /// The model region rules each stage's body runs.
-    rules: Vec<String>,
-    /// Whether a SELECT with no model call is allowed: in a statement
-    /// with a CTE or FROM subquery, as the front end allows it.
-    allow_relational: bool,
 }
 
 /// A bound ON term that is no AI predicate.
@@ -871,34 +431,20 @@ pub(crate) enum OnTerm {
     Equality(Box<Equality>),
 }
 
-/// A join's ON parts before they join the query's parts.
-struct JoinOn {
-    alias: String,
-    filter: Option<Expr>,
-    keys: Vec<(Expr, Expr)>,
-}
-
 impl Binder {
     /// A binder with no table in scope yet, for prompts rendered with
-    /// `turn` and `layout`; `rules` are the model region rules each
-    /// stage runs, and `allow_relational` allows a SELECT with no model
-    /// call.
-    pub(crate) fn new(turn: &Turn, layout: &str, rules: &[String], allow_relational: bool) -> Self {
+    /// `turn` and `layout`.
+    pub(crate) fn new(turn: &Turn, layout: &str) -> Self {
         Self {
             turn: turn.clone(),
             layout: layout.to_string(),
             tables: Vec::new(),
             schemas: BTreeMap::new(),
             document_columns: Vec::new(),
-            parts: Vec::new(),
             tested: Vec::new(),
             conditions: Vec::new(),
             selected: Vec::new(),
             outputs: Vec::new(),
-            stages: Vec::new(),
-            stage_schemas: Vec::new(),
-            allow_relational,
-            rules: rules.to_vec(),
         }
     }
 
@@ -921,158 +467,6 @@ impl Binder {
         self.tables.push((alias.to_string(), provider.to_string()));
         self.schemas.insert(provider.to_string(), schema);
         Ok(())
-    }
-
-    /// Read a table reference: `SubqueryAlias(TableScan)` or a bare `TableScan`.
-    fn table_of(plan: &LogicalPlan) -> Option<(String, String, SchemaRef)> {
-        match plan {
-            LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
-                LogicalPlan::TableScan(scan) => Some((
-                    alias.alias.table().to_string(),
-                    scan.table_name.table().to_string(),
-                    scan.source.schema(),
-                )),
-                _ => None,
-            },
-            LogicalPlan::TableScan(scan) => Some((
-                scan.table_name.table().to_string(),
-                scan.table_name.table().to_string(),
-                scan.source.schema(),
-            )),
-            _ => None,
-        }
-    }
-
-    /// Read a table reference, or bind a FROM subquery as its own stage
-    /// and read the stage's result as a table named by the CTE name or
-    /// the subquery alias, as the front end's `_compile_stage` does.
-    fn table_or_stage(
-        &mut self,
-        plan: &LogicalPlan,
-    ) -> Result<Option<(String, String, SchemaRef)>, CompileError> {
-        if let Some(table) = Self::table_of(plan) {
-            return Ok(Some(table));
-        }
-        let LogicalPlan::SubqueryAlias(alias) = plan else {
-            return Ok(None);
-        };
-        let reference = alias.alias.table().to_string();
-        // `FROM clauses x` reads the CTE `clauses` under the alias `x`
-        let (name, body) = match alias.input.as_ref() {
-            LogicalPlan::SubqueryAlias(cte) => (cte.alias.table().to_string(), cte.input.as_ref()),
-            body => (reference.clone(), body),
-        };
-        // a CTE two queries read runs once
-        if let Some((_, schema)) = self.stage_schemas.iter().find(|(found, _)| *found == name) {
-            return Ok(Some((reference, name, schema.clone())));
-        }
-        if self.provider_named(&name) {
-            return compile_error(format!(
-                "{} names a registered table or another CTE; pick another name",
-                repr_str(&name)
-            ));
-        }
-        let (place, project, inner) =
-            bind_with_stages(body, &self.turn, &self.layout, &self.rules)?;
-        let built = place_select(body, None, &self.rules, place, &project)?;
-        let schema = stage_schema(body)?;
-        self.stages.extend(inner);
-        self.stages.push((name.clone(), built.root));
-        self.stage_schemas.push((name.clone(), schema.clone()));
-        Ok(Some((reference, name, schema)))
-    }
-
-    fn provider_named(&self, name: &str) -> bool {
-        self.stages.iter().any(|(found, _)| found == name)
-            || self.tables.iter().any(|(_, provider)| provider == name)
-    }
-
-    /// Bind FROM and JOIN in table order; return each table's Scan.
-    fn bind_tables(&mut self, relation: &LogicalPlan) -> Result<Vec<String>, CompileError> {
-        let mut joins: Vec<JoinOn> = Vec::new();
-        let mut node = relation;
-        let mut tables: Vec<(String, String, SchemaRef)> = Vec::new();
-        loop {
-            match node {
-                LogicalPlan::Join(join) => {
-                    let Join {
-                        left,
-                        right,
-                        on,
-                        filter,
-                        join_type,
-                        ..
-                    } = join;
-                    if *join_type != JoinType::Inner {
-                        return unsupported(&format!("a {join_type} JOIN"));
-                    }
-                    let Some(table) = self.table_or_stage(right)? else {
-                        return unsupported("a JOIN of anything but one registered provider");
-                    };
-                    joins.push(JoinOn {
-                        alias: table.0.clone(),
-                        filter: filter.clone(),
-                        keys: on.clone(),
-                    });
-                    tables.push(table);
-                    node = left;
-                }
-                other => {
-                    let Some(table) = self.table_or_stage(other)? else {
-                        return unsupported("a FROM of anything but one registered provider");
-                    };
-                    tables.push(table);
-                    break;
-                }
-            }
-        }
-        tables.reverse();
-        joins.reverse();
-        for (alias, provider, schema) in &tables {
-            self.add_table(alias, provider, schema.clone())?;
-        }
-        let mut on_predicates = Vec::new();
-        for join in joins {
-            let mut equalities = Vec::new();
-            let mut terms: Vec<Expr> = join
-                .keys
-                .iter()
-                .map(|(left, right)| left.clone().eq(right.clone()))
-                .collect();
-            if let Some(filter) = &join.filter {
-                terms.extend(conjuncts(filter));
-            }
-            let mut predicates = Vec::new();
-            for term in terms {
-                if is_call(&term, "ai_filter") {
-                    predicates.push(self.bind_ai_filter(
-                        &term,
-                        &["selectivity", "anchor"],
-                        Some(true),
-                    )?);
-                } else if score_comparison(&term).is_some() {
-                    predicates.push(self.bind_ai_score(&term, &["selectivity"], Some(true))?);
-                } else {
-                    match self.bind_plain_on_term(&term, &join.alias)? {
-                        OnTerm::Condition(condition) => {
-                            self.parts.push(condition_part(condition));
-                        }
-                        OnTerm::Equality(equality) => equalities.push(*equality),
-                    }
-                }
-            }
-            if predicates.len() > 1 {
-                return compile_error(format!(
-                    "JOIN {} has {} AI predicates in ON; ask one question per JOIN",
-                    join.alias,
-                    predicates.len()
-                ));
-            }
-            self.add_equalities(&join.alias, equalities);
-            on_predicates.extend(predicates);
-        }
-        self.parts.extend(on_predicates);
-        Ok(tables.into_iter().map(|(alias, _, _)| alias).collect())
     }
 
     /// Bind an ON term of the JOIN of `joined` that is no AI predicate:
@@ -1112,8 +506,8 @@ impl Binder {
             right: self.bind_value(right)?,
         };
         let sides = [
-            quail_planner::nodes::column_alias_of(&equality.left),
-            quail_planner::nodes::column_alias_of(&equality.right),
+            column_alias_of(&equality.left),
+            column_alias_of(&equality.right),
         ];
         if !sides.contains(&joined.to_string()) || sides[0] == sides[1] {
             return compile_error(format!(
@@ -1125,13 +519,6 @@ impl Binder {
     }
 
     // ------------------------------------------------------------ WHERE
-
-    fn bind_where(&mut self, condition: &Expr) -> Result<(), CompileError> {
-        for term in conjuncts(condition) {
-            self.bind_where_term(&term)?;
-        }
-        Ok(())
-    }
 
     /// Bind a WHERE term that asks no model: the condition and the
     /// selectivity its HINT gives, or None for a term that asks one.
@@ -1149,20 +536,15 @@ impl Binder {
         Ok(None)
     }
 
-    /// Bind one WHERE term into the query's parts.
-    pub(crate) fn bind_where_term(&mut self, term: &Expr) -> Result<(), CompileError> {
-        if let Some((condition, hint)) = self.bind_plain_where_term(term)? {
-            self.parts.push(match hint {
-                None => condition_part(condition),
-                Some(selectivity) => Part::Hint(Hint {
-                    condition: Box::new(condition_part(condition)),
-                    selectivity: Some(selectivity),
-                    anchor: None,
-                }),
-            });
-            return Ok(());
-        }
-        let (term, hint) = self.unwrap_hint(term)?;
+    /// Refuse a WHERE term that is no plain condition and no test of a
+    /// label, with the message that names what is wrong with it.
+    ///
+    /// # Errors
+    ///
+    /// The term is outside Quail's language, or its AI filter or score
+    /// does not bind.
+    pub(crate) fn refuse_where_term(&mut self, term: &Expr) -> Result<(), CompileError> {
+        let (term, _) = self.unwrap_hint(term)?;
         if matches!(
             &term,
             Expr::BinaryExpr(BinaryExpr {
@@ -1176,25 +558,13 @@ impl Binder {
             Expr::Not(inner) => (inner.as_ref(), true),
             other => (other, false),
         };
-        if let Expr::Exists(exists) = node {
-            let anti = anti != exists.negated;
-            let gate = self.bind_exists(exists, anti)?;
-            self.parts.push(gate);
+        if matches!(node, Expr::Exists(_)) {
             return Ok(());
         }
         if anti {
             return compile_error(format!(
                 "NOT is only supported as NOT EXISTS, got NOT {node}"
             ));
-        }
-        if let Some((classify, items)) = label_test(node) {
-            let (test, selectivity) = self.bind_label_test(classify, &items, hint)?;
-            self.parts.push(Part::Hint(Hint {
-                condition: Box::new(Part::Compare(Box::new(test))),
-                selectivity,
-                anchor: None,
-            }));
-            return Ok(());
         }
         if walk(&term, &mut |inner| is_call(inner, "ai_classify")) {
             return compile_error(
@@ -1208,14 +578,12 @@ impl Binder {
             );
         }
         if score_comparison(&term).is_some() {
-            let part = self.bind_ai_score(&term, &["selectivity"], None)?;
-            self.parts.push(part);
+            self.bind_ai_score_test(&term, &["selectivity"], None)?;
         } else {
             if walk(&term, &mut |inner| is_call(inner, "ai_score")) {
                 return compile_error("AI.SCORE must be compared with <, <=, >, or >=");
             }
-            let part = self.bind_ai_filter(&term, &["selectivity", "anchor"], None)?;
-            self.parts.push(part);
+            self.bind_ai_filter_call(&term, &["selectivity", "anchor"], None)?;
         }
         Ok(())
     }
@@ -1232,56 +600,6 @@ impl Binder {
         }
         let options = parse_options(Some(&args[1]), &["selectivity"])?;
         Ok((args[0].clone(), options.selectivity))
-    }
-
-    fn bind_exists(&mut self, exists: &Exists, anti: bool) -> Result<Part, CompileError> {
-        let mut node = exists.subquery.subquery.as_ref();
-        let LogicalPlan::Projection(projection) = node else {
-            return compile_error("EXISTS must wrap SELECT 1 FROM provider WHERE AI_FILTER(...)");
-        };
-        if projection.expr.len() != 1 {
-            return compile_error(
-                "the EXISTS subquery must be exactly SELECT 1 FROM provider WHERE AI_FILTER(...)",
-            );
-        }
-        node = &projection.input;
-        let (filter, table) = match node {
-            LogicalPlan::Filter(filter) => (Some(&filter.predicate), filter.input.as_ref()),
-            other => (None, other),
-        };
-        let Some((alias, provider, schema)) = Self::table_of(table) else {
-            return compile_error("the EXISTS subquery must scan one registered provider");
-        };
-        self.add_table(&alias, &provider, schema)?;
-        let terms = filter.map(conjuncts).unwrap_or_default();
-        if terms.len() != 1 {
-            return compile_error("the EXISTS subquery takes exactly one AI_FILTER predicate");
-        }
-        let Part::Hint(hint) =
-            self.bind_ai_filter(&terms[0], &["selectivity", "anchor"], Some(true))?
-        else {
-            unreachable!("an AI_FILTER binds to a Hint");
-        };
-        let Part::Call(call) = *hint.condition else {
-            unreachable!("an AI_FILTER asks a model call");
-        };
-        let scan = LogicalNode::Scan(Scan {
-            provider,
-            alias,
-            column: ScanColumn::Unnamed(String::new()),
-            columns: Vec::new(),
-            predicates: Vec::new(),
-            schema: None,
-        });
-        Ok(Part::Hint(Hint {
-            condition: Box::new(Part::Exists(Box::new(ExistsGate {
-                call: TaggedModelCall::Call(call),
-                relation: scan,
-                anti,
-            }))),
-            selectivity: hint.selectivity,
-            anchor: hint.anchor,
-        }))
     }
 
     // ------------------------------------------------------------ conditions
@@ -1523,7 +841,7 @@ impl Binder {
     /// A test of a column operator's answer: an AI.CLASSIFY, AI.MAP, or
     /// AI.SAE_FEATURES call, or a field of an AI.EXTRACT call or its span.
     fn column_test(&mut self, test: &PlainTest) -> Result<Option<Condition>, CompileError> {
-        if let Some(kind) = column_call(&test.operand) {
+        if let Some(kind) = column_call_kind(&test.operand) {
             if kind == "extract" {
                 return compile_error("test a field of AI.EXTRACT, such as lease.end_date");
             }
@@ -1894,7 +1212,7 @@ impl Binder {
     // ------------------------------------------------------------ AI calls
 
     fn note_document_column(&mut self, column: &ValueExpression) -> Result<(), CompileError> {
-        let alias = quail_planner::nodes::column_alias_of(column);
+        let alias = column_alias_of(column);
         match self
             .document_columns
             .iter()
@@ -2009,20 +1327,6 @@ impl Binder {
         Ok((prompt, aliases))
     }
 
-    fn bind_ai_filter(
-        &mut self,
-        term: &Expr,
-        allowed: &[&str],
-        join: Option<bool>,
-    ) -> Result<Part, CompileError> {
-        let (call, options) = self.bind_ai_filter_call(term, allowed, join)?;
-        Ok(Part::Hint(Hint {
-            condition: Box::new(Part::Call(call)),
-            selectivity: options.selectivity,
-            anchor: options.anchor,
-        }))
-    }
-
     /// Bind an `AI_FILTER(PROMPT(...), options)` call: its model call
     /// and options.
     pub(crate) fn bind_ai_filter_call(
@@ -2058,20 +1362,6 @@ impl Binder {
             max_answer_tokens: 0,
         };
         Ok((call, options))
-    }
-
-    fn bind_ai_score(
-        &mut self,
-        term: &Expr,
-        allowed: &[&str],
-        join: Option<bool>,
-    ) -> Result<Part, CompileError> {
-        let (predicate, options) = self.bind_ai_score_test(term, allowed, join)?;
-        Ok(Part::Hint(Hint {
-            condition: Box::new(Part::Compare(Box::new(predicate))),
-            selectivity: options.selectivity,
-            anchor: options.anchor,
-        }))
     }
 
     /// Bind a comparison of an `AI.SCORE` call with a threshold: the
@@ -2347,7 +1637,7 @@ impl Binder {
 
     fn bind_column_call(&mut self, node: &Expr, kind: &str) -> Result<ModelCall, CompileError> {
         match kind {
-            "classify" => Ok(self.bind_ai_classify(node)?.0),
+            "label" => Ok(self.bind_ai_classify(node)?.0),
             "map" => self.bind_ai_map(node),
             _ => self.bind_ai_sae_features(node),
         }
@@ -2476,58 +1766,6 @@ impl Binder {
             prompts_seen.push(((*call.prompt).clone(), name));
         }
         Ok(())
-    }
-
-    fn place_arguments(
-        &self,
-        aliases: Vec<String>,
-        columns: &[ValueExpression],
-    ) -> PlaceRelationArguments {
-        let gates: Vec<String> = self
-            .parts
-            .iter()
-            .filter_map(|part| match part {
-                Part::Hint(hint) => match hint.condition.as_ref() {
-                    Part::Exists(gate) => match &gate.relation {
-                        LogicalNode::Scan(scan) => Some(scan.alias.clone()),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect();
-        let scans: Vec<LogicalNode> = aliases
-            .iter()
-            .filter(|alias| !gates.contains(alias))
-            .map(|alias| LogicalNode::Scan(self.scan(alias)))
-            .collect();
-        let mut parts = self.parts.clone();
-        for part in &mut parts {
-            if let Part::Hint(hint) = part
-                && let Part::Exists(gate) = hint.condition.as_mut()
-                && let LogicalNode::Scan(scan) = &mut gate.relation
-            {
-                if let Some((_, column)) = self
-                    .document_columns
-                    .iter()
-                    .find(|(found, _)| *found == scan.alias)
-                {
-                    scan.column = ScanColumn::Expression(column.clone());
-                }
-                scan.schema = Some(schema_of(&self.schemas[&scan.provider]));
-            }
-        }
-        PlaceRelationArguments {
-            scans,
-            equalities: self.equalities(),
-            parts,
-            columns: columns.to_vec(),
-            schemas: self.provider_schemas(),
-            unnested: self.unnested(),
-            tested: self.tested(),
-            allow_relational: self.allow_relational,
-        }
     }
 
     /// The Scan of a table in scope, reading its document column.
@@ -2695,7 +1933,7 @@ impl<'a> SelectBinder<'a> {
             let call = self.binder.bind_ai_map(node)?;
             return Ok(vec![named(ValueExpression::ModelCall(call), "AI.MAP")?]);
         }
-        if has_ai_call(node) || walk(node, &mut |inner| column_call(inner).is_some()) {
+        if has_ai_call(node) || walk(node, &mut |inner| column_call_kind(inner).is_some()) {
             return unsupported("a model call inside a SELECT expression");
         }
         let value = self.binder.bind_value(node)?;
@@ -2774,7 +2012,7 @@ fn operand_of(expr: &Expr) -> Option<(Expr, Option<String>)> {
     let (inner, function) = unwrap_function(expr);
     if matches!(inner, Expr::Column(_) | Expr::OuterReferenceColumn(..))
         || is_get_field(inner)
-        || column_call(inner).is_some()
+        || column_call_kind(inner).is_some()
     {
         return Some((inner.clone(), function));
     }
@@ -2919,15 +2157,6 @@ fn not(operand: Condition) -> Condition {
     Condition::Not(Not {
         operand: Box::new(operand),
     })
-}
-
-fn condition_part(condition: Condition) -> Part {
-    match condition {
-        Condition::Compare(test) => Part::Compare(test),
-        Condition::Not(not) => Part::Not(not),
-        Condition::And(connective) => Part::And(connective),
-        Condition::Or(connective) => Part::Or(connective),
-    }
 }
 
 fn model_call(prompt: quail_physical::Prompt, kind: &str) -> ModelCall {
@@ -3262,54 +2491,6 @@ pub(crate) fn feature_schema() -> SchemaRef {
     ]))
 }
 
-/// The schema of a stage's result, named as a CTE's columns, as
-/// `cte_schema`: a projected column by its column alone, an unnested
-/// field by its field alone, every other column by its AS name.
-fn stage_schema(body: &LogicalPlan) -> Result<SchemaRef, CompileError> {
-    let mut node = body;
-    let exprs = loop {
-        match node {
-            LogicalPlan::Projection(projection) => break projection.expr.clone(),
-            LogicalPlan::Limit(found) => node = &found.input,
-            LogicalPlan::Sort(found) => node = &found.input,
-            LogicalPlan::Distinct(Distinct::All(input)) => node = input,
-            _ => return unsupported("a CTE without a SELECT list"),
-        }
-    };
-    let mut fields = Vec::new();
-    for (expr, field) in exprs.iter().zip(body.schema().fields()) {
-        let name = match expr {
-            Expr::Column(column) => column.name.clone(),
-            Expr::Alias(alias) => alias.name.clone(),
-            Expr::ScalarFunction(call) if call.name() == crate::UNNEST_FIELD => {
-                string_literal(&call.args[2]).unwrap_or_default()
-            }
-            other => {
-                return compile_error(format!(
-                    "{other} in a CTE needs an AS name; a later query reads the column by that name"
-                ));
-            }
-        };
-        fields.push(field.as_ref().clone().with_name(name));
-    }
-    let names: Vec<&String> = fields.iter().map(|field| field.name()).collect();
-    if names
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        != names.len()
-    {
-        let listed: Vec<String> = names.iter().map(|name| repr_str(name)).collect();
-        return compile_error(format!(
-            "the CTE returns a column name twice: [{}]; give one an AS name",
-            listed.join(", ")
-        ));
-    }
-    Ok(std::sync::Arc::new(
-        datafusion::arrow::datatypes::Schema::new(fields),
-    ))
-}
-
 /// Whether a plan reads a CTE or a FROM subquery.
 pub(crate) fn has_subqueries(plan: &LogicalPlan) -> bool {
     plan.exists(|node| {
@@ -3317,124 +2498,4 @@ pub(crate) fn has_subqueries(plan: &LogicalPlan) -> bool {
             if !matches!(alias.input.as_ref(), LogicalPlan::TableScan(_))))
     })
     .unwrap_or(false)
-}
-
-/// A merged JOIN input: its alias, each column's expression, the table it
-/// reads, and its WHERE condition.
-pub(crate) type Merged = (String, Vec<(String, Expr)>, LogicalPlan, Option<Expr>);
-
-/// Merge each JOIN input that is a subquery reading one table, selecting
-/// and filtering it without a model call, into the query that reads it,
-/// as sqlglot's `merge_subqueries` does.
-///
-/// For example, `FROM contracts a JOIN kept b ON AI.IF(...b.text...)`,
-/// with `kept` as `SELECT c.id, c.text FROM contracts c WHERE AI.IF(...)`,
-/// reads as `FROM contracts a JOIN contracts c ON AI.IF(...c.text...)`
-/// with the subquery's WHERE. A subquery read more than once, or one
-/// that calls an AI function in its SELECT list, is left for a stage.
-///
-/// Returns:
-///     The rewritten plan and the merged subqueries' WHERE conditions,
-///     to run before the query's own.
-/// The JOIN inputs that are subqueries reading one table, selecting and
-/// filtering it without a model call, each read once: the binder merges
-/// each into the query that reads it. Each is its alias, its columns'
-/// expressions, the table it reads, and its WHERE.
-pub(crate) fn merged_subqueries(plan: &LogicalPlan) -> Vec<Merged> {
-    let aliases = crate::claim::merged_aliases(plan);
-    let mut merged: Vec<Merged> = Vec::new();
-    let _ = plan.apply(|node| {
-        let LogicalPlan::Join(join) = node else {
-            return Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue);
-        };
-        for side in [join.left.as_ref(), join.right.as_ref()] {
-            let LogicalPlan::SubqueryAlias(alias) = side else {
-                continue;
-            };
-            if !aliases.contains(&alias.alias.table().to_string()) {
-                continue;
-            }
-            let (_, body) = crate::claim::subquery_body(alias);
-            let LogicalPlan::Projection(projection) = body else {
-                continue;
-            };
-            let (base, condition) = match projection.input.as_ref() {
-                LogicalPlan::Filter(filter) => {
-                    (filter.input.as_ref(), Some(filter.predicate.clone()))
-                }
-                other => (other, None),
-            };
-            let columns = projection
-                .expr
-                .iter()
-                .map(|expr| (output_name(expr), unalias(expr).0.clone()))
-                .collect();
-            merged.push((
-                alias.alias.table().to_string(),
-                columns,
-                base.clone(),
-                condition,
-            ));
-        }
-        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
-    });
-    merged
-}
-
-fn merge_join_subqueries(plan: &LogicalPlan) -> Result<(LogicalPlan, Vec<Expr>), CompileError> {
-    use datafusion::common::tree_node::Transformed;
-    let merged = merged_subqueries(plan);
-    if merged.is_empty() {
-        return Ok((plan.clone(), Vec::new()));
-    }
-    let substitute = |expr: Expr| -> Expr {
-        expr.clone()
-            .transform_up(|node| {
-                if let Expr::Column(column) = &node
-                    && let Some(relation) = &column.relation
-                    && let Some((_, columns, _, _)) = merged
-                        .iter()
-                        .find(|(alias, _, _, _)| alias == relation.table())
-                    && let Some((_, definition)) =
-                        columns.iter().find(|(name, _)| *name == column.name)
-                {
-                    return Ok(Transformed::yes(definition.clone()));
-                }
-                Ok(Transformed::no(node))
-            })
-            .map(|found| found.data)
-            .unwrap_or(expr)
-    };
-    let rewritten = plan
-        .clone()
-        .transform_up(|node| {
-            if let LogicalPlan::SubqueryAlias(alias) = &node
-                && let Some((_, _, base, _)) = merged
-                    .iter()
-                    .find(|(name, _, _, _)| name == alias.alias.table())
-            {
-                return Ok(Transformed::yes(base.clone()));
-            }
-            let node = node
-                .map_expressions(|expr| {
-                    let before = expr.clone();
-                    let after = substitute(expr);
-                    Ok(if after == before {
-                        Transformed::no(after)
-                    } else {
-                        Transformed::yes(after)
-                    })
-                })?
-                .data;
-            Ok(Transformed::yes(node.recompute_schema()?))
-        })
-        .map(|found| found.data)
-        .map_err(|error| CompileError::new(error.to_string()))?;
-    Ok((
-        rewritten,
-        merged
-            .into_iter()
-            .filter_map(|(_, _, _, condition)| condition)
-            .collect(),
-    ))
 }

@@ -26,12 +26,11 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
-use datafusion::logical_expr::{
-    Expr, Extension, Filter, LogicalPlan, Projection, UserDefinedLogicalNode,
-};
+use datafusion::logical_expr::{Expr, Filter, LogicalPlan, Projection};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics};
+use crate::extension::{as_node, extension_node};
 
 /// Move each `AiNode` to the tables and joins it reads and order each
 /// table's operators, as the module explains.
@@ -65,19 +64,6 @@ impl OptimizerRule for PlaceAiNodes {
             ordered.data,
             changed || ordered.transformed,
         ))
-    }
-}
-
-fn extension_node(node: impl UserDefinedLogicalNode + 'static) -> LogicalPlan {
-    LogicalPlan::Extension(Extension {
-        node: Arc::new(node),
-    })
-}
-
-fn as_node<T: 'static>(plan: &LogicalPlan) -> Option<&T> {
-    match plan {
-        LogicalPlan::Extension(extension) => extension.node.as_any().downcast_ref::<T>(),
-        _ => None,
     }
 }
 

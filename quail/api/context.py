@@ -89,10 +89,6 @@ class SessionContext:
         # DataFusion's batches, shared through the Arrow C stream interface
         return self._native.sql(text, DATAFUSION_DIALECTS[dialect])
 
-    def region_sql(self, text: str) -> list[str]:
-        """Return the SQL each model region of a query sends to Quail."""
-        return self._native.region_sql(text)
-
     def region_plans(self, text: str) -> list[dict]:
         """Return each model region Rust derives, as a dict.
 

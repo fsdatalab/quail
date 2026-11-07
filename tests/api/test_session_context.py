@@ -89,12 +89,9 @@ def _rows(table: pa.Table) -> list[tuple]:
 
 
 @pytest.mark.parametrize("name", QUERIES)
-def test_a_region_plans_and_answers_as_the_written_query(context, name):
+def test_a_region_answers_as_the_written_query(context, name):
     text = QUERIES[name]
     session = context.session
-    (region,) = context.region_sql(text)
-    assert (session.sql(region).plan().graph
-            == session.sql(text).plan().graph), region
     expected = finish(session.sql(text), ORACLE).collect()
     table = context.sql(text)
     assert table.column_names == expected.column_names
@@ -112,7 +109,7 @@ def test_rust_derives_each_region_as_session_sql_compiles_it(context, name):
 def test_operators_outside_a_region_run_in_datafusion(context):
     text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
             "UNION ALL SELECT a.id FROM aspects a ORDER BY id")
-    assert len(context.region_sql(text)) == 1
+    assert len(context.region_plans(text)) == 1
     table = context.sql(text)
     # a union's column belongs to no one table
     assert table.column_names == ["id"]
@@ -148,7 +145,7 @@ def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
     assert len(_rows(table)) == 2
 
 
-def test_every_check_query_plans_the_same_graph_through_datafusion():
+def test_every_check_query_derives_one_region_as_session_sql_compiles_it():
     from tools.dump_check_queries import check_query_entries
 
     for entry in check_query_entries():
@@ -157,7 +154,8 @@ def test_every_check_query_plans_the_same_graph_through_datafusion():
         for name, columns in entry["tables"].items():
             context.register(name, quail.DocumentProvider.from_table(
                 check_table(columns), id_col="id"))
-        (region,) = context.region_sql(entry["sql"])
-        assert (session.sql(region).plan().graph
-                == session.sql(entry["sql"]).plan().graph), entry["id"]
+        (region,) = context.region_plans(entry["sql"])
+        query = session.sql(entry["sql"])
+        assert (region["operators"], region["logical"]) == (
+            query.operators, query.logical), entry["id"]
         session.close()

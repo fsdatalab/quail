@@ -420,7 +420,7 @@ fn record_names(args: &[ValueExpression]) -> Vec<String> {
             if provider.is_empty() {
                 argument_alias(argument)
             } else {
-                crate::logical::table_name(&provider).to_string()
+                crate::operators::table_name(&provider).to_string()
             }
         })
         .collect();

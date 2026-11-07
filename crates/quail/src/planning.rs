@@ -23,8 +23,8 @@ use quail_inputs::{HfTokenizer, PrefixIndex, TokenStore, TokenStoreWriter, last_
 use quail_physical::ValueExpression;
 use quail_planner::context::PlanningContext;
 use quail_planner::expressions::{CompileError, Refusal};
-use quail_planner::logical::{Scan, ScanColumn};
 use quail_planner::operators::Operators;
+use quail_planner::operators::{Scan, ScanColumn};
 use quail_planner::optimize::Selected;
 use quail_planner::placements::{Alternative, placements};
 

@@ -8,11 +8,11 @@ use quail_physical::{
 };
 use serde_json::Value;
 
+use crate::expressions::packed_columns;
 use crate::expressions::{
     PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_name, column_references,
     projected_call, projected_name, sort_name,
 };
-use crate::nodes::packed_columns;
 use crate::operators::{Operators, RowOperator};
 
 /// The struct columns a Project packs, as `Project.structs` encodes them.

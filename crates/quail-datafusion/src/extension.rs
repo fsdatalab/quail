@@ -19,6 +19,7 @@ use datafusion::common::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::registry::FunctionRegistry;
+use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::physical_planner::ExtensionPlanner;
 
@@ -107,5 +108,20 @@ impl QuailExtension {
     /// `ModelRegionExec`, for a host's own query planner.
     pub fn extension_planner(&self) -> Arc<dyn ExtensionPlanner + Send + Sync> {
         Arc::new(ModelRegionPlanner::new(Arc::clone(&self.runner)))
+    }
+}
+
+/// A plan whose root is `node`, one of Quail's extension nodes.
+pub(crate) fn extension_node(node: impl UserDefinedLogicalNode + 'static) -> LogicalPlan {
+    LogicalPlan::Extension(Extension {
+        node: Arc::new(node),
+    })
+}
+
+/// The plan's root as the extension node `T`, if it is one.
+pub(crate) fn as_node<T: 'static>(plan: &LogicalPlan) -> Option<&T> {
+    match plan {
+        LogicalPlan::Extension(extension) => extension.node.as_any().downcast_ref::<T>(),
+        _ => None,
     }
 }

@@ -11,9 +11,9 @@ use quail_physical::Prompt;
 
 use crate::context::PlanningContext;
 use crate::costs::join_specs;
+use crate::expressions::asked_call;
 use crate::expressions::{CompileError, compile_error, repr_str};
 use crate::lowering::LoweredPrompt;
-use crate::nodes::asked_call;
 use crate::operators::Operators;
 use crate::statistics::effective_selectivity;
 

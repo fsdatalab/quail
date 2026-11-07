@@ -18,7 +18,7 @@
 mod absorb;
 pub mod ai;
 mod aliases;
-pub mod bind;
+mod binding;
 mod claim;
 pub mod derive;
 mod distinct;
@@ -31,9 +31,8 @@ mod lower;
 mod optimize;
 mod placement;
 mod region;
-mod translate;
+mod terms;
 mod unnest;
-mod unparse;
 
 use std::sync::Arc;
 
@@ -59,9 +58,7 @@ pub use lower::{LowerAiCalls, lower_ai_calls};
 pub use optimize::{OptimizeModelRegions, REGION_RULES, optimize_region, region_rule};
 pub use placement::PlaceAiNodes;
 pub use region::ModelRegion;
-pub use translate::translate_relation;
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
-pub use unparse::region_sql;
 
 /// Build a DataFusion session state with Quail registered.
 ///

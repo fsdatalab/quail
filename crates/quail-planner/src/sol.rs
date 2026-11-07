@@ -22,12 +22,12 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::context::PlanningContext;
+use crate::expressions::asked_call;
 use crate::expressions::{
     CompileError, SPAN_SUFFIX, aliased_call, call_aliases, condition_columns, condition_text,
     repr_str,
 };
 use crate::lowering::LoweredPrompt;
-use crate::nodes::asked_call;
 use crate::operators::{Operators, SemanticColumn};
 use crate::plan_statistics::plan_prompts;
 use crate::search::{

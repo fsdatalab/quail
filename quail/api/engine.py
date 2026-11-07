@@ -114,30 +114,25 @@ class Engine:
         result = execute_query(query, physical_executor=self._physical_executor)
         return result.collect()
 
-    def run_region(self, kind: str, payload: str, tables: dict | None = None,
+    def run_region(self, payload: str, tables: dict | None = None,
                    fetch: int | None = None) -> pa.Table:
         """Plan and run one model region and return its rows.
 
         Args:
-            kind: "plan" for a region as JSON, its operators and DataFusion's
-                plan of it, or "sql" for the SQL of a region whose shape
-                Quail's operators do not read.
-            payload: The region or SQL.
+            payload: The region as JSON: its operators and DataFusion's
+                plan of it.
             tables: The rows of each table the region reads from
                 DataFusion, by table name.
             fetch: The most rows DataFusion reads, or None.
         """
         from quail.api.region_inputs import region_query
 
-        if kind == "plan":
-            found = json.loads(payload)
-            operators = found["operators"]
-            if fetch is not None:
-                operators = _quail_native.limited_operators(operators, fetch)
-            query = region_query(self.session, operators, logical=found["logical"],
-                                 order=self._order, tables=tables)
-        else:
-            query = self.session.sql(payload, order=self._order)
+        found = json.loads(payload)
+        operators = found["operators"]
+        if fetch is not None:
+            operators = _quail_native.limited_operators(operators, fetch)
+        query = region_query(self.session, operators, logical=found["logical"],
+                             order=self._order, tables=tables)
         return self._run(query)
 
     def close(self) -> None:

@@ -7,8 +7,8 @@
 use std::fmt;
 
 use quail_physical::{
-    Alias, ColumnRef, Condition, Connective, ModelCall, Not, Projected, RegularPredicate,
-    SortExpression, ValueExpression,
+    Alias, Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct, ModelCall, Not,
+    Projected, RegularPredicate, SortExpression, SortKey, ValueExpression,
 };
 use serde_json::Value;
 
@@ -386,6 +386,147 @@ pub fn call_aliases(call: &ModelCall) -> Vec<String> {
     found
 }
 
+/// The struct fields of one feature list, as `FEATURE_LIST` holds them.
+pub const FEATURE_FIELDS: [&str; 2] = ["feature", "strength"];
+
+/// The predicate of an AI filter or AI join as a model call.
+///
+/// # Panics
+///
+/// The predicate compares a value that asks no model.
+pub fn asked_call(asked: &Asked) -> &ModelCall {
+    match asked {
+        Asked::Call(call) => call,
+        Asked::Compare(test) => match &test.expression {
+            ValueExpression::ModelCall(call) => call,
+            _ => panic!("a comparison that asks no model"),
+        },
+    }
+}
+
+/// Every struct column of a SELECT list and its member columns, answers
+/// and spans.
+pub fn packing(structs: &[ExtractStruct]) -> Vec<(String, Vec<(String, String)>)> {
+    let mut found = Vec::new();
+    for found_struct in structs {
+        for suffix in ["", SPAN_SUFFIX] {
+            found.push((
+                format!("{}{suffix}", found_struct.name),
+                found_struct
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        (
+                            field.clone(),
+                            format!("{}.{field}{suffix}", found_struct.name),
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+    }
+    found
+}
+
+/// Result column names after packing members into struct columns.
+pub fn packed_columns(
+    columns: impl IntoIterator<Item = String>,
+    packing: &[(String, Vec<(String, String)>)],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for column in columns {
+        let name = packing
+            .iter()
+            .find(|(_, fields)| fields.iter().any(|(_, member)| *member == column))
+            .map(|(name, _)| name.clone())
+            .unwrap_or(column);
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// The one table alias a value expression of an equality reads.
+pub fn column_alias_of(expression: &ValueExpression) -> String {
+    column_references(expression)
+        .into_iter()
+        .next()
+        .map(|found| found.alias)
+        .unwrap_or_default()
+}
+
+/// The text of an equality, as `str(Equality)`.
+pub fn equality_text(equality: &Equality) -> String {
+    format!(
+        "{} = {}",
+        column_name(&equality.left, true),
+        column_name(&equality.right, true)
+    )
+}
+
+fn push_unique(found: &mut Vec<ColumnRef>, references: Vec<ColumnRef>) {
+    for reference in references {
+        if !found.contains(&reference) {
+            found.push(reference);
+        }
+    }
+}
+
+/// The columns a value expression reads, through a model call's prompt,
+/// in first use order.
+pub fn value_refs(expression: &ValueExpression) -> Vec<ColumnRef> {
+    match expression {
+        ValueExpression::ModelCall(call) => call_refs(call),
+        ValueExpression::Alias(alias) => match alias.expression.as_ref() {
+            ValueExpression::ModelCall(call) => call_refs(call),
+            other => column_references(other),
+        },
+        ValueExpression::Literal(_) => Vec::new(),
+        other => column_references(other),
+    }
+}
+
+/// The columns a model call's prompt reads, in first use order.
+pub fn call_refs(call: &ModelCall) -> Vec<ColumnRef> {
+    let mut found = Vec::new();
+    for argument in &call.prompt.args {
+        push_unique(&mut found, value_refs(argument));
+    }
+    found
+}
+
+/// The columns a condition reads, in first use order.
+pub fn condition_refs(condition: &Condition) -> Vec<ColumnRef> {
+    let mut found = Vec::new();
+    for test in tests(condition) {
+        push_unique(&mut found, value_refs(&test.expression));
+    }
+    found
+}
+
+/// The columns an AI predicate reads, in first use order.
+pub fn asked_refs(asked: &Asked) -> Vec<ColumnRef> {
+    match asked {
+        Asked::Call(call) => call_refs(call),
+        Asked::Compare(test) => value_refs(&test.expression),
+    }
+}
+
+/// The columns a join equality reads, in first use order.
+pub fn equality_refs(equality: &Equality) -> Vec<ColumnRef> {
+    let mut found = value_refs(&equality.left);
+    push_unique(&mut found, value_refs(&equality.right));
+    found
+}
+
+/// The columns a sort key reads, in first use order.
+pub fn sort_refs(key: &SortKey) -> Vec<ColumnRef> {
+    match &key.expression {
+        SortExpression::Value(value) => value_refs(value),
+    }
+}
+
 // ---------------------------------------------------------------- conditions
 
 /// The column tests under a condition, in written order.
@@ -399,33 +540,6 @@ pub fn tests(condition: &Condition) -> Vec<&RegularPredicate> {
     }
 }
 
-/// The tables a test reads.
-pub fn test_aliases(test: &RegularPredicate) -> Vec<String> {
-    if let ValueExpression::ModelCall(call) = &test.expression {
-        return call_aliases(call);
-    }
-    let mut found: Vec<String> = Vec::new();
-    for reference in column_references(&test.expression) {
-        if !found.contains(&reference.alias) {
-            found.push(reference.alias);
-        }
-    }
-    found
-}
-
-/// The tables a condition's tests read.
-pub fn condition_aliases(condition: &Condition) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    for test in tests(condition) {
-        for alias in test_aliases(test) {
-            if !found.contains(&alias) {
-                found.push(alias);
-            }
-        }
-    }
-    found
-}
-
 /// The unqualified names of the columns a condition's tests read.
 pub fn condition_columns(condition: &Condition) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
@@ -437,14 +551,6 @@ pub fn condition_columns(condition: &Condition) -> Vec<String> {
         }
     }
     found
-}
-
-/// The source columns a condition reads, in first use order.
-pub fn condition_references(condition: &Condition) -> Vec<ColumnRef> {
-    tests(condition)
-        .into_iter()
-        .flat_map(|test| column_references(&test.expression))
-        .collect()
 }
 
 fn not(operand: Condition) -> Condition {

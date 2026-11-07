@@ -1,124 +1,47 @@
-//! Placing a bound query's conditions and building its logical plan.
+//! Placing a region's bound ON and WHERE terms into each table's
+//! operators, the joins, and the tests of result rows.
 //!
-//! The input is what the SQL front end binds: the scans in FROM and
-//! JOIN order, the ON equalities, the ON and WHERE parts in written
-//! order, and the arguments of the plan's result nodes.
+//! [`crate::derive`] binds the terms in written order and hands each to
+//! [`RelationTerms`]: a condition that asks no model, an AI filter, a
+//! test of a label, an AI join, or an EXISTS gate. [`RelationTerms::content`]
+//! names each table's column operators and places each condition at its
+//! scan, after the operator that computes the columns it reads, or on
+//! the result rows.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use quail_physical::{
-    Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct, FilterPredicate, GetField,
-    ModelCall, Not, Projected, RegularPredicate, ScalarFunction, SortExpression, SortKey,
-    TaggedModelCall, ValueExpression,
+    Asked, ColumnRef, Condition, Connective, Equality, FilterPredicate, GetField, ModelCall, Not,
+    RegularPredicate, ScalarFunction, SortExpression, SortKey, TaggedModelCall, ValueExpression,
 };
-use serde::{Deserialize, Serialize};
+use quail_planner::expressions::{
+    CompileError, SPAN_SUFFIX, aliased_call, asked_call, call_aliases, column_alias_of,
+    column_name, column_references, compile_error, condition_text, conjuncts, equality_text,
+    normalize, reference_name, repr_list, repr_str, tests, validate_condition,
+};
+use quail_planner::operators::{Scan, ScanColumn, Schema};
 use serde_json::Value;
-
-use crate::expressions::{
-    CompileError, SPAN_SUFFIX, aliased_call, call_aliases, column_name, column_references,
-    compile_error, condition_text, conjuncts, normalize, reference_name, repr_list, repr_str,
-    tests, validate_condition,
-};
-use crate::logical::{
-    Filter, LogicalNode, LogicalPlan, Project, ResultNode, Scan, ScanColumn, Schema,
-    SemanticColumn, Unnest,
-};
-use crate::nodes::{
-    asked_call, equality_text, readable_columns, result_columns, validate_node, validate_plan,
-};
 
 // ---------------------------------------------------------------- input
 
 /// Values kept per table alias, in the order the aliases first appear.
-pub type ByAlias<T> = Vec<(String, Vec<T>)>;
+pub(crate) type ByAlias<T> = Vec<(String, Vec<T>)>;
 
 /// A test of a label: the classification, the accepted labels, and its selectivity.
 type LabelTest = (ModelCall, Value, Option<f64>);
-
-/// A part of a condition with the options written on it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Hint {
-    pub condition: Box<Part>,
-    pub selectivity: Option<f64>,
-    pub anchor: Option<String>,
-}
-
-/// An EXISTS or NOT EXISTS gate: some row of a table makes a model call true.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Exists {
-    pub call: TaggedModelCall,
-    /// The Scan of the subquery's table.
-    pub relation: LogicalNode,
-    pub anti: bool,
-}
-
-/// One ON or WHERE part as written.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum Part {
-    #[serde(rename = "quail.logical.naive.Hint")]
-    Hint(Hint),
-    #[serde(rename = "quail.logical.naive.Exists")]
-    Exists(Box<Exists>),
-    #[serde(rename = "quail.common.expressions.ModelCall")]
-    Call(ModelCall),
-    #[serde(rename = "quail.common.expressions.RegularPredicate")]
-    Compare(Box<RegularPredicate>),
-    #[serde(rename = "quail.common.expressions.Not")]
-    Not(Not),
-    #[serde(rename = "quail.common.expressions.And")]
-    And(Connective),
-    #[serde(rename = "quail.common.expressions.Or")]
-    Or(Connective),
-}
-
-/// The arguments of `place_relation`, with the relation tree split into
-/// its scans, ON equalities, and parts.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlaceRelationArguments {
-    /// The Scan of each table in FROM and JOIN order.
-    pub scans: Vec<LogicalNode>,
-    /// alias -> the ON equalities of the JOIN of that table, last JOIN first.
-    pub equalities: Vec<(String, Vec<Equality>)>,
-    pub parts: Vec<Part>,
-    pub columns: Vec<ValueExpression>,
-    /// provider -> its schema.
-    pub schemas: BTreeMap<String, Option<Schema>>,
-    pub unnested: Vec<String>,
-    /// (model call, column name) of each column operator a test reads.
-    pub tested: Vec<(TaggedModelCall, String)>,
-    pub allow_relational: bool,
-}
-
-/// The arguments of `LogicalPlanBuilder.project`, other than the row tests.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectArguments {
-    pub columns: Vec<ValueExpression>,
-    pub limit: Option<i64>,
-    pub order: Vec<SortKey>,
-    pub offset: i64,
-    pub distinct: bool,
-    pub structs: Vec<ExtractStruct>,
-    pub output: Vec<String>,
-    pub unnests: Vec<Vec<String>>,
-    pub unnest_outer: Vec<bool>,
-}
 
 // ---------------------------------------------------------------- placement
 
 /// The parts of a query's conditions, by where they run.
 #[derive(Debug, Default)]
-pub struct PlacedConditions {
-    pub scans: Vec<(String, Vec<Condition>)>,
-    pub computed: ByAlias<(Condition, Option<f64>)>,
-    pub rows: Vec<Condition>,
+pub(crate) struct PlacedConditions {
+    pub(crate) scans: Vec<(String, Vec<Condition>)>,
+    pub(crate) computed: ByAlias<(Condition, Option<f64>)>,
+    pub(crate) rows: Vec<Condition>,
 }
 
-fn push<K: PartialEq, V>(map: &mut Vec<(K, Vec<V>)>, key: K, value: V) {
+/// Add `value` to `key`'s values, keeping keys in first use order.
+pub(crate) fn push<K: PartialEq, V>(map: &mut Vec<(K, Vec<V>)>, key: K, value: V) {
     match map.iter_mut().find(|(found, _)| *found == key) {
         Some((_, values)) => values.push(value),
         None => map.push((key, vec![value])),
@@ -136,7 +59,7 @@ fn lookup<'a, K: PartialEq, V>(map: &'a [(K, Vec<V>)], key: &K) -> &'a [V] {
 ///
 /// `computed` maps (alias, column) to (kind, name) of the operator
 /// computing it.
-pub fn place_conditions(
+pub(crate) fn place_conditions(
     conditions: Vec<(Condition, Option<f64>)>,
     computed: &BTreeMap<(String, String), (String, String)>,
     unnested: &[String],
@@ -240,7 +163,7 @@ fn rewrite_reference(
 }
 
 /// Rewrite a condition to read result rows, where struct columns hold answers.
-pub fn result_row_condition(
+pub(crate) fn result_row_condition(
     condition: &Condition,
     packing: &[(String, Vec<(String, String)>)],
 ) -> Condition {
@@ -286,7 +209,7 @@ fn rewrite_condition(
 }
 
 /// The result row columns a rewritten condition reads, by name.
-pub fn result_columns_read(condition: &Condition) -> Vec<String> {
+pub(crate) fn result_columns_read(condition: &Condition) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for test in tests(condition) {
         for reference in column_references(&test.expression) {
@@ -299,56 +222,28 @@ pub fn result_columns_read(condition: &Condition) -> Vec<String> {
     found
 }
 
-// ---------------------------------------------------------------- builder
+// ---------------------------------------------------------------- operators
 
 /// A join predicate, before assembly.
 #[derive(Debug, Clone)]
-pub struct JoinSpec {
-    /// The newly joined table aliases.
-    pub aliases: Vec<String>,
-    pub predicate: Asked,
-    pub semantics: String,
-    pub selectivity: Option<f64>,
-    pub anchor: Option<String>,
-    pub on: Vec<Equality>,
+pub(crate) struct JoinSpec {
+    pub(crate) predicate: Asked,
+    pub(crate) semantics: String,
+    pub(crate) selectivity: Option<f64>,
+    pub(crate) anchor: Option<String>,
+    pub(crate) on: Vec<Equality>,
 }
 
-/// One table's operators, as `LogicalPlanBuilder.add_scan` takes them.
+/// One table's operators.
 #[derive(Debug, Default, Clone)]
-pub struct ScanOperators {
-    pub predicates: Vec<FilterPredicate>,
-    pub labels: Vec<(ModelCall, String)>,
-    pub regular_predicates: Vec<Condition>,
-    pub extracts: Vec<(ModelCall, String)>,
-    pub computed_filters: Vec<(Condition, Option<f64>)>,
-    pub sae_features: Vec<(ModelCall, String)>,
-    pub maps: Vec<(ModelCall, String)>,
-}
-
-/// Builds the result nodes of one SELECT over its placed relation.
-#[derive(Debug)]
-pub struct LogicalPlanBuilder {
-    root: LogicalNode,
-}
-
-fn tagged(call: &ModelCall) -> TaggedModelCall {
-    TaggedModelCall::Call(call.clone())
-}
-
-/// A column operator of `kind` ("label", "extract", "features", or
-/// "map") adding `call`'s answer as `name` to each row of `input`.
-pub fn column_node(kind: &str, input: LogicalNode, call: &ModelCall, name: &str) -> LogicalNode {
-    let column = SemanticColumn {
-        input: Box::new(input),
-        call: tagged(call),
-        name: name.to_string(),
-    };
-    match kind {
-        "label" => LogicalNode::SemanticClassify(column),
-        "extract" => LogicalNode::SemanticExtract(column),
-        "features" => LogicalNode::SemanticSaeFeatures(column),
-        _ => LogicalNode::SemanticMap(column),
-    }
+pub(crate) struct ScanOperators {
+    pub(crate) predicates: Vec<FilterPredicate>,
+    pub(crate) labels: Vec<(ModelCall, String)>,
+    pub(crate) regular_predicates: Vec<Condition>,
+    pub(crate) extracts: Vec<(ModelCall, String)>,
+    pub(crate) computed_filters: Vec<(Condition, Option<f64>)>,
+    pub(crate) sae_features: Vec<(ModelCall, String)>,
+    pub(crate) maps: Vec<(ModelCall, String)>,
 }
 
 fn check_labels(condition: &Condition, calls: &[(String, ModelCall)]) -> Result<(), CompileError> {
@@ -392,134 +287,9 @@ fn check_labels(condition: &Condition, calls: &[(String, ModelCall)]) -> Result<
     Ok(())
 }
 
-impl LogicalPlanBuilder {
-    /// A builder whose relation is `root`, for `project` to finish.
-    pub fn over(root: LogicalNode) -> Self {
-        Self { root }
-    }
-
-    /// Build the plan's result nodes over the projected columns.
-    pub fn project(
-        &self,
-        arguments: &ProjectArguments,
-        row_tests: &[Condition],
-    ) -> Result<LogicalPlan, CompileError> {
-        let root = self.root.clone();
-        let columns = &arguments.columns;
-        if columns.is_empty() {
-            return compile_error("Project needs at least one column");
-        }
-        if !arguments.structs.is_empty() && arguments.distinct {
-            return compile_error(
-                "DISTINCT does not compare AI.EXTRACT struct columns; extract each field as \
-                 its own column",
-            );
-        }
-        let unnested: BTreeSet<String> = arguments.unnests.iter().flatten().cloned().collect();
-        check_feature_lists(columns, &arguments.order, arguments.distinct, &unnested)?;
-        let reads_unnested = |expression: &ValueExpression| {
-            column_references(expression)
-                .iter()
-                .any(|found| unnested.contains(&found.alias))
-        };
-        let mut expanded: Vec<(String, ValueExpression)> = Vec::new();
-        for column in columns {
-            if reads_unnested(column) {
-                let name = column_name(column, true);
-                match expanded.iter_mut().find(|(found, _)| *found == name) {
-                    Some(entry) => entry.1 = column.clone(),
-                    None => expanded.push((name, column.clone())),
-                }
-            }
-        }
-        let mut source: Vec<ValueExpression> = columns
-            .iter()
-            .filter(|column| {
-                let name = column_name(column, true);
-                !expanded.iter().any(|(found, _)| *found == name)
-            })
-            .cloned()
-            .collect();
-        let project = |source: &[ValueExpression], input: LogicalNode| {
-            LogicalNode::Project(Project {
-                input: Box::new(input),
-                columns: source.iter().cloned().map(Projected::Expression).collect(),
-                structs: arguments.structs.clone(),
-            })
-        };
-        let written = project(&source, root.clone());
-        let returned = result_columns(&written);
-        let packing = crate::nodes::packing(&arguments.structs);
-        let row_tests: Vec<Condition> = row_tests
-            .iter()
-            .map(|test| result_row_condition(test, &packing))
-            .collect();
-        let has_rows = !arguments.unnests.is_empty() || !row_tests.is_empty();
-        if has_rows {
-            for key in &arguments.order {
-                if let SortExpression::Value(expression) = &key.expression
-                    && !column_references(expression).is_empty()
-                    && !reads_unnested(expression)
-                    && !source.contains(expression)
-                {
-                    source.push(expression.clone());
-                }
-            }
-        }
-        source.extend(row_test_columns(&row_tests, &unnested, &source, &returned));
-        let outer = if arguments.unnest_outer.is_empty() {
-            vec![false; arguments.unnests.len()]
-        } else {
-            arguments.unnest_outer.clone()
-        };
-        let mut node = unnested_node(
-            project(&source, root),
-            &arguments.unnests,
-            row_tests,
-            &outer,
-        )?;
-        if has_rows {
-            let selected: Vec<String> = if !arguments.unnests.is_empty() {
-                arguments.output.clone()
-            } else {
-                returned
-            };
-            node = LogicalNode::Project(Project {
-                input: Box::new(node),
-                columns: selected
-                    .into_iter()
-                    .map(
-                        |name| match expanded.iter().find(|(found, _)| *found == name) {
-                            Some((_, column)) => Projected::Expression(column.clone()),
-                            None => Projected::Name(name),
-                        },
-                    )
-                    .collect(),
-                structs: Vec::new(),
-            });
-        }
-        if arguments.limit.is_some()
-            || !arguments.order.is_empty()
-            || arguments.offset != 0
-            || arguments.distinct
-        {
-            node = LogicalNode::Result(ResultNode {
-                input: Box::new(node),
-                limit: arguments.limit,
-                order: arguments.order.clone(),
-                offset: arguments.offset,
-                distinct: arguments.distinct,
-            });
-        }
-        let plan = LogicalPlan { root: node };
-        validate_plan(&plan)?;
-        Ok(plan)
-    }
-}
-
 /// The source columns the row tests read that the SELECT list does not
 /// return, which it adds for them.
-pub fn row_test_columns(
+pub(crate) fn row_test_columns(
     row_tests: &[Condition],
     unnested: &BTreeSet<String>,
     source: &[ValueExpression],
@@ -545,69 +315,12 @@ pub fn row_test_columns(
     extra
 }
 
-fn unnested_node(
-    node: LogicalNode,
-    unnests: &[Vec<String>],
-    row_tests: Vec<Condition>,
-    outer: &[bool],
-) -> Result<LogicalNode, CompileError> {
-    let mut remaining = row_tests;
-    let place = |node: LogicalNode, remaining: &mut Vec<Condition>| {
-        let available = readable_columns(&node);
-        let mut node = node;
-        let mut index = 0;
-        while index < remaining.len() {
-            if result_columns_read(&remaining[index])
-                .iter()
-                .all(|name| available.contains(name))
-            {
-                node = LogicalNode::Filter(Filter {
-                    input: Box::new(node),
-                    condition: remaining.remove(index),
-                    selectivity: None,
-                });
-            } else {
-                index += 1;
-            }
-        }
-        node
-    };
-    let mut node = place(node, &mut remaining);
-    if outer.len() != unnests.len() {
-        panic!("zip() arguments have different lengths");
-    }
-    for (lists, keep_empty) in unnests.iter().zip(outer) {
-        node = LogicalNode::Unnest(Unnest {
-            input: Box::new(node),
-            columns: lists.clone(),
-            outer: *keep_empty,
-        });
-        validate_node(&node)?;
-        node = place(node, &mut remaining);
-    }
-    if let Some(test) = remaining.first() {
-        let available = readable_columns(&node);
-        let mut missing: Vec<String> = result_columns_read(test)
-            .into_iter()
-            .filter(|name| !available.contains(name))
-            .collect();
-        missing.sort();
-        missing.dedup();
-        return compile_error(format!(
-            "{} reads {}, which no result row holds",
-            condition_text(test),
-            repr_list(&missing)
-        ));
-    }
-    Ok(node)
-}
-
 /// Refuse a DISTINCT or ORDER BY that compares AI.SAE_FEATURES lists.
 ///
 /// # Errors
 ///
 /// The query compares a feature list that is not unnested.
-pub fn check_feature_lists(
+pub(crate) fn check_feature_lists(
     columns: &[ValueExpression],
     order: &[SortKey],
     distinct: bool,
@@ -645,45 +358,6 @@ pub fn check_feature_lists(
 
 // ---------------------------------------------------------------- relation
 
-/// A part without its options: a model call, or a condition.
-enum Body {
-    Exists(Box<Exists>),
-    Call(ModelCall),
-    Condition(Condition),
-}
-
-fn body_of(part: Part) -> (Body, Option<f64>, Option<String>) {
-    match part {
-        Part::Hint(hint) => {
-            let (body, _, _) = body_of(*hint.condition);
-            (body, hint.selectivity, hint.anchor)
-        }
-        Part::Exists(exists) => (Body::Exists(exists), None, None),
-        Part::Call(call) => (Body::Call(call), None, None),
-        Part::Compare(test) => (Body::Condition(Condition::Compare(test)), None, None),
-        Part::Not(not) => (Body::Condition(Condition::Not(not)), None, None),
-        Part::And(connective) => (Body::Condition(Condition::And(connective)), None, None),
-        Part::Or(connective) => (Body::Condition(Condition::Or(connective)), None, None),
-    }
-}
-
-fn scan_of(node: &LogicalNode) -> &Scan {
-    match node {
-        LogicalNode::Scan(scan) => scan,
-        _ => panic!("a relation part names a Scan"),
-    }
-}
-
-fn asks_model(condition: &Condition) -> Option<&ModelCall> {
-    match condition {
-        Condition::Compare(test) => match &test.expression {
-            ValueExpression::ModelCall(call) => Some(call),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 fn gate(
     call: &ModelCall,
     inner: &str,
@@ -715,7 +389,6 @@ fn gate(
         ));
     }
     Ok(JoinSpec {
-        aliases: vec![inner],
         predicate: Asked::Call(call.clone()),
         semantics: if anti { "anti" } else { "exists" }.to_string(),
         selectivity,
@@ -724,7 +397,8 @@ fn gate(
     })
 }
 
-fn repr_tuple(items: &[String]) -> String {
+/// A list of names as Python writes a tuple of them.
+pub(crate) fn repr_tuple(items: &[String]) -> String {
     let parts: Vec<String> = items.iter().map(|item| repr_str(item)).collect();
     if parts.len() == 1 {
         format!("({},)", parts[0])
@@ -791,8 +465,8 @@ fn join_spec(
     }
     for condition in &on {
         let sides = [
-            crate::nodes::column_alias_of(&condition.left),
-            crate::nodes::column_alias_of(&condition.right),
+            column_alias_of(&condition.left),
+            column_alias_of(&condition.right),
         ];
         if !sides.iter().all(|side| aliases.contains(side)) {
             return compile_error(format!(
@@ -803,7 +477,6 @@ fn join_spec(
         }
     }
     Ok(JoinSpec {
-        aliases: news,
         predicate,
         semantics: "full".to_string(),
         selectivity,
@@ -838,7 +511,7 @@ fn check_joins(
         }
         return compile_error(format!(
             "JOIN {alias} ON {first} without an AI predicate over its pairs {}",
-            crate::expressions::UNSUPPORTED
+            quail_planner::expressions::UNSUPPORTED
         ));
     }
     if joined.is_empty() {
@@ -852,7 +525,7 @@ fn check_joins(
                 .prompt
                 .args
                 .iter()
-                .map(crate::expressions::argument_alias)
+                .map(quail_planner::expressions::argument_alias)
                 .collect()
         })
         .collect();
@@ -872,7 +545,7 @@ fn check_joins(
         return compile_error(format!(
             "JOINed tables {} with no AI predicate over their pairs {}",
             repr_list(&uncovered),
-            crate::expressions::UNSUPPORTED
+            quail_planner::expressions::UNSUPPORTED
         ));
     }
     let mut reached: BTreeSet<String> = [root.to_string()].into_iter().collect();
@@ -910,79 +583,30 @@ fn is_score(asked: &Asked) -> bool {
 /// Each table's operators, the joins, and the row tests of one SELECT's
 /// relation, before they are put in order.
 #[derive(Debug, Clone)]
-pub struct RelationContent {
+pub(crate) struct RelationContent {
     /// Each table with its operators, in FROM and JOIN order.
-    pub tables: Vec<TableContent>,
-    pub joins: Vec<JoinSpec>,
-    /// The tables joined without an AI predicate.
-    pub cross_joined: Vec<String>,
+    pub(crate) tables: Vec<TableContent>,
+    pub(crate) joins: Vec<JoinSpec>,
     /// Classifications of joined rows, with their names.
-    pub joined_classifications: Vec<(ModelCall, String)>,
+    pub(crate) joined_classifications: Vec<(ModelCall, String)>,
     /// Tests of more than one table's columns, on the result rows.
-    pub rows: Vec<Condition>,
+    pub(crate) rows: Vec<Condition>,
 }
 
-/// One table and its operators, as `LogicalPlanBuilder.add_scan` takes them.
+/// One table and its operators.
 #[derive(Debug, Clone)]
-pub struct TableContent {
-    pub alias: String,
-    pub provider: String,
-    pub column: ScanColumn,
-    pub schema: Option<Schema>,
-    pub operators: ScanOperators,
-}
-
-/// Bind a relation's parts into each table's operators and the joins.
-///
-/// # Errors
-///
-/// A part does not fit the query's tables, or the query has no AI
-/// predicate where it needs one.
-pub fn relation_content(
-    arguments: PlaceRelationArguments,
-) -> Result<RelationContent, CompileError> {
-    let scans: Vec<Scan> = arguments
-        .scans
-        .iter()
-        .map(|node| scan_of(node).clone())
-        .collect();
-    let mut terms = RelationTerms::new(scans, arguments.equalities.clone());
-    for part in arguments.parts {
-        let (body, selectivity, anchor) = body_of(part);
-        match body {
-            Body::Exists(exists) => {
-                let TaggedModelCall::Call(call) = &exists.call;
-                terms.gate(
-                    call,
-                    scan_of(&exists.relation).clone(),
-                    exists.anti,
-                    anchor.as_ref(),
-                    selectivity,
-                )?;
-            }
-            Body::Condition(condition) if asks_model(&condition).is_none() => {
-                terms.condition(condition, selectivity);
-            }
-            Body::Call(call) => terms.asked(Asked::Call(call), selectivity, anchor)?,
-            Body::Condition(Condition::Compare(test)) => {
-                terms.asked(Asked::Compare(*test), selectivity, anchor)?;
-            }
-            Body::Condition(_) => unreachable!("a model call or a comparison of one"),
-        }
-    }
-    terms.content(
-        &arguments.columns,
-        &arguments.tested,
-        &arguments.schemas,
-        &arguments.unnested,
-        arguments.allow_relational,
-    )
+pub(crate) struct TableContent {
+    pub(crate) alias: String,
+    pub(crate) provider: String,
+    pub(crate) column: ScanColumn,
+    pub(crate) schema: Option<Schema>,
+    pub(crate) operators: ScanOperators,
 }
 
 /// The ON and WHERE terms of one SELECT's relation, bound and taken in
 /// written order, before each table's operators are named and placed.
 #[derive(Debug)]
-pub struct RelationTerms {
+pub(crate) struct RelationTerms {
     /// The Scan of each table in FROM and JOIN order, then each gate's.
     scans: Vec<Scan>,
     /// alias -> the ON equalities of the JOIN of that table, last JOIN first.
@@ -999,7 +623,7 @@ pub struct RelationTerms {
 impl RelationTerms {
     /// No terms yet over `scans`, the tables in FROM and JOIN order,
     /// whose JOINs have `equalities`, last JOIN first.
-    pub fn new(scans: Vec<Scan>, equalities: Vec<(String, Vec<Equality>)>) -> Self {
+    pub(crate) fn new(scans: Vec<Scan>, equalities: Vec<(String, Vec<Equality>)>) -> Self {
         let joined: Vec<String> = scans
             .iter()
             .skip(1)
@@ -1025,7 +649,7 @@ impl RelationTerms {
     ///
     /// The call does not read the inner table and one outer table, or
     /// the anchor is not the outer table.
-    pub fn gate(
+    pub(crate) fn gate(
         &mut self,
         call: &ModelCall,
         relation: Scan,
@@ -1040,7 +664,7 @@ impl RelationTerms {
     }
 
     /// Take a condition that asks no model.
-    pub fn condition(&mut self, condition: Condition, selectivity: Option<f64>) {
+    pub(crate) fn condition(&mut self, condition: Condition, selectivity: Option<f64>) {
         self.conditions.push((condition, selectivity));
     }
 
@@ -1050,7 +674,7 @@ impl RelationTerms {
     /// # Errors
     ///
     /// The call does not fit the query's tables.
-    pub fn asked(
+    pub(crate) fn asked(
         &mut self,
         predicate: Asked,
         selectivity: Option<f64>,
@@ -1116,7 +740,7 @@ impl RelationTerms {
     ///
     /// A part does not fit the query's tables, or the query has no AI
     /// predicate where it needs one.
-    pub fn content(
+    pub(crate) fn content(
         self,
         columns: &[ValueExpression],
         tested: &[(TaggedModelCall, String)],
@@ -1133,7 +757,7 @@ impl RelationTerms {
             joins,
             label_tests,
             mut conditions,
-            claimed,
+            ..
         } = self;
         let projected: Vec<(&ModelCall, String)> = columns
             .iter()
@@ -1271,11 +895,6 @@ impl RelationTerms {
         Ok(RelationContent {
             tables,
             joins,
-            cross_joined: joined
-                .iter()
-                .filter(|alias| !claimed.contains(alias))
-                .cloned()
-                .collect(),
             joined_classifications: named
                 .into_iter()
                 .filter(|(call, _)| call_aliases(call).len() == 2)

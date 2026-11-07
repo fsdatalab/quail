@@ -19,8 +19,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::expressions::asked_call;
 use crate::expressions::call_aliases;
-use crate::nodes::asked_call;
 use crate::operators::{ColumnTest, Operators, SemanticColumn};
 
 /// The name shown for a candidate whose column operators run above a join.

@@ -3,35 +3,67 @@ title: Logical plans
 ---
 
 A logical plan describes the operations a query requests and the data they
-read. It does not specify GPU batches or attention settings. DataFusion
-binds a query, and its optimizer rules place Quail's operators (see
-[From SQL to a plan](#from-sql-to-a-plan)).
-The [optimizer](/docs/architecture/optimizer) then prices the physical
-choices and builds a physical plan.
+read. It does not specify GPU batches or attention settings. Quail's
+logical plan is DataFusion's `LogicalPlan`: DataFusion binds a query, and
+its optimizer rules place Quail's AI operators in it as `AiNode`s (see
+[From SQL to a plan](#from-sql-to-a-plan)). Quail then reads each model
+region's operators from that plan, and the
+[optimizer](/docs/architecture/optimizer) prices the physical choices
+and builds a physical plan.
 
-This page describes the plan representation for contributors working on
-query syntax, validation, or optimizer rules.
+This page describes the plan for contributors working on query syntax,
+validation, or optimizer rules.
 
 ## Plan structure
 
-The plan is a tree. Each node represents an operation, and its children
-are the operations that supply its inputs. Data flows from scans toward
-the root.
+The plan is a tree of DataFusion's operators. Each node represents an
+operation, and its children are the operations that supply its inputs.
+Data flows from the scans toward the root.
 
 For example, imagine a query that classifies reviews by sentiment and
-returns only negative reviews. Its logical plan has these operations:
+returns only negative reviews:
 
-```text
-Result
-  Project: r.id, sentiment
-    Filter: sentiment IN ('negative')
-      SemanticClassify: sentiment
-        Scan: reviews as r
+```sql
+SELECT r.id, AI.CLASSIFY(r.body, ARRAY['positive', 'negative']) AS sentiment
+FROM reviews r
+WHERE sentiment = 'negative'
 ```
 
-`SemanticClassify` calls the model and adds a label column. `Filter` tests
-that column without calling the model. Keeping the two operations separate
-lets the planner reason about their placement and cost.
+Its logical plan, as the first half of `explain()` prints it, is:
+
+```text
+Projection: r.id, sentiment
+  AiNode: sentiment = ai_classify(r.body, make_array(Utf8("positive"), Utf8("negative"))), filter: sentiment = Utf8("negative")
+    SubqueryAlias: r
+      TableScan: reviews projection=[id, body]
+```
+
+The `AiNode` calls the model and adds the label column `sentiment`,
+then keeps the rows whose label passes its filter. The filter tests the
+column without calling the model again. `Projection`, `SubqueryAlias`,
+and `TableScan` are DataFusion's own operators.
+
+### AiNode
+
+An `AiNode` (`crates/quail-datafusion/src/ai.rs`) asks the model one
+AI call `f` about each row of its input `R`, and adds the call's answer
+as the column `a`:
+
+```text
+AI(R; g, p, h, P, n) = π_P(Limit_n(σ_p(π_{*, f_g → a}(R))))
+f_g = CASE WHEN g THEN f END
+```
+
+- `g`, the guard, says which rows the model is asked about.
+- `p`, the filter, is an exact test of the input's columns and `a`.
+- `h`, the hint, is the query's inexact `HINT` options, such as
+  `{'selectivity': 0.4}`.
+- `P`, the projection, names the added columns the node returns.
+- `n`, the fetch, keeps the first rows: of all rows, or of each key.
+
+The call's function names the node's kind: `ai_filter` (`AI.IF`),
+`ai_score`, `ai_classify`, `ai_extract`, `ai_map`, or
+`ai_sae_features`.
 
 ## From SQL to a plan
 
@@ -42,9 +74,7 @@ joins below them and a LIMIT or DISTINCT that can stop the model early
 operators above the region, such as GROUP BY, windows, and an ORDER BY
 without a LIMIT, and moves their AI calls into the region's SELECT
 list. The analyzer then lowers each AI call into one `AiNode`
-(`crates/quail-datafusion/src/lower.rs` and `ai.rs`). An `AiNode` adds
-the call's answer `a` to each row of its input, keeps the rows that
-pass its filter, and returns the columns its projection names:
+(`crates/quail-datafusion/src/lower.rs`):
 
 - An AI.IF filter is an `AiNode` whose filter is `a` and which returns
   only its input's columns. A comparison of an AI.SCORE is the same,
@@ -60,7 +90,7 @@ For example, imagine a query that joins reviews to products on an
 AI.IF, keeps negative reviews with another AI.IF, and keeps reviews
 with more than 3 stars. DataFusion binds it with every test in one
 `Filter` above the join. Lowering turns the two model tests into
-Quail's nodes, still where the query wrote them:
+`AiNode`s, still where the query wrote them:
 
 ```text
 Filter: r.stars > 3
@@ -93,71 +123,44 @@ a DISTINCT when the SELECT list returns each table's id column, and
 `PushDownDistinct` gives a one-table query's last AI.IF `AiNode` a
 fetch of one row per selected key.
 
-Finally, the Rust binder (`crates/quail-datafusion/src/bind.rs`) reads
-each operator's content, such as its prompt, labels, and selectivity
-hint, from the bound plan. The translator
-(`crates/quail-datafusion/src/translate.rs`) builds Quail's logical
-plan node by node, with each operator where the rules left it. A
-table's AI.IF and AI.SCORE `AiNode`s become one `SemanticFilter`, an
-AI join one `SemanticJoin`, and an answer column the node for its
-kind, such as `SemanticClassify`. A CTE that runs as its own stage goes through the
-same steps.
+Finally, `derive` (`crates/quail-datafusion/src/derive.rs`) reads the
+region's operators from the optimized plan. It walks the plan once,
+children first and the left input before the right, and binds each AI
+call's prompt and each condition in the order the query wrote them
+(`binding.rs`). It places each table's terms (`terms.rs`) and writes
+the region's `Operators`, with each operator where the rules left it.
+The physical planner reads only these operators. A region whose shape
+the operators cannot hold is refused when DataFusion claims it, and
+DataFusion runs that part of the query itself.
 
-Which implementation runs a node, such as a classification's label
+Which implementation runs an operator, such as a classification's label
 scoring method or whether a classification runs before or after a
 join, is a physical choice. The [optimizer](/docs/architecture/optimizer)
 prices those choices.
 
-## The node protocol
+## Operators
 
-All logical nodes implement this protocol:
+`Operators` (`crates/quail-planner/src/operators.rs`) holds a region's
+operators, grouped by kind, in the order the query wrote them. They
+cross into Python as JSON (`Query.operators`).
 
-```python
-class LogicalNode(Protocol):
-    type_name: ClassVar[str]
-
-    def children(self) -> tuple[LogicalNode, ...]: ...
-    def expressions(self) -> tuple[Any, ...]: ...
-    def output_schema(self) -> tuple[ColumnRef, ...]: ...
-    def validate(self) -> None: ...
-    def with_children(self, children) -> LogicalNode: ...
-    def with_expressions(self, expressions) -> LogicalNode: ...
-    def explain_fields(self) -> dict[str, Any]: ...
-```
-
-- `children()` returns the node's inputs.
-- `expressions()` returns the expressions attached to the operation.
-  A `SemanticFilter` holds `FilterPredicate` objects, which include a
-  predicate and a selectivity hint. A `Project` holds output expressions.
-- `output_schema()` describes the columns available after the operation.
-- `validate()` checks the node's constraints.
-- `explain_fields()` supplies fields for the plan's text representation.
-
-Nodes are frozen dataclasses. Rewrites use `with_children()`,
-`with_expressions()`, or `dataclasses.replace()` to return new nodes.
-`LogicalPlan.walk()` visits children before their parents.
-
-## Node types
-
-| Node | Meaning |
+| Field | Meaning |
 | --- | --- |
-| `Scan(provider, alias, column)` | Read document text from a registered table. |
-| `SemanticFilter(input, predicates)` | Evaluate model predicates over one table and keep passing rows. |
-| `Join(left, right, on)` | Form pairs from two inputs. Optional column equalities restrict the pairs. Without `on`, it forms every pair. |
-| `SemanticJoin(input, predicate, semantics, selectivity, anchor)` | Evaluate a model predicate over the pairs from a `Join`. The semantics are `full`, `exists`, or `anti`. |
-| `SemanticClassify(input, call, name)` | Evaluate an `AI.CLASSIFY` call and add the label column `name`. |
-| `SemanticExtract(input, call, name)` | Extract one answer field and its character positions from each document. |
-| `Filter(input, condition, selectivity)` | Keep rows that satisfy a condition on a label, extracted answer, or answer position. |
-| `Apply(input, function, kind, ids, columns, aliases)` | Run a registered Python function on input rows or pairs. |
-| `Project(input, columns, structs)` | Select values and assemble extraction structs. |
-| `Result(input, limit, order, offset, distinct)` | Set result order, remove duplicates, and apply an offset and limit. This is the root node. |
+| `scans` | Each table the region reads: its provider, alias, document column, the columns its operators read, and its regular predicates. |
+| `filters` | Each table's AI.IF and AI.SCORE predicates, with their selectivity hints. |
+| `joins` | Each AI join or EXISTS gate: its predicate, semantics (`full`, `exists`, or `anti`), selectivity, anchor, and the ON equalities below it. |
+| `classifies`, `extracts`, `sae_features`, `maps` | Each column operator: its model call, its answer column, and whether it runs above a join. |
+| `column_filters` | Each table's tests of answer columns, such as `sentiment IN ('negative')`. |
+| `projection` | The SELECT list, with each extraction's struct columns. |
+| `result` | ORDER BY, DISTINCT, OFFSET, and LIMIT. |
+| `after_projection` | The operators on result rows above the SELECT list: each `UNNEST`, each test of more than one table's columns, and the outer SELECT list. |
 
-A query joining three or more tables uses one `SemanticJoin` for each
-binary join. A classification may read one document or both documents
-of a joined pair. Conditions on labels of joined pairs are unsupported.
+A query joining three or more tables has one join for each binary
+join. A classification may read one document or both documents of a
+joined pair. Conditions on labels of joined pairs are unsupported.
 
-GROUP BY, HAVING, and windows have no node here: DataFusion runs them
-on the rows a model region returns, or computes them as a region's
+GROUP BY, HAVING, and windows have no operator here: DataFusion runs
+them on the rows a model region returns, or computes them as a region's
 input. For example, a CTE that numbers a filter's survivors with
 `ROW_NUMBER()`, read by a second AI filter, becomes two regions: the
 first filter, then DataFusion's window, then the second filter, which
@@ -176,7 +179,7 @@ operation.
 | `GetField(input, field)` | A field read from a struct. |
 | `ScalarFunction(function, args)` | A value computed for each row, such as text length. |
 | `RegularPredicate(expression, comparison, value)` | A condition on a value, such as `length(r.body) < 40`. |
-| `ModelCall(prompt, kind, labels, descriptions)` | An AI operation. The kind is `boolean`, `score`, `label`, or `extract`. |
+| `ModelCall(prompt, kind, labels, descriptions)` | An AI operation. The kind is `boolean`, `score`, `label`, `extract`, `features`, or `map`. |
 | `Alias(expression, name)` | An expression returned under a specified column name. |
 
 For example, `LENGTH(r.details.body)` reads the `details` column,
@@ -188,20 +191,17 @@ ScalarFunction("length", (
 ))
 ```
 
-Operators use these expressions as follows:
+The operators use these expressions as follows:
 
-- `Scan.column` specifies the text to tokenize. It can read a source
-  column directly or use a value expression, such as a struct field.
-- `SemanticFilter` and `SemanticJoin` test a boolean `ModelCall` or a
-  `RegularPredicate` that compares an `AI.SCORE` call with a threshold.
-- `Filter` tests a label, extracted answer, or answer position with a
-  `RegularPredicate`. The condition does not call the model again.
-- `Project.columns` specifies the returned values and their names.
-
-`LogicalPlan.operators()` collects the tree's operations for planning.
-It includes scans, predicates and joins in written order, Python
-functions, score, classification, and extraction calls, and conditions
-on their answers.
+- A scan's `column` specifies the text to tokenize. It can read a
+  source column directly or use a value expression, such as a struct
+  field.
+- A filter or join tests a boolean `ModelCall`, or a `RegularPredicate`
+  that compares an `AI.SCORE` call with a threshold.
+- A column filter tests a label, extracted answer, or answer position
+  with a `RegularPredicate`. The condition does not call the model
+  again.
+- The projection's columns specify the returned values and their names.
 
 ## Prompt binding
 

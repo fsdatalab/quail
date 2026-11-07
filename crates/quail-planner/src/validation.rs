@@ -9,8 +9,8 @@ use quail_cost::specs::{DeviceSpec, ModelSpec};
 use quail_physical::{Asked, Prompt, ValueExpression};
 
 use crate::context::PlanningContext;
+use crate::expressions::asked_call;
 use crate::expressions::{CompileError, Refusal, aliased_call, call_aliases, repr_str};
-use crate::nodes::asked_call;
 use crate::operators::Operators;
 use crate::prompts::prompt_layout;
 use crate::scores::prompt_aliases;

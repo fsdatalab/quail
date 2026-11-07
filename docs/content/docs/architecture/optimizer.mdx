@@ -19,7 +19,7 @@ to write and register an extension rule.
 
 1. **Prepare statistics.** Read token counts, or estimate document lengths
    from the first 1,024 documents while tokenization runs in the background.
-2. **Place column operators.** The logical plan arrives with each
+2. **Place column operators.** The region's operators arrive with each
    operator on its table, where DataFusion's model region rules left it
    (see [From SQL to a plan](/docs/architecture/logical-plans#from-sql-to-a-plan)),
    and each scan loading only the columns the query uses. Each candidate
@@ -152,8 +152,8 @@ chooses filter and join order for each candidate.
 ### Classification placement
 
 Physical planning considers when to classify a table's documents
-(`column_placements` in
-[`rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/rules.rs)).
+(`placements` in
+[`placements.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/placements.rs)).
 It also considers placements for extraction and AI.MAP.
 A classification that reads one table's document can run before or after
 joins involving that table. This differs from classifying a joined pair,

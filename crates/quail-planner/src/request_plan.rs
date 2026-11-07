@@ -17,9 +17,9 @@ use crate::context::PlanningContext;
 use crate::expressions::{
     CompileError, Refusal, aliased_call, argument_alias, call_aliases, projected_name, sort_name,
 };
+use crate::expressions::{asked_call, packed_columns, packing};
 use crate::graph::has_label;
 use crate::lowering::answer_ids;
-use crate::nodes::{asked_call, packed_columns, packing};
 use crate::operators::{Operators, SemanticColumn};
 use crate::prompts::{LABEL_PREFIX, join_label, prompt_layout, render_join_frame};
 use crate::request_order::request_order;

@@ -211,11 +211,7 @@ class Query:
 
                 raise CompileError(compile_message(error, self.text)) from None
             regions = []
-            for kind, payload, planned in found:
-                if kind == "sql":
-                    inner = self.session.sql(payload, order=self.order)
-                    regions.extend(inner.regions())
-                    continue
+            for payload, planned in found:
                 found = json.loads(payload)
                 region = region_query(self.session, found["operators"],
                                       logical=found["logical"], order=self.order)
