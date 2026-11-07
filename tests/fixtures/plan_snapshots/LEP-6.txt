@@ -1,14 +1,14 @@
 logical:
-  Project: d.id, area, s.id
-    SemanticJoin (full)
-      PROMPT('Is the passage in DOCUMENT {1} cited by the legal excerpt in DOCUMENT {0}?', d.destination_context, s.passage_text) (selectivity=0.231%)
-      Join
-        cross
-        Filter: d.area IN ('constitutional law', 'criminal law') (selectivity=31.8%)
-          SemanticClassify: area
-            PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the excerpt above which area of law it concerns.', d.destination_context) labels=['constitutional law', 'criminal law', 'civil procedure', 'civil rights', 'contracts', 'torts', 'property', 'administrative law', 'employment law', 'intellectual property', 'tax law', 'family law', 'immigration law', 'bankruptcy', 'antitrust']
-            Scan citation_contexts as d [destination_context, id]
-        Scan citation_passages as s [passage_text, id]
+  Projection: d.id, area, s.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Is the passage in DOCUMENT {1} cited by the legal excerpt in DOCUMENT {0}?"), d.destination_context, s.passage_text), named_struct(Utf8("selectivity"), Float64(0.0023094688221709007))), filter: __quail_answer_1, returns: []
+      Cross Join:
+        AiNode: area = ai_classify(prompt(Utf8("Judge strictly from the excerpt above which area of law it concerns.
+  
+  {0}"), d.destination_context), make_array(Utf8("constitutional law"), Utf8("criminal law"), Utf8("civil procedure"), Utf8("civil rights"), Utf8("contracts"), Utf8("torts"), Utf8("property"), Utf8("administrative law"), Utf8("employment law"), Utf8("intellectual property"), Utf8("tax law"), Utf8("family law"), Utf8("immigration law"), Utf8("bankruptcy"), Utf8("antitrust"))), filter: hint(area IN ([Utf8("constitutional law"), Utf8("criminal law")]), named_struct(Utf8("selectivity"), Float64(0.318)))
+          SubqueryAlias: d
+            TableScan: citation_contexts projection=[id, destination_context]
+        SubqueryAlias: s
+          TableScan: citation_passages projection=[id, passage_text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

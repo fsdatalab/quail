@@ -43,12 +43,14 @@ def _model_spec(model: str):
     return None if spec is None else asdict(spec)
 
 
-def explain(logical, physical, *, verbose: bool = False, result=None,
+def explain(logical, operators, physical, *, verbose: bool = False, result=None,
             usd_per_hour: float | None = None, rules=None) -> str:
-    """Format the logical and physical operator trees.
+    """Format DataFusion's plan of a region and its physical operator tree.
 
     Args:
-        logical: The optimized logical plan as JSON.
+        logical: DataFusion's plan of the region, one operator per line.
+        operators: The region's operators as JSON, which the physical
+            plan lowers.
         physical: The physical plan or planning refusal.
         verbose: Include runtime settings, internal node fields, and
             the optimizer rules.
@@ -62,7 +64,8 @@ def explain(logical, physical, *, verbose: bool = False, result=None,
         The explain text.
     """
     request = {
-        "logical": json.loads(logical),
+        "logical": logical,
+        "operators": json.loads(operators),
         "verbose": verbose,
         "usd_per_hour": usd_per_hour,
         "rules": (None if rules is None

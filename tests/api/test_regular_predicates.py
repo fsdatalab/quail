@@ -2,8 +2,8 @@
 
 import pyarrow as pa
 import pytest
-from helpers.logical import nodes
 from helpers.oracle import Oracle, oracle_executor
+from helpers.planning import operators_of, row_tests
 from helpers.sessions import CONFIG, TOKENIZER, TRUTH, _run, make_executor
 
 import quail
@@ -105,7 +105,7 @@ def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
     query = session.sql(
         FILTER_SQL + " AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)")
     # the test runs in DataFusion, before the region
-    (scan,) = nodes(query.logical, "Scan")
+    (scan,) = operators_of(query).scans
     assert scan.predicates == ()
     # r3's NULL < 3 makes the OR null, so DataFusion rejects r3
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",)]
@@ -129,9 +129,8 @@ def test_an_or_over_two_tables_runs_on_the_result_rows(session):
         WHERE r.stars > 4 OR p.price > 15
         ORDER BY r.id, p.asin
     """)
-    filters = nodes(query.logical, "Filter")
     # DataFusion computes each table's side; the region tests the OR of them
-    assert [str(node.condition) for node in filters] == [
+    assert [str(condition) for condition in row_tests(operators_of(query))] == [
         "r.__quail_expr_0 OR p.__quail_expr_1"]
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     # every pair with p1, and r0 and r5 (5 stars) with p0; r3's null
@@ -152,7 +151,7 @@ def test_datafusion_functions_run_in_where_and_select(session):
         WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND ABS(r.stars - 4) <= 1
         ORDER BY r.id""")
     # DataFusion's ABS runs the WHERE test before the region
-    (scan,) = nodes(query.logical, "Scan")
+    (scan,) = operators_of(query).scans
     assert scan.predicates == ()
     assert _run(query, make_executor(TRUTH)).to_rows() == [
         ("r0", "NE", 1), ("r4", "NE", 1)]
@@ -182,7 +181,7 @@ def test_where_takes_the_same_expressions_as_select(session):
     }
     for test, kept in cases.items():
         query = session.sql(f"{first} AND ({test}) ORDER BY r.id")
-        (scan,) = nodes(query.logical, "Scan")
+        (scan,) = operators_of(query).scans
         # DataFusion runs every plain test before the region
         assert scan.predicates == (), test
         assert [row[0] for row in _run(query, make_executor(TRUTH)).to_rows()] == (
@@ -207,11 +206,38 @@ def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
         WHERE r.stars > p.price
         ORDER BY r.id, p.asin
     """)
-    filters = nodes(query.logical, "Filter")
-    assert [str(node.condition) for node in filters] == ["greater(r.stars, p.price)"]
+    assert [str(condition) for condition in row_tests(operators_of(query))] == [
+        "greater(r.stars, p.price)"]
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     assert result.to_rows() == [
         ("r0", "p0"), ("r0", "p1"), ("r2", "p0"), ("r5", "p0"), ("r5", "p1")]
+
+
+def test_an_equality_of_two_tables_in_where_pairs_their_rows_before_the_ai_join(
+        session):
+    session.register("products", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["d0", "d1"],
+        "stars": [5, 2]}), id_col="asin"))
+    asked = []
+
+    def same(node, assignment):
+        asked.append((assignment["r"], assignment["p"]))
+        return True
+
+    for where in ("FROM reviews r JOIN products p ON {ai} WHERE r.stars = p.stars",
+                  "FROM reviews r, products p WHERE r.stars = p.stars AND {ai}"):
+        asked.clear()
+        query = session.sql("SELECT r.id, p.asin " + where.format(
+            ai="AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))")
+            + " ORDER BY r.id")
+        # the equality is the AI join's key, as an ON equality would be
+        assert [str(condition) for condition in operators_of(query).joins[0].on] == [
+            "r.stars = p.stars"]
+        assert any(node.type_name == "quail.hash_join" for node in query.plan().nodes)
+        result = _run(query, oracle_executor(Oracle(joins=same)))
+        assert result.to_rows() == [("r0", "p0"), ("r1", "p1"), ("r5", "p0")]
+        # the model is asked only about the pairs with equal stars
+        assert sorted(asked) == [(0, 0), (1, 1), (5, 0)]
 
 
 SQL_CALLS = {

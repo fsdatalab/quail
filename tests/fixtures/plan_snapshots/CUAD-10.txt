@@ -1,13 +1,8 @@
 logical:
-  Project: c.id, contract.agreement_date, contract.expiration_date, contract.governing_law
-    contract = struct(contract.agreement_date, contract.expiration_date, contract.governing_law)
-    SemanticExtract: contract.governing_law, contract.governing_law_span
-      question="Which state/country's law governs the interpretation of the contract?"
-      SemanticExtract: contract.expiration_date, contract.expiration_date_span
-        question="On what date will the contract's initial term expire?"
-        SemanticExtract: contract.agreement_date, contract.agreement_date_span
-          question='The date of the contract'
-          Scan contracts as c [text, id]
+  Projection: c.id, contract, contract_span
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("agreement_date"), Utf8("The date of the contract"), Utf8("expiration_date"), Utf8("On what date will the contract's initial term expire?"), Utf8("governing_law"), Utf8("Which state/country's law governs the interpretation of the contract?")))
+      SubqueryAlias: c
+        TableScan: contracts projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

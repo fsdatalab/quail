@@ -1,9 +1,8 @@
 logical:
-  Project: c.id, contract.liability_cap
-    contract = struct(contract.liability_cap)
-    SemanticExtract: contract.liability_cap, contract.liability_cap_span
-      question='Does the contract include a cap on liability upon the breach of a party’s obligation? This includes time limitation for the counterparty to bring claims or maximum amount for recovery.'
-      Scan contracts as c [text, id]
+  Projection: c.id, contract, contract_span
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("liability_cap"), Utf8("Does the contract include a cap on liability upon the breach of a party’s obligation? This includes time limitation for the counterparty to bring claims or maximum amount for recovery.")))
+      SubqueryAlias: c
+        TableScan: contracts projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

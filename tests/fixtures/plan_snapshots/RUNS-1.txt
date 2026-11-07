@@ -1,8 +1,12 @@
 logical:
-  Project: r.id
-    SemanticFilter
-      PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the agent run above whether the agent wrote and ran a script or test that reproduces the reported issue before changing the project's code.\n\nInstruction: answer TRUE if the agent reproduced the issue before changing the code, FALSE otherwise.", r.transcript) (selectivity=97.5%)
-      Scan issue_runs as r [transcript, id]
+  Projection: r.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent run above whether the agent wrote and ran a script or test that reproduces the reported issue before changing the project's code.
+  
+  {0}
+  
+  Instruction: answer TRUE if the agent reproduced the issue before changing the code, FALSE otherwise."), r.transcript), named_struct(Utf8("selectivity"), Float64(0.975))), filter: __quail_answer_1, returns: []
+      SubqueryAlias: r
+        TableScan: issue_runs projection=[id, transcript]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

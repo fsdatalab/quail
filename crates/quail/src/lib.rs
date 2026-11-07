@@ -37,6 +37,7 @@ use quail_datafusion::{IdentifiedTable, InputRows, ModelRegion, RegionRunner, qu
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::unbounded_channel;
 
+pub use crate::engine::region_json;
 use crate::engine::{PythonRunner, PythonTable, RegionCall};
 
 /// The model and hardware a [`Session`] runs on.
@@ -157,9 +158,9 @@ impl Session {
     /// with `run_region(kind, payload, tables, fetch)` and the
     /// attributes `turn`, `layout`, and `rules`.
     ///
-    /// `run_region` takes ("plan", a region's logical plan as JSON) or
-    /// ("sql", the region's SQL) for a region the Rust binder does not
-    /// read, the rows of each input the region reads by table name, and
+    /// `run_region` takes ("plan", a region's operators and DataFusion
+    /// plan as [`region_json`] writes them) or ("sql", the region's SQL)
+    /// for a region whose shape Quail's operators do not read, the rows of each input the region reads by table name, and
     /// the region's row limit, and returns a pyarrow Table or
     /// RecordBatchReader. `turn` and `layout` are the model's chat-turn
     /// text and prompt layout, or None to send every region as SQL.
@@ -442,8 +443,8 @@ impl Session {
 
 impl Session {
     /// Plan each model region of a query without running it, region by
-    /// region: (its kind, its logical plan or SQL, its planned region
-    /// as JSON when Rust plans it). A region's inputs that call no model
+    /// region: (its kind, the region as [`region_json`] writes it or its
+    /// SQL, its planned region as JSON when Rust plans it). A region's inputs that call no model
     /// are computed first, so it plans on their real rows.
     ///
     /// # Errors

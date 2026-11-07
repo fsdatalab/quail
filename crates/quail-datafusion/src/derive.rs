@@ -7,6 +7,8 @@
 //! condition with the binder's [`Binder`], in the order the query wrote
 //! them; names each table's operators and places its conditions with
 //! [`RelationTerms`]; and writes [`Operators`] from the plan's shape.
+//! The engine plans each region from these operators, and a region whose
+//! shape they cannot hold is refused with [`UNSUPPORTED`] in the message.
 //!
 //! For example, `SELECT r.id, AI.CLASSIFY(...) AS sentiment FROM reviews
 //! r WHERE AI.IF(...)` plans as an `AiNode` adding `sentiment` over an
@@ -43,12 +45,14 @@ use quail_planner::rules::{
 use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Fetch, Semantics, WrittenTest};
 use crate::bind::{
-    Binder, OnTerm, SelectBinder, UNSUPPORTED, Unnested, conjuncts, contains_ai_call,
-    feature_schema, has_subqueries, read_top, refuse_grouped_input, select_outputs, selected_calls,
-    unnest_term, unnested_fields, unsupported,
+    Binder, OnTerm, SelectBinder, Unnested, conjuncts, contains_ai_call, feature_schema,
+    has_subqueries, read_top, refuse_grouped_input, select_outputs, selected_calls, unnest_term,
+    unnested_fields, unsupported,
 };
 use crate::lower::quail_function;
 use crate::region::ModelRegion;
+
+pub use crate::bind::UNSUPPORTED;
 
 /// Derive a model region's operators from its plan after DataFusion's
 /// rules, running [`crate::OptimizeModelRegions`]' default rules first on a
@@ -59,24 +63,39 @@ use crate::region::ModelRegion;
 ///
 /// # Errors
 ///
-/// The region uses SQL outside Quail's language, with the message the
-/// binder gives.
+/// The region uses SQL outside Quail's language; a message that
+/// contains [`UNSUPPORTED`] names a shape DataFusion can run instead.
 pub fn derive_region_operators(
     region: &ModelRegion,
     turn: &Turn,
     layout: &str,
 ) -> Result<Operators, CompileError> {
-    if region.optimized {
-        return derive_operators(&region.plan, turn, layout);
-    }
-    let rules: Vec<String> = crate::REGION_RULES
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    let optimized = crate::lower_ai_calls(region.bound.clone())
-        .and_then(|lowered| crate::optimize_region(&lowered, &rules))
-        .map_err(|error| CompileError::new(error.to_string()))?;
-    derive_operators(&optimized, turn, layout)
+    derive_region(region, turn, layout).map(|(operators, _)| operators)
+}
+
+/// A model region's operators, as [`derive_region_operators`] derives
+/// them, and the plan after DataFusion's rules they are read from.
+///
+/// # Errors
+///
+/// As [`derive_region_operators`].
+pub fn derive_region(
+    region: &ModelRegion,
+    turn: &Turn,
+    layout: &str,
+) -> Result<(Operators, LogicalPlan), CompileError> {
+    let plan = if region.optimized {
+        region.plan.clone()
+    } else {
+        let rules: Vec<String> = crate::REGION_RULES
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        crate::lower_ai_calls(region.bound.clone())
+            .and_then(|lowered| crate::optimize_region(&lowered, &rules))
+            .map_err(|error| CompileError::new(error.to_string()))?
+    };
+    Ok((derive_operators(&plan, turn, layout)?, plan))
 }
 
 /// Derive a model region's operators from its plan after DataFusion's
@@ -98,6 +117,9 @@ pub fn derive_operators(
     walk.visit(top.relation);
     if let Some(error) = walk.refusal.take() {
         return Err(error);
+    }
+    if walk.unknown {
+        return Err(unplaced(plan));
     }
     let allow_relational = has_subqueries(plan);
     let answers = walk.answers();
@@ -140,17 +162,11 @@ pub fn derive_operators(
     binding.binder.validate_query(&columns, &structs)?;
     let content = binding.content(&walk, &columns, allow_relational)?;
     let Some(placed) = Placement::new(&walk, &content).operators() else {
-        return Err(CompileError::new(format!(
-            "the placement of these operators {UNSUPPORTED}:\n{}",
-            plan.display_indent()
-        )));
+        return Err(unplaced(plan));
     };
     let mut found = placed.operators.clone();
     if binding.unplaced {
-        return Err(CompileError::new(format!(
-            "the placement of these operators {UNSUPPORTED}:\n{}",
-            plan.display_indent()
-        )));
+        return Err(unplaced(plan));
     }
     if columns.is_empty() {
         return compile_error("Project needs at least one column");
@@ -190,11 +206,25 @@ pub fn derive_operators(
         offset: top.offset,
         distinct: top.distinct,
     };
+    if found.result.limit.is_some_and(|limit| limit <= 0) {
+        return compile_error("LIMIT must be a positive integer");
+    }
+    if found.result.offset < 0 {
+        return compile_error("OFFSET must be a nonnegative integer");
+    }
     if allow_relational && quail_planner::plan_statistics::plan_prompts(&found).is_empty() {
         return compile_error("the query has no AI predicate");
     }
     push_down_columns(&mut found, &walk, &placed, &content);
     Ok(found)
+}
+
+/// The refusal of a plan whose operators Quail's operators do not read.
+fn unplaced(plan: &LogicalPlan) -> CompileError {
+    CompileError::new(format!(
+        "the placement of these operators {UNSUPPORTED}:\n{}",
+        plan.display_indent()
+    ))
 }
 
 /// `plan` with a SELECT list under its LIMIT, ORDER BY, and DISTINCT:
@@ -234,128 +264,6 @@ fn with_select_list(plan: &LogicalPlan) -> LogicalPlan {
         }
         other => listed(other),
     }
-}
-
-/// How the derived operators of a region differ from the binder's, or
-/// None when they, or the two refusals, are the same.
-pub fn shadow_difference(region: &ModelRegion, turn: &Turn, layout: &str) -> Option<String> {
-    let bound = crate::bind::bind_model_region(region, turn, layout)
-        .map(|plan| quail_planner::operators::operators(&plan));
-    difference(bound, derive_region_operators(region, turn, layout))
-}
-
-/// How two outcomes for one region differ, or None.
-fn difference(
-    bound: Result<Operators, CompileError>,
-    derived: Result<Operators, CompileError>,
-) -> Option<String> {
-    match (bound, derived) {
-        (Ok(bound), Ok(derived)) if bound == derived => None,
-        (Err(bound), Err(derived)) if bound.0 == derived.0 => None,
-        (Ok(bound), Ok(derived)) => Some(operator_difference(&bound, &derived)),
-        (bound, derived) => Some(format!(
-            "bound: {}\nderived: {}",
-            outcome(&bound),
-            outcome(&derived)
-        )),
-    }
-}
-
-/// The regions a shadow check compared, while one is on.
-#[derive(Debug, Default, Clone)]
-pub struct ShadowLog {
-    /// How many times a region was compared.
-    pub num_comparisons: usize,
-    /// How many of those times the binder refused the region.
-    pub num_refusals: usize,
-    /// The distinct regions compared, by their plan's text.
-    pub regions: BTreeSet<String>,
-    /// Each region whose derived operators differ, its plan and how.
-    pub differences: Vec<String>,
-}
-
-static SHADOW: std::sync::Mutex<Option<ShadowLog>> = std::sync::Mutex::new(None);
-
-/// Start comparing each region bound for planning with its derived
-/// operators, or stop.
-pub fn set_shadow_check(enabled: bool) {
-    let mut log = SHADOW.lock().unwrap_or_else(|error| error.into_inner());
-    *log = enabled.then(ShadowLog::default);
-}
-
-/// Compare a region's derived operators with the binder's when a shadow
-/// check is on, and record the result.
-pub fn shadow_check(region: &ModelRegion, turn: &Turn, layout: &str) {
-    if SHADOW
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .is_none()
-    {
-        return;
-    }
-    let bound = crate::bind::bind_model_region(region, turn, layout)
-        .map(|plan| quail_planner::operators::operators(&plan));
-    let refused = bound.is_err();
-    let difference = difference(bound, derive_region_operators(region, turn, layout));
-    let text = region.plan.display_indent().to_string();
-    let mut log = SHADOW.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(log) = log.as_mut() {
-        log.num_comparisons += 1;
-        log.num_refusals += usize::from(refused);
-        if let Some(difference) = difference {
-            log.differences.push(format!("{text}\n{difference}"));
-        }
-        log.regions.insert(text);
-    }
-}
-
-/// The shadow check's log so far, emptied, when one is on.
-pub fn take_shadow_log() -> Option<ShadowLog> {
-    let mut log = SHADOW.lock().unwrap_or_else(|error| error.into_inner());
-    log.as_mut().map(std::mem::take)
-}
-
-fn outcome(found: &Result<Operators, CompileError>) -> String {
-    match found {
-        Ok(_) => "operators".to_string(),
-        Err(error) => format!("refused: {}", error.0),
-    }
-}
-
-/// The first field in which two regions' operators differ, both values
-/// shown.
-fn operator_difference(bound: &Operators, derived: &Operators) -> String {
-    macro_rules! compare {
-        ($($field:ident),*) => {
-            $(
-                if bound.$field != derived.$field {
-                    return format!(
-                        "{}: bound {:#?}\nderived {:#?}",
-                        stringify!($field),
-                        bound.$field,
-                        derived.$field
-                    );
-                }
-            )*
-        };
-    }
-    compare!(
-        scans,
-        filters,
-        filters_before_joins,
-        joins,
-        projections,
-        classifies,
-        extracts,
-        sae_features,
-        maps,
-        column_filters,
-        projection,
-        result,
-        after_projection,
-        stop_keys
-    );
-    String::new()
 }
 
 // ---------------------------------------------------------------- the walk
@@ -414,6 +322,9 @@ struct Walk<'a> {
     refusal: Option<CompileError>,
     /// Whether the plan has an operator Quail's operators do not read.
     unplaced: bool,
+    /// Whether that operator is one no operator of Quail's is, such as a
+    /// LIMIT below a filter.
+    unknown: bool,
 }
 
 impl<'a> Walk<'a> {
@@ -442,6 +353,7 @@ impl<'a> Walk<'a> {
                     Some(node) => (Kind::Ai(node), vec![self.visit(&node.input)]),
                     None => {
                         self.unplaced = true;
+                        self.unknown = true;
                         (Kind::PassThrough, Vec::new())
                     }
                 }
@@ -462,6 +374,7 @@ impl<'a> Walk<'a> {
             },
             _ => {
                 self.unplaced = true;
+                self.unknown = true;
                 (Kind::PassThrough, Vec::new())
             }
         };
@@ -911,6 +824,27 @@ impl Binding {
                 })
         });
         let (on, rest): (Vec<_>, Vec<_>) = asked.into_iter().partition(|(_, node)| node.in_on());
+        // one question per JOIN: its pairs are asked once
+        for (_, node) in &on {
+            let Some(written) = &node.written else {
+                continue;
+            };
+            let num_asked = on
+                .iter()
+                .filter(|(_, other)| {
+                    other
+                        .written
+                        .as_ref()
+                        .is_some_and(|found| found.clause == written.clause)
+                })
+                .count();
+            if num_asked > 1 {
+                return compile_error(format!(
+                    "JOIN {} has {num_asked} AI predicates in ON; ask one question per JOIN",
+                    written.on.as_deref().unwrap_or_default()
+                ));
+            }
+        }
         for (id, node) in on {
             self.bind_asked(walk, id, node)?;
         }

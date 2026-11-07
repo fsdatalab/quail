@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use quail::planning::PlanOutcome;
 use quail::planning::pricer_fields;
 use quail::pyarrow::to_pyarrow;
-use quail_datafusion::{bind, derive, region_sql};
+use quail_datafusion::{derive, region_sql};
 
 fn python_error(error: DataFusionError) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
@@ -91,15 +91,16 @@ impl NativeSession {
         .map_err(python_error)
     }
 
-    /// Bind each model region of a query into Quail's logical plan.
+    /// Derive each model region of a query's operators from its plan.
     ///
-    /// Returns one (plan JSON, None) or (None, CompileError message)
-    /// per region, and whether one region is the whole query.
-    /// `turn` and `layout` are the model's chat-turn text and prompt
-    /// layout.
+    /// Returns one (the region as JSON, None) or (None, CompileError
+    /// message) per region, and whether one region is the whole query.
+    /// The region's JSON holds `operators`, its operators as JSON text,
+    /// and `logical`, DataFusion's plan of the region. `turn` and
+    /// `layout` are the model's chat-turn text and prompt layout.
     #[allow(clippy::type_complexity)]
     #[pyo3(signature = (query, turn, layout, dialect=None))]
-    fn logical_plans(
+    fn region_plans(
         &self,
         py: Python<'_>,
         query: &str,
@@ -110,28 +111,21 @@ impl NativeSession {
         py.detach(|| {
             let plan = self.session.optimized_plan(query, dialect.as_deref())?;
             let whole = matches!(&plan, LogicalPlan::Extension(_));
-            let mut bound = Vec::new();
+            let mut derived = Vec::new();
             for region in self.session.regions(query, dialect.as_deref())? {
-                derive::shadow_check(&region, &turn, layout);
-                bound.push(match bind::bind_model_region(&region, &turn, layout) {
-                    Ok(found) => (
-                        Some(
-                            quail_planner::write_logical_plan(&found)
-                                .map_err(|error| DataFusionError::External(Box::new(error)))?,
-                        ),
-                        None,
-                    ),
+                derived.push(match derive::derive_region(&region, &turn, layout) {
+                    Ok((operators, plan)) => (Some(quail::region_json(&operators, &plan)?), None),
                     Err(error) => (None, Some(error.0)),
                 });
             }
-            Ok::<_, DataFusionError>((bound, whole))
+            Ok::<_, DataFusionError>((derived, whole))
         })
         .map_err(python_error)
     }
 
     /// Plan each model region of a query without running it: per region,
-    /// (kind, its logical plan as JSON or its SQL, its planned region as
-    /// JSON or None when Python plans it).
+    /// (kind, the region as JSON or its SQL, its planned region as JSON or
+    /// None when Python plans it).
     #[pyo3(signature = (query, dialect=None))]
     #[allow(clippy::type_complexity)]
     fn plans(
@@ -182,29 +176,6 @@ impl NativeSession {
     }
 }
 
-/// Start comparing each model region bound for planning with the
-/// operators derived from its optimized plan, or stop.
-#[pyfunction]
-fn set_shadow_check(enabled: bool) {
-    derive::set_shadow_check(enabled);
-}
-
-/// Return the shadow check's log so far and empty it: how many times a
-/// region was compared, how many of those the binder refused, the
-/// distinct regions compared, and each difference; None when no check
-/// is on.
-#[pyfunction]
-fn take_shadow_log() -> Option<(usize, usize, Vec<String>, Vec<String>)> {
-    derive::take_shadow_log().map(|log| {
-        (
-            log.num_comparisons,
-            log.num_refusals,
-            log.regions.into_iter().collect(),
-            log.differences,
-        )
-    })
-}
-
 /// Read a physical plan envelope into the Rust plan types and write
 /// it back as JSON.
 ///
@@ -215,29 +186,6 @@ fn read_and_write_plan(text: &str) -> PyResult<String> {
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
     quail_physical::write_plan(&plan)
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
-}
-
-/// Read a logical plan written by the Python codec into the Rust types
-/// and write it back.
-///
-/// Raises a ValueError when the plan does not fit the Rust types.
-#[pyfunction]
-fn read_and_write_logical_plan(text: &str) -> PyResult<String> {
-    let plan = quail_planner::read_logical_plan(text)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-    quail_planner::write_logical_plan(&plan)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
-}
-
-/// Check a logical plan as `LogicalPlan.validate` does: None, or the
-/// message of the CompileError it raises.
-#[pyfunction]
-fn validate_logical_plan(text: &str) -> PyResult<Option<String>> {
-    let plan = quail_planner::read_logical_plan(text)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-    Ok(quail_planner::nodes::validate_plan(&plan)
-        .err()
-        .map(|error| error.0))
 }
 
 /// Bind one AI function call's prompt, as `PromptBinder.bind` does.
@@ -273,32 +221,25 @@ fn bind_prompt(
     }
 }
 
-/// The placements of a plan's column operators that physical planning
-/// prices, as `quail_planner::rules::column_placements` returns them.
+/// The placements of a region's column operators that physical planning
+/// prices, as `quail_planner::placements::placements` returns them.
 ///
-/// Returns ([(plan JSON, rewrite names), ...], None), or ([], the
-/// CompileError's message).
+/// Returns [(operators JSON, rewrite names), ...].
 #[pyfunction]
-#[allow(clippy::type_complexity)]
-fn column_placements(plan: &str) -> PyResult<(Vec<(String, Vec<String>)>, Option<String>)> {
+fn column_placements(operators: &str) -> PyResult<Vec<(String, Vec<String>)>> {
     let invalid =
         |error: serde_json::Error| pyo3::exceptions::PyValueError::new_err(error.to_string());
-    let plan = quail_planner::read_logical_plan(plan).map_err(invalid)?;
-    match quail_planner::rules::column_placements(plan) {
-        Ok(found) => Ok((
-            found
-                .into_iter()
-                .map(|alternative| {
-                    Ok((
-                        quail_planner::write_logical_plan(&alternative.plan).map_err(invalid)?,
-                        alternative.rules,
-                    ))
-                })
-                .collect::<PyResult<Vec<_>>>()?,
-            None,
-        )),
-        Err(error) => Ok((Vec::new(), Some(error.0))),
-    }
+    let found: quail_planner::operators::Operators =
+        serde_json::from_str(operators).map_err(invalid)?;
+    quail_planner::placements::placements(&found)
+        .into_iter()
+        .map(|alternative| {
+            Ok((
+                serde_json::to_string(&alternative.operators).map_err(invalid)?,
+                alternative.rules,
+            ))
+        })
+        .collect()
 }
 
 /// A Rust tokenizer that calls a Python callable text -> token ids.
@@ -439,7 +380,7 @@ struct ContextFields {
     gpus: i64,
     canvas_draws: i64,
     document_tokens: std::collections::BTreeMap<String, Vec<i64>>,
-    plan: Option<serde_json::Value>,
+    operators: Option<serde_json::Value>,
     attention: Option<String>,
     #[serde(default)]
     pair_fractions: std::collections::BTreeMap<String, f64>,
@@ -509,10 +450,9 @@ fn plan_operator<'py>(
         scan_fractions: fields.scan_fractions,
         order: fields.order,
         operators: fields
-            .plan
-            .map(json_value::<quail_planner::LogicalPlan>)
-            .transpose()?
-            .map(|plan| quail_planner::operators::operators(&plan)),
+            .operators
+            .map(json_value::<quail_planner::operators::Operators>)
+            .transpose()?,
         first_documents: fields.first_documents,
         page_shared: fields.page_shared,
         reader_groups: fields.reader_groups,
@@ -528,7 +468,7 @@ fn plan_operator<'py>(
                     "the speed of light estimate needs its oracles",
                 ));
             };
-            let plan: quail_planner::LogicalPlan = json_value(get("plan"))?;
+            let found: quail_planner::operators::Operators = json_value(get("operators"))?;
             let inputs: quail_planner::sol::EstimateInputs = json_value(get("inputs"))?;
             let failed =
                 |error: PyErr| quail_planner::CompileError::new(error.value(py).to_string());
@@ -578,10 +518,7 @@ fn plan_operator<'py>(
                 subset_shared: &subset_shared,
             };
             lowering_result(quail_planner::sol::speed_of_light_estimate(
-                &quail_planner::operators::operators(&plan),
-                &context,
-                inputs,
-                &oracles,
+                &found, &context, inputs, &oracles,
             ))
         }
         "price" => {
@@ -614,13 +551,8 @@ fn plan_operator<'py>(
             lowering_result(edited)
         }
         "search_plan" => {
-            let alternatives: Vec<(quail_planner::LogicalPlan, Vec<String>)> =
-                json_value(get("alternatives"))?;
             let alternatives: Vec<(quail_planner::operators::Operators, Vec<String>)> =
-                alternatives
-                    .into_iter()
-                    .map(|(plan, rules)| (quail_planner::operators::operators(&plan), rules))
-                    .collect();
+                json_value(get("alternatives"))?;
             let rules: Vec<String> = json_value(get("rules"))?;
             lowering_result(
                 quail_planner::optimize::search_plan(&alternatives, &context, &rules).map(
@@ -1005,38 +937,37 @@ fn edit_graph(graph: &str, edit: &str) -> PyResult<(Option<String>, Option<Strin
     })
 }
 
-/// A logical plan's facts as JSON, as `quail_planner::facts::region_facts`
-/// reads them.
+/// A region's facts as JSON, as `quail_planner::facts::region_facts`
+/// reads them from its operators, given as JSON.
 #[pyfunction]
-fn region_facts(logical: &str) -> PyResult<String> {
-    let plan = quail_planner::read_logical_plan(logical)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-    Ok(quail_planner::facts::region_facts(&quail_planner::operators::operators(&plan)).to_string())
+fn region_facts(operators: &str) -> PyResult<String> {
+    Ok(quail_planner::facts::region_facts(&read_operators(operators)?).to_string())
 }
 
-/// A logical plan, as JSON, that returns at most `fetch` rows.
+/// A region's operators, as JSON, that return at most `fetch` rows.
 #[pyfunction]
-fn limited_plan(logical: &str, fetch: i64) -> PyResult<String> {
-    let mut plan = quail_planner::read_logical_plan(logical)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-    plan.root = quail_planner::logical::with_limit(plan.root, fetch);
-    quail_planner::write_logical_plan(&plan)
+fn limited_operators(operators: &str, fetch: i64) -> PyResult<String> {
+    serde_json::to_string(&read_operators(operators)?.limited(fetch))
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
 }
 
-/// A region's logical plan, its tables' rows, and the settings, read
-/// from what Python passes the planner.
+fn read_operators(operators: &str) -> PyResult<quail_planner::operators::Operators> {
+    serde_json::from_str(operators)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+/// A region's operators, its tables' rows, and the settings, read from
+/// what Python passes the planner.
 fn planning_inputs(
-    logical: &str,
+    operators: &str,
     tables: &Bound<'_, pyo3::types::PyDict>,
     settings: &str,
 ) -> PyResult<(
-    quail_planner::LogicalPlan,
+    quail_planner::operators::Operators,
     std::collections::HashMap<String, quail::planning::TableRows>,
     quail::planning::Settings,
 )> {
-    let logical = quail_planner::read_logical_plan(logical)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    let operators = read_operators(operators)?;
     let settings: quail::planning::Settings = from_json(settings)?;
     let mut rows = std::collections::HashMap::new();
     for (name, entry) in tables.iter() {
@@ -1055,7 +986,7 @@ fn planning_inputs(
             },
         );
     }
-    Ok((logical, rows, settings))
+    Ok((operators, rows, settings))
 }
 
 /// Plans model regions in Rust for one session, with the session's
@@ -1087,12 +1018,12 @@ impl NativePlanner {
     fn prepare(
         &self,
         py: Python<'_>,
-        logical: &str,
+        operators: &str,
         tables: &Bound<'_, pyo3::types::PyDict>,
         settings: &str,
     ) -> PyResult<(Option<String>, Option<String>)> {
-        let (logical, rows, settings) = planning_inputs(logical, tables, settings)?;
-        let prepared = match py.detach(|| self.planner.prepare(logical, &rows, &settings)) {
+        let (operators, rows, settings) = planning_inputs(operators, tables, settings)?;
+        let prepared = match py.detach(|| self.planner.prepare(&operators, &rows, &settings)) {
             Ok(prepared) => prepared,
             Err(error) => return Ok((None, Some(error.0))),
         };
@@ -1101,24 +1032,24 @@ impl NativePlanner {
         Ok((Some(found.to_string()), None))
     }
 
-    /// Plan a region's logical plan, as JSON, over `tables`: by provider
+    /// Plan a region's operators, as JSON, over `tables`: by provider
     /// name, (content identity or None, the rows as a pyarrow Table).
     /// `settings` is the configuration as JSON.
     ///
     /// Returns (the plan as JSON, None) or (None, a CompileError's
     /// message). The plan holds the envelope, estimates, pricer, the
-    /// chosen logical plan, the context fields, and each scan's files,
-    /// or the refusal. A request backend's plan, or that of a region that
-    /// asks no model, holds the envelope, the logical plan, and the scans.
+    /// chosen operators, the context fields, and each scan's files, or
+    /// the refusal. A request backend's plan holds the envelope, the
+    /// operators, and the scans.
     fn plan(
         &self,
         py: Python<'_>,
-        logical: &str,
+        operators: &str,
         tables: &Bound<'_, pyo3::types::PyDict>,
         settings: &str,
     ) -> PyResult<(Option<String>, Option<String>)> {
-        let (logical, rows, settings) = planning_inputs(logical, tables, settings)?;
-        let found = py.detach(|| self.planner.plan(logical, &rows, &settings));
+        let (operators, rows, settings) = planning_inputs(operators, tables, settings)?;
+        let found = py.detach(|| self.planner.plan(&operators, &rows, &settings));
         let found = match found {
             Ok(PlanOutcome::Planned(planned)) => quail::planning::planned_json(&planned)
                 .map_err(|error| PyRuntimeError::new_err(error.0))?,
@@ -1143,11 +1074,7 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(prompt_layout, module)?)?;
     module.add_function(wrap_pyfunction!(read_specs, module)?)?;
     module.add("SHARED_PRE", quail_planner::prompts::SHARED_PRE)?;
-    module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
-    module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;
-    module.add_function(wrap_pyfunction!(set_shadow_check, module)?)?;
-    module.add_function(wrap_pyfunction!(take_shadow_log, module)?)?;
     module.add_function(wrap_pyfunction!(column_placements, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
@@ -1155,7 +1082,7 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(collect_answers, module)?)?;
     module.add_function(wrap_pyfunction!(edit_graph, module)?)?;
     module.add_function(wrap_pyfunction!(region_facts, module)?)?;
-    module.add_function(wrap_pyfunction!(limited_plan, module)?)?;
+    module.add_function(wrap_pyfunction!(limited_operators, module)?)?;
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
     module.add_function(wrap_pyfunction!(prefix_statistics, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)

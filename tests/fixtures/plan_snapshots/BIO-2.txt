@@ -1,11 +1,11 @@
 logical:
-  Project: r.id, m.id
-    SemanticJoin (full)
-      PROMPT('Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?', r.report, m.term) (selectivity=3.4%)
-      Join
-        cross
-        Scan reports as r [report, id]
-        Scan terms as m [term, id]
+  Projection: r.id, m.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?"), r.report, m.term), named_struct(Utf8("selectivity"), Float64(0.03397338065661047))), filter: __quail_answer_1, returns: []
+      Cross Join:
+        SubqueryAlias: r
+          TableScan: reports projection=[id, report]
+        SubqueryAlias: m
+          TableScan: terms projection=[id, term]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

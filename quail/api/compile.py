@@ -1,9 +1,10 @@
-"""Compile SQL with DataFusion and Quail's Rust binder.
+"""Compile SQL with DataFusion and Quail's rules.
 
 DataFusion parses and binds the statement, Quail's analyzer rule claims
-its model region, and the Rust binder reads the region into Quail's
-logical plan. A CTE or FROM subquery the binder does not merge is its
-own region, whose rows the reading region takes as an input.
+its model region, and Rust derives the region's operators from
+DataFusion's plan of it. A CTE or FROM subquery the region does not
+read through is its own region, whose rows the reading region takes as
+an input.
 """
 
 from __future__ import annotations
@@ -21,8 +22,8 @@ class SQLDialect(StrEnum):
     BQ = "bq"
 
 
-# the end of a refusal of a region shape the binder does not read; such
-# a region reaches Quail as SQL text
+# the end of a refusal of a region shape Quail's operators do not read;
+# such a region reaches Quail as SQL text
 READ_AS_SQL = "is outside what Quail binds from DataFusion"
 
 # a dialect -> DataFusion's name for it

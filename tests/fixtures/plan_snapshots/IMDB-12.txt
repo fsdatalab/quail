@@ -1,10 +1,15 @@
 logical:
-  Project: r.id, genre
-    SemanticClassify: genre
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above which genre best describes the movie it reviews.', r.body) labels=['action', 'adventure', 'animation', 'biography', 'comedy', 'crime', 'documentary', 'drama', 'family', 'fantasy', 'history', 'horror', 'music', 'musical', 'mystery', 'romance', 'sci-fi', 'sport', 'thriller', 'war', 'western']
-      SemanticFilter
-        PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above whether it mentions at least one positive aspect of the movie.\n\nInstruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body) (selectivity=80.1%)
-        Scan reviews as r [body, id]
+  Projection: r.id, genre
+    AiNode: genre = ai_classify(prompt(Utf8("Judge strictly from the review above which genre best describes the movie it reviews.
+  
+  {0}"), r.body), make_array(Utf8("action"), Utf8("adventure"), Utf8("animation"), Utf8("biography"), Utf8("comedy"), Utf8("crime"), Utf8("documentary"), Utf8("drama"), Utf8("family"), Utf8("fantasy"), Utf8("history"), Utf8("horror"), Utf8("music"), Utf8("musical"), Utf8("mystery"), Utf8("romance"), Utf8("sci-fi"), Utf8("sport"), Utf8("thriller"), Utf8("war"), Utf8("western")))
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the review above whether it mentions at least one positive aspect of the movie.
+  
+  {0}
+  
+  Instruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise."), r.body), named_struct(Utf8("selectivity"), Float64(0.8008))), filter: __quail_answer_1, returns: []
+        SubqueryAlias: r
+          TableScan: reviews projection=[id, body]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

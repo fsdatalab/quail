@@ -11,10 +11,9 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int32Array, RecordBatch};
 use arrow::compute::{cast, filter_record_batch, is_not_null, take};
 use arrow::datatypes::{DataType, Int32Type};
-use quail_planner::LogicalPlan;
 use quail_planner::expressions::call_aliases;
 use quail_planner::nodes::asked_call;
-use quail_planner::operators::operators;
+use quail_planner::operators::Operators;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -42,8 +41,8 @@ pub struct OutputPort {
 /// What [`collect_answers`] reads besides the output relations.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnswerRequest {
-    /// The region's logical plan, as JSON.
-    pub logical: String,
+    /// The region's operators, as JSON.
+    pub operators: String,
     /// Every output port, in the graph's topological order.
     pub ports: Vec<OutputPort>,
     /// alias -> the number of documents its scan read.
@@ -100,9 +99,8 @@ pub fn collect_answers(
     request: &AnswerRequest,
     outputs: &HashMap<(String, String), RecordBatch>,
 ) -> Result<Answers, Error> {
-    let logical: LogicalPlan =
-        quail_planner::read_logical_plan(&request.logical).map_err(|error| error.to_string())?;
-    let found = operators(&logical);
+    let found: Operators =
+        serde_json::from_str(&request.operators).map_err(|error| error.to_string())?;
     // alias -> its AI.IF predicates' selectivities, then its column tests'
     let mut filters: Vec<(String, Vec<Option<f64>>)> = Vec::new();
     for (alias, predicates) in &found.filters {

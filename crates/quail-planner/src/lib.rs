@@ -38,6 +38,7 @@ pub mod nodes;
 pub mod operators;
 pub mod optimize;
 pub mod physical_rules;
+pub mod placements;
 pub mod plan_statistics;
 pub mod pricing;
 pub mod prompts;
@@ -53,4 +54,4 @@ pub mod statistics;
 pub mod validation;
 
 pub use expressions::CompileError;
-pub use logical::{LogicalNode, LogicalPlan, read_logical_plan, write_logical_plan};
+pub use logical::{LogicalNode, LogicalPlan};

@@ -65,13 +65,13 @@ def source_rows(catalog, name: str, table) -> pa.Array | None:
     return pc.index_in(table.column(id_col), value_set=ids).cast(pa.int32())
 
 
-def region_query(session, logical: str, *, tables: dict | None = None,
+def region_query(session, operators: str, *, tables: dict | None = None,
                  keep_order: bool = False, **options):
     """Return the RegionQuery for a model region, over its input tables.
 
     Args:
         session: The session whose tables and model the region uses.
-        logical: The region's logical plan, as Rust's JSON.
+        operators: The region's operators, as Rust's JSON.
         tables: Each input's rows as a pyarrow Table, by name, or None
             to plan before the inputs exist.
         keep_order: Read each input in the order given, as a plan Rust
@@ -83,10 +83,10 @@ def region_query(session, logical: str, *, tables: dict | None = None,
     """
     from quail.api.query import RegionQuery
 
-    scans = input_scans(json.loads(_quail_native.region_facts(logical)),
+    scans = input_scans(json.loads(_quail_native.region_facts(operators)),
                         session.catalog)
     if not scans:
-        return RegionQuery(session, logical, **options)
+        return RegionQuery(session, operators, **options)
     providers = dict(session.catalog.providers)
     assumed = {}
     rows, identities = {}, {}
@@ -112,7 +112,7 @@ def region_query(session, logical: str, *, tables: dict | None = None,
         providers[name] = MemoryTableProvider(table, id_col="",
                                               identity=f"input:{name}")
     catalog = Catalog(providers)
-    query = RegionQuery(session, logical, catalog=catalog, assumed_rows=assumed,
+    query = RegionQuery(session, operators, catalog=catalog, assumed_rows=assumed,
                         **options)
     query.source_rows = rows
     query.input_identities = identities

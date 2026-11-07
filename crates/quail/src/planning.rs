@@ -1,7 +1,7 @@
 //! Plan a model region in Rust: tokenize the documents it reads, measure
 //! them, and search its physical plans.
 //!
-//! [`Planner::plan`] takes a region's logical plan and the rows of each
+//! [`Planner::plan`] takes a region's operators and the rows of each
 //! table it scans. For each scan it writes a token store of the document
 //! column and a column file of each value column the executor reads, in
 //! the files Python's `TokenStore` and `ColumnStore` open. It computes
@@ -21,11 +21,12 @@ use arrow::ipc::writer::FileWriter;
 use arrow::row::{RowConverter, SortField};
 use quail_inputs::{HfTokenizer, PrefixIndex, TokenStore, TokenStoreWriter, last_tokens};
 use quail_physical::ValueExpression;
-use quail_planner::LogicalPlan;
 use quail_planner::context::PlanningContext;
 use quail_planner::expressions::{CompileError, Refusal};
 use quail_planner::logical::{Scan, ScanColumn};
+use quail_planner::operators::Operators;
 use quail_planner::optimize::Selected;
+use quail_planner::placements::{Alternative, placements};
 
 /// Rows the planner samples to estimate how many pairs a join's
 /// equalities keep.
@@ -77,11 +78,11 @@ pub struct ScanFiles {
     pub columns: Vec<(String, PathBuf)>,
 }
 
-/// A region's selected physical plan, the logical plan it lowers, the
+/// A region's selected physical plan, the operators it lowers, the
 /// context it was planned in, and the files its scans read.
 pub struct Planned {
     pub selected: Selected,
-    pub logical: LogicalPlan,
+    pub operators: Operators,
     /// The planning context's fields, as Python's planner reads them, to
     /// price an edited plan the same way.
     pub fields: serde_json::Value,
@@ -102,7 +103,7 @@ pub enum PlanOutcome {
 /// A region's column placements, its scans' files, and the planning
 /// context's fields, before a backend lowers it.
 pub struct Prepared {
-    pub alternatives: Vec<quail_planner::rules::LogicalAlternative>,
+    pub alternatives: Vec<Alternative>,
     /// The planning context's fields, as Python's planner reads them.
     pub fields: serde_json::Value,
     pub scans: Vec<ScanFiles>,
@@ -178,27 +179,31 @@ impl Planner {
         self.directory.path().join(format!("{kind}-{number}.arrow"))
     }
 
-    /// Place the column operators of `logical`, write each scan's token
+    /// Place the column operators of `found`, write each scan's token
     /// store and column files from `tables`, and measure them: what every
     /// backend plans from.
     ///
     /// # Errors
     ///
-    /// A scanned table is missing, a document is an expression or not
-    /// text, or a placement is not valid.
+    /// A scanned table is missing, or a document is an expression or not
+    /// text.
     pub fn prepare(
         &self,
-        logical: LogicalPlan,
+        found: &Operators,
         tables: &HashMap<String, TableRows>,
         settings: &Settings,
     ) -> Result<Prepared, CompileError> {
-        let alternatives = quail_planner::rules::column_placements(logical.clone())?;
-        let scans = scans_of(alternatives.iter().map(|alternative| &alternative.plan));
+        let alternatives = placements(found);
+        let scans = scans_of(
+            alternatives
+                .iter()
+                .map(|alternative| &alternative.operators),
+        );
         // AI.EXTRACT places its answers in its documents' text by the
         // character range of each token
         let extracted: Vec<String> = alternatives
             .iter()
-            .flat_map(|alternative| quail_planner::operators::operators(&alternative.plan).extracts)
+            .flat_map(|alternative| &alternative.operators.extracts)
             .flat_map(|extract| quail_planner::expressions::call_aliases(&extract.call))
             .collect();
         if scans.iter().any(|scan| match &scan.column {
@@ -266,14 +271,14 @@ impl Planner {
                 last_tokens(&documents).into_iter().map(i64::from).collect(),
             );
         }
-        let pair_fractions = pair_fractions(&logical, &scans, tables)?;
+        let pair_fractions = pair_fractions(found, &scans, tables)?;
         let fields = serde_json::json!({
             "model": settings.model,
             "device": settings.device,
             "gpus": settings.gpus,
             "canvas_draws": settings.canvas_draws,
             "document_tokens": document_tokens,
-            "plan": serde_json::Value::Null,
+            "operators": serde_json::Value::Null,
             "attention": settings.attention,
             "order": settings.order,
             "pair_fractions": pair_fractions
@@ -302,8 +307,8 @@ impl Planner {
         })
     }
 
-    /// Plan `logical` over `tables`, each scanned table's rows by
-    /// provider name, for `settings`.
+    /// Plan `found` over `tables`, each scanned table's rows by provider
+    /// name, for `settings`.
     ///
     /// Returns the plan, or the refusal of every alternative.
     ///
@@ -313,7 +318,7 @@ impl Planner {
     /// planning fails.
     pub fn plan(
         &self,
-        logical: LogicalPlan,
+        found: &Operators,
         tables: &HashMap<String, TableRows>,
         settings: &Settings,
     ) -> Result<PlanOutcome, CompileError> {
@@ -322,7 +327,7 @@ impl Planner {
             fields,
             scans: files,
             measured,
-        } = self.prepare(logical, tables, settings)?;
+        } = self.prepare(found, tables, settings)?;
         let Measured {
             document_tokens,
             first_documents,
@@ -366,20 +371,15 @@ impl Planner {
         if let Some(request) = &settings.request {
             return request_outcome(&alternatives, &context, request, &files);
         }
-        let operators: Vec<(quail_planner::operators::Operators, Vec<String>)> = alternatives
+        let operators: Vec<(Operators, Vec<String>)> = alternatives
             .iter()
-            .map(|alternative| {
-                (
-                    quail_planner::operators::operators(&alternative.plan),
-                    alternative.rules.clone(),
-                )
-            })
+            .map(|alternative| (alternative.operators.clone(), alternative.rules.clone()))
             .collect();
-        let found =
+        let searched =
             quail_planner::optimize::search_plan(&operators, &context, &settings.physical_rules)?;
-        Ok(match found {
+        Ok(match searched {
             Ok(selected) => PlanOutcome::Planned(Box::new(Planned {
-                logical: alternatives[selected.alternative].plan.clone(),
+                operators: alternatives[selected.alternative].operators.clone(),
                 selected,
                 fields,
                 scans: files,
@@ -470,10 +470,10 @@ impl Planner {
 }
 
 /// Each alias's scan, with the value columns any alternative reads.
-fn scans_of<'a>(plans: impl Iterator<Item = &'a LogicalPlan>) -> Vec<Scan> {
+fn scans_of<'a>(alternatives: impl Iterator<Item = &'a Operators>) -> Vec<Scan> {
     let mut found: Vec<Scan> = Vec::new();
-    for plan in plans {
-        for scan in quail_planner::operators::operators(plan).scans {
+    for operators in alternatives {
+        for scan in operators.scans.iter().cloned() {
             match found.iter_mut().find(|known| known.alias == scan.alias) {
                 Some(known) => {
                     for column in scan.columns {
@@ -528,13 +528,12 @@ fn document_texts(column: &ScanColumn, batch: &RecordBatch) -> Result<StringArra
 /// The fraction of each join's cross product its equalities keep,
 /// estimated from the first rows of each side, by join position.
 fn pair_fractions(
-    logical: &LogicalPlan,
+    found: &Operators,
     scans: &[Scan],
     tables: &HashMap<String, TableRows>,
 ) -> Result<BTreeMap<usize, f64>, CompileError> {
     let mut fractions = BTreeMap::new();
-    let operators = quail_planner::operators::operators(logical);
-    for (position, join) in operators.joins.iter().enumerate() {
+    for (position, join) in found.joins.iter().enumerate() {
         let conditions = &join.on;
         let Some(first) = conditions.first() else {
             continue;
@@ -699,7 +698,7 @@ pub fn pricer_fields(pricer: &quail_planner::pricing::PlanPricer) -> serde_json:
 /// plan, so ties go to the earlier alternative. The plan's settings list
 /// every alternative's outcome under `candidates`.
 fn request_outcome(
-    alternatives: &[quail_planner::rules::LogicalAlternative],
+    alternatives: &[Alternative],
     context: &PlanningContext,
     request: &quail_planner::request_plan::RequestSettings,
     files: &[ScanFiles],
@@ -707,7 +706,7 @@ fn request_outcome(
     let mut found = Vec::new();
     for alternative in alternatives {
         found.push(quail_planner::request_plan::request_plan(
-            &quail_planner::operators::operators(&alternative.plan),
+            &alternative.operators,
             context,
             request,
         )?);
@@ -741,23 +740,32 @@ fn request_outcome(
     });
     Ok(PlanOutcome::Fixed(fixed_json(
         envelope,
-        &alternatives[selected].plan,
+        &alternatives[selected].operators,
         files,
     )?))
 }
 
-/// A plan nothing prices as JSON: its envelope, the logical plan it
+/// A plan nothing prices as JSON: its envelope, the operators it
 /// lowers, and each scan's files.
 fn fixed_json(
     envelope: serde_json::Value,
-    logical: &LogicalPlan,
+    found: &Operators,
     files: &[ScanFiles],
 ) -> Result<serde_json::Value, CompileError> {
     Ok(serde_json::json!({
         "envelope": envelope, "estimated_seconds": 0.0,
-        "logical": quail_planner::write_logical_plan(logical).map_err(arrow_error)?,
+        "operators": operators_json(found)?,
         "scans": scans_json(files),
     }))
+}
+
+/// Operators as JSON text, as Python passes them back to Rust.
+///
+/// # Errors
+///
+/// The operators do not write.
+pub fn operators_json(found: &Operators) -> Result<String, CompileError> {
+    serde_json::to_string(found).map_err(arrow_error)
 }
 
 /// Each scan's files as JSON, by alias.
@@ -774,19 +782,19 @@ fn scans_json(scans: &[ScanFiles]) -> serde_json::Value {
         .into()
 }
 
-/// A prepared region as JSON: each column placement's logical plan and
+/// A prepared region as JSON: each column placement's operators and
 /// rules, the context fields, and each scan's files.
 ///
 /// # Errors
 ///
-/// A logical plan does not write.
+/// The operators do not write.
 pub fn prepared_json(prepared: &Prepared) -> Result<serde_json::Value, CompileError> {
     let alternatives = prepared
         .alternatives
         .iter()
         .map(|alternative| {
             Ok(serde_json::json!([
-                quail_planner::write_logical_plan(&alternative.plan).map_err(arrow_error)?,
+                operators_json(&alternative.operators)?,
                 alternative.rules,
             ]))
         })
@@ -815,11 +823,11 @@ pub fn refused_json(refused: &Refused) -> serde_json::Value {
 }
 
 /// A planned region as JSON: the plan's envelope, estimates, and pricer,
-/// the chosen logical plan, the context fields, and each scan's files.
+/// the chosen operators, the context fields, and each scan's files.
 ///
 /// # Errors
 ///
-/// The logical plan does not write.
+/// The operators do not write.
 pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError> {
     let scans = scans_json(&planned.scans);
     let plan = &planned.selected.plan;
@@ -829,7 +837,7 @@ pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError
         "estimates": plan.estimates,
         "alternative": planned.selected.alternative,
         "pricer": pricer_fields(&plan.pricer),
-        "logical": quail_planner::write_logical_plan(&planned.logical).map_err(arrow_error)?,
+        "operators": operators_json(&planned.operators)?,
         "fields": planned.fields,
         "scans": scans,
     }))

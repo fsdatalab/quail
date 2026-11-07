@@ -1,11 +1,11 @@
 logical:
-  Project: c.id, e.id
-    SemanticJoin (full)
-      PROMPT('Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?', c.claim, e.text) (selectivity=0.217%)
-      Join
-        cross
-        Scan claims as c [claim, id]
-        Scan evidence as e [text, id]
+  Projection: c.id, e.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c.claim, e.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), filter: __quail_answer_1, returns: []
+      Cross Join:
+        SubqueryAlias: c
+          TableScan: claims projection=[id, claim]
+        SubqueryAlias: e
+          TableScan: evidence projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

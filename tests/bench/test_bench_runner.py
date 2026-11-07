@@ -3,8 +3,8 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.logical import nodes, read_plan
 from helpers.oracle import Oracle, oracle_executor, question_text
+from helpers.planning import operators_of
 from helpers.sessions import TOKENIZER, encoder
 
 import quail
@@ -169,26 +169,27 @@ def test_relational_plans_build_and_run(tmp_path):
         assert "Aggregate: groupBy=[[t.trajectory_id]]" in explained
         assert "Filter: count(Int64(1)) >= Int64(2)" in explained
         assert "fetch=50" in explained
-        assert nodes(grouped.logical, "Scan")
+        assert operators_of(grouped).scans
         # the plain tests run in DataFusion, before the model reads a row
         tested = build_query(sess, get_query("REL-AGENT-1"))
-        (scan,) = nodes(tested.logical, "Scan")
+        (scan,) = operators_of(tested).scans
         assert scan.predicates == ()
         explained = tested.explain()
         assert "turn_index >= Int64(10)" in explained
         assert "token_count <= Int64(6000)" in explained
-        paged = read_plan(build_query(sess, get_query("REL-AGENT-2")).logical).root
+        paged = operators_of(build_query(sess, get_query("REL-AGENT-2"))).result
         assert (paged.limit, paged.offset) == (10, 10)
-        top = read_plan(build_query(sess, get_query("REL-AGENT-4")).logical).root
-        assert [column.name for column in top.input.columns
+        top = operators_of(build_query(sess, get_query("REL-AGENT-4")))
+        assert [column.name for column in top.projection.columns
                 if hasattr(column, "name")] == ["recovered_score"]
-        assert top.order[0].name == "recovered_score" and top.limit == 20
+        assert top.result.order[0].name == "recovered_score"
+        assert top.result.limit == 20
         # an aggregate with no measures is a DISTINCT, which the filter
         # stops per trajectory
         query = build_query(sess, get_query("REL-AGENT-3"))
-        distinct = read_plan(query.logical).root
-        assert distinct.distinct and [
-            column.column for column in distinct.input.columns
+        distinct = operators_of(query)
+        assert distinct.result.distinct and [
+            column.column for column in distinct.projection.columns
         ] == ["trajectory_id"]
         assert "stop per key: trajectory_id" in query.explain()
 

@@ -4,9 +4,8 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.logical import nodes, read_plan
 from helpers.oracle import Oracle, finish
-from helpers.planning import compile_sql
+from helpers.planning import compile_sql, read_operators
 from helpers.sessions import TOKENIZER
 
 import quail
@@ -97,18 +96,17 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
         assert score.spec.query_template == query_text, template
     session.close()
 
-    plan = compile_sql(
+    found = read_operators(compile_sql(
         "SELECT q.id, d.id FROM queries q JOIN documents d ON "
         "0.8 > AI.SCORE(PROMPT('Is {1} relevant to {0}', q.text, d.body)) "
         "WHERE 0.5 <= AI.SCORE(PROMPT('Refund? {0}', d.body))",
         catalog,
-    )
-    join = read_plan(plan).root.input
-    assert join.kind == "SemanticJoin"
+    ))
+    (join,) = found.joins
     assert (join.predicate.comparison, join.predicate.value) == ("<", 0.8)
     assert join.predicate.expression.aliases() == ("q", "d")
-    (semantic_filter,) = nodes(plan, "SemanticFilter")
-    (predicate,) = semantic_filter.predicates
+    ((alias, (predicate,)),) = found.filters
+    assert alias == "d"
     expression = predicate.expression
     assert (expression.comparison, expression.value) == (">=", 0.5)
 

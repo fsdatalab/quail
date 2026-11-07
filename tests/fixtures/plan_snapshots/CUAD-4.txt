@@ -1,9 +1,8 @@
 logical:
-  Project: c.id, contract.parties
-    contract = struct(contract.parties)
-    SemanticExtract: contract.parties, contract.parties_span
-      question='The two or more parties who signed the contract'
-      Scan contracts as c [text, id]
+  Projection: c.id, contract, contract_span
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("parties"), Utf8("The two or more parties who signed the contract")))
+      SubqueryAlias: c
+        TableScan: contracts projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

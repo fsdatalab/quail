@@ -1,6 +1,5 @@
-//! The built-in logical rules and the loop that applies them, as
-//! `quail/planner/rules/logical.py`, `tree_transforms.py`, and
-//! `quail/planner/optimizer/tree_rewrites.py` define them.
+//! The columns an operator's expressions read, and the projection of a
+//! bound plan's scans to the column values the plan reads.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,66 +8,12 @@ use quail_physical::{
     ValueExpression,
 };
 
-use crate::expressions::{CompileError, call_aliases, column_references, condition_aliases, tests};
-use crate::logical::{Filter, LogicalNode, LogicalPlan, Scan};
+use crate::expressions::{column_references, tests};
+use crate::logical::{LogicalNode, LogicalPlan, Scan};
 use crate::nodes::{
-    above_projection, added_columns, as_column, asked_call, children, column_alias, column_call,
-    input, output_schema, source_columns, subtree, validate_plan,
+    added_columns, as_column, children, column_alias, column_call, output_schema, source_columns,
+    subtree,
 };
-
-/// Lifting stops after this many passes over the candidates.
-pub const MAX_PASSES: usize = 4;
-
-/// The name shown for a candidate whose column operators run above a join.
-pub const LIFT: &str = "should_lift_column_operators";
-
-/// A logical plan and the rewrites that produced it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LogicalAlternative {
-    pub plan: LogicalPlan,
-    pub rules: Vec<String>,
-}
-
-/// The placements of a plan's column operators that physical planning
-/// prices: the plan as bound, then each plan with a classification,
-/// extraction, or map moved above a join, each scan loading the columns
-/// its plan reads.
-///
-/// # Errors
-///
-/// A moved plan is not valid.
-pub fn column_placements(plan: LogicalPlan) -> Result<Vec<LogicalAlternative>, CompileError> {
-    let mut candidates = vec![LogicalAlternative {
-        plan,
-        rules: Vec::new(),
-    }];
-    for _ in 0..MAX_PASSES {
-        let mut added: Vec<LogicalAlternative> = Vec::new();
-        for candidate in &candidates {
-            let Some(lifted) = lift_column_operators(&candidate.plan.root) else {
-                continue;
-            };
-            let root = push_down_projection(&lifted);
-            if candidates
-                .iter()
-                .chain(&added)
-                .any(|other| other.plan.root == root)
-            {
-                continue;
-            }
-            let plan = LogicalPlan { root };
-            validate_plan(&plan)?;
-            let mut rules = candidate.rules.clone();
-            rules.push(LIFT.to_string());
-            added.push(LogicalAlternative { plan, rules });
-        }
-        if added.is_empty() {
-            break;
-        }
-        candidates.extend(added);
-    }
-    Ok(candidates)
-}
 
 // ---------------------------------------------------------------- tree editing
 
@@ -108,17 +53,6 @@ fn input_mut(node: &mut LogicalNode) -> &mut LogicalNode {
         | LogicalNode::SemanticSaeFeatures(found) => &mut found.input,
         LogicalNode::Scan(_) | LogicalNode::Join(_) => panic!("the node has no single input"),
     }
-}
-
-/// A Filter's one table, as `Filter.alias`.
-fn filter_alias(filter: &Filter) -> String {
-    let aliases = condition_aliases(&filter.condition);
-    assert_eq!(
-        aliases.len(),
-        1,
-        "a Filter below the Project reads one table"
-    );
-    aliases[0].clone()
 }
 
 // ---------------------------------------------------------------- columns read
@@ -330,124 +264,4 @@ pub fn push_down_projection(root: &LogicalNode) -> LogicalNode {
     }
 
     descend(root, &BTreeMap::new(), &valued)
-}
-
-// ---------------------------------------------------------------- lifting
-
-/// alias -> the column operators and Filters lifted from its sequence.
-type Sequences = Vec<(String, Vec<LogicalNode>)>;
-
-fn extend_sequence(sequences: &mut Sequences, alias: String, nodes: Vec<LogicalNode>) {
-    match sequences.iter_mut().find(|(found, _)| *found == alias) {
-        Some((_, found)) => found.extend(nodes),
-        None => sequences.push((alias, nodes)),
-    }
-}
-
-fn sequence_alias(node: &LogicalNode) -> String {
-    match node {
-        LogicalNode::Filter(filter) => filter_alias(filter),
-        column => column_alias(as_column(column).expect("a column operator")),
-    }
-}
-
-/// Split a table's sequence at its column operators: the node below the
-/// lowest one, and the operators and Filters, lowest first.
-fn column_sequence(node: &LogicalNode) -> (LogicalNode, Vec<LogicalNode>) {
-    let mut lifted = Vec::new();
-    let mut node = node;
-    while matches!(node, LogicalNode::Filter(_)) || as_column(node).is_some() {
-        lifted.push(node.clone());
-        node = input(node);
-    }
-    lifted.reverse();
-    (node.clone(), lifted)
-}
-
-/// Move a joined table's column operators above its joins; None when no
-/// column operator moved.
-pub fn lift_column_operators(root: &LogicalNode) -> Option<LogicalNode> {
-    let is_project_over_rows =
-        matches!(root, LogicalNode::Project(project) if above_projection(&project.input));
-    if matches!(root, LogicalNode::Result(_)) || above_projection(root) || is_project_over_rows {
-        let rewritten = lift_column_operators(input(root))?;
-        return Some(with_children(root, vec![rewritten]));
-    }
-    let nodes = subtree(root);
-    let mut fixed: BTreeSet<String> = BTreeSet::new();
-    let mut joined: BTreeSet<String> = BTreeSet::new();
-    for node in &nodes {
-        if let LogicalNode::SemanticJoin(join) = node {
-            for alias in call_aliases(asked_call(&join.predicate)) {
-                if join.semantics != "full" && Some(&alias) != join.anchor.as_ref() {
-                    fixed.insert(alias.clone());
-                }
-                joined.insert(alias);
-            }
-        }
-    }
-    let joined: BTreeSet<String> = joined.difference(&fixed).cloned().collect();
-    let mut sequences: Sequences = Vec::new();
-    let (top, lifted) = column_sequence(input(root));
-    for node in lifted {
-        let alias = sequence_alias(&node);
-        extend_sequence(&mut sequences, alias, vec![node]);
-    }
-
-    fn cut(
-        node: &LogicalNode,
-        joined: &BTreeSet<String>,
-        sequences: &mut Sequences,
-    ) -> LogicalNode {
-        let (base, sequence) = column_sequence(node);
-        if let Some(first) = sequence.first() {
-            let alias = sequence_alias(first);
-            if joined.contains(&alias) {
-                extend_sequence(sequences, alias, sequence);
-                return base;
-            }
-        }
-        node.clone()
-    }
-
-    fn visit(
-        node: &LogicalNode,
-        joined: &BTreeSet<String>,
-        sequences: &mut Sequences,
-    ) -> LogicalNode {
-        match node {
-            LogicalNode::Join(join) => {
-                let left = visit(&join.left, joined, sequences);
-                let right = cut(&join.right, joined, sequences);
-                with_children(node, vec![left, right])
-            }
-            LogicalNode::SemanticJoin(_) => {
-                let child = visit(input(node), joined, sequences);
-                with_children(node, vec![child])
-            }
-            LogicalNode::SemanticClassify(column)
-                if call_aliases(column_call(column)).len() == 2 =>
-            {
-                let child = visit(input(node), joined, sequences);
-                with_children(node, vec![child])
-            }
-            _ => cut(node, joined, sequences),
-        }
-    }
-
-    let mut spine = visit(&top, &joined, &mut sequences);
-    if sequences.is_empty() {
-        return None;
-    }
-    for scan in &nodes {
-        if let LogicalNode::Scan(scan) = scan
-            && let Some((_, found)) = sequences.iter().find(|(alias, _)| *alias == scan.alias)
-        {
-            for node in found {
-                spine = with_children(node, vec![spine]);
-            }
-        }
-    }
-    let lifted = with_children(root, vec![spine]);
-    (lifted != *root).then_some(lifted)
 }

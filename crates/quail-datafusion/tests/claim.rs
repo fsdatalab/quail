@@ -62,8 +62,7 @@ async fn optimized(context: &SessionContext, query: &str) -> Result<LogicalPlan>
     sql(context, query).await?.into_optimized_plan()
 }
 
-/// Each model region of a plan, each checked to derive the operators,
-/// or the refusal, that the binder builds for it.
+/// Each model region of a plan, each checked to derive its operators.
 fn regions(plan: &LogicalPlan) -> Vec<ModelRegion> {
     let mut found = Vec::new();
     plan.apply(|node| {
@@ -77,8 +76,9 @@ fn regions(plan: &LogicalPlan) -> Vec<ModelRegion> {
     .unwrap();
     let turn = (String::new(), String::new());
     for region in &found {
-        let difference = quail_datafusion::derive::shadow_difference(region, &turn, "ai-if");
-        assert!(difference.is_none(), "{}", difference.unwrap_or_default());
+        if let Err(error) = quail_datafusion::derive::derive_region(region, &turn, "ai-if") {
+            panic!("{}\n{}", region.plan.display_indent(), error.0);
+        }
     }
     found
 }

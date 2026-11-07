@@ -1,7 +1,8 @@
-//! Quail's logical plan, as `quail/physical/codec.py` writes it.
+//! The binder's logical plan (`quail_datafusion::bind`), and the scan
+//! that `Operators` holds.
 //!
-//! A node is written `{"type": <its Python class>, ...fields}`, with
-//! its inputs nested in its fields.
+//! No region is planned from a `LogicalPlan`: the engine derives each
+//! region's `Operators` from DataFusion's plan of it.
 
 use quail_physical::{
     Asked, Condition, Equality, ExtractStruct, FilterPredicate, Projected, SortKey,
@@ -166,35 +167,6 @@ tagged_struct! {
     LogicalPlan(LogicalPlanFields, LogicalPlanTagged) = "quail.logical.plan.LogicalPlan" {
         root: LogicalNode,
     }
-}
-
-/// A region's plan that returns at most `fetch` rows, when DataFusion
-/// passes a LIMIT above the region down to it, so the model can stop
-/// once enough rows pass.
-pub fn with_limit(root: LogicalNode, fetch: i64) -> LogicalNode {
-    match root {
-        LogicalNode::Result(mut result) => {
-            result.limit = Some(result.limit.map_or(fetch, |limit| limit.min(fetch)));
-            LogicalNode::Result(result)
-        }
-        other => LogicalNode::Result(ResultNode {
-            input: Box::new(other),
-            limit: Some(fetch),
-            order: Vec::new(),
-            offset: 0,
-            distinct: false,
-        }),
-    }
-}
-
-/// Read a logical plan from JSON.
-pub fn read_logical_plan(text: &str) -> serde_json::Result<LogicalPlan> {
-    serde_json::from_str(text)
-}
-
-/// Write a logical plan as JSON.
-pub fn write_logical_plan(plan: &LogicalPlan) -> serde_json::Result<String> {
-    serde_json::to_string(plan)
 }
 
 impl Schema {

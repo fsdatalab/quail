@@ -1,22 +1,23 @@
 logical:
-  Project: r.id, n.id, c.id
-    SemanticJoin (full)
-      PROMPT('Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?', r.report, c.term) (selectivity=3.4%)
-      Join
-        cross
-        SemanticJoin (full)
-          PROMPT('Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?', r.report, n.term) (selectivity=3.4%)
-          Join
-            cross
-            SemanticFilter
-              PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the report above whether it describes a serious or life-threatening adverse event.\n\nInstruction: answer TRUE if the report describes a serious or life-threatening adverse event, FALSE otherwise.', r.report) (selectivity=63.8%)
-              Scan reports as r [report, id]
-            SemanticFilter
-              PROMPT('DOCUMENT:\n{0}\n\nIs this reaction neurological, affecting the nervous system?', n.term) (selectivity=44.8%)
-              Scan terms as n [term, id]
-        SemanticFilter
-          PROMPT('DOCUMENT:\n{0}\n\nIs this reaction cardiovascular, affecting the heart or blood vessels?', c.term) (selectivity=35%)
-          Scan terms as c [term, id]
+  Projection: r.id, n.id, c.id
+    AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?"), r.report, c.term), named_struct(Utf8("selectivity"), Float64(0.03397338065661047))), filter: __quail_answer_2, returns: []
+      Cross Join:
+        Projection: r.id, r.report, n.id
+          AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?"), r.report, n.term), named_struct(Utf8("selectivity"), Float64(0.03397338065661047))), filter: __quail_answer_1, returns: []
+            Cross Join:
+              AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the report above whether it describes a serious or life-threatening adverse event.
+  
+  {0}
+  
+  Instruction: answer TRUE if the report describes a serious or life-threatening adverse event, FALSE otherwise."), r.report), named_struct(Utf8("selectivity"), Float64(0.638))), filter: __quail_answer_3, returns: []
+                SubqueryAlias: r
+                  TableScan: reports projection=[id, report]
+              AiNode: __quail_answer_4 = ai_filter(prompt(Utf8("Is this reaction neurological, affecting the nervous system? {0}"), n.term), named_struct(Utf8("selectivity"), Float64(0.44809228039041704))), filter: __quail_answer_4, returns: []
+                SubqueryAlias: n
+                  TableScan: terms projection=[id, term]
+        AiNode: __quail_answer_5 = ai_filter(prompt(Utf8("Is this reaction cardiovascular, affecting the heart or blood vessels? {0}"), c.term), named_struct(Utf8("selectivity"), Float64(0.34960070984915703))), filter: __quail_answer_5, returns: []
+          SubqueryAlias: c
+            TableScan: terms projection=[id, term]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

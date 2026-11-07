@@ -1,19 +1,14 @@
-"""Projection pushdown rule tests."""
+"""Each scan loads the columns its region reads, and a join's placements."""
 
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from helpers.logical import kinds, nodes, read_plan
 from helpers.planning import placements
 from helpers.sessions import TOKENIZER, _run, make_executor
 
 import quail
 from quail.api.config import EngineConfig
 from quail.physical import Recombine
-
-
-def _scans(plan):
-    return {node.alias: node for node in nodes(plan, "Scan")}
 
 
 def _session(tmp_path, tokenizer=TOKENIZER):
@@ -44,8 +39,8 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     result = _run(query, make_executor(truth))
 
     assert sorted(result.to_rows()) == [(3, "r2"), (5, "r0")]
-    scan = _scans(query.logical)["r"]
-    assert scan.columns == ("stars", "id")
+    (scan,) = query.facts()["scans"]
+    assert scan["columns"] == ["stars", "id"]
     store = query.token_inputs()["r"]
     # the projected columns, then the document, which locates answers
     assert store.projected_columns == ("stars", "id", "review")
@@ -121,19 +116,17 @@ LABELLED_JOIN_SQL = """
 """
 
 
-def test_projection_pushdown_is_the_only_rewrite_of_a_join():
+def test_a_full_join_offers_its_classification_and_test_above_the_join():
     session = _pair_session()
-    plan = session.sql(JOIN_SQL).logical
-    assert read_plan(plan).root.input.kind == "SemanticJoin"
-
-    # only the projection moves
-    candidate, = placements(plan)
+    # a join with no column operator has one placement
+    candidate, = placements(session.sql(JOIN_SQL).operators)
     assert candidate.rules == ()
-    assert read_plan(candidate.plan).root == read_plan(plan).root
 
-    labelled = session.sql(LABELLED_JOIN_SQL).logical
-    # the placement rule offers the lifted plan for a full join
-    *_, placed = placements(labelled)
-    assert kinds(placed.plan)[-4:] == [
-        "SemanticJoin", "SemanticClassify", "Filter", "Project"]
+    labelled = session.sql(LABELLED_JOIN_SQL).operators
+    written, lifted = placements(labelled)
+    assert [column.above_joins for column in written.found.classifies] == [False]
+    assert lifted.rules == ("should_lift_column_operators",)
+    assert [column.above_joins for column in lifted.found.classifies] == [True]
+    ((alias, (test,)),) = lifted.found.column_filters
+    assert (alias, test.name, test.before_joins) == ("r", "topic", False)
     session.close()

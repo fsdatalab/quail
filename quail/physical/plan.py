@@ -70,7 +70,7 @@ def plan_from_json(found: dict):
 
     Args:
         found: A planned region as ``NativePlanner.plan`` returns it, read
-            from JSON: the envelope, the estimates, the logical plan, and,
+            from JSON: the envelope, the estimates, the operators, and,
             for Quail's backend, the pricer and the context fields.
     """
     if "refusal" in found:
@@ -90,7 +90,7 @@ def plan_from_json(found: dict):
         estimated_seconds=found.get("estimated_seconds", 0.0),
         nodes=graph.nodes, settings=settings, root=graph.root,
         estimates=_estimates(found.get("estimates", {})), pricing=pricing,
-        logical_plan=found.get("logical"))
+        operators=found.get("operators"))
 
 
 @dataclass(frozen=True)
@@ -102,7 +102,7 @@ class PhysicalPlan:
     would pay if its KV were released instead of pinned. pricing holds
     the planning context's fields and the pricer Rust wrote, which
     price an edited graph again; a plan without it is not priced again.
-    logical_plan records the selected tree for query execution and explain.
+    operators records the selected operators for query execution and explain.
     """
 
     model: str
@@ -117,8 +117,8 @@ class PhysicalPlan:
         default_factory=dict, repr=False)
     pricing: Mapping[str, Any] | None = field(default=None, repr=False,
                                               compare=False)
-    # the logical plan the graph lowers, as Rust's JSON
-    logical_plan: str | None = field(default=None, repr=False, compare=False)
+    # the operators the graph lowers, as Rust's JSON
+    operators: str | None = field(default=None, repr=False, compare=False)
     graph: PhysicalGraph = field(init=False, repr=False)
 
     def __post_init__(self) -> None:

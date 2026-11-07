@@ -1,12 +1,16 @@
 logical:
-  Project: t.id, progress, domain, root_cause
-    SemanticClassify: root_cause
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above what kind of defect causes the reported issue.', t.trace) labels=['assignment', 'checking', 'algorithm', 'function', 'interface', 'timing or serialization', 'build, package, or merge', 'documentation']
-      SemanticClassify: domain
-        PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above which PyPI topic best describes the project the issue is filed against.', t.trace) labels=['Communications', 'Database', 'Documentation', 'File Formats', 'Internet :: WWW/HTTP', 'Multimedia :: Graphics', 'Multimedia :: Sound/Audio', 'Multimedia :: Video', 'Office/Business :: Financial', 'Scientific/Engineering :: Artificial Intelligence', 'Scientific/Engineering :: Artificial Life', 'Scientific/Engineering :: Bio-Informatics', 'Scientific/Engineering :: GIS', 'Scientific/Engineering :: Mathematics', 'Scientific/Engineering :: Medical Science Apps.', 'Security', 'Software Development :: Build Tools', 'Software Development :: Compilers', 'Software Development :: Embedded Systems', 'Software Development :: Quality Assurance', 'Software Development :: Testing', 'Software Development :: User Interfaces', 'System :: Distributed Computing', 'System :: Networking', 'Text Processing :: Linguistic', 'Text Processing :: Markup', 'Utilities']
-        SemanticClassify: progress
-          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above how far the agent has gotten so far.', t.trace) labels=['has not located the relevant code', 'located the relevant code', 'changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails']
-          Scan agent_traces as t [trace, id]
+  Projection: t.id, progress, domain, root_cause
+    AiNode: root_cause = ai_classify(prompt(Utf8("Judge strictly from the agent trace above what kind of defect causes the reported issue.
+  
+  {0}"), t.trace), make_array(struct(Utf8("assignment"), Utf8("a value is set or initialized wrong")), struct(Utf8("checking"), Utf8("a condition or validation is missing or wrong")), struct(Utf8("algorithm"), Utf8("the steps that compute a result are wrong")), struct(Utf8("function"), Utf8("a needed function, class, or feature is missing")), struct(Utf8("interface"), Utf8("components pass the wrong arguments, return values, or messages")), struct(Utf8("timing or serialization"), Utf8("shared resources, concurrency, or the order of events are wrong")), struct(Utf8("build, package, or merge"), Utf8("a dependency, version, build, or packaging setting is wrong")), struct(Utf8("documentation"), Utf8("documentation, comments, or messages are wrong"))))
+      AiNode: domain = ai_classify(prompt(Utf8("Judge strictly from the agent trace above which PyPI topic best describes the project the issue is filed against.
+  
+  {0}"), t.trace), make_array(Utf8("Communications"), Utf8("Database"), Utf8("Documentation"), Utf8("File Formats"), Utf8("Internet :: WWW/HTTP"), Utf8("Multimedia :: Graphics"), Utf8("Multimedia :: Sound/Audio"), Utf8("Multimedia :: Video"), Utf8("Office/Business :: Financial"), Utf8("Scientific/Engineering :: Artificial Intelligence"), Utf8("Scientific/Engineering :: Artificial Life"), Utf8("Scientific/Engineering :: Bio-Informatics"), Utf8("Scientific/Engineering :: GIS"), Utf8("Scientific/Engineering :: Mathematics"), Utf8("Scientific/Engineering :: Medical Science Apps."), Utf8("Security"), Utf8("Software Development :: Build Tools"), Utf8("Software Development :: Compilers"), Utf8("Software Development :: Embedded Systems"), Utf8("Software Development :: Quality Assurance"), Utf8("Software Development :: Testing"), Utf8("Software Development :: User Interfaces"), Utf8("System :: Distributed Computing"), Utf8("System :: Networking"), Utf8("Text Processing :: Linguistic"), Utf8("Text Processing :: Markup"), Utf8("Utilities")))
+        AiNode: progress = ai_classify(prompt(Utf8("Judge strictly from the agent trace above how far the agent has gotten so far.
+  
+  {0}"), t.trace), make_array(struct(Utf8("has not located the relevant code"), Utf8("has not yet found the code that causes the issue")), struct(Utf8("located the relevant code"), Utf8("found the code that causes the issue but has not changed it")), struct(Utf8("changed the code, not checked"), Utf8("edited the code but has not run a test or reproduction since")), struct(Utf8("changed the code, check passes"), Utf8("edited the code and the latest test or reproduction run succeeds")), struct(Utf8("changed the code, check fails"), Utf8("edited the code and the latest test or reproduction run still fails"))))
+          SubqueryAlias: t
+            TableScan: agent_traces projection=[id, trace]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

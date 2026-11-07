@@ -1,11 +1,13 @@
 logical:
-  Project: r.id, sentiment, complaint
-    SemanticClassify: complaint
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above what it criticizes most about the movie.', r.body) labels=['poor acting', 'poor writing', 'poor visual effects', 'slow pacing', 'weak ending', 'too long', 'too violent', 'no specific complaint']
-      Filter: r.sentiment IN ('negative', 'mixed') (selectivity=58.5%)
-        SemanticClassify: sentiment
-          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above which category best describes the overall sentiment it expresses about the movie.', r.body) labels=['positive', 'negative', 'neutral', 'mixed']
-          Scan reviews as r [body, id]
+  Projection: r.id, sentiment, complaint
+    AiNode: complaint = ai_classify(prompt(Utf8("Judge strictly from the review above what it criticizes most about the movie.
+  
+  {0}"), r.body), make_array(Utf8("poor acting"), Utf8("poor writing"), Utf8("poor visual effects"), Utf8("slow pacing"), Utf8("weak ending"), Utf8("too long"), Utf8("too violent"), Utf8("no specific complaint")))
+      AiNode: sentiment = ai_classify(prompt(Utf8("Judge strictly from the review above which category best describes the overall sentiment it expresses about the movie.
+  
+  {0}"), r.body), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed"))), filter: hint(sentiment IN ([Utf8("negative"), Utf8("mixed")]), named_struct(Utf8("selectivity"), Float64(0.5846)))
+        SubqueryAlias: r
+          TableScan: reviews projection=[id, body]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

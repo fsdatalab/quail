@@ -9,13 +9,13 @@ ModelRegion
 
 model region:
 logical:
-  Project: s.id, f.id
-    SemanticJoin (full)
-      PROMPT('DOCUMENT {0} and DOCUMENT {1} are the patches of two agent runs on the same issue. Does the patch in DOCUMENT {1} take a different approach from the patch in DOCUMENT {0}? Answer TRUE if the two patches change different code or fix the issue in different ways, FALSE if they make essentially the same change.', s.patch, f.patch) (selectivity=6.84%)
-      Join
-        on s.instance_id = f.instance_id
-        Scan issue_runs as s [patch, id, instance_id]
-        Scan issue_runs as f [patch, id, instance_id]
+  Projection: s.id, f.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("DOCUMENT {0} and DOCUMENT {1} are the patches of two agent runs on the same issue. Does the patch in DOCUMENT {1} take a different approach from the patch in DOCUMENT {0}? Answer TRUE if the two patches change different code or fix the issue in different ways, FALSE if they make essentially the same change."), s.patch, f.patch), named_struct(Utf8("selectivity"), Float64(0.06837606837606838))), filter: __quail_answer_1, returns: []
+      Inner Join:  Filter: s.instance_id = f.instance_id
+        SubqueryAlias: s
+          TableScan: issue_runs__s projection=[id, patch, instance_id]
+        SubqueryAlias: f
+          TableScan: issue_runs__f projection=[id, patch, instance_id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

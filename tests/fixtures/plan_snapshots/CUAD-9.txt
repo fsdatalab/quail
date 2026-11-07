@@ -1,12 +1,14 @@
 logical:
-  Project: c.id, contract.license_grant
-    contract = struct(contract.license_grant)
-    SemanticExtract: contract.license_grant, contract.license_grant_span
-      question='Does the contract contain a license granted by one party to its counterparty?'
-      SemanticFilter
-        PROMPT('DOCUMENT:\n{0}\n\nDoes the contract contain a license granted by one party to its counterparty?', c.text) (selectivity=46.5%)
-        PROMPT('DOCUMENT:\n{0}\n\nDoes the contract limit the ability of a party to transfer the license being granted to a third party?', c.text) (selectivity=24.1%)
-        Scan contracts as c [text, id]
+  Projection: c.id, contract, contract_span
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("license_grant"), Utf8("Does the contract contain a license granted by one party to its counterparty?")))
+      AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}
+  
+  Does the contract limit the ability of a party to transfer the license being granted to a third party?"), c.text), named_struct(Utf8("selectivity"), Float64(0.24053452115812918))), filter: __quail_answer_2, returns: []
+        AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}
+  
+  Does the contract contain a license granted by one party to its counterparty?"), c.text), named_struct(Utf8("selectivity"), Float64(0.46547884187082406))), filter: __quail_answer_1, returns: []
+          SubqueryAlias: c
+            TableScan: contracts projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

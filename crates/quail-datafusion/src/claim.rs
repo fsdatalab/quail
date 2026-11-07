@@ -13,7 +13,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::AnalyzerRule;
 
-use crate::bind::UNSUPPORTED;
+use crate::derive::UNSUPPORTED;
 use crate::functions::{is_ai_call, is_quail_call};
 use crate::identified::IdentifiedTable;
 use crate::region::ModelRegion;
@@ -342,18 +342,15 @@ impl Extracted {
         if quail_plans(&plan)? {
             let selected = select_list(plan.clone(), needed.clone())?;
             let pushed = precompute_plain_expressions(push_plain_terms(selected)?)?;
-            let (mut bound, mut inputs) = split_inputs(pushed.clone(), false)?;
-            if binds_stages(&bound) {
-                // a subquery the binder would run as a stage runs before
-                // the region instead, as its own input
-                (bound, inputs) = split_inputs(pushed, true)?;
-            }
+            // a FROM or JOIN subquery the region does not read through runs
+            // before the region, as its own input
+            let (bound, inputs) = split_inputs(pushed)?;
             if !calls_ai(&bound)? {
                 // every model call is in a subquery that runs first: DataFusion
                 // runs this part, and the subqueries are claimed below it
                 return self.hand_back(plan, needed, limited, None);
             }
-            match binder_refusal(&bound) {
+            match refusal(&bound) {
                 None => {
                     let mut region = ModelRegion::new(bound);
                     for (name, input) in inputs {
@@ -376,7 +373,7 @@ impl Extracted {
     /// as SQL allows, such as a test of one table below a join, and the
     /// result is claimed again. Then DataFusion keeps `plan`'s operator,
     /// its AI calls moved into a projection below it, and its inputs are
-    /// claimed. `refusal` is the binder's reason Quail cannot run `plan`
+    /// claimed. `refusal` is Quail's reason it cannot run `plan`
     /// whole; it is the error when a model call is still outside every
     /// region.
     fn hand_back(
@@ -574,26 +571,86 @@ fn read_from(
     )
 }
 
-/// The binder's refusal of `plan` as a region, when the refusal is of a
-/// shape DataFusion can run instead; any other refusal is the query's
-/// error, reported when the region is bound.
-fn binder_refusal(plan: &LogicalPlan) -> Option<String> {
-    // the chat turn and layout change the prompts, not what binds
+/// Quail's refusal of `plan` as a region, when the refusal is of a shape
+/// DataFusion can run instead; any other refusal is the query's error,
+/// reported when the region is planned.
+fn refusal(plan: &LogicalPlan) -> Option<String> {
+    // the chat turn and layout change the prompts, not what Quail reads
     let turn: quail_planner::prompts::Turn = (String::new(), String::new());
-    match crate::bind::bind_region(plan, &turn, "ai-if") {
+    let region = ModelRegion::new(plan.clone());
+    match crate::derive::derive_region(&region, &turn, "ai-if") {
         Err(error) if error.0.contains(UNSUPPORTED) => Some(error.0),
         _ => None,
     }
 }
 
-/// Whether the binder reads `plan` as stages: subqueries that run before
-/// the query that reads them.
-fn binds_stages(plan: &LogicalPlan) -> bool {
-    let turn: quail_planner::prompts::Turn = (String::new(), String::new());
-    matches!(
-        crate::bind::bind_region(plan, &turn, "ai-if"),
-        Err(error) if error.0 == crate::bind::STAGED
-    )
+/// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,
+/// or the subquery itself.
+pub(crate) fn subquery_body(
+    alias: &datafusion::logical_expr::SubqueryAlias,
+) -> (String, &LogicalPlan) {
+    match alias.input.as_ref() {
+        LogicalPlan::SubqueryAlias(cte) => (cte.alias.table().to_string(), cte.input.as_ref()),
+        body => (alias.alias.table().to_string(), body),
+    }
+}
+
+/// The aliases of the JOIN inputs a region reads through, and the CTE
+/// each reads: each subquery that selects and filters one table without
+/// a model call, and is read once. Any other FROM or JOIN subquery runs
+/// before the region, as its own input.
+///
+/// For example, `FROM contracts a JOIN kept b ON AI.IF(...b.text...)`,
+/// with `kept` as `SELECT c.id, c.text FROM contracts c WHERE AI.IF(...)`,
+/// reads `kept` through: the region scans `contracts` as `c` under `b`.
+pub(crate) fn merged_aliases(plan: &LogicalPlan) -> Vec<String> {
+    let mut readers: std::collections::BTreeMap<String, usize> = Default::default();
+    let _ = plan.apply(|node| {
+        // each read of a CTE is one copy of its body under the CTE's name
+        if let LogicalPlan::SubqueryAlias(alias) = node
+            && !matches!(
+                alias.input.as_ref(),
+                LogicalPlan::TableScan(_) | LogicalPlan::SubqueryAlias(_)
+            )
+        {
+            *readers.entry(alias.alias.table().to_string()).or_default() += 1;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    let mut merged = Vec::new();
+    let _ = plan.apply(|node| {
+        let LogicalPlan::Join(join) = node else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+        for side in [join.left.as_ref(), join.right.as_ref()] {
+            let LogicalPlan::SubqueryAlias(alias) = side else {
+                continue;
+            };
+            let (name, body) = subquery_body(alias);
+            let LogicalPlan::Projection(projection) = body else {
+                continue;
+            };
+            let base = match projection.input.as_ref() {
+                LogicalPlan::Filter(filter) => filter.input.as_ref(),
+                other => other,
+            };
+            let is_table = matches!(base, LogicalPlan::SubqueryAlias(found)
+                if matches!(found.input.as_ref(), LogicalPlan::TableScan(_)));
+            let calls_model = projection
+                .expr
+                .iter()
+                .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false));
+            if is_table && readers.get(&name).copied().unwrap_or(0) <= 1 && !calls_model {
+                merged.push(alias.alias.table().to_string());
+                // `kept b` reads the CTE `kept` through `b`
+                if name != alias.alias.table() {
+                    merged.push(name);
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    merged
 }
 
 /// `plan` with DataFusion's `PushDownFilter` applied, or `plan` when the
@@ -988,20 +1045,14 @@ fn plain_input(plan: &LogicalPlan) -> Result<Option<TableScan>> {
 
 /// Take out of a region's plan each part DataFusion computes as an
 /// input: a part that calls no model and reads one table, such as a
-/// table's plain filters, and each CTE or FROM subquery that groups or
-/// windows rows. The plan reads each input as a table of its name.
+/// table's plain filters, each CTE or FROM subquery that groups or
+/// windows rows, and each one the region does not read through
+/// ([`merged_aliases`]). The plan reads each input as a table of its name.
 ///
 /// Returns the plan and each input's table name and plan.
-fn split_inputs(
-    plan: LogicalPlan,
-    cut_stages: bool,
-) -> Result<(LogicalPlan, Vec<(String, LogicalPlan)>)> {
+fn split_inputs(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<(String, LogicalPlan)>)> {
     let mut inputs: Vec<(String, LogicalPlan)> = Vec::new();
-    // the binder merges these into the query that reads them
-    let merged: Vec<String> = crate::bind::merged_subqueries(&plan)
-        .into_iter()
-        .map(|(alias, ..)| alias)
-        .collect();
+    let merged = merged_aliases(&plan);
     let mut root = true;
     let plan = plan
         .transform_down(|node| {
@@ -1016,8 +1067,8 @@ fn split_inputs(
             let LogicalPlan::SubqueryAlias(alias) = &node else {
                 return Ok(Transformed::no(node));
             };
-            // a subquery the binder does not merge runs before the query
-            // that reads it, as an input: its own model region when it
+            // a subquery the region does not read through runs before the
+            // query that reads it, as an input: its own model region when it
             // calls a model, or DataFusion's when it groups or windows
             let groups = alias.input.exists(|inner| {
                 Ok(matches!(
@@ -1026,10 +1077,7 @@ fn split_inputs(
                 ))
             })?;
             let table = matches!(alias.input.as_ref(), LogicalPlan::TableScan(_));
-            let staged = cut_stages
-                && !at_root
-                && !table
-                && !merged.contains(&alias.alias.table().to_string());
+            let staged = !at_root && !table && !merged.contains(&alias.alias.table().to_string());
             if !groups && !staged {
                 return Ok(Transformed::no(node));
             }
@@ -1233,7 +1281,7 @@ fn is_quail_operator(plan: &LogicalPlan) -> bool {
 }
 
 /// Whether an expression is a subquery Quail does not plan: anything
-/// but an EXISTS gate, whose subquery Quail's binder checks.
+/// but an EXISTS gate, whose subquery the region's lowering reads.
 fn is_subquery(expr: &Expr) -> bool {
     match expr {
         Expr::Exists(exists) => !quail_plans(&exists.subquery.subquery).unwrap_or(false),

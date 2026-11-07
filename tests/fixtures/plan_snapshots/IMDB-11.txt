@@ -1,8 +1,10 @@
 logical:
-  Project: r.id, sentiment
-    SemanticClassify: sentiment
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above which category best describes the overall sentiment it expresses about the movie.', r.body) labels=['positive', 'negative', 'neutral', 'mixed']
-      Scan reviews as r [body, id]
+  Projection: r.id, sentiment
+    AiNode: sentiment = ai_classify(prompt(Utf8("Judge strictly from the review above which category best describes the overall sentiment it expresses about the movie.
+  
+  {0}"), r.body), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed")))
+      SubqueryAlias: r
+        TableScan: reviews projection=[id, body]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

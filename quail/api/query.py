@@ -109,7 +109,7 @@ class Query:
     Rust's session parses and binds the SQL, plans each model region in
     Rust, and runs every operator outside the regions; the Python
     executor runs each planned region. A query of one model region also
-    offers that region's ``RegionQuery`` attributes, such as ``logical``.
+    offers that region's ``RegionQuery`` attributes, such as ``facts()``.
 
     Args:
         session: The session whose tables and model the query uses.
@@ -149,7 +149,7 @@ class Query:
             native = self._native()
             model = self.session.model
             try:
-                bound, self._whole = native.logical_plans(
+                bound, self._whole = native.region_plans(
                     self.text, tuple(model.turn), model.prompt_layout, self._dialect())
             except RuntimeError as error:
                 from quail.api.compile import compile_message
@@ -172,17 +172,27 @@ class Query:
         self.bound_whole()
         return len(self._bound)
 
-    @property
-    def logical(self) -> str:
-        """The one model region's logical plan as bound, before planning."""
+    def _bound_region(self) -> dict:
+        """The one model region as derived, before planning."""
         self.bound_whole()
         if len(self._bound) != 1:
             raise AttributeError(
                 f"the query has {len(self._bound)} model regions; use regions()")
-        ((plan, message),) = self._bound
+        ((found, message),) = self._bound
         if message is not None:
-            return self._region().logical
-        return plan
+            region = self._region()
+            return {"operators": region.operators, "logical": region.logical}
+        return json.loads(found)
+
+    @property
+    def logical(self) -> str:
+        """DataFusion's plan of the one model region, before planning."""
+        return self._bound_region()["logical"]
+
+    @property
+    def operators(self) -> str:
+        """The one model region's operators as JSON, before planning."""
+        return self._bound_region()["operators"]
 
     def regions(self) -> list["RegionQuery"]:
         """Plan each model region once and return them, in plan order.
@@ -206,7 +216,9 @@ class Query:
                     inner = self.session.sql(payload, order=self.order)
                     regions.extend(inner.regions())
                     continue
-                region = region_query(self.session, payload, order=self.order)
+                found = json.loads(payload)
+                region = region_query(self.session, found["operators"],
+                                      logical=found["logical"], order=self.order)
                 if planned is not None:
                     region.adopt_plan(json.loads(planned))
                 regions.append(region)
@@ -292,17 +304,20 @@ class Query:
 class RegionQuery:
     """One model region of a query: its plan, and its run in this process."""
 
-    def __init__(self, session: "Session", logical: str,
-                 order: str | None = None, *, catalog=None, assumed_rows=None):
+    def __init__(self, session: "Session", operators: str,
+                 order: str | None = None, *, logical: str = "", catalog=None,
+                 assumed_rows=None):
         self.session = session
         self.catalog = session.catalog if catalog is None else catalog
         # rows of each input table not yet computed, as a CTE's before it
         # runs, by table name
         self.assumed_rows = {} if assumed_rows is None else dict(assumed_rows)
-        # the region's logical plan, as Rust's JSON: as bound, then as the
-        # planner chose it
+        # the region's operators, as Rust's JSON: as derived, then as the
+        # planner chose them
+        self.operators = operators
+        self._operators_input = operators
+        # DataFusion's plan of the region, one operator per line
         self.logical = logical
-        self._logical_input = logical
         self._facts = {}
         self.order = order
         self._plan = None
@@ -316,21 +331,22 @@ class RegionQuery:
         # each input that holds a registered table whole: its identity
         self.input_identities = {}
 
-    def facts(self, logical: str | None = None) -> dict:
-        """Return what Rust reads from the logical plan, once per plan.
+    def facts(self, operators: str | None = None) -> dict:
+        """Return what Rust reads from the region's operators, once per value.
 
         Args:
-            logical: A logical plan as JSON; the query's chosen plan when
-                omitted.
+            operators: Operators as JSON; the query's chosen operators
+                when omitted.
 
         Returns:
-            The plan's scans, value columns, stop keys, join equalities,
-            and whether it asks the model; see ``region_facts`` in Rust.
+            The operators' scans, value columns, stop keys, join
+            equalities, and whether they ask the model; see
+            ``region_facts`` in Rust.
         """
-        logical = self.logical if logical is None else logical
-        if logical not in self._facts:
-            self._facts[logical] = json.loads(_quail_native.region_facts(logical))
-        return self._facts[logical]
+        operators = self.operators if operators is None else operators
+        if operators not in self._facts:
+            self._facts[operators] = json.loads(_quail_native.region_facts(operators))
+        return self._facts[operators]
 
     def token_inputs(self) -> dict:
         """Return the token store of every scanned alias.
@@ -385,7 +401,7 @@ class RegionQuery:
         if isinstance(plan, Refusal):
             self._plan = self._searched_plan = plan
             return plan
-        self.logical = plan.logical_plan
+        self.operators = plan.operators
         if self.session.config.gpu_timing:
             plan = replace(plan, settings={**plan.settings, "gpu_timing": True})
         if self._planning_started_at is None:
@@ -421,7 +437,7 @@ class RegionQuery:
             result: The QueryResult of running the plan, or None.
             verbose: Include runtime settings and internal node fields.
         """
-        # plan() first: it replaces self.logical with the optimized tree
+        # plan() first: it replaces self.operators with the chosen ones
         physical = self.plan()
         if result is not None:
             physical = self._plan
@@ -435,7 +451,7 @@ class RegionQuery:
             result.report.setdefault("node_metrics", {}).setdefault(
                 root, {})["output_rows"] = rows
         registry = self.session.registry
-        text = explain(self.logical, physical, verbose=verbose,
+        text = explain(self.logical, self.operators, physical, verbose=verbose,
                        result=result,
                        rules=tuple(registry.rules.values()),
                        usd_per_hour=(
@@ -444,7 +460,8 @@ class RegionQuery:
 
     def has_inputs(self) -> bool:
         """Whether the region reads a table the session did not register."""
-        return bool(input_scans(self.facts(self._logical_input), self.session.catalog))
+        return bool(input_scans(self.facts(self._operators_input),
+                                self.session.catalog))
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
@@ -582,7 +599,7 @@ class RegionQuery:
         source_rows = {alias: rows.to_pylist()
                        for alias, rows in self._alias_source_rows().items()}
         request = {
-            "logical": self.logical, "ports": ports,
+            "operators": self.operators, "ports": ports,
             "num_documents": {alias: len(tokens)
                               for alias, tokens in self._document_tokens.items()},
             "source_rows": source_rows}

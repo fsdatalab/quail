@@ -1,16 +1,16 @@
 logical:
-  Project: r.id, a.id, a2.id
-    SemanticJoin (full)
-      PROMPT('Does the review in DOCUMENT {0} express positive sentiment about the movie aspect in DOCUMENT {1}?', r.body, a2.aspect) (selectivity=16.1%)
-      Join
-        cross
-        SemanticJoin (full)
-          PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect) (selectivity=29.5%)
-          Join
-            cross
-            Scan reviews as r [body, id]
-            Scan aspects as a [aspect, id]
-        Scan aspects as a2 [aspect, id]
+  Projection: r.id, a.id, a2.id
+    AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Does the review in DOCUMENT {0} express positive sentiment about the movie aspect in DOCUMENT {1}?"), r.body, a2.aspect), named_struct(Utf8("selectivity"), Float64(0.16058333333333333))), filter: __quail_answer_2, returns: []
+      Cross Join:
+        Projection: r.id, r.body, a.id
+          AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?"), r.body, a.aspect), named_struct(Utf8("selectivity"), Float64(0.2947166666666667))), filter: __quail_answer_1, returns: []
+            Cross Join:
+              SubqueryAlias: r
+                TableScan: reviews projection=[id, body]
+              SubqueryAlias: a
+                TableScan: aspects projection=[id, aspect]
+        SubqueryAlias: a2
+          TableScan: aspects projection=[id, aspect]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

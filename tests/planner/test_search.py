@@ -1,11 +1,8 @@
-"""Search lowers each logical alternative and keeps the cheapest refined plan."""
-
-from types import SimpleNamespace
+"""Search lowers each column placement and keeps the cheapest refined plan."""
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.logical import walk
 from helpers.planning import placements, search
 from helpers.sessions import TOKENIZER
 
@@ -33,28 +30,17 @@ def query(tmp_path):
     session.close()
 
 
-COLUMN_KINDS = {"SemanticColumn", "SemanticClassify", "SemanticExtract", "SemanticMap"}
-
-
-def columns_above_joins(logical):
-    """Return the one-table column operators that sit above a SemanticJoin."""
-    return [node for node in walk(logical)
-            if node.kind in COLUMN_KINDS and len(node.call.aliases()) == 1
-            and any(below.kind == "SemanticJoin"
-                    for below in walk(SimpleNamespace(root=node.input)))]
-
-
 def alternative_plans(query):
-    """The refined plan of each logical alternative, in search order."""
+    """The refined plan of each column placement, in search order."""
     fields = query.plan().pricing["fields"]
     return [search((alternative,), fields, query.session.tokenizer)
-            for alternative in placements(query._logical_input)]
+            for alternative in placements(query.operators)]
 
 
 def test_search_compares_both_extraction_placements_and_keeps_the_cheaper(query):
-    original, lifted = placements(query._logical_input)
-    assert not columns_above_joins(original.plan)
-    assert columns_above_joins(lifted.plan)
+    original, lifted = placements(query.operators)
+    assert [column.above_joins for column in original.found.extracts] == [False]
+    assert [column.above_joins for column in lifted.found.extracts] == [True]
     assert "should_lift_column_operators" not in original.rules
     assert "should_lift_column_operators" in lifted.rules
     first, second = alternative_plans(query)

@@ -1,11 +1,11 @@
 logical:
-  Project: c.id, contract.audit_rights
-    contract = struct(contract.audit_rights)
-    SemanticExtract: contract.audit_rights, contract.audit_rights_span
-      question='Does a party have the right to\xa0 audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?'
-      SemanticFilter
-        PROMPT('DOCUMENT:\n{0}\n\nDoes a party have the right to\xa0 audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?', c.text) (selectivity=36.5%)
-        Scan contracts as c [text, id]
+  Projection: c.id, contract, contract_span
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("audit_rights"), Utf8("Does a party have the right to  audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?")))
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}
+  
+  Does a party have the right to  audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?"), c.text), named_struct(Utf8("selectivity"), Float64(0.36525612472160357))), filter: __quail_answer_1, returns: []
+        SubqueryAlias: c
+          TableScan: contracts projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

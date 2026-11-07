@@ -1,8 +1,12 @@
-//! A plan's operators as the planner reads them, as `LogicalPlan.operators`.
+//! A region's operators as the planner reads them.
 //!
-//! The physical planner reads a plan only through `Operators`.
+//! The physical planner reads a region only through `Operators`, which
+//! `quail_datafusion::derive` reads from the region's DataFusion plan.
+//! They cross into Python as JSON.
 
 use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 
 use quail_physical::{
     Asked, Condition, Equality, ExtractStruct, FilterPredicate, ModelCall, Projected, SortKey,
@@ -20,7 +24,7 @@ use crate::nodes::{
 };
 
 /// A Filter on the columns that column operators compute.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnTest {
     /// The column operator the Filter follows, the last one it reads.
     pub name: String,
@@ -37,7 +41,7 @@ pub struct ColumnTest {
 /// One model call over its input rows, adding its answer column `name`:
 /// `AI.CLASSIFY`, `AI.EXTRACT`, `AI.SAE_FEATURES`, or `AI.MAP`, as the
 /// call's kind says.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticColumn {
     pub call: ModelCall,
     pub name: String,
@@ -68,7 +72,7 @@ impl SemanticColumn {
 }
 
 /// A model call tested on the pairs of a join.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticJoin {
     pub predicate: Asked,
     /// "full", "exists", or "anti".
@@ -83,7 +87,7 @@ pub struct SemanticJoin {
 }
 
 /// The query's SELECT list.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Projection {
     /// Value expressions, Aliases, and the names of columns an unnest adds.
     pub columns: Vec<Projected>,
@@ -91,7 +95,7 @@ pub struct Projection {
 }
 
 /// `ORDER BY`, `DISTINCT`, `OFFSET`, and `LIMIT`.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResultModifiers {
     pub limit: Option<i64>,
     pub order: Vec<SortKey>,
@@ -101,7 +105,7 @@ pub struct ResultModifiers {
 
 /// An operator on result rows, above the SELECT list. Each holds the
 /// names of the result columns it returns.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RowOperator {
     /// One row per item of each listed list column.
     Unnest {
@@ -133,7 +137,7 @@ impl RowOperator {
 }
 
 /// The operators of one plan, in the order the plan was written.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Operators {
     pub scans: Vec<Scan>,
     /// alias -> its AI.IF predicates, by alias first seen.
@@ -159,6 +163,14 @@ pub struct Operators {
 }
 
 impl Operators {
+    /// These operators returning at most `fetch` rows, when DataFusion
+    /// passes a LIMIT above the region down to it, so the model can stop
+    /// once enough rows pass.
+    pub fn limited(mut self, fetch: i64) -> Self {
+        self.result.limit = Some(self.result.limit.map_or(fetch, |limit| limit.min(fetch)));
+        self
+    }
+
     /// The column operators of every kind: classifications,
     /// extractions, SAE features, then maps.
     pub fn columns(&self) -> impl Iterator<Item = &SemanticColumn> {

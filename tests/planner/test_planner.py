@@ -7,11 +7,10 @@ import _quail_native
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.logical import nodes, read_plan
-from helpers.planning import _optimize, _plan, compile_sql, node_kinds
+from helpers.planning import _plan, compile_sql, node_kinds, read_operators
 
 from quail.catalog import Catalog, DocumentProvider
-from quail.explain import explain
+from quail.explain import explain as explain_plan
 from quail.extensions import LogicalRule, PhysicalRule
 from quail.physical import (
     AiFilter,
@@ -64,6 +63,11 @@ def _cell(text, title):
     raise AssertionError(f"no row starts with {title!r}")
 
 
+def explain(operators, plan, **options):
+    """Return the explain text of a region's operators and physical plan."""
+    return explain_plan("", operators, plan, **options)
+
+
 def _five_filter_plan(catalog, sels):
     filters = " AND ".join(
         f"AI_FILTER(PROMPT('flag {j} of: {{0}}', r.review)"
@@ -80,57 +84,56 @@ def test_gpu_copies_and_memory_refusals(catalog):
     assert contiguous_shards([0, 2, 0, 4], 3) == (
         ((0, 2), (2, 4), (4, 4)), [2, 4, 0])
     assert contiguous_shards([], 2) == (((0, 0), (0, 0)), [0, 0])
-    logical = _five_filter_plan(catalog, (0.5,))
+    operators = _five_filter_plan(catalog, (0.5,))
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
         for gpus in (1, 2, 4, 8):
-            plan = _plan(logical, {"r": [100] * 8}, model=model, gpus=gpus)
+            plan = _plan(operators, {"r": [100] * 8}, model=model, gpus=gpus)
             assert plan.model == model.name
             assert plan.gpus == gpus
             scan_node = next(node for node in plan.nodes if isinstance(node, Scan))
             assert len(scan_node.shards) == gpus
 
     big = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
-    logical = _five_filter_plan(catalog, (0.9,))
+    operators = _five_filter_plan(catalog, (0.9,))
     for gpus in (1, 8):
-        result = _plan(logical, {"r": [100] * 10}, model=big, gpus=gpus)
+        result = _plan(operators, {"r": [100] * 10}, model=big, gpus=gpus)
         assert isinstance(result, Refusal)
         assert result.constraint == "weights_need_more_cards"
         assert result.needed > result.available
 
     # a document too long for one pass is skipped at execution, not refused
-    assert not isinstance(_plan(logical, {"r": [150_000]}), Refusal)
+    assert not isinstance(_plan(operators, {"r": [150_000]}), Refusal)
 
 
 def test_filter_ordering_and_kv_writes(catalog):
     # the B3 shape: a 0.2-selectivity filter written third among five
     sels = (0.9, 0.9, 0.2, 0.9, 0.9)
-    logical = _five_filter_plan(catalog, sels)
+    operators = _five_filter_plan(catalog, sels)
     tokens = {"r": [400] * 100}
 
-    by_cost = _plan(logical, tokens)
+    by_cost = _plan(operators, tokens)
     sequence = filter_sequence(by_cost)
     assert by_cost.settings["order_rule"] == "by_cost"
     assert sequence.selectivity == 0.2
     second = by_cost.graph.nodes_by_type(AiFilter.type_name)[1]
     assert second.expected_rows == pytest.approx(20.0)
-    # the physical planner chooses the order; the logical plan keeps
-    # the predicates as written
-    optimized, _ = _optimize(logical, tokens)
+    # the physical planner chooses the order; the operators keep the
+    # predicates as written
     assert sequence.written_position == 2
-    assert "predicate 3" in explain(optimized, by_cost)
+    assert "predicate 3" in explain(operators, by_cost)
 
-    as_written = _plan(logical, tokens, order="as_written")
+    as_written = _plan(operators, tokens, order="as_written")
     assert [node.selectivity
             for node in as_written.graph.nodes_by_type(AiFilter.type_name)] \
         == list(sels)
 
-    logical = compile_sql(
+    operators = compile_sql(
         "SELECT r.id FROM reviews r "
         f"WHERE AI_FILTER(PROMPT('{'long ' * 100}{{0}}', r.review), "
         "{'selectivity': 0.1}) "
         f"AND AI_FILTER(PROMPT('{'short ' * 10}{{0}}', r.review), "
         "{'selectivity': 0.5})", catalog)
-    plan = _plan(logical, {"r": [400] * 100})
+    plan = _plan(operators, {"r": [400] * 100})
     assert [node.written_position
             for node in plan.graph.nodes_by_type(AiFilter.type_name)] == [1, 0]
 
@@ -145,12 +148,12 @@ def test_filter_ordering_and_kv_writes(catalog):
     sequence = filter_sequence(plan)
     assert sequence.arena_writes is True
 
-    logical = compile_sql(
+    operators = compile_sql(
         "SELECT r.id FROM reviews r "
         "WHERE AI_FILTER(PROMPT('a: {0}', r.review)) "
         "AND AI_FILTER(PROMPT('b: {0}', r.review), {'selectivity': 0.5})",
         catalog)
-    plan = _plan(logical, {"r": [100] * 10})
+    plan = _plan(operators, {"r": [100] * 10})
     assert plan.settings["order_rule"] == "by_cost"
     assert "selectivity 0.2" in plan.settings["order_source"]
 
@@ -163,9 +166,9 @@ ROW_ESTIMATES = [
 
 def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     for sels, expected in ROW_ESTIMATES:
-        logical = _five_filter_plan(catalog, sels)
-        plan = _plan(logical, {"r": [400] * 100})
-        text = explain(logical, plan)
+        operators = _five_filter_plan(catalog, sels)
+        plan = _plan(operators, {"r": [400] * 100})
+        text = explain(operators, plan)
         physical = text.split("physical:", 1)[1]
         assert _cell(physical, "Project: r.id") == [expected], sels
         assert _cell(physical, "AiFilter: r")[0] == expected, sels
@@ -174,27 +177,27 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
         assert "tokens=40,000" in physical, sels
         assert "node_id=" not in text and "arena_writes" not in text, sels
         assert "KV=bf16, chunk budget=" in text and "KV rewind=on" in text, sels
-        predicates = read_plan(logical).root.input.predicates
+        prompts = json.loads(_quail_native.region_facts(operators))["prompts"]
         for stage in plan.graph.nodes_by_type(AiFilter.type_name):
-            predicate = predicates[stage.written_position]
+            prompt = prompts["filters"]["r"][stage.written_position]
             assert (f"predicate {stage.written_position + 1}  "
-                    f"PROMPT({predicate.prompt.template!r})") in physical, sels
-        verbose = explain(logical, plan, verbose=True)
+                    f"PROMPT({prompt['template']!r})") in physical, sels
+        verbose = explain(operators, plan, verbose=True)
         assert "node_id=ai_filter:r" in verbose, sels
         assert "admission_tokens=" in verbose and "expected_rows=" in verbose, sels
 
-    logical = _five_filter_plan(catalog, (0.25,))
-    logical = _quail_native.limited_plan(logical, 10)
-    plan = _plan(logical, {"r": [400] * 100})
-    physical = explain(logical, plan).split("physical:", 1)[1]
+    operators = _five_filter_plan(catalog, (0.25,))
+    operators = _quail_native.limited_operators(operators, 10)
+    plan = _plan(operators, {"r": [400] * 100})
+    physical = explain(operators, plan).split("physical:", 1)[1]
     assert _cell(physical, "Limit: 10") == ["10"]
     assert _cell(physical, "Project: r.id") == ["25"]
     assert "KV: not stored" in physical
 
     rules = (LogicalRule("eliminate_distinct"),
              PhysicalRule("should_push_down_limit"), PhysicalRule("should_retain_kv"))
-    assert "rules" not in explain(logical, plan, rules=rules)
-    text = explain(logical, plan, verbose=True, rules=rules)
+    assert "rules" not in explain(operators, plan, rules=rules)
+    text = explain(operators, plan, verbose=True, rules=rules)
     assert "  logical: eliminate_distinct" in text
     assert "  physical: should_push_down_limit, should_retain_kv" in text
     assert ("refine each graph in order: should_push_down_limit, "
@@ -217,13 +220,13 @@ def _join_sequence(catalog, sels=(0.1, 0.1), anchors=(None, None)):
 
 
 def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
-    logical = compile_sql("""
+    operators = compile_sql("""
         SELECT r.id FROM reviews r JOIN products p JOIN threads t
         ON AI_FILTER(PROMPT('m {0} {1} {2}', r.review, p.description, t.thread),
                      {'selectivity': 0.02})
     """, catalog)
     tokens = {"r": [3000] * 20, "p": [100] * 30, "t": [50] * 40}
-    plan = _plan(logical, tokens)
+    plan = _plan(operators, tokens)
     stage = join_stages(plan)[0]
     assert stage["expected_rows"] == 20 * 30 * 40
     assert stage["anchor"] == "r"
@@ -237,12 +240,11 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert [s["anchor"] for s in stages] == ["r", "p"]
     assert [s["written_position"] for s in stages] == [0, 1]
     # the physical planner chooses the stage order and anchors; the
-    # logical plan keeps the joins as written
-    optimized, _ = _optimize(_join_sequence(catalog), tokens, order="as_written")
-    joins = nodes(optimized, "SemanticJoin")
-    assert [join.anchor for join in joins] == [None, None]
+    # operators keep the joins as written
+    written = _join_sequence(catalog)
+    assert [join.anchor for join in read_operators(written).joins] == [None, None]
     assert [(s["exec_index"], s["anchor"]) for s in stages] == [(0, "r"), (1, "p")]
-    text = explain(optimized, plan)
+    text = explain(written, plan)
     assert "AiJoin: anchor=r" in text and "AiJoin: anchor=p" in text
     assert stages[0]["partners"] == stages[1]["partners"] == ["t"]
     assert stages[0]["expected_rows"] == 10 * 8
@@ -275,7 +277,7 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert join_stages(same)[0]["anchor"] == "r"
 
     # by_cost runs the cheap .01 exists gate before the .9 full join
-    logical = compile_sql("""
+    operators = compile_sql("""
         SELECT r.id FROM reviews r
         JOIN products p ON AI_FILTER(PROMPT('m {0} {1}', r.review, p.description),
                                      {'selectivity': 0.9})
@@ -284,11 +286,11 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
                                       {'selectivity': 0.01}))
     """, catalog)
     tokens = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
-    plan = _plan(logical, tokens)
+    plan = _plan(operators, tokens)
     assert [(s["written_position"], s["exec_index"], s["anchor"])
             for s in join_stages(plan)] == [(1, 0, "r"), (0, 1, "r")]
 
-    as_written = _plan(logical, tokens, order="as_written")
+    as_written = _plan(operators, tokens, order="as_written")
     assert join_stages(as_written)[0]["selectivity"] == 0.9
 
     assert _sink_source(plan).node_id == "recombine"

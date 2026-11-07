@@ -433,10 +433,10 @@ def speed_of_light_estimate(
               "gpus": 1, "canvas_draws": 4,
               "document_tokens": {data["alias"]: data["tokens"]
                                   for data in inputs["aliases"]},
-              "plan": None, "attention": None}
+              "operators": None, "attention": None}
     found, message = _quail_native.plan_operator(
         "speed_of_light", json.dumps(fields),
-        json.dumps({"plan": json.loads(query.logical), "inputs": inputs}),
+        json.dumps({"operators": json.loads(query.operators), "inputs": inputs}),
         vocabulary.tokens, vocabulary.decoder(),
         _Oracles(answer, label, stores))
     if message is not None:

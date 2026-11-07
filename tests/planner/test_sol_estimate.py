@@ -6,7 +6,6 @@ from dataclasses import replace
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.logical import nodes
 from helpers.sessions import TOKENIZER, encoder
 
 import quail
@@ -251,8 +250,8 @@ def test_map_answers_decode_one_pass_per_token_and_share_their_document(tmp_path
         query = sess.sql(
             "SELECT r.id, AI.MAP(r.body, 'Retell the plot.') AS plot, "
             "AI.MAP(r.body, 'List the names.') AS names FROM reviews r")
-        maps = {node.call.prompt: node.name
-                for node in nodes(query.logical, "SemanticMap")}
+        maps = {decode_plan_value(json.dumps(column["call"]["prompt"])): column["name"]
+                for column in json.loads(query.operators)["maps"]}
         lowered = {name: quail.lower_prompt(prompt, sess.tokenizer)
                    for prompt, name in maps.items()}
 

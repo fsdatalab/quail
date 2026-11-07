@@ -6,13 +6,13 @@ ModelRegion
 
 model region:
 logical:
-  Project: a.id, u.id
-    SemanticJoin (full)
-      PROMPT("Does the customer's reply in DOCUMENT {1} disagree with, correct, or push back on what the agent said in DOCUMENT {0}? Answer TRUE if the reply objects to the agent's statement, rejects its proposal, or says the agent got something wrong, FALSE otherwise.", a.content, u.content) (selectivity=5.26%)
-      Join
-        on a.id = u.prev_assistant_id
-        Scan support_messages as a [content, id]
-        Scan support_messages as u [content, id, prev_assistant_id]
+  Projection: a.id, u.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the customer's reply in DOCUMENT {1} disagree with, correct, or push back on what the agent said in DOCUMENT {0}? Answer TRUE if the reply objects to the agent's statement, rejects its proposal, or says the agent got something wrong, FALSE otherwise."), a.content, u.content), named_struct(Utf8("selectivity"), Float64(0.052648790058862))), filter: __quail_answer_1, returns: []
+      Inner Join:  Filter: a.id = u.prev_assistant_id
+        SubqueryAlias: a
+          TableScan: support_messages projection=[id, content]
+        SubqueryAlias: u
+          TableScan: support_messages__u projection=[id, content, prev_assistant_id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

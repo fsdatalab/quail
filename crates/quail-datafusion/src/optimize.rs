@@ -92,7 +92,7 @@ impl OptimizerRule for OptimizeModelRegions {
                 && !region.optimized
             {
                 // a region DataFusion's rules cannot optimize keeps its lowered
-                // plan, and the binder reports the rule's error
+                // plan, and deriving its operators reports the rule's error
                 let Ok(optimized) = optimize_region(&region.plan, &self.rules) else {
                     return Ok(Transformed::no(node));
                 };

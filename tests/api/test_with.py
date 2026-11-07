@@ -10,6 +10,7 @@ import quail
 from quail.api import execute as execution
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
+from quail.common.expressions import CompileError
 
 CONTRACTS = pa.table({
     "id": [1, 2, 3],
@@ -70,7 +71,7 @@ def test_extraction_then_score_sends_the_extracted_text_to_the_scorer(session):
     # the CTE is its own model region, which runs before the one reading it
     explained = query.explain()
     assert explained.count("model region") == 2
-    assert "SemanticExtract" in explained and "quail.ai_score" in explained
+    assert "AiExtract" in explained and "quail.ai_score" in explained
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     scores=lambda spec, ids: 0.9 if ids[0] == 0 else 0.1)
     result, recorder = run(query, oracle)
@@ -146,3 +147,26 @@ def test_a_filtered_cte_on_the_right_of_a_join_keeps_its_filter(session):
         joins=lambda node, assignment: len(set(assignment.values())) == 1))
     assert result.collect().to_pydict() == {"a.id": [1, 3], "other": [1, 3]}
     assert len(recorder.requests) == 1
+
+
+def test_a_cte_that_classifies_returns_the_columns_its_reader_names(session):
+    query = session.sql("""
+        WITH k AS (
+            SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'note']) AS kind
+            FROM contracts c)
+        SELECT k.id, k.kind FROM k WHERE k.kind = 'lease'
+    """)
+    result, _ = run(query, Oracle(labels=lambda spec, ids: spec.labels[ids[0] % 2]))
+    # the CTE is its own model region; DataFusion names the reader's columns
+    assert result.collect().to_pydict() == {
+        "k.id": [1, 3], "k.kind": ["lease", "lease"]}
+
+
+def test_a_cte_read_through_a_join_that_reuses_the_readers_alias_is_refused(session):
+    with pytest.raises(CompileError, match="duplicate table alias 'c'"):
+        session.sql("""
+            WITH kept AS (
+                SELECT c.id, c.text FROM contracts c
+                WHERE AI.IF(PROMPT('keep {0}', c.text)))
+            SELECT k.id FROM kept k JOIN contracts c ON k.id = c.id
+        """)

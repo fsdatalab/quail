@@ -1,4 +1,4 @@
-"""Plan a logical plan with Rust's planner, as a session does."""
+"""Plan a region's operators with Rust's planner, as a session does."""
 
 import json
 from dataclasses import asdict
@@ -9,6 +9,7 @@ import _quail_native
 from quail.api.compile import DATAFUSION_DIALECTS
 from quail.builtins import PHYSICAL_RULES
 from quail.common.expressions import CompileError
+from quail.physical import decode_plan_value
 from quail.physical.lowering import Vocabulary
 from quail.physical.plan import plan_from_json
 from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -22,19 +23,54 @@ def tokenizer(text):
     return text.split()
 
 
-def placements(logical):
-    """The column placements the planner prices, each with its rewrites."""
-    found, message = _quail_native.column_placements(logical)
-    if message is not None:
-        raise CompileError(message)
-    return tuple(SimpleNamespace(plan=text, rules=tuple(rules))
-                 for text, rules in found)
+def placements(operators):
+    """The column placements the planner prices, each with its rewrites.
+
+    Args:
+        operators: A region's operators as JSON.
+
+    Returns:
+        Each placement's operators, as JSON and read (``found``), and its
+        rewrites.
+    """
+    return tuple(SimpleNamespace(operators=text, found=read_operators(text),
+                                 rules=tuple(rules))
+                 for text, rules in _quail_native.column_placements(operators))
 
 
-def _optimize(logical, document_tokens, model=QWEN3_4B_FP8, **kwargs):
-    """Return a plan with one column placement and its rewrites."""
-    candidate, = placements(logical)
-    return candidate.plan, candidate.rules
+def read_operators(operators):
+    """A region's operators as Rust derives them, read for tests.
+
+    Each operator is a namespace of its fields, a list is a tuple, and an
+    expression is Quail's expression type, such as ColumnRef.
+    """
+    return _read(json.loads(operators))
+
+
+def operators_of(query):
+    """The operators Rust derives for a query's one model region, read."""
+    return read_operators(query.operators)
+
+
+def column_tests(found):
+    """Each table's tests of answers, in the order its operators run them."""
+    return [test for _, tests in found.column_filters for test in tests]
+
+
+def row_tests(found):
+    """The conditions tested on result rows above the SELECT list, lowest first."""
+    return [operator.Filter.condition for operator in found.after_projection
+            if hasattr(operator, "Filter")]
+
+
+def _read(value):
+    if isinstance(value, dict) and "type" in value:
+        return decode_plan_value(json.dumps(value))
+    if isinstance(value, dict):
+        return SimpleNamespace(**{key: _read(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_read(item) for item in value)
+    return value
 
 
 def search(alternatives, fields, word_tokenizer=tokenizer):
@@ -49,7 +85,7 @@ def search(alternatives, fields, word_tokenizer=tokenizer):
     vocabulary = Vocabulary(word_tokenizer)
     found, message = _quail_native.plan_operator(
         "search_plan", json.dumps(fields),
-        json.dumps({"alternatives": [[json.loads(alternative.plan),
+        json.dumps({"alternatives": [[json.loads(alternative.operators),
                                       list(alternative.rules)]
                                      for alternative in alternatives],
                     "rules": list(PHYSICAL_RULES)}),
@@ -58,12 +94,12 @@ def search(alternatives, fields, word_tokenizer=tokenizer):
         raise ValueError(message)
     found = json.loads(found)
     if "refusal" not in found:
-        found["logical"] = alternatives[found["alternative"]].plan
+        found["operators"] = alternatives[found["alternative"]].operators
         found["fields"] = fields
     return plan_from_json(found)
 
 
-def _plan(logical, document_tokens, model=QWEN3_4B_FP8, gpus=1, order=None,
+def _plan(operators, document_tokens, model=QWEN3_4B_FP8, gpus=1, order=None,
           attention=None):
     """Plan as a session would: the column placements, then the physical planner."""
     fields = {
@@ -72,13 +108,13 @@ def _plan(logical, document_tokens, model=QWEN3_4B_FP8, gpus=1, order=None,
         "gpus": gpus, "canvas_draws": 4,
         "document_tokens": {alias: [int(value) for value in lengths]
                             for alias, lengths in document_tokens.items()},
-        "plan": json.loads(logical), "attention": attention, "order": order,
+        "operators": json.loads(operators), "attention": attention, "order": order,
     }
-    return search(placements(logical), fields)
+    return search(placements(operators), fields)
 
 
 class _CompilingEngine:
-    """An engine that binds model regions and runs none."""
+    """An engine that plans model regions and runs none."""
 
     def __init__(self, model):
         self.turn, self.layout = tuple(model.turn), model.prompt_layout
@@ -89,7 +125,10 @@ class _CompilingEngine:
 
 
 def compile_sql(sql, catalog, dialect="snowflake", model=QWEN3_4B_FP8):
-    """Bind SQL against a catalog's schemas and return its one region's plan."""
+    """Plan SQL against a catalog's schemas; return its one region's operators.
+
+    The operators are JSON, as Rust derives them from the region's plan.
+    """
     import pyarrow as pa
 
     def refuse(_columns):
@@ -102,9 +141,9 @@ def compile_sql(sql, catalog, dialect="snowflake", model=QWEN3_4B_FP8):
             pass
         native.register(name, sink.getvalue().to_pybytes(), refuse,
                         getattr(provider, "id_col", None) or None)
-    (region,), _ = native.logical_plans(sql, tuple(model.turn), model.prompt_layout,
-                                        DATAFUSION_DIALECTS[dialect])
-    plan, message = region
+    (region,), _ = native.region_plans(sql, tuple(model.turn), model.prompt_layout,
+                                       DATAFUSION_DIALECTS[dialect])
+    found, message = region
     if message is not None:
         raise CompileError(message)
-    return plan
+    return json.loads(found)["operators"]

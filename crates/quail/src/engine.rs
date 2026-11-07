@@ -19,9 +19,10 @@ use pyo3::types::IntoPyDict;
 use std::collections::HashMap;
 
 use quail_datafusion::{
-    IdentifiedTable, InputRows, ModelRegion, RegionBatches, RegionRunner, bind, quail_column_names,
-    region_sql,
+    IdentifiedTable, InputRows, ModelRegion, RegionBatches, RegionRunner, derive,
+    quail_column_names, region_sql,
 };
+use quail_planner::operators::Operators;
 use quail_planner::prompts::Turn;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -34,7 +35,7 @@ use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 #[derive(Debug)]
 pub(crate) struct PythonRunner {
     pub(crate) engine: Py<PyAny>,
-    /// The model's chat-turn text and prompt layout, to bind regions in
+    /// The model's chat-turn text and prompt layout, to derive regions in
     /// Rust; None sends each region's SQL instead.
     pub(crate) prompting: Option<(Turn, String)>,
     /// While a query runs: the thread that called DataFusion, and where
@@ -55,26 +56,23 @@ pub(crate) struct RegionCall {
 }
 
 impl PythonRunner {
-    /// The request for one region: ("plan", its logical plan as JSON),
-    /// or ("sql", its SQL) for a region the Rust binder does not read.
+    /// The request for one region: ("plan", its operators and DataFusion
+    /// plan, as [`region_json`] writes them), or ("sql", its SQL) for a
+    /// region whose shape Quail's operators do not read.
     fn request(&self, region: &ModelRegion) -> Result<(&'static str, String)> {
         let Some((turn, layout)) = &self.prompting else {
             return Ok(("sql", region_sql(region)?));
         };
-        quail_datafusion::derive::shadow_check(region, turn, layout);
-        match bind::bind_model_region(region, turn, layout) {
-            Ok(plan) => Ok((
-                "plan",
-                quail_planner::write_logical_plan(&plan)
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?,
-            )),
-            Err(error) if error.0.contains(bind::UNSUPPORTED) => Ok(("sql", region_sql(region)?)),
+        match derive::derive_region(region, turn, layout) {
+            Ok((operators, plan)) => Ok(("plan", region_json(&operators, &plan)?)),
+            Err(error) if error.0.contains(derive::UNSUPPORTED) => Ok(("sql", region_sql(region)?)),
             Err(error) => Err(DataFusionError::Plan(format!("CompileError: {}", error.0))),
         }
     }
 
-    /// Plan a bound region in Rust, or None when Python plans it: a
-    /// region Rust refuses, or whose document is an expression.
+    /// Plan a region in Rust, or None when Python plans it: a region that
+    /// asks no model. `payload` is the region as [`region_json`] writes it;
+    /// the plan carries its DataFusion plan on to Python.
     fn plan_here(
         &self,
         region: &ModelRegion,
@@ -85,13 +83,11 @@ impl PythonRunner {
         let Some((planner, settings)) = &self.planning else {
             return Ok(None);
         };
-        let mut logical = quail_planner::read_logical_plan(payload)
-            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let (mut operators, logical) = read_region_json(payload)?;
         if let Some(fetch) = fetch {
-            logical.root = quail_planner::logical::with_limit(logical.root, fetch as i64);
+            operators = operators.limited(fetch as i64);
         }
         // Python plans a region that asks no model
-        let operators = quail_planner::operators::operators(&logical);
         let asks_model = !(operators.filters.is_empty()
             && operators.joins.is_empty()
             && operators.classifies.is_empty()
@@ -113,25 +109,25 @@ impl PythonRunner {
                 },
             );
         }
-        match planner.plan(logical, &tables, settings) {
-            Ok(PlanOutcome::Planned(planned)) => Ok(Some(
-                planned_json(&planned)
-                    .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?
-                    .to_string(),
-            )),
-            Ok(PlanOutcome::Refused(refused)) => {
-                Ok(Some(crate::planning::refused_json(&refused).to_string()))
-            }
-            Ok(PlanOutcome::Fixed(plan)) => Ok(Some(plan.to_string())),
-            Err(error) => Err(DataFusionError::Plan(format!("CompileError: {}", error.0))),
-        }
+        let compile = |error: quail_planner::CompileError| {
+            DataFusionError::Plan(format!("CompileError: {}", error.0))
+        };
+        let mut planned = match planner.plan(&operators, &tables, settings) {
+            Ok(PlanOutcome::Planned(planned)) => planned_json(&planned).map_err(compile)?,
+            Ok(PlanOutcome::Refused(refused)) => crate::planning::refused_json(&refused),
+            Ok(PlanOutcome::Fixed(plan)) => plan,
+            Err(error) => return Err(compile(error)),
+        };
+        planned["logical"] = logical.into();
+        Ok(Some(planned.to_string()))
     }
 
     /// Plan a region without running it, over the rows of its inputs that
     /// call no model; an input that calls a model plans as empty.
     ///
-    /// Returns ("plan", the planned region as JSON), ("plan", the logical
-    /// plan) when Rust leaves the region to Python, or ("sql", its SQL).
+    /// Returns ("plan", the region as [`region_json`] writes it, the
+    /// planned region as JSON or None when Python plans it), or ("sql",
+    /// its SQL, None).
     pub(crate) fn plan_only(
         &self,
         region: &ModelRegion,
@@ -230,6 +226,36 @@ impl RegionRunner for PythonRunner {
             _ => self.run_here(region, inputs, fetch),
         }
     }
+}
+
+/// A region as JSON: `operators`, its operators as JSON text, and
+/// `logical`, DataFusion's plan of the region as `display_indent` writes
+/// it.
+///
+/// # Errors
+///
+/// The operators do not write.
+pub fn region_json(
+    operators: &Operators,
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Result<String> {
+    let operators = crate::planning::operators_json(operators)
+        .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?;
+    Ok(serde_json::json!({
+        "operators": operators,
+        "logical": plan.display_indent().to_string(),
+    })
+    .to_string())
+}
+
+/// A region's operators and DataFusion plan text from [`region_json`].
+fn read_region_json(payload: &str) -> Result<(Operators, String)> {
+    let external = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+    let found: serde_json::Value = serde_json::from_str(payload).map_err(external)?;
+    let operators =
+        serde_json::from_str(found["operators"].as_str().unwrap_or_default()).map_err(external)?;
+    let logical = found["logical"].as_str().unwrap_or_default().to_string();
+    Ok((operators, logical))
 }
 
 /// An input's rows in the order of the registered table it holds rows of,

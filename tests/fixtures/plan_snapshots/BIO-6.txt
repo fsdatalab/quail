@@ -1,16 +1,20 @@
 logical:
-  Project: r.id, m.id
-    Filter: m.__label_m_0 IN ('cardiac disorders', 'vascular disorders') (selectivity=9.67%)
-      SemanticClassify: __label_m_0
-        PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the reaction above which MedDRA system organ class it belongs to.', m.term) labels=['cardiac disorders', 'vascular disorders', 'nervous system disorders', 'psychiatric disorders', 'eye disorders', 'ear and labyrinth disorders', 'respiratory, thoracic and mediastinal disorders', 'gastrointestinal disorders', 'hepatobiliary disorders', 'renal and urinary disorders', 'skin and subcutaneous tissue disorders', 'musculoskeletal and connective tissue disorders', 'blood and lymphatic system disorders', 'immune system disorders', 'endocrine disorders', 'metabolism and nutrition disorders', 'infections and infestations', 'neoplasms benign, malignant and unspecified', 'injury, poisoning and procedural complications', 'investigations', 'general disorders and administration site conditions', 'reproductive system and breast disorders', 'pregnancy, puerperium and perinatal conditions', 'congenital, familial and genetic disorders', 'surgical and medical procedures', 'social circumstances']
-        SemanticJoin (full)
-          PROMPT('Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?', r.report, m.term) (selectivity=3.4%)
-          Join
-            cross
-            SemanticFilter
-              PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the report above whether it describes a serious or life-threatening adverse event.\n\nInstruction: answer TRUE if the report describes a serious or life-threatening adverse event, FALSE otherwise.', r.report) (selectivity=63.8%)
-              Scan reports as r [report, id]
-            Scan terms as m [term, id]
+  Projection: r.id, m.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?"), r.report, m.term), named_struct(Utf8("selectivity"), Float64(0.03397338065661047))), filter: __quail_answer_1, returns: []
+      Cross Join:
+        AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the report above whether it describes a serious or life-threatening adverse event.
+  
+  {0}
+  
+  Instruction: answer TRUE if the report describes a serious or life-threatening adverse event, FALSE otherwise."), r.report), named_struct(Utf8("selectivity"), Float64(0.638))), filter: __quail_answer_2, returns: []
+          SubqueryAlias: r
+            TableScan: reports projection=[id, report]
+        Projection: m.id, m.term
+          AiNode: __quail_column_1 = ai_classify(prompt(Utf8("Judge strictly from the reaction above which MedDRA system organ class it belongs to.
+  
+  {0}"), m.term), make_array(Utf8("cardiac disorders"), Utf8("vascular disorders"), Utf8("nervous system disorders"), Utf8("psychiatric disorders"), Utf8("eye disorders"), Utf8("ear and labyrinth disorders"), Utf8("respiratory, thoracic and mediastinal disorders"), Utf8("gastrointestinal disorders"), Utf8("hepatobiliary disorders"), Utf8("renal and urinary disorders"), Utf8("skin and subcutaneous tissue disorders"), Utf8("musculoskeletal and connective tissue disorders"), Utf8("blood and lymphatic system disorders"), Utf8("immune system disorders"), Utf8("endocrine disorders"), Utf8("metabolism and nutrition disorders"), Utf8("infections and infestations"), Utf8("neoplasms benign, malignant and unspecified"), Utf8("injury, poisoning and procedural complications"), Utf8("investigations"), Utf8("general disorders and administration site conditions"), Utf8("reproductive system and breast disorders"), Utf8("pregnancy, puerperium and perinatal conditions"), Utf8("congenital, familial and genetic disorders"), Utf8("surgical and medical procedures"), Utf8("social circumstances"))), filter: hint(__quail_column_1 IN ([Utf8("cardiac disorders"), Utf8("vascular disorders")]), named_struct(Utf8("selectivity"), Float64(0.09671694764862467)))
+            SubqueryAlias: m
+              TableScan: terms projection=[id, term]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

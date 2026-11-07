@@ -1,11 +1,11 @@
 logical:
-  Project: c.id, k.id
-    SemanticJoin (full)
-      PROMPT('DOCUMENT {1} names a clause type and the question its labelers answered. Judge strictly from the contract in DOCUMENT {0} whether the answer to that question for this contract is yes.', c.text, k.question) (selectivity=19.3%)
-      Join
-        cross
-        Scan contracts as c [text, id]
-        Scan clause_types as k [question, id]
+  Projection: c.id, k.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("DOCUMENT {1} names a clause type and the question its labelers answered. Judge strictly from the contract in DOCUMENT {0} whether the answer to that question for this contract is yes."), c.text, k.question), named_struct(Utf8("selectivity"), Float64(0.19281905918876965))), filter: __quail_answer_1, returns: []
+      Cross Join:
+        SubqueryAlias: c
+          TableScan: contracts projection=[id, text]
+        SubqueryAlias: k
+          TableScan: clause_types projection=[id, question]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

@@ -10,10 +10,12 @@ Sort: contracts DESC NULLS LAST, governing_law_state ASC NULLS LAST
 
 model region:
 logical:
-  Project: governing_law_state
-    SemanticClassify: governing_law_state
-      PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the contract above which state's or country's law governs its interpretation.", c.text) labels=['New York', 'California', 'Delaware', 'Texas', 'Florida', 'another state or country', 'not stated']
-      Scan contracts as c [text]
+  Projection: governing_law_state
+    AiNode: governing_law_state = ai_classify(prompt(Utf8("Judge strictly from the contract above which state's or country's law governs its interpretation.
+  
+  {0}"), c.text), make_array(struct(Utf8("New York"), Utf8("")), struct(Utf8("California"), Utf8("")), struct(Utf8("Delaware"), Utf8("")), struct(Utf8("Texas"), Utf8("")), struct(Utf8("Florida"), Utf8("")), struct(Utf8("another state or country"), Utf8("a governing law other than those five")), struct(Utf8("not stated"), Utf8("the contract names no governing law"))))
+      SubqueryAlias: c
+        TableScan: contracts projection=[text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

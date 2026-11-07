@@ -1,8 +1,12 @@
 logical:
-  Project: r.id
-    SemanticFilter
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above whether it mentions at least one positive aspect of the movie.\n\nInstruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body) (selectivity=80.1%)
-      Scan reviews as r [body, id]
+  Projection: r.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the review above whether it mentions at least one positive aspect of the movie.
+  
+  {0}
+  
+  Instruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise."), r.body), named_struct(Utf8("selectivity"), Float64(0.8008))), filter: __quail_answer_1, returns: []
+      SubqueryAlias: r
+        TableScan: reviews projection=[id, body]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

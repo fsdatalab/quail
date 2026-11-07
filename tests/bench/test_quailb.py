@@ -1,7 +1,7 @@
 """CPU checks that every QUAIL-B query builds and plans on Quail."""
 
 
-from helpers.logical import nodes, read_plan
+from helpers.planning import operators_of
 from helpers.quailb_data import standin_sets
 from helpers.sessions import TOKENIZER
 
@@ -57,18 +57,16 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
             for qid, (_, build) in qdefs.items():
                 case = f"{backend} {qid}"
                 query = build()
+                found = operators_of(query)
                 selectivities = [
                     predicate.selectivity
-                    for node in nodes(query.logical, "SemanticFilter")
-                    for predicate in node.predicates]
-                selectivities += [join.selectivity
-                                  for join in nodes(query.logical, "SemanticJoin")]
+                    for _, predicates in found.filters for predicate in predicates]
+                selectivities += [join.selectivity for join in found.joins]
                 assert all((s is None) == qid.startswith("PRIV-")
                            for s in selectivities), case
                 plan = query.plan()
-                root = read_plan(query.logical).root
-                sorts = root.kind == "Result" and bool(
-                    root.order or root.distinct or root.offset)
+                sorts = bool(found.result.order or found.result.distinct
+                             or found.result.offset)
                 assert sorts <= (qid in relational), case
                 if backend != "quail" and sorts:
                     # a request backend sorts returned rows on the coordinator

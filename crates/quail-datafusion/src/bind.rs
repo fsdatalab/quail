@@ -3319,15 +3319,6 @@ pub(crate) fn has_subqueries(plan: &LogicalPlan) -> bool {
     .unwrap_or(false)
 }
 
-/// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,
-/// or the subquery itself.
-fn subquery_body(alias: &datafusion::logical_expr::SubqueryAlias) -> (String, &LogicalPlan) {
-    match alias.input.as_ref() {
-        LogicalPlan::SubqueryAlias(cte) => (cte.alias.table().to_string(), cte.input.as_ref()),
-        body => (alias.alias.table().to_string(), body),
-    }
-}
-
 /// A merged JOIN input: its alias, each column's expression, the table it
 /// reads, and its WHERE condition.
 pub(crate) type Merged = (String, Vec<(String, Expr)>, LogicalPlan, Option<Expr>);
@@ -3350,20 +3341,7 @@ pub(crate) type Merged = (String, Vec<(String, Expr)>, LogicalPlan, Option<Expr>
 /// each into the query that reads it. Each is its alias, its columns'
 /// expressions, the table it reads, and its WHERE.
 pub(crate) fn merged_subqueries(plan: &LogicalPlan) -> Vec<Merged> {
-    let mut readers: BTreeMap<String, usize> = BTreeMap::new();
-    let _ = plan.apply(|node| {
-        // each read of a CTE is one copy of its body under the CTE's name
-        if let LogicalPlan::SubqueryAlias(alias) = node
-            && !matches!(
-                alias.input.as_ref(),
-                LogicalPlan::TableScan(_) | LogicalPlan::SubqueryAlias(_)
-            )
-        {
-            *readers.entry(alias.alias.table().to_string()).or_default() += 1;
-        }
-        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
-    });
-    // the join inputs to merge: alias -> (its columns' expressions, its base, its WHERE)
+    let aliases = crate::claim::merged_aliases(plan);
     let mut merged: Vec<Merged> = Vec::new();
     let _ = plan.apply(|node| {
         let LogicalPlan::Join(join) = node else {
@@ -3373,7 +3351,10 @@ pub(crate) fn merged_subqueries(plan: &LogicalPlan) -> Vec<Merged> {
             let LogicalPlan::SubqueryAlias(alias) = side else {
                 continue;
             };
-            let (name, body) = subquery_body(alias);
+            if !aliases.contains(&alias.alias.table().to_string()) {
+                continue;
+            }
+            let (_, body) = crate::claim::subquery_body(alias);
             let LogicalPlan::Projection(projection) = body else {
                 continue;
             };
@@ -3383,14 +3364,6 @@ pub(crate) fn merged_subqueries(plan: &LogicalPlan) -> Vec<Merged> {
                 }
                 other => (other, None),
             };
-            let is_table = matches!(base, LogicalPlan::SubqueryAlias(found)
-                if matches!(found.input.as_ref(), LogicalPlan::TableScan(_)));
-            if !is_table
-                || readers.get(&name).copied().unwrap_or(0) > 1
-                || projection.expr.iter().any(contains_ai_call)
-            {
-                continue;
-            }
             let columns = projection
                 .expr
                 .iter()

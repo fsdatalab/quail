@@ -2,8 +2,8 @@
 
 import pyarrow as pa
 import pytest
-from helpers.logical import kinds, nodes
 from helpers.oracle import Oracle, finish, question_text
+from helpers.planning import column_tests, operators_of, placements
 from helpers.sessions import TOKENIZER
 
 import quail
@@ -95,9 +95,6 @@ def test_a_malformed_map_is_refused(session, sql, message):
 
 
 def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
-    import _quail_native
-    from helpers.planning import placements
-
     session.register("films", DocumentProvider.from_table(
         pa.table({"id": [7, 8], "plot": ["a heist", "a romance"]}), id_col="id"))
     query = session.sql(
@@ -106,14 +103,10 @@ def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
         "AI_FILTER(PROMPT('Is review {0} about film {1}?', r.body, f.plot))")
     # as written the map runs below the join, on every review; the
     # placement rule also offers it above the join, like a classification
-    written = kinds(query.logical)
-    assert written.index("SemanticMap") < written.index("SemanticJoin")
-    *_, placed = placements(query.logical)
-    moved = placed.plan
-    assert "should_lift_column_operators" in placed.rules
-    lifted = kinds(moved)
-    assert lifted.index("SemanticJoin") < lifted.index("SemanticMap")
-    assert _quail_native.validate_logical_plan(moved) is None
+    written, lifted = placements(query.operators)
+    assert [column.above_joins for column in written.found.maps] == [False]
+    assert lifted.rules == ("should_lift_column_operators",)
+    assert [column.above_joins for column in lifted.found.maps] == [True]
 
 
 @pytest.mark.parametrize("form,dialect", [("alias", "bq"), ("cte", "snowflake")])
@@ -161,12 +154,12 @@ def test_every_column_operator_supports_a_plain_result_test(session, kind, call,
         value.register("reviews", session.catalog.get("reviews"))
         query = value.sql(f"SELECT r.id, {call} AS value FROM reviews r "
                           f"WHERE HINT({operand} IS NOT NULL, {{'selectivity': 0.4}})")
-        (test,) = nodes(query.logical, "Filter")
+        (test,) = column_tests(operators_of(query))
         # the test follows the column operator whose answer it reads
-        assert test.input.call.kind == kind
+        assert test.call.kind == kind
         assert test.selectivity == 0.4
         plan = query.plan()
         (condition,) = [node for node in plan.nodes if node.type_name == "quail.filter"]
         producer = next(node for node in plan.nodes
                         if node.node_id == condition.inputs[0].source.node_id)
-        assert producer.spec.name == test.input.name
+        assert producer.spec.name == test.name

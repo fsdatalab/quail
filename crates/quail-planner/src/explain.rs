@@ -1,7 +1,9 @@
 //! The text of `explain()`: a region's logical plan and physical plan,
 //! with the planner's estimates and, after a run, what was measured.
 //!
-//! The request is JSON from Python: the logical plan, the physical plan
+//! The logical plan is DataFusion's plan of the region, as its
+//! `display_indent` writes it. The request is JSON from Python: that
+//! text, the region's operators, the physical plan
 //! as its envelope with its per node estimates in the plan's order, or a
 //! refusal, and optionally the run's report and per node metrics. A node
 //! whose type is not one of Quail's comes with its inputs, outputs, and
@@ -13,13 +15,10 @@ use quail_physical::{PhysicalNode, PortRef};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::expressions::{
-    column_name, condition_text, explain as explain_expression, explain_call, repr_float, repr_str,
-    sort_name,
-};
-use crate::logical::{LogicalNode, LogicalPlan, ScanColumn, table_name};
-use crate::nodes::{asked_call, children};
-use crate::operators::{Operators, SemanticJoin, operators};
+use crate::expressions::{column_name, condition_text, repr_float, repr_str};
+use crate::logical::table_name;
+use crate::nodes::asked_call;
+use crate::operators::{Operators, SemanticJoin};
 use crate::statistics::{DEFAULT_SELECTIVITY, effective_selectivity};
 
 /// The mark beside a selectivity the planner assumed.
@@ -40,7 +39,10 @@ const COLUMNS: [(&str, &str); 7] = [
 /// What to explain, as Python sends it.
 #[derive(Debug, Deserialize)]
 pub struct ExplainRequest {
-    pub logical: Option<LogicalPlan>,
+    /// DataFusion's plan of the region, one operator per line.
+    pub logical: Option<String>,
+    /// The operators the physical plan lowers.
+    pub operators: Option<Operators>,
     pub physical: Option<PhysicalRequest>,
     /// The refusal's fields, when no configuration can run the region.
     pub refusal: Option<Value>,
@@ -122,11 +124,7 @@ pub fn explain_text(request: &ExplainRequest) -> Result<String, String> {
     }
     let mut lines = vec!["logical:".to_string()];
     if let Some(logical) = &request.logical {
-        lines.extend(
-            logical_tree(logical)
-                .into_iter()
-                .map(|line| format!("  {line}")),
-        );
+        lines.extend(logical.lines().map(|line| format!("  {line}")));
     }
     if let Some(refusal) = &request.refusal {
         lines.push(format!(
@@ -188,10 +186,9 @@ pub fn explain_text(request: &ExplainRequest) -> Result<String, String> {
         );
     }
     lines.push(String::new());
-    let found = request.logical.as_ref().map(operators);
     let tree = physical_tree(
         &graph,
-        found.as_ref(),
+        request.operators.as_ref(),
         request.verbose,
         request.run.as_ref(),
         &physical.estimates,
@@ -363,11 +360,6 @@ fn default_note() -> String {
 
 // ---------------------------------------------------------------- values
 
-/// Python's `repr` of a JSON value.
-fn py_repr(value: &Value) -> String {
-    repr_as(value, false)
-}
-
 /// Python's `repr` of a JSON value, reading each array as a tuple when
 /// `tuples` holds, as a frozen dataclass's fields are.
 fn repr_as(value: &Value, tuples: bool) -> String {
@@ -447,20 +439,7 @@ fn width(text: &str) -> usize {
     text.chars().count()
 }
 
-// ---------------------------------------------------------------- logical
-
-fn prompt_text(prompt: &quail_physical::Prompt) -> String {
-    let arguments: Vec<String> = prompt
-        .args
-        .iter()
-        .map(|argument| column_name(argument, true))
-        .collect();
-    format!(
-        "PROMPT({}, {})",
-        repr_str(&prompt.template),
-        arguments.join(", ")
-    )
-}
+// ---------------------------------------------------------------- prompts
 
 fn short_prompt(prompt: &quail_physical::Prompt) -> String {
     let mut template = prompt.template.clone();
@@ -468,229 +447,6 @@ fn short_prompt(prompt: &quail_physical::Prompt) -> String {
         template = prefix(&template, PROMPT_CHARS) + "…";
     }
     format!("PROMPT({})", repr_str(&template))
-}
-
-fn sort_key_text(key: &quail_physical::SortKey) -> String {
-    format!(
-        "{} {} NULLS {}",
-        sort_name(&key.expression),
-        if key.descending { "DESC" } else { "ASC" },
-        if key.nulls_first { "FIRST" } else { "LAST" }
-    )
-}
-
-/// Whether a logical node reads the result rows: the Project, an Unnest,
-/// or a Filter above either.
-fn reads_projection(node: &LogicalNode) -> bool {
-    let mut node = node;
-    if matches!(node, LogicalNode::Project(_)) {
-        return true;
-    }
-    while let LogicalNode::Filter(filter) = node {
-        node = &filter.input;
-        if matches!(node, LogicalNode::Project(_)) {
-            return true;
-        }
-    }
-    matches!(node, LogicalNode::Unnest(_))
-}
-
-fn labels_repr(labels: &Value) -> String {
-    match labels {
-        Value::Array(items) => {
-            let items: Vec<String> = items.iter().map(py_repr).collect();
-            format!("[{}]", items.join(", "))
-        }
-        other => py_repr(other),
-    }
-}
-
-/// The logical operators and their expressions, one per line.
-pub fn logical_tree(plan: &LogicalPlan) -> Vec<String> {
-    let mut lines = Vec::new();
-    logical_visit(&plan.root, 0, &mut lines);
-    lines
-}
-
-fn logical_visit(node: &LogicalNode, depth: usize, lines: &mut Vec<String>) {
-    let pad = |depth: usize| "  ".repeat(depth);
-    let mut details: Vec<String> = Vec::new();
-    let title = match node {
-        LogicalNode::Result(result) => {
-            let mut depth = depth;
-            if let Some(limit) = result.limit {
-                lines.push(format!("{}Limit: {}", pad(depth), commas_int(limit)));
-                depth += 1;
-            }
-            if result.offset != 0 {
-                lines.push(format!(
-                    "{}Offset: {}",
-                    pad(depth),
-                    commas_int(result.offset)
-                ));
-                depth += 1;
-            }
-            if !result.order.is_empty() {
-                let keys: Vec<String> = result.order.iter().map(sort_key_text).collect();
-                lines.push(format!("{}Sort: {}", pad(depth), keys.join(", ")));
-                depth += 1;
-            }
-            if result.distinct {
-                lines.push(format!("{}Distinct", pad(depth)));
-                depth += 1;
-            }
-            logical_visit(&result.input, depth, lines);
-            return;
-        }
-        LogicalNode::Project(project) => {
-            let columns: Vec<String> = project
-                .columns
-                .iter()
-                .map(|column| match column {
-                    quail_physical::Projected::Name(name) => name.clone(),
-                    quail_physical::Projected::Expression(expression) => {
-                        explain_expression(expression)
-                    }
-                })
-                .collect();
-            details = project
-                .structs
-                .iter()
-                .map(|found| {
-                    let members: Vec<String> = found
-                        .fields
-                        .iter()
-                        .map(|field| format!("{}.{field}", found.name))
-                        .collect();
-                    format!("{} = struct({})", found.name, members.join(", "))
-                })
-                .collect();
-            format!("Project: {}", columns.join(", "))
-        }
-        LogicalNode::Unnest(unnest) => format!("Unnest: {}", unnest.columns.join(", ")),
-        LogicalNode::Scan(scan) => {
-            let document = match &scan.column {
-                ScanColumn::Unnamed(name) => name.clone(),
-                ScanColumn::Expression(expression) => column_name(expression, false),
-            };
-            let mut columns: Vec<String> = vec![document];
-            for column in &scan.columns {
-                if !columns.contains(column) {
-                    columns.push(column.clone());
-                }
-            }
-            let mut title = format!(
-                "Scan {} as {} [{}]",
-                table_name(&scan.provider),
-                scan.alias,
-                columns.join(", ")
-            );
-            if !scan.predicates.is_empty() {
-                let predicates: Vec<String> = scan.predicates.iter().map(condition_text).collect();
-                title += &format!(" where {}", predicates.join(" and "));
-            }
-            title
-        }
-        LogicalNode::SemanticFilter(filter) => {
-            details = filter
-                .predicates
-                .iter()
-                .map(|predicate| {
-                    format!(
-                        "{} (selectivity={})",
-                        prompt_text(&asked_call(&predicate.expression).prompt),
-                        selectivity(predicate.selectivity, false)
-                    )
-                })
-                .collect();
-            let mut title = "SemanticFilter".to_string();
-            if !filter.stop_key.is_empty() {
-                title += &format!(" stop_key={}", filter.stop_key.join(","));
-            }
-            title
-        }
-        LogicalNode::Filter(filter) => {
-            let mut title = format!("Filter: {}", condition_text(&filter.condition));
-            if !reads_projection(&filter.input) {
-                title += &format!(" (selectivity={})", selectivity(filter.selectivity, false));
-            }
-            title
-        }
-        LogicalNode::SemanticJoin(join) => {
-            details = vec![format!(
-                "{} (selectivity={})",
-                prompt_text(&asked_call(&join.predicate).prompt),
-                selectivity(join.selectivity, false)
-            )];
-            let mut title = format!("SemanticJoin ({})", join.semantics);
-            if let Some(anchor) = &join.anchor {
-                title += &format!(" anchor={anchor}");
-            }
-            title
-        }
-        LogicalNode::SemanticClassify(column) => {
-            let quail_physical::TaggedModelCall::Call(call) = &column.call;
-            let mut title = format!("SemanticClassify: {}", column.name);
-            if call.probabilities {
-                title += &format!(", {}_probabilities", column.name);
-            }
-            details = vec![format!(
-                "{} labels={}",
-                prompt_text(&call.prompt),
-                labels_repr(&call.labels)
-            )];
-            title
-        }
-        LogicalNode::SemanticExtract(column) => {
-            let quail_physical::TaggedModelCall::Call(call) = &column.call;
-            details = vec![format!("question={}", repr_str(&call.question))];
-            format!("SemanticExtract: {}, {}_span", column.name, column.name)
-        }
-        LogicalNode::Join(join) => {
-            details = join
-                .on
-                .iter()
-                .map(|equality| {
-                    format!(
-                        "on {} = {}",
-                        column_name(&equality.left, true),
-                        column_name(&equality.right, true)
-                    )
-                })
-                .collect();
-            if details.is_empty() {
-                details.push("cross".to_string());
-            }
-            "Join".to_string()
-        }
-        LogicalNode::SemanticMap(column) => {
-            let quail_physical::TaggedModelCall::Call(call) = &column.call;
-            details = vec![
-                format!("name={}", column.name),
-                format!("expression={}", explain_call(call)),
-                format!("max_answer_tokens={}", call.max_answer_tokens),
-            ];
-            "quail.semantic_map".to_string()
-        }
-        LogicalNode::SemanticSaeFeatures(column) => {
-            let quail_physical::TaggedModelCall::Call(call) = &column.call;
-            details = vec![
-                format!("name={}", column.name),
-                format!("expression={}", explain_call(call)),
-                format!("pooling={}", call.pooling),
-            ];
-            "quail.semantic_sae_features".to_string()
-        }
-    };
-    lines.push(format!("{}{title}", pad(depth)));
-    lines.extend(
-        details
-            .into_iter()
-            .map(|detail| format!("{}{detail}", pad(depth + 1))),
-    );
-    for child in children(node) {
-        logical_visit(child, depth + 1, lines);
-    }
 }
 
 // ---------------------------------------------------------------- physical

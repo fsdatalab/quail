@@ -3,7 +3,7 @@
 
 import pyarrow as pa
 import pytest
-from helpers.logical import nodes
+from helpers.planning import operators_of
 from helpers.sessions import CONFIG, TOKENIZER, _run, encoder, make_executor
 
 import quail
@@ -29,7 +29,7 @@ def session():
 def test_a_prompt_reads_a_struct_field_as_the_document(session):
     query = session.sql(
         "SELECT r.id FROM docs r WHERE AI_FILTER(PROMPT('q: {0}', r.details.body))")
-    (scan,) = nodes(query.logical, "Scan")
+    (scan,) = operators_of(query).scans
     assert str(scan.column) == "r.details.body"
     result = _run(query, make_executor({"r": {"q:": [1, 0, 1]}}))
     assert result.to_rows() == [("d0",), ("d2",)]
@@ -37,7 +37,8 @@ def test_a_prompt_reads_a_struct_field_as_the_document(session):
     bodies = ("one", "two words", "three words here")
     assert list(query.token_inputs()["r"].lengths) == [
         len(encoder()(text)) for text in bodies]
-    assert "details.body" in query.explain()
+    # DataFusion's plan of the region reads the field
+    assert 'get_field(r.details, Utf8("body"))' in query.explain()
 
 
 FILTERED = "FROM docs r WHERE AI_FILTER(PROMPT('q: {0}', r.details.body))"

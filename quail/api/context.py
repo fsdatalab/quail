@@ -3,10 +3,10 @@
 DataFusion parses and binds the query. Its rule ``ClaimModelRegions``
 replaces each part of the plan that calls an AI function, together
 with the operators around it that Quail plans, with one model region.
-Rust binds each region into Quail's logical plan, as ``Session.sql``
-compiles SQL, and Quail plans and runs it; DataFusion runs every
-operator outside the regions. A region the Rust binder does not read,
-such as one with a subquery in FROM, reaches Quail as SQL text.
+Rust derives each region's operators from DataFusion's plan of it, as
+``Session.sql`` compiles SQL, and Quail plans and runs them; DataFusion
+runs every operator outside the regions. A region whose shape Quail's
+operators do not read reaches Quail as SQL text.
 
 For example, imagine a ``reviews`` table with review text in ``body``:
 
@@ -25,6 +25,7 @@ model regions call ``quail.api.engine.Engine``.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 import pyarrow as pa
@@ -92,23 +93,26 @@ class SessionContext:
         """Return the SQL each model region of a query sends to Quail."""
         return self._native.region_sql(text)
 
-    def logical_plans(self, text: str) -> list[str]:
-        """Return the logical plan Rust binds for each model region, as JSON.
+    def region_plans(self, text: str) -> list[dict]:
+        """Return each model region Rust derives, as a dict.
+
+        Each dict holds ``operators``, the region's operators as JSON, and
+        ``logical``, DataFusion's plan of the region.
 
         Raises:
-            CompileError: The Rust binder refuses a region.
+            CompileError: Quail refuses a region.
         """
         from quail.common.expressions import CompileError
 
         model = self.session.model
-        bound, _ = self._native.logical_plans(text, tuple(model.turn),
-                                              model.prompt_layout)
-        plans = []
-        for plan, message in bound:
+        derived, _ = self._native.region_plans(text, tuple(model.turn),
+                                               model.prompt_layout)
+        regions = []
+        for found, message in derived:
             if message is not None:
                 raise CompileError(message)
-            plans.append(plan)
-        return plans
+            regions.append(json.loads(found))
+        return regions
 
     def explain(self, text: str, dialect: str = "snowflake") -> str:
         """Return DataFusion's optimized logical plan for a query."""

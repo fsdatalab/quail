@@ -102,11 +102,11 @@ def test_a_region_plans_and_answers_as_the_written_query(context, name):
 
 
 @pytest.mark.parametrize("name", QUERIES)
-def test_rust_binds_each_region_to_the_plan_session_sql_compiles(context, name):
+def test_rust_derives_each_region_as_session_sql_compiles_it(context, name):
     text = QUERIES[name]
-    (plan,) = context.logical_plans(text)
-    expected = context.session.sql(text).logical
-    assert plan == expected
+    (region,) = context.region_plans(text)
+    query = context.session.sql(text)
+    assert (region["operators"], region["logical"]) == (query.operators, query.logical)
 
 
 def test_operators_outside_a_region_run_in_datafusion(context):

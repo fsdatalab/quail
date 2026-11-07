@@ -6,10 +6,14 @@ ModelRegion
 
 model region:
 logical:
-  Project: u.id
-    SemanticFilter
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the customer message above whether the customer expresses frustration or dissatisfaction with the agent, such as repeating a request, objecting to a refusal, or complaining about the service.\n\nInstruction: answer TRUE if the customer expresses frustration or dissatisfaction with the agent, FALSE otherwise.', u.content) (selectivity=2.21%)
-      Scan support_messages as u [content, id]
+  Projection: u.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the customer message above whether the customer expresses frustration or dissatisfaction with the agent, such as repeating a request, objecting to a refusal, or complaining about the service.
+  
+  {0}
+  
+  Instruction: answer TRUE if the customer expresses frustration or dissatisfaction with the agent, FALSE otherwise."), u.content), named_struct(Utf8("selectivity"), Float64(0.022080185938407902))), filter: __quail_answer_1, returns: []
+      SubqueryAlias: u
+        TableScan: support_messages__u projection=[id, content]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

@@ -1,13 +1,12 @@
 """DataFusion's DISTINCT rules in a model region.
 
 EliminateDistinct drops a DISTINCT that removes no row; PushDownDistinct
-gives a one-table SemanticFilter the selected columns as its stop key.
+gives a one-table AI filter the selected columns as its stop key.
 """
 
 
 import pyarrow as pa
 import pytest
-from helpers.logical import nodes
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
@@ -29,14 +28,13 @@ def session():
     "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) GROUP BY r.stars",
 ])
 def test_a_distinct_that_removes_no_row_is_eliminated(session, text):
-    plan = session.sql(text).logical
-    assert not any(result.distinct for result in nodes(plan, "Result"))
+    # DataFusion's plan of the region, as explain() shows it
+    assert "Distinct" not in session.sql(text).logical
 
 
 def test_a_distinct_on_one_tables_columns_stops_its_filter_at_the_first_match(session):
-    plan = session.sql("SELECT DISTINCT r.stars FROM reviews r "
-                       "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))").logical
-    (result,) = nodes(plan, "Result")
-    assert result.distinct
-    (found,) = nodes(plan, "SemanticFilter")
-    assert found.stop_key == ("stars",)
+    query = session.sql("SELECT DISTINCT r.stars FROM reviews r "
+                        "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))")
+    assert "Distinct" in query.logical
+    assert "fetch: 1 per [stars]" in query.logical
+    assert query.facts()["stop_keys"] == {"r": ["stars"]}

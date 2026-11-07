@@ -89,8 +89,8 @@ class Engine:
 
         Args:
             planned: The planned region as JSON: its physical plan, the
-                logical plan it lowers, and each scan's files; or its
-                refusal.
+                operators it lowers, DataFusion's plan of the region, and
+                each scan's files; or its refusal.
             tables: The rows of each table the region reads, by name.
 
         Raises:
@@ -102,7 +102,8 @@ class Engine:
         found = json.loads(planned)
         if "refusal" in found:
             raise RefusalError(refusal_from_fields(found["refusal"]))
-        query = region_query(self.session, found["logical"], order=self._order,
+        query = region_query(self.session, found["operators"],
+                             logical=found.get("logical", ""), order=self._order,
                              tables=tables, keep_order=True)
         query.adopt_plan(found)
         return self._run(query)
@@ -118,9 +119,10 @@ class Engine:
         """Plan and run one model region and return its rows.
 
         Args:
-            kind: "plan" for a region's logical plan as JSON, or "sql" for
-                the SQL of a region the Rust binder does not read.
-            payload: The plan or SQL.
+            kind: "plan" for a region as JSON, its operators and DataFusion's
+                plan of it, or "sql" for the SQL of a region whose shape
+                Quail's operators do not read.
+            payload: The region or SQL.
             tables: The rows of each table the region reads from
                 DataFusion, by table name.
             fetch: The most rows DataFusion reads, or None.
@@ -128,11 +130,12 @@ class Engine:
         from quail.api.region_inputs import region_query
 
         if kind == "plan":
-            logical = payload
+            found = json.loads(payload)
+            operators = found["operators"]
             if fetch is not None:
-                logical = _quail_native.limited_plan(logical, fetch)
-            query = region_query(self.session, logical, order=self._order,
-                                 tables=tables)
+                operators = _quail_native.limited_operators(operators, fetch)
+            query = region_query(self.session, operators, logical=found["logical"],
+                                 order=self._order, tables=tables)
         else:
             query = self.session.sql(payload, order=self._order)
         return self._run(query)

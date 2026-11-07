@@ -6,8 +6,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from helpers import baselines as request_tests
-from helpers.logical import kinds, nodes, read_plan
 from helpers.oracle import Oracle, finish, oracle_executor, question_text
+from helpers.planning import column_tests, operators_of, row_tests
 from helpers.sessions import TOKENIZER
 
 import quail
@@ -296,20 +296,16 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     query = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
         f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE {tests}")
-    # each test follows its field's extraction; the span and length
-    # tests use the same Filter node
-    assert kinds(query.logical) == [
-        "Scan", "SemanticExtract", "Filter", "Filter", "Filter",
-        "SemanticExtract", "Filter", "Project"]
-    tests = nodes(query.logical, "Filter")
-    assert [str(node.condition) for node in tests] == [
+    # each test follows its field's extraction
+    found = operators_of(query)
+    assert [column.name for column in found.extracts] == ["lease.ends", "lease.rent"]
+    tests = column_tests(found)
+    assert [str(test.condition) for test in tests] == [
         "c.lease.ends IS NOT NULL", "c.lease.ends ilike '%march%'",
         "c.lease.ends_span.start < 20", "length(c.lease.rent) < 20"]
-    assert [node.selectivity for node in tests] == [0.5, 0.5, 0.5, 0.5]
+    assert [test.selectivity for test in tests] == [0.5, 0.5, 0.5, 0.5]
     # the first three tests read the first field, the last the second
-    assert [nodes(query.logical, "SemanticExtract").index(node.input)
-            if node.input.kind == "SemanticExtract" else None
-            for node in tests] == [0, None, None, 1]
+    assert [test.name for test in tests] == ["lease.ends"] * 3 + ["lease.rent"]
     plan = query.plan()
     assert not isinstance(plan, Refusal)
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
@@ -350,8 +346,8 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     negated = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
         "FROM contracts c WHERE NOT (lease.ends LIKE 'March%')")
-    assert str(read_plan(negated.logical).root.input.condition) == (
-        "NOT (c.lease.ends like 'March%')")
+    (test,) = column_tests(operators_of(negated))
+    assert str(test.condition) == "NOT (c.lease.ends like 'March%')"
     result = execute_query(negated, physical_executor=_answers_executor(
         {0: "March 3, 2027", 1: None}))
     assert result.collect().num_rows == 0
@@ -364,8 +360,9 @@ def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(sessio
             f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE ")
 
     def placed(query):
-        return [(node.input.kind, str(node.condition))
-                for node in nodes(query.logical, "Filter")]
+        found = operators_of(query)
+        return ([("extraction", str(test.condition)) for test in column_tests(found)]
+                + [("rows", str(condition)) for condition in row_tests(found)])
 
     def kept(query):
         result = execute_query(query, physical_executor=_answers_executor(
@@ -375,22 +372,22 @@ def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(sessio
     # one extraction's answer and span: the Filter follows the extraction
     one = session.sql(head + "NOT (lease.ends IS NULL OR lease_span.ends.start < 0)")
     assert placed(one) == [
-        ("SemanticExtract", "c.lease.ends IS NOT NULL"),
-        ("Filter", "NOT (c.lease.ends_span.start < 0)")]
+        ("extraction", "c.lease.ends IS NOT NULL"),
+        ("extraction", "NOT (c.lease.ends_span.start < 0)")]
     one = session.sql(head + "lease.ends IS NULL OR lease_span.ends.start >= 0")
     assert placed(one) == [
-        ("SemanticExtract", "c.lease.ends IS NULL OR c.lease.ends_span.start >= 0")]
+        ("extraction", "c.lease.ends IS NULL OR c.lease.ends_span.start >= 0")]
     assert kept(one) == [1, 2]
     # an answer and a source column, or two extractions: after the last
     # extraction read, each other column read by document ID
     mixed = session.sql(head + "NOT (lease.ends IS NULL AND c.id = 2)")
     # DataFusion computes the source column's test, c.id = 2
     assert placed(mixed) == [
-        ("SemanticExtract", "c.lease.ends IS NOT NULL OR NOT (c.__quail_expr_0)")]
+        ("extraction", "c.lease.ends IS NOT NULL OR NOT (c.__quail_expr_0)")]
     assert kept(mixed) == [1]
     fields = session.sql(head + "lease.ends = 'x' OR lease.rent IS NOT NULL")
     assert placed(fields) == [
-        ("SemanticExtract", "c.lease.ends = 'x' OR c.lease.rent IS NOT NULL")]
+        ("extraction", "c.lease.ends = 'x' OR c.lease.rent IS NOT NULL")]
     (test,) = [node for node in fields.plan().nodes if isinstance(node, Filter)]
     assert [port.source.node_id for port in test.inputs] == [
         "ai-extract:1", "ai-extract:0"]
