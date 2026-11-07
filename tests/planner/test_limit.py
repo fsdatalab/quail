@@ -25,12 +25,14 @@ AI_IF = "AI_FILTER(PROMPT('kind: {0}', r.body))"
 ORACLE = Oracle(filters=lambda alias, document, position: document in (1, 2, 4, 5),
                 labels=lambda spec, ids: "a" if ids[0] % 2 == 0 else "b")
 PASSING = [("r1",), ("r2",), ("r4",), ("r5",)]
+NOTES = REVIEWS.set_column(0, "id", pa.array([f"n{index}" for index in range(6)]))
 
 
 def _session(rules) -> quail.Session:
     session = quail.Session(CONFIG, tokenizer=TOKENIZER,
                             registry=built_in_registry(logical_rules=rules))
     session.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+    session.register("notes", quail.DocumentProvider.from_table(NOTES, id_col="id"))
     return session
 
 
@@ -108,3 +110,18 @@ def test_a_limit_over_a_projection_of_an_answer_becomes_the_fetch(sessions):
     labeled = [(f"r{index}", "a!" if index % 2 == 0 else "b!") for index in range(6)]
     for rows in _rows_on_and_off(sessions, sql):
         _assert_some_of(rows, labeled, 2)
+
+
+def test_a_limit_over_a_union_becomes_the_fetch_of_each_branch(sessions):
+    # Limit_k(R ⊎ S) = Limit_k(Limit_k(R) ⊎ Limit_k(S))
+    sql = (f"SELECT r.id FROM reviews r WHERE {AI_IF} UNION ALL "
+           "SELECT n.id FROM notes n WHERE AI_FILTER(PROMPT('kind: {0}', n.body)) "
+           "LIMIT 3")
+    for session, fetched in zip(sessions, (True, False), strict=True):
+        regions = session.sql(sql).regions()
+        assert len(regions) == 2
+        for region in regions:
+            assert ("fetch: 3" in region.logical) == fetched, region.logical
+    passing = PASSING + [(f"n{row[0][1:]}",) for row in PASSING]
+    for rows in _rows_on_and_off(sessions, sql):
+        _assert_some_of(rows, passing, 3)

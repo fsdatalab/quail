@@ -93,6 +93,7 @@ names the rule that makes each rewrite and when it applies.
 | R8 | `Limit_k(π(R)) ⇒ π(Limit_k(R))` | DataFusion's `push_down_limit`; `push_down_limit_into_ai_nodes` also reads through projections | The projection keeps one row per row. Over an `AiNode`, the LIMIT becomes the node's fetch (R9). |
 | R9 | `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))` | `push_down_limit_into_ai_nodes` | Only projections and aliases are between them, the node has no `HINT` and no per-key fetch, and `k > 0`. |
 | R10 | `Limit_{k,m}(AI(R; n)) ⇒ Limit_{k,m}(AI(R; n = min(k + m, n)))` | `push_down_limit_into_ai_nodes` | As R9, for a LIMIT with an OFFSET of `m`. |
+| R11 | `Limit_k(R ⊎ S) ⇒ Limit_k(Limit_k(R) ⊎ Limit_k(S))` | DataFusion's `push_down_limit`, then `push_down_limit_into_ai_nodes` | `⊎` is UNION ALL. Each branch's LIMIT becomes its `AiNode`'s fetch as R9 allows. |
 | R12 | `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))` | `push_down_distinct` | `K` is input columns or a classification's label, and the node has no fetch. |
 
 R1 needs no rule of its own. Quail moves each plain filter term to its
