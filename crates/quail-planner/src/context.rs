@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use quail_cost::specs::{DeviceSpec, ModelSpec};
 
 use crate::expressions::CompileError;
-use crate::logical::LogicalPlan;
 use crate::lowering::{Decoder, LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
+use crate::operators::Operators;
 
 /// The model, device, table statistics, and tokenizer of one query's planning.
 #[derive(Clone)]
@@ -30,8 +30,8 @@ pub struct PlanningContext<'a> {
     pub scan_fractions: BTreeMap<String, f64>,
     /// The stage order rule the query asked for, if any.
     pub order: Option<String>,
-    /// The logical plan being planned, if any.
-    pub logical_plan: Option<LogicalPlan>,
+    /// The operators of the plan being planned, if any.
+    pub operators: Option<Operators>,
     /// alias -> whether each document is the first of its text, for a
     /// table with copies.
     pub first_documents: BTreeMap<String, Vec<bool>>,

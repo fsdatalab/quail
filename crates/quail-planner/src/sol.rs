@@ -26,10 +26,9 @@ use crate::expressions::{
     CompileError, SPAN_SUFFIX, aliased_call, call_aliases, condition_columns, condition_text,
     repr_str,
 };
-use crate::logical::{LogicalNode, LogicalPlan};
 use crate::lowering::LoweredPrompt;
-use crate::nodes::{asked_call, column_alias, column_call, walk};
-use crate::operators::{Operators, operators};
+use crate::nodes::asked_call;
+use crate::operators::{Operators, SemanticColumn};
 use crate::plan_statistics::plan_prompts;
 use crate::search::{
     ASK, StepKey, StepPricing, default_order_rule, label_calls, order_steps, resident_after,
@@ -111,17 +110,12 @@ fn round_to(value: f64, digits: usize) -> f64 {
 }
 
 /// Refuse any operator the estimate cannot price, as `_refuse_unpriced`.
-fn refuse_unpriced(plan: &LogicalPlan, found: &Operators) -> Result<(), CompileError> {
-    for node in walk(plan) {
-        match node {
-            LogicalNode::Result(result)
-                if result.limit.is_some()
-                    && !(!result.order.is_empty() || result.distinct || result.offset != 0) =>
-            {
-                return not_priced("the speed of light estimate does not price LIMIT");
-            }
-            _ => {}
-        }
+fn refuse_unpriced(found: &Operators) -> Result<(), CompileError> {
+    let result = &found.result;
+    if result.limit.is_some()
+        && !(!result.order.is_empty() || result.distinct || result.offset != 0)
+    {
+        return not_priced("the speed of light estimate does not price LIMIT");
     }
     for (alias, predicates) in &found.filters {
         for predicate in predicates {
@@ -255,8 +249,8 @@ fn label_name(found: &Operators, call: &ModelCall) -> String {
         .classifies
         .iter()
         .rev()
-        .find(|node| column_call(node) == call)
-        .map(|node| node.name.clone())
+        .find(|column| column.call == *call)
+        .map(|column| column.name.clone())
         .unwrap_or_default()
 }
 
@@ -517,8 +511,7 @@ fn cyclic_live_rows(
 struct Estimate<'a, 'c> {
     context: &'a PlanningContext<'c>,
     oracles: &'a Oracles<'a>,
-    found: Operators,
-    plan: &'a LogicalPlan,
+    found: &'a Operators,
     inputs: EstimateInputs,
     aliases: BTreeMap<String, AliasData>,
     decode_cost: DecodeCost,
@@ -796,7 +789,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
     ) -> Result<(Vec<(String, Vec<i64>)>, Work, Vec<Map<String, Value>>), CompileError> {
         let rule = match &self.inputs.order {
             Some(order) => order.clone(),
-            None => default_order_rule(&self.found).0,
+            None => default_order_rule(self.found).0,
         };
         let mut survivors: Vec<(String, Vec<i64>)> = self
             .inputs
@@ -821,27 +814,14 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 .map(|(_, predicates)| predicates.clone())
                 .unwrap_or_default();
             let asks: Vec<usize> = (0..predicates.len()).collect();
-            let mut columns: Vec<(String, LogicalNode)> = Vec::new();
-            for (kind, list) in [
-                ("label", &self.found.classifies),
-                ("extract", &self.found.extracts),
-                ("features", &self.found.sae_features),
-                ("map", &self.found.maps),
-            ] {
-                for node in list {
-                    if column_alias(node) != alias || call_aliases(column_call(node)).len() != 1 {
-                        continue;
-                    }
-                    let logical = match kind {
-                        "label" => LogicalNode::SemanticClassify(node.clone()),
-                        "extract" => LogicalNode::SemanticExtract(node.clone()),
-                        "features" => LogicalNode::SemanticSaeFeatures(node.clone()),
-                        _ => LogicalNode::SemanticMap(node.clone()),
-                    };
-                    match columns.iter_mut().find(|(name, _)| *name == node.name) {
-                        Some(slot) => slot.1 = logical,
-                        None => columns.push((node.name.clone(), logical)),
-                    }
+            let mut columns: Vec<(String, SemanticColumn)> = Vec::new();
+            for column in self.found.columns() {
+                if column.alias() != alias || call_aliases(&column.call).len() != 1 {
+                    continue;
+                }
+                match columns.iter_mut().find(|(name, _)| *name == column.name) {
+                    Some(slot) => slot.1 = column.clone(),
+                    None => columns.push((column.name.clone(), column.clone())),
                 }
             }
             if asks.is_empty() && columns.is_empty() {
@@ -854,7 +834,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 int_true_divide(tokens.iter().sum::<i64>() as i128, tokens.len() as i128)
             };
             let steps = table_steps(
-                &self.found,
+                self.found,
                 &alias,
                 &asks,
                 &StepPricing::Estimate {
@@ -908,26 +888,23 @@ impl<'a, 'c> Estimate<'a, 'c> {
                         &mut stages,
                     )?,
                     StepKey::Name(name) => {
-                        let node = columns
+                        let column = columns
                             .iter()
                             .find(|(found, _)| found == name)
                             .expect("a column")
                             .1
                             .clone();
-                        match &node {
-                            LogicalNode::SemanticClassify(column) => {
-                                self.classify_stage(&alias, column, &rows, first, &mut stages)?
+                        match column.call.kind.as_str() {
+                            "label" => {
+                                self.classify_stage(&alias, &column, &rows, first, &mut stages)?
                             }
-                            LogicalNode::SemanticExtract(column) => {
-                                self.extract_stage(&alias, column, &rows, first, &mut stages)?
+                            "extract" => {
+                                self.extract_stage(&alias, &column, &rows, first, &mut stages)?
                             }
-                            LogicalNode::SemanticSaeFeatures(column) => {
-                                self.features_stage(&alias, column, &rows, first, &mut stages)?
+                            "features" => {
+                                self.features_stage(&alias, &column, &rows, first, &mut stages)?
                             }
-                            LogicalNode::SemanticMap(column) => {
-                                self.map_stage(&alias, column, &rows, first, &mut stages)?
-                            }
-                            _ => unreachable!(),
+                            _ => self.map_stage(&alias, &column, &rows, first, &mut stages)?,
                         }
                     }
                 };
@@ -978,16 +955,16 @@ impl<'a, 'c> Estimate<'a, 'c> {
     fn classify_stage(
         &mut self,
         alias: &str,
-        node: &crate::logical::SemanticColumn,
+        column: &SemanticColumn,
         rows: &[i64],
         first: bool,
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
-        let call = column_call(node);
+        let call = &column.call;
         let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
         let work = self.question_work(alias, rows, tail, first);
         self.answer_rows += rows.len() as f64;
-        let name = label_name(&self.found, call);
+        let name = label_name(self.found, call);
         let mut record = stage(
             CLASSIFY,
             alias,
@@ -1056,12 +1033,12 @@ impl<'a, 'c> Estimate<'a, 'c> {
     fn features_stage(
         &mut self,
         alias: &str,
-        node: &crate::logical::SemanticColumn,
+        column: &SemanticColumn,
         rows: &[i64],
         first: bool,
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
-        let call = column_call(node);
+        let call = &column.call;
         let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
         let mut work = self.question_work(alias, rows, tail, first);
         let tokens = &self.aliases[alias].tokens;
@@ -1092,7 +1069,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             rows,
             &work,
         );
-        record.insert("name".into(), Value::from(node.name.clone()));
+        record.insert("name".into(), Value::from(column.name.clone()));
         stages.push(record);
         Ok((rows.to_vec(), work))
     }
@@ -1104,12 +1081,12 @@ impl<'a, 'c> Estimate<'a, 'c> {
     fn extract_stage(
         &mut self,
         alias: &str,
-        node: &crate::logical::SemanticColumn,
+        column: &SemanticColumn,
         rows: &[i64],
         first: bool,
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
-        let call = column_call(node);
+        let call = &column.call;
         let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
         let mut work = self.question_work(alias, rows, tail, first);
         let mut answers = BTreeMap::new();
@@ -1153,7 +1130,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             rows,
             &work,
         );
-        record.insert("name".into(), Value::from(node.name.clone()));
+        record.insert("name".into(), Value::from(column.name.clone()));
         record.insert("answer_rows".into(), Value::from(answer_rows));
         stages.push(record);
         let mut rows = rows.to_vec();
@@ -1165,7 +1142,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             .map(|(_, tests)| tests.clone())
             .unwrap_or_default();
         for test in tests {
-            if test.name != node.name {
+            if test.name != column.name {
                 continue;
             }
             let passed = self.answer_survivors(&test.condition, &rows, &answers)?;
@@ -1180,7 +1157,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 &passed,
                 &Work::default(),
             );
-            record.insert("name".into(), Value::from(node.name.clone()));
+            record.insert("name".into(), Value::from(column.name.clone()));
             record.insert(
                 "condition".into(),
                 Value::from(condition_text(&test.condition)),
@@ -1194,7 +1171,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
     fn map_stage(
         &mut self,
         alias: &str,
-        node: &crate::logical::SemanticColumn,
+        column: &SemanticColumn,
         rows: &[i64],
         first: bool,
         stages: &mut Vec<Map<String, Value>>,
@@ -1205,7 +1182,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                  attention",
             );
         }
-        let call = column_call(node);
+        let call = &column.call;
         let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
         let mut work = self.question_work(alias, rows, tail, first);
         let mut answer_rows = 0;
@@ -1214,7 +1191,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             let Value::String(answer) = answer else {
                 return Err(CompileError::new(format!(
                     "ValueError: the answer oracle gave no answer for map {} on {} row {row}",
-                    repr_str(&node.name),
+                    repr_str(&column.name),
                     repr_str(alias)
                 )));
             };
@@ -1259,7 +1236,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             rows,
             &work,
         );
-        record.insert("name".into(), Value::from(node.name.clone()));
+        record.insert("name".into(), Value::from(column.name.clone()));
         record.insert("answer_rows".into(), Value::from(answer_rows));
         stages.push(record);
         Ok((rows.to_vec(), work))
@@ -1372,7 +1349,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         Ok((
             work.clone(),
             json!({
-                "name": label_name(&self.found, call),
+                "name": label_name(self.found, call),
                 "template": call.prompt.template,
                 "pairs": pairs,
                 "fresh_tokens": work.tokens.total(),
@@ -1427,21 +1404,20 @@ fn allowed_map(rows: &[(i64, Vec<i64>)]) -> BTreeMap<i64, BTreeSet<i64>> {
 /// The plan holds an operator the estimate does not price (the message
 /// starts with "NotImplementedError: "), or a callback fails.
 pub fn speed_of_light_estimate(
-    plan: &LogicalPlan,
+    found: &Operators,
     context: &PlanningContext,
     inputs: EstimateInputs,
     oracles: &Oracles,
 ) -> Result<Value, CompileError> {
-    let found = operators(plan);
-    refuse_unpriced(plan, &found)?;
-    if !label_calls(&found).is_empty() && oracles.label.is_none() {
+    refuse_unpriced(found)?;
+    if !label_calls(found).is_empty() && oracles.label.is_none() {
         return Err(CompileError::new(
             "ValueError: the query classifies documents; pass label=(prompt, assignment) -> str \
              giving each row's reference label",
         ));
     }
     let mut pre = 0;
-    for prompt in plan_prompts(&found) {
+    for prompt in plan_prompts(found) {
         if prompt.kind != "score" {
             pre = context.lowered(&prompt)?.preamble_token_ids.len() as i64;
             break;
@@ -1450,8 +1426,8 @@ pub fn speed_of_light_estimate(
     let max_pooling = found
         .sae_features
         .iter()
-        .filter(|node| column_call(node).pooling == "max")
-        .map(column_alias)
+        .filter(|column| column.call.pooling == "max")
+        .map(SemanticColumn::alias)
         .collect();
     let aliases = inputs
         .aliases
@@ -1467,7 +1443,6 @@ pub fn speed_of_light_estimate(
         window: context.model.sliding_window,
         chunk: inputs.chunk_tokens,
         found,
-        plan,
         aliases,
         inputs,
         computed_rows_by_column: BTreeMap::new(),
@@ -1476,7 +1451,6 @@ pub fn speed_of_light_estimate(
         map_passes: BTreeMap::new(),
         max_pooling,
     };
-    let _ = estimate.plan;
     let (survivors, filter_work, filter_stages) = estimate.run_filters()?;
     let resident: BTreeSet<String> = filter_stages
         .iter()
@@ -1598,7 +1572,7 @@ fn search_joins(
         relations.push(PairRelation { left, right, pairs });
     }
     let mut joined_classifications: Vec<(BTreeSet<String>, Vec<ModelCall>)> = Vec::new();
-    for (call, _) in label_calls(&estimate.found) {
+    for (call, _) in label_calls(estimate.found) {
         let aliases: BTreeSet<String> = call_aliases(&call).into_iter().collect();
         if aliases.len() != 2 {
             continue;

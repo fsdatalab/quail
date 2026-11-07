@@ -1,15 +1,15 @@
-//! Lower and refine every logical alternative, then select the cheapest,
-//! as `quail/planner/optimize.py` does.
+//! Lower and refine every alternative's operators, then select the
+//! cheapest, as `quail/planner/optimize.py` does.
 
 use serde_json::{Map, Value};
 
 use crate::context::PlanningContext;
 use crate::expressions::{CompileError, Refusal};
 use crate::graph::{PhysicalPlan, Planned, plan_region};
+use crate::operators::Operators;
 use crate::physical_rules::apply_plan_rules;
-use crate::rules::LogicalAlternative;
 
-/// The selected plan and the logical alternative it lowers.
+/// The selected plan and the index of the alternative it lowers.
 pub struct Selected {
     pub plan: PhysicalPlan,
     pub alternative: usize,
@@ -18,19 +18,22 @@ pub struct Selected {
 /// Plan each alternative, apply the physical rules, and select the
 /// cheapest, as `search_plan`. Ties go to the earlier alternative.
 ///
+/// Each alternative is a plan's operators and the rewrites that produced
+/// the plan.
+///
 /// # Errors
 ///
 /// A callback fails, or a plan is malformed.
 pub fn search_plan(
-    alternatives: &[LogicalAlternative],
+    alternatives: &[(Operators, Vec<String>)],
     context: &PlanningContext,
     rules: &[String],
 ) -> Result<Result<Selected, Refusal>, CompileError> {
     let mut candidates: Vec<Planned> = Vec::new();
-    for alternative in alternatives {
+    for (found, _) in alternatives {
         let mut candidate_context = context.clone();
-        candidate_context.logical_plan = Some(alternative.plan.clone());
-        let planned = match plan_region(&alternative.plan, &candidate_context)? {
+        candidate_context.operators = Some(found.clone());
+        let planned = match plan_region(found, &candidate_context)? {
             Ok(plan) => apply_plan_rules(plan, rules, &candidate_context)?,
             Err(refusal) => Err(refusal),
         };
@@ -62,9 +65,9 @@ pub fn search_plan(
         .iter()
         .zip(alternatives)
         .enumerate()
-        .map(|(index, (candidate, alternative))| {
+        .map(|(index, (candidate, (_, rules)))| {
             let mut entry = Map::new();
-            entry.insert("rewrites".into(), Value::from(alternative.rules.clone()));
+            entry.insert("rewrites".into(), Value::from(rules.clone()));
             entry.insert(
                 "estimated_seconds".into(),
                 match candidate {

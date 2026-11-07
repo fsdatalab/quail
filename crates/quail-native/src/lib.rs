@@ -484,7 +484,11 @@ fn plan_operator<'py>(
             .collect(),
         scan_fractions: fields.scan_fractions,
         order: fields.order,
-        logical_plan: fields.plan.map(json_value).transpose()?,
+        operators: fields
+            .plan
+            .map(json_value::<quail_planner::LogicalPlan>)
+            .transpose()?
+            .map(|plan| quail_planner::operators::operators(&plan)),
         first_documents: fields.first_documents,
         page_shared: fields.page_shared,
         reader_groups: fields.reader_groups,
@@ -550,7 +554,10 @@ fn plan_operator<'py>(
                 subset_shared: &subset_shared,
             };
             lowering_result(quail_planner::sol::speed_of_light_estimate(
-                &plan, &context, inputs, &oracles,
+                &quail_planner::operators::operators(&plan),
+                &context,
+                inputs,
+                &oracles,
             ))
         }
         "price" => {
@@ -585,10 +592,11 @@ fn plan_operator<'py>(
         "search_plan" => {
             let alternatives: Vec<(quail_planner::LogicalPlan, Vec<String>)> =
                 json_value(get("alternatives"))?;
-            let alternatives: Vec<quail_planner::rules::LogicalAlternative> = alternatives
-                .into_iter()
-                .map(|(plan, rules)| quail_planner::rules::LogicalAlternative { plan, rules })
-                .collect();
+            let alternatives: Vec<(quail_planner::operators::Operators, Vec<String>)> =
+                alternatives
+                    .into_iter()
+                    .map(|(plan, rules)| (quail_planner::operators::operators(&plan), rules))
+                    .collect();
             let rules: Vec<String> = json_value(get("rules"))?;
             lowering_result(
                 quail_planner::optimize::search_plan(&alternatives, &context, &rules).map(
@@ -979,7 +987,7 @@ fn edit_graph(graph: &str, edit: &str) -> PyResult<(Option<String>, Option<Strin
 fn region_facts(logical: &str) -> PyResult<String> {
     let plan = quail_planner::read_logical_plan(logical)
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-    Ok(quail_planner::facts::region_facts(&plan).to_string())
+    Ok(quail_planner::facts::region_facts(&quail_planner::operators::operators(&plan)).to_string())
 }
 
 /// A logical plan, as JSON, that returns at most `fetch` rows.

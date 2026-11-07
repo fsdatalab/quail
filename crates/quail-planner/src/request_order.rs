@@ -14,9 +14,8 @@ use crate::context::PlanningContext;
 use crate::costs::{join_specs, prepare_filter_costs};
 use crate::expressions::{CompileError, repr_str};
 use crate::graph::hash_join_nodes;
-use crate::logical::LogicalPlan;
 use crate::nodes::asked_call;
-use crate::operators::operators;
+use crate::operators::Operators;
 use crate::plan_statistics::CorpusStats;
 use crate::search::{StepCost, StepKey, TableStep, default_order_rule, order_steps, search_joins};
 use crate::statistics::effective_selectivity;
@@ -55,18 +54,17 @@ pub struct RequestOrder {
 ///
 /// A prompt cannot be lowered, or a scanned table has no document tokens.
 pub fn request_order(
-    plan: &LogicalPlan,
+    found: &Operators,
     context: &PlanningContext,
 ) -> Result<RequestOrder, CompileError> {
     let mut context = context.clone();
     context.gpus = 1;
     let context = &context;
-    let found = operators(plan);
     let (model, device) = (&context.model, &context.device);
     let rule = context
         .order
         .clone()
-        .unwrap_or_else(|| default_order_rule(&found).0);
+        .unwrap_or_else(|| default_order_rule(found).0);
     let mut summaries: BTreeMap<String, AliasStats> = BTreeMap::new();
     let mut tables = BTreeMap::new();
     let mut stats: BTreeMap<String, CorpusStats> = BTreeMap::new();
@@ -198,7 +196,7 @@ pub fn request_order(
         rule,
         filter_orders,
         join_sequence,
-        hash_joins: hash_join_nodes(&found, &context.pair_fractions, &scan_ports),
+        hash_joins: hash_join_nodes(found, &context.pair_fractions, &scan_ports),
         tables,
     })
 }

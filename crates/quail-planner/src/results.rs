@@ -8,14 +8,12 @@ use quail_physical::{
 };
 use serde_json::Value;
 
-use crate::LogicalPlan;
 use crate::expressions::{
     PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_name, column_references,
     projected_call, projected_name, sort_name,
 };
-use crate::logical::{LogicalNode, ResultNode};
-use crate::nodes::{above_projection, column_call, packed_columns, result_columns};
-use crate::operators::{operators, projection};
+use crate::nodes::packed_columns;
+use crate::operators::{Operators, RowOperator};
 
 /// The struct columns a Project packs, as `Project.structs` encodes them.
 pub fn structs_value(structs: &[(String, Vec<(String, String)>)]) -> Value {
@@ -49,31 +47,22 @@ pub type AnswerColumn = (String, Vec<String>, String, Value, bool);
 /// The columns a plan's result Project binds: each source expression
 /// column and each model answer column, as `ProjectAttributes` holds
 /// them.
-pub fn project_bindings(plan: &LogicalPlan) -> (Vec<(String, ValueExpression)>, Vec<AnswerColumn>) {
-    let root = match &plan.root {
-        LogicalNode::Result(result) => result.clone(),
-        other => ResultNode {
-            input: Box::new(other.clone()),
-            limit: None,
-            order: Vec::new(),
-            offset: 0,
-            distinct: false,
-        },
-    };
-    (source_columns(plan, &root), answer_columns(plan))
+pub fn project_bindings(found: &Operators) -> (Vec<(String, ValueExpression)>, Vec<AnswerColumn>) {
+    (source_columns(found), answer_columns(found))
 }
 
 /// Each result column a source expression computes, by name: the
 /// projected columns and the sort keys that read a table's columns.
-fn source_columns(plan: &LogicalPlan, root: &ResultNode) -> Vec<(String, ValueExpression)> {
-    let LogicalNode::Project(project) = projection(plan) else {
-        return Vec::new();
-    };
-    let projected = project.columns.iter().filter_map(|column| match column {
-        Projected::Expression(expression) => Some(expression),
-        Projected::Name(_) => None,
-    });
-    let sorted = root.order.iter().map(|key| {
+fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
+    let projected = found
+        .projection
+        .columns
+        .iter()
+        .filter_map(|column| match column {
+            Projected::Expression(expression) => Some(expression),
+            Projected::Name(_) => None,
+        });
+    let sorted = found.result.order.iter().map(|key| {
         let SortExpression::Value(value) = &key.expression;
         value
     });
@@ -94,8 +83,7 @@ fn source_columns(plan: &LogicalPlan, root: &ResultNode) -> Vec<(String, ValueEx
 /// Each column a model call adds: its name, the call's aliases, kind,
 /// and labels, and whether it is the call's answer, not a label's
 /// probabilities or an answer's span.
-fn answer_columns(plan: &LogicalPlan) -> Vec<AnswerColumn> {
-    let found = operators(plan);
+fn answer_columns(found: &Operators) -> Vec<AnswerColumn> {
     let mut columns: Vec<AnswerColumn> = Vec::new();
     let mut put = |name: String, call: &ModelCall, answer: bool| {
         let entry = (
@@ -110,28 +98,30 @@ fn answer_columns(plan: &LogicalPlan) -> Vec<AnswerColumn> {
             None => columns.push(entry),
         }
     };
-    for node in &found.classifies {
-        let call = column_call(node);
-        put(node.name.clone(), call, true);
+    for column in &found.classifies {
+        let call = &column.call;
+        put(column.name.clone(), call, true);
         if call.probabilities {
-            put(format!("{}{PROBABILITIES_SUFFIX}", node.name), call, false);
+            put(
+                format!("{}{PROBABILITIES_SUFFIX}", column.name),
+                call,
+                false,
+            );
         }
     }
-    for node in &found.extracts {
-        let call = column_call(node);
-        put(node.name.clone(), call, true);
-        put(format!("{}{SPAN_SUFFIX}", node.name), call, false);
+    for column in &found.extracts {
+        let call = &column.call;
+        put(column.name.clone(), call, true);
+        put(format!("{}{SPAN_SUFFIX}", column.name), call, false);
     }
-    for node in found.sae_features.iter().chain(&found.maps) {
-        put(node.name.clone(), column_call(node), true);
+    for column in found.sae_features.iter().chain(&found.maps) {
+        put(column.name.clone(), &column.call, true);
     }
-    if let LogicalNode::Project(project) = projection(plan) {
-        for column in &project.columns {
-            if let Some(call) =
-                projected_call(column, &["label", "extract", "score", "features", "map"])
-            {
-                put(projected_name(column), call, true);
-            }
+    for column in &found.projection.columns {
+        if let Some(call) =
+            projected_call(column, &["label", "extract", "score", "features", "map"])
+        {
+            put(projected_name(column), call, true);
         }
     }
     columns
@@ -145,35 +135,16 @@ fn node<A>(id: &str, inputs: &[PortRef], attributes: A) -> Node<A> {
     }
 }
 
-/// The Project, its unnests, and the nodes ending a plan, as `result_nodes`.
-///
-/// # Panics
-///
-/// The root's input is not a projection.
+/// The Project, the operators above it, and the nodes ending a plan, as
+/// `result_nodes`.
 pub fn result_nodes(
-    plan: &LogicalPlan,
-    root: &ResultNode,
+    found: &Operators,
     inputs: &[PortRef],
     columns: &[String],
     structs: &[(String, Vec<(String, String)>)],
 ) -> Vec<PhysicalNode> {
-    let mut chain: Vec<&LogicalNode> = Vec::new();
-    let mut walked: &LogicalNode = &root.input;
-    loop {
-        let next = match walked {
-            LogicalNode::Unnest(unnest) => &unnest.input,
-            LogicalNode::Filter(filter) => &filter.input,
-            LogicalNode::Project(project) => {
-                if !above_projection(&project.input) {
-                    break;
-                }
-                &project.input
-            }
-            _ => break,
-        };
-        chain.insert(0, walked);
-        walked = next;
-    }
+    let root = &found.result;
+    let chain = &found.after_projection;
     let mut hidden: Vec<String> = Vec::new();
     if chain.is_empty() {
         for key in &root.order {
@@ -195,32 +166,36 @@ pub fn result_nodes(
             columns: with_hidden(columns.to_vec()),
             structs: structs_value(structs),
             expressions: None,
-            sources: source_columns(plan, root),
-            answers: answer_columns(plan),
+            sources: source_columns(found),
+            answers: answer_columns(found),
         },
     ))];
     let mut rows = port("project", "rows");
     let mut result = packed_columns(columns.iter().cloned(), structs);
-    for (index, logical) in chain.iter().enumerate() {
-        result = result_columns(logical);
-        let node_id = match logical {
-            LogicalNode::Unnest(unnest) => {
+    let mut available =
+        packed_columns(found.projection.columns.iter().map(projected_name), structs);
+    for (index, operator) in chain.iter().enumerate() {
+        result = operator.columns().to_vec();
+        let node_id = match operator {
+            RowOperator::Unnest { lists, outer, .. } => {
                 let node_id = format!("unnest_{index}");
                 nodes.push(PhysicalNode::Unnest(node(
                     &node_id,
                     std::slice::from_ref(&rows),
                     UnnestAttributes {
-                        lists: unnest.columns.clone(),
-                        outer: unnest.outer,
+                        lists: lists.clone(),
+                        outer: *outer,
                         columns: with_hidden(result.clone()),
                     },
                 )));
                 node_id
             }
-            LogicalNode::Project(project) => {
+            RowOperator::Projection {
+                expressions: written,
+                ..
+            } => {
                 let node_id = format!("project_{index}");
-                let mut expressions = project.columns.clone();
-                let available = result_columns(&project.input);
+                let mut expressions = written.clone();
                 for key in &root.order {
                     let name = sort_name(&key.expression);
                     if result.contains(&name) {
@@ -246,13 +221,13 @@ pub fn result_nodes(
                 )));
                 node_id
             }
-            LogicalNode::Filter(filter) => {
+            RowOperator::Filter { condition, .. } => {
                 let node_id = format!("filter_{index}");
                 nodes.push(PhysicalNode::Filter(node(
                     &node_id,
                     std::slice::from_ref(&rows),
                     FilterAttributes {
-                        predicate: Some(filter.condition.clone()),
+                        predicate: Some(condition.clone()),
                         aliases: Vec::new(),
                         selectivity: None,
                         written_position: 0,
@@ -261,8 +236,8 @@ pub fn result_nodes(
                 )));
                 node_id
             }
-            _ => unreachable!("the chain holds unnests, filters, and projects"),
         };
+        available = result.clone();
         rows = port(&node_id, "rows");
     }
     if !root.order.is_empty() || root.distinct || root.offset != 0 {

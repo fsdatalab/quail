@@ -19,7 +19,7 @@ use crate::expressions::{
 };
 use crate::logical::{LogicalNode, LogicalPlan, ScanColumn, table_name};
 use crate::nodes::{asked_call, children};
-use crate::operators::operators;
+use crate::operators::{Operators, SemanticJoin, operators};
 use crate::statistics::{DEFAULT_SELECTIVITY, effective_selectivity};
 
 /// The mark beside a selectivity the planner assumed.
@@ -188,9 +188,10 @@ pub fn explain_text(request: &ExplainRequest) -> Result<String, String> {
         );
     }
     lines.push(String::new());
+    let found = request.logical.as_ref().map(operators);
     let tree = physical_tree(
         &graph,
-        request.logical.as_ref(),
+        found.as_ref(),
         request.verbose,
         request.run.as_ref(),
         &physical.estimates,
@@ -1347,7 +1348,7 @@ struct TreeRows<'a> {
     stages: Stages,
     scans: HashMap<String, crate::logical::Scan>,
     filters: HashMap<String, Vec<quail_physical::FilterPredicate>>,
-    joins: Vec<crate::logical::SemanticJoin>,
+    joins: Vec<SemanticJoin>,
     rows_estimate: HashMap<(String, String), Option<f64>>,
     shared: HashMap<String, usize>,
     visited: HashSet<String>,
@@ -1852,24 +1853,21 @@ fn table(rows: &[(String, Cells)]) -> Vec<String> {
 /// A physical tree with estimated and measured columns.
 fn physical_tree(
     graph: &Graph,
-    logical: Option<&LogicalPlan>,
+    found: Option<&Operators>,
     verbose: bool,
     run: Option<&RunRequest>,
     estimates: &[(String, Value)],
 ) -> String {
-    let (scans, filters, joins) = match logical {
-        Some(plan) => {
-            let found = operators(plan);
-            (
-                found
-                    .scans
-                    .iter()
-                    .map(|scan| (scan.alias.clone(), scan.clone()))
-                    .collect(),
-                found.filters.into_iter().collect(),
-                found.joins,
-            )
-        }
+    let (scans, filters, joins) = match found {
+        Some(found) => (
+            found
+                .scans
+                .iter()
+                .map(|scan| (scan.alias.clone(), scan.clone()))
+                .collect(),
+            found.filters.iter().cloned().collect(),
+            found.joins.clone(),
+        ),
         None => (HashMap::new(), HashMap::new(), Vec::new()),
     };
     let topological = graph.topological();

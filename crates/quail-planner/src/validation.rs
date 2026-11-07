@@ -10,9 +10,8 @@ use quail_physical::{Asked, Prompt, ValueExpression};
 
 use crate::context::PlanningContext;
 use crate::expressions::{CompileError, Refusal, aliased_call, call_aliases, repr_str};
-use crate::logical::{LogicalNode, LogicalPlan};
-use crate::nodes::{as_column, asked_call, column_call, column_kind, subtree};
-use crate::operators::{Operators, operators};
+use crate::nodes::asked_call;
+use crate::operators::Operators;
 use crate::prompts::prompt_layout;
 use crate::scores::prompt_aliases;
 use crate::search::label_calls;
@@ -40,11 +39,9 @@ pub fn has_score(found: &Operators) -> bool {
 }
 
 /// The `AI.SCORE` columns SELECT returns, as `score_projections`.
-pub fn score_projections(plan: &LogicalPlan) -> Vec<(String, quail_physical::ModelCall)> {
-    let LogicalNode::Project(project) = crate::operators::projection(plan) else {
-        unreachable!("a projection")
-    };
-    project
+pub fn score_projections(found: &Operators) -> Vec<(String, quail_physical::ModelCall)> {
+    found
+        .projection
         .columns
         .iter()
         .filter_map(|column| match column {
@@ -58,28 +55,19 @@ pub fn score_projections(plan: &LogicalPlan) -> Vec<(String, quail_physical::Mod
 
 /// (alias, call kind) of each one-table column operator above a join,
 /// as `columns_above_joins`.
-pub fn columns_above_joins(root: &LogicalNode) -> Vec<(String, &'static str)> {
-    let mut found: Vec<(String, &'static str)> = Vec::new();
-    for node in subtree(root) {
-        let Some(column) = as_column(node) else {
-            continue;
-        };
-        let aliases = call_aliases(column_call(column));
+pub fn columns_above_joins(found: &Operators) -> Vec<(String, String)> {
+    let mut above: Vec<(String, String)> = Vec::new();
+    for column in found.columns().filter(|column| column.above_joins) {
+        let aliases = call_aliases(&column.call);
         if aliases.len() != 1 {
             continue;
         }
-        if !subtree(&column.input)
-            .iter()
-            .any(|below| matches!(below, LogicalNode::SemanticJoin(_)))
-        {
-            continue;
-        }
-        let entry = (aliases[0].clone(), column_kind(node).expect("a column").1);
-        if !found.contains(&entry) {
-            found.push(entry);
+        let entry = (aliases[0].clone(), column.call.kind.clone());
+        if !above.contains(&entry) {
+            above.push(entry);
         }
     }
-    found
+    above
 }
 
 fn sae_features_refusal(found: &Operators, model: &ModelSpec, scored: bool) -> Option<Refusal> {
@@ -119,9 +107,9 @@ fn sae_features_refusal(found: &Operators, model: &ModelSpec, scored: bool) -> O
     None
 }
 
-fn score_refusal(plan: &LogicalPlan, found: &Operators) -> Option<Refusal> {
+fn score_refusal(found: &Operators) -> Option<Refusal> {
     let constraint = "unsupported_score_query";
-    let projected = score_projections(plan);
+    let projected = score_projections(found);
     let mut prompts: Vec<&Prompt> = Vec::new();
     for (_, predicates) in &found.filters {
         prompts.extend(
@@ -170,9 +158,9 @@ fn score_refusal(plan: &LogicalPlan, found: &Operators) -> Option<Refusal> {
             "joined_classify_pipeline",
         ));
     }
-    if columns_above_joins(&plan.root)
+    if columns_above_joins(found)
         .iter()
-        .any(|(_, kind)| *kind == "label")
+        .any(|(_, kind)| kind == "label")
         && !found.joins.is_empty()
     {
         return Some(refusal(
@@ -263,12 +251,11 @@ fn attention_device_refusal(model: &ModelSpec, device: &DeviceSpec) -> Option<Re
 ///
 /// The model names an unknown prompt layout.
 pub fn validate_query(
-    plan: &LogicalPlan,
+    found: &Operators,
     context: &PlanningContext,
 ) -> Result<Option<Refusal>, CompileError> {
-    let found = operators(plan);
     let (model, device) = (&context.model, &context.device);
-    let scored = has_score(&found);
+    let scored = has_score(found);
     if model.attention_mask == "set" && found.joins.iter().any(|join| is_score(&join.predicate)) {
         return Ok(Some(refusal(
             format!(
@@ -280,14 +267,14 @@ pub fn validate_query(
         )));
     }
     if (!found.sae_features.is_empty() || model.sae.is_some())
-        && let Some(refused) = sae_features_refusal(&found, model, scored)
+        && let Some(refused) = sae_features_refusal(found, model, scored)
     {
         return Ok(Some(refused));
     }
-    if scored && let Some(refused) = score_refusal(plan, &found) {
+    if scored && let Some(refused) = score_refusal(found) {
         return Ok(Some(refused));
     }
-    let labels = label_calls(&found);
+    let labels = label_calls(found);
     if !labels.is_empty() {
         let constraint = "unsupported_classify_query";
         if labels

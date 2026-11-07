@@ -18,10 +18,9 @@ use crate::expressions::{
     CompileError, Refusal, aliased_call, argument_alias, call_aliases, projected_name, sort_name,
 };
 use crate::graph::has_label;
-use crate::logical::{LogicalNode, LogicalPlan, ResultNode, SemanticColumn};
 use crate::lowering::answer_ids;
-use crate::nodes::{asked_call, column_call, output_schema, packed_columns, packing, walk};
-use crate::operators::{Operators, operators, projection};
+use crate::nodes::{asked_call, packed_columns, packing};
+use crate::operators::{Operators, SemanticColumn};
 use crate::prompts::{LABEL_PREFIX, join_label, prompt_layout, render_join_frame};
 use crate::request_order::request_order;
 use crate::results::{project_bindings, structs_value};
@@ -46,7 +45,7 @@ pub struct RequestSettings {
 
 const SPECS: &str = "quail.baselines.nodes";
 
-/// Plan `plan` for a request backend.
+/// Plan a plan's operators for a request backend.
 ///
 /// Returns `{"graph": {"nodes", "root"}, "settings"}`, or
 /// `{"refusal": ...}` when the backend cannot run the plan.
@@ -55,20 +54,19 @@ const SPECS: &str = "quail.baselines.nodes";
 ///
 /// A prompt cannot be lowered, or the prompts do not share a preamble.
 pub fn request_plan(
-    plan: &LogicalPlan,
+    found: &Operators,
     context: &PlanningContext,
     settings: &RequestSettings,
 ) -> Result<Value, CompileError> {
     // a decision model scores one option block per label
     let decides = context.model.role == "decision";
-    if let Some(refusal) = refusal(plan, context, settings, decides)? {
+    if let Some(refusal) = refusal(found, context, settings, decides)? {
         return Ok(json!({"refusal": {
             "reasons": refusal.reasons, "constraint": refusal.constraint,
             "needed": refusal.needed, "available": refusal.available, "unit": refusal.unit,
         }}));
     }
-    let found = operators(plan);
-    let order = request_order(plan, context)?;
+    let order = request_order(found, context)?;
     let mut nodes: Vec<Value> = Vec::new();
     let mut input_refs: Vec<PortRef> = Vec::new();
     let aliases: Vec<String> = found.scans.iter().map(|scan| scan.alias.clone()).collect();
@@ -105,15 +103,9 @@ pub fn request_plan(
         .join_sequence
         .first()
         .map(|(_, anchor)| anchor.clone());
-    let filters = filter_specs(
-        context,
-        &aliases,
-        &found,
-        &order.filter_orders,
-        first_anchor,
-    )?;
-    let classifies = classify_specs(context, &found, decides)?;
-    let joins = join_specs(context, &found, &order.join_sequence)?;
+    let filters = filter_specs(context, &aliases, found, &order.filter_orders, first_anchor)?;
+    let classifies = classify_specs(context, found, decides)?;
+    let joins = join_specs(context, found, &order.join_sequence)?;
     let extracts = answer_specs(context, &found.extracts, "RequestExtractSpec")?;
     let maps = answer_specs(context, &found.maps, "RequestMapSpec")?;
 
@@ -129,7 +121,7 @@ pub fn request_plan(
         }
     }
     prompts.extend(
-        label_calls(&found)
+        label_calls(found)
             .into_iter()
             .map(|(call, _)| call.prompt.as_ref().clone()),
     );
@@ -157,7 +149,7 @@ pub fn request_plan(
             "extracts": extracts, "maps": maps,
         },
     }));
-    let (results, root) = result_nodes(plan, request_id, &aliases, &joins, &extracts, &maps)?;
+    let (results, root) = result_nodes(found, request_id, &aliases, &joins, &extracts, &maps)?;
     for node in results {
         nodes.push(node_value(node)?);
     }
@@ -195,26 +187,6 @@ fn node_value(node: PhysicalNode) -> Result<Value, CompileError> {
 fn spec(name: &str, mut fields: Value) -> Value {
     fields["type"] = Value::from(format!("{SPECS}.{name}"));
     fields
-}
-
-fn result_root(plan: &LogicalPlan) -> ResultNode {
-    match &plan.root {
-        LogicalNode::Result(result) => result.clone(),
-        other => ResultNode {
-            input: Box::new(other.clone()),
-            limit: None,
-            order: Vec::new(),
-            offset: 0,
-            distinct: false,
-        },
-    }
-}
-
-fn project_columns(plan: &LogicalPlan) -> &[quail_physical::Projected] {
-    match projection(plan) {
-        LogicalNode::Project(project) => &project.columns,
-        _ => &[],
-    }
 }
 
 fn refuse(reason: String, constraint: String, unit: &str) -> Option<Refusal> {
@@ -261,14 +233,14 @@ fn extraction_refusal(
 
 /// Why the request backends cannot run the plan, or None.
 fn refusal(
-    plan: &LogicalPlan,
+    found: &Operators,
     context: &PlanningContext,
     settings: &RequestSettings,
     decides: bool,
 ) -> Result<Option<Refusal>, CompileError> {
     let backend = &settings.backend_name;
-    let root = result_root(plan);
-    let columns = project_columns(plan);
+    let root = &found.result;
+    let columns = &found.projection.columns;
     let projected: Vec<String> = columns.iter().map(projected_name).collect();
     if root
         .order
@@ -281,7 +253,6 @@ fn refusal(
             "backends",
         ));
     }
-    let found = operators(plan);
     let tests = || found.column_filters.iter().flat_map(|(_, tests)| tests);
     if tests().any(|test| {
         test.call.kind == "label"
@@ -296,9 +267,7 @@ fn refusal(
             "backends",
         ));
     }
-    let has_extract = walk(plan)
-        .iter()
-        .any(|node| matches!(node, LogicalNode::SemanticExtract(_)));
+    let has_extract = !found.extracts.is_empty();
     for (function, present) in [
         ("AI.EXTRACT", has_extract),
         ("AI.MAP", !found.maps.is_empty()),
@@ -351,7 +320,7 @@ fn refusal(
     // a diffusion model's vLLM canvas is sized for a filter's one answer
     // token, not a label
     let scores_labels = settings.scores_labels && context.model.canvas_tokens == 0;
-    if has_label(plan) && !(scores_labels || decides) {
+    if has_label(found) && !(scores_labels || decides) {
         return Ok(refuse(
             format!(
                 "AI.CLASSIFY on {backend} decodes each answer as text, which its engine does not \
@@ -362,9 +331,9 @@ fn refusal(
             "backends",
         ));
     }
-    if columns_above_joins(&plan.root)
+    if columns_above_joins(found)
         .iter()
-        .any(|(_, kind)| *kind == "label")
+        .any(|(_, kind)| kind == "label")
     {
         return Ok(refuse(
             format!("{backend} runs single-document classification before joins"),
@@ -472,8 +441,8 @@ fn classify_specs(
         let name = found
             .classifies
             .iter()
-            .find(|node| column_call(node) == &call)
-            .map(|node| node.name.clone())
+            .find(|column| column.call == call)
+            .map(|column| column.name.clone())
             .ok_or_else(|| CompileError::new("a classification has no SemanticClassify"))?;
         let labels: Vec<String> = call
             .labels
@@ -568,22 +537,11 @@ fn join_specs(
                 json!([alias, render_join_frame(&prompt.template, index, &layout)])
             })
             .collect();
-        // the tree the join extends: everything before its new tables
-        let mut outer = join.input.as_ref();
-        while let LogicalNode::Join(inner) = outer {
-            outer = &inner.left;
-        }
-        let mut outer_aliases: Vec<String> = Vec::new();
-        for field in output_schema(outer) {
-            if !outer_aliases.contains(&field.alias) {
-                outer_aliases.push(field.alias);
-            }
-        }
         specs.push(spec(
             "RequestJoinSpec",
             json!({
                 "written_position": position, "aliases": aliases,
-                "outer_aliases": outer_aliases, "anchor": anchor,
+                "outer_aliases": join.outer_aliases, "anchor": anchor,
                 "semantics": join.semantics, "selectivity": join.selectivity,
                 "label_token_ids": labels, "frame_token_ids": frames,
                 "tail_token_ids": lowered.tail_token_ids, "label_texts": label_texts,
@@ -599,15 +557,15 @@ fn join_specs(
 /// own preamble, the model's turn, which stays out of the shared one.
 fn answer_specs(
     context: &PlanningContext,
-    nodes: &[SemanticColumn],
+    columns: &[SemanticColumn],
     name: &str,
 ) -> Result<Vec<Value>, CompileError> {
     let mut specs = Vec::new();
-    for node in nodes {
-        let call = column_call(node);
+    for column in columns {
+        let call = &column.call;
         let lowered = context.lowered(&call.prompt)?;
         let mut fields = json!({
-            "alias": call_aliases(call)[0], "output": node.name,
+            "alias": call_aliases(call)[0], "output": column.name,
             "tail_token_ids": lowered.tail_token_ids,
             "tail_text": strip_placeholders(&call.prompt.tail),
             "preamble_token_ids": lowered.preamble_token_ids,
@@ -700,7 +658,7 @@ fn request_preamble(
 /// The nodes that turn the request node's answers into result rows, and
 /// the port that returns them.
 fn result_nodes(
-    plan: &LogicalPlan,
+    found: &Operators,
     request: &str,
     aliases: &[String],
     joins: &[Value],
@@ -747,7 +705,7 @@ fn result_nodes(
         port(request, format!("rows:{}", aliases[0]))
     };
 
-    let columns_written = project_columns(plan);
+    let columns_written = &found.projection.columns;
     let projected_labels: Vec<String> = columns_written
         .iter()
         .filter_map(|column| match column {
@@ -792,13 +750,10 @@ fn result_nodes(
             ));
         }
     }
-    let structs = match projection(plan) {
-        LogicalNode::Project(project) => packing(&project.structs),
-        _ => Vec::new(),
-    };
+    let structs = packing(&found.projection.structs);
     let mut inputs = vec![sink];
     inputs.extend(label_ports);
-    let (sources, answers) = project_bindings(plan);
+    let (sources, answers) = project_bindings(found);
     nodes.push(PhysicalNode::Project(Node {
         id: "project".into(),
         inputs: input_ports(&inputs),
@@ -810,7 +765,7 @@ fn result_nodes(
             answers,
         },
     }));
-    let root = result_root(plan);
+    let root = &found.result;
     let mut last = port("project", "rows");
     if !root.order.is_empty() || root.distinct || root.offset != 0 {
         // the coordinator sorts the returned rows, as on the Quail backend

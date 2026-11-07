@@ -1,7 +1,7 @@
 //! What the cost model knows about a plan before any decision, as
 //! `quail/planner/search/statistics.py` gathers it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use quail_cost::budgets::{arena_pages, chunk_budget};
 use quail_cost::joins::PricedJoin;
@@ -11,11 +11,10 @@ use quail_physical::Prompt;
 
 use crate::context::PlanningContext;
 use crate::costs::join_specs;
-use crate::expressions::{CompileError, call_aliases, compile_error, condition_aliases, repr_str};
-use crate::logical::{LogicalNode, LogicalPlan};
+use crate::expressions::{CompileError, compile_error, repr_str};
 use crate::lowering::LoweredPrompt;
-use crate::nodes::{asked_call, column_call, subtree};
-use crate::operators::{Operators, operators, projection};
+use crate::nodes::asked_call;
+use crate::operators::Operators;
 use crate::statistics::effective_selectivity;
 
 /// One table's document count and token sums, as `CorpusStats`.
@@ -100,18 +99,17 @@ pub fn plan_prompts(found: &Operators) -> Vec<Prompt> {
     prompts
 }
 
-/// Gather the statistics of one logical plan, as `plan_statistics`.
+/// Gather the statistics of one plan's operators, as `plan_statistics`.
 ///
 /// # Errors
 ///
 /// A scanned alias has no token counts, the arena does not fit the
 /// device, or the tokenizer fails.
 pub fn plan_statistics(
-    plan: &LogicalPlan,
+    found: &Operators,
     context: &PlanningContext,
 ) -> Result<PlanStatistics, CompileError> {
     let model = &context.model;
-    let found = operators(plan);
     let asks: Vec<(String, Vec<usize>)> = found
         .filters
         .iter()
@@ -128,12 +126,12 @@ pub fn plan_statistics(
         })
         .collect();
     let mut lowered: Vec<(Prompt, LoweredPrompt)> = Vec::new();
-    let mut prompts = plan_prompts(&found);
+    let mut prompts = plan_prompts(found);
     prompts.extend(
         found
             .extracts
             .iter()
-            .map(|node| (*column_call(node).prompt).clone()),
+            .map(|column| (*column.call.prompt).clone()),
     );
     for prompt in prompts {
         if !lowered.iter().any(|(seen, _)| *seen == prompt) {
@@ -237,38 +235,17 @@ pub fn plan_statistics(
     })
 }
 
-/// The Filter and SemanticFilter nodes that run before any join.
-pub fn filters_before_joins(plan: &LogicalPlan) -> Vec<&LogicalNode> {
-    subtree(projection(plan))
-        .into_iter()
-        .filter(|node| {
-            matches!(
-                node,
-                LogicalNode::Filter(_) | LogicalNode::SemanticFilter(_)
-            )
-        })
-        .filter(|node| {
-            !subtree(crate::nodes::input(node))
-                .iter()
-                .any(|below| matches!(below, LogicalNode::SemanticJoin(_)))
-        })
-        .collect()
-}
-
 /// The aliases whose documents a filter before the joins computed.
-pub fn filtered_before_joins(plan: &LogicalPlan) -> std::collections::BTreeSet<String> {
-    let mut aliases = std::collections::BTreeSet::new();
-    for node in filters_before_joins(plan) {
-        match node {
-            LogicalNode::Filter(filter) => {
-                aliases.insert(condition_aliases(&filter.condition)[0].clone());
-            }
-            LogicalNode::SemanticFilter(filter) => {
-                for predicate in &filter.predicates {
-                    aliases.insert(call_aliases(asked_call(&predicate.expression))[0].clone());
-                }
-            }
-            _ => {}
+pub fn filtered_before_joins(found: &Operators) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    for (alias, flags) in &found.filters_before_joins {
+        if flags.iter().any(|before_joins| *before_joins) {
+            aliases.insert(alias.clone());
+        }
+    }
+    for (alias, tests) in &found.column_filters {
+        if tests.iter().any(|test| test.before_joins) {
+            aliases.insert(alias.clone());
         }
     }
     aliases
@@ -276,7 +253,7 @@ pub fn filtered_before_joins(plan: &LogicalPlan) -> std::collections::BTreeSet<S
 
 /// The expected live documents per alias after its filters run.
 pub fn expected_rows_after_filters(
-    plan: &LogicalPlan,
+    found: &Operators,
     statistics: &PlanStatistics,
 ) -> BTreeMap<String, f64> {
     let mut expected: BTreeMap<String, f64> = statistics
@@ -284,21 +261,17 @@ pub fn expected_rows_after_filters(
         .iter()
         .map(|(alias, stats)| (alias.clone(), stats.num_documents as f64))
         .collect();
-    for node in filters_before_joins(plan) {
-        match node {
-            LogicalNode::Filter(filter) => {
-                let alias = condition_aliases(&filter.condition)[0].clone();
-                *expected.get_mut(&alias).expect("a table") *=
-                    effective_selectivity(filter.selectivity);
+    for ((alias, predicates), (_, flags)) in found.filters.iter().zip(&found.filters_before_joins) {
+        for (predicate, before_joins) in predicates.iter().zip(flags) {
+            if *before_joins {
+                *expected.get_mut(alias).expect("a table") *=
+                    effective_selectivity(predicate.selectivity);
             }
-            LogicalNode::SemanticFilter(filter) => {
-                for predicate in &filter.predicates {
-                    let alias = call_aliases(asked_call(&predicate.expression))[0].clone();
-                    *expected.get_mut(&alias).expect("a table") *=
-                        effective_selectivity(predicate.selectivity);
-                }
-            }
-            _ => {}
+        }
+    }
+    for (alias, tests) in &found.column_filters {
+        for test in tests.iter().filter(|test| test.before_joins) {
+            *expected.get_mut(alias).expect("a table") *= effective_selectivity(test.selectivity);
         }
     }
     expected

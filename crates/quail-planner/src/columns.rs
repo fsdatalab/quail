@@ -16,10 +16,8 @@ use crate::context::PlanningContext;
 use crate::expressions::{
     CompileError, Refusal, argument_alias, column_name, compile_error, repr_str,
 };
-use crate::logical::{LogicalNode, SemanticColumn};
 use crate::lowering::read_slot_offsets;
-use crate::nodes::{column_alias, column_call};
-use crate::operators::operators;
+use crate::operators::SemanticColumn;
 use crate::prompts::prompt_layout;
 
 /// The answer length `ExtractAssumptions` takes by default.
@@ -78,18 +76,16 @@ fn lengths_of(context: &PlanningContext, call: &ModelCall) -> Result<Vec<f64>, C
 /// The model cannot run the call, or the tokenizer fails.
 pub fn column_spec(
     context: &PlanningContext,
-    node: &LogicalNode,
+    column: &SemanticColumn,
     expected_rows: f64,
     resident: bool,
 ) -> Result<ColumnSpec, CompileError> {
-    match node {
-        LogicalNode::SemanticExtract(column) => {
+    match column.call.kind.as_str() {
+        "extract" => {
             extract_spec(context, column, expected_rows, resident).map(ColumnSpec::Extract)
         }
-        LogicalNode::SemanticMap(column) => {
-            map_spec(context, column, expected_rows, resident).map(ColumnSpec::Map)
-        }
-        LogicalNode::SemanticSaeFeatures(column) => {
+        "map" => map_spec(context, column, expected_rows, resident).map(ColumnSpec::Map),
+        "features" => {
             sae_features_spec(context, column, expected_rows, resident).map(ColumnSpec::SaeFeatures)
         }
         _ => compile_error("the node is not a column operator Rust plans yet"),
@@ -102,7 +98,7 @@ fn extract_spec(
     expected_rows: f64,
     resident: bool,
 ) -> Result<ExtractSpec, CompileError> {
-    let call = column_call(column);
+    let call = &column.call;
     let prompt = context.lowered(&call.prompt)?;
     let bound = bind(&call.prompt);
     let (model, device) = (&context.model, &context.device);
@@ -243,7 +239,7 @@ fn map_spec(
     expected_rows: f64,
     resident: bool,
 ) -> Result<MapSpec, CompileError> {
-    let call = column_call(column);
+    let call = &column.call;
     let prompt = context.lowered(&call.prompt)?;
     let bound = bind(&call.prompt);
     let mut spec = MapSpec {
@@ -281,13 +277,13 @@ fn sae_features_spec(
             "queries",
         )));
     }
-    let call = column_call(column);
-    let alias = column_alias(column);
-    let max_pooling = context.logical_plan.as_ref().is_some_and(|plan| {
-        operators(plan)
+    let call = &column.call;
+    let alias = column.alias();
+    let max_pooling = context.operators.as_ref().is_some_and(|found| {
+        found
             .sae_features
             .iter()
-            .any(|other| column_alias(other) == alias && column_call(other).pooling == "max")
+            .any(|other| other.alias() == alias && other.call.pooling == "max")
     });
     let prompt = context.lowered(&call.prompt)?;
     let summary = AliasStats::summarize(context.lengths(&alias)?, model.sliding_window);

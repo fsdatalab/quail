@@ -199,10 +199,7 @@ impl Planner {
         let extracted: Vec<String> = alternatives
             .iter()
             .flat_map(|alternative| quail_planner::operators::operators(&alternative.plan).extracts)
-            .flat_map(|extract| {
-                let quail_physical::TaggedModelCall::Call(call) = &extract.call;
-                quail_planner::expressions::call_aliases(call)
-            })
+            .flat_map(|extract| quail_planner::expressions::call_aliases(&extract.call))
             .collect();
         if scans.iter().any(|scan| match &scan.column {
             ScanColumn::Unnamed(_) => false,
@@ -359,7 +356,7 @@ impl Planner {
             pair_fractions,
             scan_fractions: BTreeMap::new(),
             order: settings.order.clone(),
-            logical_plan: None,
+            operators: None,
             first_documents,
             page_shared,
             reader_groups,
@@ -369,11 +366,17 @@ impl Planner {
         if let Some(request) = &settings.request {
             return request_outcome(&alternatives, &context, request, &files);
         }
-        let found = quail_planner::optimize::search_plan(
-            &alternatives,
-            &context,
-            &settings.physical_rules,
-        )?;
+        let operators: Vec<(quail_planner::operators::Operators, Vec<String>)> = alternatives
+            .iter()
+            .map(|alternative| {
+                (
+                    quail_planner::operators::operators(&alternative.plan),
+                    alternative.rules.clone(),
+                )
+            })
+            .collect();
+        let found =
+            quail_planner::optimize::search_plan(&operators, &context, &settings.physical_rules)?;
         Ok(match found {
             Ok(selected) => PlanOutcome::Planned(Box::new(Planned {
                 logical: alternatives[selected.alternative].plan.clone(),
@@ -532,13 +535,13 @@ fn pair_fractions(
     let mut fractions = BTreeMap::new();
     let operators = quail_planner::operators::operators(logical);
     for (position, join) in operators.joins.iter().enumerate() {
-        let conditions = quail_planner::costs::join_conditions(join);
+        let conditions = &join.on;
         let Some(first) = conditions.first() else {
             continue;
         };
         let left_alias = quail_planner::expressions::argument_alias(&first.left);
         let (mut left, mut right) = (Vec::new(), Vec::new());
-        for condition in &conditions {
+        for condition in conditions {
             let (a, b) =
                 if quail_planner::expressions::argument_alias(&condition.left) == left_alias {
                     (&condition.left, &condition.right)
@@ -704,7 +707,7 @@ fn request_outcome(
     let mut found = Vec::new();
     for alternative in alternatives {
         found.push(quail_planner::request_plan::request_plan(
-            &alternative.plan,
+            &quail_planner::operators::operators(&alternative.plan),
             context,
             request,
         )?);

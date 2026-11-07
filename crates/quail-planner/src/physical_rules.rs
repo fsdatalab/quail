@@ -15,8 +15,6 @@ use crate::classify::classify_statistics;
 use crate::context::PlanningContext;
 use crate::expressions::CompileError;
 use crate::graph::{PhysicalPlan, Planned};
-use crate::nodes::column_call;
-use crate::operators::operators;
 use crate::plan_statistics::{expected_rows_after_filters, plan_statistics};
 use crate::pricing::{expected_documents, head_tokens, pass_question_tokens, set_pass_tokens};
 use crate::retention::schedule;
@@ -95,13 +93,12 @@ fn choose_classify_implementation(
     if pending.is_empty() {
         return Ok(None);
     }
-    let Some(logical) = &context.logical_plan else {
+    let Some(found) = &context.operators else {
         return Err(CompileError::new(
-            "choose_classify_implementation needs the logical plan on the planning context to \
-             score a classification without a scoring rule",
+            "choose_classify_implementation needs the plan's operators on the planning context \
+             to score a classification without a scoring rule",
         ));
     };
-    let found = operators(logical);
     let paths = build_pipelines(&graph.nodes, &[]);
     let mut nodes = graph.nodes.clone();
     for index in pending {
@@ -113,8 +110,8 @@ fn choose_classify_implementation(
             .classifies
             .iter()
             .rev()
-            .find(|node| node.name == spec.name)
-            .map(column_call)
+            .find(|column| column.name == spec.name)
+            .map(|column| &column.call)
             .expect("the classification's call");
         let table = classify_statistics(context, &spec.aliases[0], &[])?;
         let resident = paths.get(&classify.id).expect("a pipeline")[0] != index;
@@ -513,13 +510,13 @@ fn should_retain_kv(
     context: &PlanningContext,
     settings: &mut Map<String, Value>,
 ) -> Rewrite {
-    let Some(logical) = &context.logical_plan else {
+    let Some(found) = &context.operators else {
         return Ok(None);
     };
     if settings.contains_key("retention") || !context.model.reuses_kv() {
         return Ok(None);
     }
-    let statistics = plan_statistics(logical, context)?;
+    let statistics = plan_statistics(found, context)?;
     let joins: Vec<&quail_physical::Node<quail_physical::AiJoinAttributes>> = graph
         .nodes
         .iter()
@@ -561,7 +558,7 @@ fn should_retain_kv(
         .collect();
     let mut planned = schedule(
         &sequence,
-        &expected_rows_after_filters(logical, &statistics),
+        &expected_rows_after_filters(found, &statistics),
         Some(&ids),
     );
     let before = planned["before"].clone();

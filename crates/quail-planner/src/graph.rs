@@ -1,4 +1,4 @@
-//! Build the physical graph of one logical plan in the chosen operator
+//! Build the physical graph of one plan's operators in the chosen operator
 //! order, as `quail/planner/graph/builder.py` and the operators'
 //! `emit_*` functions build it.
 
@@ -19,14 +19,13 @@ use serde_json::{Map, Value};
 use crate::classify::classify_statistics;
 use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
-use crate::costs::{join_conditions, question_tokens};
+use crate::costs::question_tokens;
 use crate::expressions::{
     CompileError, PROBABILITIES_SUFFIX, Refusal, SPAN_SUFFIX, argument_alias, call_aliases,
     condition_columns, projected_call, projected_name, repr_str,
 };
-use crate::logical::{LogicalNode, LogicalPlan, ResultNode, SemanticColumn};
-use crate::nodes::{added_columns, asked_call, column_alias, column_call, packing, walk};
-use crate::operators::{ColumnTest, Operators, operators, projection};
+use crate::nodes::{asked_call, packing};
+use crate::operators::{ColumnTest, Operators, SemanticColumn};
 use crate::pricing::PlanPricer;
 use crate::results::result_nodes;
 use crate::retention::{group_sequence, streamed_aliases};
@@ -100,7 +99,7 @@ pub fn hash_join_nodes(
 ) -> Vec<PhysicalNode> {
     let mut nodes = Vec::new();
     for (position, join) in found.joins.iter().enumerate() {
-        let conditions = join_conditions(join);
+        let conditions = &join.on;
         if conditions.is_empty() {
             continue;
         }
@@ -196,20 +195,6 @@ pub fn contiguous_shards(
     (ranges, loads)
 }
 
-/// Each alias's DISTINCT stop key from its filters, as `filter_stop_keys`.
-pub fn filter_stop_keys(plan: &LogicalPlan) -> BTreeMap<String, Vec<String>> {
-    let mut keys = BTreeMap::new();
-    for node in walk(plan) {
-        if let LogicalNode::SemanticFilter(filter) = node
-            && !filter.stop_key.is_empty()
-        {
-            let alias = call_aliases(asked_call(&filter.predicates[0].expression))[0].clone();
-            keys.insert(alias, filter.stop_key.clone());
-        }
-    }
-    keys
-}
-
 /// The longest input of a score: its resident prefix and streamed suffix
 /// tokens, as `score_input_tokens`.
 fn score_input_tokens(
@@ -264,10 +249,9 @@ impl ScoreLowering {
 type Kinds = BTreeSet<&'static str>;
 
 struct GraphBuilder<'a, 'c> {
-    plan: &'a LogicalPlan,
     context: &'a PlanningContext<'c>,
     order: OperatorOrder,
-    operators: Operators,
+    operators: &'a Operators,
     classified: BTreeSet<String>,
     after_joins: BTreeMap<String, Kinds>,
     classified_after: BTreeSet<String>,
@@ -281,7 +265,7 @@ struct GraphBuilder<'a, 'c> {
     nodes: Vec<PhysicalNode>,
     computed_ports: Vec<((String, String), PortRef)>,
     computed_columns: BTreeMap<String, BTreeSet<String>>,
-    column_nodes: Vec<((String, String), LogicalNode)>,
+    column_nodes: Vec<((String, String), SemanticColumn)>,
     emitted_tests: Vec<ColumnTest>,
     scoring: Option<ScoreLowering>,
     pairs_src: BTreeMap<usize, String>,
@@ -289,30 +273,20 @@ struct GraphBuilder<'a, 'c> {
     label_names: Vec<(ModelCall, String)>,
 }
 
-fn column_node(kind: &str, column: &SemanticColumn) -> LogicalNode {
-    match kind {
-        "label" => LogicalNode::SemanticClassify(column.clone()),
-        "extract" => LogicalNode::SemanticExtract(column.clone()),
-        "features" => LogicalNode::SemanticSaeFeatures(column.clone()),
-        _ => LogicalNode::SemanticMap(column.clone()),
-    }
-}
-
 impl<'a, 'c> GraphBuilder<'a, 'c> {
     fn new(
-        plan: &'a LogicalPlan,
+        found: &'a Operators,
         context: &'a PlanningContext<'c>,
         order: OperatorOrder,
     ) -> Result<Self, CompileError> {
-        let found = operators(plan);
-        let labels = label_calls(&found);
+        let labels = label_calls(found);
         let classified = labels.iter().map(|(_, alias)| alias.clone()).collect();
         let mut after_joins: BTreeMap<String, Kinds> = BTreeMap::new();
-        for (alias, kind) in columns_above_joins(&plan.root) {
+        for (alias, kind) in columns_above_joins(found) {
             after_joins
                 .entry(alias)
                 .or_default()
-                .insert(column_step_kind(kind));
+                .insert(column_step_kind(&kind));
         }
         let classified_after = after_joins
             .iter()
@@ -336,12 +310,11 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         let label_names = found
             .classifies
             .iter()
-            .map(|node| (column_call(node).clone(), node.name.clone()))
+            .map(|column| (column.call.clone(), column.name.clone()))
             .collect();
         Ok(GraphBuilder {
-            plan,
             context,
-            stop_keys: filter_stop_keys(plan),
+            stop_keys: found.stop_keys.clone(),
             order,
             operators: found,
             classified,
@@ -405,38 +378,29 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             &self.ask_filters,
             self.context.gpus,
         );
-        let lists = [
-            ("label", &self.operators.classifies),
-            ("extract", &self.operators.extracts),
-            ("features", &self.operators.sae_features),
-            ("map", &self.operators.maps),
-        ];
-        for (kind, columns) in lists {
-            for column in columns {
-                if call_aliases(column_call(column)).len() != 1 {
-                    continue;
-                }
-                let node = column_node(kind, column);
-                let alias = column_alias(column);
-                self.computed_columns
-                    .entry(alias.clone())
-                    .or_default()
-                    .extend(added_columns(&node));
-                let key = (alias, column.name.clone());
-                match self
-                    .column_nodes
-                    .iter_mut()
-                    .find(|(found, _)| *found == key)
-                {
-                    Some(slot) => slot.1 = node,
-                    None => self.column_nodes.push((key, node)),
-                }
+        for column in self.operators.columns() {
+            if call_aliases(&column.call).len() != 1 {
+                continue;
+            }
+            let alias = column.alias();
+            self.computed_columns
+                .entry(alias.clone())
+                .or_default()
+                .extend(column.added_columns());
+            let key = (alias, column.name.clone());
+            match self
+                .column_nodes
+                .iter_mut()
+                .find(|(found, _)| *found == key)
+            {
+                Some(slot) => slot.1 = column.clone(),
+                None => self.column_nodes.push((key, column.clone())),
             }
         }
-        if has_score(&self.operators) {
+        if has_score(self.operators) {
             let chunk = self.order.statistics.chunk;
             self.scoring = Some(ScoreLowering {
-                projected: score_projections(self.plan),
+                projected: score_projections(self.operators),
                 chunk,
                 capacity: arena_capacity(self.context, chunk)?,
                 names: Vec::new(),
@@ -475,7 +439,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 port(&scan_id, format!("rows:{}", scan.alias)),
             );
         }
-        for node in hash_join_nodes(&self.operators, &self.context.pair_fractions, &ports) {
+        for node in hash_join_nodes(self.operators, &self.context.pair_fractions, &ports) {
             if let PhysicalNode::HashJoin(join) = &node {
                 self.pairs_src
                     .insert(join.attributes.written_position as usize, join.id.clone());
@@ -582,7 +546,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     self.emit_filter(alias, &positions, expected_rows, port, followed)?
                 };
             } else {
-                let nodes: Vec<LogicalNode> = run
+                let columns: Vec<SemanticColumn> = run
                     .iter()
                     .map(|index| match &steps[*index].key {
                         StepKey::Name(name) => self
@@ -595,7 +559,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     })
                     .collect();
                 let (after, rows) =
-                    self.emit_columns(alias, expected_rows, port, &nodes, resident)?;
+                    self.emit_columns(alias, expected_rows, port, &columns, resident)?;
                 port = after;
                 row_ports.extend(rows);
             }
@@ -978,7 +942,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         alias: &str,
         expected_rows: f64,
         port: PortRef,
-        nodes: &[LogicalNode],
+        columns: &[SemanticColumn],
         resident: bool,
     ) -> Result<(PortRef, Vec<PortRef>), CompileError> {
         let computed = self
@@ -989,9 +953,9 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         let mut row_ports = Vec::new();
         let mut port = port;
         let mut expected_rows = expected_rows;
-        for (index, logical) in nodes.iter().enumerate() {
+        for (index, column) in columns.iter().enumerate() {
             let node =
-                self.column_operator(logical, port.clone(), expected_rows, resident || index > 0)?;
+                self.column_operator(column, port.clone(), expected_rows, resident || index > 0)?;
             let rows_port = node.rows_port();
             let node_id = node.id().to_string();
             let mut names = vec![];
@@ -1028,12 +992,8 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 }
                 _ => unreachable!("a column operator"),
             }
-            let projected = match logical {
-                LogicalNode::SemanticClassify(column) => {
-                    self.label_projected.contains(column_call(column))
-                }
-                _ => true,
-            };
+            let projected =
+                column.call.kind != "label" || self.label_projected.contains(&column.call);
             self.nodes.push(node);
             port = port_of(&node_id, rows_port);
             if projected {
@@ -1129,7 +1089,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
     /// One column operator's physical node, as its ColumnPlanner's `node`.
     fn column_operator(
         &mut self,
-        logical: &LogicalNode,
+        column: &SemanticColumn,
         port: PortRef,
         expected_rows: f64,
         resident: bool,
@@ -1137,10 +1097,10 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         let context = self.context;
         let model = context.model.name.clone();
         let inputs = std::slice::from_ref(&port);
-        if let LogicalNode::SemanticClassify(column) = logical {
-            let table = classify_statistics(context, &column_alias(column), &[])?;
+        if column.call.kind == "label" {
+            let table = classify_statistics(context, &column.alias(), &[])?;
             let (spec, work) = table.prepare(
-                column_call(column),
+                &column.call,
                 &column.name,
                 expected_rows,
                 context.tokenizer,
@@ -1157,7 +1117,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 model,
             ));
         }
-        let spec = column_spec(context, logical, expected_rows, resident)?;
+        let spec = column_spec(context, column, expected_rows, resident)?;
         Ok(match spec {
             ColumnSpec::Extract(spec) => {
                 let index = self.count_of("quail.ai_extract");
@@ -1371,7 +1331,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
     ) -> Result<Vec<PortRef>, CompileError> {
         let context = self.context;
         let mut row_ports = Vec::new();
-        for (call, _) in label_calls(&self.operators) {
+        for (call, _) in label_calls(self.operators) {
             let aliases = call_aliases(&call);
             if aliases.len() != 2 {
                 continue;
@@ -1548,9 +1508,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         } else {
             vec![ports[&self.operators.scans[0].alias].clone()]
         };
-        let LogicalNode::Project(project) = projection(self.plan) else {
-            unreachable!("a projection")
-        };
+        let project = &self.operators.projection;
         let mut columns = Vec::new();
         for column in &project.columns {
             columns.push(projected_name(column));
@@ -1591,20 +1549,8 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             }
         }
         result_inputs.extend(row_ports);
-        let root = &self.plan.root;
-        let result = match root {
-            LogicalNode::Result(result) => result.clone(),
-            other => ResultNode {
-                input: Box::new(other.clone()),
-                limit: None,
-                order: Vec::new(),
-                offset: 0,
-                distinct: false,
-            },
-        };
         let nodes = result_nodes(
-            self.plan,
-            &result,
+            self.operators,
             &result_inputs,
             &columns,
             &packing(&project.structs),
@@ -1679,7 +1625,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 }),
             );
         }
-        if !label_calls(&self.operators).is_empty() {
+        if !label_calls(self.operators).is_empty() {
             settings.insert(
                 "classify_placement".into(),
                 Value::from(if self.classified_after.is_empty() {
@@ -1729,24 +1675,24 @@ fn classify_node(id: &str, inputs: &[PortRef], spec: ClassifySpec, model: String
     ))
 }
 
-/// Compile a logical plan into a physical plan or a refusal, as
+/// Compile a plan's operators into a physical plan or a refusal, as
 /// `build_physical_plan`.
 ///
 /// # Errors
 ///
 /// A callback fails, or the plan is malformed.
 pub fn build_physical_plan(
-    plan: &LogicalPlan,
+    found: &Operators,
     context: &PlanningContext,
 ) -> Result<Planned, CompileError> {
-    if let Some(refusal) = validate_query(plan, context)? {
+    if let Some(refusal) = validate_query(found, context)? {
         return Ok(Err(refusal));
     }
-    let order = match choose_operator_order(plan, context)? {
+    let order = match choose_operator_order(found, context)? {
         Ok(order) => order,
         Err(refusal) => return Ok(Err(refusal)),
     };
-    GraphBuilder::new(plan, context, order)?.build()
+    GraphBuilder::new(found, context, order)?.build()
 }
 
 /// A refusal when a pair classification cannot run in its join's
@@ -1799,10 +1745,9 @@ pub fn joined_classification_refusal(nodes: &[PhysicalNode]) -> Option<Refusal> 
 /// set-attention question, or the tokenizer fails.
 pub fn bind_runtime_data(
     plan: &mut PhysicalPlan,
-    logical: &LogicalPlan,
+    found: &Operators,
     context: &PlanningContext,
 ) -> Result<(), CompileError> {
-    let found = operators(logical);
     let model = &context.model;
     let set_attention = model.attention_mask == "set";
     let layout = crate::prompts::prompt_layout(&model.prompt_layout)?;
@@ -1888,23 +1833,21 @@ pub fn bind_runtime_data(
     Ok(())
 }
 
-/// Whether a logical plan classifies documents or joined rows.
-pub fn has_label(plan: &LogicalPlan) -> bool {
-    walk(plan)
-        .iter()
-        .any(|node| matches!(node, LogicalNode::SemanticClassify(_)))
+/// Whether a plan classifies documents or joined rows.
+pub fn has_label(found: &Operators) -> bool {
+    !found.classifies.is_empty()
 }
 
-/// Build a Quail plan of one logical alternative without the optimizer
+/// Build a Quail plan of one alternative's operators without the optimizer
 /// rules, as `plan_region`.
 ///
 /// # Errors
 ///
 /// A callback fails, or the plan is malformed.
-pub fn plan_region(plan: &LogicalPlan, context: &PlanningContext) -> Result<Planned, CompileError> {
+pub fn plan_region(found: &Operators, context: &PlanningContext) -> Result<Planned, CompileError> {
     let model = &context.model;
     if model.role == "reranker" {
-        if has_label(plan) {
+        if has_label(found) {
             return Ok(Err(Refusal::new(
                 "a reranker model cannot run AI.CLASSIFY",
                 "reranker_only_scores",
@@ -1913,7 +1856,7 @@ pub fn plan_region(plan: &LogicalPlan, context: &PlanningContext) -> Result<Plan
                 "AI.CLASSIFY expressions",
             )));
         }
-        if !has_score(&operators(plan)) {
+        if !has_score(found) {
             return Ok(Err(Refusal::new(
                 "a reranker model can only be used with AI.SCORE",
                 "reranker_only_scores",
@@ -1923,14 +1866,14 @@ pub fn plan_region(plan: &LogicalPlan, context: &PlanningContext) -> Result<Plan
             )));
         }
     }
-    let mut physical = match build_physical_plan(plan, context)? {
+    let mut physical = match build_physical_plan(found, context)? {
         Ok(physical) => physical,
         Err(refusal) => return Ok(Err(refusal)),
     };
     if let Some(refusal) = joined_classification_refusal(&physical.nodes) {
         return Ok(Err(refusal));
     }
-    bind_runtime_data(&mut physical, plan, context)?;
+    bind_runtime_data(&mut physical, found, context)?;
     Ok(Ok(physical))
 }
 

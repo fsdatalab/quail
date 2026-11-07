@@ -11,9 +11,9 @@ use quail_physical::{Equality, FilterPredicate, Prompt};
 
 use crate::context::PlanningContext;
 use crate::expressions::{CompileError, argument_alias, column_name, compile_error};
-use crate::logical::{LogicalNode, SemanticJoin};
 use crate::lowering::LoweredPrompt;
 use crate::nodes::asked_call;
+use crate::operators::SemanticJoin;
 use crate::scores::{prompt_aliases, score_statistics};
 use crate::statistics::effective_selectivity;
 
@@ -112,19 +112,6 @@ pub fn prepare_filter_costs(
     Ok(prepared)
 }
 
-/// The Equality conditions under one SemanticJoin, in written order.
-pub fn join_conditions(join: &SemanticJoin) -> Vec<Equality> {
-    fn visit(node: &LogicalNode, found: &mut Vec<Equality>) {
-        if let LogicalNode::Join(join) = node {
-            visit(&join.left, found);
-            found.extend(join.on.iter().cloned());
-        }
-    }
-    let mut found = Vec::new();
-    visit(&join.input, &mut found);
-    found
-}
-
 fn priced_key(condition: &Equality) -> (String, String, String, String) {
     (
         argument_alias(&condition.left),
@@ -152,7 +139,7 @@ pub fn join_specs(
 ) -> Result<Vec<PricedJoin>, CompileError> {
     let mut out = Vec::new();
     for (position, join) in joins.iter().enumerate() {
-        let conditions = join_conditions(join);
+        let conditions = &join.on;
         let fraction = if conditions.is_empty() {
             1.0
         } else {

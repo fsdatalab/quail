@@ -1,16 +1,13 @@
-//! What the executor's caller reads from a region's logical plan, so that
-//! no logical plan crosses into Python.
+//! What the executor's caller reads from a region's operators, so that
+//! no plan crosses into Python.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::LogicalPlan;
-use crate::costs::join_conditions;
 use crate::expressions::{argument_alias, call_aliases, column_references, tests};
-use crate::graph::filter_stop_keys;
-use crate::nodes::{asked_call, column_call};
-use crate::operators::operators;
+use crate::nodes::asked_call;
+use crate::operators::Operators;
 use crate::plan_statistics::plan_prompts;
 
 /// A region's facts as JSON:
@@ -28,8 +25,7 @@ use crate::plan_statistics::plan_prompts;
 /// - `prompts`: each table's AI.IF prompts in written order, each
 ///   join's prompt by written position, and each classification's
 ///   prompt and aliases by its output name.
-pub fn region_facts(plan: &LogicalPlan) -> Value {
-    let found = operators(plan);
+pub fn region_facts(found: &Operators) -> Value {
     let mut value_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut add = |alias: &str, column: &str| {
         let columns = value_columns.entry(alias.to_string()).or_default();
@@ -38,7 +34,7 @@ pub fn region_facts(plan: &LogicalPlan) -> Value {
         }
     };
     for join in &found.joins {
-        for condition in join_conditions(join) {
+        for condition in &join.on {
             for reference in column_references(&condition.left)
                 .into_iter()
                 .chain(column_references(&condition.right))
@@ -81,9 +77,9 @@ pub fn region_facts(plan: &LogicalPlan) -> Value {
             }
         }
     }
-    for (alias, key) in filter_stop_keys(plan) {
+    for (alias, key) in &found.stop_keys {
         for column in key {
-            add(&alias, &column);
+            add(alias, column);
         }
     }
     let scans: Vec<Value> = found
@@ -100,7 +96,7 @@ pub fn region_facts(plan: &LogicalPlan) -> Value {
         .collect();
     let mut oriented = Vec::new();
     for (position, join) in found.joins.iter().enumerate() {
-        let conditions = join_conditions(join);
+        let conditions = &join.on;
         let Some(first) = conditions.first() else {
             continue;
         };
@@ -140,18 +136,18 @@ pub fn region_facts(plan: &LogicalPlan) -> Value {
     let classifies: BTreeMap<&str, Value> = found
         .classifies
         .iter()
-        .map(|node| {
-            let call = column_call(node);
+        .map(|column| {
+            let call = &column.call;
             (
-                node.name.as_str(),
+                column.name.as_str(),
                 json!({"prompt": call.prompt, "aliases": call_aliases(call)}),
             )
         })
         .collect();
     json!({
         "prompts": {"filters": filters, "joins": joins, "classifies": classifies},
-        "asks_model": !plan_prompts(&found).is_empty(),
-        "stop_keys": filter_stop_keys(plan),
+        "asks_model": !plan_prompts(found).is_empty(),
+        "stop_keys": found.stop_keys,
         "join_conditions": oriented,
         "scans": scans,
         "value_columns": value_columns,

@@ -18,9 +18,8 @@ use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
 use crate::costs::{CostCurve, prepare_filter_costs, question_tokens};
 use crate::expressions::{CompileError, call_aliases, repr_str};
-use crate::logical::{LogicalNode, LogicalPlan};
-use crate::nodes::{asked_call, column_alias, column_call};
-use crate::operators::Operators;
+use crate::nodes::asked_call;
+use crate::operators::{Operators, SemanticColumn};
 use crate::plan_statistics::{
     PlanStatistics, expected_rows_after_filters, filtered_before_joins, plan_statistics,
 };
@@ -44,7 +43,7 @@ pub enum StepCost {
     Curve(CostCurve),
     /// A column operator's planner prices it.
     Column {
-        node: Box<LogicalNode>,
+        column: Box<SemanticColumn>,
         resident: bool,
     },
 }
@@ -53,7 +52,9 @@ impl StepCost {
     fn seconds(&self, context: &PlanningContext, rows: f64) -> Result<f64, CompileError> {
         match self {
             StepCost::Curve(curve) => Ok(curve.seconds(rows)),
-            StepCost::Column { node, resident } => column_seconds(context, node, *resident, rows),
+            StepCost::Column { column, resident } => {
+                column_seconds(context, column, *resident, rows)
+            }
         }
     }
 }
@@ -65,21 +66,21 @@ impl StepCost {
 /// The tokenizer fails, or the model cannot run the operator.
 pub fn column_seconds(
     context: &PlanningContext,
-    node: &LogicalNode,
+    column: &SemanticColumn,
     resident: bool,
     rows: f64,
 ) -> Result<f64, CompileError> {
-    if let LogicalNode::SemanticClassify(column) = node {
+    if column.call.kind == "label" {
         return classify_seconds(
             context,
-            column_call(column),
+            &column.call,
             &column.name,
-            &column_alias(column),
+            &column.alias(),
             resident,
             rows,
         );
     }
-    Ok(match column_spec(context, node, rows, resident)? {
+    Ok(match column_spec(context, column, rows, resident)? {
         ColumnSpec::Extract(spec) => spec.estimated_seconds,
         ColumnSpec::Map(spec) => spec.estimated_seconds,
         ColumnSpec::SaeFeatures(spec) => spec.estimated_seconds,
@@ -187,35 +188,24 @@ pub fn table_steps(
             }
         }
     }
-    let mut nodes: Vec<LogicalNode> = Vec::new();
+    let mut columns: Vec<&SemanticColumn> = Vec::new();
     for (call, owner) in label_calls(found) {
         if owner != alias {
             continue;
         }
-        if let Some(node) = found
+        if let Some(column) = found
             .classifies
             .iter()
-            .find(|node| call_aliases(column_call(node)).len() == 1 && column_call(node) == &call)
+            .find(|column| call_aliases(&column.call).len() == 1 && column.call == call)
         {
-            nodes.push(LogicalNode::SemanticClassify(node.clone()));
+            columns.push(column);
         }
     }
-    for (variant, list) in [
-        ("extract", &found.extracts),
-        ("features", &found.sae_features),
-        ("map", &found.maps),
-    ] {
-        for node in list.iter().filter(|node| column_alias(node) == alias) {
-            nodes.push(match variant {
-                "extract" => LogicalNode::SemanticExtract(node.clone()),
-                "features" => LogicalNode::SemanticSaeFeatures(node.clone()),
-                _ => LogicalNode::SemanticMap(node.clone()),
-            });
-        }
+    for list in [&found.extracts, &found.sae_features, &found.maps] {
+        columns.extend(list.iter().filter(|column| column.alias() == alias));
     }
-    for node in nodes {
-        let column = crate::nodes::as_column(&node).expect("a column operator");
-        let call = column_call(column);
+    for column in columns {
+        let call = &column.call;
         let survival = tests
             .iter()
             .find(|(name, _)| *name == column.name)
@@ -237,11 +227,11 @@ pub fn table_steps(
         } else {
             (
                 StepCost::Column {
-                    node: Box::new(node.clone()),
+                    column: Box::new(column.clone()),
                     resident: false,
                 },
                 StepCost::Column {
-                    node: Box::new(node.clone()),
+                    column: Box::new(column.clone()),
                     resident: true,
                 },
             )
@@ -1009,14 +999,13 @@ pub fn filter_works(
 /// A cost cannot be computed; a join pair too long for a forward pass
 /// is a Refusal instead.
 pub fn choose_operator_order(
-    plan: &LogicalPlan,
+    found: &Operators,
     context: &PlanningContext,
 ) -> Result<Result<OperatorOrder, Refusal>, CompileError> {
-    let found = crate::operators::operators(plan);
-    let statistics = plan_statistics(plan, context)?;
+    let statistics = plan_statistics(found, context)?;
     let (rule, source) = match &context.order {
         Some(order) => (order.clone(), format!("user: order={}", repr_str(order))),
-        None => default_order_rule(&found),
+        None => default_order_rule(found),
     };
     let mut step_orders: Vec<(String, Vec<TableStep>)> = Vec::new();
     for table in &found.scans {
@@ -1028,7 +1017,7 @@ pub fn choose_operator_order(
             .unwrap_or(0);
         let positions: Vec<usize> = (0..count).collect();
         let steps = table_steps(
-            &found,
+            found,
             &table.alias,
             &positions,
             &StepPricing::Plan(&statistics),
@@ -1067,9 +1056,9 @@ pub fn choose_operator_order(
             )
         })
         .collect();
-    let live = expected_rows_after_filters(plan, &statistics);
-    let works = filter_works(&found, &statistics, context, &step_orders)?;
-    let resident = filtered_before_joins(plan);
+    let live = expected_rows_after_filters(found, &statistics);
+    let works = filter_works(found, &statistics, context, &step_orders)?;
+    let resident = filtered_before_joins(found);
     let mut sequence = Vec::new();
     if !found.joins.is_empty() {
         let mut base = Work::default();
@@ -1194,7 +1183,7 @@ mod tests {
             pair_fractions: BTreeMap::new(),
             scan_fractions: BTreeMap::new(),
             order: None,
-            logical_plan: None,
+            operators: None,
             first_documents: BTreeMap::new(),
             page_shared: BTreeMap::new(),
             reader_groups: BTreeMap::new(),
