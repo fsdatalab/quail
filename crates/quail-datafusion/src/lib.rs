@@ -68,6 +68,10 @@ pub use rules::{LOGICAL_RULES, logical_rule};
 pub use shared::{ROW_COLUMN, SharedInput, SharedInputExec};
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 
+/// The environment variable that turns DataFusion's dynamic filter
+/// pushdown on in a Quail session.
+const DYNAMIC_FILTERS_VARIABLE: &str = "DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN";
+
 /// Build a DataFusion session state with Quail registered.
 ///
 /// SQL is read in the Snowflake dialect, as Quail's `Session.sql`
@@ -85,7 +89,9 @@ pub fn session_state(runner: Arc<dyn RegionRunner>) -> SessionState {
 /// [`ClaimModelRegions`].
 ///
 /// DataFusion's `DATAFUSION_*` environment variables set its options,
-/// such as `DATAFUSION_EXECUTION_TARGET_PARTITIONS`.
+/// such as `DATAFUSION_EXECUTION_TARGET_PARTITIONS`. Dynamic filter
+/// pushdown is off unless `DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN`
+/// turns it on.
 ///
 /// # Errors
 ///
@@ -95,7 +101,16 @@ pub fn session_state_with_rules(
     runner: Arc<dyn RegionRunner>,
     rules: Vec<String>,
 ) -> Result<SessionState> {
-    let config = SessionConfig::from_env()?.set_str("datafusion.sql_parser.dialect", "Snowflake");
+    let mut config =
+        SessionConfig::from_env()?.set_str("datafusion.sql_parser.dialect", "Snowflake");
+    // DataFusion 55.2 moves a pushed filter into a child by column name,
+    // so in a child with two columns of one name, such as `r.id` and
+    // `p.id`, a join's filter can read the wrong one and drop every row
+    // (apache/datafusion#25244, fixed for 56 by #25259;
+    // tests/dynamic_filter.rs)
+    if std::env::var_os(DYNAMIC_FILTERS_VARIABLE).is_none() {
+        config = config.set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", false);
+    }
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()

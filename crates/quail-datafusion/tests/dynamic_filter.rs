@@ -7,30 +7,25 @@
 //! `datafusion-physical-plan` `filter_pushdown.rs`, which a hash join
 //! calls from `gather_filters_for_pushdown`). When the child has two
 //! columns of one name, the filter reads the first, whichever column
-//! the join reads. A model region over two tables returns two id
-//! columns of one name, such as `r.id` and `p.id`, so the join that adds
-//! the tables' other columns back gives each id a name of its own
-//! (`join_back.rs`).
+//! the join reads (apache/datafusion#25244). A model region over two
+//! tables returns two id columns of one name, such as `r.id` and
+//! `p.id`, so Quail's session turns dynamic filter pushdown off
+//! (`lib.rs`).
 //!
-//! The first test reproduces the bug with DataFusion's operators alone.
-//! It fails once DataFusion maps the columns by position; the renaming
-//! in `join_back.rs` can then go.
+//! The first test reproduces the bug with DataFusion alone. It fails
+//! once DataFusion maps the columns by position (apache/datafusion#25259,
+//! on its `branch-56`); Quail's session can then keep the filters on.
+//! The other tests turn the filters on to check the join back, and
+//! check that Quail's own setting keeps the rows of joins above a region.
 
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{Constraint, Constraints, JoinType, NullEquality, Result};
+use datafusion::common::{Constraint, Constraints, Result};
 use datafusion::datasource::MemTable;
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use quail_datafusion::{
@@ -55,58 +50,55 @@ fn text_batch(columns: &[&str], values: &[&[&str]]) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(text_schema(columns), arrays)?)
 }
 
-fn inner_join(
-    build: Arc<dyn ExecutionPlan>,
-    probe: Arc<dyn ExecutionPlan>,
-    keys: (Column, Column),
-) -> Result<Arc<dyn ExecutionPlan>> {
-    Ok(Arc::new(HashJoinExec::try_new(
-        build,
-        probe,
-        vec![(Arc::new(keys.0), Arc::new(keys.1))],
-        None,
-        &JoinType::Inner,
-        None,
-        PartitionMode::CollectLeft,
-        NullEquality::NullEqualsNothing,
-        false,
+/// A table of text columns with exact row counts, as DataFusion's
+/// statistics give a `MemTable`.
+fn text_table(columns: &[&str], values: &[&[&str]]) -> Result<Arc<MemTable>> {
+    let batch = text_batch(columns, values)?;
+    Ok(Arc::new(MemTable::try_new(
+        batch.schema(),
+        vec![vec![batch]],
     )?))
 }
 
 #[tokio::test]
 async fn datafusion_filters_the_first_of_two_columns_of_one_name() -> Result<()> {
-    // each row pairs a review id with a product id, under one name
-    let pairs = text_batch(&["id", "id"], &[&["r0", "r2"], &["p0", "p1"]])?;
-    let pairs = MemorySourceConfig::try_new_exec(&[vec![pairs.clone()]], pairs.schema(), None)?;
-    let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(Column::new(
-        "id", 0,
-    )))])
-    .expect("one sort key");
-    let sorted = Arc::new(SortExec::new(ordering, pairs));
-    let reviews = text_batch(&["k"], &[&["r0", "r2"]])?;
-    let reviews =
-        MemorySourceConfig::try_new_exec(&[vec![reviews.clone()]], reviews.schema(), None)?;
-    let products = text_batch(&["k"], &[&["p0", "p1"]])?;
-    let products =
-        MemorySourceConfig::try_new_exec(&[vec![products.clone()]], products.schema(), None)?;
-    // the review join's output is k, id, id; the product join reads the
-    // second id, the product's
-    let by_review = inner_join(reviews, sorted, (Column::new("k", 0), Column::new("id", 0)))?;
-    let by_product = inner_join(
-        products,
-        by_review,
-        (Column::new("k", 0), Column::new("id", 2)),
+    let context = SessionContext::new();
+    // eight pairs of a review id and a product id; four are of reviews
+    // and products the tables hold
+    let pairs = text_table(
+        &["k", "rid", "pid"],
+        &[
+            &["0", "1", "2", "3", "4", "5", "6", "7"],
+            &["r0", "r0", "r2", "r2", "r8", "r8", "r9", "r9"],
+            &["p0", "p1", "p0", "p1", "p8", "p8", "p9", "p9"],
+        ],
     )?;
-    let plan =
-        FilterPushdown::new_post_optimization().optimize(by_product, &ConfigOptions::default())?;
-    let batches = collect(Arc::clone(&plan), SessionContext::new().task_ctx()).await?;
-    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    // both pairs match; the product filter tests the review ids instead
+    context.register_table("pairs", pairs)?;
+    let reviews = text_table(&["id", "body"], &[&["r0", "r1", "r2"], &["a", "b", "c"]])?;
+    context.register_table("reviews", reviews)?;
+    let products = text_table(&["id", "text"], &[&["p0", "p1"], &["x", "y"]])?;
+    context.register_table("products", products)?;
+    // the pairs' join returns two columns named `id`. JoinSelection
+    // builds both outer joins on the smaller tables, so their filters
+    // reach the sort over the pairs, and the products' filter reads the
+    // first `id`, the review's
+    let query = "SELECT a.id, b.id, r.body, p.text \
+        FROM (SELECT k, rid AS id FROM pairs) a \
+        JOIN (SELECT k, pid AS id FROM pairs) b ON a.k = b.k \
+        JOIN reviews r ON r.id = a.id JOIN products p ON p.id = b.id \
+        ORDER BY a.id, b.id";
+    let mut found = Vec::new();
+    for setting in ["true", "false"] {
+        let set = format!("SET datafusion.optimizer.enable_dynamic_filter_pushdown = {setting}");
+        context.sql(&set).await?.collect().await?;
+        let plan = context.sql(query).await?.create_physical_plan().await?;
+        let batches = collect(Arc::clone(&plan), context.task_ctx()).await?;
+        found.push(batches.iter().map(RecordBatch::num_rows).sum::<usize>());
+    }
     assert_eq!(
-        rows,
-        0,
-        "DataFusion now keeps the pairs; drop the renaming in join_back.rs:\n{}",
-        displayable(plan.as_ref()).indent(true)
+        found,
+        [0, 4],
+        "DataFusion now keeps the pairs; Quail's session can keep dynamic filters on (lib.rs)"
     );
     Ok(())
 }
@@ -283,5 +275,37 @@ async fn a_join_with_a_plain_table_filters_the_regions_rows_by_the_tables_keys()
     ]
     .join("\n");
     assert_eq!(rows, expected, "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn joins_of_tables_above_a_region_keep_its_pairs_in_quails_session() -> Result<()> {
+    let context = context(&[]).await?;
+    // the region returns `r.id` and `p.id`; the joins above it read each
+    let (plan, rows) = run(
+        &context,
+        "SELECT r2.stars, p2.text FROM reviews r JOIN products p \
+            ON AI_FILTER(PROMPT('m {0} {1}', r.body, p.text)) \
+            JOIN reviews r2 ON r2.id = r.id JOIN products p2 ON p2.id = p.id \
+            ORDER BY r.id, p.id",
+    )
+    .await?;
+    let expected = [
+        "+-------+------+",
+        "| stars | text |",
+        "+-------+------+",
+        "| 5     | x    |",
+        "| 5     | y    |",
+        "| 4     | x    |",
+        "| 4     | y    |",
+        "+-------+------+",
+    ]
+    .join("\n");
+    assert_eq!(
+        rows,
+        expected,
+        "{}",
+        displayable(plan.as_ref()).indent(true)
+    );
     Ok(())
 }

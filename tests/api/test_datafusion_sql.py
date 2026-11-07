@@ -109,6 +109,18 @@ def test_an_ai_join_returns_each_matching_pair_once_with_both_tables_columns(
                     ("r2", 4, "p0", "x"), ("r2", 4, "p1", "y")]
 
 
+def test_joins_of_tables_above_an_ai_join_keep_each_matching_pair(session):
+    # the region returns r.id and p.id, two columns named id
+    query = session.sql(
+        "SELECT r2.stars, p2.text FROM reviews r JOIN products p "
+        "ON AI_FILTER(PROMPT('m {0} {1}', r.body, p.text)) "
+        "JOIN reviews r2 ON r2.id = r.id JOIN products p2 ON p2.id = p.id "
+        "ORDER BY r.id, p.id")
+    oracle = Oracle(joins=lambda node, assignment: assignment["r"] != 1)
+    rows = finish(query, oracle).to_rows()
+    assert rows == [(5, "x"), (5, "y"), (4, "x"), (4, "y")]
+
+
 def test_a_field_of_an_extracted_struct_is_selected_beside_a_joined_column(
         session):
     query = session.sql(

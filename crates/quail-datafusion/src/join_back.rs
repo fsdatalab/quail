@@ -96,10 +96,10 @@ impl JoinBack {
             .filter(|joined| !joined.columns.is_empty())
             .collect();
         // each joined table's id leaves the region under a name of its
-        // own. DataFusion 55.2 maps a dynamic join filter's columns into
-        // a probe side by name, so two region columns of one name, such
-        // as `r.id` and `p.id`, would send one table's ids to the other's
-        // column (tests/dynamic_filter.rs)
+        // own, as a region over two tables returns two ids of one name,
+        // such as `r.id` and `p.id`, and DataFusion 55.2's dynamic
+        // filters, when a session turns them on, read a column by name
+        // (tests/dynamic_filter.rs)
         let renamed = region
             .schema()
             .iter()
