@@ -95,6 +95,7 @@ names the rule that makes each rewrite and when it applies.
 | R10 | `Limit_{k,m}(AI(R; n)) ⇒ Limit_{k,m}(AI(R; n = min(k + m, n)))` | `push_down_limit_into_ai_nodes` | As R9, for a LIMIT with an OFFSET of `m`. |
 | R11 | `Limit_k(R ⊎ S) ⇒ Limit_k(Limit_k(R) ⊎ Limit_k(S))` | DataFusion's `push_down_limit`, then `push_down_limit_into_ai_nodes` | `⊎` is UNION ALL. Each branch's LIMIT becomes its `AiNode`'s fetch as R9 allows. |
 | R12 | `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))` | `push_down_distinct` | `K` is input columns or a classification's label, and the node has no fetch. |
+| R17 | `AI_{f→b}(AI_{f→a}(R)) ⇒ π_{*, a→b}(AI_{f→a}(R))` | `merge_repeated_ai_calls` | Same call and guard, only filters and other `AiNode`s of the same rows between them, no fetch on the upper node, each test of the upper node's answer already a test of the lower node's, and the lower node returns each column the upper one returns. The lowering already gives calls written the same way in one SELECT list and WHERE one node. |
 
 R1 needs no rule of its own. Quail moves each plain filter term to its
 table while it finds the model regions, before DataFusion's optimizer

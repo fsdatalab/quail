@@ -111,7 +111,9 @@ included: its own rules, such as `SimplifyExpressions`,
 node to the tables it reads, as `PushDownFilter` does for plain
 filters, and orders each table's operators the way the executor reads
 them. `AbsorbIntoAiNodes` makes each test of an answer column the
-filter of the `AiNode` that adds the column. `PushDownFilter` and
+filter of the `AiNode` that adds the column. `MergeRepeatedAiCalls`
+makes a node with the same call as a node below it read that node's
+answer, so the model answers the call once. `PushDownFilter` and
 `OptimizeProjections` place the plain filters and prune unread
 columns:
 

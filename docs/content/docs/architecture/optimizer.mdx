@@ -113,7 +113,7 @@ are DataFusion optimizer rules that run over the whole plan, Quail's
 `AiNode`s included; physical rules rewrite Quail's executable graphs.
 
 The logical rules are DataFusion's default rules, from
-`rewrite_set_comparison` to `optimize_projections`, with Quail's five
+`rewrite_set_comparison` to `optimize_projections`, with Quail's six
 before `replace_distinct_aggregate`, which turns a DISTINCT into a
 GROUP BY. Each rewrite of an AI operator has a number, such as R1;
 [Rules](/docs/extending/rules#rewrites-by-number) gives each one's
@@ -127,6 +127,7 @@ region.
 | `eliminate_distinct` | Logical | Remove DISTINCT when the SELECT list returns every table's id column. | No |
 | `place_ai_nodes` | Logical | Move each model operator to the tables it reads and order each table's operators. | No |
 | `absorb_into_ai_nodes` | Logical | Make each test of an answer column the filter of the `AiNode` that adds it, when the node has no fetch (R2). | No |
+| `merge_repeated_ai_calls` | Logical | Make an AI operator read the answer of the same call below it, so the model answers the call once (R17). | No |
 | `push_down_distinct` | Logical | Give the AI operator under a DISTINCT a fetch of one row per selected key: input columns, or a classification's label (R12). | No |
 | `push_down_limit_into_ai_nodes` | Logical | Make a LIMIT, with its OFFSET, the fetch of the AI operator whose rows it reads, through projections, when the node has no `HINT` (R9, R10). | No |
 | `decorrelate_predicate_subquery` | Logical | DataFusion's rule: run an IN or EXISTS subquery as a semi or anti join. | No |
