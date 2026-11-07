@@ -17,7 +17,7 @@ use quail_cost::sae_features::sae_encoded_tokens;
 use quail_cost::sol::speed_of_light;
 use quail_cost::statistics::int_true_divide;
 use quail_cost::work::{Work, ask, scan};
-use quail_physical::{Condition, ModelCall, Prompt};
+use quail_physical::{ModelCall, Prompt, ValueExpression};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -49,7 +49,7 @@ pub type Assignment = [(String, i64)];
 /// The reference label of a classification for one assignment.
 pub type LabelOracle<'a> = dyn Fn(&Prompt, &Assignment) -> Result<String, CompileError> + 'a;
 /// Which answers a one-column condition accepts.
-pub type Accepts<'a> = dyn Fn(&Condition, &[Value]) -> Result<Vec<bool>, CompileError> + 'a;
+pub type Accepts<'a> = dyn Fn(&ValueExpression, &[Value]) -> Result<Vec<bool>, CompileError> + 'a;
 /// Per document of an alias, the shared prefix tokens when only some rows compute.
 pub type SubsetShared<'a> = dyn Fn(&str, &[i64]) -> Result<Vec<i64>, CompileError> + 'a;
 /// alias -> (row, the partner rows its equality conditions keep).
@@ -123,7 +123,9 @@ fn refuse_unpriced(found: &Operators) -> Result<(), CompileError> {
             {
                 let shown = match &predicate.expression {
                     quail_physical::Asked::Call(call) => crate::expressions::explain_call(call),
-                    quail_physical::Asked::Compare(test) => crate::expressions::test_text(test),
+                    quail_physical::Asked::Compare(test) => {
+                        crate::expressions::column_name(&test.test, true)
+                    }
                 };
                 return not_priced(format!(
                     "the speed of light estimate does not price the filter {shown} on {}; it \
@@ -169,7 +171,7 @@ fn refuse_unpriced(found: &Operators) -> Result<(), CompileError> {
     for join in &found.joins {
         let quail_physical::Asked::Call(call) = &join.predicate else {
             return not_priced(
-                "the speed of light estimate does not price a join on RegularPredicate; it \
+                "the speed of light estimate does not price a join on ScoreTest; it \
                  prices AI.IF joins",
             );
         };
@@ -768,7 +770,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
 
     fn answer_survivors(
         &self,
-        condition: &Condition,
+        condition: &ValueExpression,
         rows: &[i64],
         answers: &BTreeMap<i64, Value>,
     ) -> Result<Vec<i64>, CompileError> {
@@ -1000,7 +1002,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 );
             }
             let passed = self.answer_survivors(&test.condition, &rows, &answers)?;
-            let membership = matches!(&test.condition, Condition::Compare(compare) if compare.comparison == "in");
+            let membership = test.labels.is_some();
             let mut record = stage(
                 if membership { LABEL_IN } else { ANSWER_TEST },
                 alias,
@@ -1013,11 +1015,11 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 &Work::default(),
             );
             record.insert("name".into(), Value::from(name.clone()));
-            match &test.condition {
-                Condition::Compare(compare) if membership => {
-                    record.insert("accepted".into(), compare.value.clone());
+            match &test.labels {
+                Some(labels) => {
+                    record.insert("accepted".into(), labels.clone());
                 }
-                _ => {
+                None => {
                     record.insert(
                         "condition".into(),
                         Value::from(condition_text(&test.condition)),

@@ -3,7 +3,9 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pyarrow as pa
 import pytest
+from helpers.conditions import condition as sql_condition
 from helpers.fakes import (
     DOC,
     FRAME,
@@ -22,7 +24,6 @@ from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
-from quail.common.expressions import ColumnRef, RegularPredicate
 from quail.physical import (
     AiClassify,
     AiFilter,
@@ -127,15 +128,15 @@ def fused_graph(*, classify_only=False):
         Filter(
             node_id="label:r",
             inputs=input_ports((PortRef("classify:r", "rows:r"),)),
-            predicate=RegularPredicate(
-                ColumnRef("r", "reviews", "topic"), "in", ("a",)),
+            predicate=sql_condition(
+                "topic IN ('a')", {"topic": pa.string()}, "r", "reviews"),
             aliases=("r",),
             selectivity=0.5, written_position=1),
         Filter(
             node_id="label:again",
             inputs=input_ports((PortRef("label:r", "rows:r"),)),
-            predicate=RegularPredicate(
-                ColumnRef("r", "reviews", "topic"), "in", ("a",)),
+            predicate=sql_condition(
+                "topic IN ('a')", {"topic": pa.string()}, "r", "reviews"),
             aliases=("r",),
             selectivity=1.0, written_position=2),
         AiClassify(

@@ -4,13 +4,14 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from helpers.conditions import condition as sql_condition
 from helpers.kv_checker import cpu_torch
 
 from quail.backends.quail.executor.operators.filter import ConditionGate
 from quail.backends.quail.executor.operators.sae_features import SaeFeaturesPart
 from quail.backends.quail.executor.sae import feature_lists_of_rows
 from quail.backends.quail.executor.stages import Stage
-from quail.common.expressions import ColumnRef, RegularPredicate
+from quail.common.expressions import FEATURE_LIST
 from quail.physical import AiSaeFeatures, Filter, SaeFeaturesSpec
 
 
@@ -33,8 +34,9 @@ def test_feature_lists_are_tested_after_settling_and_cached_as_values(pooling):
                            accumulator=accumulator)
     for position in range(3):
         part.stages[0].decide(position, packed[position:position + 1])
-    condition = Filter(node_id="condition", aliases=("r",), predicate=RegularPredicate(
-        ColumnRef("r", "reviews", "features"), "is not null"))
+    features = {"features": FEATURE_LIST}
+    condition = Filter(node_id="condition", aliases=("r",), predicate=sql_condition(
+        "features IS NOT NULL", features, "r", "reviews"))
     gate = ConditionGate(condition, {"features": part}, part, None)
     assert part.tested_columns == ("features",)
     assert gate.gate(("r", 1)) is None
@@ -44,8 +46,8 @@ def test_feature_lists_are_tested_after_settling_and_cached_as_values(pooling):
     assert gate.gate(("r", 2)) is None
     assert len(gate.accepted) == 2
     rejected = ConditionGate(Filter(
-        node_id="null", aliases=("r",), predicate=RegularPredicate(
-            ColumnRef("r", "reviews", "features"), "is null")),
+        node_id="null", aliases=("r",), predicate=sql_condition(
+            "features IS NULL", features, "r", "reviews")),
         {"features": part}, part, None)
     assert rejected.gate(("r", 1)) is Stage.DROP
     rows = part.result(0, 0, 0, {}).outputs["rows:r"]

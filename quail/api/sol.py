@@ -41,13 +41,7 @@ import numpy as np
 import pyarrow as pa
 
 from quail.common import budgets
-from quail.common.expressions import (
-    accepts,
-    column_name,
-    condition_columns,
-    evaluate_expression,
-    table_alias,
-)
+from quail.common.expressions import accepts, evaluate
 from quail.common.pairs import pair_table, partner_map
 from quail.common.tokens import prefix_tree
 from quail.common.work import Work
@@ -322,7 +316,7 @@ class _Oracles:
 
     def accepts(self, condition, values):
         condition = decode_plan_value(condition)
-        (column,) = condition_columns(condition)
+        (column,) = dict.fromkeys(ref.column for ref in condition.references)
         kept = accepts(condition, pa.table({column: pa.array(json.loads(values),
                                                              pa.string())}))
         return json.dumps(kept.to_pylist())
@@ -344,8 +338,7 @@ def _estimate_inputs(query, stores, chunk: int, credit: bool) -> dict:
     for scan in facts["scans"]:
         store = stores[scan["alias"]]
         tokens = [int(length) for length in store.lengths]
-        column = column_name(decode_plan_value(json.dumps(scan["column"])),
-                             qualified=False)
+        column = scan["column_name"]
         aliases.append({
             "alias": scan["alias"],
             "column": f"{scan['provider']}.{column}",
@@ -363,9 +356,9 @@ def _estimate_inputs(query, stores, chunk: int, credit: bool) -> dict:
                        decode_plan_value(json.dumps(right)))
                       for left, right in join["pairs"]]
         pairs = pair_table(
-            left_alias, [evaluate_expression(left, stores[table_alias(left)])
+            left_alias, [evaluate(left, stores[left_alias])
                          for left, _ in conditions],
-            right_alias, [evaluate_expression(right, stores[table_alias(right)])
+            right_alias, [evaluate(right, stores[right_alias])
                           for _, right in conditions])
         allowed_pairs[str(position)] = {
             alias: [[int(key), [int(row) for row in groups.rows[

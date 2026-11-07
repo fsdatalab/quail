@@ -9,6 +9,8 @@ description = "Quail's AI functions and model region planning as a DataFusion ex
 async-trait = "0.1"
 datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions", "string_expressions", "unicode_expressions", "math_expressions", "regex_expressions"] }
 base64 = "0.23"
+# a region's expressions cross to the executor as datafusion-proto bytes
+datafusion-proto = { version = "55.2.0", default-features = false }
 futures = "0.3"
 quail-physical = { path = "../quail-physical" }
 quail-planner = { path = "../quail-planner" }

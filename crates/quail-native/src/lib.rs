@@ -476,7 +476,8 @@ fn plan_operator<'py>(
                          assignment: &quail_planner::sol::Assignment| {
                 text("label", (encode(prompt), encode(&assignment.to_vec())))
             };
-            let accepts = |condition: &quail_physical::Condition, values: &[serde_json::Value]| {
+            let accepts = |condition: &quail_physical::ValueExpression,
+                           values: &[serde_json::Value]| {
                 let found = parse(text(
                     "accepts",
                     (encode(condition), encode(&values.to_vec())),
@@ -1043,6 +1044,78 @@ impl NativePlanner {
     }
 }
 
+/// Evaluate a value or condition over rows with DataFusion: (values,
+/// None), or (None, why it does not evaluate).
+///
+/// `expression` is a `ColumnRef`, `GetField`, `Alias`, or `Expression`;
+/// `rows` is a pyarrow Table or RecordBatch. A column is read by its
+/// name, with its table alias when `qualified`. The values are a
+/// pyarrow Array with one value per row; a condition's are booleans,
+/// null where SQL's three-valued logic leaves a row unknown.
+#[pyfunction]
+#[pyo3(signature = (expression, rows, qualified=false))]
+fn evaluate<'py>(
+    py: Python<'py>,
+    expression: &Bound<'py, PyAny>,
+    rows: &Bound<'py, PyAny>,
+    qualified: bool,
+) -> PyResult<(Option<Bound<'py, PyAny>>, Option<String>)> {
+    use datafusion::arrow::array::{ArrayRef, RecordBatch, RecordBatchReader};
+    let text: String = expression.call_method0("to_json")?.extract()?;
+    let expression: quail_physical::ValueExpression = serde_json::from_str(&text)
+        .map_err(|error| pyo3::exceptions::PyTypeError::new_err(error.to_string()))?;
+    let reader = quail::pyarrow::stream_from_pyarrow(rows)?;
+    let schema = reader.schema();
+    let mut batches = reader
+        .collect::<Result<Vec<RecordBatch>, _>>()
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(schema));
+    }
+    let found = py.detach(|| -> Result<ArrayRef, quail_planner::CompileError> {
+        let arrays = batches
+            .iter()
+            .map(|batch| quail_datafusion::expressions::evaluate(&expression, batch, qualified))
+            .collect::<Result<Vec<_>, _>>()?;
+        if arrays.len() == 1 {
+            return Ok(arrays.into_iter().next().expect("one array"));
+        }
+        let parts: Vec<&dyn datafusion::arrow::array::Array> =
+            arrays.iter().map(AsRef::as_ref).collect();
+        datafusion::arrow::compute::concat(&parts)
+            .map_err(|error| quail_planner::CompileError::new(error.to_string()))
+    });
+    match found {
+        Ok(array) => Ok((Some(quail::pyarrow::array_to_pyarrow(py, &array)?), None)),
+        Err(error) => Ok((None, Some(error.0))),
+    }
+}
+
+/// An `Expression` of SQL text over the columns of `rows`, a pyarrow
+/// Table or RecordBatch, each a column of table `alias` from `provider`:
+/// (its JSON, None), or (None, why it does not parse).
+#[pyfunction]
+#[pyo3(signature = (sql, rows, alias="", provider=""))]
+fn parse_expression(
+    sql: &str,
+    rows: &Bound<'_, PyAny>,
+    alias: &str,
+    provider: &str,
+) -> PyResult<(Option<String>, Option<String>)> {
+    use datafusion::arrow::array::RecordBatchReader;
+    let schema = quail::pyarrow::stream_from_pyarrow(rows)?.schema();
+    match quail_datafusion::expressions::parse(sql, &schema, alias, provider) {
+        Ok(found) => Ok((
+            Some(
+                serde_json::to_string(&quail_physical::ValueExpression::Value(found))
+                    .expect("an expression writes"),
+            ),
+            None,
+        )),
+        Err(error) => Ok((None, Some(error.0))),
+    }
+}
+
 #[pymodule]
 fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     physical::register(module)?;
@@ -1052,6 +1125,8 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<cost::CostModel>()?;
     budgets::register(module)?;
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
+    module.add_function(wrap_pyfunction!(evaluate, module)?)?;
+    module.add_function(wrap_pyfunction!(parse_expression, module)?)?;
     module.add_function(wrap_pyfunction!(model_answers, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_layout, module)?)?;
     module.add_function(wrap_pyfunction!(read_specs, module)?)?;

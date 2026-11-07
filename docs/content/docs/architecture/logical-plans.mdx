@@ -200,38 +200,46 @@ reads the window's rows as a table named by the CTE.
 ## Expressions
 
 Expressions describe the values an operator reads, computes, or tests.
-A value expression reads a column, accesses a struct field, or applies
-a function without calling the model. A `ModelCall` describes an AI
-operation.
+The planner reasons about columns and model calls; DataFusion computes
+every other value and every condition.
 
 | Expression | Value |
 | --- | --- |
 | `ColumnRef(alias, provider, column)` | A reference to a table column. |
 | `GetField(input, field)` | A field read from a struct. |
-| `ScalarFunction(function, args)` | A value computed for each row, such as text length. |
-| `RegularPredicate(expression, comparison, value)` | A condition on a value, such as `length(r.body) < 40`. |
+| `Expression(encoded, columns, text)` | A value or condition DataFusion computes for each row, such as `length(r.body) < 40`. |
 | `ModelCall(prompt, kind, labels, descriptions)` | An AI operation. The kind is `boolean`, `score`, `label`, `extract`, `features`, or `map`. |
+| `ScoreTest(call, test)` | An `AI.SCORE` call compared with a threshold. |
 | `Alias(expression, name)` | An expression returned under a specified column name. |
 
-For example, `LENGTH(r.details.body)` reads the `details` column,
-selects its `body` field, and computes the text length. Its expression is:
+An `Expression` holds DataFusion's logical expression, encoded with
+datafusion-proto. It reads its columns by position: `columns[i]` names
+the column it reads as `#i`, so the planner can rename a column, such as
+the score column a score filter reads, without DataFusion. `text` is
+how `explain()` shows it, with `{i}` for `columns[i]`.
 
-```python
-ScalarFunction("length", (
-    GetField(ColumnRef("r", "reviews", "details"), "body"),
-))
-```
+For example, `LENGTH(r.details.body) < 40` reads the `details` column of
+`reviews` as `r`. Its expression has `columns` `[r.details]` and the
+text `character_length({0}.body) < 40`.
+
+The executor evaluates an expression with `_quail_native.evaluate`,
+which takes the expression and a pyarrow table, evaluates it with
+DataFusion, and returns a pyarrow array over the same buffers: a
+condition gives booleans, null where SQL's three-valued logic leaves a
+row unknown. Python reads only an expression's `references`, the
+columns it gathers for it; `quail.common.expressions.evaluate` wraps the
+call.
 
 The operators use these expressions as follows:
 
-- A scan's `column` specifies the text to tokenize. It can read a
-  source column directly or use a value expression, such as a struct
-  field.
-- A filter or join tests a boolean `ModelCall`, or a `RegularPredicate`
-  that compares an `AI.SCORE` call with a threshold.
+- A scan's `column` specifies the text to tokenize: a source column or
+  a struct field of one. Its `predicates` are conditions on the
+  table's own columns.
+- A filter or join tests a boolean `ModelCall`, or a `ScoreTest`.
 - A column filter tests a label, extracted answer, or answer position
-  with a `RegularPredicate`. The condition does not call the model
-  again.
+  with a condition that reads the answer's column. The condition does
+  not call the model again. A test of a label that is `IN` a list of
+  labels also keeps the labels, which the planner reads.
 - The projection's columns specify the returned values and their names.
 
 ## Prompt binding

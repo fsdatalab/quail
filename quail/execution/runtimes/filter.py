@@ -38,32 +38,12 @@ class FilterRuntime:
             node, rows, lambda name, ids: _read(name, ids, node, others, sources)))
 
 
-class ResultColumns:
-    """Read result row columns by name, including fields of struct columns.
-
-    The Project packs each extraction's answers into a struct column,
-    so ``lease.ends`` is the field ``ends`` of the column ``lease`` when
-    no column has that name.
-    """
-
-    def __init__(self, batch: pa.RecordBatch):
-        self.batch = batch
-
-    def column(self, name: str):
-        if name in self.batch.schema.names:
-            return self.batch.column(name)
-        struct, _, field = name.rpartition(".")
-        if struct in self.batch.schema.names:
-            return pc.struct_field(self.batch.column(struct), field)
-        raise KeyError(f"the result rows have no column {name!r}")
-
-
 def filter_result_rows(node, value) -> NodeResult:
     """Keep the result rows whose predicate holds, one batch at a time."""
     num_rows, batches = 0, []
     for batch in row_batches(value):
         num_rows += batch.num_rows
-        kept = accepts(node.predicate, ResultColumns(batch), qualified=True)
+        kept = accepts(node.predicate, batch, qualified=True)
         batches.append(batch.filter(kept).select(list(node.columns)))
     table = pa.Table.from_batches(batches)
     return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
@@ -133,8 +113,7 @@ def filter_scores(node, rows: Rows, tested: pa.Table | None = None) -> NodeResul
                 "anchor": left,
                 "partners": right,
                 "semantics": "full",
-                "comparison": node.predicate.comparison,
-                "threshold": node.predicate.value,
+                "predicate": str(node.predicate),
             },
         )
     outputs = {node.rows_port: filtered, answer_name: answer_relation}

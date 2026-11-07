@@ -254,13 +254,7 @@ fn refusal(
         ));
     }
     let tests = || found.column_filters.iter().flat_map(|(_, tests)| tests);
-    if tests().any(|test| {
-        test.call.kind == "label"
-            && !matches!(&test.condition, quail_physical::Condition::Compare(predicate)
-                if predicate.comparison == "in"
-                    && !matches!(predicate.expression,
-                        quail_physical::ValueExpression::ScalarFunction(_)))
-    }) {
+    if tests().any(|test| test.call.kind == "label" && test.labels.is_none()) {
         return Ok(refuse(
             "plain label tests other than IN run on the Quail backend only".into(),
             "label_test_needs_quail_backend".into(),
@@ -464,12 +458,7 @@ fn classify_specs(
             .filter(|(found, _)| *found == alias)
             .flat_map(|(_, tests)| tests)
             .filter(|test| test.call == call)
-            .map(|test| match &test.condition {
-                quail_physical::Condition::Compare(predicate) => {
-                    json!([test.position, predicate.value])
-                }
-                _ => json!([test.position, null]),
-            })
+            .map(|test| json!([test.position, test.labels]))
             .collect();
         let option_offsets = if decides {
             let lengths = call

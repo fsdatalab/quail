@@ -302,7 +302,7 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     tests = column_tests(found)
     assert [str(test.condition) for test in tests] == [
         "c.lease.ends IS NOT NULL", "c.lease.ends ilike '%march%'",
-        "c.lease.ends_span.start < 20", "length(c.lease.rent) < 20"]
+        "c.lease.ends_span.start < 20", "character_length(c.lease.rent) < 20"]
     assert [test.selectivity for test in tests] == [0.5, 0.5, 0.5, 0.5]
     # the first three tests read the first field, the last the second
     assert [test.name for test in tests] == ["lease.ends"] * 3 + ["lease.rent"]
@@ -312,7 +312,7 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     filters = [n for n in plan.nodes if isinstance(n, Filter)]
     assert [str(node.predicate) for node in filters] == [
         "c.lease.ends IS NOT NULL", "c.lease.ends ilike '%march%'",
-        "c.lease.ends_span.start < 20", "length(c.lease.rent) < 20"]
+        "c.lease.ends_span.start < 20", "character_length(c.lease.rent) < 20"]
     assert filters[0].inputs[0].source.node_id == extracts[0].node_id
     assert extracts[1].inputs[0].source.node_id == filters[2].node_id
     # the three tests on the first field thin the second extraction,
@@ -352,6 +352,19 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
         {0: "March 3, 2027", 1: None}))
     assert result.collect().num_rows == 0
 
+
+def test_a_datafusion_function_arrow_compute_lacks_tests_an_answer(session):
+    from quail.api.execute import execute_query
+
+    # SPLIT_PART is DataFusion's; Arrow compute has no such function
+    query = session.sql(
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+        "FROM contracts c WHERE SPLIT_PART(lease.ends, ' ', 1) = 'March'")
+    (test,) = column_tests(operators_of(query))
+    assert str(test.condition) == "split_part(c.lease.ends, ' ', 1) = 'March'"
+    result = execute_query(query, physical_executor=_answers_executor(
+        {0: "March 3, 2027", 1: "June 1, 2030"}))
+    assert result.collect().column("c.id").to_pylist() == [1]
 
 def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(session):
     from quail.api.execute import execute_query

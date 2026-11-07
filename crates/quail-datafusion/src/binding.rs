@@ -4,30 +4,36 @@
 //! [`crate::derive`] hands the [`Binder`] each table, each ON and WHERE
 //! term, AI call, and SELECT list item as the query wrote it, in that
 //! order. The binder binds each AI call's prompt in the session model's
-//! chat turn and layout, each condition as a [`Condition`], and the
-//! SELECT list as the region's projection, and refuses SQL outside
-//! Quail's language.
+//! chat turn and layout, each column as a `ColumnRef`, each other value
+//! and each condition as an `Expression` that DataFusion evaluates, and
+//! the SELECT list as the region's projection, and refuses SQL outside
+//! Quail's language. A condition reads each answer it tests as the
+//! answer's column.
+
+use std::collections::BTreeSet;
 
 use crate::functions::function_name;
 use crate::functions::{ai_function_name, column_call_kind};
-use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
-use datafusion::logical_expr::expr::{InList, Like, ScalarFunction};
-use datafusion::logical_expr::utils::split_binary;
+use datafusion::logical_expr::expr::{InList, ScalarFunction};
+use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, SortExpr};
 use quail_physical::{
-    Alias, ColumnRef, Condition, Connective, Equality, ExtractStruct, GetField, Literal, ModelCall,
-    Not, RegularPredicate, ScalarFunction as QuailFunction, SortExpression, SortKey,
-    ValueExpression,
+    Alias, ColumnRef, Equality, ExtractStruct, GetField, ModelCall, ScoreTest, SortExpression,
+    SortKey, ValueExpression,
 };
 use quail_planner::expressions::{
     CompileError, SPAN_SUFFIX, UNSUPPORTED, aliased_call, call_aliases, column_alias_of,
-    column_name, compile_error, repr_str,
+    column_name, compile_error, explain_call, repr_list, repr_str,
 };
 use quail_planner::operators::{Scan, ScanColumn, Schema};
 use quail_planner::prompts::{self, Turn};
 use serde_json::Value;
+
+/// A condition and the selectivity its HINT gives, if any.
+pub(crate) type Hinted = (ValueExpression, Option<f64>);
 
 /// The answer limit of an AI.MAP call written without one.
 const DEFAULT_MAP_ANSWER_TOKENS: i64 = 256;
@@ -124,37 +130,6 @@ fn contains(expr: &Expr, found: impl Fn(&Expr) -> bool) -> bool {
     expr.exists(|inner| Ok(found(inner))).unwrap_or(false)
 }
 
-/// `name(args...)` as Quail's scalar function call.
-fn function(name: &str, args: Vec<ValueExpression>) -> ValueExpression {
-    ValueExpression::ScalarFunction(QuailFunction {
-        function: name.to_string(),
-        args,
-    })
-}
-
-fn literal(value: Value) -> ValueExpression {
-    ValueExpression::Literal(Literal { value })
-}
-
-/// `value` under the one-column SQL function a test applies to it, if any.
-fn applied(function: &Option<String>, value: ValueExpression) -> ValueExpression {
-    match function {
-        Some(name) => self::function(name, vec![value]),
-        None => value,
-    }
-}
-
-/// The test `expression <comparison> value` of a plain test.
-fn compare(expression: ValueExpression, test: &PlainTest) -> Result<Condition, CompileError> {
-    let predicate = RegularPredicate {
-        expression,
-        comparison: test.comparison.clone(),
-        value: test.value.clone(),
-    };
-    quail_planner::expressions::validate_test(&predicate)?;
-    Ok(Condition::Compare(Box::new(predicate)))
-}
-
 /// Whether a term asks the model, counting AI.EXTRACT only bare.
 fn has_ai_call(expr: &Expr) -> bool {
     has_ai_call_under(expr, false)
@@ -189,6 +164,33 @@ fn has_ai_call_under(expr: &Expr, in_field: bool) -> bool {
             });
             any
         }
+    }
+}
+
+/// `term`, negated when `negate`, with each NOT moved down to the tests
+/// below AND and OR by De Morgan's laws, so the parts of an AND, such as
+/// `NOT (a OR b)`, are placed apart.
+fn negated_inward(term: Expr, negate: bool) -> Expr {
+    match term {
+        Expr::Not(inner) => negated_inward(*inner, !negate),
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if matches!(op, Operator::And | Operator::Or) =>
+        {
+            let op = match (op, negate) {
+                (Operator::And, true) => Operator::Or,
+                (Operator::Or, true) => Operator::And,
+                (op, _) => op,
+            };
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(negated_inward(*left, negate)),
+                op,
+                Box::new(negated_inward(*right, negate)),
+            ))
+        }
+        Expr::IsNull(inner) if negate => Expr::IsNotNull(inner),
+        Expr::IsNotNull(inner) if negate => Expr::IsNull(inner),
+        other if negate => Expr::Not(Box::new(other)),
+        other => other,
     }
 }
 
@@ -397,17 +399,27 @@ impl Binder {
 
     // ------------------------------------------------------------ WHERE
 
-    /// Bind a WHERE term that asks no model: the condition and the
-    /// selectivity its HINT gives, or None for a term that asks one.
+    /// Bind a WHERE term that asks no model: its conditions, one per
+    /// part of an AND unless a HINT estimates the whole term, and the
+    /// selectivity the HINT gives; or None for a term that asks one.
     pub(crate) fn bind_plain_where_term(
         &mut self,
         term: &Expr,
-    ) -> Result<Option<(Condition, Option<f64>)>, CompileError> {
+    ) -> Result<Option<Vec<Hinted>>, CompileError> {
         let (term, hint) = self.unwrap_hint(term)?;
-        if !has_ai_call(&term) && label_test(&term).is_none() {
-            return Ok(Some((self.bind_condition(&term)?, hint)));
+        if has_ai_call(&term) || label_test(&term).is_some() {
+            return Ok(None);
         }
-        Ok(None)
+        let term = negated_inward(term, false);
+        let parts = match hint {
+            Some(_) => vec![&term],
+            None => split_conjunction(&term),
+        };
+        let mut bound = Vec::new();
+        for part in parts {
+            bound.push((self.bind_condition(part)?, hint));
+        }
+        Ok(Some(bound))
     }
 
     /// Refuse a WHERE term that is no plain condition and no test of a
@@ -478,254 +490,162 @@ impl Binder {
 
     // ------------------------------------------------------------ conditions
 
-    /// Bind a term that asks no model as a condition.
-    fn bind_condition(&mut self, term: &Expr) -> Result<Condition, CompileError> {
-        match term {
-            Expr::Not(inner) => Ok(not(self.bind_condition(inner)?)),
-            // x BETWEEN low AND high reads as x >= low AND x <= high
-            Expr::Between(between) => {
-                let low = Expr::BinaryExpr(BinaryExpr::new(
-                    between.expr.clone(),
-                    Operator::GtEq,
-                    between.low.clone(),
-                ));
-                let high = Expr::BinaryExpr(BinaryExpr::new(
-                    between.expr.clone(),
-                    Operator::LtEq,
-                    between.high.clone(),
-                ));
-                let both = low.and(high);
-                let rewritten = if between.negated {
-                    Expr::Not(Box::new(both))
-                } else {
-                    both
-                };
-                self.bind_condition(&rewritten)
-            }
-            Expr::BinaryExpr(BinaryExpr {
-                op: op @ (Operator::And | Operator::Or),
-                ..
-            }) => {
-                let mut operands = Vec::new();
-                for part in split_binary(term, *op) {
-                    operands.push(self.bind_condition(part)?);
+    /// Bind a term that asks no model as a condition, each answer it
+    /// tests read as the answer's column.
+    fn bind_condition(&mut self, term: &Expr) -> Result<ValueExpression, CompileError> {
+        let read = self.answer_columns(term)?;
+        self.computed(&read)
+    }
+
+    /// `term` with each column-operator call it tests as the column of
+    /// the call's answer: an AI.CLASSIFY, AI.MAP, or AI.SAE_FEATURES
+    /// call, or a field of an AI.EXTRACT call or its span.
+    fn answer_columns(&mut self, term: &Expr) -> Result<Expr, CompileError> {
+        // each label a test compares a classification with
+        let mut compared: Vec<(Expr, Value)> = Vec::new();
+        let _ = term.apply(|node| {
+            match node {
+                Expr::BinaryExpr(BinaryExpr {
+                    left,
+                    op: Operator::Eq,
+                    right,
+                }) => {
+                    for (call, other) in [(left, right), (right, left)] {
+                        if column_call_kind(call) == Some("label")
+                            && let Some(text) = string_literal(other)
+                        {
+                            compared.push((call.as_ref().clone(), Value::from(text)));
+                        }
+                    }
                 }
-                Ok(if *op == Operator::And {
-                    Condition::And(Connective { operands })
-                } else {
-                    Condition::Or(Connective { operands })
-                })
+                Expr::InList(InList { expr, list, .. })
+                    if column_call_kind(expr) == Some("label") =>
+                {
+                    let labels = list.iter().filter_map(string_literal).map(Value::from);
+                    compared.push((expr.as_ref().clone(), Value::Array(labels.collect())));
+                }
+                _ => {}
             }
-            _ => {
-                let test = self.parse_plain_test(term)?;
-                let predicate = match self.column_test(&test)? {
-                    Some(predicate) => predicate,
-                    None => self.bind_plain_test(&test)?,
+            Ok(TreeNodeRecursion::Continue)
+        });
+        for (node, labels) in &compared {
+            let call = self.bind_column_call(node, "label")?;
+            let name = self.answer_name(node, &call)?;
+            check_labels(&name, labels, &call)?;
+        }
+        let mut failed: Option<CompileError> = None;
+        let read = term
+            .clone()
+            .transform_down(|node| {
+                if failed.is_some() {
+                    return Ok(Transformed::no(node));
+                }
+                let found = match &node {
+                    // AI.SAE_FEATURES returns a list, which a test reads only here
+                    Expr::IsNull(inner) | Expr::IsNotNull(inner)
+                        if column_call_kind(inner) == Some("features") =>
+                    {
+                        self.answer_column(inner, "features").map(|column| {
+                            let column = Box::new(column);
+                            Some(match &node {
+                                Expr::IsNull(_) => Expr::IsNull(column),
+                                _ => Expr::IsNotNull(column),
+                            })
+                        })
+                    }
+                    _ => match column_call_kind(&node) {
+                        Some("extract") => {
+                            compile_error("test a field of AI.EXTRACT, such as lease.end_date")
+                        }
+                        Some("features") => compile_error(
+                            "AI.SAE_FEATURES returns a list; test IS NULL or IS NOT NULL, or \
+                             UNNEST it to test its fields",
+                        ),
+                        Some(kind) => self.answer_column(&node, kind).map(Some),
+                        None => self.extract_column(&node),
+                    },
                 };
-                Ok(if test.negated {
-                    not(predicate)
-                } else {
-                    predicate
-                })
-            }
+                match found {
+                    Ok(Some(column)) => Ok(Transformed::new(column, true, TreeNodeRecursion::Jump)),
+                    Ok(None) => Ok(Transformed::no(node)),
+                    Err(error) => {
+                        failed = Some(error);
+                        Ok(Transformed::no(node))
+                    }
+                }
+            })
+            .map_err(|error| CompileError::new(error.to_string()))?
+            .data;
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(read),
         }
     }
 
-    fn parse_plain_test(&mut self, term: &Expr) -> Result<PlainTest, CompileError> {
-        match term {
-            Expr::IsNull(inner) => {
-                if let Some((operand, function)) = operand_of(inner) {
-                    return Ok(PlainTest::new(operand, function, "is null", Value::Null));
-                }
-            }
-            Expr::IsNotNull(inner) => {
-                if let Some((operand, function)) = operand_of(inner) {
-                    let mut test = PlainTest::new(operand, function, "is null", Value::Null);
-                    test.negated = true;
-                    return Ok(test);
-                }
-            }
-            Expr::InList(InList {
-                expr,
-                list,
-                negated,
-            }) if !list.is_empty() => {
-                if let Some((operand, function)) = operand_of(expr) {
-                    let mut values = Vec::new();
-                    for item in list {
-                        values.push(sql_literal(item)?);
-                    }
-                    let mut test = PlainTest::new(operand, function, "in", Value::Array(values));
-                    test.negated = *negated;
-                    return Ok(test);
-                }
-            }
-            Expr::Like(Like {
-                negated,
-                expr,
-                pattern,
-                case_insensitive,
-                ..
-            }) => {
-                let Some((operand, function)) = operand_of(expr) else {
-                    return compile_error(format!("{term} tests a column"));
-                };
-                let Some(pattern) = string_literal(pattern) else {
-                    let name = if *case_insensitive { "ILIKE" } else { "LIKE" };
-                    return compile_error(format!("{name} compares with a string"));
-                };
-                let comparison = if *case_insensitive { "ilike" } else { "like" };
-                let mut test =
-                    PlainTest::new(operand, function, comparison, Value::String(pattern));
-                test.negated = *negated;
-                return Ok(test);
-            }
-            Expr::ScalarFunction(call)
-                if matches!(
-                    call.name(),
-                    "starts_with" | "ends_with" | "contains" | "regexp_like"
-                ) && call.args.len() == 2 =>
-            {
-                let comparison = match call.name() {
-                    "starts_with" => "starts with",
-                    "ends_with" => "ends with",
-                    "contains" => "contains",
-                    _ => "regex",
-                };
-                let Some((operand, function)) = operand_of(&call.args[0]) else {
-                    return compile_error(format!("{term} tests a column"));
-                };
-                let Some(mut pattern) = string_literal(&call.args[1]) else {
-                    return compile_error(format!(
-                        "{} compares with a string",
-                        comparison.to_uppercase()
-                    ));
-                };
-                if comparison == "regex" {
-                    // Snowflake's REGEXP_LIKE matches the whole value
-                    pattern = format!("^(?:{pattern})$");
-                }
-                return Ok(PlainTest::new(
-                    operand,
-                    function,
-                    comparison,
-                    Value::String(pattern),
-                ));
-            }
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) if comparison(*op).is_some() => {
-                let (forward, _) = comparison(*op).expect("a comparison");
-                let (backward, _) =
-                    comparison(op.swap().expect("a comparison")).expect("a comparison");
-                let (found_left, found_right) = (operand_of(left), operand_of(right));
-                match (found_left, found_right) {
-                    (Some((operand, function)), None) => {
-                        return Ok(PlainTest::new(
-                            operand,
-                            function,
-                            forward,
-                            sql_literal(right)?,
-                        ));
-                    }
-                    (None, Some((operand, function))) => {
-                        return Ok(PlainTest::new(
-                            operand,
-                            function,
-                            backward,
-                            sql_literal(left)?,
-                        ));
-                    }
-                    (Some(_), Some(_)) => {
-                        return Ok(PlainTest::new(term.clone(), None, "is true", Value::Null));
-                    }
-                    (None, None) => {}
-                }
-            }
-            _ => {}
-        }
-        if matches!(term, Expr::Column(_) | Expr::OuterReferenceColumn(..))
-            || is_get_field(term)
-            || computed_value(term)
-        {
-            return Ok(PlainTest::new(term.clone(), None, "is true", Value::Null));
-        }
-        compile_error(format!(
-            "{term} is not supported; a regular predicate is =, <>, <, <=, >, >=, IN \
-             (literals), IS NULL, IS NOT NULL, LIKE, ILIKE, CONTAINS, STARTSWITH, ENDSWITH, \
-             REGEXP_LIKE, or a boolean column or scalar function of columns"
-        ))
+    /// The answer column of a column-operator call a test reads: the
+    /// SELECT list's name for it, or a name of its own.
+    fn answer_column(&mut self, node: &Expr, kind: &str) -> Result<Expr, CompileError> {
+        let call = self.bind_column_call(node, kind)?;
+        let name = self.answer_name(node, &call)?;
+        Ok(Expr::Column(Column::new(
+            Some(call_aliases(&call)[0].clone()),
+            name,
+        )))
     }
 
-    fn bind_plain_test(&mut self, test: &PlainTest) -> Result<Condition, CompileError> {
-        let value = self.bind_value(&test.operand)?;
-        compare(applied(&test.function, value), test)
-    }
-
-    /// A test of a column operator's answer: an AI.CLASSIFY, AI.MAP, or
-    /// AI.SAE_FEATURES call, or a field of an AI.EXTRACT call or its span.
-    fn column_test(&mut self, test: &PlainTest) -> Result<Option<Condition>, CompileError> {
-        if let Some(kind) = column_call_kind(&test.operand) {
-            if kind == "extract" {
-                return compile_error("test a field of AI.EXTRACT, such as lease.end_date");
-            }
-            let call = self.bind_column_call(&test.operand, kind)?;
-            let aliases = call_aliases(&call);
-            if aliases.len() != 1 {
-                return compile_error("a filter on a label tests a one-document classification");
-            }
-            let alias = aliases[0].clone();
-            let name = self
-                .selected
-                .iter()
-                .find(|(_, node)| *node == test.operand)
-                .map(|(name, _)| name.clone())
-                .unwrap_or_else(|| format!("__column_{alias}_{}", self.tested.len()));
-            let name = match self.tested.iter().find(|(found, _)| *found == call) {
-                Some((_, existing)) => existing.clone(),
-                None => {
-                    self.tested.push((call.clone(), name.clone()));
-                    name
-                }
-            };
-            if call.kind == "features"
-                && (test.function.is_some()
-                    || !["is null", "is not null"].contains(&test.comparison.as_str()))
-            {
-                return compile_error(
-                    "AI.SAE_FEATURES returns a list; test IS NULL or IS NOT NULL, or UNNEST it \
-                     to test its fields",
-                );
-            }
-            let reference = self.column_ref(&alias, &name);
-            return compare(applied(&test.function, reference), test).map(Some);
+    /// The name of the answer column of `call`, the call `node` makes.
+    fn answer_name(&mut self, node: &Expr, call: &ModelCall) -> Result<String, CompileError> {
+        let aliases = call_aliases(call);
+        if aliases.len() != 1 {
+            return compile_error("a filter on a label tests a one-document classification");
         }
-        self.extract_test(test)
+        let alias = aliases[0].clone();
+        let name = self
+            .selected
+            .iter()
+            .find(|(_, selected)| selected == node)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| format!("__column_{alias}_{}", self.tested.len()));
+        Ok(match self.tested.iter().find(|(found, _)| found == call) {
+            Some((_, existing)) => existing.clone(),
+            None => {
+                self.tested.push((call.clone(), name.clone()));
+                name
+            }
+        })
     }
 
-    fn extract_test(&mut self, test: &PlainTest) -> Result<Option<Condition>, CompileError> {
-        // get_field(ai_extract(...), field), or
-        // get_field(get_field(ai_extract_span(...), field), start|end)
+    /// The column of the AI.EXTRACT answer, or the field of its span, a
+    /// field path reads: `get_field(ai_extract(...), field)`, or
+    /// `get_field(ai_extract_span(...), field, start|end)`; None for
+    /// another expression.
+    fn extract_column(&mut self, node: &Expr) -> Result<Option<Expr>, CompileError> {
         let mut path = Vec::new();
-        let mut node = &test.operand;
-        while is_get_field(node) {
-            let args = arguments(node);
-            path.push(string_literal(&args[1]).unwrap_or_default());
-            node = &args[0];
+        let mut inner = node;
+        while is_get_field(inner) {
+            let args = arguments(inner);
+            let mut fields: Vec<String> = args[1..]
+                .iter()
+                .map(|field| string_literal(field).unwrap_or_default())
+                .collect();
+            fields.extend(path);
+            path = fields;
+            inner = &args[0];
         }
-        path.reverse();
-        let span = is_call(node, "ai_extract_span");
-        if !(span || is_call(node, "ai_extract")) || path.is_empty() {
+        let span = is_call(inner, "ai_extract_span");
+        if !(span || is_call(inner, "ai_extract")) || path.is_empty() {
             return Ok(None);
         }
         let Some((name, call_node)) = self
             .selected
             .iter()
             .find(|(_, selected)| {
-                is_call(selected, "ai_extract") && arguments(selected) == arguments(node)
+                is_call(selected, "ai_extract") && arguments(selected) == arguments(inner)
             })
             .map(|(name, selected)| (name.clone(), selected.clone()))
         else {
             return compile_error(format!(
-                "{node} in WHERE is not returned by SELECT; name it there and test it by its \
+                "{inner} in WHERE is not returned by SELECT; name it there and test it by its \
                  AS name"
             ));
         };
@@ -746,7 +666,7 @@ impl Binder {
                 "AI.EXTRACT {} has no field {}; its fields are {}",
                 repr_str(&name),
                 repr_str(&field),
-                quail_planner::expressions::repr_list(&found.fields)
+                repr_list(&found.fields)
             ));
         }
         let member = members
@@ -755,27 +675,38 @@ impl Binder {
             .expect("a member per field");
         let alias = call_aliases(aliased_call(member, &[]).expect("an extraction"))[0].clone();
         let column = format!("{name}.{field}{}", if span { SPAN_SUFFIX } else { "" });
-        let mut expression = self.column_ref(&alias, &column);
+        let mut read = Expr::Column(Column::new(Some(alias), column));
         for part in rest {
-            expression = ValueExpression::GetField(GetField {
-                input: Box::new(expression),
-                field: part.clone(),
-            });
+            read = datafusion::functions::core::expr_fn::get_field(read, part.as_str());
         }
-        compare(applied(&test.function, expression), test).map(Some)
+        Ok(Some(read))
     }
 
-    pub(crate) fn column_ref(&self, alias: &str, column: &str) -> ValueExpression {
-        ValueExpression::ColumnRef(ColumnRef {
-            alias: alias.to_string(),
-            provider: self.provider(alias).unwrap_or_default().to_string(),
-            column: column.to_string(),
-        })
+    /// The condition `alias.column IN (labels)` on a label's column.
+    pub(crate) fn label_condition(
+        &self,
+        alias: &str,
+        column: &str,
+        labels: &Value,
+    ) -> Result<ValueExpression, CompileError> {
+        let list = labels
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|label| Expr::Literal(ScalarValue::Utf8(Some(label.to_string())), None))
+            .collect();
+        let test = Expr::InList(InList::new(
+            Box::new(Expr::Column(Column::new(Some(alias), column))),
+            list,
+            false,
+        ));
+        self.computed(&test)
     }
 
     // ------------------------------------------------------------ values
 
-    fn resolve_column(&self, column: &Column) -> Result<ValueExpression, CompileError> {
+    fn resolve_column(&self, column: &Column) -> Result<ColumnRef, CompileError> {
         let alias = match &column.relation {
             Some(relation) => relation.table().to_string(),
             None => {
@@ -801,200 +732,93 @@ impl Binder {
         let Some(provider) = self.provider(&alias) else {
             return compile_error(format!("unknown table alias {}", repr_str(&alias)));
         };
-        Ok(ValueExpression::ColumnRef(ColumnRef {
+        Ok(ColumnRef {
             alias,
             provider: provider.to_string(),
             column: column.name.clone(),
-        }))
+        })
     }
 
-    /// Bind a value expression: a column, a literal, or a function of them.
+    /// Bind a value: a column or a field of one as itself, and any other
+    /// value as an `Expression`.
     fn bind_value(&mut self, expr: &Expr) -> Result<ValueExpression, CompileError> {
-        self.bind_value_at(expr, true)
-    }
-
-    fn bind_value_at(&mut self, expr: &Expr, top: bool) -> Result<ValueExpression, CompileError> {
-        Ok(match expr {
+        match expr {
             Expr::Column(column) => {
                 if column.relation.is_none()
                     && let Some((_, output)) =
                         self.outputs.iter().find(|(name, _)| *name == column.name)
                 {
                     let output = output.clone();
-                    return self.bind_value_at(&output, top);
+                    return self.bind_value(&output);
                 }
-                self.resolve_column(column)?
+                return self.resolve_column(column).map(ValueExpression::ColumnRef);
             }
-            Expr::OuterReferenceColumn(_, column) => self.resolve_column(column)?,
-            Expr::Alias(alias) => self.bind_value_at(&alias.expr, top)?,
-            Expr::Literal(..) | Expr::Negative(_) if literal_value(expr).is_some() => {
-                literal(literal_value(expr).expect("a literal"))
+            Expr::OuterReferenceColumn(_, column) => {
+                return self.resolve_column(column).map(ValueExpression::ColumnRef);
             }
-            Expr::Negative(inner) => function("negate", vec![self.bind_value_at(inner, false)?]),
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                let (left, right) = (
-                    self.bind_value_at(left, false)?,
-                    self.bind_value_at(right, false)?,
-                );
-                match op {
-                    Operator::Plus => function("add", vec![left, right]),
-                    Operator::Minus => function("subtract", vec![left, right]),
-                    Operator::Multiply => function("multiply", vec![left, right]),
-                    Operator::Divide => function(
-                        "divide",
-                        vec![
-                            function("cast", vec![left, literal(Value::from("float64"))]),
-                            right,
-                        ],
-                    ),
-                    Operator::StringConcat => function(
-                        "binary_join_element_wise",
-                        vec![left, right, literal(Value::from(""))],
-                    ),
-                    Operator::Modulo => {
-                        return compile_error(format!(
-                            "{expr}: Arrow compute has no remainder or integer division function"
-                        ));
-                    }
-                    Operator::And => function("and_kleene", vec![left, right]),
-                    Operator::Or => function("or_kleene", vec![left, right]),
-                    op => match comparison(*op) {
-                        Some((_, name)) => function(name, vec![left, right]),
-                        None => return unsupported(&format!("the operator {op}")),
-                    },
-                }
-            }
-            Expr::Not(inner) => match inner.as_ref() {
-                Expr::IsNull(value) => {
-                    function("is_valid", vec![self.bind_value_at(value, false)?])
-                }
-                other => function("invert", vec![self.bind_value_at(other, false)?]),
-            },
-            Expr::IsNull(inner) => function("is_null", vec![self.bind_value_at(inner, false)?]),
-            Expr::IsNotNull(inner) => function("is_valid", vec![self.bind_value_at(inner, false)?]),
-            Expr::InList(InList {
-                expr,
-                list,
-                negated,
-            }) => {
-                let value = self.bind_value_at(expr, false)?;
-                let mut values = Vec::new();
-                for item in list {
-                    values.push(sql_literal(item)?);
-                }
-                let found = function(
-                    "if_else",
-                    vec![
-                        function("is_null", vec![value.clone()]),
-                        literal(Value::Null),
-                        function("is_in", vec![value, literal(Value::Array(values))]),
-                    ],
-                );
-                if *negated {
-                    function("invert", vec![found])
-                } else {
-                    found
-                }
-            }
-            Expr::Cast(cast) => {
-                let Some(kind) = cast_type(cast.field.data_type()) else {
-                    return compile_error(format!(
-                        "CAST to {} is not supported",
-                        cast.field.data_type()
-                    ));
-                };
-                function(
-                    "cast",
-                    vec![
-                        self.bind_value_at(&cast.expr, false)?,
-                        literal(Value::from(kind)),
-                    ],
-                )
-            }
-            Expr::Case(case) => {
-                let mut conditions = Vec::new();
-                let mut values = Vec::new();
-                for (when, then) in &case.when_then_expr {
-                    let condition = match &case.expr {
-                        Some(subject) => (**subject).clone().eq((**when).clone()),
-                        None => (**when).clone(),
-                    };
-                    conditions.push(self.bind_value_at(&condition, false)?);
-                    values.push(self.bind_value_at(then, false)?);
-                }
-                if let Some(default) = &case.else_expr {
-                    values.push(self.bind_value_at(default, false)?);
-                }
-                let mut args = vec![function("make_struct", conditions)];
-                args.extend(values);
-                function("case_when", args)
-            }
-            Expr::Between(between) => {
-                let value = self.bind_value_at(&between.expr, false)?;
-                let found = function(
-                    "and_kleene",
-                    vec![
-                        function(
-                            "greater_equal",
-                            vec![value.clone(), self.bind_value_at(&between.low, false)?],
-                        ),
-                        function(
-                            "less_equal",
-                            vec![value, self.bind_value_at(&between.high, false)?],
-                        ),
-                    ],
-                );
-                if between.negated {
-                    function("invert", vec![found])
-                } else {
-                    found
-                }
-            }
+            Expr::Alias(alias) => return self.bind_value(&alias.expr),
             Expr::ScalarFunction(call)
-                if translated(call.name())
-                    && !(matches!(call.name(), "btrim" | "trim") && call.args.len() == 1) =>
+                if call.name() == "get_field"
+                    && call.args[1..]
+                        .iter()
+                        .all(|field| string_literal(field).is_some()) =>
             {
-                let mut args = Vec::new();
-                for arg in &call.args {
-                    args.push(self.bind_value_at(arg, false)?);
-                }
-                let value = translate(call.name(), &call.args, args)?;
-                quail_planner::expressions::validate_expression(&value)?;
-                value
-            }
-            Expr::ScalarFunction(call) if call.name() == "get_field" => {
-                let mut value = self.bind_value_at(&call.args[0], false)?;
-                for field in &call.args[1..] {
-                    let Some(field) = string_literal(field) else {
-                        return unsupported("a field access by a computed name");
-                    };
-                    value = ValueExpression::GetField(GetField {
-                        input: Box::new(value),
-                        field,
-                    });
-                }
-                value
-            }
-            Expr::ScalarFunction(call) => {
-                let name = match (call.name(), top) {
-                    ("character_length" | "length" | "char_length", _) => "length",
-                    ("btrim" | "trim", true) if call.args.len() == 1 => "trim",
-                    ("btrim" | "trim", false) if call.args.len() == 1 => "utf8_trim_whitespace",
-                    (name, _) if name.starts_with("ai_") || name == "prompt" => {
-                        return compile_error(format!("{expr} is not a value expression"));
+                let input = self.bind_value(&call.args[0])?;
+                if matches!(
+                    input,
+                    ValueExpression::ColumnRef(_) | ValueExpression::GetField(_)
+                ) {
+                    let mut value = input;
+                    for field in &call.args[1..] {
+                        value = ValueExpression::GetField(GetField {
+                            input: Box::new(value),
+                            field: string_literal(field).expect("a field name"),
+                        });
                     }
-                    (name, _) => name,
-                };
-                let mut args = Vec::new();
-                for arg in &call.args {
-                    args.push(self.bind_value_at(arg, false)?);
+                    return Ok(value);
                 }
-                let value = function(name, args);
-                quail_planner::expressions::validate_expression(&value)?;
-                value
             }
-            other => return compile_error(format!("{other} is not a value expression")),
-        })
+            _ => {}
+        }
+        if contains(expr, |inner| {
+            function_name(inner).is_some_and(|name| name.starts_with("ai_") || name == "prompt")
+        }) {
+            return compile_error(format!("{expr} is not a value expression"));
+        }
+        self.computed(expr)
+    }
+
+    /// A value or condition DataFusion computes, as an `Expression`
+    /// over the columns it reads.
+    fn computed(&self, expr: &Expr) -> Result<ValueExpression, CompileError> {
+        let expr = expr
+            .clone()
+            .transform_up(|node| match &node {
+                Expr::Column(column) if column.relation.is_none() => Ok(
+                    match self.outputs.iter().find(|(name, _)| *name == column.name) {
+                        Some((_, output)) => Transformed::yes(output.clone()),
+                        None => Transformed::no(node),
+                    },
+                ),
+                _ => Ok(Transformed::no(node)),
+            })
+            .map_err(|error| CompileError::new(error.to_string()))?
+            .data;
+        if contains(&expr, |inner| {
+            matches!(
+                inner,
+                Expr::AggregateFunction(_)
+                    | Expr::WindowFunction(_)
+                    | Expr::ScalarSubquery(_)
+                    | Expr::InSubquery(_)
+                    | Expr::Exists(_)
+                    | Expr::Placeholder(_)
+            )
+        }) {
+            return compile_error(format!("{expr} is not a value expression"));
+        }
+        crate::expressions::expression(&expr, |column| self.resolve_column(column))
+            .map(ValueExpression::Value)
     }
 
     // ------------------------------------------------------------ AI calls
@@ -1149,7 +973,7 @@ impl Binder {
         term: &Expr,
         allowed: &[&str],
         join: Option<bool>,
-    ) -> Result<(RegularPredicate, Options), CompileError> {
+    ) -> Result<(ScoreTest, Options), CompileError> {
         let Some((comparison, call, threshold)) = score_comparison(term) else {
             return compile_error("AI.SCORE must be compared with <, <=, >, or >=");
         };
@@ -1171,12 +995,23 @@ impl Binder {
             );
         };
         let (prompt, _) = self.bind_ai_call(prompt, "ai_score", join, None)?;
-        let predicate = RegularPredicate {
-            expression: ValueExpression::ModelCall(model_call(prompt, "score")),
-            comparison: comparison.to_string(),
-            value: Value::from(value),
+        let call = model_call(prompt, "score");
+        quail_planner::expressions::validate_score_test(&call, comparison.0, Some(value))?;
+        // the planner names the score's column; the test reads it as its
+        // one column, shown as the call until then
+        let score = ColumnRef {
+            alias: String::new(),
+            provider: String::new(),
+            column: explain_call(&call),
         };
-        Ok((predicate, options))
+        let compared = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::new_unqualified("score"))),
+            comparison.1,
+            Box::new(Expr::Literal(ScalarValue::Float64(Some(value)), None)),
+        ));
+        let test = crate::expressions::expression(&compared, |_| Ok(score.clone()))?;
+        let test = ValueExpression::Value(test);
+        Ok((ScoreTest { call, test }, options))
     }
 
     /// Bind a test of an `AI.CLASSIFY` call's label, `= 'label'` or
@@ -1624,7 +1459,7 @@ impl Binder {
         if unique.len() != selected.output.len() {
             return compile_error(format!(
                 "projection names must be unique, got {}",
-                quail_planner::expressions::repr_list(&selected.output)
+                repr_list(&selected.output)
             ));
         }
         Ok(selected)
@@ -1690,122 +1525,28 @@ impl Binder {
 
 // ---------------------------------------------------------------- helpers
 
-/// One plain test before its operand is bound.
-struct PlainTest {
-    operand: Expr,
-    function: Option<String>,
-    comparison: String,
-    value: Value,
-    negated: bool,
-}
-
-impl PlainTest {
-    fn new(operand: Expr, function: Option<String>, comparison: &str, value: Value) -> Self {
-        Self {
-            operand,
-            function,
-            comparison: comparison.to_string(),
-            value,
-            negated: false,
-        }
-    }
-}
-
 fn is_get_field(expr: &Expr) -> bool {
     is_call(expr, "get_field")
 }
 
-/// The SQL function on one column, as `unwrap_function`: (column, function).
-fn unwrap_function(expr: &Expr) -> (&Expr, Option<String>) {
-    if let Expr::ScalarFunction(call) = expr
-        && call.args.len() == 1
-    {
-        let function = match call.name() {
-            "character_length" | "length" | "char_length" => Some("length"),
-            "lower" => Some("lower"),
-            "upper" => Some("upper"),
-            "btrim" | "trim" => Some("trim"),
-            _ => None,
-        };
-        if let Some(function) = function {
-            return (&call.args[0], Some(function.to_string()));
-        }
-    }
-    (expr, None)
-}
-
-/// The column a test reads and the function around it, or None.
-fn operand_of(expr: &Expr) -> Option<(Expr, Option<String>)> {
-    let (inner, function) = unwrap_function(expr);
-    if matches!(inner, Expr::Column(_) | Expr::OuterReferenceColumn(..))
-        || is_get_field(inner)
-        || column_call_kind(inner).is_some()
-    {
-        return Some((inner.clone(), function));
-    }
-    if computed_value(expr) {
-        return Some((expr.clone(), None));
-    }
-    None
-}
-
-/// Whether a node is a function or arithmetic over columns and literals.
-fn computed_value(expr: &Expr) -> bool {
-    let shape = matches!(
-        expr,
-        Expr::ScalarFunction(_)
-            | Expr::BinaryExpr(_)
-            | Expr::Negative(_)
-            | Expr::Cast(_)
-            | Expr::Case(_)
-            | Expr::InList(_)
-            | Expr::Not(_)
-            | Expr::IsNull(_)
-            | Expr::IsNotNull(_)
-    );
-    shape
-        && !contains(expr, |inner| {
-            function_name(inner).is_some_and(|name| name.starts_with("ai_"))
-        })
-        && contains(expr, |inner| {
-            matches!(inner, Expr::Column(_) | Expr::OuterReferenceColumn(..))
-        })
-}
-
-fn sql_literal(expr: &Expr) -> Result<Value, CompileError> {
-    literal_value(expr).ok_or_else(|| {
-        CompileError::new(format!(
-            "a column is compared with a number, string, or boolean literal, got {expr}"
-        ))
-    })
-}
-
-/// The SQL comparison `op` makes, and the Arrow function that computes it.
-fn comparison(op: Operator) -> Option<(&'static str, &'static str)> {
+/// The comparison a score test makes, as SQL writes it.
+fn comparison(op: Operator) -> Option<(&'static str, Operator)> {
     Some(match op {
-        Operator::Eq => ("=", "equal"),
-        Operator::NotEq => ("<>", "not_equal"),
-        Operator::Lt => ("<", "less"),
-        Operator::LtEq => ("<=", "less_equal"),
-        Operator::Gt => (">", "greater"),
-        Operator::GtEq => (">=", "greater_equal"),
+        Operator::Lt => ("<", op),
+        Operator::LtEq => ("<=", op),
+        Operator::Gt => (">", op),
+        Operator::GtEq => (">=", op),
         _ => return None,
     })
 }
 
 /// (comparison, AI.SCORE call, threshold) of a compared score, or None.
-fn score_comparison(expr: &Expr) -> Option<(&'static str, &Expr, &Expr)> {
+fn score_comparison(expr: &Expr) -> Option<((&'static str, Operator), &Expr, &Expr)> {
     let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
         return None;
     };
-    if !matches!(
-        op,
-        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
-    ) {
-        return None;
-    }
-    let forward = comparison(*op)?.0;
-    let backward = comparison(op.swap()?)?.0;
+    let forward = comparison(*op)?;
+    let backward = comparison(op.swap()?)?;
     if is_call(left, "ai_score") {
         return Some((forward, left, right));
     }
@@ -1854,10 +1595,37 @@ pub(crate) fn label_test(expr: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
     }
 }
 
-fn not(operand: Condition) -> Condition {
-    Condition::Not(Not {
-        operand: Box::new(operand),
-    })
+/// Refuse a test of the label `name` that accepts a label its
+/// classification `call` lacks.
+pub(crate) fn check_labels(
+    name: &str,
+    accepted: &Value,
+    call: &ModelCall,
+) -> Result<(), CompileError> {
+    let values = match accepted {
+        Value::Array(items) => items.clone(),
+        other => vec![other.clone()],
+    };
+    let labels: Vec<Value> = call.labels.as_array().cloned().unwrap_or_default();
+    let unknown: BTreeSet<String> = values
+        .iter()
+        .filter(|value| !labels.contains(value))
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let unknown: Vec<String> = unknown.into_iter().collect();
+    let written: Vec<String> = labels
+        .iter()
+        .filter_map(|label| label.as_str().map(str::to_string))
+        .collect();
+    compile_error(format!(
+        "the filter on {} lists {}, which are not among its labels {}",
+        repr_str(name),
+        repr_list(&unknown),
+        repr_list(&written)
+    ))
 }
 
 fn model_call(prompt: quail_physical::Prompt, kind: &str) -> ModelCall {
@@ -1936,22 +1704,6 @@ fn parse_categories(node: &Expr) -> Result<(Vec<String>, Vec<String>), CompileEr
     Ok((labels, descriptions))
 }
 
-fn cast_type(data_type: &DataType) -> Option<&'static str> {
-    Some(match data_type {
-        DataType::Int8 => "int8",
-        DataType::Int16 => "int16",
-        DataType::Int32 => "int32",
-        DataType::Int64 => "int64",
-        DataType::Float32 => "float32",
-        DataType::Float64 | DataType::Decimal128(..) | DataType::Decimal256(..) => "float64",
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string",
-        DataType::Boolean => "bool",
-        DataType::Date32 => "date32",
-        DataType::Timestamp(TimeUnit::Microsecond, None) => "timestamp[us]",
-        _ => return None,
-    })
-}
-
 /// An Arrow schema as the plan codec writes it: IPC bytes in base64.
 fn schema_of(schema: &SchemaRef) -> Schema {
     use base64::Engine;
@@ -1970,156 +1722,4 @@ fn schema_of(schema: &SchemaRef) -> Schema {
     Schema {
         ipc: base64::engine::general_purpose::STANDARD.encode(bytes),
     }
-}
-
-/// Whether a DataFusion function is one `sql_calls.translate` writes
-/// as another Arrow call.
-fn translated(name: &str) -> bool {
-    matches!(
-        name,
-        "round"
-            | "concat"
-            | "greatest"
-            | "least"
-            | "strpos"
-            | "instr"
-            | "nullif"
-            | "substr"
-            | "substring"
-            | "left"
-            | "right"
-            | "pow"
-            | "power"
-            | "reverse"
-            | "initcap"
-            | "replace"
-            | "regexp_replace"
-            | "lpad"
-            | "rpad"
-            | "ltrim"
-            | "rtrim"
-            | "btrim"
-            | "trim"
-            | "log10"
-            | "log2"
-            | "ln"
-    )
-}
-
-fn integer_argument(expr: &Expr, what: &str) -> Result<i64, CompileError> {
-    literal_value(expr)
-        .and_then(|value| value.as_i64())
-        .ok_or_else(|| CompileError::new(format!("{what} is an integer literal, got {expr}")))
-}
-
-/// The Arrow call a SQL function makes, as `sql_calls.translate`.
-fn translate(
-    name: &str,
-    written: &[Expr],
-    args: Vec<ValueExpression>,
-) -> Result<ValueExpression, CompileError> {
-    let mut args = args;
-    Ok(match name {
-        "round" => {
-            let decimals = if args.len() > 1 {
-                args.remove(1)
-            } else {
-                literal(Value::from(0))
-            };
-            function(
-                "round",
-                vec![
-                    args.remove(0),
-                    decimals,
-                    literal(Value::from("half_towards_infinity")),
-                ],
-            )
-        }
-        "concat" => {
-            args.push(literal(Value::from("")));
-            function("binary_join_element_wise", args)
-        }
-        "greatest" | "least" => {
-            let nulls: Vec<ValueExpression> = args
-                .iter()
-                .map(|argument| function("is_null", vec![argument.clone()]))
-                .collect();
-            let mut any_null = nulls[0].clone();
-            for null in &nulls[1..] {
-                any_null = function("or", vec![any_null, null.clone()]);
-            }
-            let extreme = if name == "greatest" {
-                "max_element_wise"
-            } else {
-                "min_element_wise"
-            };
-            function(
-                "if_else",
-                vec![any_null, literal(Value::Null), function(extreme, args)],
-            )
-        }
-        "strpos" | "instr" => function(
-            "add",
-            vec![function("find_substring", args), literal(Value::from(1))],
-        ),
-        "nullif" => function(
-            "if_else",
-            vec![
-                function("equal", args.clone()),
-                literal(Value::Null),
-                args[0].clone(),
-            ],
-        ),
-        "substr" | "substring" => {
-            let start = integer_argument(&written[1], "SUBSTRING's start")?;
-            if start < 1 {
-                return compile_error("SUBSTRING's start counts from 1");
-            }
-            let mut call = vec![args.remove(0), literal(Value::from(start - 1))];
-            if written.len() > 2 {
-                let length = integer_argument(&written[2], "SUBSTRING's length")?;
-                call.push(literal(Value::from(start - 1 + length)));
-            }
-            function("utf8_slice_codeunits", call)
-        }
-        "left" => function(
-            "utf8_slice_codeunits",
-            vec![
-                args.remove(0),
-                literal(Value::from(0)),
-                literal(Value::from(integer_argument(&written[1], "LEFT's length")?)),
-            ],
-        ),
-        "right" => function(
-            "utf8_slice_codeunits",
-            vec![
-                args.remove(0),
-                literal(Value::from(-integer_argument(
-                    &written[1],
-                    "RIGHT's length",
-                )?)),
-            ],
-        ),
-        "pow" | "power" => function("power", args),
-        "reverse" => function("utf8_reverse", args),
-        "initcap" => function("utf8_capitalize", args),
-        "replace" => function("replace_substring", args),
-        "regexp_replace" => function("replace_substring_regex", args),
-        "lpad" => function("utf8_lpad", args),
-        "rpad" => function("utf8_rpad", args),
-        "ltrim" | "rtrim" | "btrim" | "trim" => {
-            let side = match name {
-                "ltrim" => "l",
-                "rtrim" => "r",
-                _ => "",
-            };
-            if args.len() == 1 {
-                function(&format!("utf8_{side}trim_whitespace"), args)
-            } else {
-                function(&format!("utf8_{side}trim"), args)
-            }
-        }
-        "log10" | "log2" | "ln" => function(name, args),
-        other => function(other, args),
-    })
 }

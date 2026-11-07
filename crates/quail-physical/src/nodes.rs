@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::expressions::{Condition, Projected, ValueExpression};
+use crate::expressions::{Projected, ValueExpression};
 use crate::graph::{InputPort, OutputPort};
 use crate::specs::{
     ClassifySpec, ExtractSpec, MapSpec, RequestClassifySpec, RequestExtractSpec, RequestFilterSpec,
@@ -168,7 +168,7 @@ physical_nodes! {
         total_tokens: i64,
         shard_ranges: Vec<(i64, i64)>,
         shard_token_loads: Vec<i64>,
-        predicates: Vec<Condition>,
+        predicates: Vec<ValueExpression>,
         expected_rows: Option<f64>,
     }
     /// An `AI.IF` over one table.
@@ -202,7 +202,7 @@ physical_nodes! {
     }
     /// A condition that asks no model, on one or more tables' rows.
     Filter(FilterAttributes) = "quail.filter" {
-        predicate: Option<Condition>,
+        predicate: Option<ValueExpression>,
         aliases: Vec<String>,
         selectivity: Option<f64>,
         written_position: i64,

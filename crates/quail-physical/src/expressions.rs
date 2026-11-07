@@ -1,5 +1,9 @@
 //! The expressions physical nodes carry, from `quail.common.expressions`.
 //!
+//! A value or condition the executor computes is an [`Expression`],
+//! which DataFusion evaluates; the other types describe the model calls
+//! and the columns the planner reasons about.
+//!
 //! Each variant is tagged with its Python class, and also accepts the
 //! tag the class had before it moved from `quail.logical.expressions`.
 
@@ -22,16 +26,8 @@ pub enum ValueExpression {
         alias = "quail.logical.expressions.GetField"
     )]
     GetField(GetField),
-    #[serde(
-        rename = "quail.common.expressions.ScalarFunction",
-        alias = "quail.logical.expressions.ScalarFunction"
-    )]
-    ScalarFunction(ScalarFunction),
-    #[serde(
-        rename = "quail.common.expressions.Literal",
-        alias = "quail.logical.expressions.Literal"
-    )]
-    Literal(Literal),
+    #[serde(rename = "quail.common.expressions.Expression")]
+    Value(Expression),
     #[serde(
         rename = "quail.common.expressions.Alias",
         alias = "quail.logical.expressions.Alias"
@@ -53,6 +49,18 @@ pub struct ColumnRef {
     pub column: String,
 }
 
+impl ColumnRef {
+    /// The column's name, with its table alias when `qualified` and it
+    /// has one.
+    pub fn name(&self, qualified: bool) -> String {
+        if qualified && !self.alias.is_empty() {
+            format!("{}.{}", self.alias, self.column)
+        } else {
+            self.column.clone()
+        }
+    }
+}
+
 /// One field of a struct value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,19 +69,59 @@ pub struct GetField {
     pub field: String,
 }
 
-/// An Arrow compute function applied to values.
+/// A value or condition DataFusion computes from one row's columns.
+///
+/// `encoded` is DataFusion's logical expression as datafusion-proto
+/// bytes in base64. It reads the column named `#i` where the rows hold
+/// `columns[i]`, so a planner can rename the columns it reads without
+/// DataFusion. `text` is how `explain()` writes it, with `{i}` for the
+/// name of `columns[i]` and `{{` and `}}` for braces.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ScalarFunction {
-    pub function: String,
-    pub args: Vec<ValueExpression>,
+pub struct Expression {
+    pub encoded: String,
+    pub columns: Vec<ColumnRef>,
+    pub text: String,
 }
 
-/// A constant.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Literal {
-    pub value: Value,
+impl Expression {
+    /// The expression's text, each column named with its table alias
+    /// when `qualified`.
+    pub fn text_with(&self, qualified: bool) -> String {
+        let mut out = String::new();
+        let mut chars = self.text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '{' if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    out.push('{');
+                }
+                '}' if chars.peek() == Some(&'}') => {
+                    chars.next();
+                    out.push('}');
+                }
+                '{' => {
+                    let mut digits = String::new();
+                    for digit in chars.by_ref() {
+                        if digit == '}' {
+                            break;
+                        }
+                        digits.push(digit);
+                    }
+                    match digits
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|at| self.columns.get(at))
+                    {
+                        Some(column) => out.push_str(&column.name(qualified)),
+                        None => out.push_str(&format!("{{{digits}}}")),
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
 }
 
 /// A value under the name a query gives it.
@@ -123,53 +171,13 @@ pub struct ModelCall {
     pub max_answer_tokens: i64,
 }
 
-/// A condition on a row: a comparison, or a NOT, AND, or OR of them.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum Condition {
-    #[serde(
-        rename = "quail.common.expressions.RegularPredicate",
-        alias = "quail.logical.expressions.RegularPredicate"
-    )]
-    Compare(Box<RegularPredicate>),
-    #[serde(
-        rename = "quail.common.expressions.Not",
-        alias = "quail.logical.expressions.Not"
-    )]
-    Not(Not),
-    #[serde(
-        rename = "quail.common.expressions.And",
-        alias = "quail.logical.expressions.And"
-    )]
-    And(Connective),
-    #[serde(
-        rename = "quail.common.expressions.Or",
-        alias = "quail.logical.expressions.Or"
-    )]
-    Or(Connective),
-}
-
-/// One comparison of a value with a constant.
+/// An `AI.SCORE` call compared with a constant. `test` is an
+/// `Expression` that reads the score as its one column.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RegularPredicate {
-    pub expression: ValueExpression,
-    pub comparison: String,
-    pub value: Value,
-}
-
-/// The negation of a condition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Not {
-    pub operand: Box<Condition>,
-}
-
-/// The operands of an AND or an OR.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Connective {
-    pub operands: Vec<Condition>,
+pub struct ScoreTest {
+    pub call: ModelCall,
+    pub test: ValueExpression,
 }
 
 /// A value expression or a column name, as a projection lists them.
@@ -201,11 +209,8 @@ pub enum Asked {
         alias = "quail.logical.expressions.ModelCall"
     )]
     Call(ModelCall),
-    #[serde(
-        rename = "quail.common.expressions.RegularPredicate",
-        alias = "quail.logical.expressions.RegularPredicate"
-    )]
-    Compare(RegularPredicate),
+    #[serde(rename = "quail.common.expressions.ScoreTest")]
+    Compare(ScoreTest),
 }
 
 tagged_struct! {

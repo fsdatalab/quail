@@ -10,9 +10,9 @@ use quail_cost::work::Work;
 use quail_physical::{
     AiClassifyAttributes, AiExtractAttributes, AiFilterAttributes, AiJoinAttributes,
     AiMapAttributes, AiSaeFeaturesAttributes, AiScoreAttributes, Asked, BarrierAttributes,
-    ClassifySpec, ColumnRef, Condition, ExchangeAttributes, FilterAttributes, HashJoinAttributes,
-    ModelCall, Node, PhysicalNode, PortRef, Prompt, RecombineAttributes, RegularPredicate,
-    ScanAttributes, ScoreSpec, ValueExpression, input_ports, port,
+    ClassifySpec, ColumnRef, ExchangeAttributes, Expression, FilterAttributes, HashJoinAttributes,
+    ModelCall, Node, PhysicalNode, PortRef, Prompt, RecombineAttributes, ScanAttributes, ScoreSpec,
+    ValueExpression, input_ports, port,
 };
 use serde_json::{Map, Value};
 
@@ -767,15 +767,17 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             &node_id,
             std::slice::from_ref(&source),
             FilterAttributes {
-                predicate: Some(Condition::Compare(Box::new(RegularPredicate {
-                    expression: ValueExpression::ColumnRef(ColumnRef {
-                        alias: alias.to_string(),
-                        provider: String::new(),
-                        column: name,
+                predicate: Some(match &test.test {
+                    ValueExpression::Value(compared) => ValueExpression::Value(Expression {
+                        columns: vec![ColumnRef {
+                            alias: alias.to_string(),
+                            provider: String::new(),
+                            column: name,
+                        }],
+                        ..compared.clone()
                     }),
-                    comparison: test.comparison.clone(),
-                    value: test.value.clone(),
-                }))),
+                    other => other.clone(),
+                }),
                 aliases: aliases.to_vec(),
                 selectivity,
                 written_position: position as i64,
@@ -1061,7 +1063,12 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
     }
 
     /// A document Filter's input ports: its rows, then each other column's.
-    fn filter_inputs(&self, alias: &str, condition: &Condition, port: &PortRef) -> Vec<PortRef> {
+    fn filter_inputs(
+        &self,
+        alias: &str,
+        condition: &ValueExpression,
+        port: &PortRef,
+    ) -> Vec<PortRef> {
         let mut inputs = vec![port.clone()];
         for name in condition_columns(condition) {
             let found = self

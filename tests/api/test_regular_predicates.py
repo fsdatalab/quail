@@ -2,28 +2,15 @@
 
 import pyarrow as pa
 import pytest
+from helpers.conditions import condition
 from helpers.oracle import Oracle, oracle_executor
 from helpers.planning import operators_of, row_tests
 from helpers.sessions import CONFIG, TOKENIZER, TRUTH, _run, make_executor
 
 import quail
-from quail.common.expressions import (
-    And,
-    ColumnRef,
-    CompileError,
-    Not,
-    Or,
-    RegularPredicate,
-    evaluate_condition,
-)
+from quail.common.expressions import CompileError, evaluate
 from quail.common.selection import selected_rows
 from quail.physical.plan import graph_from_envelope
-
-REF = ColumnRef("r", "reviews", "stars")
-
-
-def _predicate(comparison, value=None):
-    return RegularPredicate(REF, comparison, value)
 
 
 @pytest.fixture()
@@ -93,10 +80,11 @@ def test_regular_predicates_select_documents_before_the_model(session):
 
 def test_not_and_or_keep_sqls_nulls():
     stars = pa.table({"stars": [5, None, 2]})
-    high, low = _predicate(">", 4), _predicate("<", 3)
-    written = Not(And((high, Or((low, Not(_predicate("is null")))))))
+    written = condition(
+        "NOT (stars > 4 AND (stars < 3 OR NOT (stars IS NULL)))",
+        {"stars": pa.int64()}, "r", "reviews")
     # the null row stays null through NOT, AND, and OR, so it is rejected
-    assert evaluate_condition(written, stars).to_pylist() == [False, None, True]
+    assert evaluate(written, stars).to_pylist() == [False, None, True]
     assert selected_rows(stars, (written,)).to_pylist() == [2]
 
 
@@ -207,7 +195,7 @@ def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
         ORDER BY r.id, p.asin
     """)
     assert [str(condition) for condition in row_tests(operators_of(query))] == [
-        "greater(r.stars, p.price)"]
+        "r.stars > p.price"]
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     assert result.to_rows() == [
         ("r0", "p0"), ("r0", "p1"), ("r2", "p0"), ("r5", "p0"), ("r5", "p1")]

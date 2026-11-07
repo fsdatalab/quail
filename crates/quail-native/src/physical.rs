@@ -367,16 +367,10 @@ static KINDS: &[Kind] = &[
         fields: fields!(; "input" = REQUIRED, "field" = REQUIRED),
     },
     Kind {
-        class: "ScalarFunction",
-        tag: "quail.common.expressions.ScalarFunction",
+        class: "Expression",
+        tag: "quail.common.expressions.Expression",
         node: false,
-        fields: fields!(; "function" = REQUIRED, "args" = REQUIRED),
-    },
-    Kind {
-        class: "Literal",
-        tag: "quail.common.expressions.Literal",
-        node: false,
-        fields: fields!(; "value" = REQUIRED),
+        fields: fields!(; "encoded" = REQUIRED, "columns" = REQUIRED, "text" = REQUIRED),
     },
     Kind {
         class: "Alias",
@@ -404,28 +398,10 @@ static KINDS: &[Kind] = &[
             "max_answer_tokens" = ZERO),
     },
     Kind {
-        class: "RegularPredicate",
-        tag: "quail.common.expressions.RegularPredicate",
+        class: "ScoreTest",
+        tag: "quail.common.expressions.ScoreTest",
         node: false,
-        fields: fields!(; "expression" = REQUIRED, "comparison" = REQUIRED, "value" = NONE),
-    },
-    Kind {
-        class: "Not",
-        tag: "quail.common.expressions.Not",
-        node: false,
-        fields: fields!(; "operand" = REQUIRED),
-    },
-    Kind {
-        class: "And",
-        tag: "quail.common.expressions.And",
-        node: false,
-        fields: fields!(; "operands" = REQUIRED),
-    },
-    Kind {
-        class: "Or",
-        tag: "quail.common.expressions.Or",
-        node: false,
-        fields: fields!(; "operands" = REQUIRED),
+        fields: fields!(; "call" = REQUIRED, "test" = REQUIRED),
     },
     Kind {
         class: "FilterPredicate",
@@ -516,7 +492,7 @@ fn canonical(kind: &Kind, value: Value) -> Result<Value, String> {
         "Equality" => round::<Equality>(value),
         "SortKey" => round::<SortKey>(value),
         "ExtractStruct" => round::<ExtractStruct>(value),
-        "RegularPredicate" | "Not" | "And" | "Or" => round::<Condition>(value),
+        "ScoreTest" => round::<Asked>(value),
         _ => round::<ValueExpression>(value),
     }
 }
@@ -793,7 +769,7 @@ fn fill_node(
                 .attributes
                 .predicate
                 .as_ref()
-                .map(condition_columns)
+                .map(quail_planner::expressions::condition_columns)
                 .unwrap_or_default();
             dict.set_item("tested_columns", tuple_of(py, &columns)?)?;
         }
@@ -905,68 +881,25 @@ fn fill_value(py: Python<'_>, dict: &Bound<'_, PyDict>, value: &Value) -> PyResu
         "FilterPredicate" => {
             let predicate: physical::FilterPredicate = serde_json::from_value(value.clone())
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            let call = match &predicate.expression {
-                physical::Asked::Call(call) => Some(call),
-                physical::Asked::Compare(test) => match &test.expression {
-                    physical::ValueExpression::ModelCall(call) => Some(call),
-                    _ => None,
-                },
-            };
-            if let Some(call) = call {
-                let prompt = serde_json::to_value(call.prompt.as_ref()).expect("a prompt writes");
-                dict.set_item("prompt", to_python(py, &prompt)?)?;
-            }
+            let call = quail_planner::expressions::asked_call(&predicate.expression);
+            let prompt = serde_json::to_value(call.prompt.as_ref()).expect("a prompt writes");
+            dict.set_item("prompt", to_python(py, &prompt)?)?;
         }
-        "Not" => {
-            dict.set_item(
-                "operands",
-                PyTuple::new(
-                    py,
-                    [dict
-                        .get_item("operand")?
-                        .unwrap_or(py.None().into_bound(py))],
-                )?,
-            )?;
+        "ColumnRef" | "GetField" | "Alias" | "Expression" => {
+            // the columns the executor gathers to evaluate the value
+            let expression: physical::ValueExpression = serde_json::from_value(value.clone())
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            let references: Vec<physical::ValueExpression> =
+                quail_planner::expressions::column_references(&expression)
+                    .into_iter()
+                    .map(physical::ValueExpression::ColumnRef)
+                    .collect();
+            let references = serde_json::to_value(references).expect("columns write");
+            dict.set_item("references", to_python(py, &references)?)?;
         }
         _ => {}
     }
     Ok(())
-}
-
-/// The unqualified names of the columns a condition's tests read, in
-/// first-use order.
-fn condition_columns(condition: &physical::Condition) -> Vec<String> {
-    fn expression(value: &physical::ValueExpression, out: &mut Vec<String>) {
-        match value {
-            physical::ValueExpression::ColumnRef(column) => {
-                if !out.contains(&column.column) {
-                    out.push(column.column.clone());
-                }
-            }
-            physical::ValueExpression::GetField(field) => expression(&field.input, out),
-            physical::ValueExpression::ScalarFunction(function) => {
-                for argument in &function.args {
-                    expression(argument, out);
-                }
-            }
-            physical::ValueExpression::Alias(alias) => expression(&alias.expression, out),
-            _ => {}
-        }
-    }
-    fn visit(condition: &physical::Condition, out: &mut Vec<String>) {
-        match condition {
-            physical::Condition::Compare(test) => expression(&test.expression, out),
-            physical::Condition::Not(not) => visit(&not.operand, out),
-            physical::Condition::And(all) | physical::Condition::Or(all) => {
-                for operand in &all.operands {
-                    visit(operand, out);
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    visit(condition, &mut out);
-    out
 }
 
 /// Read the constructor's arguments as fields, by position then by name.
@@ -1193,14 +1126,9 @@ impl Tagged {
             .map(|kind| kind.class)
             .unwrap_or_default();
         let text = match class {
-            "RegularPredicate" | "Not" | "And" | "Or" => serde_json::from_value(value)
+            "ColumnRef" | "GetField" | "Expression" => serde_json::from_value(value)
                 .ok()
-                .map(|condition| quail_planner::expressions::condition_text(&condition)),
-            "ColumnRef" | "GetField" | "ScalarFunction" | "Literal" => {
-                serde_json::from_value(value)
-                    .ok()
-                    .map(|expression| quail_planner::expressions::column_name(&expression, true))
-            }
+                .map(|expression| quail_planner::expressions::column_name(&expression, true)),
             "Equality" => serde_json::from_value::<physical::Equality>(value)
                 .ok()
                 .map(|pair| {
@@ -1379,8 +1307,7 @@ leaf_classes! {
     AnswerOutput = "AnswerOutput": Tagged [] {},
     ColumnRef = "ColumnRef": Tagged [] {},
     GetField = "GetField": Tagged [] {},
-    ScalarFunction = "ScalarFunction": Tagged [] {},
-    Literal = "Literal": Tagged [] {},
+    Expression = "Expression": Tagged [] {},
     Alias = "Alias": Tagged [] {},
     Prompt = "Prompt": Tagged [] {},
     ModelCall = "ModelCall": Tagged [] {
@@ -1401,10 +1328,7 @@ leaf_classes! {
         PyTuple::new(slf.py(), found)
     }
     },
-    RegularPredicate = "RegularPredicate": Tagged [] {},
-    Not = "Not": Tagged [] {},
-    And = "And": Tagged [] {},
-    Or = "Or": Tagged [] {},
+    ScoreTest = "ScoreTest": Tagged [] {},
     FilterPredicate = "FilterPredicate": Tagged [] {},
     Equality = "Equality": Tagged [] {},
     SortKey = "SortKey": Tagged [] {},

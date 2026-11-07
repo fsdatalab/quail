@@ -489,27 +489,9 @@ fn scans_of<'a>(alternatives: impl Iterator<Item = &'a Operators>) -> Vec<Scan> 
     found
 }
 
-/// A column, or a field of a struct column, as an array of each row's value.
+/// A value of each row of `batch`, as DataFusion evaluates it.
 fn value(expression: &ValueExpression, batch: &RecordBatch) -> Result<ArrayRef, CompileError> {
-    match expression {
-        ValueExpression::ColumnRef(column) => batch
-            .column_by_name(&column.column)
-            .cloned()
-            .ok_or_else(|| CompileError::new(format!("no column {}", column.column))),
-        ValueExpression::GetField(field) => {
-            let input = value(&field.input, batch)?;
-            let structs = input
-                .as_struct_opt()
-                .ok_or_else(|| CompileError::new(format!("{} is not a struct", field.field)))?;
-            structs
-                .column_by_name(&field.field)
-                .cloned()
-                .ok_or_else(|| CompileError::new(format!("no field {}", field.field)))
-        }
-        other => Err(CompileError::new(format!(
-            "{DOCUMENT_EXPRESSION}, not {other:?}"
-        ))),
-    }
+    quail_datafusion::expressions::evaluate(expression, batch, false)
 }
 
 /// The text of a scan's document column in one batch.

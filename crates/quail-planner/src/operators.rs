@@ -2,16 +2,18 @@
 //!
 //! The physical planner reads a region only through `Operators`, which
 //! `quail_datafusion::derive` reads from the region's DataFusion plan.
-//! They cross into Python as JSON.
+//! They cross into Python as JSON. Each value and condition the
+//! executor computes is an `Expression`, which DataFusion evaluates.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use quail_physical::{
-    Asked, Condition, Equality, ExtractStruct, FilterPredicate, ModelCall, Projected, SortKey,
+    Asked, Equality, ExtractStruct, FilterPredicate, ModelCall, Projected, SortKey,
     ValueExpression, tagged_struct,
 };
+use serde_json::Value;
 
 use crate::expressions::{PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_references};
 
@@ -88,7 +90,8 @@ pub struct Scan {
     pub alias: String,
     pub column: ScanColumn,
     pub columns: Vec<String>,
-    pub predicates: Vec<Condition>,
+    /// Conditions on the table's own columns, each an `Expression`.
+    pub predicates: Vec<ValueExpression>,
     pub schema: Option<Schema>,
 }
 
@@ -98,7 +101,12 @@ pub struct ColumnTest {
     /// The column operator the Filter follows, the last one it reads.
     pub name: String,
     pub call: ModelCall,
-    pub condition: Condition,
+    /// The condition, an `Expression` over the table's columns and the
+    /// answer columns.
+    pub condition: ValueExpression,
+    /// The labels a test of a classification's label accepts, when it is
+    /// `label IN (...)`.
+    pub labels: Option<Value>,
     pub selectivity: Option<f64>,
     /// Its position among the table's filters, after the table's AI.IF
     /// predicates, the label tests first.
@@ -184,7 +192,7 @@ pub enum RowOperator {
     },
     /// A regular condition on result rows.
     Filter {
-        condition: Condition,
+        condition: ValueExpression,
         columns: Vec<String>,
     },
     /// A SELECT list over result rows.

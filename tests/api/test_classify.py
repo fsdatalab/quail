@@ -13,14 +13,7 @@ import quail
 # one token per word: refund=1, request=2, status=3, shipping=4
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.common.expressions import (
-    Alias,
-    ColumnRef,
-    CompileError,
-    RegularPredicate,
-    column_references,
-    condition_tests,
-)
+from quail.common.expressions import Alias, CompileError
 from quail.physical import (
     AiClassify,
     AiJoin,
@@ -83,8 +76,7 @@ def test_classify_plans_filters_and_returns_labels(session):
     # a tokenizer without decode marks no word start
     assert classify.spec.label_word_starts == tuple(
         (False,) * len(ids) for ids in classify.spec.label_token_ids)
-    assert test.predicate == RegularPredicate(
-        ColumnRef("d", "documents", "topic"), "in", ("refund", "shipping"))
+    assert str(test.predicate) == "d.topic IN ('refund', 'shipping')"
 
     result = finish(query, _labels(["refund", "praise"]))
     rows = result.collect()
@@ -172,21 +164,20 @@ def test_sql_classifies_and_tests_labels(session):
         f"SELECT d.id, {call} AS topic FROM documents d "
         f"WHERE {call} IN ('refund', 'shipping')")
     (test,) = [n for n in query.plan().nodes if isinstance(n, Filter)]
-    assert test.predicate == RegularPredicate(
-        ColumnRef("d", "documents", "topic"), "in", ("refund", "shipping"))
+    assert str(test.predicate) == "d.topic IN ('refund', 'shipping')"
     # a filter on the label alone, with a selectivity option
     filtered = session.sql(
         f"SELECT d.id FROM documents d WHERE {call[:-1]}, "
         f"{{'selectivity': 0.5}}) IN ('praise')")
     (predicate,) = column_tests(operators_of(filtered))
     assert predicate.selectivity == 0.5
-    assert predicate.condition.value == ("praise",)
+    assert predicate.labels == ("praise",)
     assert operators_of(filtered).filters == ()
     # equality is membership in one label, on either side
     for form in (f"{call} = 'refund'", f"'refund' = {call}"):
         equal = session.sql(f"SELECT d.id FROM documents d WHERE {form}")
         (predicate,) = column_tests(operators_of(equal))
-        assert predicate.condition.value == ("refund",)
+        assert predicate.labels == ("refund",)
     for bad in (f"SELECT d.id, {call} FROM documents d",
                 f"SELECT d.id FROM documents d WHERE {call} IN (1)"):
         with pytest.raises(CompileError):
@@ -303,8 +294,7 @@ def test_plain_label_tests_share_the_classification_used_by_membership(session):
     (classify,) = [node for node in query.plan().nodes if isinstance(node, AiClassify)]
     # every label test reads the one classification's column
     tested = {reference.column for found in column_tests(operators_of(query))
-              for test in condition_tests(found.condition)
-              for reference in column_references(test.expression)}
+              for reference in found.condition.references}
     assert tested == {classify.spec.name}
     assert finish(query, _labels(["a", "b"])).collect().to_pylist() == [{"d.id": 7}]
 

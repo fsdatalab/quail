@@ -11,7 +11,6 @@ from helpers.sessions import TOKENIZER
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import Catalog, DocumentProvider
-from quail.common.expressions import ColumnRef, RegularPredicate
 from quail.physical import (
     AiClassify,
     AiScore,
@@ -84,8 +83,7 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
     score_filter = next(
         node for node in physical.nodes if isinstance(node, Filter)
     )
-    assert score_filter.predicate == RegularPredicate(
-        ColumnRef("d", "", "score"), ">=", 0.7)
+    assert str(score_filter.predicate) == "d.score >= 0.7"
 
     for template, query_text in QUERY_TEXTS:
         query = session.sql(
@@ -103,12 +101,13 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
         catalog,
     ))
     (join,) = found.joins
-    assert (join.predicate.comparison, join.predicate.value) == ("<", 0.8)
-    assert join.predicate.expression.aliases() == ("q", "d")
+    # the test reads the score as its one column, swapped to its left
+    assert join.predicate.test.text == "{0} < 0.8"
+    assert [arg.alias for arg in join.predicate.call["prompt"].args] == ["q", "d"]
     ((alias, (predicate,)),) = found.filters
     assert alias == "d"
     expression = predicate.expression
-    assert (expression.comparison, expression.value) == (">=", 0.5)
+    assert expression.test.text == "{0} >= 0.5"
 
 
 def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
@@ -135,7 +134,7 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
             assert sum(type(node) is AiScore for node in physical.nodes) == 1
             if "IN" in predicate:
                 assert any(isinstance(node, Filter)
-                           and node.predicate.value == ("praise",)
+                           and str(node.predicate).endswith("IN ('praise')")
                            for node in physical.nodes)
             result = finish(query, mixed())
             rows = result.collect()

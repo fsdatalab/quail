@@ -5,11 +5,7 @@ import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
 
-from quail.common.expressions import (
-    CompileError,
-    column_references,
-    evaluate_expression,
-)
+from quail.common.expressions import CompileError, evaluate
 from quail.common.pairs import pair_keys
 from quail.execution.result import (
     IndexRelation,
@@ -120,13 +116,13 @@ def projection_for(token_inputs, documents):
                 continue
             if name not in source_columns:
                 raise CompileError(f"unknown projection column {name!r}")
-            source = column_references(source_columns[name])[0]
+            source = source_columns[name].references[0]
             if source.alias not in relation.schema.names:
                 raise CompileError(
                     f"projection column {name!r} is not in the result"
                 )
             store = token_inputs[source.alias]
-            for ref in column_references(source_columns[name]):
+            for ref in source_columns[name].references:
                 loaded = (store.column_names if isinstance(store, pa.Table)
                           else store.projected_columns)
                 if ref.column not in loaded:
@@ -134,7 +130,7 @@ def projection_for(token_inputs, documents):
                         f"projection column {name!r} was not loaded by the "
                         f"scan of {source.alias!r}; the "
                         f"should_push_down_projection rule is not registered")
-            values = evaluate_expression(source_columns[name], store)
+            values = evaluate(source_columns[name], store)
             projection.append((source.alias, values))
             fields.append(pa.field(
                 name,

@@ -1,18 +1,14 @@
-//! Reading and checking expressions and conditions, as
-//! `quail/common/expressions.py` does.
-//!
-//! Error messages and the text of conditions match Python's, so a
-//! query refused by the Rust planner reads as it did.
+//! Reading and checking the expressions of a region's operators: the
+//! columns they read, their names and text, and the model calls they
+//! hold. DataFusion evaluates the values and conditions.
 
 use std::fmt;
 
 use quail_physical::{
-    Alias, Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct, ModelCall, Not,
-    Projected, RegularPredicate, SortExpression, SortKey, ValueExpression,
+    Alias, Asked, ColumnRef, Equality, ExtractStruct, ModelCall, Projected, SortExpression,
+    SortKey, ValueExpression,
 };
 use serde_json::Value;
-
-use crate::arrow_functions::ARROW_FUNCTIONS;
 
 /// The phrase every refusal of a query shape the binder does not read
 /// ends with: DataFusion runs such operators itself, around the model
@@ -81,34 +77,9 @@ pub fn compile_error<T>(message: impl Into<String>) -> Result<T, CompileError> {
 pub const SPAN_SUFFIX: &str = "_span";
 pub const PROBABILITIES_SUFFIX: &str = "_probabilities";
 pub const DESCRIPTION_WORDS: usize = 25;
-pub const VALUE_COMPARISONS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
-pub const TEXT_COMPARISONS: [&str; 7] = [
-    "like",
-    "ilike",
-    "contains",
-    "icontains",
-    "starts with",
-    "ends with",
-    "regex",
-];
 pub const SCORE_COMPARISONS: [&str; 4] = ["<", "<=", ">", ">="];
 pub const MODEL_CALL_KINDS: [&str; 6] = ["boolean", "score", "label", "extract", "features", "map"];
 pub const SAE_POOLINGS: [&str; 2] = ["last", "max"];
-/// The SQL names of scalar functions whose Arrow compute function has another name.
-const FUNCTION_ALIASES: [(&str, &str); 4] = [
-    ("length", "utf8_length"),
-    ("lower", "utf8_lower"),
-    ("upper", "utf8_upper"),
-    ("trim", "utf8_trim_whitespace"),
-];
-
-fn column_comparisons() -> Vec<&'static str> {
-    let mut found: Vec<&str> = VALUE_COMPARISONS.to_vec();
-    found.extend(["in", "is null", "is not null", "is true"]);
-    found.extend(TEXT_COMPARISONS);
-    found
-}
-
 // ---------------------------------------------------------------- Python text
 
 /// Python's `repr` of a string.
@@ -258,15 +229,6 @@ pub fn repr_list(items: &[String]) -> String {
     format!("[{}]", parts.join(", "))
 }
 
-/// A literal as Python compares it for equality: True equals 1, 1 equals 1.0.
-fn value_key(value: &Value) -> String {
-    match value {
-        Value::Bool(flag) => repr_float(if *flag { 1.0 } else { 0.0 }),
-        Value::Number(number) => repr_float(number.as_f64().unwrap_or(f64::NAN)),
-        other => other.to_string(),
-    }
-}
-
 // ---------------------------------------------------------------- columns
 
 /// The source columns a value expression reads, in first use order.
@@ -285,22 +247,20 @@ fn collect_references(expression: &ValueExpression, found: &mut Vec<ColumnRef>) 
         }
         ValueExpression::Alias(alias) => collect_references(&alias.expression, found),
         ValueExpression::GetField(field) => collect_references(&field.input, found),
-        ValueExpression::ScalarFunction(function) => {
-            for argument in &function.args {
-                collect_references(argument, found);
+        ValueExpression::Value(value) => {
+            for reference in &value.columns {
+                if !found.contains(reference) {
+                    found.push(reference.clone());
+                }
             }
         }
-        ValueExpression::Literal(_) | ValueExpression::ModelCall(_) => {}
+        ValueExpression::ModelCall(_) => {}
     }
 }
 
 /// The name of a column reference, with its table alias when it has one.
 pub fn reference_name(reference: &ColumnRef, qualified: bool) -> String {
-    if qualified && !reference.alias.is_empty() {
-        format!("{}.{}", reference.alias, reference.column)
-    } else {
-        reference.column.clone()
-    }
+    reference.name(qualified)
 }
 
 /// The name of a source, computed, or projected column, as `column_name`.
@@ -314,15 +274,7 @@ pub fn column_name(expression: &ValueExpression, qualified: bool) -> String {
         ValueExpression::GetField(field) => {
             format!("{}.{}", column_name(&field.input, qualified), field.field)
         }
-        ValueExpression::ScalarFunction(function) => {
-            let arguments: Vec<String> = function
-                .args
-                .iter()
-                .map(|argument| column_name(argument, qualified))
-                .collect();
-            format!("{}({})", function.function, arguments.join(", "))
-        }
-        ValueExpression::Literal(literal) => repr_value(&literal.value),
+        ValueExpression::Value(value) => value.text_with(qualified),
         ValueExpression::Alias(alias) => alias.name.clone(),
         ValueExpression::ModelCall(_) => panic!("a model call has no column name"),
     }
@@ -390,17 +342,10 @@ pub fn call_aliases(call: &ModelCall) -> Vec<String> {
 pub const FEATURE_FIELDS: [&str; 2] = ["feature", "strength"];
 
 /// The predicate of an AI filter or AI join as a model call.
-///
-/// # Panics
-///
-/// The predicate compares a value that asks no model.
 pub fn asked_call(asked: &Asked) -> &ModelCall {
     match asked {
         Asked::Call(call) => call,
-        Asked::Compare(test) => match &test.expression {
-            ValueExpression::ModelCall(call) => call,
-            _ => panic!("a comparison that asks no model"),
-        },
+        Asked::Compare(test) => &test.call,
     }
 }
 
@@ -482,7 +427,6 @@ pub fn value_refs(expression: &ValueExpression) -> Vec<ColumnRef> {
             ValueExpression::ModelCall(call) => call_refs(call),
             other => column_references(other),
         },
-        ValueExpression::Literal(_) => Vec::new(),
         other => column_references(other),
     }
 }
@@ -496,20 +440,11 @@ pub fn call_refs(call: &ModelCall) -> Vec<ColumnRef> {
     found
 }
 
-/// The columns a condition reads, in first use order.
-pub fn condition_refs(condition: &Condition) -> Vec<ColumnRef> {
-    let mut found = Vec::new();
-    for test in tests(condition) {
-        push_unique(&mut found, value_refs(&test.expression));
-    }
-    found
-}
-
 /// The columns an AI predicate reads, in first use order.
 pub fn asked_refs(asked: &Asked) -> Vec<ColumnRef> {
     match asked {
         Asked::Call(call) => call_refs(call),
-        Asked::Compare(test) => value_refs(&test.expression),
+        Asked::Compare(test) => call_refs(&test.call),
     }
 }
 
@@ -529,104 +464,21 @@ pub fn sort_refs(key: &SortKey) -> Vec<ColumnRef> {
 
 // ---------------------------------------------------------------- conditions
 
-/// The column tests under a condition, in written order.
-pub fn tests(condition: &Condition) -> Vec<&RegularPredicate> {
-    match condition {
-        Condition::Compare(test) => vec![test.as_ref()],
-        Condition::Not(not) => tests(&not.operand),
-        Condition::And(connective) | Condition::Or(connective) => {
-            connective.operands.iter().flat_map(tests).collect()
-        }
-    }
-}
-
-/// The unqualified names of the columns a condition's tests read.
-pub fn condition_columns(condition: &Condition) -> Vec<String> {
+/// The unqualified names of the columns a condition reads, in first
+/// use order.
+pub fn condition_columns(condition: &ValueExpression) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    for test in tests(condition) {
-        for reference in column_references(&test.expression) {
-            if !found.contains(&reference.column) {
-                found.push(reference.column);
-            }
+    for reference in column_references(condition) {
+        if !found.contains(&reference.column) {
+            found.push(reference.column);
         }
     }
     found
 }
 
-fn not(operand: Condition) -> Condition {
-    Condition::Not(Not {
-        operand: Box::new(operand),
-    })
-}
-
-/// The condition that accepts the rows the condition rejects.
-pub fn negate(condition: Condition) -> Condition {
-    match condition {
-        Condition::Not(not) => *not.operand,
-        Condition::And(connective) => Condition::Or(Connective {
-            operands: connective.operands.into_iter().map(negate).collect(),
-        }),
-        Condition::Or(connective) => Condition::And(Connective {
-            operands: connective.operands.into_iter().map(negate).collect(),
-        }),
-        Condition::Compare(test) => {
-            let negated = match test.comparison.as_str() {
-                "is null" => Some("is not null"),
-                "is not null" => Some("is null"),
-                _ => None,
-            };
-            match negated {
-                Some(comparison) => Condition::Compare(Box::new(RegularPredicate {
-                    expression: test.expression,
-                    comparison: comparison.to_string(),
-                    value: Value::Null,
-                })),
-                None => not(Condition::Compare(test)),
-            }
-        }
-    }
-}
-
-/// The condition with NOT on column tests only and AND and OR flat.
-pub fn normalize(condition: Condition) -> Condition {
-    match condition {
-        Condition::Not(not) => {
-            let negated = negate(normalize(*not.operand));
-            if matches!(negated, Condition::Not(_)) {
-                negated
-            } else {
-                normalize(negated)
-            }
-        }
-        Condition::And(connective) => Condition::And(Connective {
-            operands: flatten(connective, true),
-        }),
-        Condition::Or(connective) => Condition::Or(Connective {
-            operands: flatten(connective, false),
-        }),
-        test => test,
-    }
-}
-
-fn flatten(connective: Connective, and: bool) -> Vec<Condition> {
-    let mut operands = Vec::new();
-    for operand in connective.operands.into_iter().map(normalize) {
-        match (operand, and) {
-            (Condition::And(inner), true) | (Condition::Or(inner), false) => {
-                operands.extend(inner.operands)
-            }
-            (operand, _) => operands.push(operand),
-        }
-    }
-    operands
-}
-
-/// The conditions an AND combines, or the condition alone.
-pub fn conjuncts(condition: &Condition) -> Vec<Condition> {
-    match condition {
-        Condition::And(connective) => connective.operands.clone(),
-        other => vec![other.clone()],
-    }
+/// The text of a condition, each column named with its table alias.
+pub fn condition_text(condition: &ValueExpression) -> String {
+    column_name(condition, true)
 }
 
 // ---------------------------------------------------------------- text
@@ -675,147 +527,12 @@ fn repr_json_list(value: &Value) -> String {
     }
 }
 
-/// The text of a test, as `str(RegularPredicate)`.
-pub fn test_text(test: &RegularPredicate) -> String {
-    let name = explain(&test.expression);
-    match test.comparison.as_str() {
-        "in" => {
-            let values: Vec<String> = match &test.value {
-                Value::Array(items) => items.iter().map(repr_value).collect(),
-                other => vec![repr_value(other)],
-            };
-            format!("{name} IN ({})", values.join(", "))
-        }
-        "is true" => name,
-        comparison if comparison.starts_with("is") => {
-            format!("{name} {}", comparison.to_uppercase())
-        }
-        comparison => format!("{name} {comparison} {}", repr_value(&test.value)),
-    }
-}
-
-/// The text of a condition, as `str()` of a Python condition.
-pub fn condition_text(condition: &Condition) -> String {
-    match condition {
-        Condition::Compare(test) => test_text(test),
-        Condition::Not(not) => format!("NOT {}", operand_text(&not.operand, true)),
-        Condition::And(connective) => join_operands(connective, " AND "),
-        Condition::Or(connective) => join_operands(connective, " OR "),
-    }
-}
-
-fn join_operands(connective: &Connective, separator: &str) -> String {
-    connective
-        .operands
-        .iter()
-        .map(|operand| operand_text(operand, false))
-        .collect::<Vec<_>>()
-        .join(separator)
-}
-
-fn operand_text(operand: &Condition, always: bool) -> String {
-    let text = condition_text(operand);
-    if always || matches!(operand, Condition::And(_) | Condition::Or(_)) {
-        format!("({text})")
-    } else {
-        text
-    }
-}
-
 // ---------------------------------------------------------------- checks
-
-/// Check that a scalar function name calls a scalar function of Arrow compute.
-pub fn check_arrow_function(name: &str) -> Result<(), CompileError> {
-    let arrow = FUNCTION_ALIASES
-        .iter()
-        .find(|(sql, _)| *sql == name)
-        .map(|(_, arrow)| *arrow)
-        .unwrap_or(name);
-    let Some((_, kind, attribute)) = ARROW_FUNCTIONS.iter().find(|(found, _, _)| *found == arrow)
-    else {
-        return compile_error(format!("unknown function {}", repr_str(name)));
-    };
-    if !["scalar", "meta"].contains(kind) || !attribute || (*kind == "meta" && arrow != "cast") {
-        return compile_error(format!(
-            "{name} is an Arrow {kind} function; an expression calls a scalar function, \
-             which reads one row at a time"
-        ));
-    }
-    Ok(())
-}
-
-fn type_name(expression: &ValueExpression) -> &'static str {
-    match expression {
-        ValueExpression::ColumnRef(_) => "ColumnRef",
-        ValueExpression::GetField(_) => "GetField",
-        ValueExpression::ScalarFunction(_) => "ScalarFunction",
-        ValueExpression::Literal(_) => "Literal",
-        ValueExpression::Alias(_) => "Alias",
-        ValueExpression::ModelCall(_) => "ModelCall",
-    }
-}
-
-/// Validate one value expression, whatever its node type.
-pub fn validate_tree(expression: &ValueExpression) -> Result<(), CompileError> {
-    if matches!(expression, ValueExpression::ModelCall(_)) {
-        return compile_error(format!(
-            "a value expression is a column, a field, a function, a literal, or an \
-             alias, got {}",
-            type_name(expression)
-        ));
-    }
-    validate_expression(expression)
-}
-
-/// Validate a value expression node and the nodes below it.
-pub fn validate_expression(expression: &ValueExpression) -> Result<(), CompileError> {
-    match expression {
-        ValueExpression::ColumnRef(reference) => {
-            if reference.alias.is_empty() || reference.column.is_empty() {
-                return compile_error("a column reference names a table alias and a column");
-            }
-            Ok(())
-        }
-        ValueExpression::GetField(field) => {
-            validate_tree(&field.input)?;
-            if field.field.is_empty() {
-                return compile_error("a field access names a struct field");
-            }
-            Ok(())
-        }
-        ValueExpression::Literal(literal) => {
-            let values = match &literal.value {
-                Value::Array(items) => items.clone(),
-                other => vec![other.clone()],
-            };
-            if values
-                .iter()
-                .any(|value| matches!(value, Value::Array(_) | Value::Object(_)))
-            {
-                return compile_error(format!(
-                    "a literal is a string, number, boolean, NULL, or a list of them, got {}",
-                    repr_value(&literal.value)
-                ));
-            }
-            Ok(())
-        }
-        ValueExpression::ScalarFunction(function) => {
-            check_arrow_function(&function.function)?;
-            for argument in &function.args {
-                validate_tree(argument)?;
-            }
-            Ok(())
-        }
-        ValueExpression::Alias(alias) => validate_alias(alias),
-        ValueExpression::ModelCall(call) => validate_call(call),
-    }
-}
 
 /// Validate an Alias: its model call or value expression, and its name.
 pub fn validate_alias(alias: &Alias) -> Result<(), CompileError> {
-    match alias.expression.as_ref() {
-        ValueExpression::ModelCall(call) => validate_call(call)?,
-        other => validate_tree(other)?,
+    if let ValueExpression::ModelCall(call) = alias.expression.as_ref() {
+        validate_call(call)?;
     }
     if alias.name.is_empty() {
         return compile_error("a projected expression needs a name");
@@ -913,104 +630,25 @@ pub fn validate_call(call: &ModelCall) -> Result<(), CompileError> {
     }
 }
 
-/// Check a test: a model score against a threshold, or columns against literals.
-pub fn validate_test(test: &RegularPredicate) -> Result<(), CompileError> {
-    if let ValueExpression::ModelCall(call) = &test.expression {
-        validate_call(call)?;
-        if call.kind != "score" {
-            return compile_error("only an AI.SCORE call compares with a threshold");
-        }
-        if !SCORE_COMPARISONS.contains(&test.comparison.as_str()) {
-            return compile_error(format!(
-                "unsupported AI.SCORE comparison {}",
-                repr_str(&test.comparison)
-            ));
-        }
-        let threshold = match &test.value {
-            Value::Number(number) => number.as_f64(),
-            Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
-            _ => None,
-        };
-        if !threshold.is_some_and(|value| (0.0..=1.0).contains(&value)) {
-            return compile_error("AI.SCORE threshold must be between 0 and 1");
-        }
-        return Ok(());
+/// Check an `AI.SCORE` comparison: its call, its comparison, and its
+/// threshold, which lies between 0 and 1.
+pub fn validate_score_test(
+    call: &ModelCall,
+    comparison: &str,
+    threshold: Option<f64>,
+) -> Result<(), CompileError> {
+    validate_call(call)?;
+    if call.kind != "score" {
+        return compile_error("only an AI.SCORE call compares with a threshold");
     }
-    if column_references(&test.expression).is_empty() {
-        return compile_error("a column predicate tests a column");
-    }
-    validate_expression(&test.expression)?;
-    let comparisons = column_comparisons();
-    let comparison = test.comparison.as_str();
-    if !comparisons.contains(&comparison) {
+    if !SCORE_COMPARISONS.contains(&comparison) {
         return compile_error(format!(
-            "unsupported column comparison {}; supported: {}",
-            repr_str(comparison),
-            comparisons.join(", ")
+            "unsupported AI.SCORE comparison {}",
+            repr_str(comparison)
         ));
     }
-    if comparison == "in" {
-        let Value::Array(values) = &test.value else {
-            return compile_error("IN needs a non-empty list of literals");
-        };
-        if values.is_empty() {
-            return compile_error("IN needs a non-empty list of literals");
-        }
-        let mut keys: Vec<String> = values.iter().map(value_key).collect();
-        keys.sort();
-        keys.dedup();
-        if keys.len() != values.len() {
-            return compile_error(format!(
-                "{} IN lists a value twice",
-                explain(&test.expression)
-            ));
-        }
-    } else if comparison.starts_with("is") {
-        if !test.value.is_null() {
-            return compile_error("a null test takes no value");
-        }
-    } else if TEXT_COMPARISONS.contains(&comparison) {
-        if !test.value.is_string() {
-            return compile_error(format!("{comparison} compares with a string"));
-        }
-    } else if test.value.is_null() || test.value.is_array() {
-        return compile_error(format!("{comparison} compares with one literal"));
-    }
-    Ok(())
-}
-
-fn connective_name(condition: &Condition) -> &'static str {
-    match condition {
-        Condition::Not(_) => "NOT",
-        Condition::And(_) => "AND",
-        Condition::Or(_) => "OR",
-        Condition::Compare(_) => "",
-    }
-}
-
-/// Check a condition and every condition under it.
-pub fn validate_condition(condition: &Condition) -> Result<(), CompileError> {
-    let (operands, minimum): (Vec<&Condition>, usize) = match condition {
-        Condition::Compare(test) => return validate_test(test),
-        Condition::Not(not) => (vec![not.operand.as_ref()], 1),
-        Condition::And(connective) | Condition::Or(connective) => {
-            (connective.operands.iter().collect(), 2)
-        }
-    };
-    let name = connective_name(condition);
-    if operands.len() < minimum {
-        return compile_error(format!("{name} takes at least {minimum} conditions"));
-    }
-    for operand in operands {
-        if let Condition::Compare(test) = operand
-            && matches!(test.expression, ValueExpression::ModelCall(_))
-        {
-            return compile_error(format!(
-                "{name} combines column tests, not AI calls; put the logic inside one \
-                 prompt's text"
-            ));
-        }
-        validate_condition(operand)?;
+    if !threshold.is_some_and(|value| (0.0..=1.0).contains(&value)) {
+        return compile_error("AI.SCORE threshold must be between 0 and 1");
     }
     Ok(())
 }
@@ -1032,41 +670,6 @@ mod tests {
         ] {
             assert_eq!(repr_float(value), text);
         }
-    }
-
-    fn stars(comparison: &str, value: Value) -> Condition {
-        Condition::Compare(Box::new(RegularPredicate {
-            expression: ValueExpression::ColumnRef(ColumnRef {
-                alias: "r".into(),
-                provider: "reviews".into(),
-                column: "stars".into(),
-            }),
-            comparison: comparison.into(),
-            value,
-        }))
-    }
-
-    #[test]
-    fn not_moves_down_to_the_column_tests() {
-        let not = |operand| {
-            Condition::Not(Not {
-                operand: Box::new(operand),
-            })
-        };
-        let (high, low) = (stars(">", Value::from(4)), stars("<", Value::from(3)));
-        let written = not(Condition::And(Connective {
-            operands: vec![
-                high.clone(),
-                Condition::Or(Connective {
-                    operands: vec![low.clone(), not(stars("is null", Value::Null))],
-                }),
-            ],
-        }));
-        // De Morgan's laws, two NOTs cancel, and NOT IS NULL is IS NOT NULL
-        assert_eq!(
-            condition_text(&normalize(written)),
-            "NOT (r.stars > 4) OR (NOT (r.stars < 3) AND r.stars IS NULL)"
-        );
     }
 
     #[test]

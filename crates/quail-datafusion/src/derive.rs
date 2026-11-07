@@ -27,21 +27,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, ScalarValue};
+use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::utils::split_conjunction;
-use datafusion::logical_expr::{
-    Distinct, Expr, ExprSchemable, Join, JoinType, LogicalPlan, SortExpr,
-};
+use datafusion::logical_expr::{Distinct, Expr, Join, JoinType, LogicalPlan, SortExpr};
 use quail_physical::{
-    Asked, ColumnRef, Condition, Connective, Equality, FilterPredicate, GetField, ModelCall, Not,
-    Projected, RegularPredicate, ScalarFunction, SortExpression, SortKey, ValueExpression,
+    Asked, ColumnRef, Equality, Expression, FilterPredicate, GetField, ModelCall, Projected,
+    SortExpression, SortKey, ValueExpression,
 };
 use quail_planner::expressions::{
     CompileError, FEATURE_FIELDS, UNSUPPORTED, aliased_call, asked_call, asked_refs, call_aliases,
     call_refs, column_alias_of, column_name, column_references, compile_error, condition_columns,
-    condition_refs, condition_text, conjuncts as condition_conjuncts, equality_refs, equality_text,
-    normalize, packed_columns, packing, projected_call, reference_name, repr_list, repr_str,
-    sort_refs, tests, validate_condition, value_refs,
+    condition_text, equality_refs, equality_text, packed_columns, packing, projected_call,
+    reference_name, repr_list, repr_str, sort_refs, value_refs,
 };
 use quail_planner::operators::{
     ColumnTest, Operators, Projection, ResultModifiers, RowOperator, Scan, SemanticColumn,
@@ -51,7 +48,9 @@ use quail_planner::prompts::Turn;
 
 use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Fetch, Semantics, WrittenTest};
-use crate::binding::{Binder, Selected, label_test, output_name, string_literal, unsupported};
+use crate::binding::{
+    Binder, Selected, check_labels, label_test, output_name, string_literal, unsupported,
+};
 use crate::functions::column_call_kind;
 use crate::lower::quail_function;
 use crate::region::ModelRegion;
@@ -77,101 +76,35 @@ pub fn derive_region(
     Ok((derive_operators(&plan, turn, layout)?, plan))
 }
 
-/// `plan`'s expressions as the binder reads them: each struct or list
-/// literal written as the call it was folded from, each field path as
-/// one `get_field` per field, and without the casts type coercion adds to
-/// compare two numbers or two strings.
+/// `plan` with each struct or list literal in an `AiNode`'s expressions
+/// written as the call it was folded from.
 ///
-/// DataFusion's optimizer runs over a region's operators: its type
-/// coercion casts one side of a comparison to the other's type, and its
-/// `SimplifyExpressions` folds a `named_struct`, `struct`, or
-/// `make_array` of literals into one literal. The binder reads an AI
-/// call's options, categories, and fields from the calls the query
-/// wrote, and compares values as they are.
+/// DataFusion's `SimplifyExpressions` runs over a region's operators and
+/// folds a `named_struct`, `struct`, or `make_array` of literals into one
+/// literal. The binder reads an AI call's options, categories, and
+/// fields from the calls the query wrote.
 fn as_bound(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
-    plan.transform_up(|node| {
-        if let Some(ai) = crate::extension::as_node::<AiNode>(&node) {
-            // the filter and tests also read the answer columns
-            let mut schema = ai.input.schema().as_ref().clone();
-            schema.merge(&DFSchema::from_unqualified_fields(
-                ai.fields.clone().into(),
-                Default::default(),
-            )?);
-            let read = |expr: Expr| bound_expr(expr, &schema);
-            let mut ai = ai.clone();
-            ai.call = read(ai.call)?;
-            ai.guard = ai.guard.map(read).transpose()?;
-            ai.filter = ai.filter.map(read).transpose()?;
-            for test in &mut ai.tests {
-                test.test = read(test.test.clone())?;
-                test.written = read(test.written.clone())?;
-            }
-            return Ok(Transformed::yes(crate::extension::extension_node(
-                ai.checked()?,
-            )));
-        }
-        let mut schema = DFSchema::empty();
-        for input in node.inputs() {
-            schema.merge(input.schema());
-        }
-        node.map_expressions(|expr| bound_expr(expr, &schema).map(Transformed::yes))
-    })
-    .map(|done| done.data)
-}
-
-/// `expr` as [`as_bound`] explains, its columns typed by `schema`.
-fn bound_expr(expr: Expr, schema: &DFSchema) -> datafusion::common::Result<Expr> {
-    expr.transform_up(|inner| {
-        // DataFusion reads `get_field(get_field(x, 'a'), 'b')` as one call
-        // of a field path, `get_field(x, 'a', 'b')`
-        if let Expr::ScalarFunction(call) = &inner
-            && call.name() == "get_field"
-            && call.args.len() > 2
-        {
-            let mut args = call.args.iter().cloned();
-            let mut nested = args.next().expect("a struct");
-            for field in args {
-                nested =
-                    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                        std::sync::Arc::clone(&call.func),
-                        vec![nested, field],
-                    ));
-            }
-            return Ok(Transformed::yes(nested));
-        }
-        let (Expr::Cast(datafusion::logical_expr::Cast { expr, field })
-        | Expr::TryCast(datafusion::logical_expr::TryCast { expr, field })) = &inner
-        else {
-            return Ok(unfold(inner));
-        };
-        match expr.get_type(schema) {
-            Ok(from) if widens(&from, field.data_type()) => {
-                Ok(Transformed::yes(expr.as_ref().clone()))
-            }
-            _ => Ok(Transformed::no(inner)),
-        }
-    })
-    .map(|done| done.data)
-}
-
-/// Whether a value of type `from` keeps its value as type `to`, as type
-/// coercion casts a number or string to compare it with another.
-fn widens(from: &DataType, to: &DataType) -> bool {
-    let width = |found: &DataType| found.primitive_width().unwrap_or(usize::MAX);
-    let string = |found: &DataType| {
-        matches!(
-            found,
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-        )
+    let read = |expr: Expr| {
+        expr.transform_up(|inner| Ok(unfold(inner)))
+            .map(|done| done.data)
     };
-    from == to
-        || (string(from) && string(to))
-        || (from.is_signed_integer() && to.is_signed_integer() && width(to) >= width(from))
-        || (from.is_unsigned_integer()
-            && (to.is_unsigned_integer() && width(to) >= width(from)
-                || to.is_signed_integer() && width(to) > width(from)))
-        || (from.is_integer() && to.is_floating())
-        || (from == &DataType::Float32 && to == &DataType::Float64)
+    plan.transform_up(|node| {
+        let Some(ai) = crate::extension::as_node::<AiNode>(&node) else {
+            return Ok(Transformed::no(node));
+        };
+        let mut ai = ai.clone();
+        ai.call = read(ai.call)?;
+        ai.guard = ai.guard.map(read).transpose()?;
+        ai.filter = ai.filter.map(read).transpose()?;
+        for test in &mut ai.tests {
+            test.test = read(test.test.clone())?;
+            test.written = read(test.written.clone())?;
+        }
+        Ok(Transformed::yes(crate::extension::extension_node(
+            ai.checked()?,
+        )))
+    })
+    .map(|done| done.data)
 }
 
 /// `expr` as the `named_struct`, `struct`, or `make_array` call of
@@ -1076,7 +1009,7 @@ struct Relation {
     /// accepts, and the test's selectivity.
     label_tests: ByAlias<(ModelCall, Value, Option<f64>)>,
     /// The conditions that ask no model, and their HINT's selectivity.
-    conditions: Vec<(Condition, Option<f64>)>,
+    conditions: Vec<(ValueExpression, Option<f64>)>,
     /// alias -> the ON equalities of the JOIN of that table that no AI
     /// join has claimed, last JOIN first.
     equalities: Vec<(String, Vec<Equality>)>,
@@ -1272,8 +1205,8 @@ impl Relation {
     /// Bind a WHERE term that is no AI filter: a plain condition, a test
     /// of a label, or a test of another column operator's answer.
     fn bind_where_term(&mut self, binder: &mut Binder, term: &Expr) -> Result<(), CompileError> {
-        if let Some((condition, hint)) = binder.bind_plain_where_term(term)? {
-            self.conditions.push((condition, hint));
+        if let Some(bound) = binder.bind_plain_where_term(term)? {
+            self.conditions.extend(bound);
             return Ok(());
         }
         let (unhinted, hint) = binder.unwrap_hint(term)?;
@@ -1300,82 +1233,81 @@ impl Relation {
 
 // ---------------------------------------------------------------- conditions
 
+/// A condition that asks no model, with its HINT's selectivity and, for
+/// a test of a label, the labels it accepts.
+#[derive(Clone)]
+struct Term {
+    condition: ValueExpression,
+    selectivity: Option<f64>,
+    labels: Option<Value>,
+}
+
 /// The conditions of a relation, by where they run.
 #[derive(Default)]
 struct PlacedConditions {
-    scans: ByAlias<Condition>,
-    computed: ByAlias<(Condition, Option<f64>)>,
-    rows: Vec<Condition>,
+    scans: ByAlias<ValueExpression>,
+    computed: ByAlias<Term>,
+    rows: Vec<ValueExpression>,
 }
 
-/// Split conditions at AND and place each part where its columns exist:
-/// at a table's scan, after the operator of one table that computes the
-/// columns it reads, or on the result rows.
+/// Place each condition where its columns exist: at a table's scan,
+/// after the operator of one table that computes the columns it reads,
+/// or on the result rows.
 ///
 /// `computed` maps (alias, column) to the kind of the operator that
 /// computes it; `unnested` holds the aliases of unnested lists.
 fn place_conditions(
-    conditions: Vec<(Condition, Option<f64>)>,
+    conditions: Vec<Term>,
     computed: &BTreeMap<(String, String), &str>,
     unnested: &[String],
 ) -> Result<PlacedConditions, CompileError> {
     let mut placed = PlacedConditions::default();
-    for (condition, selectivity) in conditions {
-        let condition = normalize(condition);
-        let parts = match selectivity {
-            None => condition_conjuncts(&condition),
-            Some(_) => vec![condition],
-        };
-        for part in parts {
-            validate_condition(&part)?;
-            let references: Vec<ColumnRef> = tests(&part)
-                .into_iter()
-                .flat_map(|test| column_references(&test.expression))
-                .collect();
-            let aliases: BTreeSet<&String> = references.iter().map(|found| &found.alias).collect();
-            let owners: BTreeSet<Option<(&str, &String)>> = references
-                .iter()
-                .map(|found| {
-                    computed
-                        .get(&(found.alias.clone(), found.column.clone()))
-                        .map(|kind| (*kind, &found.column))
-                })
-                .collect();
-            let kinds: BTreeSet<&str> = owners.iter().flatten().map(|(kind, _)| *kind).collect();
-            let one_table =
-                aliases.len() == 1 && !aliases.iter().any(|alias| unnested.contains(alias));
-            if one_table && owners.len() == 1 && owners.contains(&None) {
-                if selectivity.is_some() {
-                    return compile_error(format!(
-                        "HINT estimates a test of a label or an answer; {} tests a source \
-                         column, applied at the scan",
-                        condition_text(&part)
-                    ));
-                }
-                push(&mut placed.scans, aliases.first().expect("one alias"), part);
-            } else if one_table && kinds.len() == 1 {
-                push(
-                    &mut placed.computed,
-                    aliases.first().expect("one alias"),
-                    (part, selectivity),
-                );
-            } else {
-                if kinds.contains("label") && owners.iter().flatten().count() > 1 {
-                    return compile_error(format!(
-                        "{} tests a label and another operator's column; test them in \
-                         separate conditions",
-                        condition_text(&part)
-                    ));
-                }
-                if selectivity.is_some() {
-                    return compile_error(format!(
-                        "HINT estimates a test that runs before a model call; {} runs on the \
-                         result rows, after every model call",
-                        condition_text(&part)
-                    ));
-                }
-                placed.rows.push(part);
+    for term in conditions {
+        let part = &term.condition;
+        let references = column_references(part);
+        let aliases: BTreeSet<&String> = references.iter().map(|found| &found.alias).collect();
+        let owners: BTreeSet<Option<(&str, &String)>> = references
+            .iter()
+            .map(|found| {
+                computed
+                    .get(&(found.alias.clone(), found.column.clone()))
+                    .map(|kind| (*kind, &found.column))
+            })
+            .collect();
+        let kinds: BTreeSet<&str> = owners.iter().flatten().map(|(kind, _)| *kind).collect();
+        let one_table = aliases.len() == 1 && !aliases.iter().any(|alias| unnested.contains(alias));
+        if one_table && owners.len() == 1 && owners.contains(&None) {
+            if term.selectivity.is_some() {
+                return compile_error(format!(
+                    "HINT estimates a test of a label or an answer; {} tests a source column, \
+                     applied at the scan",
+                    condition_text(part)
+                ));
             }
+            push(
+                &mut placed.scans,
+                aliases.first().expect("one alias"),
+                part.clone(),
+            );
+        } else if one_table && kinds.len() == 1 {
+            let alias = (*aliases.first().expect("one alias")).clone();
+            push(&mut placed.computed, &alias, term);
+        } else {
+            if kinds.contains("label") && owners.iter().flatten().count() > 1 {
+                return compile_error(format!(
+                    "{} tests a label and another operator's column; test them in separate \
+                     conditions",
+                    condition_text(part)
+                ));
+            }
+            if term.selectivity.is_some() {
+                return compile_error(format!(
+                    "HINT estimates a test that runs before a model call; {} runs on the result \
+                     rows, after every model call",
+                    condition_text(part)
+                ));
+            }
+            placed.rows.push(term.condition);
         }
     }
     Ok(placed)
@@ -1624,47 +1556,6 @@ fn check_calls(
     Ok(())
 }
 
-/// Refuse a test of a label that lists a label its classification lacks.
-fn check_labels(
-    condition: &Condition,
-    calls: &[(&ModelCall, &String)],
-) -> Result<(), CompileError> {
-    for test in tests(condition) {
-        let references = column_references(&test.expression);
-        if !["=", "in"].contains(&test.comparison.as_str()) || references.len() != 1 {
-            continue;
-        }
-        let name = &references[0].column;
-        let Some((call, _)) = calls.iter().find(|(_, found)| *found == name) else {
-            continue;
-        };
-        let values = match &test.value {
-            Value::Array(items) => items.clone(),
-            other => vec![other.clone()],
-        };
-        let labels: Vec<Value> = call.labels.as_array().cloned().unwrap_or_default();
-        let unknown: BTreeSet<String> = values
-            .iter()
-            .filter(|value| !labels.contains(value))
-            .filter_map(|value| value.as_str().map(str::to_string))
-            .collect();
-        if !unknown.is_empty() {
-            let unknown: Vec<String> = unknown.into_iter().collect();
-            let written: Vec<String> = labels
-                .iter()
-                .filter_map(|label| label.as_str().map(str::to_string))
-                .collect();
-            return compile_error(format!(
-                "the filter on {} lists {}, which are not among its labels {}",
-                repr_str(name),
-                repr_list(&unknown),
-                repr_list(&written)
-            ));
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------- assembly
 
 /// An AI join or gate, before it is placed.
@@ -1801,27 +1692,25 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 }
             }
         }
+        let mut terms: Vec<Term> = conditions
+            .drain(..)
+            .map(|(condition, selectivity)| Term {
+                condition,
+                selectivity,
+                labels: None,
+            })
+            .collect();
         for (alias, found) in &label_tests {
             for (call, labels, selectivity) in found {
-                let test = RegularPredicate {
-                    expression: binder.column_ref(alias, named(call)),
-                    comparison: "in".to_string(),
-                    value: labels.clone(),
-                };
-                conditions.push((Condition::Compare(Box::new(test)), *selectivity));
+                check_labels(named(call), labels, call)?;
+                terms.push(Term {
+                    condition: binder.label_condition(alias, named(call), labels)?,
+                    selectivity: *selectivity,
+                    labels: Some(labels.clone()),
+                });
             }
         }
-        let conditions = place_conditions(conditions, &computed, &binder.unnested())?;
-        for (alias, tests) in &conditions.computed {
-            let labels: Vec<(&ModelCall, &String)> = names
-                .iter()
-                .filter(|(call, _)| call.kind == "label" && call_aliases(call) == [alias.clone()])
-                .map(|(call, _)| (call, named(call)))
-                .collect();
-            for (condition, _) in tests {
-                check_labels(condition, &labels)?;
-            }
-        }
+        let conditions = place_conditions(terms, &computed, &binder.unnested())?;
         Ok(Self {
             walk,
             binder,
@@ -2087,10 +1976,8 @@ impl<'w, 'a> Assembly<'w, 'a> {
     fn place_tests(&mut self) -> Option<()> {
         let mut stacks = std::mem::take(&mut self.stacks);
         for (alias, stack) in &mut stacks {
-            for (index, (condition, _)) in
-                lookup(&self.conditions.computed, alias).iter().enumerate()
-            {
-                let position = self.test_position(stack, condition);
+            for (index, term) in lookup(&self.conditions.computed, alias).iter().enumerate() {
+                let position = self.test_position(stack, &term.condition);
                 stack.insert(position, StackItem::Test(index));
                 note(&mut self.noted, alias);
             }
@@ -2103,7 +1990,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 let StackItem::Test(index) = item else {
                     continue;
                 };
-                let read = condition_columns(&computed[*index].0);
+                let read = condition_columns(&computed[*index].condition);
                 let producer = stack[..at].iter().rev().find_map(|below| match below {
                     StackItem::Column(kind, position) => {
                         let column = self.column(kind, *position);
@@ -2127,8 +2014,9 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 .map(|(order, (index, producer))| ColumnTest {
                     name: producer.name.clone(),
                     call: producer.call.clone(),
-                    condition: computed[*index].0.clone(),
-                    selectivity: computed[*index].1,
+                    condition: computed[*index].condition.clone(),
+                    labels: computed[*index].labels.clone(),
+                    selectivity: computed[*index].selectivity,
                     position: asks + order,
                     before_joins: true,
                 })
@@ -2145,7 +2033,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
     /// operator after which every answer column it reads is added, and
     /// above the tests placed before it; a test that reads no answer
     /// column goes right above the first extraction, SAE feature, or map.
-    fn test_position(&self, stack: &[StackItem], condition: &Condition) -> usize {
+    fn test_position(&self, stack: &[StackItem], condition: &ValueExpression) -> usize {
         let reads: BTreeSet<String> = condition_columns(condition)
             .into_iter()
             .filter(|column| self.stack_columns(stack).contains(column))
@@ -2230,7 +2118,7 @@ struct ResultRows {
     /// The SELECT list's output column names.
     output: Vec<String>,
     /// The tests of more than one table's columns.
-    tests: Vec<Condition>,
+    tests: Vec<ValueExpression>,
 }
 
 impl ResultRows {
@@ -2277,7 +2165,7 @@ impl ResultRows {
             source.iter().map(|column| column_name(column, true)),
             &packing,
         );
-        let tests: Vec<Condition> = self
+        let tests: Vec<ValueExpression> = self
             .tests
             .iter()
             .map(|test| result_row_condition(test, &packing))
@@ -2326,24 +2214,25 @@ impl ResultRows {
         };
         let mut chain: Vec<RowOperator> = Vec::new();
         let mut remaining = tests;
-        let place =
-            |chain: &mut Vec<RowOperator>, names: &[String], remaining: &mut Vec<Condition>| {
-                let available = readable(names);
-                let mut index = 0;
-                while index < remaining.len() {
-                    if result_columns_read(&remaining[index])
-                        .iter()
-                        .all(|name| available.contains(name))
-                    {
-                        chain.push(RowOperator::Filter {
-                            condition: remaining.remove(index),
-                            columns: names.to_vec(),
-                        });
-                    } else {
-                        index += 1;
-                    }
+        let place = |chain: &mut Vec<RowOperator>,
+                     names: &[String],
+                     remaining: &mut Vec<ValueExpression>| {
+            let available = readable(names);
+            let mut index = 0;
+            while index < remaining.len() {
+                if result_columns_read(&remaining[index])
+                    .iter()
+                    .all(|name| available.contains(name))
+                {
+                    chain.push(RowOperator::Filter {
+                        condition: remaining.remove(index),
+                        columns: names.to_vec(),
+                    });
+                } else {
+                    index += 1;
                 }
-            };
+            }
+        };
         place(&mut chain, &names, &mut remaining);
         let outer = if self.outer.is_empty() {
             vec![false; self.unnests.len()]
@@ -2452,33 +2341,42 @@ fn unnest_columns(
     Ok(expanded)
 }
 
+/// A column of the rows below as result rows hold it: a member of a
+/// struct column as the struct's field.
+fn result_reference(
+    reference: &ColumnRef,
+    members: &BTreeMap<String, (String, String)>,
+) -> ColumnRef {
+    match members.get(&reference.column) {
+        Some((owner, name)) => ColumnRef {
+            alias: owner.clone(),
+            provider: String::new(),
+            column: name.clone(),
+        },
+        None => reference.clone(),
+    }
+}
+
 fn rewrite_reference(
     expression: &ValueExpression,
     members: &BTreeMap<String, (String, String)>,
 ) -> ValueExpression {
     match expression {
-        ValueExpression::ColumnRef(found) if members.contains_key(&found.column) => {
-            let (owner, name) = &members[&found.column];
-            ValueExpression::ColumnRef(ColumnRef {
-                alias: owner.clone(),
-                provider: String::new(),
-                column: name.clone(),
-            })
+        ValueExpression::ColumnRef(found) => {
+            ValueExpression::ColumnRef(result_reference(found, members))
         }
         ValueExpression::GetField(field) => ValueExpression::GetField(GetField {
             input: Box::new(rewrite_reference(&field.input, members)),
             field: field.field.clone(),
         }),
-        ValueExpression::ScalarFunction(function) => {
-            ValueExpression::ScalarFunction(ScalarFunction {
-                function: function.function.clone(),
-                args: function
-                    .args
-                    .iter()
-                    .map(|argument| rewrite_reference(argument, members))
-                    .collect(),
-            })
-        }
+        ValueExpression::Value(value) => ValueExpression::Value(Expression {
+            columns: value
+                .columns
+                .iter()
+                .map(|found| result_reference(found, members))
+                .collect(),
+            ..value.clone()
+        }),
         ValueExpression::Alias(alias) => ValueExpression::Alias(quail_physical::Alias {
             expression: Box::new(rewrite_reference(&alias.expression, members)),
             name: alias.name.clone(),
@@ -2489,9 +2387,9 @@ fn rewrite_reference(
 
 /// Rewrite a condition to read result rows, where struct columns hold answers.
 pub(crate) fn result_row_condition(
-    condition: &Condition,
+    condition: &ValueExpression,
     packing: &[(String, Vec<(String, String)>)],
-) -> Condition {
+) -> ValueExpression {
     let members: BTreeMap<String, (String, String)> = packing
         .iter()
         .flat_map(|(owner, names)| {
@@ -2500,48 +2398,16 @@ pub(crate) fn result_row_condition(
                 .map(move |(name, member)| (member.clone(), (owner.clone(), name.clone())))
         })
         .collect();
-    rewrite_condition(condition, &members)
-}
-
-fn rewrite_condition(
-    condition: &Condition,
-    members: &BTreeMap<String, (String, String)>,
-) -> Condition {
-    match condition {
-        Condition::Compare(test) => Condition::Compare(Box::new(RegularPredicate {
-            expression: rewrite_reference(&test.expression, members),
-            comparison: test.comparison.clone(),
-            value: test.value.clone(),
-        })),
-        Condition::Not(not) => Condition::Not(Not {
-            operand: Box::new(rewrite_condition(&not.operand, members)),
-        }),
-        Condition::And(connective) => Condition::And(Connective {
-            operands: connective
-                .operands
-                .iter()
-                .map(|operand| rewrite_condition(operand, members))
-                .collect(),
-        }),
-        Condition::Or(connective) => Condition::Or(Connective {
-            operands: connective
-                .operands
-                .iter()
-                .map(|operand| rewrite_condition(operand, members))
-                .collect(),
-        }),
-    }
+    rewrite_reference(condition, &members)
 }
 
 /// The result row columns a rewritten condition reads, by name.
-pub(crate) fn result_columns_read(condition: &Condition) -> Vec<String> {
+pub(crate) fn result_columns_read(condition: &ValueExpression) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    for test in tests(condition) {
-        for reference in column_references(&test.expression) {
-            let name = reference_name(&reference, true);
-            if !found.contains(&name) {
-                found.push(name);
-            }
+    for reference in column_references(condition) {
+        let name = reference_name(&reference, true);
+        if !found.contains(&name) {
+            found.push(name);
         }
     }
     found
@@ -2550,7 +2416,7 @@ pub(crate) fn result_columns_read(condition: &Condition) -> Vec<String> {
 /// The source columns the row tests read that the SELECT list does not
 /// return, which it adds for them.
 pub(crate) fn row_test_columns(
-    row_tests: &[Condition],
+    row_tests: &[ValueExpression],
     unnested: &BTreeSet<String>,
     source: &[ValueExpression],
     returned: &[String],
@@ -2559,16 +2425,14 @@ pub(crate) fn row_test_columns(
     present.extend(source.iter().map(|column| column_name(column, true)));
     let mut extra = Vec::new();
     for test in row_tests {
-        for found in tests(test) {
-            for reference in column_references(&found.expression) {
-                let name = reference_name(&reference, true);
-                if !reference.provider.is_empty()
-                    && !unnested.contains(&reference.alias)
-                    && !present.contains(&name)
-                {
-                    present.insert(name);
-                    extra.push(ValueExpression::ColumnRef(reference));
-                }
+        for reference in column_references(test) {
+            let name = reference_name(&reference, true);
+            if !reference.provider.is_empty()
+                && !unnested.contains(&reference.alias)
+                && !present.contains(&name)
+            {
+                present.insert(name);
+                extra.push(ValueExpression::ColumnRef(reference));
             }
         }
     }
@@ -2659,7 +2523,7 @@ fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly
                     }
                 }
             }
-            RowOperator::Filter { condition, .. } => top.add(condition_refs(condition)),
+            RowOperator::Filter { condition, .. } => top.add(column_references(condition)),
             RowOperator::Unnest { .. } => {}
         }
     }
@@ -2702,7 +2566,7 @@ fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly
     }
     for scan in &found.scans {
         for predicate in &scan.predicates {
-            value(condition_refs(predicate));
+            value(column_references(predicate));
         }
     }
     for column in found.extracts.iter().chain(&found.maps) {
@@ -2799,13 +2663,13 @@ fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly
                     needed.remove(&alias, &column.added_columns());
                 }
                 StackItem::Test(index) => {
-                    needed.add(condition_refs(&computed[*index].0));
+                    needed.add(column_references(&computed[*index].condition));
                 }
             }
         }
         let scan = &found.scans[index];
         for predicate in &scan.predicates {
-            needed.add(condition_refs(predicate));
+            needed.add(column_references(predicate));
         }
         let sources = source_columns(&scan.column);
         let columns: Vec<String> = needed

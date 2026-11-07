@@ -24,6 +24,7 @@ mod claim;
 pub mod derive;
 mod distinct;
 mod exec;
+pub mod expressions;
 mod extension;
 mod functions;
 mod identified;

@@ -6,15 +6,16 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use crate::expressions::asked_call;
-use crate::expressions::{argument_alias, call_aliases, column_references, tests};
-use crate::operators::Operators;
+use crate::expressions::{argument_alias, call_aliases, column_name, column_references};
+use crate::operators::{Operators, ScanColumn};
 use crate::plan_statistics::plan_prompts;
 
 /// A region's facts as JSON:
 ///
 /// - `asks_model`: whether any operator asks the model;
-/// - `scans`: each scan's alias, provider, document column, value
-///   columns, and the column names of its table's schema;
+/// - `scans`: each scan's alias, provider, document column and its
+///   name without the alias, value columns, and the column names of
+///   its table's schema;
 /// - `value_columns`: alias -> the columns the executor reads by
 ///   document id: join equalities, regular predicates, tests of labels
 ///   and answers on the table's own columns, and DISTINCT stop keys;
@@ -58,21 +59,17 @@ pub fn region_facts(found: &Operators) -> Value {
         .collect();
     for scan in &found.scans {
         for predicate in &scan.predicates {
-            for test in tests(predicate) {
-                for reference in column_references(&test.expression) {
-                    add(&scan.alias, &reference.column);
-                }
+            for reference in column_references(predicate) {
+                add(&scan.alias, &reference.column);
             }
         }
     }
     for (alias, filters) in &found.column_filters {
         let columns = schemas.get(alias.as_str()).cloned().unwrap_or_default();
         for filter in filters {
-            for test in tests(&filter.condition) {
-                for reference in column_references(&test.expression) {
-                    if reference.alias == *alias && columns.contains(&reference.column) {
-                        add(alias, &reference.column);
-                    }
+            for reference in column_references(&filter.condition) {
+                if reference.alias == *alias && columns.contains(&reference.column) {
+                    add(alias, &reference.column);
                 }
             }
         }
@@ -89,6 +86,10 @@ pub fn region_facts(found: &Operators) -> Value {
             json!({
                 "alias": scan.alias, "provider": scan.provider,
                 "column": scan.column, "columns": scan.columns,
+                "column_name": match &scan.column {
+                    ScanColumn::Unnamed(name) => name.clone(),
+                    ScanColumn::Expression(column) => column_name(column, false),
+                },
                 "schema": schemas.get(scan.alias.as_str()),
                 "schema_ipc": scan.schema.as_ref().map(|schema| schema.ipc.clone()),
             })

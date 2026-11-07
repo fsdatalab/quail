@@ -3,7 +3,7 @@
 //!
 //! | module | Python |
 //! |---|---|
-//! | `expressions` | the helpers of `quail/common/expressions.py` |
+//! | `expressions` | the columns, names, and model calls of expressions |
 //! | `context` | `PlanningContext` |
 //! | `costs` | the filter costs and join specs of `quail/planner/operators` |
 //! | `columns` | the column planners of `quail/planner/operators` |
@@ -15,9 +15,7 @@
 //! | `scores` | `quail/planner/operators/score.py` |
 //! | `statistics` | `quail/planner/statistics` |
 //! | `prompts` | the prompt binding of `quail/common/prompts.py` |
-//! | `arrow_functions` | `pyarrow.compute`'s function list |
 
-pub mod arrow_functions;
 pub mod classify;
 pub mod columns;
 pub mod context;

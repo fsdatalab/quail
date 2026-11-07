@@ -8,6 +8,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 import torch as tensor_torch
+from helpers.conditions import condition as sql_condition
 from helpers.extract_fakes import (
     LEASE,
     NOTHING,
@@ -37,7 +38,6 @@ from quail.backends.quail.executor.state import LoadedModelState, QueryExecution
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_execute
 from quail.builtins import built_in_registry
-from quail.common.expressions import And, ColumnRef, GetField, Not, Or, RegularPredicate
 from quail.physical import (
     AiExtract,
     AiFilter,
@@ -323,6 +323,9 @@ def _extract_spec(monkeypatch, text, gold, spec=None, vocabulary=None, recurrent
 
 DOCS = [LEASE, TERM, NOTHING]
 GOLD = ["March 3, 2027", "five years", None]
+SPAN = pa.struct([("start", pa.int32()), ("end", pa.int32())])
+# the answer columns the conditions on extractions read
+ANSWERS = {"ends": pa.string(), "starts": pa.string(), "starts_span": SPAN}
 
 
 def _setup(monkeypatch, documents=None, token_documents=None,
@@ -621,8 +624,8 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                   backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(node_id="filter:c:0",
                inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
-               predicate=Not(RegularPredicate(
-                   ColumnRef("c", "contracts", "ends"), "like", "five%")),
+               predicate=sql_condition(
+                   "NOT (ends LIKE 'five%')", ANSWERS, "c", "contracts"),
                aliases=("c",), written_position=0),
         AiExtract(node_id="ai-extract:starts",
                   inputs=input_ports((PortRef("filter:c:0", "rows:c"),)),
@@ -634,13 +637,9 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                # by document ID from the port that still carries it
                inputs=input_ports((PortRef("ai-extract:starts", "rows:c"),
                                    PortRef("filter:c:0", "rows:c"))),
-               predicate=Or((
-                   RegularPredicate(ColumnRef("c", "contracts", "starts"), "is null"),
-                   And((RegularPredicate(ColumnRef("c", "contracts", "ends"),
-                                         "like", "March%"),
-                        RegularPredicate(
-                            GetField(ColumnRef("c", "contracts", "starts_span"),
-                                     "start"), "<", 40))))),
+               predicate=sql_condition(
+                   "starts IS NULL OR (ends LIKE 'March%' AND starts_span.start < 40)",
+                   ANSWERS, "c", "contracts"),
                aliases=("c",), written_position=1),
     ), PortRef("filter:c:1", "rows:c"))
     assert [member.node_id for member in graph.pipelines()["ai-extract:ends"]
@@ -710,9 +709,8 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
             Filter(
                 node_id="filter:c:1",
                 inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
-                predicate=RegularPredicate(
-                    ColumnRef("c", "contracts", "ends"), "is not null"
-                ),
+                predicate=sql_condition(
+                    "ends IS NOT NULL", ANSWERS, "c", "contracts"),
                 aliases=("c",),
                 written_position=1,
             ),
@@ -798,8 +796,8 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
                   backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(node_id="filter:c:0",
                inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
-               predicate=RegularPredicate(
-                   ColumnRef("c", "contracts", "ends"), "is not null"),
+               predicate=sql_condition(
+                   "ends IS NOT NULL", ANSWERS, "c", "contracts"),
                aliases=("c",), written_position=0),
     ), PortRef("filter:c:0", "rows:c"))
     local = _state(model)

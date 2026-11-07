@@ -12,9 +12,9 @@ mod tagged;
 mod topology;
 
 pub use expressions::{
-    Alias, Asked, ColumnRef, Condition, Connective, Equality, ExtractStruct, FilterPredicate,
-    GetField, Literal, ModelCall, Not, Projected, Prompt, RegularPredicate, ScalarFunction,
-    SortExpression, SortKey, TaggedModelCall, ValueExpression,
+    Alias, Asked, ColumnRef, Equality, Expression, ExtractStruct, FilterPredicate, GetField,
+    ModelCall, Projected, Prompt, ScoreTest, SortExpression, SortKey, TaggedModelCall,
+    ValueExpression,
 };
 pub use graph::{
     AnswerOutput, InputPort, OutputPort, PhysicalGraph, PlanEnvelope, PortRef, ValueType,
@@ -62,5 +62,21 @@ mod tests {
         let text = r#"{"type":"quail.logical.expressions.ColumnRef","alias":"r","provider":"reviews","column":"id"}"#;
         let expression: ValueExpression = serde_json::from_str(text).unwrap();
         assert!(matches!(expression, ValueExpression::ColumnRef(_)));
+    }
+
+    #[test]
+    fn an_expression_names_its_columns_in_its_text() {
+        let column = |alias: &str, name: &str| ColumnRef {
+            alias: alias.into(),
+            provider: String::new(),
+            column: name.into(),
+        };
+        let expression = Expression {
+            encoded: String::new(),
+            columns: vec![column("r", "stars"), column("", "label")],
+            text: "{0} > 3 AND {1} = '{{x}}'".into(),
+        };
+        assert_eq!(expression.text_with(true), "r.stars > 3 AND label = '{x}'");
+        assert_eq!(expression.text_with(false), "stars > 3 AND label = '{x}'");
     }
 }

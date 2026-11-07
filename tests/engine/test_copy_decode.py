@@ -3,8 +3,10 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pyarrow as pa
 import pytest
 import torch
+from helpers.conditions import condition as sql_condition
 from helpers.extract_fakes import make_spec
 from helpers.extract_reference import Decoder, add_answers
 from helpers.extract_reference import ReferenceInputs as ExtractionInputs
@@ -363,7 +365,6 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     from quail.backends.quail.executor.operators.filter import ConditionGate
     from quail.backends.quail.executor.operators.map import MapPart
     from quail.backends.quail.executor.parts import execute_parts
-    from quail.common.expressions import ColumnRef, RegularPredicate
     from quail.physical import AiExtract, Filter, PortRef, input_ports
 
     cpu_staging(monkeypatch)
@@ -422,10 +423,9 @@ def test_maps_and_extracts_share_branches_without_changing_results(
             aliases=("c",),
             written_position=0,
             inputs=input_ports((PortRef(source, "rows:c"),)),
-            predicate=RegularPredicate(
-                ColumnRef("c", "contracts", column),
-                "is not null" if tested == "extract" else "<>",
-                None if tested == "extract" else ""),
+            predicate=sql_condition(
+                f"{column} IS NOT NULL" if tested == "extract"
+                else f"{column} <> ''", {column: pa.string()}, "c", "contracts"),
         )
         parts.extend([ConditionGate(condition, {column: producer}, producer, None),
                       after])

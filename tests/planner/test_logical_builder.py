@@ -43,8 +43,3 @@ def test_a_query_the_builder_cannot_plan_is_refused_with_its_reason(name):
         session.sql(sql)
     session.close()
 
-
-def test_the_arrow_function_list_matches_pyarrow():
-    from tools.write_arrow_functions import PATH, arrow_functions_text
-
-    assert PATH.read_text() == arrow_functions_text()

@@ -13,11 +13,7 @@ import pyarrow as pa
 from quail.api.compile import READ_AS_SQL
 from quail.api.execute import execute_query
 from quail.api.region_inputs import input_scans
-from quail.common.expressions import (
-    CompileError,
-    evaluate_expression,
-    source_columns,
-)
+from quail.common.expressions import CompileError, evaluate
 from quail.common.pairs import FIRST_DOCUMENT, columns_key
 from quail.common.tokens import ColumnStore, ScanInput, TokenStore
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
@@ -488,8 +484,8 @@ class RegionQuery:
             inputs[node.input_id] = document_input(
                 store.tokens,
                 (
-                    evaluate_expression(column, store)
-                    if set(source_columns(column))
+                    evaluate(column, store)
+                    if {ref.column for ref in column.references}
                     <= set(store.projected_columns)
                     else None
                 ),

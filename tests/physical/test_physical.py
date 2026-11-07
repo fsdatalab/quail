@@ -11,7 +11,7 @@ import pytest
 import quail
 from quail.api.execute import _execute_physical
 from quail.builtins import built_in_registry
-from quail.common.expressions import ColumnRef, RegularPredicate
+from quail.common.expressions import ColumnRef
 from quail.execution.metrics import NodeResult
 from quail.execution.runtimes import BarrierRuntime
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
@@ -163,9 +163,8 @@ def test_an_extension_node_encodes_validates_and_runs(monkeypatch):
 
 
 def test_a_plan_saved_before_the_expressions_moved_still_decodes():
-    predicate = RegularPredicate(ColumnRef("r", "reviews", "stars"), ">", 3)
-    saved = json.loads(predicate.to_json())
-    for value in (saved, saved["expression"]):
-        value["type"] = value["type"].replace(
-            "quail.common.expressions", "quail.logical.expressions")
-    assert decode_plan_value(json.dumps(saved)) == predicate
+    column = ColumnRef("r", "reviews", "stars")
+    saved = json.loads(column.to_json())
+    saved["type"] = saved["type"].replace(
+        "quail.common.expressions", "quail.logical.expressions")
+    assert decode_plan_value(json.dumps(saved)) == column

@@ -264,7 +264,8 @@ An expression can call any of
 [DataFusion's scalar functions](https://datafusion.apache.org/user-guide/sql/scalar_functions.html),
 such as `ABS`, `REVERSE`, `SUBSTR`, or `REGEXP_LIKE`, with their SQL
 meaning. DataFusion evaluates them: a plain test or column runs before the
-model reads a row. `WHERE` takes the same expressions as `SELECT`: a
+model reads a row, and a test of a model's answer, such as
+`SPLIT_PART(lease.ends, ' ', 1) = 'March'`, runs as each answer settles. `WHERE` takes the same expressions as `SELECT`: a
 function that returns a boolean, such as `STARTS_WITH(r.body, 'Great')`,
 is a condition by itself.
 
@@ -277,7 +278,7 @@ WHERE AI.IF(PROMPT('Is the review positive? {0}', r.body))
   AND ABS(r.stars - 4) <= 1;
 ```
 
-An aggregate or vector function, such as `SUM` or `SORT_INDICES`, reads more
+An aggregate or window function, such as `SUM` or `ROW_NUMBER`, reads more
 than one row, so Quail refuses it in an expression; use `GROUP BY` for an
 aggregate.
 

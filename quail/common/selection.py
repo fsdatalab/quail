@@ -4,8 +4,7 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.common.expressions import evaluate_condition
-from quail.common.predicates import accepted_rows
+from quail.common.expressions import accepted_rows, evaluate
 
 
 def selected_rows(columns, predicates) -> pa.Array:
@@ -13,11 +12,11 @@ def selected_rows(columns, predicates) -> pa.Array:
 
     Args:
         columns: The table holding every predicate's column.
-        predicates: The RegularPredicate tests, combined with AND.
+        predicates: The conditions, each an Expression, combined with AND.
     """
     mask = None
     for predicate in predicates:
-        test = evaluate_condition(predicate, columns)
+        test = evaluate(predicate, columns)
         mask = test if mask is None else pc.and_kleene(mask, test)
     return pc.indices_nonzero(accepted_rows(mask))
 
