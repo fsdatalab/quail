@@ -1,6 +1,6 @@
 logical:
   Projection: c.id, topic
-    AiNode: topic = ai_classify(prompt(Utf8("Judge strictly from the claim above which topic it is about.\n\n{0}"), c.claim), make_array(Utf8("politics"), Utf8("sports"), Utf8("film and television"), Utf8("music"), Utf8("literature"), Utf8("science"), Utf8("history"), Utf8("geography"), Utf8("business"), Utf8("religion"), Utf8("other"))), filter: hint(topic IN ([Utf8("politics"), Utf8("history")]), named_struct(Utf8("selectivity"), Float64(0.092)))
+    AiNode: topic = ai_classify(prompt(Utf8("Judge strictly from the claim above which topic it is about.\n\n{0}"), c.claim), make_array(Utf8("politics"), Utf8("sports"), Utf8("film and television"), Utf8("music"), Utf8("literature"), Utf8("science"), Utf8("history"), Utf8("geography"), Utf8("business"), Utf8("religion"), Utf8("other"))), filter: hint(topic = Utf8("politics") OR topic = Utf8("history"), named_struct(Utf8("selectivity"), Float64(0.092)))
       SubqueryAlias: c
         TableScan: claims projection=[id, claim]
 

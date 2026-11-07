@@ -217,15 +217,12 @@ impl Session {
             )),
             _ => None,
         };
-        let regions = match rules {
-            Some(rules) => {
-                for name in &rules {
-                    quail_datafusion::region_rule(name)?;
-                }
-                quail_datafusion::OptimizeModelRegions::new(rules)
-            }
-            None => quail_datafusion::OptimizeModelRegions::default(),
-        };
+        let rules = rules.unwrap_or_else(|| {
+            quail_datafusion::LOGICAL_RULES
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        });
         let runner = Arc::new(PythonRunner {
             engine,
             prompting,
@@ -234,8 +231,8 @@ impl Session {
         });
         let context = quail_datafusion::session_context_with_rules(
             Arc::clone(&runner) as Arc<dyn RegionRunner>,
-            regions,
-        );
+            rules,
+        )?;
         Ok(Self {
             context,
             runtime: Some(Runtime::new()?),

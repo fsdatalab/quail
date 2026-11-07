@@ -3,7 +3,7 @@ logical:
     AiNode: aspect_sentiment = ai_classify(prompt(Utf8("Judge strictly from the review in DOCUMENT {0} what sentiment it expresses about the movie aspect in DOCUMENT {1}."), r.body, a.aspect), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed")))
       AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?"), r.body, a.aspect), named_struct(Utf8("selectivity"), Float64(0.2947166666666667))), filter: __quail_answer_1, returns: []
         Cross Join:
-          AiNode: sentiment = ai_classify(prompt(Utf8("Judge strictly from the review above which category best describes the overall sentiment it expresses about the movie.\n\n{0}"), r.body), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed"))), filter: hint(sentiment IN ([Utf8("negative"), Utf8("mixed")]), named_struct(Utf8("selectivity"), Float64(0.5846)))
+          AiNode: sentiment = ai_classify(prompt(Utf8("Judge strictly from the review above which category best describes the overall sentiment it expresses about the movie.\n\n{0}"), r.body), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed"))), filter: hint(sentiment = Utf8("negative") OR sentiment = Utf8("mixed"), named_struct(Utf8("selectivity"), Float64(0.5846)))
             SubqueryAlias: r
               TableScan: reviews projection=[id, body]
           SubqueryAlias: a

@@ -69,7 +69,7 @@ impl ModelRegionExec {
         runner: Arc<dyn RegionRunner>,
         inputs: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Self {
-        let schema = Arc::clone(region.bound.schema().inner());
+        let schema = Arc::clone(region.plan.schema().inner());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),

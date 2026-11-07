@@ -5,11 +5,12 @@ title: Custom Rules
 An optimizer rule changes a plan while preserving the query's result.
 Quail's rules are written in Rust:
 
-- Logical rules are DataFusion `OptimizerRule`s that run inside each
-  model region, over DataFusion's plan with Quail's `AiNode`s. They
-  are listed by name
-  in `region_rule` in
-  [`crates/quail-datafusion/src/optimize.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/optimize.rs).
+- Logical rules are DataFusion `OptimizerRule`s that run over the
+  whole plan, Quail's `AiNode`s included: DataFusion's default rules
+  and Quail's. They are listed by name in `LOGICAL_RULES` and
+  `logical_rule` in
+  [`crates/quail-datafusion/src/rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/rules.rs).
+  `claim_model_regions` always runs after them.
 - Physical rules rewrite executable graphs and their settings, in
   [`crates/quail-planner/src/physical_rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/physical_rules.rs).
 
@@ -22,7 +23,10 @@ their order.
    `OptimizerRule` and returns the rewritten plan, as `PushDownFilter`
    does. A physical rule returns a replacement graph, or none to keep
    the graph, and may add settings the executor reads.
-2. Add its name to the match in `region_rule` or `apply_rule`.
+2. Add its name to the match in `logical_rule` or `apply_rule`. A
+   logical rule that moves operators around an `AiNode` follows the
+   node's `UserDefinedLogicalNodeCore` methods, which say which filters
+   and limits may move below it.
 3. Register the name.
 
 Give each rule a unique name, shown in `explain()`. A logical rule's
@@ -49,8 +53,9 @@ raises `TypeError`.
 
 Rules run in registration order within each step:
 
-1. DataFusion applies the logical rules inside each model region, and
-   Quail reads the region's operators from the result.
+1. DataFusion applies the logical rules to the whole plan, then
+   `claim_model_regions` claims each model region, and Quail reads the
+   region's operators from the result.
 2. Build an executable graph for each placement of the column
    operators: the plan as placed, and each plan with a classification,
    extraction, or map moved above a join.

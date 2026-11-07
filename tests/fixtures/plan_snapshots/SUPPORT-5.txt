@@ -1,7 +1,7 @@
 logical:
   Projection: r1.id, r2.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Do the two conversations in DOCUMENT {0} and DOCUMENT {1}, which start from the same customer request, handle it in different ways? Answer TRUE if the agent takes different actions or the customer ends up with a different outcome, FALSE if the actions and outcome are the same."), r1.transcript, r2.transcript), named_struct(Utf8("selectivity"), Float64(0.349609375))), filter: __quail_answer_1, returns: []
-      Inner Join:  Filter: r1.task_id = r2.task_id
+      Inner Join: r1.task_id = r2.task_id
         SubqueryAlias: r1
           TableScan: support_traces projection=[id, transcript, task_id]
         SubqueryAlias: r2

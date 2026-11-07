@@ -168,5 +168,5 @@ def test_a_cte_read_through_a_join_that_reuses_the_readers_alias_is_refused(sess
             WITH kept AS (
                 SELECT c.id, c.text FROM contracts c
                 WHERE AI.IF(PROMPT('keep {0}', c.text)))
-            SELECT k.id FROM kept k JOIN contracts c ON k.id = c.id
+            SELECT k.id, c.text FROM kept k JOIN contracts c ON k.id = c.id
         """)

@@ -63,7 +63,7 @@ class Engine:
 
     @property
     def rules(self) -> list[str]:
-        """The optimizer rules each model region runs, in order."""
+        """The logical optimizer rules DataFusion runs, in order."""
         return [rule.name for rule in self.session.registry.logical_rules.values()]
 
     @property

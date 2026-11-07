@@ -27,7 +27,7 @@ impl RegionRunner for KeepsFirstReview {
         _inputs: &[InputRows],
         _fetch: Option<usize>,
     ) -> Result<RegionBatches> {
-        let schema = Arc::new(region.bound.schema().as_arrow().clone());
+        let schema = Arc::new(region.plan.schema().as_arrow().clone());
         let columns = schema
             .fields()
             .iter()

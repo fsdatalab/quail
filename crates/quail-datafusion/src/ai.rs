@@ -26,6 +26,10 @@
 //! DataFusion expressions, which `expressions()` returns; a prompt is not
 //! rendered for a model here: physical planning renders it for the model
 //! it plans for.
+//!
+//! DataFusion's optimizer rules move filters, limits, and column lists
+//! around the node as its `UserDefinedLogicalNodeCore` methods allow;
+//! each method says which rewrites keep the node's meaning.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -82,7 +86,9 @@ pub struct Written {
 /// it reads keep it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WrittenTest {
-    /// The test as the plan holds it, such as `sentiment IN ('negative')`.
+    /// The test as the plan holds it once DataFusion's
+    /// `SimplifyExpressions` has rewritten it, such as
+    /// `sentiment = 'negative' OR sentiment = 'mixed'`.
     pub test: Expr,
     /// The test with each AI call as the query wrote it, such as
     /// `ai_classify(...) IN ('negative')`.
@@ -301,19 +307,52 @@ impl UserDefinedLogicalNodeCore for AiNode {
         &self.schema
     }
 
+    /// The call and the guard: the expressions over the input's columns.
+    ///
+    /// The filter and tests also read the answer, which is not a column
+    /// of the input; DataFusion's rules resolve a node's expressions
+    /// against its input, so they do not rewrite these.
     fn expressions(&self) -> Vec<Expr> {
         let mut exprs = vec![self.call.clone()];
         exprs.extend(self.guard.clone());
-        exprs.extend(self.filter.clone());
         exprs
     }
 
-    // a test of the answer waits for it; any other runs first
+    /// The columns a filter above the node must not read to move below it.
+    ///
+    /// A test of the answer waits for it. A test of the input's columns
+    /// moves below a node with no fetch, `σ_q(AI(R)) = AI(σ_q(R))`. Above
+    /// a fetch it stays: limiting rows before the test is not limiting
+    /// them after. Only a test of a per-key fetch's key columns moves,
+    /// as it keeps or drops each key's rows whole.
     fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
-        self.fields
+        let mut prevent: HashSet<String> = self
+            .fields
             .iter()
             .map(|field| field.name().clone())
-            .collect()
+            .collect();
+        let key: &[String] = match &self.fetch {
+            None => return prevent,
+            Some(Fetch::Global(_)) => &[],
+            Some(Fetch::PerKey { key, .. }) => key,
+        };
+        // DataFusion names the columns by name alone, so a key name that
+        // two input columns share stays blocked
+        let names: Vec<&String> = self
+            .input
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect();
+        for name in &names {
+            let unique_key =
+                key.contains(name) && names.iter().filter(|found| *found == name).count() == 1;
+            if !unique_key {
+                prevent.insert((*name).clone());
+            }
+        }
+        prevent
     }
 
     fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
@@ -325,7 +364,12 @@ impl UserDefinedLogicalNodeCore for AiNode {
             .copied()
             .filter(|index| *index < width)
             .collect();
-        for expr in self.expressions() {
+        let read = self
+            .expressions()
+            .into_iter()
+            .chain(self.filter.clone())
+            .chain(self.tests.iter().map(|test| test.test.clone()));
+        for expr in read {
             for column in expr.column_refs() {
                 match input.index_of_column(column) {
                     Ok(index) => needed.push(index),
@@ -334,15 +378,34 @@ impl UserDefinedLogicalNodeCore for AiNode {
                 }
             }
         }
+        // a per-key fetch reads its key columns
+        if let Some(Fetch::PerKey { key, .. }) = &self.fetch {
+            for name in key {
+                let found: Vec<usize> = input
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| field.name() == name)
+                    .map(|(index, _)| index)
+                    .collect();
+                let [index] = found.as_slice() else {
+                    return None;
+                };
+                needed.push(*index);
+            }
+        }
         needed.sort_unstable();
         needed.dedup();
         Some(vec![needed])
     }
 
-    // the answer is one per row, so a limit can read fewer rows first
+    /// Whether a limit above the node may also read fewer rows below it:
+    /// a node with no filter, guard, or hint returns one row per input
+    /// row, `Limit_n(AI(R)) = Limit_n(AI(Limit_n(R)))`.
     fn supports_limit_pushdown(&self) -> bool {
         self.filter.is_none()
             && self.guard.is_none()
+            && self.hint.is_none()
             && self.semantics == Semantics::Rows
             && !matches!(self.fetch, Some(Fetch::PerKey { .. }))
     }
@@ -359,15 +422,17 @@ impl UserDefinedLogicalNodeCore for AiNode {
         exprs: Vec<Expr>,
         mut inputs: Vec<LogicalPlan>,
     ) -> Result<Self> {
-        let mut exprs = exprs.into_iter();
+        // a rule that rewrites an expression may alias it to keep its name;
+        // the node's schema does not name its expressions
+        let mut exprs = exprs.into_iter().map(|expr| match expr {
+            Expr::Alias(alias) => *alias.expr,
+            other => other,
+        });
         let mut node = self.clone();
         node.input = Arc::new(inputs.remove(0));
         node.call = exprs.next().expect("the node's call");
         if self.guard.is_some() {
             node.guard = exprs.next();
-        }
-        if self.filter.is_some() {
-            node.filter = exprs.next();
         }
         node.checked()
     }
@@ -428,10 +493,7 @@ mod tests {
     fn an_ai_filter_keeps_its_input_schema_and_reads_its_prompt_columns() {
         let node = ai_filter("Is {0} kind?");
         assert_eq!(node.schema(), reviews().schema());
-        assert_eq!(
-            node.expressions(),
-            vec![ask("ai_filter", "Is {0} kind?"), col("kind")]
-        );
+        assert_eq!(node.expressions(), vec![ask("ai_filter", "Is {0} kind?")]);
         let rebuilt = node
             .with_exprs_and_inputs(node.expressions(), vec![reviews()])
             .unwrap();
@@ -490,5 +552,136 @@ mod tests {
             text.contains("Projection: reviews.id, reviews.body"),
             "{text}"
         );
+    }
+
+    fn tone(fetch: Option<Fetch>, hint: Option<Expr>) -> LogicalPlan {
+        let mut node = AiNode::try_new(
+            Arc::new(reviews()),
+            ask("ai_classify", "Tone of {0}?"),
+            "tone".into(),
+            vec![Field::new("tone", DataType::Utf8, true)],
+        )
+        .unwrap();
+        node.fetch = fetch;
+        node.hint = hint;
+        crate::extension::extension_node(node.checked().unwrap())
+    }
+
+    /// The plan after the default optimizer rules, one line per operator.
+    fn optimized(plan: LogicalPlan) -> Vec<String> {
+        Optimizer::with_rules(crate::rules::default_rules())
+            .optimize(plan, &OptimizerContext::new(), |_, _| {})
+            .unwrap()
+            .display_indent()
+            .to_string()
+            .lines()
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    fn position(lines: &[String], start: &str) -> usize {
+        lines
+            .iter()
+            .position(|line| line.starts_with(start))
+            .unwrap_or_else(|| panic!("no {start} in {lines:?}"))
+    }
+
+    #[test]
+    fn a_filter_of_the_input_stays_above_a_node_with_a_fetch() {
+        let per_key = Fetch::PerKey {
+            key: vec!["id".into()],
+            n: 1,
+        };
+        for fetch in [Fetch::Global(2), per_key] {
+            let plan = LogicalPlanBuilder::from(tone(Some(fetch), None))
+                .filter(col("r.stars").gt(lit(3)))
+                .unwrap()
+                .build()
+                .unwrap();
+            let lines = optimized(plan);
+            // limiting rows before the test is not limiting them after
+            assert!(
+                position(&lines, "Filter") < position(&lines, "AiNode"),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_of_a_per_key_fetchs_key_moves_below_the_node() {
+        let fetch = Fetch::PerKey {
+            key: vec!["id".into()],
+            n: 1,
+        };
+        let plan = LogicalPlanBuilder::from(tone(Some(fetch), None))
+            .filter(col("r.id").gt(lit(3)))
+            .unwrap()
+            .build()
+            .unwrap();
+        let lines = optimized(plan);
+        // the test keeps or drops each key's rows whole
+        assert!(
+            position(&lines, "AiNode") < position(&lines, "Filter"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_test_of_the_answer_stays_above_a_node_with_a_fetch() {
+        let plan = LogicalPlanBuilder::from(tone(Some(Fetch::Global(2)), None))
+            .filter(col("tone").eq(lit("kind")))
+            .unwrap()
+            .build()
+            .unwrap();
+        let lines = optimized(plan);
+        let node = position(&lines, "AiNode");
+        assert!(position(&lines, "Filter") < node, "{lines:?}");
+        assert!(!lines[node].contains("filter:"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_limit_stays_above_a_node_with_a_hint() {
+        let limited = |hint: Option<Expr>| {
+            let plan = LogicalPlanBuilder::from(tone(None, hint))
+                .limit(0, Some(2))
+                .unwrap()
+                .build()
+                .unwrap();
+            let lines = optimized(plan);
+            let node = position(&lines, "AiNode");
+            lines[node..].iter().any(|line| line.starts_with("Limit"))
+        };
+        // a hint's rows are a sub-list of the rows a limit would read
+        assert!(!limited(Some(lit(0.5))));
+        assert!(limited(None));
+    }
+
+    #[test]
+    fn a_where_filter_under_a_distinct_moves_below_its_per_key_fetch() {
+        let filter = LogicalPlan::Extension(Extension {
+            node: Arc::new(ai_filter("Is {0} kind?")),
+        });
+        let plan = LogicalPlanBuilder::from(filter)
+            .filter(col("r.stars").gt(lit(3)))
+            .unwrap()
+            .project(vec![col("r.id")])
+            .unwrap()
+            .distinct()
+            .unwrap()
+            .build()
+            .unwrap();
+        let distinct = Optimizer::with_rules(vec![Arc::new(crate::distinct::PushDownDistinct)])
+            .optimize(plan, &OptimizerContext::new(), |_, _| {})
+            .unwrap()
+            .display_indent()
+            .to_string();
+        let lines: Vec<String> = distinct
+            .lines()
+            .map(|line| line.trim().to_string())
+            .collect();
+        // the WHERE runs before the DISTINCT stops each key at one row
+        let node = position(&lines, "AiNode");
+        assert!(lines[node].contains("fetch: 1 per [id]"), "{lines:?}");
+        assert!(node < position(&lines, "Filter"), "{lines:?}");
     }
 }

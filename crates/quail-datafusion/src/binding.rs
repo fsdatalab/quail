@@ -1823,6 +1823,20 @@ pub(crate) fn label_test(expr: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
             list,
             negated: false,
         }) if is_call(expr, "ai_classify") => Some((expr, list.iter().collect())),
+        // DataFusion writes a short IN list as an OR of equalities
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) => {
+            let (call, mut labels) = label_test(left)?;
+            let (other, more) = label_test(right)?;
+            if call != other {
+                return None;
+            }
+            labels.extend(more);
+            Some((call, labels))
+        }
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Eq,

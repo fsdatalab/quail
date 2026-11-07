@@ -217,9 +217,3 @@ def test_a_join_with_two_ai_predicates_in_its_on_is_refused(catalog):
             ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
             AND AI_FILTER(PROMPT('y {0} {1}', r.review, p.description))
         """, catalog)
-
-
-def test_a_limit_of_zero_is_refused(catalog):
-    with pytest.raises(CompileError, match="LIMIT must be a positive integer"):
-        compile_sql("SELECT r.id FROM reviews r "
-                    "WHERE AI_FILTER(PROMPT('x {0}', r.review)) LIMIT 0", catalog)

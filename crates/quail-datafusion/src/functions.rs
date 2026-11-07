@@ -1,8 +1,9 @@
 //! Quail's AI functions as DataFusion scalar UDFs.
 //!
 //! The UDFs let DataFusion parse, bind, and type a query that calls
-//! the AI functions. They never run: `ClaimModelRegions` moves every
-//! call into a model region, which Quail plans and executes.
+//! the AI functions. They never run: `LowerAiCalls` turns every call
+//! into an `AiNode`, and `ClaimModelRegions` moves each into a model
+//! region, which Quail plans and executes.
 
 use std::sync::Arc;
 

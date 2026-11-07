@@ -16,11 +16,13 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class LogicalRule:
-    """An optimizer rule that DataFusion runs inside each model region.
+    """A logical optimizer rule that DataFusion runs over a query's plan.
 
-    The name is the rule's ``OptimizerRule::name()``; the rules are
-    listed in ``quail_datafusion::region_rule``. A registry lists the
-    rules a session applies, by name, in the order they apply.
+    The name is the rule's ``OptimizerRule::name()``: one of Quail's
+    rules or DataFusion's default rules, listed in
+    ``quail_datafusion::logical_rule``. A registry lists the rules a
+    session applies, by name, in the order they apply;
+    ``claim_model_regions`` always runs after them.
     """
 
     name: str

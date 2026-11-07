@@ -5,15 +5,16 @@ Sort: test_steps DESC NULLS LAST, m.trace_id ASC NULLS LAST, fetch=50
       Aggregate: groupBy=[[m.trace_id]], aggr=[[count(Int64(1))]]
         ModelRegion
           SubqueryAlias: m
-            Filter: issue_messages.role = Utf8("assistant")
-              TableScan: issue_messages projection=[id, trace_id, turn_index, role, content, tool_call_id, prev_id, prev_user_id, prev_assistant_id]
+            Projection: issue_messages.trace_id, issue_messages.content, issue_messages.id
+              Filter: issue_messages.role = Utf8("assistant")
+                TableScan: issue_messages projection=[trace_id, role, content, id]
 
 model region:
 logical:
   Projection: m.trace_id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent step above whether it runs the project's tests or a reproduction script.\n\n{0}\n\nInstruction: answer TRUE if the step runs tests or a reproduction script, FALSE otherwise."), m.content), named_struct(Utf8("selectivity"), Float64(0.2946534217550425))), filter: __quail_answer_1, returns: []
       SubqueryAlias: m
-        TableScan: issue_messages__m projection=[trace_id, content]
+        TableScan: issue_messages__m
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

@@ -6,6 +6,8 @@
 //! SELECT list. The rule moves each node as low as its inputs allow, as
 //! `PushDownFilter` does for plain filters:
 //!
+//! - A node with a fetch stays where it is: below a filter or join it
+//!   would limit different rows.
 //! - An AI filter or AI column of one table, and a test of one table's
 //!   answers, move through joins, AI joins, other filters, windows, and
 //!   projections that only pass columns, down to the table.
@@ -164,6 +166,11 @@ fn ai_join(plan: &LogicalPlan) -> Option<&AiNode> {
 
 fn mover(node: &LogicalPlan) -> Option<Mover> {
     if let Some(ai) = as_node::<AiNode>(node) {
+        // moving a node with a fetch below an operator moves the operator
+        // above the fetch
+        if ai.fetch.is_some() {
+            return None;
+        }
         let tables = expr_tables(&ai.call, &[]);
         return match role(ai) {
             Role::TableFilter => (tables.len() == 1).then_some(Mover {

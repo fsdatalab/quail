@@ -10,7 +10,11 @@
 //! - `PushDownDistinct` gives a one-table query's last `AI.IF` filter a
 //!   fetch of one row per value of the selected columns: the executor
 //!   stops asking the model about a document once a row with the same
-//!   key has passed every filter.
+//!   key has passed every filter. A plain filter right above the node is
+//!   a WHERE term under the `DISTINCT`, so it moves below the node: the
+//!   fetch counts only rows that pass it. No other filter moves below the
+//!   node afterwards, unless it reads only the key columns
+//!   ([`AiNode`]'s `prevent_predicate_push_down_columns`).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -18,7 +22,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Constraint, Result};
 use datafusion::logical_expr::{
-    Distinct, Expr, Extension, LogicalPlan, Projection, UserDefinedLogicalNode,
+    Distinct, Expr, Extension, Filter, LogicalPlan, Projection, UserDefinedLogicalNode,
 };
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
@@ -69,9 +73,11 @@ impl OptimizerRule for PushDownDistinct {
                 .clone()
                 .transform_down(|node| mark(node, &key, &mut found))
                 .ok()?;
-            marked
-                .transformed
-                .then(|| LogicalPlan::Distinct(Distinct::All(Arc::new(marked.data))))
+            if !marked.transformed {
+                return None;
+            }
+            let lowered = marked.data.transform_up(filter_below_fetch).ok()?.data;
+            Some(LogicalPlan::Distinct(Distinct::All(Arc::new(lowered))))
         })
     }
 }
@@ -211,6 +217,29 @@ fn stop_key(input: &LogicalPlan) -> Option<Vec<String>> {
         }
     }
     (!key.is_empty()).then_some(key)
+}
+
+/// A plain filter directly above an `AiNode` with a per-key fetch, below
+/// the node instead: a term of the WHERE under the `DISTINCT`, which the
+/// fetch counts rows after.
+fn filter_below_fetch(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    let LogicalPlan::Filter(filter) = &plan else {
+        return Ok(Transformed::no(plan));
+    };
+    let Some(node) = as_node::<AiNode>(&filter.input) else {
+        return Ok(Transformed::no(plan));
+    };
+    let reads_answer = filter.predicate.column_refs().iter().any(|column| {
+        column.relation.is_none() && node.fields.iter().any(|field| field.name() == &column.name)
+    });
+    if !matches!(node.fetch, Some(Fetch::PerKey { .. })) || reads_answer {
+        return Ok(Transformed::no(plan));
+    }
+    let below = Filter::try_new(filter.predicate.clone(), Arc::clone(&node.input))?;
+    let moved = node.with_input(LogicalPlan::Filter(below))?;
+    Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+        node: Arc::new(moved),
+    })))
 }
 
 /// `node` with a fetch of one row per `key` when it is the first

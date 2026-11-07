@@ -178,7 +178,7 @@ impl PythonRunner {
             stream_from_pyarrow(answer.bind(py))
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let schema = Arc::clone(region.bound.schema());
+        let schema = Arc::clone(region.plan.schema());
         let names = quail_column_names(&schema);
         // DataFusion reads each batch as the Python stream yields it
         Ok(Box::new(
@@ -335,7 +335,7 @@ fn named_tables(region: &ModelRegion) -> Result<HashMap<String, TableRows>> {
     use datafusion::datasource::source_as_provider;
     use datafusion::logical_expr::LogicalPlan;
     let mut found: Vec<(String, Arc<dyn TableProvider>)> = Vec::new();
-    region.bound.apply(|node| {
+    region.plan.apply(|node| {
         if let LogicalPlan::TableScan(scan) = node
             && let Ok(provider) = source_as_provider(&scan.source)
             && provider.downcast_ref::<IdentifiedTable>().is_some()

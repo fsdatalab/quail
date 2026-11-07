@@ -54,13 +54,15 @@ runner that calls Quail's Python executor.
 - The AI functions, under their internal names (`ai_filter`,
   `ai_classify`, ...) and their SQL names (`AI.IF`, `AI.CLASSIFY`,
   `ai.classify`, ...).
-- Two analyzer rules, ahead of the session's own:
-  `claim_model_regions` gathers the AI calls and the operators that
-  change what the model is asked into `ModelRegion` nodes, and
-  `lower_ai_calls` turns each call into an `AiNode`.
-- One optimizer rule, `optimize_model_regions`, that runs Quail's
-  region rules inside each region. `with_region_rules` picks them by
-  name.
+- One analyzer rule, ahead of the session's own: `lower_ai_calls`
+  turns each AI call in a part of the query Quail plans into an
+  `AiNode`.
+- Quail's optimizer rules among the session's own, before
+  `replace_distinct_aggregate`, so DataFusion's rules optimize the
+  plan around each `AiNode`; and `claim_model_regions` last, which
+  gathers the `AiNode`s and the operators around them into
+  `ModelRegion` nodes. `with_logical_rules` names the rule list
+  instead.
 - A query planner that plans each `ModelRegion` as a
   `ModelRegionExec`.
 
@@ -86,6 +88,6 @@ following need Quail's `sql()`:
 datafusion-python can load UDFs and table providers from another
 library, and a query planner through `datafusion-ffi`'s
 `FFI_QueryPlanner`. It cannot load analyzer or logical optimizer
-rules. A Quail planner for datafusion-python would claim and lower the
-regions inside its query planner, after the session's own optimizer
-has run. That is not built yet.
+rules. A Quail planner for datafusion-python would lower the AI calls
+and claim the regions inside its query planner, after the session's own
+optimizer has run. That is not built yet.

@@ -7,11 +7,23 @@ from quail.execution.runtimes import built_in_runtimes
 from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
 from quail.specs import DEVICES, MODELS
 
-# the optimizer rules each model region runs, in order, as
-# quail_datafusion::REGION_RULES names them
+# the logical optimizer rules, in order, as quail_datafusion::LOGICAL_RULES
+# names them: DataFusion's default rules with Quail's four before
+# replace_distinct_aggregate; claim_model_regions always runs after them
 LOGICAL_RULES = (
+    "rewrite_set_comparison", "optimize_unions", "unions_to_filter",
+    "simplify_expressions",
     "eliminate_distinct", "place_ai_nodes", "absorb_into_ai_nodes",
-    "push_down_distinct", "push_down_filter", "optimize_projections",
+    "push_down_distinct",
+    "replace_distinct_aggregate", "eliminate_join",
+    "decorrelate_predicate_subquery", "scalar_subquery_to_join",
+    "decorrelate_lateral_join", "extract_equijoin_predicate",
+    "eliminate_duplicated_expr", "eliminate_filter", "eliminate_cross_join",
+    "eliminate_limit", "propagate_empty_relation", "filter_null_join_keys",
+    "eliminate_outer_join", "push_down_limit", "push_down_filter",
+    "single_distinct_aggregation_to_group_by", "eliminate_group_by_constant",
+    "common_sub_expression_eliminate", "extract_leaf_expressions",
+    "push_down_leaf_projections", "optimize_projections",
 )
 # the built-in physical rules, in the order they apply
 PHYSICAL_RULES = (

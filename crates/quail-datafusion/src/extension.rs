@@ -23,42 +23,41 @@ use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::physical_planner::ExtensionPlanner;
 
+use crate::LowerAiCalls;
 use crate::exec::{ModelRegionPlanner, QuailQueryPlanner, RegionRunner};
 use crate::functions::quail_functions;
-use crate::{ClaimModelRegions, LowerAiCalls, OptimizeModelRegions, region_rule};
+use crate::rules::{logical_rules, with_quail_rules};
 
 /// Quail's additions to a DataFusion session: the AI functions, the
-/// rules that claim, lower, and optimize model regions, and the planner
-/// that runs each region on `runner`.
+/// rules that lower AI calls, optimize around them, and claim model
+/// regions, and the planner that runs each region on `runner`.
 #[derive(Debug)]
 pub struct QuailExtension {
     runner: Arc<dyn RegionRunner>,
-    rules: Vec<String>,
+    /// The optimizer rules, by name, or None for the session's own rules
+    /// with Quail's among them.
+    rules: Option<Vec<String>>,
 }
 
 impl QuailExtension {
-    /// Quail with the default model region rules, running regions on
-    /// `runner`.
+    /// Quail with the session's optimizer rules and Quail's among them
+    /// ([`crate::rules`]), running regions on `runner`.
     pub fn new(runner: Arc<dyn RegionRunner>) -> Self {
         Self {
             runner,
-            rules: crate::REGION_RULES
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            rules: None,
         }
     }
 
-    /// Run `rules`, names [`region_rule`] knows, inside each model region.
+    /// Run `rules`, names [`crate::logical_rule`] knows, in order, as the
+    /// session's optimizer rules; `ClaimModelRegions` runs after them.
     ///
     /// # Errors
     ///
     /// A rule name is unknown.
-    pub fn with_region_rules(mut self, rules: Vec<String>) -> Result<Self> {
-        for name in &rules {
-            region_rule(name)?;
-        }
-        self.rules = rules;
+    pub fn with_logical_rules(mut self, rules: Vec<String>) -> Result<Self> {
+        logical_rules(&rules)?;
+        self.rules = Some(rules);
         Ok(self)
     }
 
@@ -77,26 +76,31 @@ impl QuailExtension {
     /// Add Quail's functions and rules to `state`, keeping its query
     /// planner; the host adds [`Self::extension_planner`] to it.
     ///
-    /// Quail's analyzer rules run first, on the plan as DataFusion's SQL
-    /// planner bound it, before the host's rules such as type coercion.
+    /// `LowerAiCalls` runs first, on the plan as DataFusion's SQL planner
+    /// bound it, before the host's analyzer rules such as type coercion.
+    /// Quail's optimizer rules join the host's, as [`crate::rules`]
+    /// explains, unless [`Self::with_logical_rules`] names the list.
     ///
     /// # Errors
     ///
     /// A Quail function's name is taken by one `state` cannot replace.
     pub fn register_rules(&self, state: SessionState) -> Result<SessionState> {
-        let mut analyzer: Vec<Arc<dyn AnalyzerRule + Send + Sync>> =
-            vec![Arc::new(ClaimModelRegions::new()), Arc::new(LowerAiCalls)];
+        let mut analyzer: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![Arc::new(LowerAiCalls)];
         analyzer.extend(
             state
                 .analyzer()
                 .rules
                 .iter()
-                .filter(|rule| !matches!(rule.name(), "claim_model_regions" | "lower_ai_calls"))
+                .filter(|rule| rule.name() != "lower_ai_calls")
                 .cloned(),
         );
+        let optimizer = match &self.rules {
+            Some(names) => logical_rules(names)?,
+            None => with_quail_rules(state.optimizers()),
+        };
         let mut state = SessionStateBuilder::new_from_existing(state)
             .with_analyzer_rules(analyzer)
-            .with_optimizer_rule(Arc::new(OptimizeModelRegions::new(self.rules.clone())))
+            .with_optimizer_rules(optimizer)
             .build();
         for function in quail_functions() {
             state.register_udf(function)?;

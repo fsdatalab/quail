@@ -27,9 +27,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, ScalarValue};
+use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::logical_expr::utils::split_conjunction;
-use datafusion::logical_expr::{Distinct, Expr, Join, JoinType, LogicalPlan, SortExpr};
+use datafusion::logical_expr::{
+    Distinct, Expr, ExprSchemable, Join, JoinType, LogicalPlan, SortExpr,
+};
 use quail_physical::{
     Asked, ColumnRef, Condition, Connective, Equality, FilterPredicate, GetField, ModelCall, Not,
     Projected, RegularPredicate, ScalarFunction, SortExpression, SortKey, ValueExpression,
@@ -55,9 +57,8 @@ use crate::lower::quail_function;
 use crate::region::ModelRegion;
 use serde_json::Value;
 
-/// A model region's operators and the plan after DataFusion's rules
-/// they are read from, running [`crate::OptimizeModelRegions`]' default
-/// rules first on a region that has not been through them.
+/// A model region's operators and the plan after DataFusion's optimizer
+/// they are read from.
 ///
 /// `turn` and `layout` are the session model's chat-turn text and prompt
 /// layout.
@@ -71,18 +72,163 @@ pub fn derive_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<(Operators, LogicalPlan), CompileError> {
-    let plan = if region.optimized {
-        region.plan.clone()
-    } else {
-        let rules: Vec<String> = crate::REGION_RULES
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        crate::lower_ai_calls(region.bound.clone())
-            .and_then(|lowered| crate::optimize_region(&lowered, &rules))
-            .map_err(|error| CompileError::new(error.to_string()))?
-    };
+    let plan =
+        as_bound(region.plan.clone()).map_err(|error| CompileError::new(error.to_string()))?;
     Ok((derive_operators(&plan, turn, layout)?, plan))
+}
+
+/// `plan`'s expressions as the binder reads them: each struct or list
+/// literal written as the call it was folded from, each field path as
+/// one `get_field` per field, and without the casts type coercion adds to
+/// compare two numbers or two strings.
+///
+/// DataFusion's optimizer runs over a region's operators: its type
+/// coercion casts one side of a comparison to the other's type, and its
+/// `SimplifyExpressions` folds a `named_struct`, `struct`, or
+/// `make_array` of literals into one literal. The binder reads an AI
+/// call's options, categories, and fields from the calls the query
+/// wrote, and compares values as they are.
+fn as_bound(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
+    plan.transform_up(|node| {
+        if let Some(ai) = crate::extension::as_node::<AiNode>(&node) {
+            // the filter and tests also read the answer columns
+            let mut schema = ai.input.schema().as_ref().clone();
+            schema.merge(&DFSchema::from_unqualified_fields(
+                ai.fields.clone().into(),
+                Default::default(),
+            )?);
+            let read = |expr: Expr| bound_expr(expr, &schema);
+            let mut ai = ai.clone();
+            ai.call = read(ai.call)?;
+            ai.guard = ai.guard.map(read).transpose()?;
+            ai.filter = ai.filter.map(read).transpose()?;
+            for test in &mut ai.tests {
+                test.test = read(test.test.clone())?;
+                test.written = read(test.written.clone())?;
+            }
+            return Ok(Transformed::yes(crate::extension::extension_node(
+                ai.checked()?,
+            )));
+        }
+        let mut schema = DFSchema::empty();
+        for input in node.inputs() {
+            schema.merge(input.schema());
+        }
+        node.map_expressions(|expr| bound_expr(expr, &schema).map(Transformed::yes))
+    })
+    .map(|done| done.data)
+}
+
+/// `expr` as [`as_bound`] explains, its columns typed by `schema`.
+fn bound_expr(expr: Expr, schema: &DFSchema) -> datafusion::common::Result<Expr> {
+    expr.transform_up(|inner| {
+        // DataFusion reads `get_field(get_field(x, 'a'), 'b')` as one call
+        // of a field path, `get_field(x, 'a', 'b')`
+        if let Expr::ScalarFunction(call) = &inner
+            && call.name() == "get_field"
+            && call.args.len() > 2
+        {
+            let mut args = call.args.iter().cloned();
+            let mut nested = args.next().expect("a struct");
+            for field in args {
+                nested =
+                    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                        std::sync::Arc::clone(&call.func),
+                        vec![nested, field],
+                    ));
+            }
+            return Ok(Transformed::yes(nested));
+        }
+        let (Expr::Cast(datafusion::logical_expr::Cast { expr, field })
+        | Expr::TryCast(datafusion::logical_expr::TryCast { expr, field })) = &inner
+        else {
+            return Ok(unfold(inner));
+        };
+        match expr.get_type(schema) {
+            Ok(from) if widens(&from, field.data_type()) => {
+                Ok(Transformed::yes(expr.as_ref().clone()))
+            }
+            _ => Ok(Transformed::no(inner)),
+        }
+    })
+    .map(|done| done.data)
+}
+
+/// Whether a value of type `from` keeps its value as type `to`, as type
+/// coercion casts a number or string to compare it with another.
+fn widens(from: &DataType, to: &DataType) -> bool {
+    let width = |found: &DataType| found.primitive_width().unwrap_or(usize::MAX);
+    let string = |found: &DataType| {
+        matches!(
+            found,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    };
+    from == to
+        || (string(from) && string(to))
+        || (from.is_signed_integer() && to.is_signed_integer() && width(to) >= width(from))
+        || (from.is_unsigned_integer()
+            && (to.is_unsigned_integer() && width(to) >= width(from)
+                || to.is_signed_integer() && width(to) > width(from)))
+        || (from.is_integer() && to.is_floating())
+        || (from == &DataType::Float32 && to == &DataType::Float64)
+}
+
+/// `expr` as the `named_struct`, `struct`, or `make_array` call of
+/// literals it was folded from, when it is a struct or list literal.
+fn unfold(expr: Expr) -> Transformed<Expr> {
+    use datafusion::arrow::array::Array;
+    use datafusion::logical_expr::expr::ScalarFunction as Call;
+    let Expr::Literal(value, _) = &expr else {
+        return Transformed::no(expr);
+    };
+    let element = |array: &dyn Array, index: usize| {
+        ScalarValue::try_from_array(array, index)
+            .map(|value| unfold(Expr::Literal(value, None)).data)
+    };
+    match value {
+        ScalarValue::Struct(array) if array.len() == 1 => {
+            let fields = array.fields();
+            let positional = fields
+                .iter()
+                .enumerate()
+                .all(|(index, field)| *field.name() == format!("c{index}"));
+            let mut args = Vec::new();
+            for (index, field) in fields.iter().enumerate() {
+                let Ok(value) = element(array.column(index).as_ref(), 0) else {
+                    return Transformed::no(expr);
+                };
+                if !positional {
+                    args.push(Expr::Literal(
+                        ScalarValue::Utf8(Some(field.name().clone())),
+                        None,
+                    ));
+                }
+                args.push(value);
+            }
+            let function = if positional {
+                datafusion::functions::core::r#struct()
+            } else {
+                datafusion::functions::core::named_struct()
+            };
+            Transformed::yes(Expr::ScalarFunction(Call::new_udf(function, args)))
+        }
+        ScalarValue::List(array) if array.len() == 1 => {
+            let values = array.value(0);
+            let mut args = Vec::new();
+            for index in 0..values.len() {
+                let Ok(value) = element(values.as_ref(), index) else {
+                    return Transformed::no(expr);
+                };
+                args.push(value);
+            }
+            Transformed::yes(Expr::ScalarFunction(Call::new_udf(
+                datafusion::functions_nested::make_array::make_array_udf(),
+                args,
+            )))
+        }
+        _ => Transformed::no(expr),
+    }
 }
 
 /// A model region's operators, read from its plan after DataFusion's
@@ -287,6 +433,11 @@ fn read_top(plan: &LogicalPlan) -> Result<Top<'_>, CompileError> {
                 node = &found.input;
             }
             LogicalPlan::Sort(found) => {
+                // DataFusion moves a LIMIT over an ORDER BY into the sort
+                if let Some(fetch) = found.fetch {
+                    let fetch = fetch as i64;
+                    limit = Some(limit.map_or(fetch, |found: i64| found.min(fetch)));
+                }
                 order = found.expr.clone();
                 node = &found.input;
             }
@@ -765,7 +916,12 @@ impl<'a> Walk<'a> {
             terms.extend(
                 found
                     .into_iter()
-                    .filter(|term| !tests.iter().any(|test| test.test == **term))
+                    .filter(|term| {
+                        // DataFusion may write one test as several terms
+                        !tests
+                            .iter()
+                            .any(|test| split_conjunction(&test.test).contains(term))
+                    })
                     .map(|term| self.written(term, answers)),
             );
         }
@@ -834,6 +990,21 @@ impl<'a> Walk<'a> {
             };
             return answer.call.clone().alias(name.unwrap_or(written));
         }
+        // DataFusion merges a SELECT list over the region's into it; an
+        // expression over an answer reads the answer's call, as written
+        let merged = merged
+            .clone()
+            .transform_up(|found| match &found {
+                Expr::Column(column) if column.relation.is_none() => Ok(
+                    match answers.iter().find(|answer| answer.name == column.name) {
+                        Some(answer) => Transformed::yes(answer.call.clone()),
+                        None => Transformed::no(found),
+                    },
+                ),
+                _ => Ok(Transformed::no(found)),
+            })
+            .map(|found| found.data)
+            .unwrap_or(merged);
         if merged == *inner {
             return expr.clone();
         }

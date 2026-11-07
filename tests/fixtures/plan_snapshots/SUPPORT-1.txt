@@ -1,15 +1,16 @@
 DataFusion:
 ModelRegion
   SubqueryAlias: u
-    Filter: support_messages.role = Utf8("user")
-      TableScan: support_messages projection=[id, trace_id, turn_index, role, content, tool_call_id, prev_id, prev_user_id, prev_assistant_id]
+    Projection: support_messages.id, support_messages.content
+      Filter: support_messages.role = Utf8("user")
+        TableScan: support_messages projection=[id, role, content]
 
 model region:
 logical:
   Projection: u.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the customer message above whether the customer expresses frustration or dissatisfaction with the agent, such as repeating a request, objecting to a refusal, or complaining about the service.\n\n{0}\n\nInstruction: answer TRUE if the customer expresses frustration or dissatisfaction with the agent, FALSE otherwise."), u.content), named_struct(Utf8("selectivity"), Float64(0.022080185938407902))), filter: __quail_answer_1, returns: []
       SubqueryAlias: u
-        TableScan: support_messages__u projection=[id, content]
+        TableScan: support_messages__u
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

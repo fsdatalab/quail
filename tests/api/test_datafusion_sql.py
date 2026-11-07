@@ -51,6 +51,8 @@ def session():
     ("SELECT r.id, CASE WHEN AI.CLASSIFY(PROMPT('t: {0}', r.body), ['a', 'b']) "
      "= 'a' THEN 1 ELSE 0 END AS f FROM reviews r ORDER BY r.id",
      [("r0", 1), ("r1", 1), ("r2", 1)]),
+    # DataFusion's optimizer replaces LIMIT 0 with no rows; no model runs
+    (f"SELECT r.id FROM reviews r WHERE {AI_IF} LIMIT 0", []),
 ])
 def test_sql_around_ai_functions_returns_what_datafusion_computes(session, sql, rows):
     query = session.sql(sql)

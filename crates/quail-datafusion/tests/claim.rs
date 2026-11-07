@@ -175,9 +175,10 @@ async fn an_exists_gate_becomes_a_semi_join_inside_the_region() -> Result<()> {
     assert_eq!(found.len(), 1, "{}", plan.display_indent());
     let shape = lines(&found[0].plan);
     assert!(shape[1].starts_with("AiNode: semi"), "{shape:?}");
+    // the gate's table is an input DataFusion scans for the region
     assert_eq!(
         shape.last().map(String::as_str),
-        Some("TableScan: aspects projection=[aspect]")
+        Some("TableScan: aspects__a")
     );
     Ok(())
 }
@@ -244,8 +245,6 @@ async fn a_classification_is_a_column_the_projection_reads() -> Result<()> {
         plan[1].starts_with("AiNode: tone = ai_classify"),
         "{plan:?}"
     );
-    // the binder reads the SELECT list as DataFusion bound it
-    assert!(lines(&region.bound)[0].contains("AS tone"));
     Ok(())
 }
 

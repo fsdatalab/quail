@@ -68,13 +68,14 @@ literal as `\n`, so each node stays on one line.
 
 ## From SQL to a plan
 
-DataFusion parses and binds the SQL. Its analyzer then claims each
-model region: the operators that call the model, with the filters and
+DataFusion parses and binds the SQL. Quail's analyzer rule
+`lower_ai_calls` runs first. It finds each part of the query that
+Quail plans: the operators that call the model, with the filters and
 joins below them and a LIMIT or DISTINCT that can stop the model early
 (`crates/quail-datafusion/src/claim.rs`). DataFusion keeps the
-operators above the region, such as GROUP BY, windows, and an ORDER BY
-without a LIMIT, and moves their AI calls into the region's SELECT
-list. The analyzer then lowers each AI call into one `AiNode`
+operators above that part, such as GROUP BY, windows, and an ORDER BY
+without a LIMIT, and moves their AI calls into the part's SELECT list.
+The rule then lowers each AI call in the part into one `AiNode`
 (`crates/quail-datafusion/src/lower.rs`):
 
 - An AI.IF filter is an `AiNode` whose filter is `a` and which returns
@@ -102,9 +103,12 @@ Filter: r.stars > 3
         TableScan: products as p
 ```
 
-DataFusion's optimizer then runs the model region's rules
-(`crates/quail-datafusion/src/optimize.rs`). `PlaceAiNodes` moves
-each node to the tables it reads, as `PushDownFilter` does for plain
+DataFusion's optimizer then runs over the whole plan, `AiNode`s
+included: its own rules, such as `SimplifyExpressions`,
+`PushDownFilter`, `PushDownLimit`, decorrelation, and
+`OptimizeProjections`, with Quail's rules among them
+(`crates/quail-datafusion/src/rules.rs`). `PlaceAiNodes` moves each
+node to the tables it reads, as `PushDownFilter` does for plain
 filters, and orders each table's operators the way the executor reads
 them. `AbsorbIntoAiNodes` makes each test of an answer column the
 filter of the `AiNode` that adds the column. `PushDownFilter` and
@@ -115,14 +119,35 @@ columns:
 AiNode: AI.IF('Review {0} discusses product {1}', r.body, p.text)
   Inner Join: r.asin = p.asin
     AiNode: AI.IF('This review is negative', r.body)
-      TableScan: reviews as r, filter r.stars > 3
+      Filter: r.stars > 3
+        TableScan: reviews as r
     TableScan: products as p
 ```
 
-The DISTINCT rules run in the same place: `EliminateDistinct` removes
-a DISTINCT when the SELECT list returns each table's id column, and
-`PushDownDistinct` gives a one-table query's last AI.IF `AiNode` a
-fetch of one row per selected key.
+The DISTINCT rules run before DataFusion turns a DISTINCT into a GROUP
+BY: `EliminateDistinct` removes a DISTINCT when the SELECT list returns
+each table's id column, and `PushDownDistinct` gives a one-table
+query's last AI.IF `AiNode` a fetch of one row per selected key.
+
+Each `AiNode` tells DataFusion's rules what they may do around it:
+
+- A filter of the input's columns moves below a node with no fetch.
+  Above a fetch it stays, since limiting rows before a test is not
+  limiting them after; only a test of a per-key fetch's key columns
+  moves, as it keeps or drops each key's rows whole.
+- A test of the answer stays above the node, and `AbsorbIntoAiNodes`
+  makes it the node's filter only when the node has no fetch.
+- A LIMIT moves below a node only when the node returns one row per
+  input row: no filter, guard, hint, or per-key fetch.
+- Projection pruning keeps the columns the node's call, filter, tests,
+  and per-key fetch read.
+
+The last optimizer rule, `claim_model_regions`, runs the rules before
+it until the plan stops changing, then replaces each part that holds
+`AiNode`s with one `ModelRegion`: the `AiNode`s and the operators
+around them that Quail plans. A part DataFusion computes for the
+region, such as a table's plain filters or a CTE that groups rows,
+becomes one of the region's inputs.
 
 Finally, `derive` (`crates/quail-datafusion/src/derive.rs`) reads the
 region's operators from the optimized plan. It walks the plan once,
@@ -136,8 +161,8 @@ writes the region's `Operators` in the plan's order: each `AiNode` is
 one AI filter, AI join, gate, or column operator where the rules left
 it.
 The physical planner reads only these operators. A region whose shape
-the operators cannot hold is refused when DataFusion claims it, and
-DataFusion runs that part of the query itself.
+the operators cannot hold is refused when it is claimed, and DataFusion
+runs that part of the query itself.
 
 Which implementation runs an operator, such as a classification's label
 scoring method or whether a classification runs before or after a

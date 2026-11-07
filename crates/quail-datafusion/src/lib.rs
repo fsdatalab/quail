@@ -1,9 +1,10 @@
 //! Quail as a DataFusion extension.
 //!
-//! A query's AI function calls, and the operators around them that
-//! Quail plans, become one `ModelRegion` node. DataFusion plans and
-//! runs everything else; a [`RegionRunner`] plans and runs each model
-//! region.
+//! A query's AI function calls become `AiNode`s, which DataFusion's
+//! optimizer rules move and prune around as they do any other node (see
+//! [`rules`]). Then the `AiNode`s, and the operators around them that
+//! Quail plans, become one `ModelRegion` node. DataFusion plans and runs
+//! everything else; a [`RegionRunner`] plans and runs each model region.
 //!
 //! ```ignore
 //! let context = quail_datafusion::session_context(runner);
@@ -28,9 +29,9 @@ mod functions;
 mod identified;
 mod joins;
 mod lower;
-mod optimize;
 mod placement;
 mod region;
+pub mod rules;
 mod unnest;
 
 use std::sync::Arc;
@@ -54,9 +55,9 @@ pub use extension::QuailExtension;
 pub use functions::{AI_FUNCTION_NAMES, brace_structs, is_ai_call, quail_functions};
 pub use identified::IdentifiedTable;
 pub use lower::{LowerAiCalls, lower_ai_calls};
-pub use optimize::{OptimizeModelRegions, REGION_RULES, optimize_region, region_rule};
 pub use placement::PlaceAiNodes;
 pub use region::ModelRegion;
+pub use rules::{LOGICAL_RULES, logical_rule};
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 
 /// Build a DataFusion session state with Quail registered.
@@ -64,38 +65,52 @@ pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 /// SQL is read in the Snowflake dialect, as Quail's `Session.sql`
 /// reads it; `SET datafusion.sql_parser.dialect` changes it.
 pub fn session_state(runner: Arc<dyn RegionRunner>) -> SessionState {
-    session_state_with_rules(runner, OptimizeModelRegions::default())
+    session_state_with_rules(
+        runner,
+        LOGICAL_RULES.iter().map(ToString::to_string).collect(),
+    )
+    .expect("Quail's rules and functions register on a new session")
 }
 
-/// Build a DataFusion session state with Quail registered, whose model
-/// regions run `regions`' rules.
+/// Build a DataFusion session state with Quail registered, whose
+/// optimizer runs `rules`, names [`logical_rule`] knows, in order, then
+/// [`ClaimModelRegions`].
+///
+/// # Errors
+///
+/// A rule name is unknown.
 pub fn session_state_with_rules(
     runner: Arc<dyn RegionRunner>,
-    regions: OptimizeModelRegions,
-) -> SessionState {
+    rules: Vec<String>,
+) -> Result<SessionState> {
     let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Snowflake");
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()
         .build();
     QuailExtension::new(runner)
-        .with_region_rules(regions.rules().to_vec())
-        .and_then(|quail| quail.register(state))
-        .expect("Quail's rules and functions register on a new session")
+        .with_logical_rules(rules)?
+        .register(state)
 }
 
 /// Build a DataFusion session context with Quail registered.
 pub fn session_context(runner: Arc<dyn RegionRunner>) -> SessionContext {
-    session_context_with_rules(runner, OptimizeModelRegions::default())
+    SessionContext::new_with_state(session_state(runner))
 }
 
-/// Build a DataFusion session context with Quail registered, whose model
-/// regions run `regions`' rules.
+/// Build a DataFusion session context with Quail registered, whose
+/// optimizer runs `rules`, as [`session_state_with_rules`] explains.
+///
+/// # Errors
+///
+/// A rule name is unknown.
 pub fn session_context_with_rules(
     runner: Arc<dyn RegionRunner>,
-    regions: OptimizeModelRegions,
-) -> SessionContext {
-    SessionContext::new_with_state(session_state_with_rules(runner, regions))
+    rules: Vec<String>,
+) -> Result<SessionContext> {
+    Ok(SessionContext::new_with_state(session_state_with_rules(
+        runner, rules,
+    )?))
 }
 
 /// Plan a SQL query that may call AI functions as `AI.<name>(...)`.

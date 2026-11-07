@@ -1,9 +1,9 @@
 //! The `LowerAiCalls` analyzer rule: AI calls as Quail's plan nodes.
 //!
 //! DataFusion binds a query's AI calls as scalar functions inside its
-//! own operators. The rule rewrites each model region so each call is an
-//! [`AiNode`] of its own, and DataFusion's operators hold only the
-//! relational work:
+//! own operators. The rule rewrites each part of the query that Quail
+//! plans so each call is an [`AiNode`] of its own, and DataFusion's
+//! operators hold only the relational work:
 //!
 //! - A `Filter` keeps its other terms; each `AI.IF` term, or comparison
 //!   of an `AI.SCORE` call, is an `AiNode` above it whose filter tests
@@ -35,21 +35,27 @@ use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, plan_err};
+use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Expr, ExprSchemable, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
 };
 use datafusion::optimizer::AnalyzerRule;
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 
 use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Semantics, Written, WrittenTest};
 use crate::extension::{as_node, extension_node};
 use crate::functions::column_call_kind;
 use crate::functions::function_name;
-use crate::region::ModelRegion;
 
-/// Rewrite each model region's AI calls into Quail's plan nodes, as the
-/// module explains.
+/// Rewrite the AI calls of each part of a query that Quail plans into
+/// Quail's plan nodes, as the module explains.
+///
+/// The rule runs first among the analyzer rules, on the plan as
+/// DataFusion's SQL planner bound it; [`crate::claim`] explains which
+/// parts Quail plans.
 #[derive(Debug, Default)]
 pub struct LowerAiCalls;
 
@@ -58,19 +64,8 @@ impl AnalyzerRule for LowerAiCalls {
         "lower_ai_calls"
     }
 
-    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        Ok(plan
-            .transform_up(|node| {
-                if let LogicalPlan::Extension(extension) = &node
-                    && let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>()
-                {
-                    let mut region = region.clone();
-                    region.plan = lower_ai_calls(region.bound.clone())?;
-                    return Ok(Transformed::yes(extension_node(region)));
-                }
-                Ok(Transformed::no(node))
-            })?
-            .data)
+    fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
+        crate::claim::lower_regions(plan, config)
     }
 }
 
@@ -487,7 +482,7 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
     for (position, term) in tested {
         let test = read_columns(term.clone(), &added)?;
         written.push(WrittenTest {
-            test: test.clone(),
+            test: simplified(test.clone(), &input),
             written: term,
             position,
             clause,
@@ -500,6 +495,24 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         Some(test) => Ok(Transformed::yes(LogicalPlan::Filter(test))),
         None => Ok(Transformed::no(LogicalPlan::Filter(filter.clone()))),
     }
+}
+
+/// `test` as DataFusion's type coercion and `SimplifyExpressions`
+/// rewrite it in a filter over `input`, or as it is when they fail: the
+/// `AiNode`s whose answers it reads find the filter's term by this form.
+fn simplified(test: Expr, input: &LogicalPlan) -> Expr {
+    let Ok(coerced) = test
+        .clone()
+        .rewrite(&mut TypeCoercionRewriter::new(input.schema()))
+    else {
+        return test;
+    };
+    let context = SimplifyContext::builder()
+        .with_schema(Arc::clone(input.schema()))
+        .build();
+    ExprSimplifier::new(context)
+        .simplify(coerced.data)
+        .unwrap_or(test)
 }
 
 /// `plan` with `tests` kept by each `AiNode` that adds a column of `names`.
@@ -627,8 +640,8 @@ fn lower_projection(
     )))
 }
 
-/// Rewrite a region's AI calls into Quail's plan nodes, as the module
-/// explains.
+/// Rewrite the AI calls of one part of a query that Quail plans into
+/// Quail's plan nodes, as the module explains.
 ///
 /// # Errors
 ///
