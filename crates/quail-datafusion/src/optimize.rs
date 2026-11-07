@@ -2,10 +2,10 @@
 //!
 //! DataFusion's optimizer treats a model region as a leaf. Inside it,
 //! [`OptimizeModelRegions`] runs a list of optimizer rules over the
-//! lowered region, by default [`REGION_RULES`]: Quail's DISTINCT and
-//! placement rules, then DataFusion's `PushDownFilter` and
-//! `OptimizeProjections`, which move plain filters down to the scans
-//! around Quail's plan nodes and prune columns no operator reads, as each
+//! lowered region, by default [`REGION_RULES`]: Quail's DISTINCT,
+//! placement, and absorption rules, then DataFusion's `PushDownFilter`
+//! and `OptimizeProjections`, which move plain filters down to the scans
+//! around Quail's `AiNode`s and prune columns no operator reads, as each
 //! node's `prevent_predicate_push_down_columns` and
 //! `necessary_children_exprs` allow.
 
@@ -22,9 +22,10 @@ use crate::region::ModelRegion;
 
 /// The rules a model region runs by default, in order: each name is an
 /// `OptimizerRule`'s `name()`.
-pub const REGION_RULES: [&str; 5] = [
+pub const REGION_RULES: [&str; 6] = [
     "eliminate_distinct",
-    "place_semantic_nodes",
+    "place_ai_nodes",
+    "absorb_into_ai_nodes",
     "push_down_distinct",
     "push_down_filter",
     "optimize_projections",
@@ -38,7 +39,8 @@ pub const REGION_RULES: [&str; 5] = [
 pub fn region_rule(name: &str) -> Result<Arc<dyn OptimizerRule + Send + Sync>> {
     Ok(match name {
         "eliminate_distinct" => Arc::new(crate::distinct::EliminateDistinct),
-        "place_semantic_nodes" => Arc::new(crate::placement::PlaceSemanticNodes),
+        "place_ai_nodes" => Arc::new(crate::placement::PlaceAiNodes),
+        "absorb_into_ai_nodes" => Arc::new(crate::absorb::AbsorbIntoAiNodes),
         "push_down_distinct" => Arc::new(crate::distinct::PushDownDistinct),
         "push_down_filter" => Arc::new(PushDownFilter::new()),
         "optimize_projections" => Arc::new(OptimizeProjections::new()),

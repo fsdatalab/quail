@@ -41,16 +41,20 @@ joins below them and a LIMIT or DISTINCT that can stop the model early
 (`crates/quail-datafusion/src/claim.rs`). DataFusion keeps the
 operators above the region, such as GROUP BY, windows, and an ORDER BY
 without a LIMIT, and moves their AI calls into the region's SELECT
-list. The analyzer then lowers the region's AI calls into three logical
-node types
-(`crates/quail-datafusion/src/lower.rs`):
+list. The analyzer then lowers each AI call into one `AiNode`
+(`crates/quail-datafusion/src/lower.rs` and `ai.rs`). An `AiNode` adds
+the call's answer `a` to each row of its input, keeps the rows that
+pass its filter, and returns the columns its projection names:
 
-- `SemanticFilter`: the AI.IF and AI.SCORE tests of one table.
-- `SemanticJoin`: an AI.IF over two tables, or an EXISTS or NOT EXISTS
-  over a model call, as a semi or anti join.
-- `SemanticColumn`: a classification, extraction, SAE feature list, or
-  map, which adds an answer column. A test of that column becomes a
-  plain DataFusion `Filter` above it.
+- An AI.IF filter is an `AiNode` whose filter is `a` and which returns
+  only its input's columns. A comparison of an AI.SCORE is the same,
+  with the comparison as the filter.
+- An AI.IF over two tables is an `AiNode` over their join. An EXISTS
+  or NOT EXISTS over a model call is an `AiNode` over the join with
+  semi or anti semantics: it returns the outer rows.
+- A classification, extraction, SAE feature list, or map is an
+  `AiNode` that returns its answer column. A test of that column is
+  first a plain DataFusion `Filter` above it.
 
 For example, imagine a query that joins reviews to products on an
 AI.IF, keeps negative reviews with another AI.IF, and keeps reviews
@@ -60,39 +64,43 @@ Quail's nodes, still where the query wrote them:
 
 ```text
 Filter: r.stars > 3
-  SemanticFilter: AI.IF('This review is negative', r.body)
-    SemanticJoin: full AI.IF('Review {0} discusses product {1}', r.body, p.text)
+  AiNode: AI.IF('This review is negative', r.body)
+    AiNode: AI.IF('Review {0} discusses product {1}', r.body, p.text)
       Inner Join: r.asin = p.asin
         TableScan: reviews as r
         TableScan: products as p
 ```
 
 DataFusion's optimizer then runs the model region's rules
-(`crates/quail-datafusion/src/optimize.rs`). `PlaceSemanticNodes`
-moves each node to the tables it reads, as `PushDownFilter` does for
-plain filters, and orders each table's operators the way the executor
-reads them. `PushDownFilter` and `OptimizeProjections` place the plain
-filters and prune unread columns:
+(`crates/quail-datafusion/src/optimize.rs`). `PlaceAiNodes` moves
+each node to the tables it reads, as `PushDownFilter` does for plain
+filters, and orders each table's operators the way the executor reads
+them. `AbsorbIntoAiNodes` makes each test of an answer column the
+filter of the `AiNode` that adds the column. `PushDownFilter` and
+`OptimizeProjections` place the plain filters and prune unread
+columns:
 
 ```text
-SemanticJoin: full AI.IF('Review {0} discusses product {1}', r.body, p.text)
+AiNode: AI.IF('Review {0} discusses product {1}', r.body, p.text)
   Inner Join: r.asin = p.asin
-    SemanticFilter: AI.IF('This review is negative', r.body)
+    AiNode: AI.IF('This review is negative', r.body)
       TableScan: reviews as r, filter r.stars > 3
     TableScan: products as p
 ```
 
 The DISTINCT rules run in the same place: `EliminateDistinct` removes
 a DISTINCT when the SELECT list returns each table's id column, and
-`PushDownDistinct` gives a one-table `SemanticFilter` a stop key.
+`PushDownDistinct` gives a one-table query's last AI.IF `AiNode` a
+fetch of one row per selected key.
 
 Finally, the Rust binder (`crates/quail-datafusion/src/bind.rs`) reads
 each operator's content, such as its prompt, labels, and selectivity
 hint, from the bound plan. The translator
 (`crates/quail-datafusion/src/translate.rs`) builds Quail's logical
 plan node by node, with each operator where the rules left it. A
-`SemanticColumn` becomes the node for its kind, such as
-`SemanticClassify`. A CTE that runs as its own stage goes through the
+table's AI.IF and AI.SCORE `AiNode`s become one `SemanticFilter`, an
+AI join one `SemanticJoin`, and an answer column the node for its
+kind, such as `SemanticClassify`. A CTE that runs as its own stage goes through the
 same steps.
 
 Which implementation runs a node, such as a classification's label

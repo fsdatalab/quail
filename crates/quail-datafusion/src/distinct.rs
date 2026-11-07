@@ -7,9 +7,10 @@
 //! - `EliminateDistinct` removes a `DISTINCT` that removes no row: the
 //!   SELECT list returns every table's id column, which each table
 //!   declares as its primary key.
-//! - `PushDownDistinct` gives a one-table query's `SemanticFilter` the
-//!   selected columns as its stop key: the executor stops asking the
-//!   model about a document once a row with the same key has passed.
+//! - `PushDownDistinct` gives a one-table query's last `AI.IF` filter a
+//!   fetch of one row per value of the selected columns: the executor
+//!   stops asking the model about a document once a row with the same
+//!   key has passed every filter.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
-use crate::semantic::{SemanticColumn, SemanticFilter, SemanticJoin};
+use crate::ai::{AiNode, Fetch, Semantics};
 
 /// Remove a region's `DISTINCT` when it removes no row, as the module
 /// explains.
@@ -44,8 +45,8 @@ impl OptimizerRule for EliminateDistinct {
     }
 }
 
-/// Give a one-table region's `SemanticFilter` the `DISTINCT` columns as
-/// its stop key, as the module explains.
+/// Give a one-table region's last `AI.IF` filter a fetch of one row per
+/// value of the `DISTINCT` columns, as the module explains.
 #[derive(Debug, Default)]
 pub struct PushDownDistinct;
 
@@ -61,10 +62,11 @@ impl OptimizerRule for PushDownDistinct {
     ) -> Result<Transformed<LogicalPlan>> {
         edit_distinct(plan, |input| {
             let key = stop_key(input)?;
+            let mut found = false;
             let marked = input
                 .as_ref()
                 .clone()
-                .transform_down(|node| mark(node, &key))
+                .transform_down(|node| mark(node, &key, &mut found))
                 .ok()?;
             marked
                 .transformed
@@ -174,37 +176,31 @@ fn table_keys(plan: &LogicalPlan) -> Option<Vec<(String, String)>> {
     known.then_some(keys)
 }
 
-/// The SELECT list's columns, when the region asks only one table's
-/// `SemanticFilter` and returns plain columns of that table.
+/// The SELECT list's columns, when the region asks only `AI.IF` filters
+/// of one table and returns plain columns of that table.
 fn stop_key(input: &LogicalPlan) -> Option<Vec<String>> {
     let LogicalPlan::Projection(projection) = input else {
         return None;
     };
-    let mut filters: Vec<&SemanticFilter> = Vec::new();
-    let mut other = false;
+    let mut filters: Vec<&AiNode> = Vec::new();
     projection
         .input
         .apply(|node| {
-            if let Some(filter) = as_node::<SemanticFilter>(node) {
-                filters.push(filter);
-            } else if as_node::<SemanticJoin>(node).is_some()
-                || as_node::<SemanticColumn>(node).is_some()
-            {
-                other = true;
+            if let Some(ai) = as_node::<AiNode>(node) {
+                filters.push(ai);
             }
             Ok(TreeNodeRecursion::Continue)
         })
         .ok()?;
-    let [filter] = filters.as_slice() else {
-        return None;
-    };
-    if other || filter.predicates.iter().any(asks_score) {
+    let only_filters = filters
+        .iter()
+        .all(|ai| ai.function() == "ai_filter" && ai.semantics == Semantics::Rows);
+    if filters.is_empty() || !only_filters {
         return None;
     }
-    let tables: BTreeSet<String> = filter
-        .predicates
+    let tables: BTreeSet<String> = filters
         .iter()
-        .flat_map(|predicate| predicate.column_refs())
+        .flat_map(|ai| ai.call.column_refs())
         .filter_map(|column| column.relation.as_ref().map(|r| r.table().to_string()))
         .collect();
     let [table] = tables.into_iter().collect::<Vec<_>>().try_into().ok()?;
@@ -223,21 +219,29 @@ fn stop_key(input: &LogicalPlan) -> Option<Vec<String>> {
     (!key.is_empty()).then_some(key)
 }
 
-fn asks_score(predicate: &Expr) -> bool {
-    predicate
-        .exists(|expr| Ok(matches!(expr, Expr::ScalarFunction(call) if call.name() == "ai_score")))
-        .unwrap_or(false)
-}
-
-fn mark(node: LogicalPlan, key: &[String]) -> Result<Transformed<LogicalPlan>> {
-    let Some(filter) = as_node::<SemanticFilter>(&node) else {
+/// `node` with a fetch of one row per `key` when it is the first
+/// `AiNode` found, which `found` records.
+fn mark(node: LogicalPlan, key: &[String], found: &mut bool) -> Result<Transformed<LogicalPlan>> {
+    if *found {
+        return Ok(Transformed::new(node, false, TreeNodeRecursion::Stop));
+    }
+    let Some(ai) = as_node::<AiNode>(&node) else {
         return Ok(Transformed::no(node));
     };
-    if filter.stop_key == key {
-        return Ok(Transformed::no(node));
+    *found = true;
+    let fetch = Fetch::PerKey {
+        key: key.to_vec(),
+        n: 1,
+    };
+    if ai.fetch.as_ref() == Some(&fetch) {
+        return Ok(Transformed::new(node, false, TreeNodeRecursion::Stop));
     }
-    let mut marked = filter.clone();
-    marked.stop_key = key.to_vec();
+    let mut marked = ai.clone();
+    marked.fetch = Some(fetch);
     let node: Arc<dyn UserDefinedLogicalNode> = Arc::new(marked);
-    Ok(Transformed::yes(LogicalPlan::Extension(Extension { node })))
+    Ok(Transformed::new(
+        LogicalPlan::Extension(Extension { node }),
+        true,
+        TreeNodeRecursion::Stop,
+    ))
 }

@@ -124,7 +124,7 @@ async fn datafusion_groups_the_answers_a_region_returns() -> Result<()> {
     assert!(
         inner
             .iter()
-            .any(|line| line.starts_with("SemanticColumn: label = ai_classify")),
+            .any(|line| line.starts_with("AiNode: label = ai_classify")),
         "{inner:?}"
     );
     Ok(())
@@ -167,7 +167,7 @@ async fn an_exists_gate_becomes_a_semi_join_inside_the_region() -> Result<()> {
     let found = regions(&plan);
     assert_eq!(found.len(), 1, "{}", plan.display_indent());
     let shape = lines(&found[0].plan);
-    assert!(shape[1].starts_with("SemanticJoin: semi"), "{shape:?}");
+    assert!(shape[1].starts_with("AiNode: semi"), "{shape:?}");
     assert_eq!(
         shape.last().map(String::as_str),
         Some("TableScan: aspects projection=[aspect]")
@@ -191,11 +191,11 @@ async fn a_where_clause_asks_the_model_above_its_plain_terms() -> Result<()> {
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
     let plan = lines(&region.plan);
-    assert!(plan[1].starts_with("SemanticFilter: ai_filter"), "{plan:?}");
-    assert!(
-        plan[1].contains("Kind?") && plan[1].contains("Long?"),
-        "{plan:?}"
-    );
+    // one node per AI call, the first written lowest
+    assert!(plan[1].starts_with("AiNode: "), "{plan:?}");
+    assert!(plan[1].contains("Long?"), "{plan:?}");
+    assert!(plan[2].starts_with("AiNode: "), "{plan:?}");
+    assert!(plan[2].contains("Kind?"), "{plan:?}");
     // the plain test runs in DataFusion, in the region's input
     assert!(!plan.iter().any(|line| line.contains("r9")), "{plan:?}");
     assert!(
@@ -216,7 +216,7 @@ async fn an_ai_join_asks_the_model_above_datafusions_join() -> Result<()> {
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
     let plan = lines(&region.plan);
     assert!(
-        plan[1].starts_with("SemanticJoin: full ai_filter"),
+        plan[1].starts_with("AiNode: __quail_answer_1 = ai_filter"),
         "{plan:?}"
     );
     // the ON has no other term, so DataFusion's join pairs every row
@@ -234,7 +234,7 @@ async fn a_classification_is_a_column_the_projection_reads() -> Result<()> {
     let plan = lines(&region.plan);
     assert_eq!(plan[0], "Projection: r.id, tone");
     assert!(
-        plan[1].starts_with("SemanticColumn: tone = ai_classify"),
+        plan[1].starts_with("AiNode: tone = ai_classify"),
         "{plan:?}"
     );
     // the binder reads the SELECT list as DataFusion bound it
@@ -243,26 +243,30 @@ async fn a_classification_is_a_column_the_projection_reads() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_test_of_a_label_reads_the_column_its_classification_adds() -> Result<()> {
+async fn a_test_of_a_label_is_absorbed_into_its_classifications_filter() -> Result<()> {
     let context = context()?;
     let query = "SELECT r.id, AI.CLASSIFY(PROMPT('Tone of {0}?', r.body), ['good', 'bad']) \
         AS tone FROM reviews r WHERE tone = 'good'";
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
     let plan = lines(&region.plan);
-    let test = plan
-        .iter()
-        .position(|line| line == "Filter: tone = Utf8(\"good\")");
-    let column = plan
-        .iter()
-        .position(|line| line.starts_with("SemanticColumn: tone = ai_classify"));
-    assert!(test.unwrap() < column.unwrap(), "{plan:?}");
     // one classification serves the test and the SELECT list
-    let columns = plan
+    let columns: Vec<&String> = plan
         .iter()
-        .filter(|line| line.starts_with("SemanticColumn"))
-        .count();
-    assert_eq!(columns, 1, "{plan:?}");
+        .filter(|line| line.starts_with("AiNode"))
+        .collect();
+    let [column] = columns.as_slice() else {
+        panic!("{plan:?}");
+    };
+    assert!(column.starts_with("AiNode: tone = ai_classify"), "{plan:?}");
+    assert!(
+        column.ends_with(", filter: tone = Utf8(\"good\")"),
+        "{plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.starts_with("Filter")),
+        "{plan:?}"
+    );
     Ok(())
 }
 

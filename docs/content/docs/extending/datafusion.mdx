@@ -57,8 +57,7 @@ runner that calls Quail's Python executor.
 - Two analyzer rules, ahead of the session's own:
   `claim_model_regions` gathers the AI calls and the operators that
   change what the model is asked into `ModelRegion` nodes, and
-  `lower_ai_calls` turns each call into a `SemanticFilter`,
-  `SemanticJoin`, or `SemanticColumn` node.
+  `lower_ai_calls` turns each call into an `AiNode`.
 - One optimizer rule, `optimize_model_regions`, that runs Quail's
   region rules inside each region. `with_region_rules` picks them by
   name.

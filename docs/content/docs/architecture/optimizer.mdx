@@ -115,7 +115,8 @@ physical rules rewrite Quail's executable graphs.
 | Rule | Kind | Decision | Uses cost estimates |
 | --- | --- | --- | --- |
 | `eliminate_distinct` | Logical | Remove DISTINCT when the SELECT list returns every table's id column. | No |
-| `place_semantic_nodes` | Logical | Move each model operator to the tables it reads and order each table's operators. | No |
+| `place_ai_nodes` | Logical | Move each model operator to the tables it reads and order each table's operators. | No |
+| `absorb_into_ai_nodes` | Logical | Make each test of an answer column the filter of the `AiNode` that adds it. | No |
 | `push_down_distinct` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `push_down_filter` | Logical | DataFusion's rule: move plain filters to the scans. | No |
 | `optimize_projections` | Logical | DataFusion's rule: drop columns no operator reads. | No |

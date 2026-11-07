@@ -1,12 +1,13 @@
 //! A model region's relation, read node by node from DataFusion's plan.
 //!
 //! After [`crate::LowerAiCalls`] and DataFusion's rules, a region's plan
-//! places each operator: a table's scan and plain tests, its
-//! `SemanticFilter`, its `SemanticColumn` nodes and the tests of their
-//! answers, the joins and their `SemanticJoin` nodes. [`translate_relation`]
-//! writes that plan as Quail's logical nodes, one for each of DataFusion's,
-//! taking each node's content (bound prompts, conditions, names) from the
-//! binder's [`RelationContent`].
+//! places each operator: a table's scan and plain tests, its AI filters,
+//! its AI columns and the tests of their answers, the joins and their AI
+//! joins, each an `AiNode`. [`translate_relation`] writes that plan as
+//! Quail's logical nodes: one `SemanticFilter` for a table's AI filters,
+//! and one node for each other `AiNode` and each of DataFusion's
+//! operators, taking each node's content (bound prompts, conditions,
+//! names) from the binder's [`RelationContent`].
 //!
 //! The SELECT list, grouping, windows, ORDER BY, and LIMIT above the
 //! relation are not read here: the builder's `project` adds them.
@@ -22,7 +23,7 @@ use quail_planner::logical::{Filter, Join, LogicalNode, Scan, SemanticFilter, Se
 use quail_planner::nodes::added_columns;
 use quail_planner::nodes::asked_call;
 
-use crate::semantic::{SemanticColumn, SemanticFilter as DataFusionSemanticFilter};
+use crate::ai::{AiNode, Fetch, Semantics};
 
 fn as_node<T: 'static>(plan: &LogicalPlan) -> Option<&T> {
     match plan {
@@ -271,15 +272,23 @@ impl<'a> Translation<'a> {
         }))
     }
 
+    /// Whether `node` is an AI filter of one table, rather than an AI
+    /// join or gate.
+    fn is_table_filter(&self, node: &AiNode) -> bool {
+        node.is_predicate()
+            && node.semantics == Semantics::Rows
+            && self.tables(&node.call).len() < 2
+    }
+
     fn relation(&mut self, plan: &LogicalPlan) -> Option<LogicalNode> {
-        if let Some(filter) = as_node::<DataFusionSemanticFilter>(plan) {
-            return self.semantic_filter(filter);
-        }
-        if let Some(column) = as_node::<SemanticColumn>(plan) {
-            return self.column(column);
-        }
-        if let Some(join) = as_node::<crate::semantic::SemanticJoin>(plan) {
-            return self.semantic_join(join);
+        if let Some(node) = as_node::<AiNode>(plan) {
+            if !node.is_predicate() {
+                return self.column(node);
+            }
+            if self.is_table_filter(node) {
+                return self.semantic_filter(node);
+            }
+            return self.semantic_join(node);
         }
         match plan {
             LogicalPlan::Projection(projection) => self.relation(&projection.input),
@@ -349,28 +358,40 @@ impl<'a> Translation<'a> {
         self.relation(&alias.input)
     }
 
-    fn semantic_filter(&mut self, filter: &DataFusionSemanticFilter) -> Option<LogicalNode> {
-        let read: BTreeSet<String> = filter
-            .predicates
-            .iter()
-            .flat_map(|predicate| self.tables(predicate))
-            .collect();
-        let (alias,) = <[String; 1]>::try_from(read.into_iter().collect::<Vec<_>>())
-            .ok()
-            .map(|[alias]| (alias,))?;
+    /// The AI filters of one table, `filter` and the run of them below it,
+    /// as one `SemanticFilter`.
+    fn semantic_filter(&mut self, filter: &AiNode) -> Option<LogicalNode> {
+        let read = self.tables(&filter.call);
+        let mut run = vec![filter];
+        let mut below = filter.input.as_ref();
+        while let Some(next) = as_node::<AiNode>(below)
+            && self.is_table_filter(next)
+            && self.tables(&next.call) == read
+        {
+            run.push(next);
+            below = next.input.as_ref();
+        }
+        let [alias] = <[String; 1]>::try_from(read.into_iter().collect::<Vec<_>>()).ok()?;
         let predicates: Vec<FilterPredicate> = self.table(&alias)?.operators.predicates.clone();
         // the table's filters in one node, as Quail's operators read them
-        if predicates.len() != filter.predicates.len() {
+        if predicates.len() != run.len() {
             return None;
         }
+        let stop_key = run
+            .iter()
+            .find_map(|node| match &node.fetch {
+                Some(Fetch::PerKey { key, n: 1 }) => Some(key.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
         Some(LogicalNode::SemanticFilter(SemanticFilter {
-            input: Box::new(self.relation(&filter.input)?),
+            input: Box::new(self.relation(below)?),
             predicates,
-            stop_key: filter.stop_key.clone(),
+            stop_key,
         }))
     }
 
-    fn column(&mut self, column: &SemanticColumn) -> Option<LogicalNode> {
+    fn column(&mut self, column: &AiNode) -> Option<LogicalNode> {
         let kind = column_kind(&column.call)?;
         let read: Vec<String> = self.tables(&column.call).into_iter().collect();
         if read.len() == 2 {
@@ -378,7 +399,8 @@ impl<'a> Translation<'a> {
             // puts each one right above the join, the first written on top
             let mut run = vec![column];
             let mut below = column.input.as_ref();
-            while let Some(next) = as_node::<SemanticColumn>(below)
+            while let Some(next) = as_node::<AiNode>(below)
+                && !next.is_predicate()
                 && self.tables(&next.call) == self.tables(&column.call)
             {
                 run.push(next);
@@ -405,10 +427,10 @@ impl<'a> Translation<'a> {
                 .any(|(owner, found, _)| *owner == alias && found == name)
         };
         // an extraction of several questions is one Quail column per field
-        let field_prefix = format!("{}.", column.name);
+        let field_prefix = format!("{}.", column.answer);
         let mut chosen: Vec<(quail_physical::ModelCall, String)> = entries
             .iter()
-            .filter(|(_, name)| *name == column.name || name.starts_with(&field_prefix))
+            .filter(|(_, name)| *name == column.answer || name.starts_with(&field_prefix))
             .cloned()
             .collect();
         if chosen.is_empty() {
@@ -417,7 +439,7 @@ impl<'a> Translation<'a> {
         }
         for (call, name) in chosen {
             self.columns
-                .push((alias.clone(), name.clone(), column.name.clone()));
+                .push((alias.clone(), name.clone(), column.answer.clone()));
             node = column_node(kind, node, &call, &name);
         }
         Some(node)
@@ -425,7 +447,7 @@ impl<'a> Translation<'a> {
 
     fn joined_classification(
         &mut self,
-        column: &SemanticColumn,
+        column: &AiNode,
         input: LogicalNode,
     ) -> Option<LogicalNode> {
         let placed = |name: &String| self.columns.iter().any(|(_, found, _)| found == name);
@@ -433,7 +455,7 @@ impl<'a> Translation<'a> {
             .content
             .joined_classifications
             .iter()
-            .find(|(_, name)| *name == column.name)
+            .find(|(_, name)| *name == column.answer)
             .or_else(|| {
                 self.content
                     .joined_classifications
@@ -443,14 +465,14 @@ impl<'a> Translation<'a> {
             .clone();
         let read: Vec<String> = self.tables(&column.call).into_iter().collect();
         self.columns
-            .push((read.join(","), name.clone(), column.name.clone()));
+            .push((read.join(","), name.clone(), column.answer.clone()));
         Some(column_node("label", input, &call, &name))
     }
 
-    fn semantic_join(&mut self, join: &crate::semantic::SemanticJoin) -> Option<LogicalNode> {
+    fn semantic_join(&mut self, join: &AiNode) -> Option<LogicalNode> {
         // the lowest join first: the content lists them in written order
         let mut input = self.relation(&join.input)?;
-        let read = self.tables(&join.predicate);
+        let read = self.tables(&join.call);
         let index = self
             .content
             .joins

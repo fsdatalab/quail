@@ -6,8 +6,8 @@ An optimizer rule changes a plan while preserving the query's result.
 Quail's rules are written in Rust:
 
 - Logical rules are DataFusion `OptimizerRule`s that run inside each
-  model region, over DataFusion's plan with Quail's `SemanticFilter`,
-  `SemanticJoin`, and `SemanticColumn` nodes. They are listed by name
+  model region, over DataFusion's plan with Quail's `AiNode`s. They
+  are listed by name
   in `region_rule` in
   [`crates/quail-datafusion/src/optimize.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/optimize.rs).
 - Physical rules rewrite executable graphs and their settings, in

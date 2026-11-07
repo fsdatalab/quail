@@ -10,8 +10,8 @@ from quail.specs import DEVICES, MODELS
 # the optimizer rules each model region runs, in order, as
 # quail_datafusion::REGION_RULES names them
 LOGICAL_RULES = (
-    "eliminate_distinct", "place_semantic_nodes", "push_down_distinct",
-    "push_down_filter", "optimize_projections",
+    "eliminate_distinct", "place_ai_nodes", "absorb_into_ai_nodes",
+    "push_down_distinct", "push_down_filter", "optimize_projections",
 )
 # the built-in physical rules, in the order they apply
 PHYSICAL_RULES = (

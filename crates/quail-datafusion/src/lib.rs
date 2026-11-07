@@ -15,6 +15,8 @@
 //!     .await?;
 //! ```
 
+mod absorb;
+pub mod ai;
 mod aliases;
 pub mod bind;
 mod claim;
@@ -28,7 +30,6 @@ mod lower;
 mod optimize;
 mod placement;
 mod region;
-pub mod semantic;
 mod translate;
 mod unnest;
 mod unparse;
@@ -42,6 +43,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::sql::parser::Statement;
 
+pub use absorb::AbsorbIntoAiNodes;
 pub use aliases::{
     SPAN_SUFFIX, add_extract_spans, distinct_order_ordinals, inline_select_aliases,
     positional_ai_arguments, remove_select_calls, restore_select_aliases,
@@ -54,7 +56,7 @@ pub use functions::{AI_FUNCTION_NAMES, brace_structs, is_ai_call, quail_function
 pub use identified::IdentifiedTable;
 pub use lower::{LowerAiCalls, lower_ai_calls};
 pub use optimize::{OptimizeModelRegions, REGION_RULES, optimize_region, region_rule};
-pub use placement::PlaceSemanticNodes;
+pub use placement::PlaceAiNodes;
 pub use region::ModelRegion;
 pub use translate::translate_relation;
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};

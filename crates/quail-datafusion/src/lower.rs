@@ -1,32 +1,30 @@
 //! The `LowerAiCalls` analyzer rule: AI calls as Quail's plan nodes.
 //!
 //! DataFusion binds a query's AI calls as scalar functions inside its
-//! own operators. The rule rewrites each model region so the model's
-//! work is in plan nodes of its own, and DataFusion's operators hold
-//! only the relational work:
+//! own operators. The rule rewrites each model region so each call is an
+//! [`AiNode`] of its own, and DataFusion's operators hold only the
+//! relational work:
 //!
 //! - A `Filter` keeps its other terms; each `AI.IF` term, or comparison
-//!   of an `AI.SCORE` call, goes into a [`SemanticFilter`] above it, or
-//!   a [`SemanticJoin`] when the term reads two tables.
-//! - An inner `Join` keeps its other ON terms; each `AI.IF` term goes
-//!   into a [`SemanticJoin`] above it.
+//!   of an `AI.SCORE` call, is an `AiNode` above it whose filter tests
+//!   the answer. A term that reads two tables is an AI join.
+//! - An inner `Join` keeps its other ON terms; each `AI.IF` term is an
+//!   `AiNode` above it.
 //! - A `Filter`'s test of an `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP`, or
 //!   `AI.SAE_FEATURES` answer, such as `sentiment IN ('negative')`,
-//!   reads the column a [`SemanticColumn`] below it adds.
+//!   reads the column an `AiNode` below it adds.
 //! - A `Projection` of such a call `AS name` reads the column `name`,
-//!   which a [`SemanticColumn`] below it adds unless one already does.
-//!   An extraction's column holds its answer, and `name` with the span
+//!   which an `AiNode` below it adds unless one already does. An
+//!   extraction's column holds its answer, and `name` with the span
 //!   suffix its spans.
-//!
 //! - An `EXISTS` gate, `EXISTS (SELECT 1 FROM t s WHERE AI.IF(...))`,
-//!   joins the table and keeps the rows of the outer one: a
-//!   [`SemanticJoin`] of semi semantics, or anti for `NOT EXISTS`.
+//!   joins the table and keeps the rows of the outer one: an `AiNode`
+//!   of semi semantics, or anti for `NOT EXISTS`.
 //!
 //! A column takes its SELECT alias as its name, or a name of its own when
 //! only a test reads it. A call anywhere else stays as DataFusion bound
 //! it.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field};
@@ -41,8 +39,8 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::AnalyzerRule;
 
 use crate::SPAN_SUFFIX;
+use crate::ai::{AiNode, Semantics, Written};
 use crate::region::ModelRegion;
-use crate::semantic::{SemanticColumn, SemanticFilter, SemanticJoin, Written};
 
 /// Rewrite each model region's AI calls into Quail's plan nodes, as the
 /// module explains.
@@ -93,6 +91,17 @@ fn hinted(expr: &Expr) -> &Expr {
     }
 }
 
+/// The term inside a `HINT`, and the `HINT`'s options, if it has any.
+fn unhint(expr: &Expr) -> (Expr, Option<Expr>) {
+    match expr {
+        Expr::ScalarFunction(call) if call.name() == "hint" && !call.args.is_empty() => {
+            let (term, inner) = unhint(&call.args[0]);
+            (term, call.args.get(1).cloned().or(inner))
+        }
+        other => (other.clone(), None),
+    }
+}
+
 /// Whether a term is a predicate the model answers: an `AI.IF` call or a
 /// comparison of an `AI.SCORE` call.
 fn is_asked(term: &Expr) -> bool {
@@ -115,14 +124,6 @@ fn is_asked(term: &Expr) -> bool {
     }
 }
 
-/// The tables a term reads.
-fn tables(term: &Expr) -> BTreeSet<String> {
-    term.column_refs()
-        .into_iter()
-        .filter_map(|column| column.relation.as_ref().map(ToString::to_string))
-        .collect()
-}
-
 fn is_column_call(expr: &Expr) -> bool {
     matches!(
         function_name(expr),
@@ -130,9 +131,12 @@ fn is_column_call(expr: &Expr) -> bool {
     )
 }
 
-/// A predicate's asked terms with their positions, and the rest, each
-/// in written order, and how many terms it has.
-fn split_asked(predicate: &Expr) -> (Vec<(usize, Expr)>, Vec<Expr>, usize) {
+/// Terms of one WHERE or ON, each with its position among them.
+type Terms = Vec<(usize, Expr)>;
+
+/// A predicate's asked terms and the rest, in written order, and how many
+/// terms it has.
+fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
     let terms = split_conjunction(predicate);
     let num_terms = terms.len();
     let (mut asked, mut rest) = (Vec::new(), Vec::new());
@@ -140,64 +144,69 @@ fn split_asked(predicate: &Expr) -> (Vec<(usize, Expr)>, Vec<Expr>, usize) {
         if is_asked(term) {
             asked.push((position, term.clone()));
         } else {
-            rest.push(term.clone());
+            rest.push((position, term.clone()));
         }
     }
     (asked, rest, num_terms)
 }
 
-/// Stack one node per asked term on `input`, merging the one-table
-/// terms of a run on the same table into one `SemanticFilter`.
+/// An `AiNode` over `input` asking `term`, an `AI.IF` call or a
+/// comparison of an `AI.SCORE` call, whose filter tests the answer.
+fn asked_node(
+    input: LogicalPlan,
+    term: &Expr,
+    answer: String,
+    semantics: Semantics,
+    written: Option<Written>,
+    in_on: bool,
+) -> Result<LogicalPlan> {
+    let (term, hint) = unhint(term);
+    let read = Expr::Column(Column::from_name(answer.clone()));
+    let (call, filter) = match term {
+        Expr::BinaryExpr(mut binary) if function_name(&binary.left) == Some("ai_score") => {
+            let call = std::mem::replace(binary.left.as_mut(), read);
+            (call, Expr::BinaryExpr(binary))
+        }
+        Expr::BinaryExpr(mut binary) if function_name(&binary.right) == Some("ai_score") => {
+            let call = std::mem::replace(binary.right.as_mut(), read);
+            (call, Expr::BinaryExpr(binary))
+        }
+        call => (call, read),
+    };
+    let (_, field) = call.to_field(input.schema())?;
+    let field = field.as_ref().clone().with_name(answer.clone());
+    let mut node = AiNode::try_new(Arc::new(input), call, answer, vec![field])?;
+    node.filter = Some(filter);
+    node.hint = hint;
+    node.projection = Some(Vec::new());
+    node.semantics = semantics;
+    node.written = written;
+    node.in_on = in_on;
+    Ok(extension_node(node.checked()?))
+}
+
+/// Stack one `AiNode` per asked term on `input`, in written order.
 fn stack_asked(
     mut input: LogicalPlan,
-    asked: Vec<(usize, Expr)>,
+    asked: Terms,
     num_terms: usize,
     in_on: bool,
-) -> LogicalPlan {
-    let mut run: Vec<(usize, Expr)> = Vec::new();
-    let mut run_table: Option<BTreeSet<String>> = None;
-    let close = |input: LogicalPlan, run: &mut Vec<(usize, Expr)>| {
-        if run.is_empty() {
-            return input;
-        }
-        let (positions, predicates) = std::mem::take(run).into_iter().unzip();
-        extension_node(SemanticFilter {
-            input: Arc::new(input),
-            predicates,
-            stop_key: Vec::new(),
-            written: Written {
-                positions,
-                num_terms,
-            },
-        })
-    };
+    columns: &mut Columns,
+) -> Result<LogicalPlan> {
     for (position, term) in asked {
-        let read = tables(&term);
-        if read.len() < 2 {
-            if run_table.as_ref() != Some(&read) {
-                input = close(input, &mut run);
-                run_table = Some(read);
-            }
-            run.push((position, term));
-            continue;
-        }
-        input = close(input, &mut run);
-        run_table = None;
-        input = extension_node(
-            SemanticJoin::try_new(
-                Arc::new(input),
-                term,
-                "full".to_string(),
-                in_on,
-                Written {
-                    positions: vec![position],
-                    num_terms,
-                },
-            )
-            .expect("a full join keeps its input's rows"),
-        );
+        input = asked_node(
+            input,
+            &term,
+            columns.answer_name(),
+            Semantics::Rows,
+            Some(Written {
+                position,
+                num_terms,
+            }),
+            in_on,
+        )?;
     }
-    close(input, &mut run)
+    Ok(input)
 }
 
 /// The column each call a filter tests or a SELECT list returns is
@@ -208,9 +217,17 @@ struct Columns {
     selected: Vec<(Expr, String)>,
     /// How many columns took a name of their own.
     num_unnamed: usize,
+    /// How many answers of tests took a name.
+    num_answers: usize,
 }
 
 impl Columns {
+    /// A name for the answer of an `AI.IF` or `AI.SCORE` test.
+    fn answer_name(&mut self) -> String {
+        self.num_answers += 1;
+        format!("__quail_answer_{}", self.num_answers)
+    }
+
     fn name_for(&mut self, call: &Expr) -> String {
         if let Some((_, name)) = self.selected.iter().find(|(found, _)| found == call) {
             return name.clone();
@@ -298,15 +315,16 @@ fn column_calls(term: &Expr) -> Vec<Expr> {
     found
 }
 
-/// The name of the column a `SemanticColumn` below `plan` adds for
-/// `call`, if one does.
+/// The name of the column an `AiNode` below `plan` adds for `call`, if
+/// one does.
 fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
     let mut name = None;
     let _ = plan.apply(|node| {
-        if let Some(column) = as_node::<SemanticColumn>(node)
+        if let Some(column) = as_node::<AiNode>(node)
+            && !column.is_predicate()
             && column.call == *call
         {
-            name = Some(column.name.clone());
+            name = Some(column.answer.clone());
             return Ok(TreeNodeRecursion::Stop);
         }
         // a derived table's columns are named by its alias
@@ -318,7 +336,7 @@ fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
     name
 }
 
-/// `input` with a `SemanticColumn` adding `call`'s answer as `name`,
+/// `input` with an `AiNode` adding `call`'s answer as `name`,
 /// and an extraction's spans as `name` with the span suffix.
 fn add_column(input: LogicalPlan, call: Expr, name: &str) -> Result<LogicalPlan> {
     let schema = input.schema();
@@ -337,7 +355,7 @@ fn add_column(input: LogicalPlan, call: Expr, name: &str) -> Result<LogicalPlan>
         ));
         fields.push(field(&spans, format!("{name}{SPAN_SUFFIX}"))?);
     }
-    Ok(extension_node(SemanticColumn::try_new(
+    Ok(extension_node(AiNode::try_new(
         Arc::new(input),
         call,
         name.to_string(),
@@ -403,11 +421,12 @@ fn exists_gate(term: &Expr) -> Option<(LogicalPlan, Expr, bool)> {
 
 fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<LogicalPlan>> {
     let (asked, rest, num_terms) = split_asked(&filter.predicate);
-    let (gates, rest): (Vec<Expr>, Vec<Expr>) = rest
+    let (gates, rest): (Terms, Terms) = rest
         .into_iter()
-        .partition(|term| exists_gate(term).is_some());
+        .partition(|(_, term)| exists_gate(term).is_some());
     let (tested, plain): (Vec<Expr>, Vec<Expr>) = rest
         .into_iter()
+        .map(|(_, term)| term)
         .partition(|term| !column_calls(term).is_empty());
     if asked.is_empty() && tested.is_empty() && gates.is_empty() {
         return Ok(Transformed::no(LogicalPlan::Filter(filter.clone())));
@@ -420,19 +439,27 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         },
         None => filter.input.as_ref().clone(),
     };
-    input = stack_asked(input, asked, num_terms, false);
-    for gate in &gates {
+    input = stack_asked(input, asked, num_terms, false, columns)?;
+    for (position, gate) in &gates {
         let (table, predicate, negated) = exists_gate(gate).expect("a gate");
         let joined = datafusion::logical_expr::LogicalPlanBuilder::from(input)
             .cross_join(table)?
             .build()?;
-        input = extension_node(SemanticJoin::try_new(
-            Arc::new(joined),
-            predicate,
-            if negated { "anti" } else { "semi" }.to_string(),
+        input = asked_node(
+            joined,
+            &predicate,
+            columns.answer_name(),
+            if negated {
+                Semantics::Anti
+            } else {
+                Semantics::Semi
+            },
+            Some(Written {
+                position: *position,
+                num_terms,
+            }),
             false,
-            Written::default(),
-        )?);
+        )?;
     }
     if tested.is_empty() {
         return Ok(Transformed::yes(input));
@@ -478,7 +505,7 @@ fn boolean_filter(predicate: Expr, input: &Arc<LogicalPlan>) -> Result<Option<Fi
     Ok(Filter::try_new(predicate, Arc::clone(input)).ok())
 }
 
-fn lower_join(join: &Join) -> Result<Transformed<LogicalPlan>> {
+fn lower_join(join: &Join, columns: &mut Columns) -> Result<Transformed<LogicalPlan>> {
     let Some(predicate) = &join.filter else {
         return Ok(Transformed::no(LogicalPlan::Join(join.clone())));
     };
@@ -487,13 +514,14 @@ fn lower_join(join: &Join) -> Result<Transformed<LogicalPlan>> {
         return Ok(Transformed::no(LogicalPlan::Join(join.clone())));
     }
     let mut kept = join.clone();
-    kept.filter = conjunction(rest);
+    kept.filter = conjunction(rest.into_iter().map(|(_, term)| term));
     Ok(Transformed::yes(stack_asked(
         LogicalPlan::Join(kept),
         asked,
         num_terms,
         true,
-    )))
+        columns,
+    )?))
 }
 
 fn lower_projection(
@@ -574,11 +602,12 @@ pub fn lower_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
     let mut columns = Columns {
         selected: selected_calls(&plan),
         num_unnamed: 0,
+        num_answers: 0,
     };
     Ok(plan
         .transform_up(|node| match &node {
             LogicalPlan::Filter(filter) => lower_filter(filter, &mut columns),
-            LogicalPlan::Join(join) => lower_join(join),
+            LogicalPlan::Join(join) => lower_join(join, &mut columns),
             LogicalPlan::Projection(projection) => lower_projection(projection, &mut columns),
             _ => Ok(Transformed::no(node)),
         })?

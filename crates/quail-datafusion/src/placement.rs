@@ -1,26 +1,24 @@
-//! The `PlaceSemanticNodes` optimizer rule: Quail's operators on the
-//! tables and joins they read.
+//! The `PlaceAiNodes` optimizer rule: Quail's `AiNode`s on the tables
+//! and joins they read.
 //!
-//! [`crate::LowerAiCalls`] leaves each of Quail's nodes where the query
-//! wrote its call: an `AI.IF` in WHERE above the joins, a classification
-//! below the SELECT list. The rule moves each node as low as its inputs
-//! allow, as `PushDownFilter` does for plain filters:
+//! [`crate::LowerAiCalls`] leaves each `AiNode` where the query wrote its
+//! call: an `AI.IF` in WHERE above the joins, a classification below the
+//! SELECT list. The rule moves each node as low as its inputs allow, as
+//! `PushDownFilter` does for plain filters:
 //!
-//! - A `SemanticFilter` or `SemanticColumn` of one table, and a test of
-//!   one table's answers, move through joins, `SemanticJoin` nodes,
-//!   other filters, windows, and projections that only pass columns,
-//!   down to the table.
-//! - A `SemanticJoin`, and a `SemanticColumn` of joined rows, move to
-//!   the lowest join whose inputs hold every table they read; a
-//!   classification of joined rows stays above the `SemanticJoin` of the
-//!   same two tables.
+//! - An AI filter or AI column of one table, and a test of one table's
+//!   answers, move through joins, AI joins, other filters, windows, and
+//!   projections that only pass columns, down to the table.
+//! - An AI join or `EXISTS` gate, and an AI column of joined rows, move
+//!   to the lowest join whose inputs hold every table they read; a
+//!   classification of joined rows stays above the AI join of the same
+//!   two tables.
 //!
 //! Then it orders the operators on each table as Quail's executor reads
-//! them: one `SemanticFilter` with the table's `AI.IF` predicates in
-//! written order; each test of a label right after the classification
-//! it reads; the other classifications; then each extraction, SAE
-//! feature, and map column, each followed by the tests its answers
-//! allow.
+//! them: the table's `AI.IF` and `AI.SCORE` filters in written order;
+//! each test of a label right after the classification it reads; the
+//! other classifications; then each extraction, SAE feature, and map
+//! column, each followed by the tests its answers allow.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -33,16 +31,16 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
-use crate::semantic::{SemanticColumn, SemanticFilter, SemanticJoin, Written};
+use crate::ai::{AiNode, Semantics};
 
-/// Move each of Quail's nodes to the tables and joins it reads and order
-/// each table's operators, as the module explains.
+/// Move each `AiNode` to the tables and joins it reads and order each
+/// table's operators, as the module explains.
 #[derive(Debug, Default)]
-pub struct PlaceSemanticNodes;
+pub struct PlaceAiNodes;
 
-impl OptimizerRule for PlaceSemanticNodes {
+impl OptimizerRule for PlaceAiNodes {
     fn name(&self) -> &str {
-        "place_semantic_nodes"
+        "place_ai_nodes"
     }
 
     fn rewrite(
@@ -96,14 +94,14 @@ fn plan_tables(plan: &LogicalPlan) -> BTreeSet<String> {
     found
 }
 
-/// The answer columns the `SemanticColumn` nodes in a plan add, with the
-/// tables each reads.
+/// The answer columns the `AiNode`s in a plan return, with the tables
+/// each reads.
 fn plan_answers(plan: &LogicalPlan) -> Vec<(String, BTreeSet<String>)> {
     let mut found = Vec::new();
     let _ = plan.apply(|node| {
-        if let Some(column) = as_node::<SemanticColumn>(node) {
+        if let Some(column) = as_node::<AiNode>(node) {
             let read = expr_tables(&column.call, &[]);
-            for field in &column.fields {
+            for field in &column.returned_fields() {
                 found.push((field.name().clone(), read.clone()));
             }
         }
@@ -116,7 +114,7 @@ fn plan_answers(plan: &LogicalPlan) -> Vec<(String, BTreeSet<String>)> {
 }
 
 /// The tables an expression reads: its columns' tables, and for an
-/// answer column, the tables its `SemanticColumn` reads.
+/// answer column, the tables its `AiNode` reads.
 fn expr_tables(expr: &Expr, answers: &[(String, BTreeSet<String>)]) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for column in expr.column_refs() {
@@ -147,42 +145,61 @@ fn expr_answers(expr: &Expr) -> BTreeSet<String> {
 struct Mover {
     tables: BTreeSet<String>,
     added: BTreeSet<String>,
-    /// Whether it pairs rows of two tables: a `SemanticJoin` or a
+    /// Whether it pairs rows of two tables: an AI join or a
     /// classification of joined rows.
     pairs: bool,
 }
 
+/// What an `AiNode` does to the rows of the tables it reads.
+#[derive(PartialEq)]
+enum Role {
+    /// Keeps the rows of one table that pass its test.
+    TableFilter,
+    /// Keeps the pairs of two tables that pass its test, or gates rows.
+    Join,
+    /// Adds an answer column.
+    Column,
+}
+
+fn role(node: &AiNode) -> Role {
+    if !node.is_predicate() {
+        return Role::Column;
+    }
+    if node.semantics == Semantics::Rows && expr_tables(&node.call, &[]).len() < 2 {
+        return Role::TableFilter;
+    }
+    Role::Join
+}
+
+/// The `AiNode` that is an AI join or gate, if `plan` is one.
+fn ai_join(plan: &LogicalPlan) -> Option<&AiNode> {
+    as_node::<AiNode>(plan).filter(|node| role(node) == Role::Join)
+}
+
 fn mover(node: &LogicalPlan) -> Option<Mover> {
-    if let Some(filter) = as_node::<SemanticFilter>(node) {
-        let tables: BTreeSet<String> = filter
-            .predicates
-            .iter()
-            .flat_map(|predicate| expr_tables(predicate, &[]))
-            .collect();
-        return (tables.len() == 1).then_some(Mover {
-            tables,
-            added: BTreeSet::new(),
-            pairs: false,
-        });
-    }
-    if let Some(column) = as_node::<SemanticColumn>(node) {
-        let tables = expr_tables(&column.call, &[]);
-        return Some(Mover {
-            pairs: tables.len() > 1,
-            tables,
-            added: column
-                .fields
-                .iter()
-                .map(|field| field.name().clone())
-                .collect(),
-        });
-    }
-    if let Some(join) = as_node::<SemanticJoin>(node) {
-        return Some(Mover {
-            tables: expr_tables(&join.predicate, &[]),
-            added: BTreeSet::new(),
-            pairs: true,
-        });
+    if let Some(ai) = as_node::<AiNode>(node) {
+        let tables = expr_tables(&ai.call, &[]);
+        return match role(ai) {
+            Role::TableFilter => (tables.len() == 1).then_some(Mover {
+                tables,
+                added: BTreeSet::new(),
+                pairs: false,
+            }),
+            Role::Column => Some(Mover {
+                pairs: tables.len() > 1,
+                tables,
+                added: ai
+                    .returned_fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect(),
+            }),
+            Role::Join => Some(Mover {
+                tables,
+                added: BTreeSet::new(),
+                pairs: true,
+            }),
+        };
     }
     if let LogicalPlan::Filter(filter) = node {
         let answers = plan_answers(&filter.input);
@@ -249,14 +266,14 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                 None
             }
         }
-        LogicalPlan::Extension(_) if as_node::<SemanticJoin>(&input).is_some() => {
-            let join = as_node::<SemanticJoin>(&input).expect("a SemanticJoin");
+        LogicalPlan::Extension(_) if ai_join(&input).is_some() => {
+            let join = ai_join(&input).expect("an AI join");
             let sides = join_sides(&join.input);
             let fits = sides.is_some_and(|(left, right)| {
                 moving.tables.is_subset(&left) || moving.tables.is_subset(&right)
             });
             // a classification of joined rows reads the pairs the join keeps
-            let same_pair = moving.pairs && expr_tables(&join.predicate, &[]) == moving.tables;
+            let same_pair = moving.pairs && expr_tables(&join.call, &[]) == moving.tables;
             if fits && !same_pair {
                 let below = with_input(&node, join.input.as_ref().clone())?;
                 Some(with_input(&input, below)?)
@@ -301,8 +318,8 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
 /// One operator of a table's stack.
 enum Item {
-    Filter(SemanticFilter),
-    Column(SemanticColumn),
+    Filter(AiNode),
+    Column(AiNode),
     Test(Expr),
 }
 
@@ -323,12 +340,13 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             Some(found) if !found.pairs && found.tables == top.tables => {}
             _ => break,
         }
-        if let Some(filter) = as_node::<SemanticFilter>(&below) {
-            items.push(Item::Filter(filter.clone()));
-            below = filter.input.as_ref().clone();
-        } else if let Some(column) = as_node::<SemanticColumn>(&below) {
-            items.push(Item::Column(column.clone()));
-            below = column.input.as_ref().clone();
+        if let Some(ai) = as_node::<AiNode>(&below) {
+            items.push(if role(ai) == Role::TableFilter {
+                Item::Filter(ai.clone())
+            } else {
+                Item::Column(ai.clone())
+            });
+            below = ai.input.as_ref().clone();
         } else if let LogicalPlan::Filter(filter) = &below {
             for term in split_conjunction(&filter.predicate).into_iter().rev() {
                 items.push(Item::Test(term.clone()));
@@ -342,65 +360,44 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         return Ok(Transformed::no(node));
     }
     items.reverse();
-    let mut predicates: Vec<Expr> = Vec::new();
-    let mut stop_key: Vec<String> = Vec::new();
-    let mut columns: Vec<SemanticColumn> = Vec::new();
+    let mut filters: Vec<AiNode> = Vec::new();
+    let mut columns: Vec<AiNode> = Vec::new();
     let mut tests: Vec<Expr> = Vec::new();
     for item in items {
         match item {
-            Item::Filter(filter) => {
-                predicates.extend(filter.predicates);
-                if stop_key.is_empty() {
-                    stop_key = filter.stop_key;
-                }
-            }
+            Item::Filter(filter) => filters.push(filter),
             Item::Column(column) => columns.push(column),
             Item::Test(term) => tests.push(term),
         }
     }
-    let kind = |column: &SemanticColumn| match &column.call {
-        Expr::ScalarFunction(call) => match call.name() {
-            "ai_classify" => 0,
-            "ai_extract" => 1,
-            "ai_sae_features" => 2,
-            _ => 3,
-        },
+    let kind = |column: &AiNode| match column.function() {
+        "ai_classify" => 0,
+        "ai_extract" => 1,
+        "ai_sae_features" => 2,
         _ => 3,
     };
-    let names = |column: &SemanticColumn| -> BTreeSet<String> {
+    let names = |column: &AiNode| -> BTreeSet<String> {
         column
-            .fields
+            .returned_fields()
             .iter()
             .map(|field| field.name().clone())
             .collect()
     };
     let mut plan = below;
-    if !predicates.is_empty() {
-        plan = extension_node(SemanticFilter {
-            input: Arc::new(plan),
-            predicates,
-            stop_key,
-            written: Written::default(),
-        });
+    for filter in &filters {
+        plan = extension_node(filter.with_input(plan)?);
     }
-    let mut placed: Vec<SemanticColumn> = Vec::new();
-    let add_column = |plan: LogicalPlan,
-                      column: &SemanticColumn,
-                      placed: &mut Vec<SemanticColumn>|
-     -> Result<LogicalPlan> {
-        placed.push(column.clone());
-        Ok(extension_node(SemanticColumn::try_new(
-            Arc::new(plan),
-            column.call.clone(),
-            column.name.clone(),
-            column.fields.clone(),
-        )?))
-    };
+    let mut placed: Vec<AiNode> = Vec::new();
+    let add_column =
+        |plan: LogicalPlan, column: &AiNode, placed: &mut Vec<AiNode>| -> Result<LogicalPlan> {
+            placed.push(column.clone());
+            Ok(extension_node(column.with_input(plan)?))
+        };
     let mut done_tests = vec![false; tests.len()];
     // each test of a label after the classification it reads
     for (index, test) in tests.iter().enumerate() {
         let read = expr_answers(test);
-        let reads: Vec<&SemanticColumn> = columns
+        let reads: Vec<&AiNode> = columns
             .iter()
             .filter(|column| !names(column).is_disjoint(&read))
             .collect();
@@ -408,17 +405,17 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             continue;
         }
         for column in reads {
-            if !placed.iter().any(|found| found.name == column.name) {
+            if !placed.iter().any(|found| found.answer == column.answer) {
                 plan = add_column(plan, column, &mut placed)?;
             }
         }
         plan = LogicalPlan::Filter(Filter::try_new(test.clone(), Arc::new(plan))?);
         done_tests[index] = true;
     }
-    let mut ordered: Vec<&SemanticColumn> = columns.iter().collect();
+    let mut ordered: Vec<&AiNode> = columns.iter().collect();
     ordered.sort_by_key(|column| kind(column));
     for column in ordered {
-        if placed.iter().any(|found| found.name == column.name) {
+        if placed.iter().any(|found| found.answer == column.answer) {
             continue;
         }
         plan = add_column(plan, column, &mut placed)?;
