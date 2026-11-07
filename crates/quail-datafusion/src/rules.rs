@@ -2,7 +2,7 @@
 //!
 //! DataFusion's optimizer runs its own rules over the whole plan, each
 //! `AiNode` included, with Quail's rules among them. [`LOGICAL_RULES`]
-//! is the default order: DataFusion's default rules, with Quail's six
+//! is the default order: DataFusion's default rules, with Quail's seven
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
 //! GROUP BY. Then
 //! [`crate::ClaimModelRegions`] runs last: it runs the listed rules
@@ -19,13 +19,14 @@ use datafusion::common::{Result, plan_err};
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 
 /// Quail's own rules, in the order they run.
-pub const QUAIL_RULES: [&str; 6] = [
+pub const QUAIL_RULES: [&str; 7] = [
     "eliminate_distinct",
     "place_ai_nodes",
     "absorb_into_ai_nodes",
     "merge_repeated_ai_calls",
     "push_down_distinct",
     "push_down_limit_into_ai_nodes",
+    "push_down_projection_into_ai_nodes",
 ];
 
 /// The rule Quail's rules run before.
@@ -33,7 +34,7 @@ const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
 
 /// The logical optimizer rules a session runs by default, in order: each
 /// name is an `OptimizerRule`'s `name()`.
-pub const LOGICAL_RULES: [&str; 31] = [
+pub const LOGICAL_RULES: [&str; 32] = [
     "rewrite_set_comparison",
     "optimize_unions",
     "unions_to_filter",
@@ -44,6 +45,7 @@ pub const LOGICAL_RULES: [&str; 31] = [
     "merge_repeated_ai_calls",
     "push_down_distinct",
     "push_down_limit_into_ai_nodes",
+    "push_down_projection_into_ai_nodes",
     "replace_distinct_aggregate",
     "eliminate_join",
     "decorrelate_predicate_subquery",
@@ -75,6 +77,9 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
         "merge_repeated_ai_calls" => Arc::new(crate::repeated::MergeRepeatedAiCalls),
         "push_down_distinct" => Arc::new(crate::distinct::PushDownDistinct),
         "push_down_limit_into_ai_nodes" => Arc::new(crate::limit::PushDownLimitIntoAiNodes),
+        "push_down_projection_into_ai_nodes" => {
+            Arc::new(crate::projection::PushDownProjectionIntoAiNodes)
+        }
         _ => return None,
     })
 }

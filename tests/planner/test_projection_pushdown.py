@@ -3,11 +3,13 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from helpers.oracle import Oracle, finish
 from helpers.planning import placements
-from helpers.sessions import TOKENIZER, _run, make_executor
+from helpers.sessions import CONFIG, TOKENIZER, _run, make_executor
 
 import quail
 from quail.api.config import EngineConfig
+from quail.builtins import LOGICAL_RULES, built_in_registry
 
 
 def _session(tmp_path, tokenizer=TOKENIZER):
@@ -128,4 +130,48 @@ def test_a_full_join_offers_its_classification_and_test_above_the_join():
     assert [column.above_joins for column in lifted.found.classifies] == [True]
     ((alias, (test,)),) = lifted.found.column_filters
     assert (alias, test.name, test.before_joins) == ("r", "topic", False)
+    session.close()
+
+
+
+# R5, π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P])): an AI operator returns the
+# added columns the SELECT list above it reads
+PROJECTION_RULE = "push_down_projection_into_ai_nodes"
+EXTRACTED = pa.table({"id": ["r0", "r1", "r2"], "body": ["ab x", "cd", "ab y"]})
+
+
+def _extract_session(rules) -> quail.Session:
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER,
+                            registry=built_in_registry(logical_rules=rules))
+    session.register("reviews",
+                     quail.DocumentProvider.from_table(EXTRACTED, id_col="id"))
+    return session
+
+
+def test_an_extraction_under_a_select_list_returns_only_the_columns_it_reads():
+    sql = ("SELECT x.id, x.e FROM (SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) "
+           "AS e FROM reviews r) x")
+    found = []
+    for rules in (LOGICAL_RULES,
+                  [name for name in LOGICAL_RULES if name != PROJECTION_RULE]):
+        session = _extract_session(rules)
+        query = session.sql(sql)
+        node = next(line for line in query.logical.splitlines() if "AiNode" in line)
+        oracle = Oracle(answers=lambda spec, document: None if document == 1 else "ab")
+        rows = finish(query, oracle).collect().to_pylist()
+        found.append((node.endswith("returns: [e]"),
+                      sorted((row["x.id"], row["x.e"]["w"]) for row in rows)))
+        session.close()
+    # with the rule the node returns its answer without its spans
+    assert found[0] == (True, [("r0", "ab"), ("r1", None), ("r2", "ab")])
+    assert found[1] == (False, found[0][1])
+
+
+def test_an_extraction_the_query_returns_keeps_its_spans():
+    session = _extract_session(LOGICAL_RULES)
+    query = session.sql(
+        "SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e FROM reviews r")
+    assert "returns:" not in query.logical
+    rows = finish(query, Oracle(answers=lambda spec, document: "ab")).collect()
+    assert "e_span" in rows.column_names
     session.close()
