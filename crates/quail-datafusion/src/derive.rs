@@ -41,7 +41,7 @@ use quail_planner::rules::{
 };
 
 use crate::SPAN_SUFFIX;
-use crate::ai::{AiNode, Fetch, Semantics};
+use crate::ai::{AiNode, Fetch, Semantics, WrittenTest};
 use crate::bind::{
     Binder, OnTerm, SelectBinder, UNSUPPORTED, Unnested, conjuncts, contains_ai_call,
     feature_schema, has_subqueries, read_top, refuse_grouped_input, select_outputs, selected_calls,
@@ -648,14 +648,24 @@ impl<'a> Walk<'a> {
             .unwrap_or_else(|_| expr.clone())
     }
 
-    /// The terms of the plan's filters and of its AI columns' tests, as the
-    /// query wrote them.
-    ///
-    /// Each test of answers marked with its written position follows the
-    /// other terms, in that order.
+    /// The terms of the plan's filters, as the query wrote them, then its
+    /// tests of answer columns, in written order.
     fn where_terms(&self, answers: &[Answer]) -> Vec<Expr> {
+        let mut tests: Vec<&WrittenTest> = Vec::new();
+        for id in self.ids() {
+            let Kind::Ai(node) = &self.get(id).kind else {
+                continue;
+            };
+            for test in &node.tests {
+                if !tests
+                    .iter()
+                    .any(|found| (found.clause, found.position) == (test.clause, test.position))
+                {
+                    tests.push(test);
+                }
+            }
+        }
         let mut terms = Vec::new();
-        let mut tests: Vec<(usize, Expr)> = Vec::new();
         for id in self.ids() {
             let found: Vec<Expr> = match &self.get(id).kind {
                 Kind::Filter(predicate) => conjuncts(predicate),
@@ -664,15 +674,20 @@ impl<'a> Walk<'a> {
                 }
                 _ => continue,
             };
-            for term in found {
-                match written_test(&term) {
-                    Some((position, test)) => tests.push((position, self.written(&test, answers))),
-                    None => terms.push(self.written(&term, answers)),
-                }
-            }
+            // each test of answers is in written order below
+            terms.extend(
+                found
+                    .iter()
+                    .filter(|term| !tests.iter().any(|test| test.test == **term))
+                    .map(|term| self.written(term, answers)),
+            );
         }
-        tests.sort_by_key(|(position, _)| *position);
-        terms.extend(tests.into_iter().map(|(_, test)| test));
+        tests.sort_by_key(|test| (test.clause, test.position));
+        terms.extend(
+            tests
+                .into_iter()
+                .map(|test| self.written(&test.written, &[])),
+        );
         terms
     }
 
@@ -812,24 +827,6 @@ struct Binding {
     unplaced: bool,
 }
 
-/// The written position and the test of a term the lowering marked,
-/// `quail_written(test, position)`.
-fn written_test(term: &Expr) -> Option<(usize, Expr)> {
-    let Expr::ScalarFunction(call) = term else {
-        return None;
-    };
-    if call.name() != crate::lower::WRITTEN_TEST {
-        return None;
-    }
-    match call.args.as_slice() {
-        [
-            test,
-            Expr::Literal(datafusion::common::ScalarValue::Int64(Some(position)), _),
-        ] => Some((usize::try_from(*position).ok()?, test.clone())),
-        _ => None,
-    }
-}
-
 /// Whether a term is `a.x = b.y`, an equality of two tables' columns.
 fn is_column_equality(term: &Expr) -> bool {
     match term {
@@ -841,16 +838,6 @@ fn is_column_equality(term: &Expr) -> bool {
         }
         _ => false,
     }
-}
-
-/// The number at the end of an answer column's name, `__quail_answer_<n>`,
-/// which counts the AI predicates in written order.
-fn answer_number(node: &AiNode) -> usize {
-    node.answer
-        .rsplit('_')
-        .next()
-        .and_then(|number| number.parse().ok())
-        .unwrap_or(usize::MAX)
 }
 
 impl Binding {
@@ -914,20 +901,16 @@ impl Binding {
                 _ => None,
             })
             .collect();
+        // the ON predicates by their JOINs, then WHERE's by their terms
         asked.sort_by_key(|(_, node)| {
-            (
-                !node.in_on,
-                if node.in_on {
-                    answer_number(node)
-                } else {
-                    node.written
-                        .as_ref()
-                        .map_or(usize::MAX, |written| written.position)
-                },
-                answer_number(node),
-            )
+            node.written
+                .as_ref()
+                .map_or((true, usize::MAX, usize::MAX), |written| match written.on {
+                    Some(_) => (false, written.index, written.index),
+                    None => (true, written.position, written.index),
+                })
         });
-        let (on, rest): (Vec<_>, Vec<_>) = asked.into_iter().partition(|(_, node)| node.in_on);
+        let (on, rest): (Vec<_>, Vec<_>) = asked.into_iter().partition(|(_, node)| node.in_on());
         for (id, node) in on {
             self.bind_asked(walk, id, node)?;
         }
@@ -954,7 +937,7 @@ impl Binding {
         id: usize,
         node: &AiNode,
     ) -> Result<(), CompileError> {
-        let join = node.in_on.then_some(true);
+        let join = node.in_on().then_some(true);
         let call = walk.written(&node.call, &[]);
         if node.semantics != Semantics::Rows {
             let Kind::Join(_) = &walk.get(walk.get(id).inputs[0]).kind else {

@@ -10,9 +10,13 @@
 //!   the answer. A term that reads two tables is an AI join.
 //! - An inner `Join` keeps its other ON terms; each `AI.IF` term is an
 //!   `AiNode` above it.
+//! - Each such node records where the query wrote its term
+//!   ([`crate::ai::Written`]).
 //! - A `Filter`'s test of an `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP`, or
 //!   `AI.SAE_FEATURES` answer, such as `sentiment IN ('negative')`,
-//!   reads the column an `AiNode` below it adds.
+//!   reads the column an `AiNode` below it adds. Each node whose answer
+//!   it reads keeps the test as written and its place in the WHERE
+//!   ([`crate::ai::WrittenTest`]).
 //! - A `Projection` of such a call `AS name` reads the column `name`,
 //!   which an `AiNode` below it adds unless one already does. An
 //!   extraction's column holds its answer, and `name` with the span
@@ -30,7 +34,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, Result, ScalarValue, plan_err};
+use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Expr, ExprSchemable, Extension, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
@@ -39,7 +43,7 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::AnalyzerRule;
 
 use crate::SPAN_SUFFIX;
-use crate::ai::{AiNode, Semantics, Written};
+use crate::ai::{AiNode, Semantics, Written, WrittenTest};
 use crate::region::ModelRegion;
 
 /// Rewrite each model region's AI calls into Quail's plan nodes, as the
@@ -155,10 +159,9 @@ fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
 fn asked_node(
     input: LogicalPlan,
     term: &Expr,
-    answer: String,
+    (answer, index): (String, usize),
     semantics: Semantics,
-    written: Option<Written>,
-    in_on: bool,
+    written: Written,
 ) -> Result<LogicalPlan> {
     let (term, hint) = unhint(term);
     let read = Expr::Column(Column::from_name(answer.clone()));
@@ -180,17 +183,19 @@ fn asked_node(
     node.hint = hint;
     node.projection = Some(Vec::new());
     node.semantics = semantics;
-    node.written = written;
-    node.in_on = in_on;
+    node.written = Some(Written { index, ..written });
     Ok(extension_node(node.checked()?))
 }
 
 /// Stack one `AiNode` per asked term on `input`, in written order.
+///
+/// `on` is the alias of the table whose JOIN's ON holds the terms, or
+/// None for a WHERE.
 fn stack_asked(
     mut input: LogicalPlan,
     asked: Terms,
-    num_terms: usize,
-    in_on: bool,
+    (num_terms, clause): (usize, usize),
+    on: Option<&str>,
     columns: &mut Columns,
 ) -> Result<LogicalPlan> {
     for (position, term) in asked {
@@ -199,11 +204,13 @@ fn stack_asked(
             &term,
             columns.answer_name(),
             Semantics::Rows,
-            Some(Written {
+            Written {
                 position,
                 num_terms,
-            }),
-            in_on,
+                clause,
+                index: 0,
+                on: on.map(str::to_string),
+            },
         )?;
     }
     Ok(input)
@@ -219,13 +226,25 @@ struct Columns {
     num_unnamed: usize,
     /// How many answers of tests took a name.
     num_answers: usize,
+    /// How many WHEREs and ONs the lowering met.
+    num_clauses: usize,
 }
 
 impl Columns {
-    /// A name for the answer of an `AI.IF` or `AI.SCORE` test.
-    fn answer_name(&mut self) -> String {
+    /// A name for the answer of an `AI.IF` or `AI.SCORE` test, and the
+    /// test's number among the region's AI predicates.
+    fn answer_name(&mut self) -> (String, usize) {
         self.num_answers += 1;
-        format!("__quail_answer_{}", self.num_answers)
+        (
+            format!("__quail_answer_{}", self.num_answers),
+            self.num_answers,
+        )
+    }
+
+    /// The number of the next WHERE or ON.
+    fn clause(&mut self) -> usize {
+        self.num_clauses += 1;
+        self.num_clauses
     }
 
     fn name_for(&mut self, call: &Expr) -> String {
@@ -253,19 +272,6 @@ fn selected_calls(plan: &LogicalPlan) -> Vec<(Expr, String)> {
         Ok(TreeNodeRecursion::Continue)
     });
     found
-}
-
-/// The function that marks a test of answers with its position among
-/// the tests of its WHERE, `quail_written(test, position)`, where the
-/// WHERE has more than one: the rules place each test with the columns
-/// it reads, which loses the order the query wrote them in.
-pub const WRITTEN_TEST: &str = "quail_written";
-
-fn call_quail(name: &str, args: Vec<Expr>) -> Expr {
-    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-        quail_function(name),
-        args,
-    ))
 }
 
 pub(crate) fn quail_function(name: &str) -> Arc<datafusion::logical_expr::ScalarUDF> {
@@ -306,31 +312,6 @@ fn base_call(call: &Expr) -> Expr {
     Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
         function, args,
     ))
-}
-
-/// The `{'selectivity': ...}` option of the classification a label test
-/// reads, `= 'label'` or `IN ('label', ...)` with no `HINT` around it;
-/// the column the test reads instead of the call keeps no option.
-fn label_selectivity(term: &Expr) -> Option<Expr> {
-    let classify = |expr: &Expr| function_name(expr) == Some("ai_classify");
-    let call = match term {
-        Expr::InList(list) if !list.negated && classify(&list.expr) => list.expr.as_ref(),
-        Expr::BinaryExpr(binary) if binary.op == Operator::Eq && classify(&binary.left) => {
-            binary.left.as_ref()
-        }
-        Expr::BinaryExpr(binary) if binary.op == Operator::Eq && classify(&binary.right) => {
-            binary.right.as_ref()
-        }
-        _ => return None,
-    };
-    match call {
-        Expr::ScalarFunction(found) => found
-            .args
-            .last()
-            .filter(|arg| is_selectivity_hint(arg))
-            .cloned(),
-        _ => None,
-    }
 }
 
 fn is_span_call(expr: &Expr) -> bool {
@@ -462,14 +443,13 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
     let (gates, rest): (Terms, Terms) = rest
         .into_iter()
         .partition(|(_, term)| exists_gate(term).is_some());
-    let (tested, plain): (Vec<Expr>, Vec<Expr>) = rest
+    let (tested, plain): (Terms, Terms) = rest
         .into_iter()
-        .map(|(_, term)| term)
-        .partition(|term| !column_calls(term).is_empty());
+        .partition(|(_, term)| !column_calls(term).is_empty());
     if asked.is_empty() && tested.is_empty() && gates.is_empty() {
         return Ok(Transformed::no(LogicalPlan::Filter(filter.clone())));
     }
-    let mut input = match conjunction(plain) {
+    let mut input = match conjunction(plain.into_iter().map(|(_, term)| term)) {
         // a term DataFusion cannot type keeps its operator, for the binder to refuse
         Some(predicate) => match boolean_filter(predicate, &filter.input)? {
             Some(kept) => LogicalPlan::Filter(kept),
@@ -477,7 +457,8 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         },
         None => filter.input.as_ref().clone(),
     };
-    input = stack_asked(input, asked, num_terms, false, columns)?;
+    let clause = columns.clause();
+    input = stack_asked(input, asked, (num_terms, clause), None, columns)?;
     for (position, gate) in &gates {
         let (table, predicate, negated) = exists_gate(gate).expect("a gate");
         let joined = datafusion::logical_expr::LogicalPlanBuilder::from(input)
@@ -492,18 +473,20 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
             } else {
                 Semantics::Semi
             },
-            Some(Written {
+            Written {
                 position: *position,
                 num_terms,
-            }),
-            false,
+                clause,
+                index: 0,
+                on: None,
+            },
         )?;
     }
     if tested.is_empty() {
         return Ok(Transformed::yes(input));
     }
     let mut added: Vec<(Expr, String)> = Vec::new();
-    for call in tested.iter().flat_map(column_calls) {
+    for call in tested.iter().flat_map(|(_, term)| column_calls(term)) {
         if added.iter().any(|(found, _)| *found == call) {
             continue;
         }
@@ -517,33 +500,45 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         };
         added.push((call, name));
     }
-    let num_tests = tested.len();
-    let tests = tested
-        .into_iter()
-        .enumerate()
-        .map(|(position, term)| {
-            let options = label_selectivity(&term);
-            let mut read = read_columns(term, &added)?;
-            if let Some(options) = options {
-                read = call_quail("hint", vec![read, options]);
-            }
-            // the rules split the tests among the columns they read
-            if num_tests > 1 {
-                read = call_quail(
-                    WRITTEN_TEST,
-                    vec![
-                        read,
-                        Expr::Literal(ScalarValue::Int64(Some(position as i64)), None),
-                    ],
-                );
-            }
-            Ok(read)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut tests = Vec::new();
+    let mut written = Vec::new();
+    for (position, term) in tested {
+        let test = read_columns(term.clone(), &added)?;
+        written.push(WrittenTest {
+            test: test.clone(),
+            written: term,
+            position,
+            clause,
+        });
+        tests.push(test);
+    }
+    let names: Vec<String> = added.iter().map(|(_, name)| name.clone()).collect();
+    input = with_tests(input, &names, &written)?;
     match boolean_filter(conjunction(tests).expect("a test"), &Arc::new(input))? {
         Some(test) => Ok(Transformed::yes(LogicalPlan::Filter(test))),
         None => Ok(Transformed::no(LogicalPlan::Filter(filter.clone()))),
     }
+}
+
+/// `plan` with `tests` kept by each `AiNode` that adds a column of `names`.
+fn with_tests(plan: LogicalPlan, names: &[String], tests: &[WrittenTest]) -> Result<LogicalPlan> {
+    Ok(plan
+        .transform_down(|node| {
+            // a derived table's columns are named by its alias
+            if matches!(node, LogicalPlan::SubqueryAlias(_)) {
+                return Ok(Transformed::new(node, false, TreeNodeRecursion::Jump));
+            }
+            let Some(column) = as_node::<AiNode>(&node) else {
+                return Ok(Transformed::no(node));
+            };
+            if column.is_predicate() || !names.contains(&column.answer) {
+                return Ok(Transformed::no(node));
+            }
+            let mut column = column.clone();
+            column.tests.extend(tests.iter().cloned());
+            Ok(Transformed::yes(extension_node(column)))
+        })?
+        .data)
 }
 
 /// A filter over `input` that keeps the rows where `predicate` is true,
@@ -570,13 +565,21 @@ fn lower_join(join: &Join, columns: &mut Columns) -> Result<Transformed<LogicalP
     if asked.is_empty() || join.join_type != JoinType::Inner {
         return Ok(Transformed::no(LogicalPlan::Join(join.clone())));
     }
+    // the joined table's alias, which names the ON
+    let joined = join
+        .right
+        .schema()
+        .iter()
+        .find_map(|(qualifier, _)| qualifier.map(|found| found.table().to_string()))
+        .unwrap_or_default();
+    let clause = columns.clause();
     let mut kept = join.clone();
     kept.filter = conjunction(rest.into_iter().map(|(_, term)| term));
     Ok(Transformed::yes(stack_asked(
         LogicalPlan::Join(kept),
         asked,
-        num_terms,
-        true,
+        (num_terms, clause),
+        Some(&joined),
         columns,
     )?))
 }
@@ -660,6 +663,7 @@ pub fn lower_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
         selected: selected_calls(&plan),
         num_unnamed: 0,
         num_answers: 0,
+        num_clauses: 0,
     };
     Ok(plan
         .transform_up(|node| match &node {

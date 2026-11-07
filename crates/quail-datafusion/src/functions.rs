@@ -206,7 +206,6 @@ pub fn quail_functions() -> Vec<Arc<ScalarUDF>> {
         ("ai_sae_features", FunctionKind::SaeFeatures),
         ("prompt", FunctionKind::Prompt),
         ("hint", FunctionKind::Hint),
-        (crate::lower::WRITTEN_TEST, FunctionKind::Hint),
         (crate::unnest::UNNEST_TEST, FunctionKind::Unnest),
         (crate::unnest::UNNEST_FIELD, FunctionKind::UnnestField),
     ]

@@ -58,12 +58,39 @@ pub enum Fetch {
     PerKey { key: Vec<String>, n: usize },
 }
 
-/// Where a node's term was written among the terms of one WHERE or ON:
-/// the term's position, and how many terms it has.
+/// Where the query wrote an AI predicate's term.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Written {
+    /// The term's position among the terms of its WHERE or ON.
     pub position: usize,
+    /// How many terms that WHERE or ON has.
     pub num_terms: usize,
+    /// Which WHERE or ON it is, numbered as the lowering meets them.
+    pub clause: usize,
+    /// The predicate's number among the region's AI predicates, in
+    /// written order.
+    pub index: usize,
+    /// The alias of the table whose JOIN's ON holds the term, or None
+    /// for a WHERE.
+    pub on: Option<String>,
+}
+
+/// A test of answer columns, as the query wrote it in a WHERE.
+///
+/// The optimizer rules move the test with the columns it reads, which
+/// loses its place among the WHERE's terms; the `AiNode`s whose answers
+/// it reads keep it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WrittenTest {
+    /// The test as the plan holds it, such as `sentiment IN ('negative')`.
+    pub test: Expr,
+    /// The test with each AI call as the query wrote it, such as
+    /// `ai_classify(...) IN ('negative')`.
+    pub written: Expr,
+    /// The term's position among the terms of its WHERE.
+    pub position: usize,
+    /// Which WHERE it is, numbered as the lowering meets them.
+    pub clause: usize,
 }
 
 /// One AI call over the rows of its input, as `AiNode`; the module
@@ -89,8 +116,8 @@ pub struct AiNode {
     pub semantics: Semantics,
     /// Where the query wrote the call's term, if in a WHERE or ON.
     pub written: Option<Written>,
-    /// Whether the query wrote the term in a join's ON rather than in WHERE.
-    pub in_on: bool,
+    /// The tests of the node's answers the query wrote in a WHERE.
+    pub tests: Vec<WrittenTest>,
     schema: DFSchemaRef,
 }
 
@@ -119,7 +146,7 @@ impl AiNode {
             fetch: None,
             semantics: Semantics::Rows,
             written: None,
-            in_on: false,
+            tests: Vec::new(),
             schema: Arc::new(DFSchema::empty()),
         }
         .checked()
@@ -187,6 +214,13 @@ impl AiNode {
     /// `AI.SCORE`, rather than a column the query reads.
     pub fn is_predicate(&self) -> bool {
         matches!(self.function(), "ai_filter" | "ai_score")
+    }
+
+    /// Whether the query wrote the call's term in a JOIN's ON.
+    pub fn in_on(&self) -> bool {
+        self.written
+            .as_ref()
+            .is_some_and(|written| written.on.is_some())
     }
 
     /// The added columns the node returns.
