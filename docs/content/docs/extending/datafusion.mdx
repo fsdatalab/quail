@@ -46,9 +46,11 @@ let context = SessionContext::new_with_state(state);
 
 `runner` implements `RegionRunner`: it takes one model region, the rows
 of the region's inputs, and an optional row limit, and returns the
-region's rows as a stream of Arrow batches. The region runs only the
-model work and the operators it needs; DataFusion runs the sorts,
-limits, aggregates, unnests, and the rest of the SELECT list above
+region's rows as a stream of Arrow batches: the id column of each
+table the region reads and the answers. The region runs only the
+model work and the operators it needs; DataFusion joins the tables'
+other columns back on their ids, then runs the sorts, limits,
+aggregates, unnests, and the rest of the SELECT list above
 `ModelRegionExec`. `quail::Session` uses a
 runner that calls Quail's Python executor.
 
@@ -67,7 +69,13 @@ runner that calls Quail's Python executor.
   `ModelRegion` nodes. `with_logical_rules` names the rule list
   instead.
 - A query planner that plans each `ModelRegion` as a
-  `ModelRegionExec`.
+  `ModelRegionExec`, and each `SharedInput`, a region input that the
+  join above the region reads too, as a `SharedInputExec` that
+  computes its rows once.
+- Two settings that keep the region's row order through that join:
+  `datafusion.optimizer.enable_round_robin_repartition` and
+  `datafusion.optimizer.repartition_joins` are off, in the session
+  `quail_datafusion::session_state` builds.
 
 A session with its own `QueryPlanner` calls `register_rules` instead,
 and adds `extension_planner()` to the extension planners its planner

@@ -1,4 +1,4 @@
-//! `ModelRegionExec` and the planners that build it.
+//! `ModelRegionExec` and the planners that build it and `SharedInputExec`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -24,6 +24,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use futures::stream;
 
 use crate::region::ModelRegion;
+use crate::shared::{SharedInput, SharedInputExec, SharedRowsByKey};
 
 /// The rows of one region input: its table name and its batches.
 pub type InputRows = (String, Vec<RecordBatch>);
@@ -226,16 +227,21 @@ impl Iterator for Limited {
 }
 
 /// The `ExtensionPlanner` that turns a `ModelRegion` into a
-/// `ModelRegionExec`.
+/// `ModelRegionExec`, and a `SharedInput` into a `SharedInputExec` that
+/// shares its rows with the other readers of its key.
 #[derive(Debug)]
 pub struct ModelRegionPlanner {
     runner: Arc<dyn RegionRunner>,
+    shared: SharedRowsByKey,
 }
 
 impl ModelRegionPlanner {
     /// Create the planner; every region it plans runs on `runner`.
     pub fn new(runner: Arc<dyn RegionRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            shared: SharedRowsByKey::default(),
+        }
     }
 }
 
@@ -250,6 +256,17 @@ impl ExtensionPlanner for ModelRegionPlanner {
         _session: &dyn Session,
         _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        if let Some(shared) = node.as_any().downcast_ref::<SharedInput>() {
+            let Some(input) = physical_inputs.first() else {
+                return internal_err!("SharedInput reads one input");
+            };
+            return Ok(Some(Arc::new(SharedInputExec::new(
+                Arc::clone(input),
+                shared.numbered,
+                self.shared.rows(shared.key),
+                Arc::new(node.schema().as_arrow().clone()),
+            ))));
+        }
         let Some(region) = node.as_any().downcast_ref::<ModelRegion>() else {
             return Ok(None);
         };

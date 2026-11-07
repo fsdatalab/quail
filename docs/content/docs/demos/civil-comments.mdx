@@ -66,14 +66,13 @@ The Quail planner places the toxicity filter below the join. The relevant
 part of `query.explain()` is:
 
 ```text
-Project: c.comment_id, f.field
-  AiJoin: anchor=c
-    join 1 full (c, f)
-    AiFilter: c
-      survivors stream into the join with KV pinned
-      predicate 1
-      Scan comments as c
-    Scan fields as f
+AiJoin: anchor=c
+  join 1 full (c, f)
+  AiFilter: c
+    survivors stream into the join with KV pinned
+    predicate 1
+    Scan comments as c
+  Scan fields as f
 ```
 
 The plan runs in two steps:

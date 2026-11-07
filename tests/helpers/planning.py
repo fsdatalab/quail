@@ -61,13 +61,24 @@ def column_tests(found):
 def row_tests(query):
     """The tests DataFusion runs on a region's rows, as explain() shows them.
 
-    Each is the predicate of a FilterExec above the ModelRegionExec, with
-    its columns named without their positions, outermost first.
+    Each is the predicate of a FilterExec, or the filter of a join that
+    adds tables' columns back, above the ModelRegionExec, with its
+    columns named without their positions, outermost first. DataFusion's
+    dynamic filters are left out.
     """
     above = query.explain().split("ModelRegionExec")[0]
-    return [re.sub(r"@\d+", "", line.strip().removeprefix("FilterExec: ")
-                   .split(", projection=")[0])
-            for line in above.splitlines() if line.strip().startswith("FilterExec: ")]
+    tests = []
+    for line in above.splitlines():
+        line = line.strip()
+        if line.startswith("FilterExec: "):
+            found = line.removeprefix("FilterExec: ").split(", projection=")[0]
+        elif line.startswith("HashJoinExec: ") and ", filter=" in line:
+            found = line.split(", filter=")[1].split(", projection=")[0]
+        else:
+            continue
+        if "DynamicFilter" not in found:
+            tests.append(re.sub(r"@\d+", "", found))
+    return tests
 
 
 def _read(value):

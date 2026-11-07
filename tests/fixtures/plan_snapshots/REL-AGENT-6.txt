@@ -4,17 +4,20 @@ SortPreservingMergeExec: [first_fix@2 ASC NULLS LAST, trajectory_id@0 ASC NULLS 
     SortExec: TopK(fetch=50), expr=[min(t.turn_index)@2 ASC NULLS LAST, trajectory_id@0 ASC NULLS LAST], preserve_partitioning=[true]
       FilterExec: count(Int64(1))@1 >= 2
         AggregateExec: mode=FinalPartitioned, gby=[trajectory_id@0 as trajectory_id], aggr=[count(Int64(1)), min(t.turn_index), max(t.token_count)]
-          RepartitionExec: partitioning=Hash([trajectory_id@0], 4), input_partitions=4
+          RepartitionExec: partitioning=Hash([trajectory_id@0], 4), input_partitions=1
             AggregateExec: mode=Partial, gby=[trajectory_id@0 as trajectory_id], aggr=[count(Int64(1)), min(t.turn_index), max(t.token_count)]
-              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+              HashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(__quail_key_t@0, id@0)], projection=[trajectory_id@1, turn_index@2, token_count@3]
+                CoalescePartitionsExec
+                  ProjectionExec: expr=[id@0 as __quail_key_t, trajectory_id@1 as trajectory_id, turn_index@2 as turn_index, token_count@3 as token_count]
+                    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
                 ModelRegionExec
 
 model region:
 logical:
-  Projection: t.trajectory_id, t.turn_index, t.token_count
+  Projection: t.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3030474040632054))), filter: __quail_answer_1, returns: []
       SubqueryAlias: t
-        TableScan: agent_traces projection=[trace, trajectory_id, turn_index, token_count]
+        TableScan: agent_traces projection=[trace, trajectory_id, turn_index, token_count, id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

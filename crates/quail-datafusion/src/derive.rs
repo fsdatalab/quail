@@ -2112,6 +2112,15 @@ fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly
         for predicate in &scan.predicates {
             needed.add(column_references(predicate));
         }
+        // a per-key fetch groups the documents by its key's values
+        if let Some(key) = found.stop_keys.get(&alias) {
+            let columns = needed.by_alias.entry(alias.clone()).or_default();
+            for column in key {
+                if !columns.contains(column) {
+                    columns.push(column.clone());
+                }
+            }
+        }
         let sources = source_columns(&scan.column);
         let columns: Vec<String> = needed
             .by_alias

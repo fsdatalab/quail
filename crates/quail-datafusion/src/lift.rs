@@ -11,12 +11,14 @@
 //!   columns, which needs every model call's answer first, or of an
 //!   unnested list's fields;
 //! - the SELECT list's expressions, other than its columns and model
-//!   calls, which the region returns.
+//!   calls.
 //!
 //! For example, `SELECT r.id, UPPER(p.name) AS name ... WHERE r.stars <
-//! p.stars` over an AI join returns `r.id`, `p.name`, `r.stars`, and
-//! `p.stars` from the region; DataFusion keeps the rows with `r.stars <
-//! p.stars` and computes `name`.
+//! p.stars` over an AI join leaves the SELECT list `r.id`, `p.name`,
+//! `r.stars`, and `p.stars` below the operators above; DataFusion keeps
+//! the rows with `r.stars < p.stars` and computes `name`.
+//! [`crate::join_back`] then splits that list into the region's ids
+//! and answers and the join that adds `p.name` and the stars back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::{Result, exec_err};
+use datafusion::common::{Constraint, Constraints, Result, exec_err};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
@@ -44,13 +44,15 @@ fn text_table(columns: &[&str], rows: &[&[&str]]) -> Result<MemTable> {
 
 fn context() -> Result<SessionContext> {
     let context = session_context(Arc::new(NotRun));
-    context.register_table(
-        "reviews",
-        Arc::new(text_table(
-            &["id", "body"],
-            &[&["r1", "A moving ending."], &["r2", "Too long."]],
-        )?),
-    )?;
+    // a region returns each review's id, its primary key
+    let reviews = text_table(
+        &["id", "body"],
+        &[&["r1", "A moving ending."], &["r2", "Too long."]],
+    )?
+    .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+        vec![0],
+    )]));
+    context.register_table("reviews", Arc::new(reviews))?;
     context.register_table(
         "aspects",
         Arc::new(text_table(&["aspect"], &[&["ending"], &["pacing"]])?),
@@ -325,5 +327,35 @@ async fn a_plain_expression_in_select_runs_in_datafusion_as_an_input_column() ->
         "{:?}",
         lines(&input)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_table_without_a_key_is_numbered_and_joined_back_on_its_rows() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT r.id, a.aspect FROM reviews r \
+        JOIN aspects a ON AI.IF(PROMPT('Does {0} discuss {1}?', r.body, a.aspect))";
+    let plan = optimized(&context, query).await?;
+    let [region] = <[ModelRegion; 1]>::try_from(regions(&plan)).unwrap();
+    // the region returns the review's key and the aspect's row number
+    assert_eq!(
+        lines(&region.plan)[0],
+        "Projection: r.id, a.__quail_row",
+        "{}",
+        plan.display_indent()
+    );
+    // the join above reads the aspects through the region's shared input
+    let text = plan.display_indent().to_string();
+    assert!(
+        text.contains("Inner Join: __quail_key_a = a.__quail_row"),
+        "{text}"
+    );
+    let shared: Vec<&str> = lines(&plan)
+        .iter()
+        .filter(|line| line.starts_with("SharedInput: "))
+        .map(|line| text.matches(line.as_str()).next().unwrap_or_default())
+        .collect();
+    assert_eq!(shared.len(), 2, "{text}");
+    assert_eq!(shared[0], shared[1], "{text}");
     Ok(())
 }

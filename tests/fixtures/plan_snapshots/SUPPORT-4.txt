@@ -13,19 +13,19 @@ SortPreservingMergeExec: [n@1 DESC NULLS LAST, intent@0 ASC NULLS LAST]
 {0}"), t.request),make_array(struct(Utf8("cancel"), Utf8("cancel an order, flight, or reservation")), struct(Utf8("change"), Utf8("modify an order or reservation, such as items, flights, seats, baggage, or address")), struct(Utf8("return or exchange"), Utf8("return delivered items or exchange them for others")), struct(Utf8("refund or compensation"), Utf8("get money back or compensation without changing the order")), struct(Utf8("information"), Utf8("ask about an order, reservation, product, or policy")), struct(Utf8("other"), Utf8("none of the above"))))], aggr=[count(Int64(1))]
         RepartitionExec: partitioning=Hash([AI.CLASSIFY(prompt(Utf8("Judge strictly from the customer's opening message above what the customer wants the agent to do.
 
-{0}"), t.request),make_array(struct(Utf8("cancel"), Utf8("cancel an order, flight, or reservation")), struct(Utf8("change"), Utf8("modify an order or reservation, such as items, flights, seats, baggage, or address")), struct(Utf8("return or exchange"), Utf8("return delivered items or exchange them for others")), struct(Utf8("refund or compensation"), Utf8("get money back or compensation without changing the order")), struct(Utf8("information"), Utf8("ask about an order, reservation, product, or policy")), struct(Utf8("other"), Utf8("none of the above"))))@0], 4), input_partitions=4
+{0}"), t.request),make_array(struct(Utf8("cancel"), Utf8("cancel an order, flight, or reservation")), struct(Utf8("change"), Utf8("modify an order or reservation, such as items, flights, seats, baggage, or address")), struct(Utf8("return or exchange"), Utf8("return delivered items or exchange them for others")), struct(Utf8("refund or compensation"), Utf8("get money back or compensation without changing the order")), struct(Utf8("information"), Utf8("ask about an order, reservation, product, or policy")), struct(Utf8("other"), Utf8("none of the above"))))@0], 4), input_partitions=1
           AggregateExec: mode=Partial, gby=[intent@0 as AI.CLASSIFY(prompt(Utf8("Judge strictly from the customer's opening message above what the customer wants the agent to do.
 
 {0}"), t.request),make_array(struct(Utf8("cancel"), Utf8("cancel an order, flight, or reservation")), struct(Utf8("change"), Utf8("modify an order or reservation, such as items, flights, seats, baggage, or address")), struct(Utf8("return or exchange"), Utf8("return delivered items or exchange them for others")), struct(Utf8("refund or compensation"), Utf8("get money back or compensation without changing the order")), struct(Utf8("information"), Utf8("ask about an order, reservation, product, or policy")), struct(Utf8("other"), Utf8("none of the above"))))], aggr=[count(Int64(1))]
-            RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+            ProjectionExec: expr=[intent@0 as intent]
               ModelRegionExec
 
 model region:
 logical:
-  Projection: intent
+  Projection: intent, t.id
     AiNode: intent = ai_classify(prompt(Utf8("Judge strictly from the customer's opening message above what the customer wants the agent to do.\n\n{0}"), t.request), make_array(struct(Utf8("cancel"), Utf8("cancel an order, flight, or reservation")), struct(Utf8("change"), Utf8("modify an order or reservation, such as items, flights, seats, baggage, or address")), struct(Utf8("return or exchange"), Utf8("return delivered items or exchange them for others")), struct(Utf8("refund or compensation"), Utf8("get money back or compensation without changing the order")), struct(Utf8("information"), Utf8("ask about an order, reservation, product, or policy")), struct(Utf8("other"), Utf8("none of the above"))))
       SubqueryAlias: t
-        TableScan: support_traces projection=[request]
+        TableScan: support_traces projection=[request, id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

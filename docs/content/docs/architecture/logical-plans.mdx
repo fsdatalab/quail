@@ -164,10 +164,21 @@ between AI calls, the joins the AI operators need, and the scans. A
 part DataFusion computes for the region, such as a table's plain
 filters or a CTE that groups rows, becomes one of the region's inputs.
 
-The region returns its rows: ids, answers, and the input columns the
-operators above it read. DataFusion runs the rest of the part above
-the region (`crates/quail-datafusion/src/lift.rs`):
+The region returns one row per surviving document, or per surviving
+tuple of a join: the id column of each table it reads, and the
+answers of its AI calls. A table's id column is its primary key; an
+input without one, such as a CTE that groups rows, gets
+`__quail_row`, each row's position among the input's rows. DataFusion
+runs the rest of the part above the region
+(`crates/quail-datafusion/src/lift.rs` and `join_back.rs`):
 
+- for each table whose other columns the SELECT list reads, an inner
+  join of the region's rows with the table on its id, which adds those
+  columns back. The table is the join's build side and the region's
+  rows the probe side, so the rows keep the region's order. The join
+  reads a region input through the same `SharedInput` as the region,
+  so DataFusion computes the input's rows once; it scans an identified
+  table the region reads by name again;
 - each `UNNEST` of an `AI.SAE_FEATURES` list, as DataFusion's `Unnest`
   of the list column the region returns;
 - each test of the result rows: a test of more than one table's
@@ -215,7 +226,7 @@ cross into Python as JSON (`Query.operators`).
 | `joins` | Each AI join or EXISTS gate: its predicate, semantics (`full`, `exists`, or `anti`), selectivity, anchor, and the ON equalities below it. |
 | `classifies`, `extracts`, `sae_features`, `maps` | Each column operator: its model call, its answer column, and whether it runs above a join. |
 | `column_filters` | Each table's tests of answer columns, such as `sentiment IN ('negative')`. |
-| `projection` | The columns the region returns, with each extraction's struct columns. |
+| `projection` | The columns the region returns, the id column of each table and the answers, with each extraction's struct columns. |
 | `fetch` | The most rows the region returns: the fetch of its last `AiNode`, or of a LIMIT directly above it, with its OFFSET. The executor stops once that many rows pass. |
 | `stop_keys` | Each table's per-key fetch, when the region asks only that table's AI.IF filters. |
 

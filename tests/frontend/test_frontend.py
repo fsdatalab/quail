@@ -80,8 +80,8 @@ def test_sql_dialects_and_join_spellings_produce_the_same_plan(catalog):
     star = compile_operators(
         "SELECT * FROM reviews r WHERE "
         "AI_FILTER(PROMPT('neg: {0}', r.review))", catalog)
-    assert [(c.alias, c.column) for c in star.projection.columns] == \
-        [("r", "id"), ("r", "review")]
+    # the region returns the id; DataFusion joins the review back
+    assert [(c.alias, c.column) for c in star.projection.columns] == [("r", "id")]
 
     snowflake = compile_sql(
         "SELECT r.id FROM reviews r WHERE "

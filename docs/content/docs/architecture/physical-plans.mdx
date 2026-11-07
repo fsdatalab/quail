@@ -36,18 +36,17 @@ it identifies each review by its row position in the input table,
 starting at zero. Quail calls this position a document ID. It is separate
 from the value in `reviews.id`.
 
-Quail uses four operators to execute this query. Each box
+Quail uses three operators to execute this query. Each box
 represents an operator. Each arrow shows the data passed between operators.
 
 <Mermaid chart={`flowchart TD
     scan["Scan"]
     classify["AiClassify"]
     filter["Filter"]
-    project["Project"]
+    rows["region rows"]
     scan -->|Document IDs| classify
     classify -->|Document IDs and labels| filter
-    filter -->|Document IDs for negative reviews| project
-    classify -->|Document IDs and labels| project
+    filter -->|Document IDs and labels of negative reviews| rows
 `} />
 
 1. **Scan** returns the document IDs for the `reviews` input.
@@ -55,9 +54,15 @@ represents an operator. Each arrow shows the data passed between operators.
    corresponding reviews. It produces a table of document IDs and labels.
 3. **Filter** reads that table and keeps the document IDs whose label is
    `negative`. This comparison runs on the CPU.
-4. **Project** receives the selected document IDs and the classification
-   table. It reads `reviews.id` for each selected review and adds the
-   classification label. The result has `id` and `sentiment` columns.
+
+The region's rows are built from the operators' outputs, not by an
+operator: one row per surviving document, or per surviving tuple of an
+AI join, with the id column of each table, here `reviews.id`, and each
+answer the SELECT list reads, here the label. Rust joins the surviving
+documents, each full join's true pairs, and each answer table on
+document IDs (`quail::results::region_rows`). A query that also reads
+another column of `reviews`, such as `title`, gets it from DataFusion,
+which joins `reviews` back on `id` above the region.
 
 The `SELECT` and `WHERE` expressions use the same classification output.
 Quail does not classify each review again for the `SELECT` expression.
@@ -95,6 +100,26 @@ SortExec: TopK(fetch=25), expr=[commit_score@1 DESC NULLS LAST, id@0 ASC NULLS L
 
 `ModelRegionExec` runs the region. Its inputs below it are the rows
 DataFusion computes for it, here the calls in the Negotiation stage.
+It returns one stream of the region's rows, after the whole region
+has run; with several GPUs, the coordinator merges each GPU's outputs
+first.
+
+When the SELECT list reads a table's columns besides its id,
+DataFusion joins the table back above the region. For example, a query
+that returns each review's `stars` beside a classification:
+
+```text
+DataFusion:
+HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(__quail_key_r@0, id@0)], projection=[id@2, stars@1, kind@3]
+  ProjectionExec: expr=[id@0 as __quail_key_r, stars@1 as stars]
+    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+  ModelRegionExec
+```
+
+The table is the join's build side, so the rows keep the region's
+order. When DataFusion computes a table's rows for the region, the
+join reads them through the same `SharedInputExec` as the region, so
+they are computed once.
 
 ## Inspect the plan
 

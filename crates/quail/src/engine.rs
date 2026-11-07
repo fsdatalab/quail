@@ -19,7 +19,7 @@ use pyo3::types::IntoPyDict;
 use std::collections::HashMap;
 
 use quail_datafusion::{
-    IdentifiedTable, InputRows, ModelRegion, RegionBatches, RegionRunner, derive,
+    IdentifiedTable, InputRows, ModelRegion, RegionBatches, RegionRunner, SharedInput, derive,
     quail_column_names,
 };
 use quail_planner::operators::Operators;
@@ -383,6 +383,12 @@ fn whole_table_identity(input: &datafusion::logical_expr::LogicalPlan) -> Option
                 });
             }
             LogicalPlan::SubqueryAlias(_) | LogicalPlan::Projection(_) => {}
+            LogicalPlan::Extension(extension)
+                if extension
+                    .node
+                    .as_any()
+                    .downcast_ref::<SharedInput>()
+                    .is_some() => {}
             _ => whole = false,
         }
         Ok(TreeNodeRecursion::Continue)

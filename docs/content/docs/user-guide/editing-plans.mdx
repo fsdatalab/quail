@@ -74,18 +74,17 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens
 
                                                  est. rows  est. pass  est. time
-  Project: c.id, e.id
-    AiJoin: anchor=c                                                     4.29 ms
-      KV: anchor=streamed from its filter, retain after join=no
-      join 1 full (c, e) over hash_join:c-e            0.6       20%*
-      AiFilter: c                                      0.6               2.39 ms
-        survivors stream into the join with KV pinned
-        predicate 1                                      3       20%*
-        Scan claims as c
-          tokens=306, mean_document_tokens=102
-      Scan evidence as e
-        tokens=4,506, mean_document_tokens=1,502
-      HashJoin: c.evidence_wiki_url = e.id
+  AiJoin: anchor=c                                                     4.29 ms
+    KV: anchor=streamed from its filter, retain after join=no
+    join 1 full (c, e) over hash_join:c-e            0.6       20%*
+    AiFilter: c                                      0.6               2.39 ms
+      survivors stream into the join with KV pinned
+      predicate 1                                      3       20%*
+      Scan claims as c
+        tokens=306, mean_document_tokens=102
+    Scan evidence as e
+      tokens=4,506, mean_document_tokens=1,502
+    HashJoin: c.evidence_wiki_url = e.id
 ```
 
 The line "survivors stream into the join with KV pinned" means a claim

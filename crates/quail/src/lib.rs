@@ -33,7 +33,9 @@ use datafusion::common::{Constraint, Constraints, DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use pyo3::prelude::*;
-use quail_datafusion::{IdentifiedTable, InputRows, ModelRegion, RegionRunner, quail_schema};
+use quail_datafusion::{
+    IdentifiedTable, InputRows, ModelRegion, RegionRunner, SharedInput, quail_schema,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -392,11 +394,19 @@ impl Session {
     pub fn regions(&self, query: &str, dialect: Option<&str>) -> Result<Vec<ModelRegion>> {
         let plan = self.optimized_plan(query, dialect)?;
         let mut regions = Vec::new();
+        // a shared input's rows are computed once, however often it is read
+        let mut shared = Vec::new();
         plan.apply(|node| {
-            if let LogicalPlan::Extension(extension) = node
-                && let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>()
-            {
-                regions.push(region.clone());
+            if let LogicalPlan::Extension(extension) = node {
+                if let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>() {
+                    regions.push(region.clone());
+                }
+                if let Some(input) = extension.node.as_any().downcast_ref::<SharedInput>() {
+                    if shared.contains(&input.key) {
+                        return Ok(TreeNodeRecursion::Jump);
+                    }
+                    shared.push(input.key);
+                }
             }
             Ok(TreeNodeRecursion::Continue)
         })?;

@@ -16,7 +16,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use datafusion::prelude::SessionContext;
 use quail_datafusion::{InputRows, ModelRegion, QuailExtension, RegionBatches, RegionRunner};
 
-/// Stands in for Quail's executor: the model keeps the review "r1".
+/// Stands in for Quail's executor: the model keeps the first review.
 #[derive(Debug)]
 struct KeepsFirstReview;
 
@@ -28,11 +28,15 @@ impl RegionRunner for KeepsFirstReview {
         _fetch: Option<usize>,
     ) -> Result<RegionBatches> {
         let schema = Arc::new(region.plan.schema().as_arrow().clone());
+        // one row: each id column, such as a row number, read from "0"
         let columns = schema
             .fields()
             .iter()
-            .map(|_| Arc::new(StringArray::from(vec!["r1"])) as Arc<dyn Array>)
-            .collect();
+            .map(|field| {
+                let value: Arc<dyn Array> = Arc::new(StringArray::from(vec!["0"]));
+                datafusion::arrow::compute::cast(&value, field.data_type())
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(Box::new(std::iter::once(Ok(batch))))
     }

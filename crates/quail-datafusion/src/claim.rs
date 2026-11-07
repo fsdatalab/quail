@@ -24,6 +24,9 @@
 //! the `AiNode`s and the operators that run with them on the GPU. The
 //! rest of the part's SELECT list, each `UNNEST`, and each test of the
 //! result rows run in DataFusion above the region ([`lift_relational`]).
+//! The region returns the id column of each table it reads and its
+//! answers; DataFusion joins the tables' other columns back on their
+//! ids ([`join_back`]).
 use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
@@ -43,8 +46,10 @@ use crate::ai::AiNode;
 use crate::extension::{as_node, extension_node};
 use crate::functions::{is_ai_call, is_quail_call};
 use crate::identified::IdentifiedTable;
+use crate::join_back::join_back;
 use crate::lift::lift_relational;
 use crate::region::ModelRegion;
+use crate::shared::{ROW_COLUMN, SharedInput, row_field};
 use quail_planner::expressions::UNSUPPORTED;
 
 /// The name of [`ClaimModelRegions`], which runs after every other
@@ -106,7 +111,10 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
     if !kept_by_datafusion(&plan)? {
         let selected = select_list(plan.clone(), None)?;
         let (bound, inputs, _) = split_inputs(selected)?;
+        let numbered_inputs = numbered(&bound);
         let (bound, above) = lift_relational(bound)?;
+        let names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
+        let (bound, back) = join_back(bound, &names)?;
         if calls_ai(&bound)? && quail_plans(&bound)? {
             refused = refusal_of(&bound);
             if refused.is_none() {
@@ -114,11 +122,19 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
                 // a fetch counts the rows the region returns, not the
                 // rows a lifted test or UNNEST keeps of them
                 region.fetch = fetch.filter(|_| above.keeps_rows());
+                let shared = back.inputs();
+                let mut read = Vec::new();
                 for (name, input) in inputs {
-                    region.inputs.push(claim_regions(input, None)?);
+                    let mut input = claim_regions(input, None)?;
+                    let numbered = numbered_inputs.contains(&name);
+                    if numbered || shared.contains(&name) {
+                        input = extension_node(SharedInput::try_new(input, numbered)?);
+                    }
+                    read.push((name.clone(), input.clone()));
+                    region.inputs.push(input);
                     region.input_names.push(name);
                 }
-                return above.build(extension_node(region));
+                return above.build(back.build(extension_node(region), &read)?);
             }
         }
     }
@@ -1204,6 +1220,34 @@ fn read_by_name(plan: &LogicalPlan) -> bool {
             .is_ok_and(|provider| provider.downcast_ref::<IdentifiedTable>().is_some())
 }
 
+/// The inputs a region's plan reads with [`ROW_COLUMN`], by name: those
+/// without an id column of their own.
+fn numbered(plan: &LogicalPlan) -> Vec<String> {
+    let mut found = Vec::new();
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && scan.source.schema().index_of(ROW_COLUMN).is_ok()
+        {
+            found.push(scan.table_name.table().to_string());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+/// The schema of a placeholder for a region input: the input's columns,
+/// then [`ROW_COLUMN`] when `numbered`, as [`SharedInput`] returns them.
+fn placeholder_schema(
+    schema: &datafusion::arrow::datatypes::Schema,
+    numbered: bool,
+) -> Arc<datafusion::arrow::datatypes::Schema> {
+    let mut fields: Vec<_> = schema.fields().iter().cloned().collect();
+    if numbered {
+        fields.push(Arc::new(row_field()));
+    }
+    Arc::new(datafusion::arrow::datatypes::Schema::new(fields))
+}
+
 /// Whether DataFusion computes this part of a region as an input: it
 /// calls no model, reads one table, and is more than an identified table
 /// the runner reads by name.
@@ -1281,7 +1325,8 @@ fn split_inputs(plan: LogicalPlan) -> Result<Split> {
             if !read_before && inputs.iter().any(|(found, _)| *found == name) {
                 name = format!("{name}_{}", inputs.len());
             }
-            let schema = Arc::new(body.schema().as_arrow().clone());
+            // a CTE's rows have no id column; the region numbers them
+            let schema = placeholder_schema(body.schema().as_arrow(), true);
             let Ok(table) = MemTable::try_new(schema, vec![vec![]]) else {
                 return Ok(Transformed::no(node));
             };
@@ -1402,7 +1447,7 @@ fn cut_input(
         None => node,
     };
     let key = key.map(|(_, name)| name);
-    let fields = Arc::new(node.schema().as_arrow().clone());
+    let fields = placeholder_schema(node.schema().as_arrow(), key.is_none());
     let mut placeholder = MemTable::try_new(Arc::clone(&fields), vec![vec![]])?;
     if let Some(index) = key.and_then(|column| fields.index_of(&column).ok()) {
         placeholder =
@@ -1475,14 +1520,23 @@ fn table_input(
     }
     let name = scan.table_name.table().to_string();
     let schema = provider.schema();
-    let mut placeholder = MemTable::try_new(Arc::clone(&schema), vec![vec![]])?;
-    if let Some(constraints) = provider.constraints() {
+    let keyed = provider.constraints().is_some_and(|constraints| {
+        constraints.iter().any(|constraint| {
+            matches!(constraint, datafusion::common::Constraint::PrimaryKey(indices) if indices.len() == 1)
+        })
+    });
+    // a table without an id column has its rows numbered
+    let mut placeholder = MemTable::try_new(placeholder_schema(&schema, !keyed), vec![vec![]])?;
+    let mut projection = scan.projection.clone();
+    if keyed && let Some(constraints) = provider.constraints() {
         placeholder = placeholder.with_constraints(constraints.clone());
+    } else if let Some(read) = &mut projection {
+        read.push(schema.fields().len());
     }
     let read = LogicalPlanBuilder::scan_with_filters(
         scan.table_name.clone(),
         provider_as_source(Arc::new(placeholder)),
-        scan.projection.clone(),
+        projection,
         scan.filters.clone(),
     )?
     .build()?;

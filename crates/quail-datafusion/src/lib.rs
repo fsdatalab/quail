@@ -28,6 +28,7 @@ pub mod expressions;
 mod extension;
 mod functions;
 mod identified;
+mod join_back;
 mod joins;
 mod lift;
 mod limit;
@@ -36,6 +37,7 @@ mod placement;
 mod regexps;
 mod region;
 pub mod rules;
+mod shared;
 mod unnest;
 
 use std::sync::Arc;
@@ -63,6 +65,7 @@ pub use lower::{LowerAiCalls, lower_ai_calls};
 pub use placement::PlaceAiNodes;
 pub use region::ModelRegion;
 pub use rules::{LOGICAL_RULES, logical_rule};
+pub use shared::{ROW_COLUMN, SharedInput, SharedInputExec};
 pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 
 /// Build a DataFusion session state with Quail registered.
@@ -92,7 +95,13 @@ pub fn session_state_with_rules(
     runner: Arc<dyn RegionRunner>,
     rules: Vec<String>,
 ) -> Result<SessionState> {
-    let config = SessionConfig::from_env()?.set_str("datafusion.sql_parser.dialect", "Snowflake");
+    // the join that adds a region's tables' columns back keeps the
+    // region's row order only when one partition of the region's rows
+    // probes the whole table: no round-robin split, no partitioned join
+    let config = SessionConfig::from_env()?
+        .set_str("datafusion.sql_parser.dialect", "Snowflake")
+        .set_bool("datafusion.optimizer.enable_round_robin_repartition", false)
+        .set_bool("datafusion.optimizer.repartition_joins", false);
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()
