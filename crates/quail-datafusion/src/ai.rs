@@ -27,9 +27,11 @@
 //! rendered for a model here: physical planning renders it for the model
 //! it plans for.
 //!
-//! DataFusion's optimizer rules move filters, limits, and column lists
-//! around the node as its `UserDefinedLogicalNodeCore` methods allow;
-//! each method says which rewrites keep the node's meaning.
+//! DataFusion's optimizer rules move filters and column lists around the
+//! node as its `UserDefinedLogicalNodeCore` methods allow; each method
+//! says which rewrites keep the node's meaning. A LIMIT or DISTINCT above
+//! the node becomes its fetch (`PushDownLimitIntoAiNodes`,
+//! `PushDownDistinct`).
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -378,9 +380,9 @@ impl UserDefinedLogicalNodeCore for AiNode {
                 }
             }
         }
-        // a per-key fetch reads its key columns
+        // a per-key fetch reads its key columns, unless the key is the answer
         if let Some(Fetch::PerKey { key, .. }) = &self.fetch {
-            for name in key {
+            for name in key.iter().filter(|name| !self.is_field(name)) {
                 let found: Vec<usize> = input
                     .fields()
                     .iter()
@@ -399,15 +401,11 @@ impl UserDefinedLogicalNodeCore for AiNode {
         Some(vec![needed])
     }
 
-    /// Whether a limit above the node may also read fewer rows below it:
-    /// a node with no filter, guard, or hint returns one row per input
-    /// row, `Limit_n(AI(R)) = Limit_n(AI(Limit_n(R)))`.
+    /// False: a limit above the node becomes its fetch
+    /// ([`crate::PushDownLimitIntoAiNodes`]) rather than a copy below it,
+    /// so the executor counts the rows that pass the node.
     fn supports_limit_pushdown(&self) -> bool {
-        self.filter.is_none()
-            && self.guard.is_none()
-            && self.hint.is_none()
-            && self.semantics == Semantics::Rows
-            && !matches!(self.fetch, Some(Fetch::PerKey { .. }))
+        false
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -517,7 +515,6 @@ mod tests {
             .map(|f| f.name().clone())
             .collect();
         assert_eq!(names, ["id", "body", "stars", "tone"]);
-        assert!(node.supports_limit_pushdown());
     }
 
     #[test]
@@ -640,20 +637,31 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_stays_above_a_node_with_a_hint() {
+    fn a_limit_becomes_the_fetch_of_a_node_without_a_hint() {
         let limited = |hint: Option<Expr>| {
             let plan = LogicalPlanBuilder::from(tone(None, hint))
                 .limit(0, Some(2))
                 .unwrap()
                 .build()
                 .unwrap();
-            let lines = optimized(plan);
-            let node = position(&lines, "AiNode");
-            lines[node..].iter().any(|line| line.starts_with("Limit"))
+            optimized(plan)
         };
-        // a hint's rows are a sub-list of the rows a limit would read
-        assert!(!limited(Some(lit(0.5))));
-        assert!(limited(None));
+        let lines = limited(None);
+        assert!(
+            lines[position(&lines, "AiNode")].contains("fetch: 2"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("Limit")),
+            "{lines:?}"
+        );
+        let lines = limited(Some(lit(0.5)));
+        let node = position(&lines, "AiNode");
+        assert!(position(&lines, "Limit") < node, "{lines:?}");
+        assert!(
+            !lines[node..].iter().any(|line| line.starts_with("Limit")),
+            "{lines:?}"
+        );
     }
 
     #[test]

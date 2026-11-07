@@ -8,13 +8,13 @@ from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
 from quail.specs import DEVICES, MODELS
 
 # the logical optimizer rules, in order, as quail_datafusion::LOGICAL_RULES
-# names them: DataFusion's default rules with Quail's four before
+# names them: DataFusion's default rules with Quail's five before
 # replace_distinct_aggregate; claim_model_regions always runs after them
 LOGICAL_RULES = (
     "rewrite_set_comparison", "optimize_unions", "unions_to_filter",
     "simplify_expressions",
     "eliminate_distinct", "place_ai_nodes", "absorb_into_ai_nodes",
-    "push_down_distinct",
+    "push_down_distinct", "push_down_limit_into_ai_nodes",
     "replace_distinct_aggregate", "eliminate_join",
     "decorrelate_predicate_subquery", "scalar_subquery_to_join",
     "decorrelate_lateral_join", "extract_equijoin_predicate",
@@ -33,15 +33,20 @@ PHYSICAL_RULES = (
 )
 
 
-def built_in_registry() -> ExtensionRegistry:
-    """Create one registry with Quail built ins."""
+def built_in_registry(logical_rules=LOGICAL_RULES) -> ExtensionRegistry:
+    """Create one registry with Quail built ins.
+
+    Args:
+        logical_rules: The names of the logical rules to register, in the
+            order they apply; leaving a rule out turns it off.
+    """
     registry = ExtensionRegistry()
     for model in MODELS.values():
         registry.register_model(model)
     for device in DEVICES.values():
         registry.register_device(device)
     registry.register_backend(QuailBackend())
-    for name in LOGICAL_RULES:
+    for name in logical_rules:
         registry.register_logical_rule(LogicalRule(name))
     for name in PHYSICAL_RULES:
         registry.register_physical_rule(PhysicalRule(name))

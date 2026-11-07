@@ -2,15 +2,16 @@
 //!
 //! DataFusion's optimizer runs its own rules over the whole plan, each
 //! `AiNode` included, with Quail's rules among them. [`LOGICAL_RULES`]
-//! is the default order: DataFusion's default rules, with Quail's four
+//! is the default order: DataFusion's default rules, with Quail's five
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
-//! GROUP BY that Quail's DISTINCT rules do not read. Then
+//! GROUP BY. Then
 //! [`crate::ClaimModelRegions`] runs last: it runs the listed rules
 //! until the plan stops changing, then claims the model regions.
 //!
 //! Each `AiNode` tells DataFusion's rules what they may do around it:
-//! which filters may move below it, which columns it reads, and whether
-//! a limit may move below it (see [`crate::ai::AiNode`]).
+//! which filters may move below it and which columns it reads (see
+//! [`crate::ai::AiNode`]). A limit does not move below a node: it
+//! becomes the node's fetch ([`crate::PushDownLimitIntoAiNodes`]).
 
 use std::sync::Arc;
 
@@ -18,11 +19,12 @@ use datafusion::common::{Result, plan_err};
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 
 /// Quail's own rules, in the order they run.
-pub const QUAIL_RULES: [&str; 4] = [
+pub const QUAIL_RULES: [&str; 5] = [
     "eliminate_distinct",
     "place_ai_nodes",
     "absorb_into_ai_nodes",
     "push_down_distinct",
+    "push_down_limit_into_ai_nodes",
 ];
 
 /// The rule Quail's rules run before.
@@ -30,7 +32,7 @@ const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
 
 /// The logical optimizer rules a session runs by default, in order: each
 /// name is an `OptimizerRule`'s `name()`.
-pub const LOGICAL_RULES: [&str; 29] = [
+pub const LOGICAL_RULES: [&str; 30] = [
     "rewrite_set_comparison",
     "optimize_unions",
     "unions_to_filter",
@@ -39,6 +41,7 @@ pub const LOGICAL_RULES: [&str; 29] = [
     "place_ai_nodes",
     "absorb_into_ai_nodes",
     "push_down_distinct",
+    "push_down_limit_into_ai_nodes",
     "replace_distinct_aggregate",
     "eliminate_join",
     "decorrelate_predicate_subquery",
@@ -68,6 +71,7 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
         "place_ai_nodes" => Arc::new(crate::placement::PlaceAiNodes),
         "absorb_into_ai_nodes" => Arc::new(crate::absorb::AbsorbIntoAiNodes),
         "push_down_distinct" => Arc::new(crate::distinct::PushDownDistinct),
+        "push_down_limit_into_ai_nodes" => Arc::new(crate::limit::PushDownLimitIntoAiNodes),
         _ => return None,
     })
 }

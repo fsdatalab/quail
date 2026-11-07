@@ -113,9 +113,9 @@ are DataFusion optimizer rules that run over the whole plan, Quail's
 `AiNode`s included; physical rules rewrite Quail's executable graphs.
 
 The logical rules are DataFusion's default rules, from
-`rewrite_set_comparison` to `optimize_projections`, with Quail's four
+`rewrite_set_comparison` to `optimize_projections`, with Quail's five
 before `replace_distinct_aggregate`, which turns a DISTINCT into a
-GROUP BY that Quail's DISTINCT rules do not read. The table lists
+GROUP BY. The table lists
 Quail's rules and the DataFusion rules that most change a model
 region.
 
@@ -125,13 +125,14 @@ region.
 | `eliminate_distinct` | Logical | Remove DISTINCT when the SELECT list returns every table's id column. | No |
 | `place_ai_nodes` | Logical | Move each model operator to the tables it reads and order each table's operators. | No |
 | `absorb_into_ai_nodes` | Logical | Make each test of an answer column the filter of the `AiNode` that adds it. | No |
-| `push_down_distinct` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
+| `push_down_distinct` | Logical | Give the AI operator under a DISTINCT a fetch of one row per selected key: input columns, or a classification's label. | No |
+| `push_down_limit_into_ai_nodes` | Logical | Make a LIMIT, with its OFFSET, the fetch of the AI operator whose rows it reads. | No |
 | `decorrelate_predicate_subquery` | Logical | DataFusion's rule: run an IN or EXISTS subquery as a semi or anti join. | No |
-| `push_down_limit` | Logical | DataFusion's rule: move a LIMIT below operators that keep one row per row. | No |
+| `push_down_limit` | Logical | DataFusion's rule: move a LIMIT below operators that keep one row per row, but not below an AI operator. | No |
 | `push_down_filter` | Logical | DataFusion's rule: move plain filters to the scans. | No |
 | `optimize_projections` | Logical | DataFusion's rule: drop columns no operator reads. | No |
 | `claim_model_regions` | Logical | Run the rules above until the plan stops changing, then claim each model region. Always last. | No |
-| `should_push_down_limit` | Physical | Stop an eligible filter sequence after enough documents pass. | No |
+| `should_push_down_limit` | Physical | Stop an eligible filter sequence once the region's fetch, or its LIMIT, of documents pass. | No |
 | `choose_classify_implementation` | Physical | Choose a classification's label scoring method. | Yes |
 | `should_retain_kv` | Physical | Keep selected document KV for later operators. | No |
 | `should_share_prefixes` | Physical | Reuse KV between documents with a shared prefix. | Yes |

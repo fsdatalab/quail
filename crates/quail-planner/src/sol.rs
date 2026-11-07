@@ -112,7 +112,7 @@ fn round_to(value: f64, digits: usize) -> f64 {
 /// Refuse any operator the estimate cannot price, as `_refuse_unpriced`.
 fn refuse_unpriced(found: &Operators) -> Result<(), CompileError> {
     let result = &found.result;
-    if result.limit.is_some()
+    if found.limit().is_some()
         && !(!result.order.is_empty() || result.distinct || result.offset != 0)
     {
         return not_priced("the speed of light estimate does not price LIMIT");

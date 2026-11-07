@@ -49,6 +49,36 @@ session = quail.Session(config, registry=registry)
 Registering an object that is not a `LogicalRule` or a `PhysicalRule`
 raises `TypeError`.
 
+A logical rule is turned off by leaving its name out of the registry.
+For example, imagine a test that checks a query returns the same rows
+with and without `push_down_limit_into_ai_nodes`, which makes a LIMIT
+the fetch of the `AiNode` below it:
+
+```python
+from quail.builtins import LOGICAL_RULES, built_in_registry
+
+rules = [name for name in LOGICAL_RULES if name != "push_down_limit_into_ai_nodes"]
+session = quail.Session(config, registry=built_in_registry(logical_rules=rules))
+```
+
+## Fetch rules
+
+An `AiNode`'s fetch keeps the first rows that pass its filter, of all
+rows or of each key, and lets the executor stop asking the model. A
+rule that sets a fetch follows two conditions:
+
+- The node's tests are its own filter first. A fetch counts rows after
+  the filter, and `absorb_into_ai_nodes` absorbs nothing into a node
+  with a fetch.
+- Only operators that keep one row per row are between the LIMIT or
+  DISTINCT and the node, and the node has no `HINT`.
+
+`push_down_limit_into_ai_nodes` and `push_down_distinct`, in
+[`limit.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/limit.rs)
+and
+[`distinct.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/distinct.rs),
+are the built-in examples.
+
 ## Rule order
 
 Rules run in registration order within each step:

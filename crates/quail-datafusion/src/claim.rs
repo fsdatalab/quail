@@ -12,7 +12,10 @@
 //! whole subtree Quail can plan, and which calls an AI function
 //! somewhere in that subtree, is lowered; the walk does not look below
 //! it. A `Limit`, its `Sort`, and a `Distinct` directly over the AI work
-//! stay with it, where Quail can stop the model early. Its root is a
+//! stay with it. DataFusion's optimizer makes such a `Limit` the fetch of
+//! the `AiNode` it reads ([`crate::PushDownLimitIntoAiNodes`]), and a
+//! `Distinct` a per-key fetch ([`crate::PushDownDistinct`]), where Quail
+//! can stop the model early. Its root is a
 //! SELECT list: a part with none gets a `Projection` of the columns the
 //! operators above it read.
 //!
@@ -30,15 +33,15 @@ use datafusion::common::{Column, DataFusionError, Result, TableReference, plan_e
 use datafusion::datasource::{MemTable, provider_as_source, source_as_provider};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
-    Aggregate, Distinct, Expr, FetchType, Filter, Limit, LogicalPlan, LogicalPlanBuilder,
-    Projection, SkipType, SubqueryAlias, TableScan, TableScanBuilder, UserDefinedLogicalNodeCore,
-    Window,
+    Aggregate, Distinct, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Projection, SubqueryAlias,
+    TableScan, TableScanBuilder, Window,
 };
 use datafusion::optimizer::{
     Analyzer, Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule,
 };
 
 use crate::ai::AiNode;
+use crate::distinct::is_distinct;
 use crate::extension::{as_node, extension_node};
 use crate::functions::{is_ai_call, is_quail_call};
 use crate::identified::IdentifiedTable;
@@ -99,7 +102,7 @@ fn claim_regions(plan: LogicalPlan, limited: bool) -> Result<LogicalPlan> {
     }
     let mut refused = None;
     if !kept_by_datafusion(&plan, limited, true)? {
-        let selected = select_list(as_written(plan.clone())?, None)?;
+        let selected = select_list(plan.clone(), None)?;
         let (bound, inputs, _) = split_inputs(selected)?;
         let bound = restore_distinct(bound)?;
         let read_none = bound.schema().fields().is_empty();
@@ -167,94 +170,12 @@ fn with_a_column(plan: LogicalPlan) -> Result<LogicalPlan> {
     )?))
 }
 
-/// Whether an `Aggregate` is a `DISTINCT`: it groups by each of its
-/// input's columns, in order, and computes nothing else.
-///
-/// DataFusion's `replace_distinct_aggregate` writes a `DISTINCT` so.
-fn is_distinct(aggregate: &Aggregate) -> bool {
-    let columns: Vec<Expr> = aggregate
-        .input
-        .schema()
-        .columns()
-        .into_iter()
-        .map(Expr::Column)
-        .collect();
-    aggregate.aggr_expr.is_empty() && aggregate.group_expr == columns
-}
-
-/// A region's plan with its `LIMIT` where the query wrote it, above its
-/// SELECT list, as Quail reads it.
-///
-/// DataFusion moves a `LIMIT` below the SELECT list and copies it below
-/// each `AiNode` that returns a row per input row; Quail's physical
-/// planner moves the limit down itself.
-fn as_written(plan: LogicalPlan) -> Result<LogicalPlan> {
-    let plan = match plan {
-        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
-            LogicalPlan::Limit(limit) => {
-                let below = Projection::try_new(projection.expr.clone(), Arc::clone(&limit.input))?;
-                LogicalPlan::Limit(Limit {
-                    skip: limit.skip.clone(),
-                    fetch: limit.fetch.clone(),
-                    input: Arc::new(LogicalPlan::Projection(below)),
-                })
-            }
-            _ => LogicalPlan::Projection(projection),
-        },
-        other => other,
-    };
-    plan.transform_down(|node| {
-        let LogicalPlan::Limit(limit) = &node else {
-            return Ok(Transformed::no(node));
-        };
-        let (Ok(SkipType::Literal(skip)), Ok(FetchType::Literal(Some(fetch)))) =
-            (limit.get_skip_type(), limit.get_fetch_type())
-        else {
-            return Ok(Transformed::no(node));
-        };
-        let input = without_copies(limit.input.as_ref().clone(), skip + fetch, false)?;
-        Ok(Transformed::yes(LogicalPlan::Limit(Limit {
-            skip: limit.skip.clone(),
-            fetch: limit.fetch.clone(),
-            input: Arc::new(input),
-        })))
-    })
-    .map(|done| done.data)
-}
-
-/// `plan`, the input of a limit of `rows` rows, without the copies of
-/// that limit DataFusion's `push_down_limit` put below an `AiNode`: a
-/// `Limit` of `rows`, or a scan's fetch of `rows`. `below` says an
-/// `AiNode` is above `plan`.
-fn without_copies(plan: LogicalPlan, rows: usize, below: bool) -> Result<LogicalPlan> {
-    let copy = |limit: &Limit| {
-        matches!(limit.get_skip_type(), Ok(SkipType::Literal(0)))
-            && matches!(limit.get_fetch_type(), Ok(FetchType::Literal(Some(found))) if found == rows)
-    };
-    match plan {
-        LogicalPlan::Limit(limit) if below && copy(&limit) => {
-            without_copies(limit.input.as_ref().clone(), rows, below)
-        }
-        LogicalPlan::TableScan(mut scan) if below && scan.fetch == Some(rows) => {
-            scan.fetch = None;
-            Ok(LogicalPlan::TableScan(scan))
-        }
-        LogicalPlan::Extension(_)
-            if as_node::<AiNode>(&plan).is_some_and(|node| node.supports_limit_pushdown()) =>
-        {
-            let input = without_copies(plan.inputs()[0].clone(), rows, true)?;
-            plan.with_new_exprs(plan.expressions(), vec![input])
-        }
-        LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => {
-            let input = without_copies(plan.inputs()[0].clone(), rows, below)?;
-            plan.with_new_exprs(plan.expressions(), vec![input])
-        }
-        other => Ok(other),
-    }
-}
-
 /// `plan` with each `Aggregate` that is a `DISTINCT` written as one
 /// again, as Quail reads a region's `DISTINCT`.
+///
+/// DataFusion's `replace_distinct_aggregate` writes each `DISTINCT` as a
+/// GROUP BY, which its physical planner requires; the region runs its own
+/// `DISTINCT` until DataFusion runs the operators above the region.
 fn restore_distinct(plan: LogicalPlan) -> Result<LogicalPlan> {
     plan.transform_up(|node| match &node {
         LogicalPlan::Aggregate(aggregate) if is_distinct(aggregate) => Ok(Transformed::yes(
@@ -845,7 +766,7 @@ fn refusal(plan: &LogicalPlan, config: &ConfigOptions) -> Result<Option<String>>
     else {
         return Ok(None);
     };
-    let selected = select_list(as_written(optimized)?, None)?;
+    let selected = select_list(optimized, None)?;
     Ok(refusal_of(&restore_distinct(selected)?))
 }
 

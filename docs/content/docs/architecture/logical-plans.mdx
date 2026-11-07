@@ -124,10 +124,25 @@ AiNode: AI.IF('Review {0} discusses product {1}', r.body, p.text)
     TableScan: products as p
 ```
 
-The DISTINCT rules run before DataFusion turns a DISTINCT into a GROUP
-BY: `EliminateDistinct` removes a DISTINCT when the SELECT list returns
-each table's id column, and `PushDownDistinct` gives a one-table
-query's last AI.IF `AiNode` a fetch of one row per selected key.
+Two rules give an `AiNode` a fetch, so the executor can stop asking
+the model once enough rows pass. Each runs only on a node with no fetch
+and no hint, after the tests of its answer are its own filter, since a
+fetch counts the rows that pass the filter:
+
+- `PushDownLimitIntoAiNodes` makes a LIMIT the fetch of the `AiNode`
+  below it, when only projections are between them:
+  `Limit_k(AI(R)) ⇒ AI(R; n = k)`. A LIMIT with an OFFSET of `m` stays
+  and fetches `k + m` rows: `Limit_{k,m}(AI(R)) ⇒ Limit_{k,m}(AI(R; n = k + m))`.
+  An ORDER BY with a LIMIT is not one: it reads every row.
+- `PushDownDistinct` gives the `AiNode` under a DISTINCT a fetch of one
+  row per value of the selected columns `K`:
+  `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))`. `K` is columns of the
+  node's input, or the node's answer alone, such as a classification's
+  label. It reads a DISTINCT before and after DataFusion turns it into a
+  GROUP BY, so a filter on `K` above the DISTINCT does not stop it.
+
+`EliminateDistinct` removes a DISTINCT when the SELECT list returns
+each table's id column.
 
 Each `AiNode` tells DataFusion's rules what they may do around it:
 
@@ -137,8 +152,7 @@ Each `AiNode` tells DataFusion's rules what they may do around it:
   moves, as it keeps or drops each key's rows whole.
 - A test of the answer stays above the node, and `AbsorbIntoAiNodes`
   makes it the node's filter only when the node has no fetch.
-- A LIMIT moves below a node only when the node returns one row per
-  input row: no filter, guard, hint, or per-key fetch.
+- A LIMIT does not move below a node; it becomes the node's fetch.
 - Projection pruning keeps the columns the node's call, filter, tests,
   and per-key fetch read.
 
@@ -183,7 +197,9 @@ cross into Python as JSON (`Query.operators`).
 | `classifies`, `extracts`, `sae_features`, `maps` | Each column operator: its model call, its answer column, and whether it runs above a join. |
 | `column_filters` | Each table's tests of answer columns, such as `sentiment IN ('negative')`. |
 | `projection` | The SELECT list, with each extraction's struct columns. |
-| `result` | ORDER BY, DISTINCT, OFFSET, and LIMIT. |
+| `result` | ORDER BY, DISTINCT, OFFSET, and a LIMIT that is not a fetch. |
+| `fetch` | The fetch of the region's last `AiNode`: the rows a LIMIT and its OFFSET need, after which the executor stops. |
+| `stop_keys` | Each table's per-key fetch, when the region asks only that table's AI.IF filters. |
 | `after_projection` | The operators on result rows above the SELECT list: each `UNNEST`, each test of more than one table's columns, and the outer SELECT list. |
 
 A query joining three or more tables has one join for each binary

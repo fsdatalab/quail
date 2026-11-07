@@ -29,6 +29,7 @@ mod extension;
 mod functions;
 mod identified;
 mod joins;
+mod limit;
 mod lower;
 mod placement;
 mod regexps;
@@ -56,6 +57,7 @@ pub use exec::{InputRows, ModelRegionExec, ModelRegionPlanner, RegionBatches, Re
 pub use extension::QuailExtension;
 pub use functions::{AI_FUNCTION_NAMES, brace_structs, is_ai_call, quail_functions};
 pub use identified::IdentifiedTable;
+pub use limit::PushDownLimitIntoAiNodes;
 pub use lower::{LowerAiCalls, lower_ai_calls};
 pub use placement::PlaceAiNodes;
 pub use region::ModelRegion;

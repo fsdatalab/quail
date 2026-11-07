@@ -774,7 +774,7 @@ fn result_nodes(
             },
         }));
         last = port("sort", "rows");
-    } else if let Some(limit) = root.limit {
+    } else if let Some(limit) = found.limit() {
         nodes.push(PhysicalNode::Limit(Node {
             id: "limit".into(),
             inputs: input_ports(&[port("project", "rows")]),

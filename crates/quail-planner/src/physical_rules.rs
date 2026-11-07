@@ -55,11 +55,15 @@ fn should_push_down_limit(graph: &Graph, settings: &mut Map<String, Value>) -> R
         _ => None,
     });
     let pipelines = build_pipelines(&graph.nodes, &[]);
+    // a sort that only skips an OFFSET reads the rows in the Limit's order
     let blocked = pipelines.members.len() > 1
-        || graph
-            .nodes
-            .iter()
-            .any(|node| matches!(node, PhysicalNode::Sort(_) | PhysicalNode::AiJoin(_)));
+        || graph.nodes.iter().any(|node| match node {
+            PhysicalNode::Sort(sort) => {
+                !sort.attributes.keys.is_empty() || sort.attributes.distinct
+            }
+            PhysicalNode::AiJoin(_) => true,
+            _ => false,
+        });
     match limit {
         Some(count) if !blocked => {
             settings.insert("filter_limit".into(), Value::from(count));

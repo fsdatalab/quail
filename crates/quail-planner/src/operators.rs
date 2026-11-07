@@ -171,7 +171,11 @@ pub struct Projection {
     pub structs: Vec<ExtractStruct>,
 }
 
-/// `ORDER BY`, `DISTINCT`, `OFFSET`, and `LIMIT`.
+/// `ORDER BY`, `DISTINCT`, `OFFSET`, and `LIMIT`, as the region runs
+/// them on its result rows.
+///
+/// A LIMIT that DataFusion's rules made the fetch of the region's last
+/// AI operator is `Operators::fetch` instead.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResultModifiers {
     pub limit: Option<i64>,
@@ -233,6 +237,10 @@ pub struct Operators {
     pub column_filters: Vec<(String, Vec<ColumnTest>)>,
     pub projection: Projection,
     pub result: ResultModifiers,
+    /// The fetch of the region's last AI operator: the first rows that
+    /// pass it, which a LIMIT and its OFFSET need. The executor stops
+    /// asking the model once that many rows pass.
+    pub fetch: Option<i64>,
     /// The operators on result rows above the SELECT list, lowest first.
     pub after_projection: Vec<RowOperator>,
     /// alias -> the DISTINCT stop key of its AI.IF predicates.
@@ -246,6 +254,16 @@ impl Operators {
     pub fn limited(mut self, fetch: i64) -> Self {
         self.result.limit = Some(self.result.limit.map_or(fetch, |limit| limit.min(fetch)));
         self
+    }
+
+    /// The rows a Limit after the SELECT list keeps, when no ORDER BY,
+    /// DISTINCT, or OFFSET runs there: the smaller of the region's LIMIT
+    /// and its last AI operator's fetch.
+    pub fn limit(&self) -> Option<i64> {
+        match (self.result.limit, self.fetch) {
+            (Some(limit), Some(fetch)) => Some(limit.min(fetch)),
+            (limit, fetch) => limit.or(fetch),
+        }
     }
 
     /// The column operators of every kind: classifications,

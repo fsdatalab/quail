@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Distinct, Expr, Join, JoinType, LogicalPlan, SortExpr};
@@ -51,6 +51,7 @@ use crate::ai::{AiNode, Fetch, Semantics, WrittenTest};
 use crate::binding::{
     Binder, Selected, check_labels, label_test, output_name, string_literal, unsupported,
 };
+use crate::extension::as_node;
 use crate::functions::column_call_kind;
 use crate::lower::quail_function;
 use crate::region::ModelRegion;
@@ -178,6 +179,7 @@ fn derive_operators(
     let listed = with_select_list(plan);
     let top = read_top(&listed)?;
     refuse_grouped_input(top.relation)?;
+    let fetch = read_fetch(&top).ok_or_else(|| unplaced(plan))?;
     let mut walk = Walk::default();
     walk.visit(top.relation);
     if let Some(error) = walk.refusal.take() {
@@ -265,7 +267,13 @@ fn derive_operators(
         offset: top.offset,
         distinct: top.distinct,
     };
-    if found.result.limit.is_some_and(|limit| limit <= 0) {
+    found.fetch = fetch;
+    if found
+        .result
+        .limit
+        .or(found.fetch)
+        .is_some_and(|limit| limit <= 0)
+    {
         return compile_error("LIMIT must be a positive integer");
     }
     if found.result.offset < 0 {
@@ -284,6 +292,17 @@ fn unplaced(plan: &LogicalPlan) -> CompileError {
         "the placement of these operators {UNSUPPORTED}:\n{}",
         plan.display_indent()
     ))
+}
+
+/// Whether an operator is one that [`read_top`] reads above a SELECT
+/// list: DataFusion's `push_down_limit` moves a LIMIT below the outer
+/// SELECT list, and an ORDER BY of a column the SELECT list does not
+/// return has one above it.
+fn above_select_list(plan: &LogicalPlan) -> bool {
+    matches!(
+        plan,
+        LogicalPlan::Limit(_) | LogicalPlan::Sort(_) | LogicalPlan::Distinct(_)
+    )
 }
 
 /// `plan` with a SELECT list under its LIMIT, ORDER BY, and DISTINCT:
@@ -311,12 +330,7 @@ fn with_select_list(plan: &LogicalPlan) -> LogicalPlan {
             plan.with_new_exprs(plan.expressions(), inputs)
                 .unwrap_or_else(|_| plan.clone())
         }
-        LogicalPlan::Projection(projection)
-            if matches!(
-                projection.input.as_ref(),
-                LogicalPlan::Sort(_) | LogicalPlan::Distinct(_)
-            ) =>
-        {
+        LogicalPlan::Projection(projection) if above_select_list(&projection.input) => {
             let input = with_select_list(&projection.input);
             plan.with_new_exprs(plan.expressions(), vec![input])
                 .unwrap_or_else(|_| plan.clone())
@@ -382,11 +396,7 @@ fn read_top(plan: &LogicalPlan) -> Result<Top<'_>, CompileError> {
                 return compile_error("DISTINCT ON is not supported; use DISTINCT");
             }
             LogicalPlan::Projection(found)
-                if outer_projection.is_none()
-                    && matches!(
-                        *found.input,
-                        LogicalPlan::Sort(_) | LogicalPlan::Distinct(_)
-                    ) =>
+                if outer_projection.is_none() && above_select_list(&found.input) =>
             {
                 outer_projection = Some(&found.expr);
                 node = &found.input;
@@ -400,7 +410,8 @@ fn read_top(plan: &LogicalPlan) -> Result<Top<'_>, CompileError> {
     let mut expressions = projection.expr.clone();
     if let Some(outer) = outer_projection {
         // ORDER BY a column SELECT does not return: the inner
-        // projection adds it, the outer one drops it
+        // projection adds it, the outer one drops it; or a LIMIT that
+        // DataFusion moved below the SELECT list
         expressions = outer
             .iter()
             .map(|expr| match expr {
@@ -422,6 +433,33 @@ fn read_top(plan: &LogicalPlan) -> Result<Top<'_>, CompileError> {
         projection: expressions,
         relation: projection.input.as_ref(),
     })
+}
+
+/// The global fetch of the region's last `AiNode`, which a LIMIT became
+/// (`PushDownLimitIntoAiNodes`); None, in the outer Option, when another
+/// node has one, or an ORDER BY or DISTINCT reads the node's rows, as the
+/// region's operators cannot place a LIMIT there.
+fn read_fetch(top: &Top<'_>) -> Option<Option<i64>> {
+    let mut last = top.relation;
+    while let LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) = last {
+        last = last.inputs()[0];
+    }
+    let last = as_node::<AiNode>(last);
+    let mut fetch = None;
+    let mut elsewhere = false;
+    let _ = top.relation.apply(|plan| {
+        if let Some(node) = as_node::<AiNode>(plan)
+            && let Some(Fetch::Global(rows)) = &node.fetch
+        {
+            match last {
+                Some(found) if std::ptr::eq(found, node) => fetch = Some(*rows as i64),
+                _ => elsewhere = true,
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    let reordered = fetch.is_some() && (!top.order.is_empty() || top.distinct);
+    (!elsewhere && !reordered).then_some(fetch)
 }
 
 /// Refuse a SELECT whose input is a GROUP BY or a window.
@@ -1734,6 +1772,22 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 && self.walk.call_tables(&node.call).len() < 2)
     }
 
+    /// Whether the executor's stop key of `alias`'s AI.IF filters keeps
+    /// a per-key fetch's rows: the executor stops a key once a document
+    /// passes the table's filters, so the region asks only those filters
+    /// and joins nothing.
+    fn stops_per_key(&self, alias: &str) -> bool {
+        self.walk.ids().all(|id| match &self.walk.get(id).kind {
+            Kind::Ai(node) => {
+                node.function() == "ai_filter"
+                    && self.is_table_filter(id)
+                    && self.call_tables(id).iter().eq([alias])
+            }
+            Kind::Join(_) => false,
+            _ => true,
+        })
+    }
+
     fn call_tables(&self, id: usize) -> BTreeSet<String> {
         match &self.walk.get(id).kind {
             Kind::Ai(node) => self.walk.call_tables(&node.call),
@@ -1811,7 +1865,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
             Kind::Ai(AiNode {
                 fetch: Some(Fetch::PerKey { key, n: 1 }),
                 ..
-            }) => Some(key.clone()),
+            }) if self.stops_per_key(&alias) => Some(key.clone()),
             _ => None,
         });
         for predicate in predicates {

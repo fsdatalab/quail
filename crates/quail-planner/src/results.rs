@@ -240,7 +240,18 @@ pub fn result_nodes(
         available = result.clone();
         rows = port(&node_id, "rows");
     }
-    if !root.order.is_empty() || root.distinct || root.offset != 0 {
+    let sorted = !root.order.is_empty() || root.distinct;
+    if sorted || root.offset != 0 {
+        if let (false, Some(count)) = (sorted, found.fetch) {
+            // the rows the OFFSET skips and the LIMIT keeps, which
+            // `should_push_down_limit` stops the model at
+            nodes.push(PhysicalNode::Limit(node(
+                "limit",
+                std::slice::from_ref(&rows),
+                LimitAttributes { count },
+            )));
+            rows = port("limit", "rows");
+        }
         nodes.push(PhysicalNode::Sort(node(
             "sort",
             std::slice::from_ref(&rows),
@@ -256,7 +267,7 @@ pub fn result_nodes(
                 fetch: root.limit,
             },
         )));
-    } else if let Some(count) = root.limit {
+    } else if let Some(count) = found.limit() {
         nodes.push(PhysicalNode::Limit(node(
             "limit",
             std::slice::from_ref(&rows),
