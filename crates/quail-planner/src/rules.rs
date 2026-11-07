@@ -131,7 +131,9 @@ fn push_unique(found: &mut Vec<ColumnRef>, references: Vec<ColumnRef>) {
     }
 }
 
-fn value_refs(expression: &ValueExpression) -> Vec<ColumnRef> {
+/// The columns a value expression reads, through a model call's prompt,
+/// in first use order.
+pub fn value_refs(expression: &ValueExpression) -> Vec<ColumnRef> {
     match expression {
         ValueExpression::ModelCall(call) => call_refs(call),
         ValueExpression::Alias(alias) => match alias.expression.as_ref() {
@@ -143,7 +145,8 @@ fn value_refs(expression: &ValueExpression) -> Vec<ColumnRef> {
     }
 }
 
-fn call_refs(call: &ModelCall) -> Vec<ColumnRef> {
+/// The columns a model call's prompt reads, in first use order.
+pub fn call_refs(call: &ModelCall) -> Vec<ColumnRef> {
     let mut found = Vec::new();
     for argument in &call.prompt.args {
         push_unique(&mut found, value_refs(argument));
@@ -151,7 +154,8 @@ fn call_refs(call: &ModelCall) -> Vec<ColumnRef> {
     found
 }
 
-fn condition_refs(condition: &Condition) -> Vec<ColumnRef> {
+/// The columns a condition reads, in first use order.
+pub fn condition_refs(condition: &Condition) -> Vec<ColumnRef> {
     let mut found = Vec::new();
     for test in tests(condition) {
         push_unique(&mut found, value_refs(&test.expression));
@@ -159,20 +163,23 @@ fn condition_refs(condition: &Condition) -> Vec<ColumnRef> {
     found
 }
 
-fn asked_refs(asked: &Asked) -> Vec<ColumnRef> {
+/// The columns an AI predicate reads, in first use order.
+pub fn asked_refs(asked: &Asked) -> Vec<ColumnRef> {
     match asked {
         Asked::Call(call) => call_refs(call),
         Asked::Compare(test) => value_refs(&test.expression),
     }
 }
 
-fn equality_refs(equality: &Equality) -> Vec<ColumnRef> {
+/// The columns a join equality reads, in first use order.
+pub fn equality_refs(equality: &Equality) -> Vec<ColumnRef> {
     let mut found = value_refs(&equality.left);
     push_unique(&mut found, value_refs(&equality.right));
     found
 }
 
-fn sort_refs(key: &SortKey) -> Vec<ColumnRef> {
+/// The columns a sort key reads, in first use order.
+pub fn sort_refs(key: &SortKey) -> Vec<ColumnRef> {
     match &key.expression {
         SortExpression::Value(value) => value_refs(value),
     }

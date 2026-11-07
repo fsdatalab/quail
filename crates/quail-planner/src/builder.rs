@@ -517,7 +517,9 @@ impl LogicalPlanBuilder {
     }
 }
 
-fn row_test_columns(
+/// The source columns the row tests read that the SELECT list does not
+/// return, which it adds for them.
+pub fn row_test_columns(
     row_tests: &[Condition],
     unnested: &BTreeSet<String>,
     source: &[ValueExpression],
@@ -600,7 +602,12 @@ fn unnested_node(
     Ok(node)
 }
 
-fn check_feature_lists(
+/// Refuse a DISTINCT or ORDER BY that compares AI.SAE_FEATURES lists.
+///
+/// # Errors
+///
+/// The query compares a feature list that is not unnested.
+pub fn check_feature_lists(
     columns: &[ValueExpression],
     order: &[SortKey],
     distinct: bool,
@@ -678,12 +685,13 @@ fn asks_model(condition: &Condition) -> Option<&ModelCall> {
 }
 
 fn gate(
-    exists: &Exists,
+    call: &ModelCall,
+    inner: &str,
+    anti: bool,
     anchor: Option<&String>,
     selectivity: Option<f64>,
 ) -> Result<JoinSpec, CompileError> {
-    let inner = scan_of(&exists.relation).alias.clone();
-    let TaggedModelCall::Call(call) = &exists.call;
+    let inner = inner.to_string();
     let aliases = call_aliases(call);
     if aliases.len() != 2 || !aliases.contains(&inner) {
         return compile_error(
@@ -709,7 +717,7 @@ fn gate(
     Ok(JoinSpec {
         aliases: vec![inner],
         predicate: Asked::Call(call.clone()),
-        semantics: if exists.anti { "anti" } else { "exists" }.to_string(),
+        semantics: if anti { "anti" } else { "exists" }.to_string(),
         selectivity,
         anchor: Some(outer),
         on: Vec::new(),
@@ -933,238 +941,348 @@ pub struct TableContent {
 pub fn relation_content(
     arguments: PlaceRelationArguments,
 ) -> Result<RelationContent, CompileError> {
-    let mut scans: Vec<Scan> = arguments
+    let scans: Vec<Scan> = arguments
         .scans
         .iter()
         .map(|node| scan_of(node).clone())
         .collect();
-    let mut equalities = arguments.equalities.clone();
-    let joined: Vec<String> = scans
-        .iter()
-        .skip(1)
-        .map(|scan| scan.alias.clone())
-        .collect();
-    let base = scans[0].alias.clone();
-    let mut filters: Vec<(String, Vec<FilterPredicate>)> = Vec::new();
-    let mut joins: Vec<JoinSpec> = Vec::new();
-    let mut label_tests: ByAlias<LabelTest> = Vec::new();
-    let mut conditions: Vec<(Condition, Option<f64>)> = Vec::new();
-    let mut claimed: Vec<String> = Vec::new();
+    let mut terms = RelationTerms::new(scans, arguments.equalities.clone());
     for part in arguments.parts {
         let (body, selectivity, anchor) = body_of(part);
         match body {
             Body::Exists(exists) => {
-                scans.push(scan_of(&exists.relation).clone());
-                joins.push(gate(&exists, anchor.as_ref(), selectivity)?);
+                let TaggedModelCall::Call(call) = &exists.call;
+                terms.gate(
+                    call,
+                    scan_of(&exists.relation).clone(),
+                    exists.anti,
+                    anchor.as_ref(),
+                    selectivity,
+                )?;
             }
             Body::Condition(condition) if asks_model(&condition).is_none() => {
-                conditions.push((condition, selectivity));
+                terms.condition(condition, selectivity);
             }
-            body => {
-                let predicate = match body {
-                    Body::Call(call) => Asked::Call(call),
-                    Body::Condition(Condition::Compare(test)) => Asked::Compare(*test),
-                    _ => unreachable!("a model call or a comparison of one"),
-                };
-                let call = asked_call(&predicate).clone();
-                if let Asked::Compare(test) = &predicate
-                    && call.kind == "label"
-                {
-                    let aliases = call_aliases(&call);
-                    if aliases.len() != 1 {
-                        return compile_error(format!(
-                            "a filter on a label tests a one-document classification; this one \
-                             classifies pairs of {}",
-                            repr_tuple(&aliases)
-                        ));
-                    }
-                    push(
-                        &mut label_tests,
-                        aliases[0].clone(),
-                        (call.clone(), test.value.clone(), selectivity),
-                    );
-                    continue;
-                }
-                let aliases = call_aliases(&call);
-                if aliases.len() == 1 {
-                    if anchor.is_some() {
-                        return compile_error(
-                            "anchor is a join option; a one-provider AI_FILTER takes only \
-                             selectivity",
-                        );
-                    }
-                    push(
-                        &mut filters,
-                        aliases[0].clone(),
-                        FilterPredicate {
-                            expression: predicate,
-                            selectivity,
-                        },
-                    );
-                } else {
-                    joins.push(join_spec(
-                        predicate,
-                        selectivity,
-                        anchor,
-                        &aliases,
-                        &base,
-                        &joined,
-                        &mut claimed,
-                        &mut equalities,
-                    )?);
-                }
+            Body::Call(call) => terms.asked(Asked::Call(call), selectivity, anchor)?,
+            Body::Condition(Condition::Compare(test)) => {
+                terms.asked(Asked::Compare(*test), selectivity, anchor)?;
             }
+            Body::Condition(_) => unreachable!("a model call or a comparison of one"),
         }
     }
-    let projected: Vec<(&ModelCall, String)> = arguments
-        .columns
-        .iter()
-        .filter_map(|column| {
-            let call = aliased_call(column, &[])?;
-            Some((call, column_name(column, true)))
-        })
-        .collect();
-    check_joins(&equalities, &base, &joined, &joins, &projected)?;
-    let tested: Vec<(ModelCall, String)> = arguments
-        .tested
-        .iter()
-        .map(|(TaggedModelCall::Call(call), name)| (call.clone(), name.clone()))
-        .collect();
-    check_calls(
-        &filters,
-        &joins,
-        &label_tests,
-        &projected,
-        &tested,
+    terms.content(
+        &arguments.columns,
+        &arguments.tested,
+        &arguments.schemas,
+        &arguments.unnested,
         arguments.allow_relational,
-    )?;
-    let (named, labels) = label_names(&label_tests, &filters, &projected, &tested);
-    let mut computing: BTreeMap<&str, ByAlias<(ModelCall, String)>> = BTreeMap::new();
-    for kind in ["extract", "features", "map"] {
-        computing.insert(kind, Vec::new());
+    )
+}
+
+/// The ON and WHERE terms of one SELECT's relation, bound and taken in
+/// written order, before each table's operators are named and placed.
+#[derive(Debug)]
+pub struct RelationTerms {
+    /// The Scan of each table in FROM and JOIN order, then each gate's.
+    scans: Vec<Scan>,
+    /// alias -> the ON equalities of the JOIN of that table, last JOIN first.
+    equalities: Vec<(String, Vec<Equality>)>,
+    joined: Vec<String>,
+    base: String,
+    filters: Vec<(String, Vec<FilterPredicate>)>,
+    joins: Vec<JoinSpec>,
+    label_tests: ByAlias<LabelTest>,
+    conditions: Vec<(Condition, Option<f64>)>,
+    claimed: Vec<String>,
+}
+
+impl RelationTerms {
+    /// No terms yet over `scans`, the tables in FROM and JOIN order,
+    /// whose JOINs have `equalities`, last JOIN first.
+    pub fn new(scans: Vec<Scan>, equalities: Vec<(String, Vec<Equality>)>) -> Self {
+        let joined: Vec<String> = scans
+            .iter()
+            .skip(1)
+            .map(|scan| scan.alias.clone())
+            .collect();
+        let base = scans[0].alias.clone();
+        Self {
+            scans,
+            equalities,
+            joined,
+            base,
+            filters: Vec::new(),
+            joins: Vec::new(),
+            label_tests: Vec::new(),
+            conditions: Vec::new(),
+            claimed: Vec::new(),
+        }
     }
-    let entries = projected
-        .iter()
-        .map(|(call, name)| ((*call).clone(), name.clone()))
-        .chain(tested.iter().cloned());
-    for (call, name) in entries {
-        if let Some(by_alias) = computing.get_mut(call.kind.as_str()) {
-            let alias = call_aliases(&call)[0].clone();
-            let entry = (call.clone(), name.clone());
-            match by_alias.iter_mut().find(|(found, _)| *found == alias) {
-                Some((_, calls)) => {
-                    if !calls.contains(&entry) {
-                        calls.push(entry);
-                    }
-                }
-                None => by_alias.push((alias, vec![entry])),
+
+    /// Take an EXISTS or NOT EXISTS gate over the table `relation` scans.
+    ///
+    /// # Errors
+    ///
+    /// The call does not read the inner table and one outer table, or
+    /// the anchor is not the outer table.
+    pub fn gate(
+        &mut self,
+        call: &ModelCall,
+        relation: Scan,
+        anti: bool,
+        anchor: Option<&String>,
+        selectivity: Option<f64>,
+    ) -> Result<(), CompileError> {
+        let spec = gate(call, &relation.alias, anti, anchor, selectivity);
+        self.scans.push(relation);
+        self.joins.push(spec?);
+        Ok(())
+    }
+
+    /// Take a condition that asks no model.
+    pub fn condition(&mut self, condition: Condition, selectivity: Option<f64>) {
+        self.conditions.push((condition, selectivity));
+    }
+
+    /// Take a model call or a comparison of one: an AI filter, a label
+    /// test, or an AI join.
+    ///
+    /// # Errors
+    ///
+    /// The call does not fit the query's tables.
+    pub fn asked(
+        &mut self,
+        predicate: Asked,
+        selectivity: Option<f64>,
+        anchor: Option<String>,
+    ) -> Result<(), CompileError> {
+        let call = asked_call(&predicate).clone();
+        if let Asked::Compare(test) = &predicate
+            && call.kind == "label"
+        {
+            let aliases = call_aliases(&call);
+            if aliases.len() != 1 {
+                return compile_error(format!(
+                    "a filter on a label tests a one-document classification; this one \
+                     classifies pairs of {}",
+                    repr_tuple(&aliases)
+                ));
             }
+            push(
+                &mut self.label_tests,
+                aliases[0].clone(),
+                (call.clone(), test.value.clone(), selectivity),
+            );
+            return Ok(());
         }
-    }
-    let providers: BTreeMap<String, String> = scans
-        .iter()
-        .map(|scan| (scan.alias.clone(), scan.provider.clone()))
-        .collect();
-    for (alias, found) in &label_tests {
-        for (call, accepted, selectivity) in found {
-            let name = labels
-                .iter()
-                .find(|(owner, _)| owner == alias)
-                .and_then(|(_, calls)| calls.iter().find(|(found, _)| found == call))
-                .map(|(_, name)| name.clone())
-                .expect("a label column name");
-            conditions.push((
-                Condition::Compare(Box::new(RegularPredicate {
-                    expression: ValueExpression::ColumnRef(ColumnRef {
-                        alias: alias.clone(),
-                        provider: providers[alias].clone(),
-                        column: name,
-                    }),
-                    comparison: "in".to_string(),
-                    value: python_tuple(accepted),
-                })),
-                *selectivity,
-            ));
-        }
-    }
-    let mut computed: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
-    for (alias, calls) in &computing["extract"] {
-        for (_, name) in calls {
-            for column in [name.clone(), format!("{name}{SPAN_SUFFIX}")] {
-                computed.insert(
-                    (alias.clone(), column),
-                    ("extract".to_string(), name.clone()),
+        let aliases = call_aliases(&call);
+        if aliases.len() == 1 {
+            if anchor.is_some() {
+                return compile_error(
+                    "anchor is a join option; a one-provider AI_FILTER takes only \
+                     selectivity",
                 );
             }
+            push(
+                &mut self.filters,
+                aliases[0].clone(),
+                FilterPredicate {
+                    expression: predicate,
+                    selectivity,
+                },
+            );
+        } else {
+            self.joins.push(join_spec(
+                predicate,
+                selectivity,
+                anchor,
+                &aliases,
+                &self.base,
+                &self.joined,
+                &mut self.claimed,
+                &mut self.equalities,
+            )?);
         }
+        Ok(())
     }
-    for kind in ["features", "map"] {
-        for (alias, calls) in &computing[kind] {
+
+    /// Name each table's operators and place the conditions.
+    ///
+    /// `columns` is the SELECT list, `tested` the (call, name) of each
+    /// column operator only a test reads, `schemas` each provider's
+    /// schema, and `unnested` the aliases of unnested lists.
+    ///
+    /// # Errors
+    ///
+    /// A part does not fit the query's tables, or the query has no AI
+    /// predicate where it needs one.
+    pub fn content(
+        self,
+        columns: &[ValueExpression],
+        tested: &[(TaggedModelCall, String)],
+        schemas: &BTreeMap<String, Option<Schema>>,
+        unnested: &[String],
+        allow_relational: bool,
+    ) -> Result<RelationContent, CompileError> {
+        let Self {
+            scans,
+            equalities,
+            joined,
+            base,
+            filters,
+            joins,
+            label_tests,
+            mut conditions,
+            claimed,
+        } = self;
+        let projected: Vec<(&ModelCall, String)> = columns
+            .iter()
+            .filter_map(|column| {
+                let call = aliased_call(column, &[])?;
+                Some((call, column_name(column, true)))
+            })
+            .collect();
+        check_joins(&equalities, &base, &joined, &joins, &projected)?;
+        let tested: Vec<(ModelCall, String)> = tested
+            .iter()
+            .map(|(TaggedModelCall::Call(call), name)| (call.clone(), name.clone()))
+            .collect();
+        check_calls(
+            &filters,
+            &joins,
+            &label_tests,
+            &projected,
+            &tested,
+            allow_relational,
+        )?;
+        let (named, labels) = label_names(&label_tests, &filters, &projected, &tested);
+        let mut computing: BTreeMap<&str, ByAlias<(ModelCall, String)>> = BTreeMap::new();
+        for kind in ["extract", "features", "map"] {
+            computing.insert(kind, Vec::new());
+        }
+        let entries = projected
+            .iter()
+            .map(|(call, name)| ((*call).clone(), name.clone()))
+            .chain(tested.iter().cloned());
+        for (call, name) in entries {
+            if let Some(by_alias) = computing.get_mut(call.kind.as_str()) {
+                let alias = call_aliases(&call)[0].clone();
+                let entry = (call.clone(), name.clone());
+                match by_alias.iter_mut().find(|(found, _)| *found == alias) {
+                    Some((_, calls)) => {
+                        if !calls.contains(&entry) {
+                            calls.push(entry);
+                        }
+                    }
+                    None => by_alias.push((alias, vec![entry])),
+                }
+            }
+        }
+        let providers: BTreeMap<String, String> = scans
+            .iter()
+            .map(|scan| (scan.alias.clone(), scan.provider.clone()))
+            .collect();
+        for (alias, found) in &label_tests {
+            for (call, accepted, selectivity) in found {
+                let name = labels
+                    .iter()
+                    .find(|(owner, _)| owner == alias)
+                    .and_then(|(_, calls)| calls.iter().find(|(found, _)| found == call))
+                    .map(|(_, name)| name.clone())
+                    .expect("a label column name");
+                conditions.push((
+                    Condition::Compare(Box::new(RegularPredicate {
+                        expression: ValueExpression::ColumnRef(ColumnRef {
+                            alias: alias.clone(),
+                            provider: providers[alias].clone(),
+                            column: name,
+                        }),
+                        comparison: "in".to_string(),
+                        value: python_tuple(accepted),
+                    })),
+                    *selectivity,
+                ));
+            }
+        }
+        let mut computed: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+        for (alias, calls) in &computing["extract"] {
             for (_, name) in calls {
+                for column in [name.clone(), format!("{name}{SPAN_SUFFIX}")] {
+                    computed.insert(
+                        (alias.clone(), column),
+                        ("extract".to_string(), name.clone()),
+                    );
+                }
+            }
+        }
+        for kind in ["features", "map"] {
+            for (alias, calls) in &computing[kind] {
+                for (_, name) in calls {
+                    computed.insert(
+                        (alias.clone(), name.clone()),
+                        (kind.to_string(), name.clone()),
+                    );
+                }
+            }
+        }
+        for (alias, named_calls) in &labels {
+            for (_, name) in named_calls {
                 computed.insert(
                     (alias.clone(), name.clone()),
-                    (kind.to_string(), name.clone()),
+                    ("label".to_string(), name.clone()),
                 );
             }
         }
-    }
-    for (alias, named_calls) in &labels {
-        for (_, name) in named_calls {
-            computed.insert(
-                (alias.clone(), name.clone()),
-                ("label".to_string(), name.clone()),
-            );
-        }
-    }
-    let placed = place_conditions(conditions, &computed, &arguments.unnested)?;
-    let tables = scans
-        .iter()
-        .map(|scan| {
-            let of = |kind: &str| -> Vec<(ModelCall, String)> {
-                lookup(&computing[kind], &scan.alias).to_vec()
-            };
-            TableContent {
-                alias: scan.alias.clone(),
-                provider: scan.provider.clone(),
-                column: scan.column.clone(),
-                schema: arguments.schemas.get(&scan.provider).cloned().flatten(),
-                operators: ScanOperators {
-                    predicates: lookup(&filters, &scan.alias).to_vec(),
-                    labels: lookup(&labels, &scan.alias).to_vec(),
-                    regular_predicates: lookup(&placed.scans, &scan.alias).to_vec(),
-                    extracts: of("extract"),
-                    computed_filters: lookup(&placed.computed, &scan.alias).to_vec(),
-                    sae_features: of("features"),
-                    maps: of("map"),
-                },
+        let placed = place_conditions(conditions, &computed, unnested)?;
+        let tables = scans
+            .iter()
+            .map(|scan| {
+                let of = |kind: &str| -> Vec<(ModelCall, String)> {
+                    lookup(&computing[kind], &scan.alias).to_vec()
+                };
+                TableContent {
+                    alias: scan.alias.clone(),
+                    provider: scan.provider.clone(),
+                    column: scan.column.clone(),
+                    schema: schemas.get(&scan.provider).cloned().flatten(),
+                    operators: ScanOperators {
+                        predicates: lookup(&filters, &scan.alias).to_vec(),
+                        labels: lookup(&labels, &scan.alias).to_vec(),
+                        regular_predicates: lookup(&placed.scans, &scan.alias).to_vec(),
+                        extracts: of("extract"),
+                        computed_filters: lookup(&placed.computed, &scan.alias).to_vec(),
+                        sae_features: of("features"),
+                        maps: of("map"),
+                    },
+                }
+            })
+            .collect::<Vec<TableContent>>();
+        for table in &tables {
+            let calls: Vec<(String, ModelCall)> = table
+                .operators
+                .labels
+                .iter()
+                .map(|(call, name)| (name.clone(), call.clone()))
+                .collect();
+            for (condition, _) in &table.operators.computed_filters {
+                check_labels(condition, &calls)?;
             }
-        })
-        .collect::<Vec<TableContent>>();
-    for table in &tables {
-        let calls: Vec<(String, ModelCall)> = table
-            .operators
-            .labels
-            .iter()
-            .map(|(call, name)| (name.clone(), call.clone()))
-            .collect();
-        for (condition, _) in &table.operators.computed_filters {
-            check_labels(condition, &calls)?;
         }
+        Ok(RelationContent {
+            tables,
+            joins,
+            cross_joined: joined
+                .iter()
+                .filter(|alias| !claimed.contains(alias))
+                .cloned()
+                .collect(),
+            joined_classifications: named
+                .into_iter()
+                .filter(|(call, _)| call_aliases(call).len() == 2)
+                .collect(),
+            rows: placed.rows,
+        })
     }
-    Ok(RelationContent {
-        tables,
-        joins,
-        cross_joined: joined
-            .iter()
-            .filter(|alias| !claimed.contains(alias))
-            .cloned()
-            .collect(),
-        joined_classifications: named
-            .into_iter()
-            .filter(|(call, _)| call_aliases(call).len() == 2)
-            .collect(),
-        rows: placed.rows,
-    })
 }
 
 /// Python's `tuple(value)`: a list stays, a string becomes its characters.

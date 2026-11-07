@@ -61,6 +61,7 @@ impl PythonRunner {
         let Some((turn, layout)) = &self.prompting else {
             return Ok(("sql", region_sql(region)?));
         };
+        quail_datafusion::derive::shadow_check(region, turn, layout);
         match bind::bind_model_region(region, turn, layout) {
             Ok(plan) => Ok((
                 "plan",

@@ -20,6 +20,7 @@ pub mod ai;
 mod aliases;
 pub mod bind;
 mod claim;
+pub mod derive;
 mod distinct;
 mod exec;
 mod extension;

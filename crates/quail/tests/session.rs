@@ -67,8 +67,14 @@ fn reviews() -> Result<MemTable> {
 fn a_rust_program_runs_an_ai_filter_over_its_own_table() -> Result<()> {
     let session = Session::with_engine(engine())?;
     session.register_table("reviews", Arc::new(reviews()?))?;
+    quail_datafusion::derive::set_shadow_check(true);
     let batches =
         session.sql("SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('q1: {0}', r.body))")?;
+    let log = quail_datafusion::derive::take_shadow_log().expect("a shadow check");
+    quail_datafusion::derive::set_shadow_check(false);
+    // the region's operators derived from its optimized plan are the binder's
+    assert!(log.num_comparisons > 0);
+    assert!(log.differences.is_empty(), "{:?}", log.differences);
     let mut ids: Vec<String> = Vec::new();
     for batch in &batches {
         let column = batch

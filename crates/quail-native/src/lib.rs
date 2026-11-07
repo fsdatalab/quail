@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use quail::planning::PlanOutcome;
 use quail::planning::pricer_fields;
 use quail::pyarrow::to_pyarrow;
-use quail_datafusion::{bind, region_sql};
+use quail_datafusion::{bind, derive, region_sql};
 
 fn python_error(error: DataFusionError) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
@@ -112,6 +112,7 @@ impl NativeSession {
             let whole = matches!(&plan, LogicalPlan::Extension(_));
             let mut bound = Vec::new();
             for region in self.session.regions(query, dialect.as_deref())? {
+                derive::shadow_check(&region, &turn, layout);
                 bound.push(match bind::bind_model_region(&region, &turn, layout) {
                     Ok(found) => (
                         Some(
@@ -179,6 +180,29 @@ impl NativeSession {
         py.detach(|| self.session.explain(query, dialect.as_deref()))
             .map_err(python_error)
     }
+}
+
+/// Start comparing each model region bound for planning with the
+/// operators derived from its optimized plan, or stop.
+#[pyfunction]
+fn set_shadow_check(enabled: bool) {
+    derive::set_shadow_check(enabled);
+}
+
+/// Return the shadow check's log so far and empty it: how many times a
+/// region was compared, how many of those the binder refused, the
+/// distinct regions compared, and each difference; None when no check
+/// is on.
+#[pyfunction]
+fn take_shadow_log() -> Option<(usize, usize, Vec<String>, Vec<String>)> {
+    derive::take_shadow_log().map(|log| {
+        (
+            log.num_comparisons,
+            log.num_refusals,
+            log.regions.into_iter().collect(),
+            log.differences,
+        )
+    })
 }
 
 /// Read a physical plan envelope into the Rust plan types and write
@@ -1122,6 +1146,8 @@ fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(read_and_write_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(validate_logical_plan, module)?)?;
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;
+    module.add_function(wrap_pyfunction!(set_shadow_check, module)?)?;
+    module.add_function(wrap_pyfunction!(take_shadow_log, module)?)?;
     module.add_function(wrap_pyfunction!(column_placements, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;

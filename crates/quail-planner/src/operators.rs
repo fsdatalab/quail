@@ -133,7 +133,7 @@ impl RowOperator {
 }
 
 /// The operators of one plan, in the order the plan was written.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Operators {
     pub scans: Vec<Scan>,
     /// alias -> its AI.IF predicates, by alias first seen.

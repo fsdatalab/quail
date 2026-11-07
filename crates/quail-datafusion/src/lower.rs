@@ -30,7 +30,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, Result, plan_err};
+use datafusion::common::{Column, Result, ScalarValue, plan_err};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Expr, ExprSchemable, Extension, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
@@ -255,7 +255,20 @@ fn selected_calls(plan: &LogicalPlan) -> Vec<(Expr, String)> {
     found
 }
 
-fn quail_function(name: &str) -> Arc<datafusion::logical_expr::ScalarUDF> {
+/// The function that marks a test of answers with its position among
+/// the tests of its WHERE, `quail_written(test, position)`, where the
+/// WHERE has more than one: the rules place each test with the columns
+/// it reads, which loses the order the query wrote them in.
+pub const WRITTEN_TEST: &str = "quail_written";
+
+fn call_quail(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+        quail_function(name),
+        args,
+    ))
+}
+
+pub(crate) fn quail_function(name: &str) -> Arc<datafusion::logical_expr::ScalarUDF> {
     crate::functions::quail_functions()
         .into_iter()
         .find(|function| function.name() == name)
@@ -293,6 +306,31 @@ fn base_call(call: &Expr) -> Expr {
     Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
         function, args,
     ))
+}
+
+/// The `{'selectivity': ...}` option of the classification a label test
+/// reads, `= 'label'` or `IN ('label', ...)` with no `HINT` around it;
+/// the column the test reads instead of the call keeps no option.
+fn label_selectivity(term: &Expr) -> Option<Expr> {
+    let classify = |expr: &Expr| function_name(expr) == Some("ai_classify");
+    let call = match term {
+        Expr::InList(list) if !list.negated && classify(&list.expr) => list.expr.as_ref(),
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq && classify(&binary.left) => {
+            binary.left.as_ref()
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq && classify(&binary.right) => {
+            binary.right.as_ref()
+        }
+        _ => return None,
+    };
+    match call {
+        Expr::ScalarFunction(found) => found
+            .args
+            .last()
+            .filter(|arg| is_selectivity_hint(arg))
+            .cloned(),
+        _ => None,
+    }
 }
 
 fn is_span_call(expr: &Expr) -> bool {
@@ -479,9 +517,28 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         };
         added.push((call, name));
     }
+    let num_tests = tested.len();
     let tests = tested
         .into_iter()
-        .map(|term| read_columns(term, &added))
+        .enumerate()
+        .map(|(position, term)| {
+            let options = label_selectivity(&term);
+            let mut read = read_columns(term, &added)?;
+            if let Some(options) = options {
+                read = call_quail("hint", vec![read, options]);
+            }
+            // the rules split the tests among the columns they read
+            if num_tests > 1 {
+                read = call_quail(
+                    WRITTEN_TEST,
+                    vec![
+                        read,
+                        Expr::Literal(ScalarValue::Int64(Some(position as i64)), None),
+                    ],
+                );
+            }
+            Ok(read)
+        })
         .collect::<Result<Vec<_>>>()?;
     match boolean_filter(conjunction(tests).expect("a test"), &Arc::new(input))? {
         Some(test) => Ok(Transformed::yes(LogicalPlan::Filter(test))),
