@@ -79,6 +79,27 @@ and
 [`distinct.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/distinct.rs),
 are the built-in examples.
 
+## Rewrites by number
+
+Each rewrite of an AI operator has a number. The operator is
+`AI(R; g, p, h, P, n)`, as
+[Logical plans](/docs/architecture/logical-plans) defines it. The table
+names the rule that makes each rewrite and when it applies.
+
+| Number | Rewrite | Rule | Condition |
+| --- | --- | --- | --- |
+| R1 | `σ_q(AI(R)) ⇒ AI(σ_q(R))` | Quail's region claim, then DataFusion's `push_down_filter` | `q` reads only columns of `R`, and the node has no fetch. Above a per-key fetch, only a test of the key columns moves. |
+| R2 | `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)` | `absorb_into_ai_nodes` | `q` tests the node's answer, and the node has no fetch. |
+| R9 | `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))` | `push_down_limit_into_ai_nodes` | Only projections and aliases are between them, the node has no `HINT` and no per-key fetch, and `k > 0`. |
+| R10 | `Limit_{k,m}(AI(R; n)) ⇒ Limit_{k,m}(AI(R; n = min(k + m, n)))` | `push_down_limit_into_ai_nodes` | As R9, for a LIMIT with an OFFSET of `m`. |
+| R12 | `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))` | `push_down_distinct` | `K` is input columns or a classification's label, and the node has no fetch. |
+
+R1 needs no rule of its own. Quail moves each plain filter term to its
+table while it finds the model regions, before DataFusion's optimizer
+runs, so the term is below the `AiNode` once the node exists. Within
+the optimizer, an `AiNode`'s `prevent_predicate_push_down_columns`
+lets `push_down_filter` move such a term below the node.
+
 ## Rule order
 
 Rules run in registration order within each step:
