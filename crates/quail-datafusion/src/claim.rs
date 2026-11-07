@@ -522,6 +522,38 @@ impl Extracted {
             })
     }
 
+    /// `plan` with the model regions of each uncorrelated `IN` subquery
+    /// claimed: DataFusion runs the `IN` as a semi-join, whose subquery
+    /// side is then a part of its own.
+    fn claim_in_subqueries(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        let mut failed = None;
+        let claimed = plan.map_expressions(|expr| {
+            expr.transform_down(|inner| match inner {
+                Expr::InSubquery(mut found)
+                    if found.subquery.outer_ref_columns.is_empty()
+                        && calls_ai_function(&found.subquery.subquery)? =>
+                {
+                    let body = found.subquery.subquery.as_ref().clone();
+                    match self.claim(body, None) {
+                        Ok(body) => {
+                            found.subquery.subquery = Arc::new(body);
+                            Ok(Transformed::yes(Expr::InSubquery(found)))
+                        }
+                        Err(error) => {
+                            failed = Some(error);
+                            Ok(Transformed::no(Expr::InSubquery(found)))
+                        }
+                    }
+                }
+                other => Ok(Transformed::no(other)),
+            })
+        })?;
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(claimed.data),
+        }
+    }
+
     fn hand_back_parts(
         &mut self,
         plan: LogicalPlan,
@@ -537,6 +569,7 @@ impl Extracted {
                 return claimed;
             }
         }
+        let plan = self.claim_in_subqueries(plan)?;
         // a filter's terms with a subquery stay in DataFusion; the rest
         // run below it, where a region can take them
         if let LogicalPlan::Filter(filter) = &plan {
@@ -1568,13 +1601,13 @@ fn select_list(plan: LogicalPlan, needed: Option<Vec<Column>>) -> Result<Logical
 }
 
 /// Whether any operator in the subtree is an `AiNode`, or calls an AI
-/// function in its expressions or in an EXISTS subquery.
+/// function in its expressions or in an EXISTS or IN subquery.
 fn calls_ai(plan: &LogicalPlan) -> Result<bool> {
     Ok(plan.exists(|node| Ok(as_node::<AiNode>(node).is_some()))? || calls_ai_function(plan)?)
 }
 
-/// Whether any operator in the subtree, or an EXISTS subquery in it,
-/// calls an AI function that is not yet lowered into an `AiNode`.
+/// Whether any operator in the subtree, or an EXISTS or IN subquery in
+/// it, calls an AI function that is not yet lowered into an `AiNode`.
 fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
     plan.exists(|node| {
         // an `AiNode`'s expressions hold its lowered call
@@ -1584,6 +1617,7 @@ fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
         for expr in node.expressions() {
             let found = expr.exists(|inner| match inner {
                 Expr::Exists(exists) => calls_ai_function(&exists.subquery.subquery),
+                Expr::InSubquery(found) => calls_ai_function(&found.subquery.subquery),
                 other => Ok(is_ai_call(other)),
             })?;
             if found {

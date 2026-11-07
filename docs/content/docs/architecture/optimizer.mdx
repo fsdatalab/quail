@@ -113,7 +113,7 @@ are DataFusion optimizer rules that run over the whole plan, Quail's
 `AiNode`s included; physical rules rewrite Quail's executable graphs.
 
 The logical rules are DataFusion's default rules, from
-`rewrite_set_comparison` to `optimize_projections`, with Quail's nine
+`rewrite_set_comparison` to `optimize_projections`, with Quail's ten
 before `replace_distinct_aggregate`, which turns a DISTINCT into a
 GROUP BY. Each rewrite of an AI operator has a number, such as R1;
 [Rules](/docs/extending/rules#rewrites-by-number) gives each one's
@@ -133,6 +133,7 @@ region.
 | `push_down_projection_into_ai_nodes` | Logical | Make an AI operator return only its answer and the added columns the SELECT list above it reads, such as an extraction's spans (R5). | No |
 | `push_down_case_guards` | Logical | Make the test of a `CASE WHEN c THEN <answer> END` the guard of the classification, map, or SAE features below it, so the model is asked only where `c` is TRUE (R6). | No |
 | `push_down_substring_prechecks` | Logical | Before an extraction whose answer a `LIKE` tests, keep only the documents that contain the pattern's literal text, ignoring case (R4). | No |
+| `push_down_semi_join_fetch` | Logical | Give the AI.IF filter on the subquery side of a semi-join, such as an `IN` subquery, one row per join key (R13). | No |
 | `push_down_or_guards` | Logical | Off by default. Guard an AI test that is one term of an OR with the other terms, so the model is asked only where they are not TRUE (R7). | No |
 | `decorrelate_predicate_subquery` | Logical | DataFusion's rule: run an IN or EXISTS subquery as a semi or anti join. | No |
 | `push_down_limit` | Logical | DataFusion's rule: move a LIMIT below operators that keep one row per row, but not below an AI operator. | No |

@@ -99,6 +99,7 @@ names the rule that makes each rewrite and when it applies.
 | R10 | `Limit_{k,m}(AI(R; n)) ⇒ Limit_{k,m}(AI(R; n = min(k + m, n)))` | `push_down_limit_into_ai_nodes` | As R9, for a LIMIT with an OFFSET of `m`. |
 | R11 | `Limit_k(R ⊎ S) ⇒ Limit_k(Limit_k(R) ⊎ Limit_k(S))` | DataFusion's `push_down_limit`, then `push_down_limit_into_ai_nodes` | `⊎` is UNION ALL. Each branch's LIMIT becomes its `AiNode`'s fetch as R9 allows. |
 | R12 | `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))` | `push_down_distinct` | `K` is input columns or a classification's label, and the node has no fetch. |
+| R13 | `S ⋉_{J=K} AI(R) ⇒ S ⋉_{J=K} AI(R; n = 1 per K)` | `push_down_semi_join_fetch` | `J = K` is the whole join condition, `K` are input columns of the node, each name once; only projections and aliases are between the join and the node; the node, and every `AiNode` below it, is an AI.IF over the same one table, with no join, fetch, `HINT`, or guard. |
 | R17 | `AI_{f→b}(AI_{f→a}(R)) ⇒ π_{*, a→b}(AI_{f→a}(R))` | `merge_repeated_ai_calls` | Same call and guard, only filters and other `AiNode`s of the same rows between them, no fetch on the upper node, each test of the upper node's answer already a test of the lower node's, and the lower node returns each column the upper one returns. The lowering already gives calls written the same way in one SELECT list and WHERE one node. |
 
 R4 relies on `AI.EXTRACT` copying each answer from its document, so an
@@ -131,6 +132,17 @@ filter in the physical plan that passes the rows its guard leaves out
 without asking the model. Until then, derive refuses an AI filter with
 a guard. Add the rule to a session's list to run it:
 `built_in_registry(logical_rules=(*LOGICAL_RULES, "push_down_or_guards"))`.
+
+R13 covers an uncorrelated `IN` subquery, such as `WHERE p.number IN
+(SELECT r.product FROM reviews r WHERE AI.IF(...))`: Quail lowers the
+subquery's AI calls as a part of its own, and DataFusion's
+`decorrelate_predicate_subquery` runs the `IN` as a semi-join above the
+subquery's model region. The executor stops a key's documents once one
+passes the table's AI filters, as for R12, and only in a region that
+asks one table's AI.IF filters and joins nothing; the rule's conditions
+are that region's. A correlated `EXISTS` with an AI call on the
+subquery's table alone is still refused: its semi-join is inside the
+region, which Quail does not bind.
 
 R1 needs no rule of its own. Quail moves each plain filter term to its
 table while it finds the model regions, before DataFusion's optimizer
