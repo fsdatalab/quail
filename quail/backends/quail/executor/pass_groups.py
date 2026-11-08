@@ -4,8 +4,7 @@ A pass group (PackSetPasses) is the operators whose questions share a
 pass over each document: AI filters (yes/no), scores (yes/no, read as
 a probability), classifications (option codes), and extractions
 (pointer reads). A PassGroup asks them all in one pass per document,
-as stages of the chain's SetPasses run, and decodes the answers for
-every document at once.
+in one GPU loop, and decodes the answers for every document at once.
 """
 
 from dataclasses import dataclass, field, replace
@@ -14,7 +13,7 @@ import numpy as np
 
 from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.readout import AsyncPassReadout
-from quail.backends.quail.executor.set_passes import Passes, group_passes
+from quail.backends.quail.executor.set_passes import Passes, group_passes, run_passes
 from quail.backends.quail.executor.stages import Stage
 from quail.common.document_ends import ends_for, joined_state
 from quail.physical import AiFilter, ClassifySpec, ExtractSpec, ScoreSpec
@@ -184,7 +183,7 @@ class PassGroup:
     it planned for splits the group into more passes, one stage each.
 
     Args:
-        run: The SetPasses the group's stages join.
+        state: The query's execution state.
         questions: The group's SetQuestions, in plan order.
         prefixes: Per document the run may ask, its prompt head and
             document tokens; the longest state sizes the passes.
@@ -194,17 +193,18 @@ class PassGroup:
         ValueError: The questions differ in prompt head or state tail.
     """
 
-    def __init__(self, run, questions, prefixes, label="pass group"):
+    def __init__(self, state, questions, prefixes, label="pass group"):
         first = questions[0]
         if any(q.head != first.head or q.state_tail != first.state_tail
                for q in questions):
             raise ValueError("the questions of one pass group share their prompt "
                              "head and state tail")
-        state = run.state
-        self.run = run
+        self.state = state
+        self.label = label
         self.questions = questions
         self.ends = dict(first.ends) if first.ends else None
         self.reads_any = any(q.kind == "read" for q in questions)
+        self.reads = []         # per pass asked, the state rows a read scores
         rows = state.answer_rows
         yes = [rows.allowed[i] for i in rows.true_cols.tolist()]
         no = [rows.allowed[i] for i in rows.false_cols.tolist()]
@@ -216,7 +216,7 @@ class PassGroup:
         self.temperature = model_spec.answer_temperature
         torch = state.torch
         head_weights = full_output_head(state.loaded_model.model)
-        longest = max((len(self.state(prefix)) for prefix in prefixes), default=0)
+        longest = max((len(self.state_of(prefix)) for prefix in prefixes), default=0)
         self.passes = []
         self.stages = []
         for members, suffix, shape in group_passes(
@@ -234,50 +234,53 @@ class PassGroup:
                            for slot, y, n in yes_no)
 
             self.passes.append((members, places, code_width, reads, shape))
-            self.stages.append(run.add_stage(Stage(
+            self.stages.append(Stage(
                 suffixes=[suffix],
                 readout=AsyncPassReadout(torch, torch.nn.functional, head_weights,
                                          targets, kinds, model_spec.read_span_tokens),
                 questions=(shape,),
                 question_slots=tuple(questions[member].slots for member in members),
-                state_reads=run.state_reads if reads else None,
-                decide=decide, label=label)))
+                state_reads=self.reads.__getitem__ if reads else None,
+                decide=decide, label=label))
 
-    def state(self, prefix):
+    def state_of(self, prefix):
         """A document's state: its prefix, joined with the state tail."""
         return joined_state(prefix, self.questions[0].state_tail, self.ends)
 
-    def ask(self, prefixes, stop_groups=None):
-        """Ask every question of the group of each document; yields its Passes.
+    def ask(self, prefixes, stop_groups=None, limit=None,
+            num_key_survivors=1) -> GroupAnswers:
+        """Ask every question of the group of each document, in one GPU loop.
 
         Args:
             prefixes: Per document, its prompt head and document tokens.
             stop_groups: Per document, its stop key group, or None. The
                 groups apply to a group of one pass only, so the answers
                 of split passes line up.
-
-        Returns:
-            The GroupAnswers.
+            limit: Stop once this many documents passed every yes/no
+                question, or None.
+            num_key_survivors: How many documents of a stop key group
+                must pass before the rest of the group is skipped.
         """
-        states = [self.state(prefix) for prefix in prefixes]
+        states = [self.state_of(prefix) for prefix in prefixes]
         head = len(self.questions[0].head)
         # a read's document rows: the first row, which stands for nothing,
         # then each document row the state kept
         reads = ([np.r_[0, np.arange(head, min(len(prefix), len(kept)))]
                   for prefix, kept in zip(prefixes, states)]
-                 if self.reads_any else None)
-        passes = Passes(requests=None, reads=None if reads is None else [],
-                        stop_groups=(None if stop_groups is None
+                 if self.reads_any else [])
+        passes = Passes(stop_groups=(None if stop_groups is None
                                      or len(self.passes) > 1 else list(stop_groups)))
-        for stage, (*_, shape) in zip(self.stages, self.passes):
+        self.reads[:] = []
+        for stage, (*_, shape) in enumerate(self.passes):
             passes.stages += [stage] * len(states)
             passes.states += states
             passes.suffix_tokens += [sum(shape)] * len(states)
             passes.owners += range(len(states))
-            if reads is not None:
-                passes.reads += reads
-        answered = yield passes
-        return self.answers(answered, len(states))
+            self.reads += reads
+        return self.answers(run_passes(self.state, self.stages, passes,
+                                       label=self.label, limit=limit,
+                                       num_key_survivors=num_key_survivors),
+                            len(states))
 
     def answers(self, passes, count) -> GroupAnswers:
         """Decode the group's answers from its answered passes.

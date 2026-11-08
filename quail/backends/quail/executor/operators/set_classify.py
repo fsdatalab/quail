@@ -15,6 +15,7 @@ from quail.backends.quail.executor.pass_groups import (
     option_probabilities,
 )
 from quail.backends.quail.executor.readout import AsyncPassReadout
+from quail.backends.quail.executor.set_passes import own_stage, run_passes
 from quail.backends.quail.reranker import (
     classify_outputs,
     probability_column,
@@ -107,39 +108,17 @@ def score_result(node, ids, scores, priors, cost, suffix_tokens) -> NodeResult:
                    "input_rows": len(ids), "suffix_tokens": suffix_tokens}))
 
 
-def joined_label_stage(run, node) -> int:
-    """Add the stage of a classification of a join's pairs to a set run.
-
-    Args:
-        run: The SetPasses the classification runs in.
-        node: The AiClassify over the join's pairs.
-
-    Returns:
-        The stage's index in the run.
-    """
-    torch, model = run.state.torch, run.state.loaded_model.model
-    targets = sorted({token for ids in node.spec.label_token_ids for token in ids})
-    return run.own_stage(AsyncPassReadout(torch, torch.nn.functional,
-                                          full_output_head(model), targets, None),
-                         f"classify {node.spec.name}")
-
-
-def joined_labels(run, stage, node, join):
+def joined_labels(state, node, join) -> NodeResult:
     """Classify the pairs a join kept, as option-code questions in each anchor's passes.
 
     Each anchor document is the state again; each partner the join kept
     for it is one question: the partner's label and document, then the
-    classification's question and options. Yields the passes as one
-    step of the run.
+    classification's question and options.
 
     Args:
-        run: The SetPasses the classification runs in.
-        stage: Its stage in the run (joined_label_stage).
+        state: The query's execution state.
         node: The AiClassify over the join's pairs.
         join: The JoinOperator that ran the join, under set attention.
-
-    Returns:
-        The classification's NodeResult.
     """
     spec = node.spec
     (join_node,) = [member for member in join.nodes if node.classifies_join(member)]
@@ -163,12 +142,18 @@ def joined_labels(run, stage, node, join):
         question_header_token_ids=spec.question_header_token_ids,
         anchor=spec.anchor, document_ends=node.document_ends)
     targets = sorted({token for ids in spec.label_token_ids for token in ids})
-    model_spec = run.state.loaded_model.model_spec
+    torch = state.torch
+    model_spec = state.loaded_model.model_spec
     passes = join_passes(questions, join.inputs["prefixes"], sorted(kept), kept.get,
                          join.inputs["partner_documents"], model_spec.set_size,
-                         run.state.chunk_tokens)
-    passes.stages = [stage] * len(passes.states)
-    passes = yield passes
+                         state.chunk_tokens)
+    passes.stages = [0] * len(passes.states)
+    readout = AsyncPassReadout(torch, torch.nn.functional,
+                               full_output_head(state.loaded_model.model), targets,
+                               None)
+    label = f"classify {spec.name}"
+    run_passes(state, [own_stage(state, readout, label, passes)], passes,
+               label=label)
     rows = np.zeros((0, 2), dtype=np.int32)
     values = np.zeros(0, dtype=object)
     if passes.states:

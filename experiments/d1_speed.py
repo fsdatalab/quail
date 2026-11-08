@@ -286,7 +286,6 @@ def quail_profile() -> dict:
     from dataclasses import replace
 
     from quail.backends.quail.executor.pass_groups import PassGroup
-    from quail.backends.quail.executor.set_passes import SetPasses
     from quail.common.document_ends import document_ends
     from quail.common.tokens import DocumentPrefixes
 
@@ -303,9 +302,7 @@ def quail_profile() -> dict:
     prefixes = DocumentPrefixes(first.head, documents["r"], rows)
 
     def ask(asked):
-        run = SetPasses(state)
-        return run.run(PassGroup(run, asked, prefixes).ask(prefixes),
-                       label="pass group")
+        return PassGroup(state, asked, prefixes).ask(prefixes)
 
     result = dict(
         classify=_profile("classify", lambda: ask(questions[1:2]), len(rows),

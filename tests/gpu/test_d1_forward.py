@@ -475,16 +475,15 @@ def _ask(loaded, answer_ids, questions):
     from dataclasses import replace
 
     from quail.backends.quail.executor.pass_groups import PassGroup
-    from quail.backends.quail.executor.set_passes import SetPasses
 
     ids = _tokenizer()
     first = questions[0]
     ends = _ends(first.head, first.state_tail, [ids(r) for r in REVIEWS])
     prefixes = [list(first.head) + ids(review) for review in REVIEWS]
-    run = SetPasses(_execution_state(loaded, answer_ids))
-    pass_group = PassGroup(run, [replace(question, ends=ends)
-                                 for question in questions], prefixes)
-    group = run.run(pass_group.ask(prefixes), label="pass group")
+    pass_group = PassGroup(_execution_state(loaded, answer_ids),
+                           [replace(question, ends=ends) for question in questions],
+                           prefixes)
+    group = pass_group.ask(prefixes)
     assert group.positions.tolist() == list(range(len(REVIEWS)))
     return group.answers
 

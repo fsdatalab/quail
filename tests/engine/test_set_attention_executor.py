@@ -163,14 +163,6 @@ class _OneGroup:
     def group(self, pass_group, kept):
         self.asked.append(len(kept))
         return self.answers
-        yield
-
-
-def _finish(steps) -> dict:
-    """Run set_steps that ask no passes of the GPU loop to their results."""
-    with pytest.raises(StopIteration) as stop:
-        next(steps)
-    return stop.value.value
 
 
 def test_a_label_packed_with_a_filter_answers_only_the_rows_the_filter_keeps():
@@ -191,8 +183,7 @@ def test_a_label_packed_with_a_filter_answers_only_the_rows_the_filter_keeps():
         [4, 4], tokens=100))
     state = SimpleNamespace(loaded_model=SimpleNamespace(model_spec=D1_2B_BF16))
 
-    results = _finish(pipeline.set_steps(state, nodes, [10, 11, 12, 13],
-                                         [[0]] * 4, ask))
+    results = pipeline.set_steps(state, nodes, [10, 11, 12, 13], [[0]] * 4, ask)
 
     labels = results["c"].outputs["rows:r"]
     assert ask.asked == [4]
@@ -223,8 +214,7 @@ def test_a_score_packed_with_a_label_reads_its_answers_for_every_row():
         np.array([[0.9, 0.1], [0.2, 0.8], [0.6, 0.4]])], [3, 3], tokens=100))
     state = SimpleNamespace(loaded_model=SimpleNamespace(model_spec=D1_2B_BF16))
 
-    results = _finish(pipeline.set_steps(state, nodes, [10, 11, 12], [[0]] * 3,
-                                         ask))
+    results = pipeline.set_steps(state, nodes, [10, 11, 12], [[0]] * 3, ask)
 
     scored = results["s"].outputs["rows:r"]
     assert scored.ids["r"].to_pylist() == [10, 11, 12]
@@ -235,7 +225,7 @@ def test_a_score_packed_with_a_label_reads_its_answers_for_every_row():
         == (100, 0)
 
 
-def test_a_later_step_asks_only_the_kept_documents_in_the_same_loop(monkeypatch):
+def test_a_later_step_asks_only_the_documents_the_step_before_kept(monkeypatch):
     from helpers.fakes import (
         cpu_arena,
         fake_pack,
@@ -244,19 +234,15 @@ def test_a_later_step_asks_only_the_kept_documents_in_the_same_loop(monkeypatch)
         fake_torch,
     )
 
-    from quail.backends.quail.executor import chunk, stage_executor
-    from quail.backends.quail.executor.set_passes import Passes, SetPasses
+    from quail.backends.quail.executor import chunk
+    from quail.backends.quail.executor.set_passes import (
+        Passes,
+        own_stage,
+        run_passes,
+    )
     from quail.backends.quail.executor.stages import Stage, StageRequests
 
     monkeypatch.setattr(chunk, "pack_chunk", fake_pack)
-    loops = []
-    original = stage_executor.StageExecutor.__init__
-
-    def counted(self, *args, **kwargs):
-        loops.append(self)
-        original(self, *args, **kwargs)
-
-    monkeypatch.setattr(stage_executor.StageExecutor, "__init__", counted)
 
     def forward_chunk(packed):
         # a pass's answer: whether its document token is even, then, at
@@ -270,28 +256,20 @@ def test_a_later_step_asks_only_the_kept_documents_in_the_same_loop(monkeypatch)
             arena=cpu_arena(64), input_staging=None,
             pipeline=fake_pipeline(whole_sequences=True,
                                    forward_chunk=forward_chunk)))
-    run = SetPasses(state)
     readout = fake_readout()
-    first = run.add_stage(Stage(suffixes=[[7]], readout=readout))
-    second = run.own_stage(readout, "second step")
     documents = [[10], [11], [12], [13], [16]]
 
-    def steps():
-        answered = yield Passes(stages=[first] * 5, states=documents,
-                                suffix_tokens=[1] * 5, owners=list(range(5)))
-        kept = [index for index, value in zip(answered.owners, answered.values)
-                if value]
-        answered = yield Passes(
-            stages=[second] * len(kept), states=[documents[i] for i in kept],
-            suffix_tokens=[2] * len(kept), owners=kept,
-            requests=[StageRequests([[8, 9]]) for _ in kept])
-        return {index: bool(value)
-                for index, value in zip(answered.owners, answered.values)}, \
-            answered.tokens
+    first = run_passes(state, [Stage(suffixes=[[7]], readout=readout)], Passes(
+        stages=[0] * 5, states=documents, suffix_tokens=[1] * 5,
+        owners=list(range(5))), label="first step")
+    kept = [index for index, value in zip(first.owners, first.values) if value]
+    second = Passes(stages=[0] * len(kept), states=[documents[i] for i in kept],
+                    suffix_tokens=[2] * len(kept), owners=kept,
+                    requests=[StageRequests([[8, 9]]) for _ in kept])
+    run_passes(state, [own_stage(state, readout, "second step", second)], second,
+               label="second step")
 
-    passed, tokens = run.run(steps(), label="two steps")
-
-    assert len(loops) == 1
-    assert passed == {0: False, 2: True, 4: True}
+    assert {index: bool(value) for index, value in
+            zip(second.owners, second.values)} == {0: False, 2: True, 4: True}
     # each of the three kept documents' passes: one state token, two asked
-    assert tokens == 3 * (1 + 2)
+    assert second.tokens == 3 * (1 + 2)

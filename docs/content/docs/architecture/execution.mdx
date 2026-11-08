@@ -86,14 +86,13 @@ extractions alone use their own prompt layout. Every other chain reads
 one document table: the first node's prompt head with each document,
 keyed by alias and document id, under one prefix tree.
 
-Under set attention a pipeline also runs in one loop, but each request
-there is a *pass*: one unpaged sequence of a state, a document and the
-text after it, then the questions asked of it. A `SetChain` gives each
-pass of each pass group, each join, and each classification of a
-join's pairs a stage of one `StageExecutor`, which asks each pass at
-its own stage only. A step's passes enter the loop once every pass of
-the step before has answered, because a step asks only the rows the
-steps before it kept.
+Under set attention each request is a *pass*: one unpaged sequence of
+a state, a document and the text after it, then the questions asked of
+it. A `SetChain` runs each step (a pass group, a join, or a
+classification of a join's pairs) as one `StageExecutor` over the
+step's passes, which asks each pass at its own stage only. A step runs
+once the step before it has answered, because a step asks only the
+rows the steps before it kept.
 
 ### Reading the region's input
 

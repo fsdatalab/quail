@@ -1,10 +1,9 @@
-"""Run a chain's steps under set attention, as passes in one GPU loop.
+"""Run a chain's steps under set attention, as passes.
 
 Under set attention every forward-pass sequence is one pass: a state,
 then the questions asked of it. A chain's GPU steps are pass groups
 (PackSetPasses), joins, and classifications of a join's pairs; each
-asks its passes as anchors of the chain's one SetPasses run, at its own
-stages. A step's passes join the loop once the step before it has
+asks its passes in a GPU loop of its own once the step before it has
 answered, since a step asks only the rows the steps before it kept.
 """
 
@@ -18,7 +17,6 @@ from quail.backends.quail.executor.operators.join import set_joins, upstream_joi
 from quail.backends.quail.executor.operators.set_classify import (
     SetLabels,
     classify_result,
-    joined_label_stage,
     joined_labels,
     score_result,
 )
@@ -29,9 +27,7 @@ from quail.backends.quail.executor.operators.set_extract import (
     read_texts,
 )
 from quail.backends.quail.executor.pass_groups import PassGroup, node_question
-from quail.backends.quail.executor.readout import AsyncSlotMargins
 from quail.backends.quail.executor.region import pipeline_ids, pipeline_rows
-from quail.backends.quail.executor.set_passes import SetPasses
 from quail.common.tokens import DocumentPrefixes
 from quail.execution.finished import report_outputs
 from quail.execution.ids import id_positions
@@ -93,7 +89,7 @@ def _join_run(nodes, index) -> list:
 
 def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
               context=None):
-    """Run a pipeline's steps under set attention, in order; yields their passes.
+    """Run a pipeline's steps under set attention, in order.
 
     The operators of one pass group (PackSetPasses) are asked in one
     pass per document when the pipeline reaches the group's first
@@ -114,9 +110,8 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
         ids: The document ids the pipeline reads.
         prefixes: Per position in ids, the prompt head and document tokens.
         ask: What asks the model: group(pass group, kept positions),
-            joins(nodes, anchor ids), and joined(node, join), each a
-            generator of Passes returning GroupAnswers, the
-            JoinOperator, or the NodeResult.
+            joins(nodes, anchor ids), and joined(node, join), returning
+            GroupAnswers, the JoinOperator, or the NodeResult.
         texts: The table's texts by document id, for extractions.
         inputs: Per node id, its input values from outside the pipeline.
         context: The execution context, for conditions and joins.
@@ -135,7 +130,7 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
             if node.pass_group not in groups:
                 members = [member for member in nodes if _kind(member) in PACKED
                            and member.pass_group == node.pass_group]
-                group = yield from ask.group(node.pass_group, kept)
+                group = ask.group(node.pass_group, kept)
                 groups[node.pass_group] = (members, group, kept[group.positions])
             members, group, answered = groups[node.pass_group]
             # the kept rows the group answered, and their answers
@@ -193,13 +188,13 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
             if index and _kind(nodes[index - 1]) == "join":
                 continue
             run = _join_run(nodes, index)
-            join = yield from ask.joins(run, ids[kept])
+            join = ask.joins(run, ids[kept])
             for member in run:
                 results[member.node_id] = join.results()[member.node_id]
                 report_outputs(member, results[member.node_id])
             node = run[-1]
         else:
-            results[node.node_id] = yield from ask.joined(node, join)
+            results[node.node_id] = ask.joined(node, join)
             report_outputs(node, results[node.node_id])
             continue
         rows = results[node.node_id].outputs.get(f"rows:{alias}")
@@ -209,11 +204,9 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
 
 
 class SetChain:
-    """A chain under set attention: every step's passes in one SetPasses run.
+    """A chain under set attention: each step's passes in a GPU loop of its own.
 
-    The chain's stages are added before the run, in step order: one per
-    pass of each pass group, one per join, and one per classification
-    of a join's pairs. Each step reports its nodes' rows as it finishes.
+    Each step reports its nodes' rows as it finishes.
 
     Args:
         state: The query's execution state.
@@ -235,24 +228,14 @@ class SetChain:
         self.prefixes = DocumentPrefixes(head, context.state["documents"][alias],
                                          self.ids)
         self.texts = context.state.get("texts", {}).get(alias)
-        self.run = SetPasses(state)
         self.groups = {}
-        self.stages = {}        # join or joined classification -> its stage
-        readout = None
         for node in nodes:
-            kind = _kind(node)
-            if kind in PACKED and node.pass_group not in self.groups:
+            if _kind(node) in PACKED and node.pass_group not in self.groups:
                 members = [member for member in nodes if _kind(member) in PACKED
                            and member.pass_group == node.pass_group]
                 self.groups[node.pass_group] = PassGroup(
-                    self.run, [node_question(member) for member in members],
+                    state, [node_question(member) for member in members],
                     self.prefixes, f"pass group ({len(members)} questions)")
-            elif kind == "join":
-                readout = readout or AsyncSlotMargins(state.torch, state.answer_rows)
-                self.stages[node.node_id] = self.run.own_stage(
-                    readout, f"join predicate {node.written_position}")
-            elif kind == "joined":
-                self.stages[node.node_id] = joined_label_stage(self.run, node)
         # a limit and stop keys apply to the pass group that ends the
         # chain, when it is one pass
         last = self.nodes[-1]
@@ -270,33 +253,29 @@ class SetChain:
                                   else first_filter.num_key_survivors)
 
     def group(self, pass_group, kept):
-        """Ask a pass group of the kept documents; yields its Passes."""
+        """Ask a pass group of the kept documents; return its GroupAnswers."""
         group = self.groups[pass_group]
-        stops = (None if self.stop_groups is None or group is not self.ending
-                 else [self.stop_groups[int(p)] for p in kept])
-        return (yield from group.ask([self.prefixes[int(p)] for p in kept], stops))
+        prefixes = [self.prefixes[int(p)] for p in kept]
+        if group is not self.ending:
+            return group.ask(prefixes)
+        return group.ask(prefixes, None if self.stop_groups is None
+                         else [self.stop_groups[int(p)] for p in kept],
+                         limit=self.context.state.get("filter_limit"),
+                         num_key_survivors=self.num_key_survivors)
 
     def joins(self, nodes, anchor_ids):
-        """Ask a group of joins of the anchors; yields their Passes."""
+        """Ask a group of joins of the anchors; return their JoinOperator."""
         join = upstream_join(self.state, nodes, anchor_ids, (), self.inputs,
                              self.context)
-        yield from set_joins(self.run, [self.stages[node.node_id] for node in nodes],
-                             join)
+        set_joins(self.state, join)
         return join
 
     def joined(self, node, join):
-        """Classify a join's kept pairs; yields their Passes."""
-        return (yield from joined_labels(self.run, self.stages[node.node_id], node,
-                                         join))
+        """Classify a join's kept pairs; return the NodeResult."""
+        return joined_labels(self.state, node, join)
 
     def execute(self) -> dict:
-        """Run the chain's steps in one GPU loop; return node id -> NodeResult."""
-        steps = set_steps(self.state, self.nodes, self.ids, self.prefixes, self,
-                          texts=self.texts, inputs=self.inputs,
-                          context=self.context)
-        return self.run.run(
-            steps, label=f"set pipeline {self.nodes[0].document_aliases[0]}",
-            limit=(self.context.state.get("filter_limit")
-                   if self.ending is not None else None),
-            stop_keys=self.stop_groups is not None,
-            num_key_survivors=self.num_key_survivors)
+        """Run the chain's steps; return node id -> NodeResult."""
+        return set_steps(self.state, self.nodes, self.ids, self.prefixes, self,
+                         texts=self.texts, inputs=self.inputs,
+                         context=self.context)
