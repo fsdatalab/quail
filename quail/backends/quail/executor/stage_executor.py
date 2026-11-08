@@ -34,7 +34,8 @@ HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
 def answer_admission_mode() -> str:
     """Return the answer admission QUAIL_ANSWER_ADMISSION names, headroom by default.
 
-    Either mode admits a document's answers one at a time.
+    Either mode admits a document's answers together when they fit and
+    one at a time when they do not.
 
     - headroom=0: admit when the prompt fits; every answer's headroom is 0.
     - headroom: admit when the prompt and each answer's chosen headroom fit.
@@ -300,7 +301,7 @@ class StageExecutor:
             self.answer_admission = HeadroomAdmission(
                 decoder, self.prefix_lengths, self.capacity_extra,
                 self.sched.dependencies, self.borrowing.tree_shared,
-                decode_cost, self.arena.page_holds,
+                self.arena.page_cost, decode_cost, self.arena.page_holds,
                 choose_headroom=self.admission_mode == "headroom",
                 chunk_tokens=self.sched.chunk_budget,
                 trace=bool(os.environ.get(HEADROOM_TRACE_ENV)))
@@ -1024,7 +1025,7 @@ class StageExecutor:
                     and (self.sched.pending or self.sched.waiting)):
                 started = time.perf_counter()
                 self.answer_admission.refresh(
-                    replays, self._replay_pages(replays),
+                    self.sched._stage, replays, self._replay_pages(replays),
                     self.arena.free_pages if self.paged else None)
                 self.answer_admission.order_waiting(self.sched.waiting)
                 self.admission_s += time.perf_counter() - started

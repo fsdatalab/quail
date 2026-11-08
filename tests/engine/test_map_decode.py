@@ -16,6 +16,7 @@ import torch
 from helpers.fakes import cpu_staging, fake_pipeline
 from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 
+from quail.backends.quail.executor.admission import pages_for
 from quail.backends.quail.executor.answer_admission import (
     HeadroomAdmission,
     _allocate,
@@ -599,7 +600,8 @@ def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
         decoder.written[0][a] = length
     cost = DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"])
     admission = HeadroomAdmission(decoder, [prefix_tokens] * num_documents, 6, {},
-                                  [0] * num_documents, cost)
+                                  [0] * num_documents,
+                                  lambda tokens: pages_for(tokens, 4), cost)
     return decoder, admission
 
 
@@ -609,12 +611,13 @@ def test_zero_headroom_admits_when_the_prompt_fits_but_waits_for_replays():
     decoder.answer_slots = {0: np.arange(2)}
     decoder.start(0, 0, 10, [0, 1, 2, 3])
     admission = HeadroomAdmission(decoder, [8, 8], 6, {}, [0, 0],
+                                  lambda tokens: pages_for(tokens, 4),
                                   choose_headroom=False)
-    admission.refresh()
+    admission.refresh(np.array([0, -1]))
     assert admission.allows(1, 4, 4)
     assert not admission.allows(1, 3, 4)
     decoder.pause(0)
-    admission.refresh(replay_pages=4)
+    admission.refresh(np.array([0, -1]), replay_pages=4)
     assert not admission.allows(1, 4, 4)
     assert admission.allows(1, 8, 4)
     assert admission.waits()
@@ -623,7 +626,7 @@ def test_zero_headroom_admits_when_the_prompt_fits_but_waits_for_replays():
 def test_a_new_document_leaves_running_headroom_alone_when_pages_are_ample():
     decoder, admission = headroom_admission(ended=[(2, 30)], prefix_tokens=8000)
     decoder.start(0, 0, 8006, list(range(2003)))
-    admission.refresh(free_pages=1000)
+    admission.refresh(np.array([0, -1, -2]), free_pages=1000)
     held = int(admission._remaining(np.array([0]))[0])
     assert held > 0
     assert not admission.allows(1, 3, 4)
@@ -638,7 +641,7 @@ def test_a_new_document_leaves_running_headroom_alone_when_pages_are_ample():
 def test_a_second_document_in_a_round_shrinks_the_first_ones_headroom_to_fit():
     decoder, admission = headroom_admission(prefix_tokens=8, limit=128,
                                             expected_tokens=64)
-    admission.refresh(free_pages=30)
+    admission.refresh(np.array([-1, -1, -1]), free_pages=30)
     assert admission.allows(0, 30, 4)
     admission.admit(0)
     first = admission.headroom_pages
@@ -686,22 +689,24 @@ def test_survival_curves_match_a_full_recount_after_answers_end_unseen():
     decoder, admission = headroom_admission(num_documents=60, limit=32,
                                             expected_tokens=8)
     admission.bucket_answers = 1
-    admission.refresh(free_pages=1000)
+    stages = np.full(60, -1)
+    admission.refresh(stages, free_pages=1000)
     rng = np.random.default_rng(5)
     for a in range(40):
         decoder.start(a, 0, 14, [4 * a, 4 * a + 1, 4 * a + 2, 4 * a + 3])
         decoder.written[0][a] = rng.integers(0, 20)
-    admission.refresh(free_pages=1000)
+    admission.refresh(stages, free_pages=1000)
     # half end as a settle ends them; slot 50 starts and ends between refreshes
     for a in [*range(0, 40, 2), 50]:
         decoder.lengths[0][a] = decoder.written[0][a] = rng.integers(1, 32)
         decoder.map[a] = -1
         decoder.ended_log.append(np.array([a]))
     decoder.written[0][1] += 3
-    admission.refresh(free_pages=1000)
+    admission.refresh(stages, free_pages=1000)
     recount = HeadroomAdmission(decoder, [8] * 60, 6, {}, [0] * 60,
+                                lambda tokens: pages_for(tokens, 4),
                                 admission.decode_cost, bucket_answers=1)
-    recount.refresh(free_pages=1000)
+    recount.refresh(stages, free_pages=1000)
     assert np.array_equal(admission.map_counts, recount.map_counts)
     assert np.allclose(admission.whole, recount.whole)
     assert np.allclose(admission.curves, recount.curves)
@@ -718,6 +723,7 @@ def test_eviction_takes_remaining_tokens_from_each_answers_length_bucket():
     for a in [*range(2, 10), *range(12, 20)]:
         decoder.lengths[0][a] = decoder.written[0][a] = 3 if a < 10 else 24
     admission = HeadroomAdmission(decoder, prefixes, 6, {}, [0] * num_documents,
+                                  lambda tokens: pages_for(tokens, 4),
                                   choose_headroom=False, bucket_answers=1)
     decoder.start(0, 0, 14, [0, 1, 2, 3])
     decoder.start(10, 0, 2006, [4, 5, 6, 7])
