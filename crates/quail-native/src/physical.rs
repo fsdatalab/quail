@@ -139,7 +139,7 @@ static KINDS: &[Kind] = &[
             "document_head" = EMPTY, "share_prefixes" = NO, "attention" = S,
             "stop_key" = EMPTY, "pass_group" = Some("-1"), "state_tail_tokens" = ZERO,
             "question_header_token_ids" = EMPTY, "document_ends" = EMPTY,
-            "num_key_survivors" = Some("1")),
+            "num_key_survivors" = Some("1"), "guard" = NONE, "alternative" = NONE),
     },
     Kind {
         class: "AiScore",
@@ -384,7 +384,8 @@ static KINDS: &[Kind] = &[
         class: "FilterPredicate",
         tag: "quail.common.expressions.FilterPredicate",
         node: false,
-        fields: fields!(; "expression" = REQUIRED, "selectivity" = NONE),
+        fields: fields!(; "expression" = REQUIRED, "selectivity" = NONE, "guard" = NONE,
+            "alternative" = NONE),
     },
     Kind {
         class: "Equality",

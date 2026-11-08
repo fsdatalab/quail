@@ -19,7 +19,8 @@ use crate::plan_statistics::plan_prompts;
 /// - `value_columns`: alias -> the columns the executor reads by
 ///   document id: join equalities, regular predicates, tests of labels
 ///   and answers on the table's own columns, DISTINCT stop keys, and
-///   the guards of column operators;
+///   the guards of column operators and AI filters and the
+///   alternatives of AI filters;
 /// - `stop_keys`: alias -> its DISTINCT stop key;
 /// - `join_conditions`: for each join with equalities, its written
 ///   position, its two aliases, and each equality's sides in that
@@ -80,7 +81,16 @@ pub fn region_facts(found: &Operators) -> Value {
             add(alias, column);
         }
     }
-    for guard in found.columns().filter_map(|column| column.guard.as_ref()) {
+    let filter_guards = found.filters.iter().flat_map(|(_, predicates)| {
+        predicates
+            .iter()
+            .flat_map(|predicate| predicate.guard.iter().chain(&predicate.alternative))
+    });
+    for guard in found
+        .columns()
+        .filter_map(|column| column.guard.as_ref())
+        .chain(filter_guards)
+    {
         for reference in column_references(guard) {
             add(&reference.alias, &reference.column);
         }

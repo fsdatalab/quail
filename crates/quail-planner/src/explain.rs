@@ -1146,6 +1146,12 @@ impl TreeRows<'_> {
                 condition_text(guard)
             ));
         }
+        if let Some(alternative) = known.alternative() {
+            details.push(format!(
+                "passes each row where {}, whatever the model answers",
+                condition_text(alternative)
+            ));
+        }
         let title = match known {
             PhysicalNode::Scan(scan) => {
                 let scan = &scan.attributes;

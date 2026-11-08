@@ -73,6 +73,15 @@ pub fn derive_region(
     if let Some(fetch) = region.fetch {
         operators = operators.limited(fetch as i64);
     }
+    let ored = operators
+        .filters
+        .iter()
+        .flat_map(|(_, predicates)| predicates)
+        .any(|predicate| predicate.alternative.is_some());
+    if ored && operators.fetch.is_some() {
+        // the executor counts the rows that pass among the rows it asks
+        return unsupported("a LIMIT over an OR of an AI filter and other tests");
+    }
     Ok((operators, plan))
 }
 
@@ -992,6 +1001,32 @@ impl Relation {
             self.joins.insert(id, spec);
             return Ok(());
         }
+        // an AI.IF in an OR passes the rows where the OR's other terms are TRUE
+        let alternative = match &node.filter {
+            Some(Expr::Column(column))
+                if node.function() == "ai_filter"
+                    && column.relation.is_none()
+                    && column.name == node.answer =>
+            {
+                None
+            }
+            Some(filter)
+                if node.function() == "ai_filter" && split_conjunction(filter).len() == 1 =>
+            {
+                match crate::or_guards::or_terms(node) {
+                    Some(rest) => Some(binder.bind_condition(&walk.written(&rest, &[]))?),
+                    None => {
+                        self.unplaced = true;
+                        return Ok(());
+                    }
+                }
+            }
+            _ => None,
+        };
+        let guard = match &node.guard {
+            Some(guard) => Some(binder.bind_condition(&walk.written(guard, &[]))?),
+            None => None,
+        };
         let (predicate, options) = if node.function() == "ai_score" {
             let answer = Answer {
                 name: node.answer.clone(),
@@ -1015,9 +1050,17 @@ impl Relation {
             let filter = FilterPredicate {
                 expression: predicate,
                 selectivity: options.selectivity,
+                guard,
+                alternative,
             };
             push(&mut self.filters, &read[0], filter);
             return Ok(());
+        }
+        if alternative.is_some() || guard.is_some() {
+            return unsupported(&format!(
+                "{}, an OR of an AI join and other tests,",
+                walk.written(node.filter.as_ref().expect("an OR"), &[])
+            ));
         }
         let spec = JoinSpec {
             predicate,
@@ -1608,10 +1651,10 @@ impl<'w, 'a> Assembly<'w, 'a> {
             return None;
         }
         for id in self.walk.ids() {
-            // only a column node's executor reads a guard
+            // a column node's and an AI.IF filter's executors read a guard
             if let Kind::Ai(node) = &self.walk.get(id).kind
                 && node.guard.is_some()
-                && (node.is_predicate() || node.semantics != Semantics::Rows)
+                && (node.function() == "ai_score" || node.semantics != Semantics::Rows)
             {
                 return None;
             }
@@ -1667,6 +1710,14 @@ impl<'w, 'a> Assembly<'w, 'a> {
             }) if self.stops_per_key(&alias) => Some((key.clone(), *n)),
             _ => None,
         });
+        // the executor counts a key's survivors among the rows it asks
+        if stop_key.is_some()
+            && predicates
+                .iter()
+                .any(|predicate| predicate.alternative.is_some())
+        {
+            return None;
+        }
         for predicate in predicates {
             push(&mut self.found.filters, &alias, predicate);
             push(&mut self.found.filters_before_joins, &alias, before_joins);
@@ -2042,6 +2093,11 @@ fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly
     let guards: Vec<ColumnRef> = found
         .columns()
         .filter_map(|column| column.guard.as_ref())
+        .chain(found.filters.iter().flat_map(|(_, predicates)| {
+            predicates
+                .iter()
+                .flat_map(|predicate| predicate.guard.iter().chain(&predicate.alternative))
+        }))
         .flat_map(column_references)
         .collect();
     value(guards.clone());

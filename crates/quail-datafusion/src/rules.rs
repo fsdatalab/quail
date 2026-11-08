@@ -2,7 +2,7 @@
 //!
 //! DataFusion's optimizer runs its own rules over the whole plan, each
 //! `AiNode` included, with Quail's rules among them. [`LOGICAL_RULES`]
-//! is the default order: DataFusion's default rules, with Quail's eleven
+//! is the default order: DataFusion's default rules, with Quail's twelve
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
 //! GROUP BY. Then
 //! [`crate::ClaimModelRegions`] runs last: it runs the listed rules
@@ -19,7 +19,7 @@ use datafusion::common::{Result, plan_err};
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 
 /// Quail's own rules, in the order they run.
-pub const QUAIL_RULES: [&str; 11] = [
+pub const QUAIL_RULES: [&str; 12] = [
     "eliminate_distinct",
     "place_ai_nodes",
     "absorb_into_ai_nodes",
@@ -28,6 +28,7 @@ pub const QUAIL_RULES: [&str; 11] = [
     "push_down_limit_into_ai_nodes",
     "push_down_projection_into_ai_nodes",
     "push_down_case_guards",
+    "push_down_or_guards",
     "push_down_substring_prechecks",
     "push_down_semi_join_fetch",
     "push_down_count_threshold",
@@ -38,7 +39,7 @@ const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
 
 /// The logical optimizer rules a session runs by default, in order: each
 /// name is an `OptimizerRule`'s `name()`.
-pub const LOGICAL_RULES: [&str; 36] = [
+pub const LOGICAL_RULES: [&str; 37] = [
     "rewrite_set_comparison",
     "optimize_unions",
     "unions_to_filter",
@@ -51,6 +52,7 @@ pub const LOGICAL_RULES: [&str; 36] = [
     "push_down_limit_into_ai_nodes",
     "push_down_projection_into_ai_nodes",
     "push_down_case_guards",
+    "push_down_or_guards",
     "push_down_substring_prechecks",
     "push_down_semi_join_fetch",
     "push_down_count_threshold",
@@ -92,7 +94,6 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
         "push_down_substring_prechecks" => Arc::new(crate::substring::PushDownSubstringPrechecks),
         "push_down_semi_join_fetch" => Arc::new(crate::keyed::PushDownSemiJoinFetch),
         "push_down_count_threshold" => Arc::new(crate::keyed::PushDownCountThreshold),
-        // off by default: a session lists it to run it
         "push_down_or_guards" => Arc::new(crate::or_guards::PushDownOrGuards),
         _ => return None,
     })
@@ -188,14 +189,5 @@ mod tests {
         let listed: Vec<String> = LOGICAL_RULES.iter().map(ToString::to_string).collect();
         let rules = logical_rules(&listed).unwrap();
         assert_eq!(rules.last().unwrap().name(), crate::claim::CLAIM_RULE);
-    }
-
-    #[test]
-    fn a_rule_off_by_default_is_known_by_name() {
-        assert!(!LOGICAL_RULES.contains(&"push_down_or_guards"));
-        assert_eq!(
-            logical_rule("push_down_or_guards").unwrap().name(),
-            "push_down_or_guards"
-        );
     }
 }

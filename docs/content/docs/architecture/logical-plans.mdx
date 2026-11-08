@@ -83,6 +83,9 @@ The rule then lowers each AI call in the part into one `AiNode`
 - An AI.IF filter is an `AiNode` whose filter is `a` and which returns
   only its input's columns. A comparison of an AI.SCORE is the same,
   with the comparison as the filter.
+- An OR of one AI.IF and terms that ask no model, such as
+  `r.flagged OR AI.IF(...)`, is an `AiNode` whose filter is the OR with
+  `a` in the call's place.
 - An AI.IF over two tables is an `AiNode` over their join. An EXISTS
   or NOT EXISTS over a model call is an `AiNode` over the join with
   semi or anti semantics: it returns the outer rows.

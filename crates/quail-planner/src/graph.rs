@@ -627,6 +627,8 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     state_tail_tokens: 0,
                     question_header_token_ids: Vec::new(),
                     document_ends: Value::Array(Vec::new()),
+                    guard: predicate.guard.clone(),
+                    alternative: predicate.alternative.clone(),
                 },
             )));
             surviving *= effective_selectivity(predicate.selectivity);

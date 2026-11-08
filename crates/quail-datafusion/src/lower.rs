@@ -7,7 +7,10 @@
 //!
 //! - A `Filter` keeps its other terms; each `AI.IF` term, or comparison
 //!   of an `AI.SCORE` call, is an `AiNode` above it whose filter tests
-//!   the answer. A term that reads two tables is an AI join.
+//!   the answer. A term that reads two tables is an AI join. An OR of
+//!   one `AI.IF` and terms that ask no model, such as `r.flagged OR
+//!   AI.IF(...)`, is an `AiNode` whose filter is the OR with the answer
+//!   in the call's place.
 //! - An inner `Join` keeps its other ON terms; each `AI.IF` term is an
 //!   `AiNode` above it.
 //! - Each such node records where the query wrote its term
@@ -36,7 +39,7 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::simplify::SimplifyContext;
-use datafusion::logical_expr::utils::{conjunction, split_conjunction};
+use datafusion::logical_expr::utils::{conjunction, split_binary, split_conjunction};
 use datafusion::logical_expr::{
     Expr, ExprSchemable, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
 };
@@ -116,19 +119,41 @@ fn is_asked(term: &Expr) -> bool {
 type Terms = Vec<(usize, Expr)>;
 
 /// A predicate's asked terms and the rest, in written order, and how many
-/// terms it has.
+/// terms it has. An OR with one `AI.IF` term, [`or_asked`], is asked.
 fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
     let terms = split_conjunction(predicate);
     let num_terms = terms.len();
     let (mut asked, mut rest) = (Vec::new(), Vec::new());
     for (position, term) in terms.into_iter().enumerate() {
-        if is_asked(term) {
+        if is_asked(term) || or_asked(term).is_some() {
             asked.push((position, term.clone()));
         } else {
             rest.push((position, term.clone()));
         }
     }
     (asked, rest, num_terms)
+}
+
+/// The `AI.IF` call of an OR whose other terms ask no model and read no
+/// model answer, such as `r.flagged OR AI.IF(...)`, and the OR's terms.
+fn or_asked(term: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
+    let terms = split_binary(term, Operator::Or);
+    if terms.len() < 2 {
+        return None;
+    }
+    let (calls, others): (Vec<&Expr>, Vec<&Expr>) = terms
+        .iter()
+        .copied()
+        .partition(|found| function_name(found) == Some("ai_filter"));
+    let plain = |found: &Expr| {
+        !found
+            .exists(|inner| Ok(crate::is_ai_call(inner) || matches!(inner, Expr::Exists(_))))
+            .unwrap_or(true)
+    };
+    match calls.as_slice() {
+        [call] if others.iter().all(|found| plain(found)) => Some((call, terms)),
+        _ => None,
+    }
 }
 
 /// An `AiNode` over `input` asking `term`, an `AI.IF` call or a
@@ -142,7 +167,23 @@ fn asked_node(
 ) -> Result<LogicalPlan> {
     let (term, hint) = unhint(term);
     let read = Expr::Column(Column::from_name(answer.clone()));
+    let ored = or_asked(&term).map(|(call, terms)| {
+        // the OR's terms in written order, the call's answer in its place
+        let filter = terms
+            .into_iter()
+            .map(|found| {
+                if found == call {
+                    read.clone()
+                } else {
+                    found.clone()
+                }
+            })
+            .reduce(Expr::or)
+            .expect("an OR's terms");
+        (call.clone(), filter)
+    });
     let (call, filter) = match term {
+        _ if ored.is_some() => ored.expect("an OR"),
         Expr::BinaryExpr(mut binary) if function_name(&binary.left) == Some("ai_score") => {
             let call = std::mem::replace(binary.left.as_mut(), read);
             (call, Expr::BinaryExpr(binary))

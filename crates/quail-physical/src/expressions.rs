@@ -222,6 +222,14 @@ tagged_struct! {
         expression: Asked,
         /// The fraction of documents that pass, if the query gives one.
         selectivity: Option<f64>,
+        /// The condition that says which documents the model is asked
+        /// about; None asks about every document.
+        guard: Option<ValueExpression>,
+        /// The other terms of an OR the predicate is one term of: a
+        /// document where it is TRUE passes whatever the model answers,
+        /// and a document the guard leaves out passes only then. None
+        /// for a predicate that is not in an OR.
+        alternative: Option<ValueExpression>,
     }
 }
 

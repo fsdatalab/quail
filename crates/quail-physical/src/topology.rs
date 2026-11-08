@@ -465,7 +465,7 @@ impl PhysicalNode {
     /// Whether this node can use the KV the node before it left.
     pub fn can_follow(&self, previous: &PhysicalNode, first: &PhysicalNode) -> bool {
         // the executor asks a guarded node about its guard's rows alone
-        if self.guard().is_some() {
+        if self.guard().is_some() || self.alternative().is_some() {
             return false;
         }
         match self {
@@ -496,7 +496,7 @@ impl PhysicalNode {
 
     /// Whether a consumer can run before other documents finish.
     pub fn can_precede(&self, consumer: &PhysicalNode) -> bool {
-        if self.guard().is_some() {
+        if self.guard().is_some() || self.alternative().is_some() {
             return false;
         }
         match self {
@@ -513,14 +513,24 @@ impl PhysicalNode {
         }
     }
 
-    /// A column node's guard: the condition that says which rows the
-    /// model is asked about. None for every other node.
+    /// A column node's or AI filter's guard: the condition that says
+    /// which rows the model is asked about. None for every other node.
     pub fn guard(&self) -> Option<&ValueExpression> {
         match self {
+            PhysicalNode::AiFilter(node) => node.attributes.guard.as_ref(),
             PhysicalNode::AiClassify(node) => node.attributes.guard.as_ref(),
             PhysicalNode::AiExtract(node) => node.attributes.guard.as_ref(),
             PhysicalNode::AiMap(node) => node.attributes.guard.as_ref(),
             PhysicalNode::AiSaeFeatures(node) => node.attributes.guard.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// An AI filter's alternative: the condition under which a row
+    /// passes whatever the model answers. None for every other node.
+    pub fn alternative(&self) -> Option<&ValueExpression> {
+        match self {
+            PhysicalNode::AiFilter(node) => node.attributes.alternative.as_ref(),
             _ => None,
         }
     }
