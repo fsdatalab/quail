@@ -15,10 +15,8 @@ from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena, PageArena
 from quail.backends.quail.executor.chunk import Suffixes
 from quail.backends.quail.executor.gdn import plan_phases
-from quail.backends.quail.executor.stages import (
-    Stage,
-    run_stages,
-)
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage
 
 
 class _Rows(dict):
@@ -96,11 +94,11 @@ def _run(arena, keys, stages, budget, monkeypatch, prefix_tree=None,
         if arena.is_resident(keys[anchor]):
             arena.retain(keys[anchor], lengths[anchor])
 
-    return run_stages(
+    return StageExecutor(
         fake_torch(), arena, pipeline, stages,
         prefixes or [[1] * 64 for _ in keys],
         budget, anchor_keys=keys, on_settled=settled,
-        attention_mode="unified", prefix_tree=prefix_tree)
+        attention_mode="unified", prefix_tree=prefix_tree).run()
 
 
 def _stages(count=2, frame=(7, 7), question=3):

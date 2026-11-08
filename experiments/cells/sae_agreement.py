@@ -135,7 +135,8 @@ def quail() -> dict:
     from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.sae import SaeEncoder, SaeFeaturesReadout
-    from quail.backends.quail.executor.stages import Stage, run_stages
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import Stage
     from quail.backends.quail.worker import checkpoint_arena_args
     from quail.common import budgets
     from quail.specs import H100_SXM, MODELS
@@ -181,11 +182,11 @@ def quail() -> dict:
     tail = prompts[0][1]
     stage = Stage(suffixes=[[tail[-1]]], frame=list(tail[:-1]),
                   readout=readout, single=True, label="sae agreement")
-    stage_answers, _, _ = run_stages(
+    stage_answers, _, _ = StageExecutor(
         torch, arena, pipeline, [stage],
         [list(document) for document, _ in prompts],
         BUDGET, anchor_keys=[("sae", index) for index in range(len(prompts))],
-        attention_mode="unified", default_attention="unified")
+        attention_mode="unified", default_attention="unified").run()
     keep = encoder.keep
 
     def feature_set(index_tensor, value_tensor):

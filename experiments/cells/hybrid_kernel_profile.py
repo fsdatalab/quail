@@ -174,7 +174,8 @@ def quail(model: str, backend: str = "flashinfer",
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
-    from quail.backends.quail.executor.stages import filter_stages, run_stages
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import filter_stages
     from quail.backends.quail.worker import checkpoint_arena_args
     from quail.common import budgets
     from quail.common.tokens import model_answers
@@ -209,8 +210,8 @@ def quail(model: str, backend: str = "flashinfer",
                          add_special_tokens=False)["input_ids"]
 
     def stage(batch):
-        run_stages(torch, arena, pipeline, filter_stages([question], answers),
-                   batch, budget, attention_mode="unified")
+        StageExecutor(torch, arena, pipeline, filter_stages([question], answers),
+                   batch, budget, attention_mode="unified").run()
         torch.cuda.synchronize()
         for key in arena.resident_keys():
             arena.free_key(key)

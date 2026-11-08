@@ -28,7 +28,8 @@ from quail.backends.quail.executor.model_operator import gated_stages
 from quail.backends.quail.executor.operators.classify import ClassifyOperator
 from quail.backends.quail.executor.operators.filter import ConditionGate, FilterOperator
 from quail.backends.quail.executor.operators.map import MapOperator
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage
 from quail.common.answers import answer_survival
 from quail.common.decode import DecodeCost
 from quail.common.tokens import prefix_tree
@@ -201,9 +202,9 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
                          [STOP], setup.page_tokens)
     maps.decoder = decoder
     stats = {}
-    run_stages(torch_, arena, pipeline, stages, prefixes, budget,
+    StageExecutor(torch_, arena, pipeline, stages, prefixes, budget,
                anchor_keys=keys, attention_mode=path, prefix_tree=tree,
-               decoder=decoder, dependencies=dependencies, stats=stats)
+               decoder=decoder, dependencies=dependencies, stats=stats).run()
     passed = [question is None
               or next_token(chain(document + question)) % 2 == 1
               for document in documents]
@@ -266,10 +267,10 @@ def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(
         arena.free_key(keys[anchor])
 
     stats = {}
-    run_stages(torch_, arena, pipeline, stages, prefixes, setup.budget,
+    StageExecutor(torch_, arena, pipeline, stages, prefixes, setup.budget,
                anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
                decoder=decoder, on_settled=settled, stats=stats,
-               limit=limit, survival=1.0)
+               limit=limit, survival=1.0).run()
     # a branch settles at its own end, so documents in flight when the
     # limit is reached still finish; the limit counts whole documents
     assert (len(survivors) == labels.count("keep") if limit is None
@@ -320,10 +321,10 @@ def test_fused_document_operators_equal_running_each_operator_alone(
             decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes),
                                  maps.answer_limits, [STOP], setup.page_tokens)
             maps.decoder = decoder
-        every, _, _ = run_stages(
+        every, _, _ = StageExecutor(
             torch_, arena, pipeline, stages, prefixes, setup.budget,
             anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
-            decoder=decoder, limit=limit, survival=1.0)
+            decoder=decoder, limit=limit, survival=1.0).run()
         assert not arena.accounting.owned
         return every
 
@@ -413,9 +414,9 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
                          expected_tokens=[1] * len(limits))
     maps.decoder = decoder
     stats = {}
-    run_stages(torch_, arena, pipeline, stages, prefixes, budget,
+    StageExecutor(torch_, arena, pipeline, stages, prefixes, budget,
                anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
-               decoder=decoder, stats=stats, limit=limit, attention_mode=path)
+               decoder=decoder, stats=stats, limit=limit, attention_mode=path).run()
     asked = np.flatnonzero(maps.asked[0])
     assert len(asked) >= (limit or 1)
     assert all(classification.plan.labels[a] == "keep" for a in asked)
@@ -495,9 +496,9 @@ def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
                          [STOP], 4)
     first.decoder = second.decoder = decoder
     stats = {}
-    run_stages(torch_, arena, pipeline, stages, prefixes, setup.budget,
+    StageExecutor(torch_, arena, pipeline, stages, prefixes, setup.budget,
                anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
-               decoder=decoder, stats=stats)
+               decoder=decoder, stats=stats).run()
     passed = [bool(next_token(chain(document + question)) % 2)
               for document in documents]
     for q, (tail, answer_limit) in enumerate(zip(tails, limits)):
@@ -544,10 +545,11 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
                          expected_tokens=[1] * len(limits))
     maps.decoder = decoder
     stats = {}
-    run_stages(events_torch(lag), arena, pipeline, gated_stages([maps]), prefixes,
+    StageExecutor(events_torch(lag), arena, pipeline, gated_stages([maps]), prefixes,
                budget, anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
                decoder=decoder, stats=stats, attention_mode=path,
-               decode_cost=DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"]))
+               decode_cost=DecodeCost.from_specs(QWEN3_4B_FP8,
+                                                 DEVICES["h100-sxm"])).run()
     for q, (tail, answer_limit) in enumerate(zip(tails, limits)):
         got = [answer.tolist() for answer in decoder.answers(q, maps._slots(q, ids))]
         assert got == [greedy(documents[a] + tail, answer_limit) for a in ids]
@@ -753,8 +755,8 @@ def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
     decoder.tokenizer = LetterTokenizer()
     decoder.answer_stops[0] = answer_stop(node)
     maps.decoder = decoder
-    run_stages(torch_, arena, pipeline, stages, prefixes, 400, anchor_keys=keys,
-               prefix_tree=tree, decoder=decoder, dependencies=dependencies)
+    StageExecutor(torch_, arena, pipeline, stages, prefixes, 400, anchor_keys=keys,
+               prefix_tree=tree, decoder=decoder, dependencies=dependencies).run()
     got = [answer.tolist() for answer in decoder.answers(0, maps._slots(0, ids))]
     # an answer the test settles stops after its first token, either way
     assert got == [want[:1] for want in wanted]

@@ -151,7 +151,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
     from quail.backends.quail.executor.model_operator import gated_stages
     from quail.backends.quail.executor.operators.extract import ExtractOperator
     from quail.backends.quail.executor.operators.filter import FilterOperator
-    from quail.backends.quail.executor.stages import run_stages
+    from quail.backends.quail.executor.stage_executor import StageExecutor
     from quail.physical import AiExtract
 
     cpu_staging(monkeypatch)
@@ -247,7 +247,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
             survivors.append(anchor)
         arena.free_key(keys[anchor])
 
-    every, timed_spans, fresh = run_stages(
+    every, timed_spans, fresh = StageExecutor(
         torch_,
         arena,
         fake_pipeline(forward_chunk=forward_chunk, canvas_ids=()),
@@ -262,7 +262,7 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         limit=limit,
         survival=1.0,
         attention_mode=setup.path if state_slots else None,
-    )
+    ).run()
     expected_survivors = [
         d
         for d, document in enumerate(part.extraction.documents)

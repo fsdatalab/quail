@@ -3,7 +3,7 @@
 A join writes each anchor document and a frame into KV (and, on a hybrid
 model, into a checkpoint that the frame extends), then streams every
 partner after it. This cell sends a few anchors of different lengths
-and a handful of partners through run_stages, and sends the same
+and a handful of partners through StageExecutor, and sends the same
 concatenated prompt of every (anchor, partner) pair through stock vLLM.
 The reference records each pair's TRUE minus FALSE logprob. Quail
 records the same difference and its answer bit.
@@ -79,13 +79,14 @@ def _pieces(spec, tokenizer):
 
 def _run_join(torch, arena, pipeline, answers, anchors, suffixes, frame, budget):
     """Run one join stage of partner suffixes; return answer rows per anchor."""
-    from quail.backends.quail.executor.stages import Stage, run_stages
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import Stage
 
     stages = [Stage(suffixes=suffixes, readout=answers, frame=frame)]
-    stage_answers, _, _ = run_stages(
+    stage_answers, _, _ = StageExecutor(
         torch, arena, pipeline, stages, anchors, budget,
         on_settled=lambda anchor, survived, row: None,
-        attention_mode="unified", label="join (1 stage)")
+        attention_mode="unified", label="join (1 stage)").run()
     return stage_answers[0]
 
 
@@ -148,7 +149,7 @@ def reference(model: str) -> dict:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
 def quail(model: str) -> dict:
-    """Quail's TRUE minus FALSE logit for every pair, through run_stages."""
+    """Quail's TRUE minus FALSE logit for every pair, through StageExecutor."""
     import numpy as np
     import torch
     import torch.nn.functional as F

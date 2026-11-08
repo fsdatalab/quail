@@ -300,9 +300,7 @@ class RegionExecution:
                                      if operator.attention), settings.attention),
                 prefix_tree=tree, stats=stats, limit=settings.limit,
                 survival=survival(operators),
-                paged=(paged or pipeline.needs_pages) and not pipeline.whole_sequences,
-                unit="documents", count_answers=False, label=settings.label,
-                default_attention="tree", on_chunk=self._on_chunk,
+                paged=paged, label=settings.label, on_chunk=self._on_chunk,
                 on_answers=(None if finished_rows() is None else self._on_answers),
                 stop_groups=settings.stop_groups,
                 appended_tokens=max(operator.appended_tokens

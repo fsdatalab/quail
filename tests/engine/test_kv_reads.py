@@ -162,7 +162,8 @@ def test_an_unpaged_filter_writes_a_long_document_in_pages_over_passes(
         monkeypatch):
     from helpers.kv_checker import Run, answer, chain, passthrough
 
-    from quail.backends.quail.executor.stages import filter_stages, run_stages
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import filter_stages
 
     cpu_staging(monkeypatch)
     documents = [list(range(100)), [7] * 20]
@@ -170,10 +171,10 @@ def test_an_unpaged_filter_writes_a_long_document_in_pages_over_passes(
     answers = {chain(document + question): answer(chain(document + question))
                for document in documents}
     run = Run(Setup(path="unified", pages=40, budget=32), answers)
-    got, _, tokens = run_stages(
+    got, _, tokens = StageExecutor(
         run.torch, run.arena, run.pipeline,
         filter_stages([question], passthrough()), documents, 32,
-        anchor_keys=[("d", 0), ("d", 1)], paged=False)
+        anchor_keys=[("d", 0), ("d", 1)], paged=False).run()
     assert {d: [int(bit) for bit in row] for d, row in got[0].items()} == {
         d: [answers[chain(document + question)]]
         for d, document in enumerate(documents)}

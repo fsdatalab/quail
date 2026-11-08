@@ -1,6 +1,7 @@
 """A fake model that checks every KV read, and runners for filters and joins.
 
-from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
+from quail.backends.quail.executor.stages import Stage, filter_stages
+from quail.backends.quail.executor.stage_executor import StageExecutor
 A fake model stands in for the network. Each packed row gets a hash of
 its token and the hash its attention reads at the row before it, and
 every write stores (token, position, hash) in the arena's rows. A
@@ -20,7 +21,8 @@ from helpers.fakes import fake_pipeline, fake_readout, fake_torch
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.model_operator import gated_stages
 from quail.backends.quail.executor.operators.filter import FilterOperator
-from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.common.tokens import prefix_tree
 
 
@@ -391,10 +393,10 @@ def check_filter(documents, questions, setup):
     parts = [FilterOperator(SimpleNamespace(question_token_ids=q),
                         list(range(len(documents))), passthrough(), len(tail))
              for q in questions]
-    got, _, _ = run_stages(
+    got, _, _ = StageExecutor(
         run.torch, run.arena, run.pipeline, gated_stages(parts), documents,
         setup.budget, anchor_keys=[("d", i) for i in range(len(documents))],
-        attention_mode=setup.path, prefix_tree=run.tree(documents))
+        attention_mode=setup.path, prefix_tree=run.tree(documents)).run()
     for d, document in enumerate(documents):
         want = []
         for q in questions:
@@ -440,14 +442,14 @@ def check_join(anchors, frame, partners, setup, retain=False):
         else:
             run.arena.free_key(keys[a])
 
-    run_stages(
+    StageExecutor(
         run.torch, run.arena, run.pipeline,
         [Stage(suffixes=partners, readout=passthrough(), frame=frame)],
         anchors, setup.budget,
         anchor_keys=keys,
         attention_mode=setup.path,
         prefix_tree=run.tree(anchors),
-        on_settled=lambda anchor, survived, row: anchor_done(anchor, row))
+        on_settled=lambda anchor, survived, row: anchor_done(anchor, row)).run()
     for a, anchor in enumerate(anchors):
         assert rows[a] == [answers[chain(anchor + frame + p + tail)]
                            for p in partners], f"anchor {a}"
@@ -466,10 +468,10 @@ def check_feed(documents, question, frame, partners, setup):
     keys = [("d", i) for i in range(len(documents))]
     stage_list = filter_stages([question], passthrough()) + [
         Stage(suffixes=partners, readout=passthrough(), frame=frame)]
-    out, _, _ = run_stages(
+    out, _, _ = StageExecutor(
         run.torch, run.arena, run.pipeline, stage_list, documents, setup.budget,
         anchor_keys=keys, prefix_tree=run.tree(documents),
-        attention_mode=setup.path)
+        attention_mode=setup.path).run()
     survivors = {d for d, document in enumerate(documents)
                  if answers[chain(document + question + tail)]}
     assert set(out[1]) == survivors
@@ -497,14 +499,14 @@ def check_join_after_join(anchors, frame, partners, setup):
     def retain(a, row):
         run.arena.retain(keys[a], len(anchors[a]))
 
-    run_stages(
+    StageExecutor(
         run.torch, run.arena, run.pipeline,
         [Stage(suffixes=partners, readout=passthrough(), frame=frame)],
         first, setup.budget,
         anchor_keys=keys[:1],
         attention_mode=setup.path,
         prefix_tree=run.tree(first),
-        on_settled=lambda anchor, survived, row: retain(anchor, row))
+        on_settled=lambda anchor, survived, row: retain(anchor, row)).run()
     assert run.arena.is_resident(keys[0])
     rows = {}
 
@@ -512,14 +514,14 @@ def check_join_after_join(anchors, frame, partners, setup):
         rows[a] = list(row)
         run.arena.free_key(keys[a])
 
-    run_stages(
+    StageExecutor(
         run.torch, run.arena, run.pipeline,
         [Stage(suffixes=partners, readout=passthrough(), frame=frame)],
         anchors, setup.budget,
         anchor_keys=keys,
         attention_mode=setup.path,
         prefix_tree=run.tree(anchors),
-        on_settled=lambda anchor, survived, row: free(anchor, row))
+        on_settled=lambda anchor, survived, row: free(anchor, row)).run()
     for a, anchor in enumerate(anchors):
         assert rows[a] == [answers[chain(anchor + frame + p + tail)]
                            for p in partners], f"anchor {a}"

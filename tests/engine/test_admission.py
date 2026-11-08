@@ -13,7 +13,8 @@ from quail.backends.quail.executor.admission import (
     Settlement,
     pages_for,
 )
-from quail.backends.quail.executor.stages import filter_stages, run_stages
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import filter_stages
 from quail.common.tokens import PrefixTree
 
 
@@ -225,12 +226,12 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
     from quail.backends.quail.executor.model_operator import settle_documents
 
     keys = [("r", d) for d in range(len(documents))]
-    got, _, tokens = run_stages(
+    got, _, tokens = StageExecutor(
         fake_torch(), arena, pipeline, filter_stages([[QUESTION]], answers),
         documents, budget, anchor_keys=keys, prefix_tree=tree, limit=limit,
         on_settled=settle_documents(arena, keys, documents, bool(retain), budget),
         attention_mode=attention_mode, stats=stats, stop_groups=stop_groups,
-        num_key_survivors=num_key_survivors, default_attention="unified")
+        num_key_survivors=num_key_survivors, default_attention="unified").run()
     got = {document: list(row) for document, row in got[0].items()}
     return got, tokens, stats["borrowed_tokens"], arena
 

@@ -139,13 +139,10 @@ def run_passes(state, stages, passes: Passes, *, label: str, limit=None,
     loaded = state.loaded_model
     answers, spans, _ = StageExecutor(
         state.torch, loaded.arena, loaded.pipeline, stages, passes.states,
-        state.chunk_tokens, anchor_keys=None, on_settled=None,
-        staging=input_staging(state), attention_mode=None, prefix_tree=None,
-        stats=None, limit=limit, paged=False, unit="passes",
-        count_answers=False, label=label, default_attention="unified",
-        on_chunk=None, on_answers=None, stop_groups=passes.stop_groups,
-        gpu_timing=state.gpu_timing, num_key_survivors=num_key_survivors,
-        start_stages=passes.stages).run()
+        state.chunk_tokens, staging=input_staging(state), limit=limit,
+        paged=False, unit="passes", label=label, default_attention="unified",
+        stop_groups=passes.stop_groups, gpu_timing=state.gpu_timing,
+        num_key_survivors=num_key_survivors, start_stages=passes.stages).run()
     for anchor, (j, length) in enumerate(zip(passes.stages, passes.suffix_tokens)):
         row = answers[j].get(anchor)
         if row is not None:

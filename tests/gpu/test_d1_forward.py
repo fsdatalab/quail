@@ -433,7 +433,8 @@ def quail(prompts, answer_ids, loaded):
 
     from quail.backends.quail.executor.model_loading import full_output_head
     from quail.backends.quail.executor.readout import AsyncLabelLogprobs
-    from quail.backends.quail.executor.stages import Stage, run_stages
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import Stage
 
     model, arena, pipeline = loaded
     targets = list(answer_ids[0]) + list(answer_ids[1])
@@ -448,8 +449,8 @@ def quail(prompts, answer_ids, loaded):
         documents = [list(lowered.preamble_token_ids) + ids(review)
                      for review in REVIEWS]
         stage = Stage(suffixes=[list(lowered.tail_token_ids)], readout=readout)
-        answers, _, _ = run_stages(torch, arena, pipeline, [stage], documents,
-                                   budget, paged=False)
+        answers, _, _ = StageExecutor(torch, arena, pipeline, [stage], documents,
+                                   budget, paged=False).run()
         rows.extend(np.asarray(answers[0][document])[0].tolist()
                     for document in range(len(REVIEWS)))
     return rows
@@ -502,14 +503,14 @@ def quail_joins(join_passes, answer_ids, loaded):
     import numpy as np
 
     from quail.backends.quail.executor.readout import AnswerRows, AsyncSlotMargins
-    from quail.backends.quail.executor.stages import run_stages
+    from quail.backends.quail.executor.stage_executor import StageExecutor
 
     model, arena, pipeline = loaded
     stage, states, _ = join_passes
     stage.readout = AsyncSlotMargins(torch, AnswerRows(
         torch, torch.nn.functional, model, answer_ids[0], answer_ids[1]))
-    answers, _, _ = run_stages(torch, arena, pipeline, [stage], states, BUDGET,
-                               paged=False)
+    answers, _, _ = StageExecutor(torch, arena, pipeline, [stage], states, BUDGET,
+                               paged=False).run()
     return [np.asarray(answers[0][index][0], dtype=float).tolist()
             for index in range(len(states))]
 

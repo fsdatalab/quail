@@ -16,7 +16,8 @@ from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.admission import JoinAdmission
 from quail.backends.quail.executor.model_operator import gated_stages
 from quail.backends.quail.executor.operators.filter import FilterOperator
-from quail.backends.quail.executor.stages import filter_stages, frame_writes, run_stages
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import filter_stages, frame_writes
 
 
 def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
@@ -66,12 +67,12 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
     arena.activate = activate
     real_pack = chunk_mod.pack_chunk
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    run_stages(
+    StageExecutor(
         fake_torch(), arena, paged,
         filter_stages(questions[:1], answers), documents[:1], 200,
         paged=False,
         default_attention='unified',
-        anchor_keys=[('d', 0)])
+        anchor_keys=[('d', 0)]).run()
     monkeypatch.setattr(chunk_mod, "pack_chunk", real_pack)
     assert activated == [("d", 0)]
     assert arena.retention_cap_pages == 8
