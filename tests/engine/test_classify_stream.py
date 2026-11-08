@@ -380,8 +380,25 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "documents": documents,
     }
-    result = execute_single_graph(state, SETTINGS, graph)
+    handed = []
+
+    class Taken:
+        """Takes the rows a region reports, as the region's FinishedRows."""
+
+        def wants(self, node, port):
+            return False
+
+        def report(self, table):
+            if table.schema.metadata[b"quail.node"] == b"classify:rp":
+                handed.extend(table.to_pylist())
+
+    with reporting(Taken()):
+        result = execute_single_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
+    # each anchor's labeled pairs are handed on as the anchor settles
+    assert sorted(handed, key=lambda row: (row["r"], row["p"])) == [
+        {"r": 0, "p": 0, "stance": "a"}, {"r": 0, "p": 1, "stance": "b"},
+        {"r": 1, "p": 1, "stance": "a"}]
     outputs = result["_outputs"]
     metrics = result["node_metrics"]
     assert outputs[PortRef("group:0", "rows:r")].column("r").to_pylist() \

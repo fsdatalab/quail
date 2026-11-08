@@ -117,10 +117,14 @@ then. So the runner sends rows on as the last step reports them:
   each forward pass's finished documents. Rust builds those documents'
   rows from the last step's outputs for them and the earlier steps'
   whole outputs, and `ModelRegionExec` hands them to DataFusion at once.
+- A join reports each anchor's true pairs once they are answered. A
+  lone anti-join reports each anchor that matched nothing once it
+  settles, and a classification of a join's pairs reports each
+  anchor's pairs once it settles.
 - Under set attention each step of a pipeline reports its rows when
   the step finishes, while later steps run.
-- Any other last step, such as an extraction, a map, a join, or an
-  operator with a guard, sends its rows when it finishes.
+- Any other last step, such as an extraction, a map, or an operator
+  with a guard, sends its rows when it finishes.
 - A region with a fetch sends its rows once every row is in, so Rust
   can keep its first rows.
 - A row is sent once: when the step finishes, the runner sends only

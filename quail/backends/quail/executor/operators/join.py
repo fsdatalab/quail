@@ -144,10 +144,21 @@ class JoinOperator(ModelOperator):
         return finished
 
     def settle_kv(self, anchor, survived, row):
-        """Settle anchor KV using join answers after all readers finish."""
+        """Settle anchor KV using join answers after all readers finish.
+
+        An anchor of a lone anti-join that matched nothing is one of its
+        rows from then on.
+        """
         self.settled[anchor] = True
-        self.inputs["anchor_done"](
-            anchor, row if self.final_rows[anchor] is None else self.final_rows[anchor])
+        final = row if self.final_rows[anchor] is None else self.final_rows[anchor]
+        self.inputs["anchor_done"](anchor, final)
+        node = self.node
+        if (len(self.nodes) == 1 and node.semantics == "anti" and not any(final)
+                and finished_rows() is not None):
+            anchor_id = int(self.inputs["anchor_keys"][anchor][1])
+            self.finished.append(finished_table(
+                node.node_id, f"rows:{node.anchor}",
+                Rows({node.anchor: np.asarray([anchor_id], dtype=np.int32)}).table()))
 
     def read_answers(self, every) -> int:
         """Map predicate answers to reached anchors and count suffix work."""

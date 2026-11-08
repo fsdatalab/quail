@@ -106,21 +106,41 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         """Send the settled documents' labels to the answer sink; return their rows.
 
         A settled document's label is final once it has one; a document
-        whose answer names no label has no row.
+        whose answer names no label has no row. A settled anchor's pairs
+        are labeled once it settles.
         """
         finished, self.finished = self.finished, []
         documents = sorted(set(finished))
         self._send(documents)
-        if self.plan.partners is not None or finished_rows() is None:
+        if finished_rows() is None:
             return []
+        plan = self.plan
         ready = [document for document in documents
                  if document not in self.reported
-                 and self.plan.labels[document] is not None]
-        if not ready:
-            return []
+                 and (plan.partners is not None or plan.labels[document] is not None)]
         self.reported.update(ready)
-        return [finished_table(self.node.node_id, self.node.rows_port,
-                               self._label_rows(ready).table())]
+        if plan.partners is not None:
+            pairs = [(anchor, partner) for anchor in ready
+                     for partner in plan.partners.kept(anchor)
+                     if (anchor, partner) in plan.pair_labels]
+            rows = self._pair_rows(pairs) if pairs else None
+        else:
+            rows = self._label_rows(ready) if ready else None
+        if rows is None:
+            return []
+        return [finished_table(self.node.node_id, self.node.rows_port, rows.table())]
+
+    def _pair_ids(self, pairs) -> np.ndarray:
+        """The (anchor, partner) document ids of pairs given by position."""
+        return np.asarray([[self.ids[anchor], self.plan.partners.ids[partner]]
+                           for anchor, partner in pairs],
+                          dtype=np.int32).reshape(-1, 2)
+
+    def _pair_rows(self, pairs):
+        """The label rows of (anchor, partner) pairs given by position."""
+        spec, plan = self.node.spec, self.plan
+        return score_rows(self._pair_ids(pairs), spec.aliases, spec.name,
+                          [plan.pair_labels[pair] for pair in pairs], pa.string())
 
     def _label_rows(self, documents):
         """The label rows of documents that have a label, with probabilities."""
@@ -167,15 +187,10 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         plan = self.plan
         if plan.partners is not None:
             pairs = sorted(plan.pair_labels)
-            rows = np.asarray(
-                [[self.ids[anchor], plan.partners.ids[partner]]
-                 for anchor, partner in pairs], dtype=np.int32).reshape(-1, 2)
-            scored = score_rows(rows, spec.aliases, spec.name,
-                               [plan.pair_labels[pair] for pair in pairs],
-                               pa.string())
+            scored = self._pair_rows(pairs)
             sink = answer_sink()
-            if sink is not None and len(rows):
-                sink(scored_batch(self.node, rows,
+            if sink is not None and pairs:
+                sink(scored_batch(self.node, self._pair_ids(pairs),
                                   scored.column(spec.name).to_pylist()))
             return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
                 input_rows=len(pairs), output_rows=len(pairs),
