@@ -279,10 +279,6 @@ class RegionExecution:
         paged = paged or pipeline.needs_pages
         if keep_kv and not paged:
             raise ValueError("retaining document KV requires arena writes")
-        if not paged and tree is not None and not tree.shared_tokens:
-            # the unpaged path borrows nothing; a paged run keeps the tree
-            # for documents that may arrive and share with these
-            tree = None
         owner = next((operator for operator in operators
                       if getattr(operator, "settles_kv", False)), None)
         settled = (owner.settle_kv if owner is not None else settle_documents(

@@ -117,16 +117,6 @@ Sharing has these limits:
   without ORDER BY can return different qualifying rows than it would
   without sharing.
 
-Documents can also arrive after admission starts.
-[`GrowingPrefixTree`](https://github.com/fsdatalab/quail/blob/main/quail/common/tokens.py)
-places each one in the sorted order among the documents still queued and
-recomputes the parent and shared tokens of the queued documents after it.
-An admitted document keeps its choice. A late document borrows from a
-parent that is queued or running, or from a finished parent whose pages
-are still held or retained; otherwise it computes its whole prefix. When
-every document arrives before the first forward pass, the order and the
-borrowing equal the plan built from all of them.
-
 See
 [`Borrowing`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/admission.py)
 for admission decisions.

@@ -73,12 +73,6 @@ class Borrowing:
     shared tokens) or the parent never runs (see skip()). record()
     keeps the choice. Filter and join admission both use it.
 
-    Documents may arrive after admission starts (add()). Under a tree
-    in sorted token order each takes its place in a GrowingPrefixTree,
-    and a queued document whose parent or shared tokens changed takes
-    the new ones; an admitted document keeps its choice. Under any
-    other tree, or none, a document that arrives borrows nothing.
-
     Args:
         n: Documents.
         tree: A PrefixTree over the documents, or None.
@@ -93,12 +87,9 @@ class Borrowing:
         self.tree_parent = [None] * n if tree is None else list(tree.parent)
         self.tree_shared = [0] * n if tree is None else list(tree.shared)
         self.tree = tree
-        self.growing = None        # the GrowingPrefixTree, from the first add()
-        self._order = None         # an explicit tree's order, then arrivals
         self.can_borrow = can_borrow
         self.admitted = set()
         self.skipped = set()       # documents that never run a chunk
-        self.detached = set()      # resident documents, which borrow nothing
         # documents whose prefix is still being written by a chunked
         # prefill: a borrower waits until every page of it is written
         self.prefilling = set()
@@ -111,58 +102,12 @@ class Borrowing:
 
         A tree that shares nothing leaves the documents in position order.
         """
-        tree = self.growing or self.tree
-        if tree is None or not tree.shared_tokens:
-            return None
-        return tree.order if self._order is None else self._order
+        return None if self.tree is None else self.tree.order
 
     def detach(self, document):
         """The document's KV is already resident, so it borrows nothing."""
-        self.detached.add(document)
         self.tree_parent[document] = None
         self.tree_shared[document] = 0
-
-    def add(self, count, documents=None):
-        """Take `count` documents past the ones seen so far.
-
-        Args:
-            count: The documents that arrived.
-            documents: Token sequences of every document, seen and new,
-                indexable by position, or None to place the new ones
-                after the others, borrowing nothing.
-
-        Returns:
-            (document, old parent) for each queued document seen before
-            whose parent or shared tokens changed.
-        """
-        seen = len(self.tree_parent)
-        if self.growing is not None and documents is None:
-            raise ValueError("a tree in sorted token order places documents "
-                             "by their tokens")
-        if (self.growing is None and self._order is None and documents is not None
-                and self.tree is not None and self.tree.page_tokens is not None):
-            from quail.common.tokens import GrowingPrefixTree
-
-            self.growing = GrowingPrefixTree(self.tree)
-        if self.growing is None:
-            if self.tree is not None:
-                if self._order is None:
-                    self._order = list(self.tree.order)
-                self._order.extend(range(seen, seen + count))
-            self.tree_parent.extend([None] * count)
-            self.tree_shared.extend([0] * count)
-            return []
-        changed = self.growing.add(documents, fixed=self.admitted)
-        self.tree_parent.extend(self.growing.parent[seen:])
-        self.tree_shared.extend(self.growing.shared[seen:])
-        moved = []
-        for document in changed:
-            if document in self.detached or document in self.skipped:
-                continue
-            moved.append((document, self.tree_parent[document]))
-            self.tree_parent[document] = self.growing.parent[document]
-            self.tree_shared[document] = self.growing.shared[document]
-        return moved
 
     def skip(self, document):
         """The document never runs a chunk, so its borrowers pack whole."""
@@ -325,8 +270,6 @@ class JoinAdmission:
         dependencies: Dependent anchor -> (parent anchor, start stage). A
             dependent waits for its parent's launch at that stage, runs only
             that stage, and is excluded from limits and survival estimates.
-        input_open: Whether more anchors may arrive through
-            add_documents; done() then waits for input_ended().
         chunked_prefill: Whether a fresh anchor whose prefix and first
             request exceed the chunk budget writes its prefix over
             several passes (see take_prefills); otherwise it raises
@@ -362,7 +305,7 @@ class JoinAdmission:
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
                  stop_groups=None, stop_width=1, reserve=None, dependencies=None,
-                 gated=(), num_key_survivors=1, skip=None, input_open=False,
+                 gated=(), num_key_survivors=1, skip=None,
                  chunked_prefill=False, start_stages=None, one_stage=False):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
@@ -457,7 +400,6 @@ class JoinAdmission:
         self.blocked_pages = 0
         self.reserve = reserve
         self.answers = [dict() for _ in range(k)]
-        self.input_open = input_open
         self.chunked_prefill = chunked_prefill
         self.one_stage = one_stage
         self._starts = []          # per anchor: the stage it starts at
@@ -465,7 +407,6 @@ class JoinAdmission:
         self._prefilled = []       # anchors whose last piece is in this pass
         self.prefills = []         # this pass's pieces: (anchor, start, end)
         resident = dict(resident or {})
-        self._resident = set(resident)
         anchor_partners = dict(anchor_partners or {})
         # A deferred parent cannot free its pages before a dependent runs.
         self._dependent_pages = np.zeros(n, dtype=np.int64)
@@ -492,97 +433,6 @@ class JoinAdmission:
             for a in self.pending:
                 for group in self.groups[a]:
                     self._group_members.setdefault(group, set()).add(a)
-
-    def add_documents(self, prefix_tokens, documents=None, resident=None,
-                      anchor_partners=None, stop_groups=None, stop_width=None,
-                      start_stages=None):
-        """Queue anchors that arrive while the run is under way.
-
-        They take the next anchor indices. A fresh anchor joins the
-        queue at its place in the prefix tree's order among the anchors
-        still queued (in arrival order without a tree); a resident one
-        joins the resident anchors at the front. One whose stop key
-        groups are all done is skipped on arrival: it never runs and
-        take_skipped() lists it.
-
-        Args:
-            prefix_tokens: The new anchors' prefix token counts.
-            documents: Token sequences of every anchor, seen and new,
-                indexable by position; the prefix tree places the new
-                ones by them. None places them in arrival order.
-            resident: As the constructor takes it, keyed by the new
-                anchors' indices.
-            anchor_partners: As the constructor takes it, keyed by the
-                new anchors' indices.
-            stop_groups: The new anchors' stop key groups, when the run
-                has them.
-            stop_width: The anchors of one group in flight at once, now
-                that more have arrived, or None to keep it.
-            start_stages: The new anchors' start stages, or None for the
-                first stage.
-
-        Returns:
-            (anchor, old parent) for each queued anchor whose borrowed
-            parent changed, as Borrowing.add gives them.
-        """
-        start = len(self.prefix)
-        count = len(prefix_tokens)
-        if not count:
-            return []
-        resident = dict(resident or {})
-        anchor_partners = dict(anchor_partners or {})
-        if (self.groups is None) != (stop_groups is None):
-            raise ValueError("stop_groups must match the run's stop key groups")
-        if self.groups is not None:
-            if len(stop_groups) != count:
-                raise ValueError("stop_groups must match prefix_tokens")
-            self.groups.extend(_stop_counts(group) for group in stop_groups)
-        if stop_width is not None:
-            self._group_width = max(1, int(stop_width))
-        moved = self.borrowing.add(count, documents)
-        self._dependent_pages = np.concatenate(
-            (self._dependent_pages, np.zeros(count, dtype=np.int64)))
-        starts = [0] * count if start_stages is None else list(start_stages)
-        for index, prefix in enumerate(prefix_tokens):
-            a = start + index
-            self._register(prefix, resident.get(a), anchor_partners.get(a),
-                           starts[index])
-        tree_shared = self.borrowing.tree_shared
-        for a, _ in moved:
-            # a queued anchor's shared tokens only grow as documents arrive
-            if self._stage[a] == -1 and self._first[a]:
-                self._min_fresh = min(self._min_fresh,
-                                      self._least_tokens(a, tree_shared[a]))
-        arrived = []
-        for a in range(start, start + count):
-            if a in resident:
-                self.borrowing.detach(a)
-                self._resident.add(a)
-            if self._stage[a] != -1:
-                continue        # settled on arrival, with nothing to ask
-            if self.groups is not None and self.groups[a] and all(
-                    group in self._group_done for group in self.groups[a]):
-                self._skip_queued(a)
-                continue
-            if self.groups is not None:
-                for group in self.groups[a]:
-                    self._group_members.setdefault(group, set()).add(a)
-            arrived.append(a)
-        residents = [a for a in self.pending if a in self._resident]
-        fresh = [a for a in self.pending if a not in self._resident]
-        fresh.extend(a for a in arrived if a not in self._resident)
-        order = self.borrowing.order
-        # the queue in the tree's order, which a parent leads; the first
-        # shared page switches it from position order
-        fresh.sort(key=None if order is None
-                   else {a: index for index, a in enumerate(order)}.__getitem__)
-        self.pending = deque((
-            *residents, *(a for a in arrived if a in self._resident), *fresh))
-        return moved
-
-    def input_ended(self):
-        """No more anchors will arrive; done() may report the run done."""
-        self.input_open = False
 
     def num_partners(self, a, j):
         """Return the number of partner requests anchor a streams at stage j.
@@ -701,7 +551,7 @@ class JoinAdmission:
         need = self.page_cost(prefix + self._extra)
         shared = self.borrowing.tree_shared[a] if a in self.dependencies else 0
         fresh = prefix - shared
-        reserve = self._dependent_pages[a] if a < len(self._dependent_pages) else 0
+        reserve = self._dependent_pages[a]
         if resident_pages is not None:
             need = max(0, need - resident_pages)
         elif self.page_cost(fresh + self._extra) + reserve > self.arena_pages:
@@ -755,25 +605,15 @@ class JoinAdmission:
             self._page_reserve = max(self._page_reserve, largest)
         self._first.append(first)
         # the fewest tokens any fresh anchor can pack: a borrower
-        # packs only the tokens past its shared prefix
-        tree_shared = self.borrowing.tree_shared
-        shared = tree_shared[a] if a < len(tree_shared) else 0
-        self._min_fresh = min(self._min_fresh, self._least_tokens(a, shared))
+        # packs only the tokens past its shared prefix, and an anchor
+        # too long for one pass starts its chunked prefill in any room
+        least = max(0, carried - self.borrowing.tree_shared[a]) + first
+        if self.chunked_prefill and least > self.chunk_budget:
+            least = 1
+        self._min_fresh = min(self._min_fresh, least)
         if not need:
             self._zero_cost += 1
         return a
-
-    def _least_tokens(self, a, shared):
-        """The fewest tokens a fresh anchor packs in the pass that admits it.
-
-        A borrower packs only the tokens past its shared prefix; an
-        anchor too long for one pass starts its chunked prefill in any
-        room.
-        """
-        tokens = max(0, self._carried[a] - shared) + self._first[a]
-        if self.chunked_prefill and tokens > self.chunk_budget:
-            return 1
-        return tokens
 
     def take_prefills(self):
         """Remove and return this pass's chunked prefill pieces.
@@ -1029,10 +869,6 @@ class JoinAdmission:
         """The stage the document is at, or a negative number once it is done."""
         return self._stage[a]
 
-    def ended(self, a) -> bool:
-        """Whether the anchor is done: answered, dropped, or skipped."""
-        return self._stage[a] == _DONE
-
     def report(self, a, j, start, end, bits):
         """Record a group's answers and update document progress.
 
@@ -1250,5 +1086,4 @@ class JoinAdmission:
         return len(self.pending) == self._dead and not self.ready \
             and not self._prefill and not self._prefilled \
             and not self.in_flight and not self._settled \
-            and all(self._stage[a] == _DONE for a in self.waiting) \
-            and not self.input_open
+            and all(self._stage[a] == _DONE for a in self.waiting)

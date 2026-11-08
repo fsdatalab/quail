@@ -248,7 +248,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                on_answers=None, stop_groups=None, appended_tokens=None,
                gpu_timing=False, survival=None, decoder=None, dependencies=None,
                knee_rows=0, decode_cost=None, summary=True, num_key_survivors=1,
-               skip=None, arrivals=None):
+               skip=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -319,11 +319,6 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             answer_tokens, or None. A document's row at such a stage is
             reported once its answer ends; until then the decoder packs
             one row for it per pass.
-        arrivals: Optional callable(StageExecutor) asked before each
-            forward pass, and whenever nothing is in flight, while the
-            input is open. It may queue documents with add_documents
-            and end the input with input_ended. None ends the input
-            with the documents given.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is
@@ -348,7 +343,6 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         decoder=decoder, dependencies=dependencies, knee_rows=knee_rows,
         summary=summary,
         decode_cost=decode_cost, num_key_survivors=num_key_survivors, skip=skip,
-        arrivals=arrivals,
     ).run()
 
 

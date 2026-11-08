@@ -3,7 +3,6 @@
 import json
 import os
 import time
-from bisect import bisect_right
 from functools import partial
 from itertools import groupby
 
@@ -108,30 +107,6 @@ def lowest_borrows(borrowing):
     return lowest
 
 
-class DocumentBatches:
-    """Token sequences that arrive in batches, indexed as one sequence."""
-
-    def __init__(self, first):
-        self.batches = [first]
-        self.starts = [0]
-        self.total = len(first)
-
-    def add(self, batch):
-        """Append a batch after the sequences so far."""
-        self.batches.append(batch)
-        self.starts.append(self.total)
-        self.total += len(batch)
-
-    def __len__(self):
-        return self.total
-
-    def __getitem__(self, index):
-        if not 0 <= index < self.total:
-            raise IndexError(index)
-        batch = bisect_right(self.starts, index) - 1
-        return self.batches[batch][index - self.starts[batch]]
-
-
 class StageExecutor:
     """Admission state, packed inputs, pending answers, and metrics for one run."""
 
@@ -141,8 +116,7 @@ class StageExecutor:
                  default_attention, on_chunk, on_answers, stop_groups=None, skip=None,
                  appended_tokens=None, gpu_timing=False, survival=None,
                  decoder=None, dependencies=None, knee_rows=0, decode_cost=None,
-                 summary=True, num_key_survivors=1, arrivals=None,
-                 start_stages=None):
+                 summary=True, num_key_survivors=1, start_stages=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
         self.torch = torch
@@ -185,6 +159,8 @@ class StageExecutor:
                               prefill_tokens=0, pairs=0, kv_read=0, sol_s=0.0)
 
         k = len(self.stages)
+        if prefix_tree is not None and not prefix_tree.shared_tokens:
+            prefix_tree = None
         # a whole-sequence anchor is one pass: it asks one request at its
         # start stage, its own or the stage's one suffix
         self.whole_sequences = getattr(self.pipeline, "whole_sequences", False)
@@ -199,13 +175,8 @@ class StageExecutor:
         self.prefixes = anchor_prefixes
         # a prefix is built on each access, so its length is read once
         self.prefix_lengths = [len(prefix) for prefix in self.prefixes]
-        # a list, so documents that arrive extend the one every reader holds
         self.keys = (list(range(len(self.prefixes))) if anchor_keys is None
                      else list(anchor_keys))
-        self.arrivals = arrivals
-        self.budget = budget
-        self.stop_groups = None if stop_groups is None else list(stop_groups)
-        self.num_key_survivors = num_key_survivors
         if len(self.keys) != len(self.prefixes):
             raise ValueError("anchor_keys must match anchor_prefixes")
         if decoder is not None:
@@ -275,7 +246,20 @@ class StageExecutor:
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
 
-        resident = self._resident_pages(range(len(self.keys)))
+        resident = {}
+        if self.paged:
+            for a, key in enumerate(self.keys):
+                if not self.arena.is_resident(key):
+                    continue
+                if self.arena.prefix_tokens(key) != self.prefix_lengths[a]:
+                    # KV an earlier operator left under this key was
+                    # built for another prefix; it is fed afresh
+                    self.arena.free_key(key)
+                    continue
+                resident[a] = self._held_pages(key, self.prefix_lengths[a])
+        # Pin resident documents while fresh admissions evict retained KV.
+        for a in resident:
+            self.arena.pin(self.keys[a])
 
         self.asking = any(stage.requests is not None or stage.own_suffixes
                           for stage in self.stages)
@@ -310,7 +294,6 @@ class StageExecutor:
                        if stage.prepare is not None],
                 reserve=self._reserve if self.paged else None,
                 dependencies=dependencies,
-                input_open=arrivals is not None,
                 # a paged document writes its prefix over several passes
                 # when it is too long for one
                 chunked_prefill=self.paged,
@@ -318,7 +301,8 @@ class StageExecutor:
                 one_stage=self.whole_sequences,
             )
         except OversizedDocumentError as error:
-            raise self._oversized(error) from error
+            raise ValueError(f"{self.label}: document {self.keys[error.anchor]}: "
+                             f"{error.reason}") from error
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         self.admission_mode = answer_admission_mode()
@@ -342,7 +326,6 @@ class StageExecutor:
         # at the shared point, so a parent writes one slot per point
         self.share_points = [()] * len(self.keys)
         self._extends = False
-        self._share_room = None     # share points kept per document, when saved
         spec = getattr(self.pipeline, "spec", None)
         if (self.paged and getattr(spec, "state_layers", ())
                 and not getattr(self.arena, "num_state_slots", 0)):
@@ -358,15 +341,22 @@ class StageExecutor:
             # a small pool keeps only the lengths that save the most
             base = 1 + int(self._extends)
             room = max(0, (self.arena.num_state_slots - base) // 3)
-            self._share_room = room
-            self._choose_share_points()
+            self.share_points = state_share_points(
+                self.borrowing.tree_parent, self.borrowing.tree_shared,
+                limit=room)
+            need = base + max(map(len, self.share_points), default=0)
+            if self.arena.num_state_slots < need:
+                raise ValueError(
+                    f"the arena has {self.arena.num_state_slots} checkpoint "
+                    f"slots and this query holds {need} per document in "
+                    f"flight; a document this long needs a smaller chunk "
+                    f"or a larger pool")
             self.borrowing.can_borrow = self._state_borrow_check(
                 self.borrowing.can_borrow)
         # The admission detaches residents from borrowing: they pack no prefix.
         self.borrowers = self.borrowing.borrowers()
         self.lowest_borrow = lowest_borrows(self.borrowing)
         self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]
-        self._held_keys = set(self.held)
 
         self._held_parents = set()
         self._reserved_parents = {}
@@ -381,169 +371,14 @@ class StageExecutor:
             self.label = " > ".join(stage.label or f"stage {j}"
                                    for j, stage in enumerate(self.stages))
         self.counting_answers = count_answers
-        self.progress = Progress(
-            self.label, total=self._progress_total(range(len(self.prefixes)))
-            - (0 if self.counting_answers else len(self.sched.dependencies)),
-            unit=unit)
+        total = (sum(self.sched.num_partners(a, j) for a in range(len(self.prefixes))
+                     for j in range(k))
+                 if self.counting_answers
+                 else len(self.prefixes) - len(self.sched.dependencies))
+        self.progress = Progress(self.label, total=total, unit=unit)
         self.finished = 0
 
         self.readouts = ReadoutGroups(self.torch, self.stages)
-
-    def _progress_total(self, anchors) -> int:
-        """The progress units of the anchors: answers or documents."""
-        if not self.counting_answers:
-            return len(anchors)
-        return sum(self.sched.num_partners(a, j) for a in anchors
-                   for j in range(len(self.stages)))
-
-    def _resident_pages(self, anchors) -> dict:
-        """Pin the anchors whose prefix KV is resident; anchor -> pages held.
-
-        KV an earlier operator left under a key for another prefix is
-        freed, and the document is fed afresh.
-        """
-        resident = {}
-        if not self.paged:
-            return resident
-        for a in anchors:
-            key = self.keys[a]
-            if not self.arena.is_resident(key):
-                continue
-            if self.arena.prefix_tokens(key) != self.prefix_lengths[a]:
-                self.arena.free_key(key)
-                continue
-            resident[a] = self._held_pages(key, self.prefix_lengths[a])
-        # Pin resident documents while fresh admissions evict retained KV.
-        for a in resident:
-            self.arena.pin(self.keys[a])
-        return resident
-
-    def _oversized(self, error):
-        """The ValueError naming a document too large for the run."""
-        return ValueError(f"{self.label}: document {self.keys[error.anchor]}: "
-                          f"{error.reason}")
-
-    def _choose_share_points(self):
-        """Choose each queued document's share points, keeping admitted ones'.
-
-        Raises:
-            ValueError: The checkpoint slots cannot hold what one
-                document in flight needs.
-        """
-        points = state_share_points(
-            self.borrowing.tree_parent, self.borrowing.tree_shared,
-            limit=self._share_room)
-        for a in self.borrowing.admitted:
-            points[a] = self.share_points[a]
-        self.share_points = points
-        need = 1 + int(self._extends) + max(map(len, points), default=0)
-        if self.arena.num_state_slots < need:
-            raise ValueError(
-                f"the arena has {self.arena.num_state_slots} checkpoint "
-                f"slots and this query holds {need} per document in "
-                f"flight; a document this long needs a smaller chunk "
-                f"or a larger pool")
-
-    def add_documents(self, prefixes, keys=None, stop_groups=None,
-                      start_stages=None):
-        """Queue documents that arrive while the run is under way.
-
-        They take the next document indices, after every document given
-        so far. Each takes its place in the prefix tree (see
-        GrowingPrefixTree): it borrows from a parent still queued or in
-        flight, or from one that finished while its pages are still
-        held or retained; otherwise it packs whole. A queued document
-        whose parent changed releases the old parent's hold and takes
-        the new one's. The callbacks the run was given (on_settled,
-        skip, the stages') must accept the new indices.
-
-        Args:
-            prefixes: The new documents' prefix token sequences.
-            keys: Their arena keys; their indices when omitted.
-            stop_groups: Their stop key groups, when the run has them.
-            start_stages: The stage each starts at, or None for the
-                first stage.
-
-        Raises:
-            ValueError: A document cannot fit the whole arena.
-        """
-        start = len(self.prefix_lengths)
-        count = len(prefixes)
-        if not count:
-            return
-        if not self.sched.input_open:
-            raise ValueError("documents arrived after the input ended")
-        if not isinstance(self.prefixes, DocumentBatches):
-            self.prefixes = DocumentBatches(self.prefixes)
-        self.prefixes.add(prefixes)
-        self.keys.extend(range(start, start + count) if keys is None else keys)
-        if len(self.keys) != len(self.prefixes):
-            raise ValueError("keys must match prefixes")
-        lengths = [len(prefix) for prefix in prefixes]
-        self.prefix_lengths.extend(lengths)
-        self.appended.extend([0] * count)
-        self.answer_stage = np.concatenate(
-            (self.answer_stage, np.zeros(count, dtype=np.int64)))
-        self.share_points.extend([()] * count)
-        if self.stop_groups is not None:
-            self.stop_groups.extend(stop_groups)
-        if self.decoder is not None:
-            self.decoder.add_documents(count)
-        anchors = range(start, start + count)
-        try:
-            moved = self.sched.add_documents(
-                lengths, documents=self.prefixes,
-                resident=self._resident_pages(anchors),
-                anchor_partners={a: self._requests_of(a, self.keys[a])
-                                 for a in anchors},
-                stop_groups=stop_groups,
-                stop_width=max(self._stop_width(self.stop_groups, self.budget),
-                               self.num_key_survivors),
-                start_stages=start_stages)
-        except OversizedDocumentError as error:
-            raise self._oversized(error) from error
-        if self.answer_admission is not None:
-            self.answer_admission.add_documents(lengths)
-        self.borrowers.extend([0] * count)
-        for a in anchors:
-            parent = self.borrowing.tree_parent[a]
-            if parent is not None:
-                self._move_borrower(a, None, parent)
-        for a, old in moved:
-            self._move_borrower(a, old, self.borrowing.tree_parent[a])
-        if self._share_room is not None:
-            self._choose_share_points()
-        self.progress.total += self._progress_total(anchors)
-
-    def input_ended(self):
-        """No more documents will arrive; the run ends once they finish."""
-        self.sched.input_ended()
-
-    def _move_borrower(self, a, old, new):
-        """Move a queued document's claim from parent old to parent new.
-
-        A parent admitted already holds its pages for each queued
-        borrower; one still queued counts it, to hold once admitted. A
-        parent that left keeps no hold, and the document packs whole.
-        """
-        if old is not None:
-            if old in self.borrowing.admitted:
-                self.arena.release(self.keys[old])
-            else:
-                self.borrowers[old] -= 1
-        if new is None:
-            return
-        shared = self.borrowing.tree_shared[a]
-        self.lowest_borrow[new] = min(self.lowest_borrow.get(new, shared), shared)
-        key = self.keys[new]
-        if key not in self._held_keys:
-            self._held_keys.add(key)
-            self.held.append(key)
-        if new not in self.borrowing.admitted:
-            self.borrowers[new] += 1
-        elif self.arena.is_resident(key):
-            self.arena.hold(key, 1)
-            self.arena.keep_window(key, shared)
 
     def _stop_width(self, stop_groups, budget) -> int:
         """Anchors of one stop key group in flight at once.
@@ -1231,18 +1066,9 @@ class StageExecutor:
             if a in self._reserved_parents:
                 self.arena.done_reading((self._reserved_parents.pop(a),))
 
-    def _take_arrivals(self) -> bool:
-        """Ask the arrivals callback for documents; whether any came or input ended."""
-        if self.arrivals is None or not self.sched.input_open:
-            return False
-        seen = len(self.keys)
-        self.arrivals(self)
-        return len(self.keys) > seen or not self.sched.input_open
-
     def run(self):
         """Drive admission and drain the launched answer handles in order."""
         while True:
-            self._take_arrivals()
             # documents with nothing to send at their first stage never run
             for settlement in self.sched.take_settled():
                 self._event(settlement)
@@ -1296,15 +1122,10 @@ class StageExecutor:
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):
                     continue
-                if self._take_arrivals():
-                    continue
                 # parents freed but held for queued children hold the
                 # pages: the children pack their whole prefixes
                 if self.arena.drop_holds(self.held):
                     continue
-                if self.sched.input_open:
-                    raise AssertionError("nothing in flight and no document "
-                                         "arrived while the input is open")
                 raise AssertionError("nothing buildable and nothing in flight")
             self._run_part(groups, decode, replays, prefills)
             self._prefilled(prefills)
