@@ -17,7 +17,8 @@ Per query and configuration the cell records seconds from building the
 query to its collected rows (planning included, startup excluded), the
 engine's wall seconds, questions (the rows each AI operator asked the
 model about, summed over operators), fresh and cached tokens, map and
-extraction answer tokens, $/query on H100, and a hash of the rows.
+extraction answer tokens, $/query on H100, and a hash of the rows. A
+query of several model regions sums each measure over its regions.
 Results go to /results/ablations/rules/<run id>/<group>.json.
 """
 
@@ -141,14 +142,20 @@ def measure(session, sql: str, compare: str, usd_per_hour: float) -> dict:
     result = query.run()
     table = result.collect()
     seconds = time.perf_counter() - started
-    report = result.report
-    nodes = report.get("node_metrics", {}).values()
+    # a query of several model regions reports each region apart
+    regions = result.report.get("regions") or [result.report]
+    node_metrics = {
+        (name if len(regions) == 1 else f"region {index}/{name}"): metrics
+        for index, region in enumerate(regions, 1)
+        for name, metrics in region.get("node_metrics", {}).items()}
+    nodes = node_metrics.values()
     keys = row_keys(table, compare)
-    fresh = report.get("fresh_tokens", 0)
-    cached = report.get("cached_tokens", 0)
+    fresh = sum(region.get("fresh_tokens", 0) for region in regions)
+    cached = sum(region.get("cached_tokens", 0) for region in regions)
     return {
         "seconds": round(seconds, 3),
-        "wall_s": round(report.get("wall_s", 0.0), 3),
+        "num_regions": len(regions),
+        "wall_s": round(sum(region.get("wall_s", 0.0) for region in regions), 3),
         "questions": sum(node.get("evaluated_documents", 0) for node in nodes),
         "fresh_tokens": fresh, "cached_tokens": cached,
         "input_tokens_per_second": round((fresh + cached) / seconds, 1),
@@ -159,7 +166,7 @@ def measure(session, sql: str, compare: str, usd_per_hour: float) -> dict:
         "num_rows": table.num_rows,
         "rows_sha256": hashlib.sha256(
             "\n".join(sorted(keys)).encode()).hexdigest(),
-        "node_metrics": report.get("node_metrics", {}),
+        "node_metrics": node_metrics,
         "plan": plan_text,
         "keys": keys,
     }

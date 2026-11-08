@@ -125,7 +125,8 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     The result holds DataFusion's rows. A query of one model region also
     carries that region's plan, metrics, and answers, and, when the region
     is the whole query, the region's own rows, which keep Quail's added
-    columns such as a label's probabilities.
+    columns such as a label's probabilities. A query of several model
+    regions reports each region's report under ``regions``.
     """
     from quail.api.context import SessionContext
 
@@ -148,7 +149,8 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     context = SessionContext(query.session, order=query.order, run_query=run_query)
     table = context.sql(query.text, query.dialect)
     if len(results) != 1:
-        return QueryResult.from_table(table)
+        return QueryResult.from_table(table, report={
+            "regions": [result.report for result in results]} if results else None)
     (region,) = results
     # the time outside the region: building the context, planning the
     # SQL, gathering the region's rows, and the operators around it

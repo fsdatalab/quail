@@ -87,3 +87,16 @@ def test_a_classification_in_a_derived_table_and_outside_it_labels_each_row_once
                                enumerate("ababab")]
     # without the rule, the outer call labels every row again
     assert (on[1], off[1]) == (6, 12)
+
+
+def test_a_query_of_two_model_regions_reports_each_region(sessions):
+    sql = (f"SELECT d.id, d.t, {TONE.replace('r.body', 'd.body')} AS u FROM "
+           f"(SELECT r.id, r.body, {TONE} AS t FROM reviews r) d")
+    oracle = Oracle(labels=lambda spec, ids: "a")
+    report = finish(sessions[1].sql(sql), oracle).report
+    regions = report["regions"]
+    assert len(regions) == 2
+    # each region labels the six reviews
+    assert [sum(node.get("evaluated_documents", 0)
+                for node in region["node_metrics"].values())
+            for region in regions] == [6, 6]
