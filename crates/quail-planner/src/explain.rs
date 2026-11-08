@@ -1165,6 +1165,11 @@ impl TreeRows<'_> {
                 condition_text(alternative)
             ));
         }
+        if let Some(answer) = known.answer() {
+            details.push(format!(
+                "keeps every row and returns its answer as {answer}"
+            ));
+        }
         let title = match known {
             PhysicalNode::Scan(scan) => {
                 let scan = &scan.attributes;

@@ -22,14 +22,29 @@
 //! - a term of its filter is an OR, one of whose terms is `b`, and no
 //!   other term of the filter reads `b`;
 //! - the other terms of the OR, `a`, read only columns of the one table
-//!   the call reads.
+//!   the call reads, or are answers of the earlier `AI.IF`s of the OR.
+//!
+//! An OR of several `AI.IF`s, `a ∨ f_1 ∨ … ∨ f_k`, lowers to one node per
+//! call: each `f_j` but the last returns its answer `b_j` and drops no
+//! row, in written order, below the last, whose filter is `a ∨ b_1 ∨ … ∨
+//! b_k`. The rule guards each earlier node with the terms before it,
+//!
+//! ```text
+//! AI_{f_j → b_j}(R) ⇒ AI_{f_j → b_j}(R; g = a IS NOT TRUE ∧ b_1 IS NOT TRUE ∧ … ∧ b_{j-1} IS NOT TRUE)
+//! ```
+//!
+//! leaving the first unguarded when there is no `a`, and the last with
+//! every other term. A guard writes `t_1 OR t_2 IS NOT TRUE` as `t_1 IS
+//! NOT TRUE AND t_2 IS NOT TRUE`, which is the same test.
 //!
 //! The executor's AI filter asks the model about the rows where the
 //! guard is TRUE and passes each row where `a` is TRUE without asking.
 
-use datafusion::common::Result;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::logical_expr::utils::{disjunction, split_binary, split_conjunction};
+use std::sync::Arc;
+
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::{Column, Result};
+use datafusion::logical_expr::utils::{conjunction, disjunction, split_binary, split_conjunction};
 use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
@@ -105,12 +120,67 @@ fn push_down_or(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(rest) = or_terms(node) else {
         return Ok(Transformed::no(plan));
     };
-    if !reads_call_table(&rest, node) {
+    // the earlier AI.IFs of the OR, which return their answers below
+    let answers = answer_nodes(&node.input);
+    let is_answer = |term: &Expr| {
+        matches!(term, Expr::Column(column)
+            if column.relation.is_none() && answers.contains(&column.name))
+    };
+    let (read, plain): (Vec<Expr>, Vec<Expr>) = split_binary(&rest, Operator::Or)
+        .into_iter()
+        .cloned()
+        .partition(|term| is_answer(term));
+    if let Some(plain) = disjunction(plain.iter().cloned())
+        && !reads_call_table(&plain, node)
+    {
         return Ok(Transformed::no(plan));
     }
-    let mut guarded = node.clone();
-    guarded.guard = Some(rest.is_not_true());
+    let mut seen = plain;
+    let input = Arc::unwrap_or_clone(Arc::clone(&node.input))
+        .transform_up(|below| {
+            let Some(asked) = as_node::<AiNode>(&below) else {
+                return Ok(Transformed::no(below));
+            };
+            let answer = Expr::Column(Column::from_name(asked.answer.clone()));
+            if !read.contains(&answer) {
+                return Ok(Transformed::no(below));
+            }
+            let mut guarded = asked.clone();
+            guarded.guard = not_true(&seen);
+            seen.push(answer);
+            Ok(Transformed::yes(extension_node(guarded.checked()?)))
+        })?
+        .data;
+    let mut guarded = node.with_input(input)?;
+    guarded.guard = not_true(&seen);
     Ok(Transformed::yes(extension_node(guarded.checked()?)))
+}
+
+/// `t1 IS NOT TRUE AND t2 IS NOT TRUE ...`, which is TRUE exactly where
+/// `t1 OR t2 ...` is not TRUE; None for no terms.
+fn not_true(terms: &[Expr]) -> Option<Expr> {
+    conjunction(terms.iter().cloned().map(Expr::is_not_true))
+}
+
+/// The answers of the `AI.IF` nodes in `plan` that return their answer
+/// and drop no row, with no guard, `HINT`, or fetch: the earlier `AI.IF`s
+/// of an OR.
+fn answer_nodes(plan: &LogicalPlan) -> Vec<String> {
+    let mut found = Vec::new();
+    let _ = plan.apply(|below| {
+        if let Some(asked) = as_node::<AiNode>(below)
+            && asked.semantics == Semantics::Rows
+            && asked.function() == "ai_filter"
+            && asked.filter.is_none()
+            && asked.guard.is_none()
+            && asked.hint.is_none()
+            && asked.fetch.is_none()
+        {
+            found.push(asked.answer.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 #[cfg(test)]
@@ -123,7 +193,6 @@ mod tests {
     use datafusion::optimizer::{Optimizer, OptimizerContext};
 
     use super::*;
-    use std::sync::Arc;
 
     /// An AI.IF of `reviews.body` answering `kind`, with `filter`, and
     /// returning `returned` of its added columns.

@@ -62,10 +62,19 @@ def test_sql_around_ai_functions_returns_what_datafusion_computes(session, sql, 
     assert [tuple(row.values()) for row in table.to_pylist()] == rows
 
 
-def test_an_or_of_two_model_calls_is_refused_with_its_reason(session):
-    with pytest.raises(CompileError, match="an OR of a model call and other tests"):
-        session.sql(f"SELECT r.id FROM reviews r WHERE {AI_IF} OR r.stars > 3 "
-                    f"OR {AI_IF.replace('q:', 'p:')}")
+def test_an_or_of_two_model_calls_and_a_column_test_returns_the_rows_any_accepts(
+        session):
+    query = session.sql(f"SELECT r.id FROM reviews r WHERE {AI_IF} OR r.stars > 3 "
+                        f"OR {AI_IF.replace('q:', 'p:')} ORDER BY r.id")
+    rows = finish(query, ORACLE).collect().to_pylist()
+    # r1 has two stars and the model rejects it
+    assert [tuple(row.values()) for row in rows] == [("r0",), ("r2",)]
+
+
+def test_an_or_of_a_score_comparison_is_refused_with_its_reason(session):
+    score = "AI.SCORE(PROMPT('s: {0}', r.body)) > 0.5"
+    with pytest.raises(CompileError, match="an OR of a model call other than AI.IF"):
+        session.sql(f"SELECT r.id FROM reviews r WHERE {score} OR r.stars > 3")
 
 
 def test_a_limit_above_a_datafusion_projection_stops_at_its_rows(session):

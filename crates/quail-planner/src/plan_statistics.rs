@@ -265,7 +265,7 @@ pub fn expected_rows_after_filters(
         for (predicate, before_joins) in predicates.iter().zip(flags) {
             if *before_joins {
                 *expected.get_mut(alias).expect("a table") *=
-                    effective_selectivity(predicate.selectivity);
+                    crate::statistics::row_selectivity(predicate);
             }
         }
     }

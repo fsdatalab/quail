@@ -81,6 +81,7 @@ pub fn region_facts(found: &Operators) -> Value {
             add(alias, column);
         }
     }
+    let answers = found.filter_answers();
     let filter_guards = found.filters.iter().flat_map(|(_, predicates)| {
         predicates
             .iter()
@@ -91,8 +92,12 @@ pub fn region_facts(found: &Operators) -> Value {
         .filter_map(|column| column.guard.as_ref())
         .chain(filter_guards)
     {
+        // a guard may read an earlier AI filter's answer, which no
+        // table holds
         for reference in column_references(guard) {
-            add(&reference.alias, &reference.column);
+            if !answers.contains(&(reference.alias.as_str(), reference.column.as_str())) {
+                add(&reference.alias, &reference.column);
+            }
         }
     }
     let scans: Vec<Value> = found

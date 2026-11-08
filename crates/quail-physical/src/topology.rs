@@ -289,8 +289,11 @@ impl PhysicalNode {
             }
             PhysicalNode::AiFilter(node) => {
                 let alias = &node.attributes.alias;
+                // a filter that returns its answer adds it to the rows
+                let mut schema = of(alias);
+                schema.extend(node.attributes.answer.iter().cloned());
                 vec![
-                    rows(format!("rows:{alias}"), of(alias)),
+                    rows(format!("rows:{alias}"), schema),
                     output(
                         format!("filter_answers:{alias}"),
                         ValueType::FilterAnswers,
@@ -465,7 +468,7 @@ impl PhysicalNode {
     /// Whether this node can use the KV the node before it left.
     pub fn can_follow(&self, previous: &PhysicalNode, first: &PhysicalNode) -> bool {
         // the executor asks a guarded node about its guard's rows alone
-        if self.guard().is_some() || self.alternative().is_some() {
+        if self.runs_alone() {
             return false;
         }
         match self {
@@ -496,7 +499,7 @@ impl PhysicalNode {
 
     /// Whether a consumer can run before other documents finish.
     pub fn can_precede(&self, consumer: &PhysicalNode) -> bool {
-        if self.guard().is_some() || self.alternative().is_some() {
+        if self.runs_alone() {
             return false;
         }
         match self {
@@ -522,6 +525,22 @@ impl PhysicalNode {
             PhysicalNode::AiExtract(node) => node.attributes.guard.as_ref(),
             PhysicalNode::AiMap(node) => node.attributes.guard.as_ref(),
             PhysicalNode::AiSaeFeatures(node) => node.attributes.guard.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Whether the executor runs the node in a pipeline of its own: a
+    /// node with a guard, an AI filter with an alternative, or an AI
+    /// filter that returns its answer.
+    pub fn runs_alone(&self) -> bool {
+        self.guard().is_some() || self.alternative().is_some() || self.answer().is_some()
+    }
+
+    /// The column an AI filter that keeps every row adds with its
+    /// answer. None for every other node.
+    pub fn answer(&self) -> Option<&String> {
+        match self {
+            PhysicalNode::AiFilter(node) => node.attributes.answer.as_ref(),
             _ => None,
         }
     }

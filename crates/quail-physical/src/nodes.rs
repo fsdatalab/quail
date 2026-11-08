@@ -193,6 +193,7 @@ physical_nodes! {
         num_key_survivors: i64,
         guard: Option<ValueExpression>,
         alternative: Option<ValueExpression>,
+        answer: Option<String>,
     }
     /// An `AI.SCORE` call.
     AiScore(AiScoreAttributes) = "quail.ai_score" {

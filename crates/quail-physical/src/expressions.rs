@@ -230,6 +230,11 @@ tagged_struct! {
         /// and a document the guard leaves out passes only then. None
         /// for a predicate that is not in an OR.
         alternative: Option<ValueExpression>,
+        /// The column the predicate adds with its answer, when it keeps
+        /// every row it reads instead of dropping the rows it rejects:
+        /// TRUE or FALSE for a document it asks about, NULL for one its
+        /// guard leaves out. None for a predicate that drops rows.
+        answer: Option<String>,
     }
 }
 

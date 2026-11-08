@@ -32,7 +32,7 @@ use crate::operators::{Operators, SemanticColumn};
 use crate::plan_statistics::plan_prompts;
 use crate::search::{
     ASK, StepKey, StepPricing, default_order_rule, label_calls, order_steps, resident_after,
-    table_steps,
+    table_rule, table_steps,
 };
 
 const FILTER: &str = "AI.IF";
@@ -855,7 +855,12 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 .expect("rows")
                 .1
                 .clone();
-            let ordered: Vec<usize> = order_steps(&steps, &rule, live.len() as f64, self.context)?;
+            let ordered: Vec<usize> = order_steps(
+                &steps,
+                table_rule(self.found, &alias, &rule),
+                live.len() as f64,
+                self.context,
+            )?;
             let mut rows = live;
             let mut reached: Option<Vec<Vec<i64>>> = None;
             if self.inputs.stop_groups.contains_key(&alias)
@@ -938,9 +943,28 @@ impl<'a, 'c> Estimate<'a, 'c> {
         let prompt = &asked_call(&predicate.expression).prompt;
         let tail = self.lower(prompt)?.tail_token_ids.len() as i64;
         let work = self.question_work(alias, rows, tail, first);
+        // a filter that returns its answer keeps every row; the filter in
+        // an OR after it passes a row any AI.IF of the OR accepts, and
+        // the estimate leaves out the OR's plain terms
+        let ored: Vec<Prompt> = if predicate.alternative.is_some() {
+            self.found
+                .filters
+                .iter()
+                .filter(|(owner, _)| owner == alias)
+                .flat_map(|(_, predicates)| predicates)
+                .filter(|earlier| earlier.answer.is_some())
+                .map(|earlier| (*asked_call(&earlier.expression).prompt).clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut passed = Vec::new();
         for row in rows {
-            if self.passes(prompt, &[(alias, *row)])? {
+            let mut passes = predicate.answer.is_some();
+            for asked in std::iter::once(prompt.as_ref()).chain(&ored) {
+                passes = passes || self.passes(asked, &[(alias, *row)])?;
+            }
+            if passes {
                 passed.push(*row);
             }
         }

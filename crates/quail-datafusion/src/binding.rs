@@ -440,7 +440,10 @@ impl Binder {
                 ..
             })
         ) {
-            return unsupported(&format!("{term}, an OR of a model call and other tests,"));
+            // an OR of AI.IF calls and plain tests is an AiNode's filter
+            return unsupported(&format!(
+                "{term}, an OR of a model call other than AI.IF and other tests,"
+            ));
         }
         let (node, anti) = match &term {
             Expr::Not(inner) => (inner.as_ref(), true),
@@ -597,6 +600,15 @@ impl Binder {
         self.answer_types
             .push((alias.clone(), name.clone(), data_type));
         Ok(Expr::Column(Column::new(Some(alias), name)))
+    }
+
+    /// Record that a condition may read `alias.column`, an answer of
+    /// type `data_type` that no table holds.
+    pub(crate) fn note_answer_type(&mut self, alias: &str, column: &str, data_type: DataType) {
+        let entry = (alias.to_string(), column.to_string(), data_type);
+        if !self.answer_types.contains(&entry) {
+            self.answer_types.push(entry);
+        }
     }
 
     /// The name of the answer column of `call`, the call `node` makes.

@@ -5,7 +5,7 @@
 //! They cross into Python as JSON. Each value and condition the
 //! executor computes is an `Expression`, which DataFusion evaluates.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -222,6 +222,19 @@ impl Operators {
     pub fn limited(mut self, fetch: i64) -> Self {
         self.fetch = Some(self.fetch.map_or(fetch, |found| found.min(fetch)));
         self
+    }
+
+    /// (alias, column) of each answer an AI filter that keeps every row
+    /// adds.
+    pub fn filter_answers(&self) -> BTreeSet<(&str, &str)> {
+        self.filters
+            .iter()
+            .flat_map(|(alias, predicates)| {
+                predicates.iter().filter_map(move |predicate| {
+                    Some((alias.as_str(), predicate.answer.as_deref()?))
+                })
+            })
+            .collect()
     }
 
     /// The column operators of every kind: classifications,

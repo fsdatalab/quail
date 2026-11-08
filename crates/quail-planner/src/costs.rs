@@ -15,7 +15,6 @@ use crate::expressions::{CompileError, argument_alias, column_name, compile_erro
 use crate::lowering::LoweredPrompt;
 use crate::operators::SemanticJoin;
 use crate::scores::{prompt_aliases, score_statistics};
-use crate::statistics::effective_selectivity;
 
 /// A predicate's seconds as a function of the documents it reads.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,7 +102,7 @@ pub fn prepare_filter_costs(
             )
         };
         prepared.push(PredicateCost {
-            selectivity: effective_selectivity(predicate.selectivity),
+            selectivity: crate::statistics::row_selectivity(predicate),
             first,
             later,
             reuse_key,

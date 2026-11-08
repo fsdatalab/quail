@@ -33,7 +33,7 @@ use crate::search::{
     ASK, OperatorOrder, StepKey, TableStep, choose_operator_order, column_step_kind, label_calls,
     resident_after,
 };
-use crate::statistics::{arena_capacity, effective_selectivity, pair_counts};
+use crate::statistics::{arena_capacity, effective_selectivity, pair_counts, row_selectivity};
 use crate::validation::{
     columns_above_joins, has_score, is_score, score_projections, validate_query,
 };
@@ -629,9 +629,10 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     document_ends: Value::Array(Vec::new()),
                     guard: predicate.guard.clone(),
                     alternative: predicate.alternative.clone(),
+                    answer: predicate.answer.clone(),
                 },
             )));
-            surviving *= effective_selectivity(predicate.selectivity);
+            surviving *= row_selectivity(&predicate);
             port = port_of(&ask_id, format!("rows:{alias}"));
         }
         Ok(port)

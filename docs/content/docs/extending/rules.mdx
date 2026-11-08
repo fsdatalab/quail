@@ -94,7 +94,7 @@ names the rule that makes each rewrite and when it applies.
 | R4 | `σ_{a LIKE x}(AI_{extract(d)→a}(R)) ⇒ σ_{a LIKE x}(AI_{extract(d)→a}(σ_{d ILIKE '%s%'}(R)))` | `push_down_substring_prechecks` | The node is an extraction of rows with no fetch; its filter has a term `a.f LIKE x` or `ILIKE x`, not negated, with a literal pattern; `s` is the longest word of the longest literal run of `x`. The test of the answer stays. |
 | R5 | `π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))`; `π_{a.f}(AI_{extract(d, {f, g})→a}(R)) ⇒ π_{a.f}(AI_{extract(d, {f})→a}(R))` | `push_down_projection_into_ai_nodes` | `Q` is a projection directly above a node of rows; the node keeps its answer, and drops each other added column `Q` does not read, such as an extraction's spans under a FROM subquery. An extraction asks only the fields the plan reads when every use of its answer and spans, through projections that pass them on or rename them, reads named fields; a use that reads the answer whole, or the query's result columns holding it, keeps every field. DataFusion's `optimize_projections` already prunes the input columns the node reads. |
 | R6 | `π_{B, (CASE WHEN c THEN a END)→z}(AI_{f→a}(R)) ⇒ π_{B, a→z}(AI_{f→a}(R; g = g ∧ c))` | `push_down_case_guards` | The node is a classification, map, or SAE features of rows with no filter, `HINT`, or fetch; the projection is directly above it; every item that reads an added column is `CASE WHEN c THEN <column> END` with the same `c`; `c` reads only columns of the one table the call reads. |
-| R7 | `AI_{f→b}(R; p = a ∨ b) ⇒ AI_{f→b}(R; g = (a IS NOT TRUE), p = a ∨ b)` | `push_down_or_guards` | The node is an AI.IF of rows with no guard, `HINT`, or fetch, and returns none of the columns it adds; a term of its filter is an OR with the answer `b` as one term and no other term reads `b`; the other terms `a` read only columns of the one table the call reads. |
+| R7 | `AI_{f→b}(R; p = a ∨ b) ⇒ AI_{f→b}(R; g = (a IS NOT TRUE), p = a ∨ b)`; with earlier AI.IFs `b_1 … b_{k-1}` of the OR below, `AI_{f_j→b_j}(R) ⇒ AI_{f_j→b_j}(R; g = (a ∨ b_1 ∨ … ∨ b_{j-1}) IS NOT TRUE)` | `push_down_or_guards` | The node is an AI.IF of rows with no guard, `HINT`, or fetch, and returns none of the columns it adds; a term of its filter is an OR with the answer `b` as one term and no other term reads `b`; the other terms `a` read only columns of the one table the call reads, or are the answers `b_j` of AI.IF nodes below that return their answer and have no filter, guard, `HINT`, or fetch. |
 | R8 | `Limit_k(π(R)) ⇒ π(Limit_k(R))` | DataFusion's `push_down_limit`; `push_down_limit_into_ai_nodes` also reads through projections | The projection keeps one row per row. Over an `AiNode`, the LIMIT becomes the node's fetch (R9). |
 | R9 | `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))` | `push_down_limit_into_ai_nodes` | Only projections and aliases are between them, the node has no `HINT` and no per-key fetch, and `k > 0`. |
 | R10 | `Limit_{k,m}(AI(R; n)) ⇒ Limit_{k,m}(AI(R; n = min(k + m, n)))` | `push_down_limit_into_ai_nodes` | As R9, for a LIMIT with an OFFSET of `m`. |
@@ -149,8 +149,19 @@ rule, the filter asks every row and still passes the rows where `a` is
 TRUE. A guarded or ORed AI filter runs in a pipeline of its own, stock
 vLLM refuses it, and so does a region with a LIMIT or a DISTINCT stop
 key over it, since the executor counts survivors among the rows it
-asks. An OR of two AI.IF calls, or of an AI.IF over two tables, is
-still refused.
+asks. An OR of an AI.IF over two tables, an AI join, is refused.
+
+An OR of several AI.IF calls, such as `WHERE r.flagged OR AI.IF(q1) OR
+AI.IF(q2)`, lowers to one `AiNode` per call, in written order. Each but
+the last returns its answer `b_j` and drops no row; the last is the node
+whose filter is `r.flagged OR b_1 OR b_2`. The rule guards the first with
+`r.flagged IS NOT TRUE` and the second with `r.flagged IS NOT TRUE AND
+b_1 IS NOT TRUE`; with no plain term, the first is not guarded. The
+physical AI filter of an earlier call keeps every row and adds its
+answer column, TRUE or FALSE where it asked and NULL elsewhere; the last
+filter's guard and alternative read those columns. The planner keeps
+such a table's filters in written order. A later rule may reorder the
+calls by cost.
 
 R13 covers an uncorrelated `IN` subquery, such as `WHERE p.number IN
 (SELECT r.product FROM reviews r WHERE AI.IF(...))`: Quail lowers the

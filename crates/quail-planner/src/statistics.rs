@@ -18,6 +18,16 @@ pub fn effective_selectivity(selectivity: Option<f64>) -> f64 {
     selectivity.unwrap_or(DEFAULT_SELECTIVITY)
 }
 
+/// The fraction of the rows an AI filter reads that it passes on: every
+/// row for a filter that returns its answer, else its selectivity.
+pub fn row_selectivity(predicate: &quail_physical::FilterPredicate) -> f64 {
+    if predicate.answer.is_some() {
+        1.0
+    } else {
+        effective_selectivity(predicate.selectivity)
+    }
+}
+
 /// Expected documents with at least one matching tuple.
 pub fn surviving_documents(num_documents: f64, num_partners: f64, selectivity: Option<f64>) -> f64 {
     let selectivity = effective_selectivity(selectivity);

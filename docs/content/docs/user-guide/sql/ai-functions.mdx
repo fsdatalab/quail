@@ -69,6 +69,27 @@ WHERE AI.IF(PROMPT('Does this review mention a positive aspect?\n\n{0}', r.body)
 Use `AND` to combine filters. All AI filters on one table must read the
 same document column.
 
+Use `OR` to keep a row that any of several tests accepts. The terms can
+be `AI.IF` calls and conditions that ask no model, in any number:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE r.flagged
+   OR AI.IF(PROMPT('Does this review mention a refund?\n\n{0}', r.body))
+   OR AI.IF(PROMPT('Does this review mention a delivery problem?\n\n{0}', r.body))
+```
+
+Quail asks each `AI.IF` only about the rows where no term before it is
+TRUE, in the order the query writes them, and asks the conditions that
+ask no model first. In the query above, the model reads a flagged review
+for neither question, and reads a review it says mentions a refund only
+once. The `OR` follows SQL: a row passes when one term is TRUE, so `NULL
+OR TRUE` passes and `NULL OR FALSE` does not. Every term of the `OR` must
+read the same one table; an `OR` with an `AI.IF` join, an `AI.SCORE`
+comparison, or a test of another function's answer is refused, and so is
+a `LIMIT` or `DISTINCT` over the query.
+
 ### Joining
 
 Use `AI.IF` to join two tables with a natural language condition:

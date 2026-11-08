@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::utils::split_conjunction;
@@ -665,6 +665,44 @@ impl<'a> Walk<'a> {
             .unwrap_or_else(|_| expr.clone())
     }
 
+    /// `expr` as the query wrote it, as [`Walk::written`], with each
+    /// answer of an AI filter that keeps every row read as a column of
+    /// the filter's table, which `binder` then knows.
+    fn filter_answers(&self, expr: &Expr, binder: &mut Binder) -> Expr {
+        let mut answers: Vec<(String, String)> = Vec::new();
+        for id in self.ids() {
+            let Kind::Ai(node) = &self.get(id).kind else {
+                continue;
+            };
+            let tables = self.call_tables(&node.call);
+            if node.function() == "ai_filter"
+                && node.filter.is_none()
+                && node.semantics == Semantics::Rows
+                && let [alias] = tables.into_iter().collect::<Vec<_>>().as_slice()
+            {
+                answers.push((node.answer.clone(), alias.clone()));
+            }
+        }
+        self.written(expr, &[])
+            .transform_up(|found| match &found {
+                Expr::Column(column) if column.relation.is_none() => {
+                    match answers.iter().find(|(answer, _)| *answer == column.name) {
+                        Some((answer, alias)) => {
+                            binder.note_answer_type(alias, answer, DataType::Boolean);
+                            Ok(Transformed::yes(Expr::Column(Column::new(
+                                Some(alias.clone()),
+                                answer.clone(),
+                            ))))
+                        }
+                        None => Ok(Transformed::no(found)),
+                    }
+                }
+                _ => Ok(Transformed::no(found)),
+            })
+            .map(|found| found.data)
+            .unwrap_or_else(|_| self.written(expr, &[]))
+    }
+
     /// The terms of the plan's filters, as the query wrote them, then its
     /// tests of answer columns, in written order.
     fn where_terms(&self, answers: &[Answer]) -> Vec<Expr> {
@@ -1011,7 +1049,10 @@ impl Relation {
                 if node.function() == "ai_filter" && split_conjunction(filter).len() == 1 =>
             {
                 match crate::or_guards::or_terms(node) {
-                    Some(rest) => Some(binder.bind_condition(&walk.written(&rest, &[]))?),
+                    Some(rest) => {
+                        let rest = walk.filter_answers(&rest, binder);
+                        Some(binder.bind_condition(&rest)?)
+                    }
                     None => {
                         self.unplaced = true;
                         return Ok(());
@@ -1021,9 +1062,14 @@ impl Relation {
             _ => None,
         };
         let guard = match &node.guard {
-            Some(guard) => Some(binder.bind_condition(&walk.written(guard, &[]))?),
+            Some(guard) => {
+                let guard = walk.filter_answers(guard, binder);
+                Some(binder.bind_condition(&guard)?)
+            }
             None => None,
         };
+        let answer =
+            (node.function() == "ai_filter" && node.filter.is_none()).then(|| node.answer.clone());
         let (predicate, options) = if node.function() == "ai_score" {
             let answer = Answer {
                 name: node.answer.clone(),
@@ -1049,14 +1095,15 @@ impl Relation {
                 selectivity: options.selectivity,
                 guard,
                 alternative,
+                answer,
             };
             push(&mut self.filters, &read[0], filter);
             return Ok(());
         }
-        if alternative.is_some() || guard.is_some() {
+        if alternative.is_some() || guard.is_some() || answer.is_some() {
             return unsupported(&format!(
                 "{}, an OR of an AI join and other tests,",
-                walk.written(node.filter.as_ref().expect("an OR"), &[])
+                walk.written(node.filter.as_ref().unwrap_or(&node.call), &[])
             ));
         }
         let spec = JoinSpec {
@@ -2078,6 +2125,9 @@ impl Needed {
 /// Each scan's columns: the column values the operators above it read,
 /// nearest the result first.
 fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly<'_, '_>) {
+    // a guard may read an earlier AI filter's answer, which no table holds
+    let unread = found.clone();
+    let answers = unread.filter_answers();
     let mut valued: BTreeSet<(String, String)> = BTreeSet::new();
     let mut top = Needed::default();
     for column in &found.projection.columns {
@@ -2118,6 +2168,9 @@ fn push_down_columns(found: &mut Operators, walk: &Walk<'_>, assembly: &Assembly
                 .flat_map(|predicate| predicate.guard.iter().chain(&predicate.alternative))
         }))
         .flat_map(column_references)
+        .filter(|reference| {
+            !answers.contains(&(reference.alias.as_str(), reference.column.as_str()))
+        })
         .collect();
     value(guards.clone());
     let scan_ids: Vec<usize> = walk

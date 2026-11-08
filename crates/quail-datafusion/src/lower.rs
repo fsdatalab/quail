@@ -10,7 +10,10 @@
 //!   the answer. A term that reads two tables is an AI join. An OR of
 //!   one `AI.IF` and terms that ask no model, such as `r.flagged OR
 //!   AI.IF(...)`, is an `AiNode` whose filter is the OR with the answer
-//!   in the call's place.
+//!   in the call's place. With more `AI.IF`s, such as `r.flagged OR
+//!   AI.IF(q1) OR AI.IF(q2)`, each but the last is an `AiNode` that
+//!   returns its answer `b1` and drops no row, in written order, and the
+//!   last is the node whose filter is `r.flagged OR b1 OR b2`.
 //! - An inner `Join` keeps its other ON terms; each `AI.IF` term is an
 //!   `AiNode` above it.
 //! - Each such node records where the query wrote its term
@@ -134,9 +137,10 @@ fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
     (asked, rest, num_terms)
 }
 
-/// The `AI.IF` call of an OR whose other terms ask no model and read no
-/// model answer, such as `r.flagged OR AI.IF(...)`, and the OR's terms.
-fn or_asked(term: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
+/// The `AI.IF` calls of an OR whose other terms ask no model and read no
+/// model answer, such as `r.flagged OR AI.IF(...) OR AI.IF(...)`, in
+/// written order, and the OR's terms.
+fn or_asked(term: &Expr) -> Option<(Vec<&Expr>, Vec<&Expr>)> {
     let terms = split_binary(term, Operator::Or);
     if terms.len() < 2 {
         return None;
@@ -150,10 +154,44 @@ fn or_asked(term: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
             .exists(|inner| Ok(crate::is_ai_call(inner) || matches!(inner, Expr::Exists(_))))
             .unwrap_or(true)
     };
-    match calls.as_slice() {
-        [call] if others.iter().all(|found| plain(found)) => Some((call, terms)),
-        _ => None,
-    }
+    (!calls.is_empty() && others.iter().all(|found| plain(found))).then_some((calls, terms))
+}
+
+/// `term` with its first occurrence of `call` replaced by `with`.
+fn replace_first(term: Expr, call: &Expr, with: &Expr) -> Result<Expr> {
+    let mut done = false;
+    Ok(term
+        .transform_down(|found| {
+            if done || found != *call {
+                return Ok(Transformed::no(found));
+            }
+            done = true;
+            Ok(Transformed::new(
+                with.clone(),
+                true,
+                TreeNodeRecursion::Jump,
+            ))
+        })?
+        .data)
+}
+
+/// An `AiNode` over `input` asking an `AI.IF` call of an OR and
+/// returning its answer as the column `answer` instead of filtering:
+/// the OR's last `AI.IF` reads it as one of the OR's other terms.
+fn answer_node(
+    input: LogicalPlan,
+    call: &Expr,
+    (answer, index): (String, usize),
+    written: &Written,
+) -> Result<LogicalPlan> {
+    let (_, field) = call.to_field(input.schema())?;
+    let field = field.as_ref().clone().with_name(answer.clone());
+    let mut node = AiNode::try_new(Arc::new(input), call.clone(), answer, vec![field])?;
+    node.written = Some(Written {
+        index,
+        ..written.clone()
+    });
+    Ok(extension_node(node.checked()?))
 }
 
 /// An `AiNode` over `input` asking `term`, an `AI.IF` call or a
@@ -167,8 +205,9 @@ fn asked_node(
 ) -> Result<LogicalPlan> {
     let (term, hint) = unhint(term);
     let read = Expr::Column(Column::from_name(answer.clone()));
-    let ored = or_asked(&term).map(|(call, terms)| {
+    let ored = or_asked(&term).map(|(calls, terms)| {
         // the OR's terms in written order, the call's answer in its place
+        let call = calls[0];
         let filter = terms
             .into_iter()
             .map(|found| {
@@ -216,19 +255,31 @@ fn stack_asked(
     on: Option<&str>,
     columns: &mut Columns,
 ) -> Result<LogicalPlan> {
-    for (position, term) in asked {
+    for (position, mut term) in asked {
+        let written = Written {
+            position,
+            num_terms,
+            clause,
+            index: 0,
+            on: on.map(str::to_string),
+        };
+        // each AI.IF of an OR but the last returns its answer, which the
+        // last reads as one of the OR's other terms
+        let calls: Vec<Expr> = or_asked(hinted(&term))
+            .map(|(calls, _)| calls.into_iter().cloned().collect())
+            .unwrap_or_default();
+        for call in calls.iter().rev().skip(1).rev() {
+            let (answer, index) = columns.answer_name();
+            let read = Expr::Column(Column::from_name(answer.clone()));
+            input = answer_node(input, call, (answer, index), &written)?;
+            term = replace_first(term, call, &read)?;
+        }
         input = asked_node(
             input,
             &term,
             columns.answer_name(),
             Semantics::Rows,
-            Written {
-                position,
-                num_terms,
-                clause,
-                index: 0,
-                on: on.map(str::to_string),
-            },
+            written,
         )?;
     }
     Ok(input)
