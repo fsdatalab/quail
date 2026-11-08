@@ -37,12 +37,15 @@ OUTPUT_DIR = "/results/ablations/rules"
 WARMUP_DOCUMENTS = 64
 SENTIMENT = "ARRAY['positive', 'negative', 'mixed']"
 GOVERNING_LAW = "Which state or country has its law govern this agreement?"
+RECOMMEND_MAP = ("Does the reviewer recommend the movie? Start with Yes or No, "
+                 "then give the reason in one sentence.")
 ENDING = "PROMPT('Does this review discuss the ending of the movie?\\n\\n{0}', r.body)"
 RECOMMEND = "PROMPT('Does the reviewer recommend the movie?\\n\\n{0}', r.body)"
 ACTING = "PROMPT('Does the review praise the acting?\\n\\n{0}', r.body)"
 CANCEL = ("PROMPT('Does the customer ask to cancel, return, or exchange "
           "something?\\n\\n{0}', m.content)")
-# name -> (rule, SQL, how rows compare: "rows" whole, or "ids" the first column)
+# name -> (rule, SQL, how rows compare: "rows" whole, "nulls" (see row_keys),
+# or "ids" the first column, counting the rows whose other columns differ)
 QUERIES = {
     "case classify": ("push_down_case_guards", (
         "SELECT r.id, CASE WHEN LENGTH(r.body) > 2000 THEN "
@@ -90,13 +93,18 @@ QUERIES = {
         f"SELECT d.id, d.t, AI.CLASSIFY(d.body, {SENTIMENT}) AS u FROM "
         f"(SELECT r.id, r.body, AI.CLASSIFY(r.body, {SENTIMENT}) AS t "
         "FROM reviews r) d"), "rows"),
+    # the model starts each answer with a space: 2600 of 5000 begin " Yes"
     "map prefix test": ("should_stop_answers_early", (
-        "SELECT r.id FROM reviews r WHERE AI.MAP(r.body, 'Does the reviewer "
-        "recommend the movie? Start with Yes or No, then give the reason in "
-        "one sentence.', 64) LIKE 'Yes%'"), "rows"),
+        f"SELECT r.id FROM reviews r WHERE AI.MAP(r.body, '{RECOMMEND_MAP}', 64) "
+        "LIKE ' Yes%'"), "rows"),
+    # the projection reads the answer, so only answers that fail stop early
+    "map prefix test with answers": ("should_stop_answers_early", (
+        f"SELECT r.id, AI.MAP(r.body, '{RECOMMEND_MAP}', 64) AS a FROM reviews r "
+        "WHERE a LIKE ' Yes%'"), "ids"),
+    # 5 of 45 contracts answer exactly "State of California"
     "extract equality test": ("should_stop_answers_early", (
         f"SELECT c.id, AI.EXTRACT(c.text, {{'law': '{GOVERNING_LAW}'}}) AS e "
-        "FROM contracts c WHERE e.law = 'Delaware'"), "rows"),
+        "FROM contracts c WHERE e.law = 'State of California'"), "ids"),
 }
 # each group runs on its own H100
 GROUPS = {
@@ -125,9 +133,12 @@ def row_keys(table, compare: str) -> list[str]:
     Args:
         table: The query's rows.
         compare: "rows" keys whole rows, "nulls" keys the first column and
-            whether each other column is NULL, since map text may vary.
+            whether each other column is NULL, since map text may vary,
+            and "ids" keys the first column alone.
     """
     rows = table.to_pylist()
+    if compare == "ids":
+        rows = [row[table.column_names[0]] for row in rows]
     if compare == "nulls":
         rows = [{key: value if key == table.column_names[0] else value is None
                  for key, value in row.items()} for row in rows]
@@ -169,6 +180,10 @@ def measure(session, sql: str, compare: str, usd_per_hour: float) -> dict:
         "node_metrics": node_metrics,
         "plan": plan_text,
         "keys": keys,
+        # by the first column, the other columns, for counting text changes
+        "answers": {json.dumps(row.pop(table.column_names[0]), default=str):
+                    json.dumps(row, sort_keys=True, default=str)
+                    for row in table.to_pylist()} if compare == "ids" else {},
     }
 
 
@@ -231,7 +246,8 @@ def run_group(group: str, scale_factor: float, run_dir: str) -> str:
                     entry[label] = {"error": traceback.format_exc()}
                 print(group, name, label, {key: value for key, value in
                       entry[label].items()
-                      if key not in ("keys", "node_metrics", "plan")}, flush=True)
+                      if key not in ("keys", "answers", "node_metrics", "plan")},
+                      flush=True)
     for entry in record["queries"].values():
         on, off = entry.get("on", {}), entry.get("off", {})
         if "keys" in on and "keys" in off:
@@ -239,6 +255,11 @@ def run_group(group: str, scale_factor: float, run_dir: str) -> str:
             entry["rows_equal"] = left == right
             entry["num_rows_differing"] = sum(((left - right) + (right - left))
                                               .values())
+        if "answers" in on and "answers" in off:
+            left, right = on.pop("answers"), off.pop("answers")
+            if left or right:
+                entry["num_kept_answers_differing"] = sum(
+                    left[key] != right[key] for key in left.keys() & right.keys())
     path = Path(run_dir) / f"{group.replace(' ', '_')}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, indent=1, default=str))
