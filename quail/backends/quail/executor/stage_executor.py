@@ -25,7 +25,7 @@ from quail.backends.quail.executor.stages import (
 from quail.progress import Progress, logger
 
 ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
-ANSWER_ADMISSION_MODES = ("headroom=0", "headroom", "partial")
+ANSWER_ADMISSION_MODES = ("headroom=0", "headroom")
 # a directory each headroom run writes a file of its headroom over time
 # and its curves to
 HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
@@ -34,9 +34,10 @@ HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
 def answer_admission_mode() -> str:
     """Return the answer admission QUAIL_ANSWER_ADMISSION names, headroom by default.
 
+    Either mode admits a document's answers one at a time.
+
     - headroom=0: admit when the prompt fits; every answer's headroom is 0.
     - headroom: admit when the prompt and each answer's chosen headroom fit.
-    - partial: headroom, admitting a document's answers one at a time.
 
     Raises:
         ValueError: The variable names no mode.
@@ -299,9 +300,8 @@ class StageExecutor:
             self.answer_admission = HeadroomAdmission(
                 decoder, self.prefix_lengths, self.capacity_extra,
                 self.sched.dependencies, self.borrowing.tree_shared,
-                self.arena.page_cost, decode_cost, self.arena.page_holds,
-                choose_headroom=self.admission_mode != "headroom=0",
-                partial=self.admission_mode == "partial",
+                decode_cost, self.arena.page_holds,
+                choose_headroom=self.admission_mode == "headroom",
                 chunk_tokens=self.sched.chunk_budget,
                 trace=bool(os.environ.get(HEADROOM_TRACE_ENV)))
         # a Gated DeltaNet layer starts a borrower from the parent's state
@@ -1024,10 +1024,9 @@ class StageExecutor:
                     and (self.sched.pending or self.sched.waiting)):
                 started = time.perf_counter()
                 self.answer_admission.refresh(
-                    self.sched._stage, replays, self._replay_pages(replays),
+                    replays, self._replay_pages(replays),
                     self.arena.free_pages if self.paged else None)
-                if self.answer_admission.partial:
-                    self.answer_admission.order_waiting(self.sched.waiting)
+                self.answer_admission.order_waiting(self.sched.waiting)
                 self.admission_s += time.perf_counter() - started
             started = time.perf_counter()
             groups = self.sched.next_chunk(
