@@ -82,6 +82,18 @@ class FullAttentionGroup:
         self.borrowed = np.zeros(num_slots, dtype=np.int64)
         self.lead = np.zeros(num_slots, dtype=np.int64)
 
+    def add_slots(self, count):
+        """Append `count` slots with no pages and nothing borrowed."""
+        start = len(self.parent)
+        zeros = np.zeros(count, dtype=np.int64)
+        self.pages = np.concatenate(
+            (self.pages, np.zeros((count, self.pages.shape[1]), dtype=np.int32)))
+        self.num_pages = np.concatenate((self.num_pages, zeros))
+        self.parent = np.concatenate(
+            (self.parent, np.arange(start, start + count, dtype=np.int64)))
+        self.borrowed = np.concatenate((self.borrowed, zeros))
+        self.lead = np.concatenate((self.lead, zeros))
+
     def start(self, document, pages, parent, shared_tokens):
         """Bind a branch to its pages and borrowed document prefix."""
         self.set_pages(document, pages)

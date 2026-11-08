@@ -114,6 +114,37 @@ class MapDecoder:
         self.tokenizer = None
         self.stopped_early = np.zeros(len(self.limits), dtype=np.int64)
 
+    def add_documents(self, count: int) -> None:
+        """Make room for the answers of `count` documents that arrived.
+
+        Raises:
+            ValueError: Extraction answers are configured; their copy
+                groups are laid out over the documents given at first.
+        """
+        if self.copy_inputs or self.copy_groups:
+            raise ValueError("extraction answers take no documents that "
+                             "arrive while they run")
+
+        def grown(values, fill=0):
+            pad = np.full((*values.shape[:-1], count), fill, dtype=values.dtype)
+            return np.concatenate((values, pad), axis=-1)
+
+        self.tokens = [np.concatenate(
+            (tokens, np.zeros((count, tokens.shape[1]), dtype=tokens.dtype)))
+            for tokens in self.tokens]
+        self.lengths = grown(self.lengths, -1)
+        self.written = grown(self.written)
+        self.steps = [grown(steps) for steps in self.steps]
+        for name, fill in (("paused", 0), ("map", -1), ("origin", 0), ("fed", 0),
+                           ("stopped", 0), ("inflight", 0), ("copy_pending", 0),
+                           ("copy_document", -1), ("copy_sources", -1),
+                           ("num_streams", 0), ("drafts", 0)):
+            setattr(self, name, grown(getattr(self, name), fill))
+        self.kv.add_slots(count)
+        if self.next_token is not None:
+            self.next_token = self.torch.cat((self.next_token, self.torch.zeros(
+                count, dtype=self.torch.int64, device=self.device)))
+
     def configure_copy(self, first, slots, documents, specs):
         """Register extraction fields for setup after the first forward launch."""
         self.constrained[first:first + len(specs)] = True

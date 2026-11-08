@@ -763,3 +763,58 @@ def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
     assert decoder.rows_fed[0] < sum(map(len, wanted))
     assert not decoder.active
     assert not arena.accounting.owned
+
+
+@pytest.mark.parametrize("mode", ["headroom", "headroom=0"])
+def test_map_answers_of_documents_arriving_while_others_decode_equal_greedy(
+        monkeypatch, mode):
+    from quail.backends.quail.executor.operators.map import NoAnswers
+    from quail.backends.quail.executor.stages import StageRequests
+
+    cpu_staging(monkeypatch)
+    monkeypatch.setenv("QUAIL_ANSWER_ADMISSION", mode)
+    rng = np.random.default_rng(23)
+    header = rng.integers(20, 400, size=8).tolist()
+    documents = [header + rng.integers(20, 400, size=int(n)).tolist()
+                 for n in rng.integers(1, 40, size=14)]
+    tail, limit = [500, 501], 12
+    setup = Setup(path="unified", pages=60, page_tokens=4, budget=60)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=(),
+                             tree_attention=True)
+    torch_ = events_torch(1)
+    first = 4
+    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), first, [limit], [STOP],
+                         setup.page_tokens)
+    decoder.answer_slots[0] = np.arange(first)
+    stage = Stage(suffixes=lambda key: StageRequests([tail]), suffix_tokens=2,
+                  rewind=True, append=True, single=True, readout=NoAnswers(),
+                  decide=lambda anchor, row: True, answer_tokens=limit)
+    keys = [("d", d) for d in range(len(documents))]
+    batches = [range(4, 9), range(9, 14)]
+    arrived = []
+
+    def arrivals(executor):
+        # a batch arrives once the documents before it are decoding
+        if decoder.running().size and batches:
+            arrived.append(executor.pass_work["passes"])
+            batch = batches.pop(0)
+            decoder.answer_slots[0] = np.arange(batch.stop)
+            executor.add_documents([documents[d] for d in batch],
+                                   [keys[d] for d in batch])
+        if not batches:
+            executor.input_ended()
+
+    stats = {}
+    run_stages(torch_, arena, pipeline, [stage], documents[:first], setup.budget,
+               anchor_keys=keys[:first], attention_mode="unified",
+               prefix_tree=prefix_tree(documents[:first], setup.page_tokens),
+               decoder=decoder, arrivals=arrivals, stats=stats,
+               decode_cost=DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"]))
+    got = [answer.tolist() for answer in decoder.answers(0, range(len(documents)))]
+    assert got == [greedy(document + tail, limit) for document in documents]
+    assert len(arrived) == 2 and min(arrived) > 0
+    assert stats["borrowed_tokens"] > 0
+    assert not decoder.active
+    assert not arena.accounting.owned

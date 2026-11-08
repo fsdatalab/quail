@@ -519,12 +519,16 @@ class PrefixTree:
         parent: Per document, the position it borrows from, or None.
         shared: Per document, the borrowed tokens, a multiple of the
             page size.
+        page_tokens: The page size of a tree built from the documents'
+            tokens in sorted order, which GrowingPrefixTree can extend;
+            None for a tree given by its parents.
     """
 
-    def __init__(self, order, parent, shared):
+    def __init__(self, order, parent, shared, page_tokens=None):
         self.order = order
         self.parent = parent
         self.shared = shared
+        self.page_tokens = page_tokens
         self._reader_groups = None
 
     @property
@@ -583,8 +587,127 @@ class PrefixIndex:
                     while parent[owner] is not None and shared[owner] >= pages:
                         owner = parent[owner]
                     parent[index] = owner
-            self._trees[page_tokens] = PrefixTree(self.order, parent, shared)
+            self._trees[page_tokens] = PrefixTree(self.order, parent, shared,
+                                                  page_tokens)
         return self._trees[page_tokens]
+
+
+def _sort_key(document):
+    """A document's key in sorted token order, and its tokens to compare.
+
+    Returns (key, tokens, common), where common(left, right) counts the
+    tokens two documents' tokens share; PrefixIndex sorts by the same keys.
+    """
+    try:
+        array = _token_array(document)
+    except (TypeError, ValueError):
+        # Test tokenizers may return words instead of integer token IDs.
+        words = tuple(document)
+        return words, words, longest_common_prefix
+    return array.astype(">i4").tobytes(), array, _array_common_prefix
+
+
+class GrowingPrefixTree:
+    """A prefix tree over the documents seen so far, extended as more arrive.
+
+    It starts from a PrefixTree that prefix_tree built in sorted token
+    order and keeps the same rules as documents arrive: add() places
+    each new document in sorted order, ties after the documents before
+    it, and recomputes from the first place that changed the shared
+    tokens (with the document before it in the order, page-rounded and
+    short of its last token) and the parent of every document not
+    fixed. A fixed document, one admitted already, keeps its parent and
+    shared tokens. With no document fixed, the tree after any sequence
+    of add() calls equals prefix_tree over every document: the same
+    order, parents, and shared tokens.
+
+    Args:
+        tree: A PrefixTree with page_tokens set, over the first documents.
+
+    Attributes:
+        order, parent, shared: As PrefixTree's, over the documents seen.
+    """
+
+    def __init__(self, tree):
+        if tree.page_tokens is None:
+            raise ValueError("only a tree in sorted token order can grow")
+        self.page_tokens = tree.page_tokens
+        self.order = list(tree.order)
+        self.parent = list(tree.parent)
+        self.shared = list(tree.shared)
+
+    @property
+    def shared_tokens(self) -> int:
+        """Tokens the tree lets the engine read instead of compute."""
+        return sum(self.shared)
+
+    def add(self, documents, fixed=frozenset()) -> list:
+        """Place the documents past the ones seen so far.
+
+        Args:
+            documents: Token sequences of every document, those seen
+                and the new ones after them, indexable by position.
+            fixed: Positions whose parent and shared tokens stay.
+
+        Returns:
+            The positions seen before whose parent or shared tokens changed.
+        """
+        seen = len(self.parent)
+        if len(documents) <= seen:
+            return []
+        keys = {}
+
+        def key(position):
+            if position not in keys:
+                keys[position] = _sort_key(documents[position])
+            return keys[position]
+
+        order = self.order
+        for position in range(seen, len(documents)):
+            low, high = 0, len(order)
+            mine = key(position)[0]
+            while low < high:
+                middle = (low + high) // 2
+                if key(order[middle])[0] <= mine:
+                    low = middle + 1
+                else:
+                    high = middle
+            order.insert(low, position)
+            self.parent.append(None)
+            self.shared.append(0)
+        place = {document: index for index, document in enumerate(order)}
+        new = range(seen, len(documents))
+        first = min(place[position] for position in new)
+        before = {document: (self.parent[document], self.shared[document])
+                  for document in order[first:] if document < seen}
+        # a document's shared tokens change only with the one before it
+        moved = set(new)
+        moved.update(order[place[position] + 1] for position in new
+                     if place[position] + 1 < len(order))
+        page = self.page_tokens
+        for document in moved - set(fixed):
+            index = place[document]
+            if not index:
+                self.shared[document] = 0
+                continue
+            mine, tokens, common = key(document)
+            _, previous, _ = key(order[index - 1])
+            count = min(common(previous, tokens), max(len(tokens) - 1, 0))
+            self.shared[document] = count // page * page
+        for index in range(first, len(order)):
+            document = order[index]
+            if document in fixed:
+                continue
+            pages = self.shared[document]
+            owner = None
+            if pages and index:
+                owner = order[index - 1]
+                while (self.parent[owner] is not None
+                       and self.shared[owner] >= pages):
+                    owner = self.parent[owner]
+            self.parent[document] = owner
+        return [document for document, was in before.items()
+                if (self.parent[document], self.shared[document]) != was]
 
 
 def _array_common_prefix(left, right) -> int:

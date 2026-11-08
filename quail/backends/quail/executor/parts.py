@@ -288,7 +288,9 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
     paged = paged or pipeline.needs_pages
     if keep_kv and not paged:
         raise ValueError("retaining document KV requires arena writes")
-    if prefix_tree is not None and not prefix_tree.shared_tokens:
+    if not paged and prefix_tree is not None and not prefix_tree.shared_tokens:
+        # the unpaged path borrows nothing; a paged run keeps the tree
+        # for documents that may arrive and share with these
         prefix_tree = None
     settled = next((part.on_settled for part in parts
                     if part.on_settled is not None), None)

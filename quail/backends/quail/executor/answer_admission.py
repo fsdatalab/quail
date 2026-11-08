@@ -146,6 +146,8 @@ class HeadroomAdmission:
             for anchor, prefix in enumerate(self.prefix)])
         page_tokens = decoder.page_tokens
         start_tokens = min(page_tokens, int(decoder.limits.max()) - 1)
+        self.capacity_extra = capacity_extra
+        self.start_tokens = start_tokens
         self.prompt = self.prefix + capacity_extra - start_tokens
         self.capacity = -(-(self.prefix + capacity_extra) // page_tokens) * page_tokens
         self.roots = self.parent == np.arange(len(self.prefix))
@@ -220,6 +222,53 @@ class HeadroomAdmission:
         # (refresh, bucket, pages) for each
         self.granted = []
         self.granted_at = []
+
+    def add_documents(self, prefix_lengths):
+        """Take documents that arrived while the run is under way.
+
+        They take the next anchor indices, each its own root with no
+        dependents. Bound curves are bound again, counting every
+        answer's observation afresh, since a document may open a
+        longer input bucket.
+
+        Args:
+            prefix_lengths: The new documents' prefix token counts.
+        """
+        prefix = np.asarray(prefix_lengths, dtype=np.int64)
+        count = len(prefix)
+        start = len(self.prefix)
+        page_tokens = self.decoder.page_tokens
+        zeros = np.zeros(count, dtype=np.int64)
+        self.prefix = np.concatenate((self.prefix, prefix))
+        self.parent = np.concatenate(
+            (self.parent, np.arange(start, start + count)))
+        self.prompt_pages = np.concatenate((self.prompt_pages, zeros))
+        self.prompt = np.concatenate(
+            (self.prompt, prefix + self.capacity_extra - self.start_tokens))
+        self.capacity = np.concatenate((self.capacity, -(
+            -(prefix + self.capacity_extra) // page_tokens) * page_tokens))
+        self.roots = np.concatenate((self.roots, np.ones(count, dtype=bool)))
+        self.borrowed = np.concatenate((self.borrowed, zeros))
+        self.lead = np.concatenate((self.lead, zeros))
+        self.child_order = np.argsort(self.parent, kind="stable")
+        self.child_start = np.searchsorted(self.parent[self.child_order],
+                                           np.arange(len(self.prefix) + 1))
+        self.bucket = input_bucket(self.prefix)
+        self.num_buckets = int(self.bucket.max()) + 1
+        self.slot_map = np.concatenate((self.slot_map, zeros - 1))
+        self.slot_row = np.concatenate((self.slot_row, zeros - 1))
+        self._observed = np.concatenate((self._observed, zeros))
+        self._ended = np.concatenate((self._ended, np.zeros(count, dtype=bool)))
+        self.committed = np.concatenate(
+            (self.committed, np.zeros(count, dtype=bool)))
+        self.reach = np.concatenate((self.reach, zeros))
+        if self.slots is not None:
+            self.slot_map[self.slots] = -1
+            self.slot_row[self.slots] = -1
+            self.slots = None
+            self._update_curves()
+        self._candidate = None
+        self._decision = None
 
     def _bind(self):
         decoder = self.decoder
