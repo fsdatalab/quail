@@ -60,18 +60,24 @@ quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "e8826ce
 # One wheel holds the quail package and _quail_native, the planner's
 # Rust module, built from the crates/ workspace
 [build-system]
-requires = ["maturin>=1.9,<2"]
+requires = ["maturin>=1.10,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
-# a development install builds Quail's crates unoptimized; dependencies
-# are optimized once by [profile.dev.package."*"] and stay cached
-profile = "dev"
 manifest-path = "crates/quail-native/Cargo.toml"
 module-name = "_quail_native"
 python-packages = ["quail"]
 include = ["LICENSE", "README.md"]
 exclude = ["demos/**", "docs/**"]
+# Wheels (`uv build`) use the release profile. `uv sync` installs the
+# project editable, which builds the dev profile instead: dependencies are
+# optimized and cached once, and an edit recompiles only Quail's crates,
+# incrementally (see [profile.dev] in Cargo.toml).
+profile = "release"
+editable-profile = "dev"
+# pyo3 rebuilds whenever the Python path it is built against changes; the
+# base interpreter's path stays the same across uv's build environments
+use-base-python = true
 
 [tool.uv]
 # uv's Python builds include the C headers Triton needs at startup

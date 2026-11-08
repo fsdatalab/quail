@@ -4,9 +4,14 @@
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
-# pyo3 builds against the project's Python, the one an embedded
-# interpreter loads Quail from. Forced, because maturin otherwise passes
-# the path of a fresh build environment on every install, which makes
-# pyo3 and every crate above it rebuild.
-[env]
-PYO3_PYTHON = { value = ".venv/bin/python", relative = true, force = true }
+# On macOS maturin links the Python module with these flags, passed as
+# RUSTFLAGS to every crate. Changed RUSTFLAGS recompile every crate, so if
+# cargo test, cargo build and rust-analyzer ran without them, each switch
+# between them and `uv sync` would recompile all of DataFusion. With the
+# flags here, maturin finds them already set and adds nothing, and every
+# build shares one set of compiled dependencies.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

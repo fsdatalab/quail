@@ -31,6 +31,27 @@ The development dependencies include
 [quail-b](https://github.com/fsdatalab/quail-bench).
 You need access to that repository to install them.
 
+`uv sync` builds the module with Cargo's dev profile. The first build
+compiles DataFusion and Arrow, optimized, and takes many minutes; later
+builds recompile only Quail's crates. Each clone or git worktree has its
+own `target/` directory, so each starts with that first build. To share
+one build across worktrees, point Cargo at one target directory, either
+in your shell:
+
+```bash
+export CARGO_TARGET_DIR="$HOME/.cache/quail-target"
+```
+
+or in a Cargo config above your worktrees, such as
+`~/.cargo/config.toml`:
+
+```toml
+[build]
+target-dir = "/Users/you/.cache/quail-target"
+```
+
+Cargo locks the directory, so two worktrees building at once take turns.
+
 ## Make a change
 
 For a new feature or a substantial change, open an issue to discuss the
