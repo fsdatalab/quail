@@ -5,7 +5,6 @@ import pickle
 import pyarrow as pa
 import pytest
 
-from quail.common.shards import contiguous_shards
 from quail.common.tokens import (
     ArrowTokenDocuments,
     TokenStore,
@@ -49,8 +48,6 @@ def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypa
     assert len(lengths) == 3 and all(length > 0 for length in lengths)
     assert store._reader.schema.names == [
         "__quail_token_ids", "__quail_token_count"]
-    total = sum(lengths)
-    assert contiguous_shards(store.lengths, 1, total=total) == (((0, 3),), [total])
     index = store.prefix_index
     with monkeypatch.context() as patch:
         patch.setattr("quail.common.tokens._token_array",

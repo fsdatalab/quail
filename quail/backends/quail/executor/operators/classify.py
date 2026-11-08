@@ -10,7 +10,6 @@ from quail.backends.quail.executor.model_operator import (
     join_prior_rows,
     prior_inputs,
 )
-from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.reranker import (
     classify_outputs,
     probability_column,
@@ -22,39 +21,6 @@ from quail.common.selection import document_positions
 from quail.execution.finished import finished_rows, finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.progress import answer_sink
-
-
-def classification_operator(state: QueryExecutionState, node, ids, chain, inputs):
-    """Prepare a classification with the labels its inputs provide."""
-    position = document_positions(ids)
-    plan = ClassifyStages(state, node.spec, len(ids),
-                          lambda key: position[key[1]])
-    plan.seeds = ids
-    priors, prior_tables = prior_inputs(node, chain, inputs)
-    return ClassifyOperator(node, ids, plan, priors, prior_tables=prior_tables)
-
-
-def joined_classification(state: QueryExecutionState, node, join, ids,
-                          join_inputs, context):
-    """Build classification stages for the pairs retained by a join."""
-    spec = node.spec
-    stage = next(stage for stage in join
-                 if set(spec.aliases) == {stage.anchor, *stage.partners})
-    # the join's partner tuples, one partner alias each
-    partner_ids = [int(entry[0]) if isinstance(entry, (tuple, list))
-                   else int(entry)
-                   for entry in join_inputs["partner_indices"][
-                       stage.written_position]]
-    documents = context.state["documents"][spec.partner]
-    kept = KeptPairs(join.index(stage))
-    partners = JoinPartners(
-        ids=partner_ids,
-        documents=[documents[partner] for partner in partner_ids],
-        kept=kept.of)
-    position = document_positions(ids)
-    plan = ClassifyStages(state, spec, len(ids),
-                          lambda key: position[key[1]], partners=partners)
-    return ClassifyOperator(node, ids, plan, kept=kept)
 
 
 class ClassifyOperator(ColumnOperator, SingleNodeOperator):
@@ -74,17 +40,33 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         """Build labels for documents or for the pairs retained by a join."""
         from quail.backends.quail.executor.operators.join import JoinOperator
 
-        node = nodes[0]
-        if node.spec.partner is None:
-            return classification_operator(region.query, node, region.document_ids(),
-                                       chain, region.node_inputs(node))
+        node, spec, ids = nodes[0], nodes[0].spec, region.document_ids()
+        position = document_positions(ids)
+        if spec.partner is None:
+            plan = ClassifyStages(region.query, spec, len(ids),
+                                  lambda key: position[key[1]])
+            plan.seeds = ids
+            priors, prior_tables = prior_inputs(node, chain, region.node_inputs(node))
+            return cls(node, ids, plan, priors, prior_tables=prior_tables)
         join = next(operator for operator in reversed(chain)
                     if isinstance(operator, JoinOperator))
-        operator = joined_classification(region.query, node, join.nodes,
-                                         region.document_ids(), join.inputs,
-                                         region.context)
-        join.add_reader(operator.kept)
-        return operator
+        stage = next(stage for stage in join.nodes
+                     if set(spec.aliases) == {stage.anchor, *stage.partners})
+        # the join's partner tuples, one partner alias each
+        partner_ids = [int(entry[0]) if isinstance(entry, (tuple, list))
+                       else int(entry)
+                       for entry in join.inputs["partner_indices"][
+                           stage.written_position]]
+        documents = region.context.state["documents"][spec.partner]
+        kept = KeptPairs(join.nodes.index(stage))
+        partners = JoinPartners(
+            ids=partner_ids,
+            documents=[documents[partner] for partner in partner_ids],
+            kept=kept.of)
+        plan = ClassifyStages(region.query, spec, len(ids),
+                              lambda key: position[key[1]], partners=partners)
+        join.add_reader(kept)
+        return cls(node, ids, plan, kept=kept)
 
     def __init__(self, node, ids, plan: ClassifyStages, priors=(), kept=None,
                  prior_tables=()):

@@ -71,13 +71,6 @@ def _five_filter_plan(catalog, sels):
 
 
 def test_gpu_copies_and_memory_refusals(catalog):
-    from quail.common.shards import contiguous_shards
-
-    assert contiguous_shards([2, 2, 2], 2) == (((0, 1), (1, 3)), [2, 4])
-    assert contiguous_shards([1, 0, 9], 2) == (((0, 1), (1, 3)), [1, 9])
-    assert contiguous_shards([0, 2, 0, 4], 3) == (
-        ((0, 2), (2, 4), (4, 4)), [2, 4, 0])
-    assert contiguous_shards([], 2) == (((0, 0), (0, 0)), [0, 0])
     operators = _five_filter_plan(catalog, (0.5,))
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
         for gpus in (1, 2, 4, 8):

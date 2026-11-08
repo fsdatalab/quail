@@ -131,8 +131,7 @@ pub fn hash_join_nodes(
     nodes
 }
 
-/// Split ordered documents into compact token balanced ranges, as
-/// `contiguous_shards`.
+/// Split ordered documents into compact token balanced ranges.
 pub fn contiguous_shards(
     lengths: &[i64],
     gpus: i64,
