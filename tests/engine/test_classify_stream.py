@@ -28,11 +28,13 @@ from quail.physical import (
     AiClassify,
     AiFilter,
     AiJoin,
+    AiScore,
     ClassifySpec,
     Filter,
     PhysicalGraph,
     PortRef,
     Scan,
+    ScoreSpec,
     input_ports,
 )
 from quail.specs import DEVICES, MODELS
@@ -492,3 +494,184 @@ def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
                 if entry["prefix"] is not None]
     assert sorted(prefills) == list(range(num_documents))
     assert not arena.accounting.owned
+
+
+# a score's tail and cue; the model answers every score suffix alike
+SCORE_TAIL = 4800
+
+
+class ScoringModel(LabelingModel):
+    """Answer label and join suffixes from truth, and every score suffix."""
+
+    def forward_chunk(self, chunk):
+        if all(suffix[-1] == SCORE_TAIL + 1 for spec in chunk.specs
+               for suffix in spec["suffixes"]):
+            self.launched.append(chunk.specs)
+            return [len(suffix) % 7 / 7 for spec in chunk.specs
+                    for suffix in spec["suffixes"]]
+        return super().forward_chunk(chunk)
+
+
+def score_graph():
+    """Score each document of r alone, then each pair of r and p."""
+    def spec(name, aliases, parts):
+        return ScoreSpec(name=name, aliases=aliases, query_template="",
+                         arguments=tuple((alias, "text") for alias in aliases),
+                         expected_rows=4, estimated_seconds=0.0,
+                         prompt_token_parts=parts)
+
+    tail = (SCORE_TAIL, SCORE_TAIL + 1)
+    return PhysicalGraph((
+        Scan(node_id="input:r", alias="r", input_id="r"),
+        Scan(node_id="input:p", alias="p", input_id="p"),
+        AiScore(node_id="score:r", backend_name="quail", model="qwen3-4b-fp8",
+                inputs=input_ports((PortRef("input:r", "rows:r"),)),
+                spec=spec("fun", ("r",), ((), tail))),
+        AiScore(node_id="score:rp", backend_name="quail", model="qwen3-4b-fp8",
+                inputs=input_ports((PortRef("input:r", "rows:r"),
+                                    PortRef("input:p", "rows:p"))),
+                spec=spec("match", ("r", "p"), ((), (CLASSIFY_FRAME,), tail))),
+    ), PortRef("score:rp", "rows"))
+
+
+def filter_graph(num_filters):
+    """Ask each document of r one filter question after another."""
+    nodes = [Scan(node_id="input:r", alias="r", input_id="r")]
+    source = PortRef("input:r", "rows:r")
+    for index in range(num_filters):
+        nodes.append(AiFilter(
+            node_id=f"filter:{index}", inputs=input_ports((source,)), alias="r",
+            arena_writes=num_filters > 1, question_token_ids=(QUESTION + index,),
+            written_position=index, question_tokens=1, preamble_tokens=0,
+            selectivity=0.7, expected_rows=10.0))
+        source = PortRef(f"filter:{index}", "rows:r")
+    return PhysicalGraph(tuple(nodes), source)
+
+
+def chunk_compositions(launched) -> list:
+    """Each packed chunk's entries: key, prefix length, and suffix tokens."""
+    return [[(repr(entry["key"]),
+              None if entry["prefix"] is None else len(entry["prefix"]),
+              int(entry["f"]), int(entry.get("start", 0)),
+              repr(entry.get("borrow_key")),
+              tuple(tuple(int(token) for token in suffix)
+                    for suffix in entry["suffixes"]))
+             for entry in chunk] for chunk in launched]
+
+
+# per region: chunks packed, a digest of their compositions, each
+# node's fresh tokens, and a digest of the output tables, recorded on
+# the executor before it streamed documents between operators
+RECORDED_CHUNKS = {
+    "filter": (3, "60593d47291287dce3509ac1afa1ef11b6892d5ddc5bb7f82a0d4406cc4ea7b3",
+               {"filter:0": 336},
+               "eea6f194bfc2d904e270bf21ef228f481b26fb3edeaa9642d253fca105c59441"),
+    "filters": (5, "532361ce9c62647069dace66789bb277e036655251f73bdd6c0857d34f063089",
+                {"filter:0": 336, "filter:1": 9},
+                "cc574da4ec685bd89fe4b37a4ce345cc9bc94cbe69fae515053c64900202c3d5"),
+    "fused": (8, "5569260ca2d19dc490f28f284efb652ce7037c2d98d196cfc0d246df7837e58c",
+              {"classify:kind": 8, "classify:r": 18, "filter:r": 336, "group:0": 92},
+              "d1a18ac0ec0b19778fd2714f6c9224c8ac60ce742537066800ac1a4e1e4b3051"),
+    "joined": (12, "55f1c193ef72a23fbfc8dc00d047765ea31d1de12af325e43122dae6e6a66abd",
+               {"classify:rp": 171, "group:0": 644, "group:1": 42},
+               "fd3e330ee7483b08ce830d7f9c3f4311ec75f5fc84baa60c26f5b8d2586f8653"),
+    "scores": (11, "0dabe20b32fbddbb6b3fe3b141a9b8b413413b2e7fbf79c72d1b56da5af9403b",
+               {"score:r": 350, "score:rp": 756},
+               "5b5d400f4a5835fc1c148132ab952e937fd79ebe2a8a9b43c8d8d1111b78a264"),
+}
+
+
+@pytest.mark.parametrize("region", sorted(RECORDED_CHUNKS))
+def test_each_region_packs_the_chunks_it_packed_before_streaming(
+        monkeypatch, region):
+    import hashlib
+    import json
+
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    from quail.backends.quail.executor import label_stages as label_stages_module
+
+    num_documents, num_partners = 14, 4
+    documents = {
+        "r": [[DOC + d] * (10 + 2 * d) for d in range(num_documents)],
+        "p": [[PARTNER + i] * (4 + i) for i in range(num_partners)],
+    }
+    filter_truth = [[d % 3 != 0, d % 4 != 1] for d in range(num_documents)]
+    label_truth = [d % 2 for d in range(num_documents)]
+    join_truth = {("r", d): [(d + i) % 3 == 0 for i in range(num_partners)]
+                  for d in range(num_documents)}
+    joined_truth = {(d, i): (d + i) % 2 for d in range(num_documents)
+                    for i in range(num_partners)}
+    graph = {"fused": fused_graph, "scores": score_graph,
+             "joined": joined_graph, "filter": lambda: filter_graph(1),
+             "filters": lambda: filter_graph(2)}[region]()
+    if region == "joined":
+        documents["q"] = [[PARTNER + num_partners] * 2]
+        join_truth = {key: values + [1] for key, values in join_truth.items()}
+        graph = joined_graph(two_joins=True)
+    model = ScoringModel(filter_truth if region in ("filter", "filters", "fused")
+                         else [], join_truth,
+                         label_truth, joined_truth)
+    torch = fake_torch()
+    torch.nn = SimpleNamespace(functional=None)
+    arena = cpu_arena(64)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    execution = QuailModelExecution(SimpleNamespace(
+        model=MODELS["qwen3-4b-fp8"], gpu_index=0, gpus=1,
+        device=DEVICES["h100-sxm"]))
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.bind_query(torch=torch, async_answers=fake_readout(),
+                         answer_rows=object(), chunk_tokens=120,
+                         async_scores=fake_readout())
+
+    class LabelReadout:
+        trailing_rows = 1
+        normalize = False
+
+        def __init__(self, targets, rows):
+            self.targets = np.asarray(targets)
+            self.rows = rows
+            self.dtype = np.dtype((np.float32, (rows, len(targets))))
+
+        def submit(self, rows, rows_per_answer=None):
+            if rows_per_answer is None:
+                rows_per_answer = [1] * len(rows)
+            padded = np.full((len(rows_per_answer), self.rows,
+                              len(self.targets)), np.nan, np.float32)
+            start = 0
+            for answer, count in enumerate(rows_per_answer):
+                for offset in range(count):
+                    row = rows[start + offset]
+                    padded[answer, offset] = (row if hasattr(row, "shape")
+                                              else np.zeros(len(self.targets)))
+                start += count
+            return padded
+
+        def result(self, rows):
+            return rows
+
+    monkeypatch.setattr(label_stages_module, "full_output_head",
+                        lambda model: SimpleNamespace(shape=(1, 1), dtype="fake"))
+    monkeypatch.setattr(
+        label_stages_module, "AsyncLabelLogprobs",
+        lambda torch, F, head, targets, rows, normalize: LabelReadout(
+            targets, rows))
+    execution.loaded_model.label_readout = LabelReadout(TARGETS, 1)
+    state = {
+        "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                               execution=execution, spec=MODELS["qwen3-4b-fp8"]),
+        "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
+        "chunk_tokens": 120, "documents": documents,
+    }
+    result = execute_single_graph(state, SETTINGS, graph)
+    assert not arena.accounting.owned
+
+    compositions = chunk_compositions(model.launched)
+    digest = hashlib.sha256(json.dumps(compositions).encode()).hexdigest()
+    fresh = {name: metrics["fresh_tokens"]
+             for name, metrics in sorted(result["node_metrics"].items())
+             if metrics["fresh_tokens"]}
+    rows = hashlib.sha256(json.dumps(
+        [(repr(port), table.to_pydict())
+         for port, table in sorted(result["_outputs"].items(), key=repr)],
+        default=str).encode()).hexdigest()
+    assert (len(compositions), digest, fresh, rows) == RECORDED_CHUNKS[region]
