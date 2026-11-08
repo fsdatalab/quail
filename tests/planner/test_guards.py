@@ -17,6 +17,7 @@ from helpers.sessions import CONFIG, TOKENIZER
 import quail
 from quail.api.config import EngineConfig
 from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.physical import AiClassify, AiFilter
 from quail.physical.plan import Refusal
 
 CASE_RULE = "push_down_case_guards"
@@ -227,4 +228,30 @@ def test_stock_vllm_refuses_an_or_of_a_column_and_an_ai_filter():
     session.close()
     assert isinstance(plan, Refusal)
     assert plan.constraint == "or_filter_needs_quail_backend"
+
+def test_a_guarded_classification_is_priced_on_the_rows_its_guard_passes(sessions):
+    def classified_rows(sql):
+        plan = sessions[0].sql(sql).plan()
+        (node,) = [node for node in plan.nodes if isinstance(node, AiClassify)]
+        return node.spec.expected_rows, plan.estimated_seconds
+
+    guarded = classified_rows(
+        f"SELECT r.id, CASE WHEN r.long THEN {TONE} END AS t FROM reviews r")
+    everything = classified_rows(f"SELECT r.id, {TONE} AS t FROM reviews r")
+    # r.long passes the default 20% of rows
+    assert guarded[0] == pytest.approx(0.2 * everything[0])
+    assert guarded[1] < everything[1]
+
+
+def test_an_ai_filter_in_an_or_is_priced_on_the_rows_where_the_rest_is_not_true(
+        sessions):
+    sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"
+    (guarded,) = [node for node in sessions[0].sql(sql).plan().nodes
+                  if isinstance(node, AiFilter)]
+    unguarded = _session([name for name in LOGICAL_RULES if name != OR_RULE])
+    (everything,) = [node for node in unguarded.sql(sql).plan().nodes
+                     if isinstance(node, AiFilter)]
+    unguarded.close()
+    # r.long IS NOT TRUE passes 1 - 20% of rows
+    assert guarded.expected_rows == pytest.approx(0.8 * everything.expected_rows)
 

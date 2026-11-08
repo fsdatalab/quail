@@ -81,25 +81,14 @@ pub fn prepare_filter_costs(
             (curve.clone(), curve, Some((*call.prompt).clone()))
         } else {
             let question = question_tokens(&context.lowered(&call.prompt)?, model.canvas_tokens)?;
-            (
-                CostCurve::Linear(filter_cost(
-                    question,
-                    mean_tokens,
-                    model,
-                    device,
-                    chunk_tokens,
-                    true,
-                )),
-                CostCurve::Linear(filter_cost(
-                    question,
-                    mean_tokens,
-                    model,
-                    device,
-                    chunk_tokens,
-                    false,
-                )),
-                None,
-            )
+            // a guarded filter asks the model about its guard's rows alone
+            let asked = crate::statistics::predicate_asked_fraction(predicate);
+            let cost = |fresh: bool| {
+                CostCurve::Linear(
+                    asked * filter_cost(question, mean_tokens, model, device, chunk_tokens, fresh),
+                )
+            };
+            (cost(true), cost(false), None)
         };
         prepared.push(PredicateCost {
             selectivity: crate::statistics::row_selectivity(predicate),

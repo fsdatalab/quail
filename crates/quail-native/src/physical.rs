@@ -388,7 +388,7 @@ static KINDS: &[Kind] = &[
         tag: "quail.common.expressions.FilterPredicate",
         node: false,
         fields: fields!(; "expression" = REQUIRED, "selectivity" = NONE, "guard" = NONE,
-            "alternative" = NONE, "answer" = NONE),
+            "alternative" = NONE, "answer" = NONE, "guard_selectivity" = NONE),
     },
     Kind {
         class: "Equality",

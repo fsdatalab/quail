@@ -235,6 +235,9 @@ tagged_struct! {
         /// TRUE or FALSE for a document it asks about, NULL for one its
         /// guard leaves out. None for a predicate that drops rows.
         answer: Option<String>,
+        /// The estimated fraction of documents where the guard is TRUE;
+        /// None without a guard, or for the default selectivity.
+        guard_selectivity: Option<f64>,
     }
 }
 

@@ -33,7 +33,9 @@ use crate::search::{
     ASK, OperatorOrder, StepKey, TableStep, choose_operator_order, column_step_kind, label_calls,
     resident_after,
 };
-use crate::statistics::{arena_capacity, effective_selectivity, pair_counts, row_selectivity};
+use crate::statistics::{
+    arena_capacity, effective_selectivity, pair_counts, predicate_asked_fraction, row_selectivity,
+};
 use crate::validation::{
     columns_above_joins, has_score, is_score, score_projections, validate_query,
 };
@@ -611,7 +613,8 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     question_tokens: question_tokens(&lowered, model.canvas_tokens)?,
                     preamble_tokens: lowered.preamble_token_ids.len() as i64,
                     selectivity: predicate.selectivity,
-                    expected_rows: round_one(surviving),
+                    // a guarded filter asks the model about its guard's rows alone
+                    expected_rows: round_one(surviving * predicate_asked_fraction(&predicate)),
                     question_token_ids: Vec::new(),
                     document_head: lowered.preamble_token_ids.clone(),
                     share_prefixes: false,
@@ -1088,6 +1091,8 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         let context = self.context;
         let model = context.model.name.clone();
         let inputs = std::slice::from_ref(&port);
+        // a guarded operator asks the model about its guard's rows alone
+        let expected_rows = expected_rows * column.asked_fraction();
         if column.call.kind == "label" {
             let table = classify_statistics(context, &column.alias(), &[])?;
             let (spec, work) = table.prepare(

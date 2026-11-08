@@ -896,6 +896,9 @@ struct Relation {
     /// Whether a term the lowering left in place binds, which the
     /// operators cannot read.
     unplaced: bool,
+    /// The answer of each AI filter that keeps every row, and its
+    /// selectivity hint, for the guards that read it.
+    answers: Vec<(String, Option<f64>)>,
 }
 
 /// Whether a term is `a.x = b.y`, an equality of two tables' columns.
@@ -1090,12 +1093,20 @@ impl Relation {
                     "anchor is a join option; a one-provider AI_FILTER takes only selectivity",
                 );
             }
+            let guard_selectivity = node
+                .guard
+                .as_ref()
+                .map(|found| crate::guards::guard_selectivity(found, &self.answers));
+            if let Some(answer) = &answer {
+                self.answers.push((answer.clone(), options.selectivity));
+            }
             let filter = FilterPredicate {
                 expression: predicate,
                 selectivity: options.selectivity,
                 guard,
                 alternative,
                 answer,
+                guard_selectivity,
             };
             push(&mut self.filters, &read[0], filter);
             return Ok(());
@@ -1896,6 +1907,10 @@ impl<'w, 'a> Assembly<'w, 'a> {
                         name,
                         above_joins,
                         guard: guard.clone(),
+                        guard_selectivity: found
+                            .guard
+                            .as_ref()
+                            .map(|found| crate::guards::guard_selectivity(found, &[])),
                         hint_tests: Vec::new(),
                     });
                     let position = self.found.classifies.len() - 1;
@@ -1929,6 +1944,10 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 name,
                 above_joins,
                 guard: guard.clone(),
+                guard_selectivity: node
+                    .guard
+                    .as_ref()
+                    .map(|found| crate::guards::guard_selectivity(found, &[])),
                 hint_tests,
             });
             let position = list.len() - 1;

@@ -34,6 +34,7 @@ use crate::search::{
     ASK, StepKey, StepPricing, default_order_rule, label_calls, order_steps, resident_after,
     table_rule, table_steps,
 };
+use crate::statistics::predicate_asked_fraction;
 
 const FILTER: &str = "AI.IF";
 const CLASSIFY: &str = "AI.CLASSIFY";
@@ -889,15 +890,19 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 let step = &steps[*index];
                 let first = previous.is_none_or(|previous| !resident_after(&steps[previous], step));
                 previous = Some(*index);
-                let (passed, stage_work) = match &step.key {
-                    StepKey::Position(position) => self.ask_stage(
-                        &alias,
-                        &predicates[*position],
-                        *position,
-                        &rows,
-                        first,
-                        &mut stages,
-                    )?,
+                let (passed, stage_work, asked) = match &step.key {
+                    StepKey::Position(position) => {
+                        let predicate = &predicates[*position];
+                        let (passed, work) = self.ask_stage(
+                            &alias,
+                            predicate,
+                            *position,
+                            &rows,
+                            first,
+                            &mut stages,
+                        )?;
+                        (passed, work, predicate_asked_fraction(predicate))
+                    }
                     StepKey::Name(name) => {
                         let column = columns
                             .iter()
@@ -905,7 +910,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                             .expect("a column")
                             .1
                             .clone();
-                        match column.call.kind.as_str() {
+                        let (passed, work) = match column.call.kind.as_str() {
                             "label" => {
                                 self.classify_stage(&alias, &column, &rows, first, &mut stages)?
                             }
@@ -916,11 +921,14 @@ impl<'a, 'c> Estimate<'a, 'c> {
                                 self.features_stage(&alias, &column, &rows, first, &mut stages)?
                             }
                             _ => self.map_stage(&alias, &column, &rows, first, &mut stages)?,
-                        }
+                        };
+                        (passed, work, column.asked_fraction())
                     }
                 };
                 rows = passed;
-                work = &work + &stage_work;
+                // a guarded operator asks the model about an estimated
+                // fraction of its rows, its guard's
+                work = &work + &(&stage_work * asked);
             }
             survivors
                 .iter_mut()

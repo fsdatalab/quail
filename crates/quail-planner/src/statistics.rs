@@ -28,6 +28,24 @@ pub fn row_selectivity(predicate: &quail_physical::FilterPredicate) -> f64 {
     }
 }
 
+/// The fraction of the rows a model node reads that it asks about: the
+/// guard's estimated selectivity, the default selectivity for a guard
+/// without an estimate, and every row without a guard.
+pub fn guarded_fraction(
+    guard: Option<&quail_physical::ValueExpression>,
+    selectivity: Option<f64>,
+) -> f64 {
+    match guard {
+        Some(_) => effective_selectivity(selectivity),
+        None => 1.0,
+    }
+}
+
+/// The fraction of the rows an AI filter reads that it asks about.
+pub fn predicate_asked_fraction(predicate: &quail_physical::FilterPredicate) -> f64 {
+    guarded_fraction(predicate.guard.as_ref(), predicate.guard_selectivity)
+}
+
 /// Expected documents with at least one matching tuple.
 pub fn surviving_documents(num_documents: f64, num_partners: f64, selectivity: Option<f64>) -> f64 {
     let selectivity = effective_selectivity(selectivity);

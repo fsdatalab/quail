@@ -137,6 +137,15 @@ extraction keeps its `CASE`: its answer is a struct of one answer per
 question, and an unasked row would read as a struct of NULL answers
 rather than NULL.
 
+The planner prices a guarded operator on the rows its guard passes: its
+expected rows are the rows it reads times the guard's estimated
+selectivity, in the cost model and in the speed of light estimate. The
+estimate is the one filters use: the default selectivity of 20% for a
+test, or the `selectivity` of an earlier AI.IF whose answer the guard
+reads; `x IS NOT TRUE` passes the rest of `x`'s rows, an AND the product
+of its terms', and an OR the rows any term passes. For example, R7's
+guard `r.flagged IS NOT TRUE` passes an estimated 80% of the rows.
+
 R7 starts from the lowering. `WHERE r.flagged OR AI.IF(...)` is one
 `AiNode` whose filter is `r.flagged OR b`, with the answer `b` in the
 call's place, and which returns none of its added columns; that is

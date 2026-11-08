@@ -129,6 +129,10 @@ pub struct SemanticColumn {
     /// answer is NULL. None asks about every row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<ValueExpression>,
+    /// The estimated fraction of rows where the guard is TRUE; None
+    /// without a guard, or for the default selectivity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_selectivity: Option<f64>,
     /// Tests of the answer the operator may drop rows by, conditions
     /// over the answer column: the `AiNode`'s hint test.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -136,6 +140,11 @@ pub struct SemanticColumn {
 }
 
 impl SemanticColumn {
+    /// The fraction of the rows it reads that the model is asked about.
+    pub fn asked_fraction(&self) -> f64 {
+        crate::statistics::guarded_fraction(self.guard.as_ref(), self.guard_selectivity)
+    }
+
     /// The table alias its answer columns belong to.
     pub fn alias(&self) -> String {
         call_aliases(&self.call)

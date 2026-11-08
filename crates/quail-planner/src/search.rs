@@ -25,7 +25,8 @@ use crate::plan_statistics::{
 };
 use crate::scores::score_join_work;
 use crate::statistics::{
-    DEFAULT_SELECTIVITY, cross_tuples, effective_selectivity, surviving_documents, thin,
+    DEFAULT_SELECTIVITY, cross_tuples, effective_selectivity, predicate_asked_fraction,
+    surviving_documents, thin,
 };
 
 pub const ASK: &str = "ask";
@@ -70,6 +71,8 @@ pub fn column_seconds(
     resident: bool,
     rows: f64,
 ) -> Result<f64, CompileError> {
+    // a guarded operator asks the model about its guard's rows alone
+    let rows = rows * column.asked_fraction();
     if column.call.kind == "label" {
         return classify_seconds(
             context,
@@ -995,7 +998,8 @@ pub fn filter_works(
                 } else {
                     scan(&prefix, &question, model.sliding_window)
                 };
-                total = &total + &(&operation * count);
+                let asked = count * predicate_asked_fraction(&predicates[position]);
+                total = &total + &(&operation * asked);
             }
             count *= step.selectivity;
             previous = Some(step);
