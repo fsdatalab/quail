@@ -795,7 +795,7 @@ def test_map_answers_of_documents_arriving_while_others_decode_equal_greedy(
     batches = [range(4, 9), range(9, 14)]
     arrived = []
 
-    def arrivals(executor, block):
+    def arrivals(executor):
         # a batch arrives once the documents before it are decoding
         if decoder.running().size and batches:
             arrived.append(executor.pass_work["passes"])

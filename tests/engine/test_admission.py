@@ -539,7 +539,7 @@ def _arriving_join(documents, first, setup, arrivals, retain=False):
         else:
             run.arena.free_key(keys[anchor])
 
-    def asked(executor, block):
+    def asked(executor):
         arrivals(executor, lambda batch: executor.add_documents(
             [documents[d] for d in batch], [keys[d] for d in batch]))
 

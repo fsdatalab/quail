@@ -166,32 +166,6 @@ class ArrowTokenDocuments(Sequence):
         return TokenView(values.slice(start, end - start), bounds)
 
 
-class DocumentBatches(Sequence):
-    """Token sequences that arrive in batches, indexed as one sequence."""
-
-    def __init__(self, first=()):
-        self.batches = [first]
-        self.starts = [0]
-        self.total = len(first)
-
-    def add(self, batch):
-        """Append a batch after the sequences so far."""
-        self.batches.append(batch)
-        self.starts.append(self.total)
-        self.total += len(batch)
-
-    def __len__(self):
-        return self.total
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return [self[i] for i in range(*index.indices(len(self)))]
-        if not 0 <= index < self.total:
-            raise IndexError(index)
-        batch = bisect.bisect_right(self.starts, index) - 1
-        return self.batches[batch][index - self.starts[batch]]
-
-
 class TokenLengths(Sequence):
     """Per document token counts, exact from a token store or estimated.
 
@@ -280,24 +254,6 @@ def token_keys(tokens: pa.ChunkedArray) -> pa.ChunkedArray:
     return pa.chunked_array(chunks, pa.large_binary())
 
 
-def first_documents(tokens: pa.ChunkedArray, columns) -> pa.Array:
-    """Each document's first document with its tokens and its row values, as int32.
-
-    The documents are grouped by hashing their token bytes, like a
-    GROUP BY, so no prefix index is built.
-
-    Args:
-        tokens: Each document's token list.
-        columns: Arrow arrays, one value per document; two documents
-            share a first document only if they are equal in each.
-    """
-    if not len(tokens):
-        return pa.array([], pa.int32())
-    groups = group_ids([token_keys(tokens), *columns])
-    _, first, inverse = np.unique(groups, return_index=True, return_inverse=True)
-    return pa.array(first[inverse], pa.int32())
-
-
 class TokenStore(Sequence):
     """Provide random token access from one memory mapped Arrow file."""
 
@@ -363,7 +319,12 @@ class TokenStore(Sequence):
             columns: Arrow arrays, one value per document; two documents
                 share a first document only if they are equal in each.
         """
-        return first_documents(self.arrow_array, columns)
+        if not len(self):
+            return pa.array([], pa.int32())
+        groups = group_ids([token_keys(self.arrow_array), *columns])
+        _, first, inverse = np.unique(groups, return_index=True,
+                                      return_inverse=True)
+        return pa.array(first[inverse], pa.int32())
 
     @property
     def arrow_array(self) -> pa.ChunkedArray:

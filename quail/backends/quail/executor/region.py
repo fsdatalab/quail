@@ -13,17 +13,10 @@ Each chain runs as one StageExecutor over one document table: the
 chain's first operator's documents, under the prompt head the first
 node shows them with, keyed by (alias, document id), with one prefix
 tree over them.
-
-A chain whose first node reads an input as it arrives (see
-quail.execution.arrivals) starts with the documents that have arrived;
-the GPU loop takes the others between forward passes, and the chain
-ends once the input has ended and every document left its stages.
 """
 
-from collections.abc import Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
-from functools import partial
 from itertools import groupby
 from typing import Any
 
@@ -42,7 +35,6 @@ from quail.backends.quail.executor.model_operator import (
 from quail.backends.quail.executor.stages import Stage
 from quail.common.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.answer_stops import answer_stop
-from quail.execution.arrivals import Arrivals
 from quail.execution.finished import (
     finished_rows,
     hinted,
@@ -50,7 +42,6 @@ from quail.execution.finished import (
     hinting,
     report,
 )
-from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
 from quail.execution.rows import Rows
 from quail.physical import AiFilter, AiJoin
@@ -80,10 +71,7 @@ class ChainRun:
         limit: Stop once this many documents passed every operator, or None.
         attention: The attention path the plan chose, or None.
         paged: Whether documents' KV is written to arena pages.
-        stop_keys: The StopKeyGroups numbering each document's stop key
-            group, or None.
-        stop_groups: Per document of the table, its stop key group, or
-            None.
+        stop_groups: Per document, its stop key group, or None.
         num_key_survivors: How many documents of a group must pass.
         skip: Callable(document) -> bool, asked before a document is
             admitted, or None to skip what the region's hint drops.
@@ -93,23 +81,18 @@ class ChainRun:
     limit: int | None = None
     attention: str | None = None
     paged: bool = True
-    stop_keys: Any = None
     stop_groups: Any = None
     num_key_survivors: int = 1
     skip: Any = None
 
 
-def anchor_port(first, inputs) -> str:
-    """The name of the input port whose rows a chain's first operator reads."""
-    alias = first.document_aliases[0]
-    return next((port.name for port in first.inputs
-                 if port.source.port == f"rows:{alias}"),
-                next(iter(inputs[first.node_id])))
-
-
 def pipeline_rows(first, inputs):
     """The rows, or ids, a chain's first operator reads."""
-    return inputs[first.node_id][anchor_port(first, inputs)]
+    alias = first.document_aliases[0]
+    anchor_port = next((port.name for port in first.inputs
+                        if port.source.port == f"rows:{alias}"), None)
+    return (inputs[first.node_id][anchor_port] if anchor_port is not None
+            else next(iter(inputs[first.node_id].values())))
 
 
 def pipeline_ids(first, inputs) -> np.ndarray:
@@ -138,8 +121,6 @@ class RegionExecution:
         self.operators = []
         self.executor = None
         self._ids = None
-        # the input the chain reads as it arrives, or None
-        self.arrivals = None
         # operators whose rows an answer finished since the last chunk
         self._answered = []
 
@@ -181,8 +162,6 @@ class RegionExecution:
         from quail.backends.quail.executor.pipeline import execute_set_pipeline
 
         query = self.query
-        self.nodes, self.inputs, self._ids = tuple(nodes), inputs, None
-        self.arrivals = self._arriving()
         if query is not None:
             query.gpu_timing = bool(self.context.state.get("gpu_timing", False))
             # a set-attention model runs every pipeline as passes over
@@ -190,35 +169,11 @@ class RegionExecution:
             if (query.loaded_model.pipeline.whole_sequences
                     and nodes[0].document_aliases):
                 return execute_set_pipeline(query, nodes, inputs, self.context)
+        self.nodes, self.inputs, self._ids = tuple(nodes), inputs, None
         self.operators = self._chain(self.nodes)
         if not any(operator.stages for operator in self.operators):
             return self._run_answered()
         return self._run_stages()
-
-    def _arriving(self) -> Arrivals | None:
-        """The input the chain reads while its rows arrive, or None.
-
-        A chain whose first node reads an input as it arrives streams
-        when it runs a GPU loop and each of its nodes' operators takes
-        documents while the loop runs. Otherwise the input is read to its
-        end first, and the chain reads every row.
-        """
-        first = self.nodes[0]
-        if not first.document_aliases:
-            return None
-        port = anchor_port(first, self.inputs)
-        source = self.inputs[first.node_id][port]
-        if not isinstance(source, Arrivals):
-            return None
-        types, query = self.model.operator_types, self.query
-        if (query is not None and not query.loaded_model.pipeline.whole_sequences
-                and all(types[node.type_name].streams(node) for node in self.nodes)):
-            self._ids = list(range(len(source)))
-            return source
-        source.wait()
-        self.inputs[first.node_id][port] = Rows(
-            {first.document_aliases[0]: arrow_ids(range(len(source)))})
-        return None
 
     def _chain(self, nodes) -> list:
         """Build the chain's operators, grouping nodes an operator combines."""
@@ -241,8 +196,7 @@ class RegionExecution:
         if own is not None:
             return own
         first = self.nodes[0]
-        # the documents arrived so far, apart from the ids still growing
-        alias, ids = first.document_aliases[0], np.array(self.document_ids())
+        alias, ids = first.document_aliases[0], self.document_ids()
         prefixes = DocumentPrefixes(first.document_head, self.documents[alias], ids)
         return RegionDocuments(prefixes, DocumentKeys(alias, ids),
                                execution_prefix_tree(first, prefixes,
@@ -316,9 +270,7 @@ class RegionExecution:
                     prefixes, keys, tree, state.loaded_model.arena.page_tokens, low)
                 dependencies.update(added)
         pipeline = state.loaded_model.pipeline
-        # a document that arrives later may be too long for one pass,
-        # which needs its KV in pages
-        paged = settings.paged or self.arrivals is not None
+        paged = settings.paged
         if pipeline.whole_sequences:
             if keep_kv:
                 raise ValueError("a set-attention model keeps no document KV")
@@ -333,18 +285,12 @@ class RegionExecution:
             tree = None
         owner = next((operator for operator in operators
                       if getattr(operator, "settles_kv", False)), None)
-        anchor_keys, anchor_prefixes = keys, prefixes
-        if self.arrivals is not None:
-            # documents that arrive join the GPU loop's anchors, so the
-            # callbacks read them from the loop
-            anchor_keys, anchor_prefixes = (_Anchors(self, "keys"),
-                                            _Anchors(self, "prefixes"))
         settled = (owner.settle_kv if owner is not None else settle_documents(
-            state.loaded_model.arena, anchor_keys, anchor_prefixes, keep_kv,
-            state.chunk_tokens, dependencies))
+            state.loaded_model.arena, keys, prefixes, keep_kv, state.chunk_tokens,
+            dependencies))
         decoder = self._decoder(operators, len(prefixes))
         stats = {}
-        skip = settings.skip or hinted_out(anchor_keys)
+        skip = settings.skip or hinted_out(keys)
         self._routes = _Routes(operators)
         self._answered = []
         with ExitStack() as resources:
@@ -369,47 +315,13 @@ class RegionExecution:
                 dependencies=dependencies,
                 knee_rows=getattr(state, "knee_rows", 0),
                 decode_cost=getattr(state, "decode_cost", None),
-                num_key_survivors=settings.num_key_survivors, skip=skip,
-                arrivals=(None if self.arrivals is None
-                          else partial(self._arrive, operators, settings)))
+                num_key_survivors=settings.num_key_survivors, skip=skip)
             operators[0].push(np.arange(len(table.prefixes)))
-            if self.arrivals is None:
-                operators[0].finish_input()
+            operators[0].finish_input()
             every, spans, tokens = self.executor.run()
         for operator in operators[1:]:
             operator.finish_input()
         return close_operators(operators, every, spans, tokens, stats)
-
-    def _arrive(self, operators, settings, executor, block) -> None:
-        """Hand the GPU loop the documents that have arrived.
-
-        Once the input has ended, the loop's input and the first
-        operator's end too.
-
-        Args:
-            operators: The chain's operators, in order.
-            settings: The chain's ChainRun.
-            executor: The StageExecutor.
-            block: Wait until documents arrive or the input ends.
-        """
-        arrived = self.arrivals.arrive(block)
-        if arrived is None:
-            if self.arrivals.ended:
-                executor.input_ended()
-                operators[0].finish_input()
-            return
-        start = len(self._ids)
-        self._ids.extend(arrived.tolist())
-        for operator in operators:
-            operator.add_documents(len(arrived))
-        first = self.nodes[0]
-        alias = first.document_aliases[0]
-        executor.add_documents(
-            DocumentPrefixes(first.document_head, self.documents[alias], arrived),
-            DocumentKeys(alias, arrived),
-            stop_groups=(None if settings.stop_keys is None
-                         else settings.stop_keys.of(arrived)))
-        operators[0].push(np.arange(start, start + len(arrived)))
 
     def _keep_kv(self) -> bool:
         """Whether the chain's last model node retains its documents' KV."""
@@ -489,27 +401,6 @@ class HintGate:
     def decide(self, keys) -> list:
         """Return the keys whose documents the hint keeps."""
         return [key for key in keys if not hinted(key)]
-
-
-class _Anchors(Sequence):
-    """One of the running StageExecutor's per-anchor lists, read on each access.
-
-    Anchors that arrive extend the executor's own lists.
-
-    Args:
-        region: The RegionExecution whose executor holds the list.
-        name: The executor's attribute: "keys" or "prefixes".
-    """
-
-    def __init__(self, region, name: str):
-        self.region = region
-        self.name = name
-
-    def __len__(self):
-        return len(getattr(self.region.executor, self.name))
-
-    def __getitem__(self, index):
-        return getattr(self.region.executor, self.name)[index]
 
 
 class _Routes:

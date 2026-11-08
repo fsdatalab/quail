@@ -99,17 +99,16 @@ def keeps(alias, document: int) -> bool:
     """Whether the model should ask about a document of the alias.
 
     False when the hint, as it is now, rejects the document's row of
-    its table; the hint is read again whenever it has tightened or the
-    table has grown.
+    its table; the hint is read again whenever it has tightened.
     """
     table = _TABLES.get(alias) if isinstance(alias, str) else None
     if table is None:
         return True
     generation = _HINT.generation()
     found = _KEEP.get(table)
-    if found is None or found[0] != generation or document >= len(found[1]):
+    if found is None or found[0] != generation:
         found = _KEEP[table] = (generation, _HINT.keep(table))
-    return document >= len(found[1]) or bool(found[1][document])
+    return bool(found[1][document])
 
 
 def hinting() -> bool:

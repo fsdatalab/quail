@@ -22,7 +22,6 @@ from quail.backends.quail.executor.stages import Stage, frame_writes
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.common.expressions import effective_selectivity
 from quail.common.tokens import prefix_tree
-from quail.execution.arrivals import Arrivals
 from quail.physical import AiFilter, AiJoin, Filter, ValueType
 from quail.progress import logger
 
@@ -64,8 +63,7 @@ def prior_inputs(node, operators, inputs):
         if port.value_type is ValueType.ROWS:
             if port.source.node_id in by_node:
                 priors.append((by_node[port.source.node_id], port.source))
-            elif not isinstance(inputs[port.name], Arrivals):
-                # an input read as it arrives is a scan's rows: ids alone
+            else:
                 prior_tables.append(inputs[port.name])
     return priors, prior_tables
 
@@ -113,22 +111,6 @@ class ModelOperator(ABC):
     answer_dependencies = ()
     # the documents pushed into the operator so far
     pushed = 0
-
-    @classmethod
-    def streams(cls, node) -> bool:
-        """Whether the operator for node takes documents while the GPU loop runs.
-
-        A chain streams an input as it arrives only when each of its
-        operators does; add_documents then makes room for each batch.
-        """
-        return False
-
-    def add_documents(self, count: int) -> None:
-        """Make room for count more documents of the region's table.
-
-        The region's document ids, which the operator holds, have grown
-        by count already; the documents are pushed after.
-        """
 
     @classmethod
     def build(cls, region, nodes, chain):

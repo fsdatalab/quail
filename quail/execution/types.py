@@ -12,7 +12,6 @@ import pyarrow.compute as pc
 
 from quail.common.pairs import COLUMNS_PREFIX
 from quail.common.tokens import decode_token_documents
-from quail.execution.arrivals import Arrivals
 from quail.execution.result import answer_table
 from quail.execution.rows import Rows, rows_of
 from quail.physical import (
@@ -77,14 +76,11 @@ class PhysicalRequest:
                 raise ValueError(
                     f"execution relations are keyed {COLUMNS_PREFIX}<alias>, "
                     f"got {key!r}")
-            if not isinstance(value, (pa.Table, Arrivals)):
+            if not isinstance(value, pa.Table):
                 raise TypeError("execution relations must be Arrow tables")
 
     def column_tables(self) -> dict[str, pa.Table]:
-        """Return the value tables of the scans, by alias.
-
-        An input read as it arrives has its Arrivals as its table.
-        """
+        """Return the value tables of the scans, by alias."""
         return {key[len(COLUMNS_PREFIX):]: table
                 for key, table in self.relations.items()
                 if key.startswith(COLUMNS_PREFIX)}

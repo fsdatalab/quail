@@ -269,15 +269,6 @@ class ClassifyStages:
                 read_all_rows=False, single=True, append=True,
                 label=f"{spec.name} round {round}"))
 
-    def add_documents(self, count: int) -> None:
-        """Track count more documents, which arrived while the stages run."""
-        self.labels = np.concatenate((self.labels, np.full(count, None, dtype=object)))
-        if self.probabilities is not None:
-            self.probabilities = np.concatenate((self.probabilities, np.full(
-                (count, self.probabilities.shape[1]), np.nan)))
-        if self.decoder is not None:
-            self.decoder.add_documents(count)
-
     def _joined_stages(self, state: QueryExecutionState, spec, count, partners):
         """Initialize one classification stage over the pairs retained by a join."""
         if spec.scoring != "letters":

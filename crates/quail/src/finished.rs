@@ -18,9 +18,7 @@ use arrow::array::{
     Array, ArrayRef, AsArray, DictionaryArray, Int32Array, RecordBatch, RecordBatchOptions,
     StringArray, StructArray, new_null_array,
 };
-use arrow::compute::{
-    SortColumn, cast, concat, concat_batches, interleave, lexsort_to_indices, take,
-};
+use arrow::compute::{SortColumn, cast, concat_batches, interleave, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use quail_planner::expressions::{
     PROBABILITIES_SUFFIX, asked_call, call_aliases, column_references,
@@ -465,52 +463,6 @@ impl FinishedRows {
                 continue;
             }
             found.extend(self.take_rows(relation, batch)?);
-        }
-        self.build(found)
-    }
-
-    /// Take `count` more documents of `alias`, numbered after the ones
-    /// before, with each source column's values for them in `sources`;
-    /// return the region rows they complete, with the rows complete
-    /// before any report, or None when there are none.
-    ///
-    /// A table no operator drops gains them as surviving documents.
-    ///
-    /// # Errors
-    ///
-    /// A source column of the alias has no values in `sources`, or the
-    /// rows' columns do not build.
-    pub fn add_documents(
-        &mut self,
-        alias: &str,
-        count: usize,
-        sources: &HashMap<String, ArrayRef>,
-    ) -> Result<Option<RecordBatch>, Error> {
-        let Some(position) = self.aliases.iter().position(|found| found == alias) else {
-            return Ok(None);
-        };
-        for column in &mut self.columns {
-            if let Column::Source(name, read, values) = column
-                && *read == position
-            {
-                let added = sources
-                    .get(name)
-                    .ok_or_else(|| format!("the column {name} has no source"))?;
-                *values = concat(&[values.as_ref(), added.as_ref()]).map_err(arrow_error)?;
-            }
-        }
-        let mut found = std::mem::take(&mut self.pending);
-        for relation in 0..self.relations.len() {
-            if !self.relations[relation].known || self.relations[relation].aliases != [position] {
-                continue;
-            }
-            let start = self.relations[relation].keys.len();
-            for document in start..start + count {
-                if self.relations[relation].insert(vec![document as i32], (0, 0)) {
-                    let row = self.relations[relation].keys.len() - 1;
-                    found.extend(self.joined(relation, row));
-                }
-            }
         }
         self.build(found)
     }

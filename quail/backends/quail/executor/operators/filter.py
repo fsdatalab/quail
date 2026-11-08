@@ -35,10 +35,6 @@ class FilterOperator(SingleNodeOperator):
                    len(query.loaded_model.pipeline.canvas_ids))
 
     @classmethod
-    def streams(cls, node) -> bool:
-        return True
-
-    @classmethod
     def alone(cls, region, operators, table, settings):
         """Filters alone keep each stop key group's documents apart.
 
@@ -48,14 +44,13 @@ class FilterOperator(SingleNodeOperator):
         from quail.backends.quail.executor.region import pipeline_rows
 
         node = operators[0].node
-        keys = stop_keys(region.context.state, node)
         return replace(
             settings, label=f"filter ({len(operators)} predicates)",
             attention=node.attention or "unified",
             paged=node.arena_writes or len(operators) > 1,
-            stop_keys=keys,
-            stop_groups=None if keys is None else keys.of(
-                region.document_ids(), copies_of(pipeline_rows(node, region.inputs))),
+            stop_groups=filter_stop_groups(
+                region.context.state, node,
+                pipeline_rows(node, region.inputs)),
             num_key_survivors=node.num_key_survivors)
 
     def __init__(self, node, ids, async_answers, canvas_tokens=0):
@@ -127,10 +122,6 @@ class ConditionGate(SingleNodeOperator):
     stages = ()
 
     @classmethod
-    def streams(cls, node) -> bool:
-        return True
-
-    @classmethod
     def build(cls, region, nodes, chain):
         """Bind a condition to the operators computing its columns and the table."""
         node = nodes[0]
@@ -156,9 +147,10 @@ class ConditionGate(SingleNodeOperator):
         self.producers = producers  # column -> the operator computing it
         self.source = source  # the operator whose rows the Filter reads
         self.columns = columns  # the table's source columns, by document
-        # id(operator) -> document id -> its index among the operator's
-        # documents, extended as documents arrive
-        self.positions = {id(operator): {} for operator in producers.values()}
+        self.positions = {
+            id(operator): {document: index
+                           for index, document in enumerate(operator.ids)}
+            for operator in producers.values()}
         self.accepted = {}
         self.decided = {}  # key -> kept, from decide, until gate asks
 
@@ -175,8 +167,6 @@ class ConditionGate(SingleNodeOperator):
         operator = self.producers.get(name)
         if operator is not None:
             positions = self.positions[id(operator)]
-            for index in range(len(positions), len(operator.ids)):
-                positions[operator.ids[index]] = index
             return operator.tested_values(name, [positions[document]
                                                  for document in documents])
         if self.columns is None or name not in self.columns.column_names:
@@ -315,13 +305,12 @@ def filter_result(node, answers, tokens, document_ids,
 
 
 class StopKeyGroups:
-    """Number each document's stop key group, batch by batch.
+    """Number each document's stop key group.
 
     Documents with equal values in an AI filter's ``stop_key`` columns
     share a group number; the scheduler reads one document of a group at
     a time and skips the rest once the node's num_key_survivors survive.
-    A number, once given, stays the same for the documents that arrive
-    later.
+    A number, once given, stays the same for later calls.
 
     Args:
         node: The AiFilter, with a stop key.
@@ -367,12 +356,6 @@ class StopKeyGroups:
         return [self.numbers.setdefault(key, len(self.numbers)) for key in keys]
 
 
-def copies_of(rows):
-    """The documents each row stands for, deduplicated Rows' COPIES column, or None."""
-    return (rows.column(COPIES) if isinstance(rows, Rows)
-            and COPIES in rows.column_names else None)
-
-
 def stop_keys(state, node) -> StopKeyGroups | None:
     """The stop key groups of an AI filter, or None without a stop key.
 
@@ -395,4 +378,8 @@ def filter_stop_groups(state, node, rows) -> list | None:
             carry a COPIES column for a stop key.
     """
     keys = stop_keys(state, node)
-    return None if keys is None else keys.of(id_positions(rows), copies_of(rows))
+    if keys is None:
+        return None
+    copies = (rows.column(COPIES) if isinstance(rows, Rows)
+              and COPIES in rows.column_names else None)
+    return keys.of(id_positions(rows), copies)
