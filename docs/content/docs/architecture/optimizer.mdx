@@ -127,7 +127,7 @@ region.
 | `eliminate_distinct` | Logical | Remove DISTINCT when the SELECT list returns every table's id column. | No |
 | `place_ai_nodes` | Logical | Move each model operator to the tables it reads and order each table's operators. | No |
 | `absorb_into_ai_nodes` | Logical | Make each test of an answer column the filter of the `AiNode` that adds it, when the node has no fetch (R2). | No |
-| `merge_repeated_ai_calls` | Logical | Make an AI operator read the answer of the same call below it, so the model answers the call once (R17). | No |
+| `merge_repeated_ai_calls` | Logical | Make an AI operator read the answer of the same call below it, also across a derived table or CTE, so the model answers the call once (R17). | No |
 | `push_down_distinct` | Logical | Give the AI operator under a DISTINCT a fetch of one row per selected key: input columns, or a classification's label (R12). | No |
 | `push_down_limit_into_ai_nodes` | Logical | Make a LIMIT, with its OFFSET, the fetch of the AI operator whose rows it reads, through projections, when the node has no `HINT` (R9, R10). | No |
 | `push_down_projection_into_ai_nodes` | Logical | Make an AI operator return only its answer and the added columns the SELECT list above it reads, such as an extraction's spans, and an extraction ask only the fields the query reads (R5). | No |

@@ -73,3 +73,17 @@ def test_a_classification_in_select_and_where_labels_each_row_once(sessions):
         rows, num_questions = _rows_and_questions(session, sql)
         assert rows == [("r0", "a"), ("r2", "a"), ("r4", "a")]
         assert num_questions == 6
+
+
+def test_a_classification_in_a_derived_table_and_outside_it_labels_each_row_once(
+        sessions):
+    sql = (f"SELECT d.id, d.t, {TONE.replace('r.body', 'd.body')} AS u FROM "
+           f"(SELECT r.id, r.body, {TONE} AS t FROM reviews r) d")
+    assert sessions[0].sql(sql).logical.count("AiNode") == 1
+    # without the rule, the derived table is a model region of its own
+    assert len(sessions[1].sql(sql).regions()) == 2
+    on, off = (_rows_and_questions(session, sql) for session in sessions)
+    assert on[0] == off[0] == [(f"r{index}", label, label) for index, label in
+                               enumerate("ababab")]
+    # without the rule, the outer call labels every row again
+    assert (on[1], off[1]) == (6, 12)
