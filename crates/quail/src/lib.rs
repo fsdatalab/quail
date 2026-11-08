@@ -18,6 +18,7 @@
 //! ```
 
 mod engine;
+pub mod finished;
 pub mod planning;
 pub mod pyarrow;
 pub mod results;

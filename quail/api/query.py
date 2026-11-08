@@ -16,10 +16,11 @@ from quail.api.region_inputs import input_scans
 from quail.common.expressions import CompileError
 from quail.common.pairs import FIRST_DOCUMENT, columns_key
 from quail.common.tokens import ColumnStore, ScanInput, TokenStore
+from quail.execution.finished import finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
 from quail.execution.result import QueryResult
 from quail.execution.rows import as_table
-from quail.execution.streaming import RegionStream
+from quail.execution.runner import compute_subgraph
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
 from quail.physical import Limit, Scan, decode_plan_value
@@ -523,16 +524,43 @@ class RegionQuery:
             tables[columns_key(alias)] = pa.table(values)
         return tables
 
-    def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
-        """Build the region's rows from the run's outputs, with its report."""
+    def finished_rows(self, on_rows=None):
+        """Return the FinishedRows that builds the region's rows from its run.
+
+        Args:
+            on_rows: Optional callable(pyarrow Table) handed each batch
+                of rows as it is built, each row once.
+        """
+        request = self._answer_request(self.plan(), returned=True)
+        return _quail_native.FinishedRows(json.dumps(request), self._source_values,
+                                          on_rows)
+
+    def finish(self, response, coordinator_wall: float = 0.0,
+               finished=None) -> QueryResult:
+        """Build the region's rows from the run's outputs, with its report.
+
+        Args:
+            response: The run's PhysicalResponse.
+            coordinator_wall: Seconds the run took, as the caller saw it.
+            finished: The FinishedRows the run reported to, or None for
+                a new one. Every returned output is reported to it, so it
+                builds each row the run's operators did not report.
+        """
         plan = self.plan()
         out = response.metrics
         report = json.loads(_quail_native.execution_report(
             plan.backend, plan.estimated_seconds, plan.settings.get("order_rule"),
             json.dumps(out, default=str), coordinator_wall))
         tables = _output_tables(response.outputs)
-        rows = _quail_native.region_rows(
-            json.dumps(self._answer_request(plan)), tables, self._source_values)
+        if finished is None:
+            finished = self.finished_rows()
+        for node in plan.graph.topological_nodes():
+            for output in node.outputs:
+                table = tables.get((node.node_id, output.name))
+                if table is not None and finished.wants(node.node_id, output.name):
+                    finished.report(finished_table(node.node_id, output.name, table))
+        finished.finish()
+        rows = finished.rows()
         result = QueryResult.from_table(rows, report=report)
         result.plan = plan.graph
         measured = dict(out.get("node_metrics", {}))
@@ -559,31 +587,6 @@ class RegionQuery:
         self._collect_answers(result, plan, tables)
         return result
 
-    def region_stream(self, on_rows, hint=None) -> RegionStream | None:
-        """Return the stream that hands ``on_rows`` the region's rows as they finish.
-
-        None for a region with a fetch: Rust keeps its first rows once
-        every row is in.
-
-        Args:
-            on_rows: Callable(pyarrow Table) handed each batch of rows.
-            hint: Rust's ``InputHint`` over the region's one input, which
-                the executor skips the input's rows by, or None.
-        """
-        if json.loads(self.operators).get("fetch") is not None:
-            return None
-        request = json.dumps(self._answer_request(self.plan()))
-
-        def send(tables):
-            rows = _quail_native.region_rows(request, tables, self._source_values)
-            if rows.num_rows:
-                on_rows(rows)
-
-        alias = None if hint is None else next(
-            (scan["alias"] for scan in self.facts()["scans"]
-             if scan["provider"] == hint.table), None)
-        return RegionStream(send, hint, alias)
-
     def _source_values(self, name: str, expression: str) -> pa.Table:
         """Return a source column's values for each document of its table.
 
@@ -602,18 +605,30 @@ class RegionQuery:
                     f"the column {name!r} was not loaded by the scan of {alias!r}")
         return pa.table({name: source.evaluate(store)})
 
-    def _answer_request(self, plan) -> dict:
+    def _answer_request(self, plan, returned: bool = False) -> dict:
         """Return what Rust reads besides the output relations.
 
         The operators, every output port, and each scan's documents.
+
+        Args:
+            plan: The physical plan.
+            returned: List only the ports of the nodes the run returns:
+                the model nodes and the inputs they read.
         """
+        nodes = plan.graph.topological_nodes()
+        if returned:
+            try:
+                kept = {node.node_id for node in compute_subgraph(plan.graph).nodes}
+            except ValueError:
+                kept = set()
+            nodes = [node for node in nodes if node.node_id in kept]
         ports = [
             {"node_type": node.type_name, "node": node.node_id,
              "port": output.name, "value_type": output.value_type.value,
              "answer": None if output.answer is None else {
                  "kind": output.answer.kind, "name": output.answer.name,
                  "columns": list(output.answer.columns)}}
-            for node in plan.graph.topological_nodes() for output in node.outputs]
+            for node in nodes for output in node.outputs]
         source_rows = {alias: rows.to_pylist()
                        for alias, rows in self._alias_source_rows().items()}
         return {

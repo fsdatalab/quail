@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 
 import numpy as np
+import pyarrow as pa
 
 from quail.backends.quail.executor.model_operator import (
     ModelOperator,
@@ -32,6 +33,7 @@ from quail.common.tokens import (
     concat_tokens,
     select_documents,
 )
+from quail.execution.finished import finished_rows, finished_table
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
@@ -93,6 +95,7 @@ class JoinOperator(ModelOperator):
         self.settled = np.zeros(len(ids), dtype=bool)
         self.final_rows = [None] * len(ids)
         self.readers = []
+        self.finished = []      # finished rows since the last take
         lists_for = inputs.get("anchor_partners")
         self.stages = [
             Stage(suffixes=suffixes, readout=state.async_answers, frame=frame,
@@ -119,6 +122,28 @@ class JoinOperator(ModelOperator):
         if index == len(self.stages) - 1:
             self.final_rows[anchor] = row
         return bool(any(row))
+
+    def answered(self, anchor, stage, start, end, answers):
+        """Record the pairs one group of an anchor's partners answered true.
+
+        A pair is settled once answered: a true one is a row of the
+        join's answers, and its anchor survives a join that keeps
+        matched anchors.
+        """
+        node = self.nodes[stage]
+        anchor_id = int(self.inputs["anchor_keys"][anchor][1])
+        lists_for = self.inputs.get("anchor_partners")
+        members = None if lists_for is None else lists_for(anchor_id, stage)
+        tuples = self.inputs["partner_indices"][node.written_position]
+        matched = [tuples[start + position if members is None
+                          else int(members[start + position])]
+                   for position, answer in enumerate(answers) if answer]
+        self.finished.extend(settled_pairs(node, anchor_id, matched))
+        return bool(matched)
+
+    def take_finished(self):
+        finished, self.finished = self.finished, []
+        return finished
 
     def settle_kv(self, anchor, survived, row):
         """Settle anchor KV using join answers after all readers finish."""
@@ -217,6 +242,34 @@ class JoinOperator(ModelOperator):
     def results(self) -> dict:
         """Return results for every join predicate in the group."""
         return self._results
+
+
+def settled_pairs(node, anchor_id, partner_tuples) -> list:
+    """The finished rows of an anchor's pairs a join answered true.
+
+    Args:
+        node: The AiJoin.
+        anchor_id: The anchor's document id.
+        partner_tuples: Each true pair's partner ids, one per partner alias.
+
+    Returns:
+        The pairs as rows of the join's answers, and, for a join that
+        keeps matched anchors, the anchor as a row of its rows port.
+    """
+    if not partner_tuples or finished_rows() is None:
+        return []
+    count = len(partner_tuples)
+    columns = {node.anchor: pa.array([anchor_id] * count, pa.int32())}
+    for index, alias in enumerate(node.partners):
+        columns[alias] = pa.array([int(found[index]) for found in partner_tuples],
+                                  pa.int32())
+    columns["answer"] = pa.array([True] * count)
+    tables = [finished_table(node.node_id, f"join_answers:{node.written_position}",
+                             pa.table(columns))]
+    if node.semantics != "anti":
+        tables.append(finished_table(node.node_id, f"rows:{node.anchor}", Rows(
+            {node.anchor: np.asarray([anchor_id], dtype=np.int32)}).table()))
+    return tables
 
 
 @dataclass(frozen=True)

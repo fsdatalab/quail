@@ -975,7 +975,8 @@ class StageExecutor:
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)
             if self.counting_answers else self.finished)
-        if transitions and self.on_chunk is not None:
+        # with on_answers, answers may finish rows before any document moves
+        if (transitions or self.on_answers is not None) and self.on_chunk is not None:
             self.on_chunk(transitions)
         self._release_skipped()
 
@@ -1019,7 +1020,8 @@ class StageExecutor:
         for entry in waiting:
             transitions.extend(self._record(*entry))
         self._decide_waiting()
-        if transitions and self.on_chunk is not None:
+        # with on_answers, answers may finish rows before any document moves
+        if (transitions or self.on_answers is not None) and self.on_chunk is not None:
             self.on_chunk(transitions)
 
     def _decide_waiting(self):

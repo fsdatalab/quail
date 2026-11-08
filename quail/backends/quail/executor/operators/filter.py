@@ -11,13 +11,13 @@ from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.common.expressions import accepts
 from quail.common.pairs import COPIES, columns_key
 from quail.common.selection import group_ids
+from quail.execution.finished import finished_rows, finished_table
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import filter_answer_table
 from quail.execution.rows import Rows
 from quail.execution.runtimes.filter import filter_scores, tested_table
-from quail.execution.streaming import region_stream
 from quail.progress import answer_sink
 
 
@@ -75,12 +75,12 @@ class FilterOperator(SingleNodeOperator):
         self.finished.append((document, survived))
 
     def take_finished(self):
-        """Report the settled documents to the answer sink and the stream.
+        """Report the settled documents to the answer sink; return the passed.
 
         The sink receives ``{"kind": "filter", "node", "alias", "stages",
         "documents"}``, where ``documents`` lists ``[document id, stage,
-        passed]`` per document; the stream, when the filter is the
-        region's last operator, the documents' rows.
+        passed]`` per document. The documents that passed are the rows
+        of the filter's rows port.
         """
         finished, self.finished = self.finished, []
         sink = answer_sink()
@@ -89,12 +89,9 @@ class FilterOperator(SingleNodeOperator):
                   "alias": self.node.alias, "stages": 1,
                   "documents": [[int(self.ids[document]), 0, passed]
                                 for document, passed in finished]})
-        stream = region_stream()
-        if not finished or stream is None or not stream.wants(self.node):
-            return None
-        return filter_result(
-            self.node, {document: [int(passed)] for document, passed in finished},
-            0, self.ids).outputs
+        passed = [document for document, survived in finished if survived]
+        return passed_rows(self.node, self.node.alias,
+                           [self.ids[document] for document in passed])
 
     def read_answers(self, every) -> int | None:
         """Record filter answers and leave token accounting to the region."""
@@ -138,10 +135,14 @@ class ConditionGate(SingleNodeOperator):
                       if any(member.node_id == source_id
                              for member in operator.nodes))
         return cls(node, producers, source,
-                   region.context.sources.get(columns_key(node.aliases[0])))
+                   region.context.sources.get(columns_key(node.aliases[0])),
+                   region.document_ids)
 
-    def __init__(self, node, producers, source, columns):
+    def __init__(self, node, producers, source, columns, document_ids=None):
         self.node = node
+        # Callable() -> the region's document ids, by position
+        self.document_ids = document_ids
+        self.finished = []  # documents that passed since the last take
         self.producers = producers  # column -> the operator computing it
         self.source = source  # the operator whose rows the Filter reads
         self.columns = columns  # the table's source columns, by document
@@ -207,6 +208,19 @@ class ConditionGate(SingleNodeOperator):
                 accepts(self.node.predicate, pa.table(values))[0].as_py())
         return None if self.accepted[token] else Stage.DROP
 
+    def settle(self, document, survived, row):
+        if survived:
+            self.finished.append(document)
+
+    def take_finished(self):
+        """Return the documents that passed the condition as its last stage."""
+        finished, self.finished = self.finished, []
+        if not finished or self.document_ids is None:
+            return []
+        ids = self.document_ids()
+        return passed_rows(self.node, self.node.aliases[0],
+                           [ids[document] for document in finished])
+
     def read_answers(self, every):
         return None
 
@@ -226,6 +240,14 @@ def _hashable(value):
     if isinstance(value, list):
         return tuple(_hashable(item) for item in value)
     return value
+
+
+def passed_rows(node, alias, document_ids) -> list:
+    """The finished rows of documents that passed a filter, by their ids."""
+    if not len(document_ids) or finished_rows() is None:
+        return []
+    ids = arrow_ids(np.sort(np.asarray(document_ids, dtype=np.int64)))
+    return [finished_table(node.node_id, f"rows:{alias}", Rows({alias: ids}).table())]
 
 
 def filter_result(node, answers, tokens, document_ids,

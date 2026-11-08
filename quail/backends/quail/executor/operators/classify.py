@@ -1,5 +1,7 @@
 """Classify documents, or the pairs a join kept, and build their label rows."""
 
+from dataclasses import replace
+
 import numpy as np
 import pyarrow as pa
 
@@ -19,6 +21,7 @@ from quail.backends.quail.reranker import (
 )
 from quail.common.expressions import PROBABILITIES_SUFFIX
 from quail.common.selection import document_positions
+from quail.execution.finished import finished_rows, finished_table, hinted_out
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.progress import answer_sink
 
@@ -85,6 +88,17 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         join.add_reader(operator.kept)
         return operator
 
+    @classmethod
+    def alone(cls, region, operators, table, settings):
+        """A classification of documents alone skips what the region's hint drops.
+
+        A skipped document gets no label, so it has no row.
+        """
+        (operator,) = operators
+        if operator.plan.partners is not None:
+            return settings
+        return replace(settings, skip=hinted_out(table.keys))
+
     def __init__(self, node, ids, plan: ClassifyStages, priors=(), kept=None,
                  prior_tables=()):
         self.node = node
@@ -96,15 +110,44 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         self.kept = kept
         self.finished = []      # documents settled since the last take
         self.sent = set()       # documents whose labels went to the sink
+        self.reported = set()   # documents whose label rows were taken
 
     def settle(self, document, survived, row):
         self.finished.append(document)
 
     def take_finished(self):
-        """Send the settled documents' labels to the answer sink."""
+        """Send the settled documents' labels to the answer sink; return their rows.
+
+        A settled document's label is final once it has one; a document
+        whose answer names no label has no row.
+        """
         finished, self.finished = self.finished, []
-        self._send(sorted(set(finished)))
-        return None
+        documents = sorted(set(finished))
+        self._send(documents)
+        if self.plan.partners is not None or finished_rows() is None:
+            return []
+        ready = [document for document in documents
+                 if document not in self.reported
+                 and self.plan.labels[document] is not None]
+        if not ready:
+            return []
+        self.reported.update(ready)
+        return [finished_table(self.node.node_id, self.node.rows_port,
+                               self._label_rows(ready).table())]
+
+    def _label_rows(self, documents):
+        """The label rows of documents that have a label, with probabilities."""
+        spec, plan = self.node.spec, self.plan
+        rows = np.asarray([[self.ids[index]] for index in documents],
+                          dtype=np.int32).reshape(-1, 1)
+        scored = score_rows(rows, spec.aliases, spec.name,
+                            [plan.labels[index] for index in documents],
+                            pa.string())
+        if plan.probabilities is not None:
+            scored = scored.with_column(
+                spec.name + PROBABILITIES_SUFFIX,
+                probability_column(spec.labels, plan.probabilities[documents]))
+        return scored
 
     def _send(self, documents) -> None:
         """Send the labels of documents that have one and were not sent."""
@@ -157,16 +200,7 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         # a document whose answer named no label has no row
         labeled = [index for index, label in enumerate(plan.labels)
                    if label is not None]
-        rows = np.asarray([[self.ids[index]] for index in labeled],
-                          dtype=np.int32).reshape(-1, 1)
-        scored = score_rows(rows, spec.aliases, spec.name,
-                           [plan.labels[index] for index in labeled],
-                           pa.string())
-        if plan.probabilities is not None:
-            scored = scored.with_column(
-                spec.name + PROBABILITIES_SUFFIX,
-                probability_column(spec.labels, plan.probabilities[labeled]))
-        scored = join_prior_rows(scored, spec.aliases[0],
+        scored = join_prior_rows(self._label_rows(labeled), spec.aliases[0],
                                  self.priors, self.prior_tables)
         return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),

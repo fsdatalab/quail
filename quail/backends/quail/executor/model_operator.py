@@ -167,14 +167,31 @@ class ModelOperator(ABC):
             row: Its answer row at the operator's last stage it reached.
         """
 
-    def take_finished(self) -> dict | None:
-        """Return the outputs of the documents settled since the last call.
+    def answered(self, anchor, stage, start, end, answers) -> bool:
+        """Take the answers one group of an anchor's requests got.
 
-        The outputs are the node's port values for those documents
-        alone, so a region can send rows on while it runs; None when
-        the operator sends none.
+        Args:
+            anchor: The anchor's position in the region's table.
+            stage: The index of the stage among the operator's stages.
+            start: The first request of the group.
+            end: The request after its last.
+            answers: The group's answers, one per request.
+
+        Returns:
+            Whether the answers finished rows that take_finished returns.
         """
-        return None
+        return False
+
+    def take_finished(self) -> list:
+        """Return the rows the operator finished since the last call.
+
+        Each is a table finished_table tagged with the node and port
+        that wrote it: a node's ids, one column per alias, or a join's
+        anchor and partner ids, and the answer columns of those rows.
+        Empty when the operator finished none, or reports its rows only
+        with its result.
+        """
+        return []
 
     def finish_input(self) -> None:
         """Record that no more documents will be pushed."""

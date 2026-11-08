@@ -125,6 +125,13 @@ class ExtractOperator(MapOperator):
         decoder.configure_copy(self.first, self.slots, self.extraction,
                                [node.spec for node in self.nodes])
 
+    def answer_rows(self, q, positions):
+        """The Rows of field q's answers and spans over documents, by position."""
+        spec = self.nodes[q].spec
+        values, spans = self.answers(q, positions)
+        return extraction_rows(spec.alias, spec.name, spec.span_name,
+                               self.ids[positions], values, spans)
+
     def answers(self, q, kept=None):
         slots = self.slots[q] if kept is None else self.slots[q, kept]
         return self.decoder.output_answers(self.first + q, slots)

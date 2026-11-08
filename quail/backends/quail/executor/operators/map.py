@@ -23,6 +23,7 @@ from quail.backends.quail.executor.model_operator import (
 )
 from quail.backends.quail.executor.stages import Stage, StageRequests
 from quail.common.tokens import DocumentPrefixes, PrefixTree
+from quail.execution.finished import finished_rows, finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
 
@@ -77,6 +78,7 @@ class MapOperator(ColumnOperator, ModelOperator):
         self.asked = [np.zeros(len(self.ids), dtype=bool) for _ in self.nodes]
         self.slots = np.arange(len(self.ids), dtype=np.int64)[None, :]
         self._results = {}
+        self.finished = []      # (map, document) answers ended since the last take
         tails = []
         for node in self.nodes:
             head, tail = node.spec.prompt_token_parts
@@ -166,6 +168,33 @@ class MapOperator(ColumnOperator, ModelOperator):
     def expected_answer_tokens(self) -> tuple:
         return tuple(node.spec.expected_answer_tokens for node in self.nodes)
 
+    def settle(self, document, survived, row):
+        """Record that a branch's answer ended: one map's answer for a document."""
+        q, position = self.branch_of.get(document, (None, None))
+        if q is not None and self.asked[q][position]:
+            self.finished.append((q, position))
+
+    def take_finished(self):
+        """Return each map's rows whose answers ended since the last call."""
+        finished, self.finished = self.finished, []
+        if not finished or finished_rows() is None:
+            return []
+        tables = []
+        for q in sorted({q for q, _ in finished}):
+            node = self.nodes[q]
+            positions = sorted(position for found, position in finished if found == q)
+            tables.append(finished_table(node.node_id, node.rows_port,
+                                         self.answer_rows(q, positions).table()))
+        return tables
+
+    def answer_rows(self, q, positions):
+        """The Rows of map q's answers over documents, by position."""
+        spec = self.nodes[q].spec
+        (values,) = self.column_values(q, positions)
+        (alias,) = spec.aliases
+        return Rows({alias: self.ids[positions].astype(np.int32)},
+                    pa.table({spec.name: values}))
+
     def read_answers(self, every) -> int:
         """Return the tokens the maps fed: their tails and their decode rows."""
         tails = sum(int(asked.sum()) * len(node.spec.prompt_token_parts[1])
@@ -187,11 +216,8 @@ class MapOperator(ColumnOperator, ModelOperator):
             spec = node.spec
             asked = np.flatnonzero(self.asked[q])
             tokens = self.decoder.answers(self.first + q, self._slots(q, asked))
-            (values,) = self.column_values(q, asked)
-            (alias,) = spec.aliases
-            rows = Rows({alias: self.ids[asked].astype(np.int32)},
-                        pa.table({spec.name: values}))
-            rows = join_prior_rows(rows, alias, self.priors, self.prior_tables)
+            rows = join_prior_rows(self.answer_rows(q, asked), spec.aliases[0],
+                                   self.priors, self.prior_tables)
             selected = stage_spans(spans, offset, offset + 1)
             fresh_tokens = fresh - sum(own[1:]) if q == 0 else own[q]
             tail = len(spec.prompt_token_parts[1])
@@ -265,6 +291,20 @@ class AnswerBranches(MapOperator):
                          [node for operator in operators for node in operator.nodes],
                          first.ids, first.first)
         self.asked = [asked for operator in operators for asked in operator.asked]
+
+    def settle(self, document, survived, row):
+        """Record a branch's ended answer in the operator whose map it is."""
+        q, position = self.branch_of.get(document, (None, None))
+        if q is None or not self.asked[q][position]:
+            return
+        for operator in self.operators:
+            start = operator.first - self.first
+            if start <= q < start + len(operator.nodes):
+                operator.finished.append((q - start, position))
+
+    def take_finished(self):
+        return [table for operator in self.operators
+                for table in operator.take_finished()]
 
     def branch_inputs(self, prefixes, keys, tree, page_tokens, stage):
         result = super().branch_inputs(prefixes, keys, tree, page_tokens, stage)

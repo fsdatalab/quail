@@ -3,10 +3,12 @@
 The oracle stands in for the GPU. Its ModelOperators run in the
 production RegionExecution, one node at a time: the region prepares
 each node's documents, its stop key groups, its join inputs, and its
-candidate rows, and sends finished rows to the region's stream. The
-oracle answers each pushed document from the truth it was given and
-builds each result with the production builders (filter_result,
-scored_result, extraction_rows, and the join answer record the
+candidate rows, and reports the rows each operator finishes to the
+region's FinishedRows, one answered row at a time. The oracle answers
+each pushed document from the truth it was given and builds each
+result and each finished row with the production builders
+(filter_result, scored_result, extraction_rows, passed_rows,
+finished_scores, settled_pairs, and the join answer record the
 executor writes), so a test never spells a port name or a result
 shape.
 """
@@ -25,16 +27,18 @@ from quail.backends.quail.executor.operators.filter import (
     filter_result,
     filter_stop_groups,
 )
-from quail.backends.quail.executor.operators.join import prepare_join_inputs
+from quail.backends.quail.executor.operators.join import (
+    prepare_join_inputs,
+    settled_pairs,
+)
 from quail.backends.quail.executor.operators.sae_features import (
     FEATURE_LIST,
 )
 from quail.backends.quail.executor.operators.score import (
     candidate_rows,
+    finished_scores,
     hinted_rows,
-    scored_outputs,
     scored_result,
-    value_type,
 )
 from quail.backends.quail.executor.region import (
     RegionDocuments,
@@ -43,11 +47,16 @@ from quail.backends.quail.executor.region import (
 )
 from quail.backends.quail.reranker import score_rows, scored_batch
 from quail.execution.answer_stops import Stop, answer_stop, copied_completions
+from quail.execution.finished import (
+    finished_rows,
+    finished_table,
+    keeps,
+    region_hint,
+)
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import true_answer_rows
 from quail.execution.rows import Rows, extraction_rows
 from quail.execution.spans import locate_span
-from quail.execution.streaming import region_stream
 from quail.physical import (
     AiClassify,
     AiExtract,
@@ -98,7 +107,6 @@ class Oracle:
         retain: How many of a keep_kv filter's survivors the oracle
             retains in the arena, as the executor would.
         join_metrics: Metrics every join stage reports beside its rows.
-        streams: Whether a score call reports each row as it is scored.
         tightens_after: Source rows of the first alias after whose
             filter answer or score the oracle waits until the region's
             hint tightens, so a test decides when the operator above the
@@ -115,7 +123,7 @@ class Oracle:
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
                  answers=None, features=None, maps=None, *,
                  probabilities=False, retain=0, join_metrics=None,
-                 streams=False, pipelines=False, tightens_after=()):
+                 pipelines=False, tightens_after=()):
         self.filters = filters or {}
         self.joins = joins or {}
         self.labels = labels
@@ -126,7 +134,6 @@ class Oracle:
         self.probabilities = probabilities
         self.retain = retain
         self.join_metrics = join_metrics
-        self.streams = streams
         self.groups_operators = pipelines
         self.tightens_after = frozenset(tightens_after)
         self.arena = None
@@ -186,8 +193,7 @@ class Oracle:
             AssertionError: The hint did not tighten within
                 HINT_WAIT_SECONDS.
         """
-        stream = region_stream()
-        hint = None if stream is None else stream.hint
+        hint = region_hint()
         if hint is None or row not in self.tightens_after:
             send()
             return
@@ -350,6 +356,7 @@ class OracleOperator(ModelOperator):
         self.nodes = (node,)
         self.num_documents = num_documents
         self.result_value = None
+        self.finished = []      # finished rows since the last take
 
     def layout(self, region):
         return RegionDocuments(range(self.num_documents), None)
@@ -388,9 +395,12 @@ class OracleFilter(FilterOperator):
     def push(self, documents):
         oracle, node = self.oracle, self.node
         survivors = {}
-        stream = region_stream()
-        reporting = answer_sink() is not None or (
-            stream is not None and stream.wants(node))
+        # each document is a chunk of its own, unless an answer sink
+        # takes the answers, which the real loop sends a chunk at a time
+        sink = answer_sink()
+        one_by_one = ((finished_rows() is not None and sink is None)
+                      or (oracle.tightens_after and (
+                          sink is not None or finished_rows() is not None)))
         for local in documents:
             document = self.ids[local]
             # a document that stands for copies has one group per copy
@@ -400,20 +410,19 @@ class OracleFilter(FilterOperator):
             if found and all(survivors.get(group, 0) >= node.num_key_survivors
                              for group in found):
                 continue
-            if stream is not None and not stream.keeps(node.alias, int(document)):
+            if not keeps(node.alias, int(document)):
                 continue
             oracle.asked.append((node.alias, int(document)))
             passed = oracle._filter_answer(node, document)
             self.answers[local] = [passed]
             self.finished.append((local, passed))
-            if oracle.tightens_after and reporting:
+            if one_by_one:
                 oracle._answered(oracle._source(node.alias, document),
                                  partial(self.region.send_finished, self))
             if passed:
                 for group in found:
                     survivors[group] = survivors.get(group, 0) + 1
-        if not oracle.tightens_after:
-            # the real loop reports a chunk's finished documents together
+        if not one_by_one:
             self.region.send_finished(self)
         if node.keep_kv and oracle.arena is not None:
             kept = [document for local, document in enumerate(self.ids)
@@ -445,6 +454,10 @@ class OracleJoin(OracleOperator):
     def push(self, documents):
         self._results = self._predicates(self.nodes, self.inputs)
 
+    def take_finished(self):
+        finished, self.finished = self.finished, []
+        return finished
+
     def results(self) -> dict:
         return self._results
 
@@ -467,6 +480,11 @@ class OracleJoin(OracleOperator):
                 rows[local] = [
                     oracle._join_answer(node, anchor_ids[local], partners[member])
                     for member in mine]
+                # an anchor's pairs are reported once answered
+                self.finished = settled_pairs(node, int(anchor_ids[local]), [
+                    partners[member] for member, answer in zip(mine, rows[local])
+                    if answer])
+                self.region.send_finished(self)
             for local, row in rows.items():
                 inputs["anchor_done"](local, row)
             passing = {local for local, row in rows.items() if any(row)}
@@ -527,48 +545,44 @@ class OracleScore(OracleOperator):
             raise ValueError(
                 "AI.SCORE needs one prompt argument per document relation")
         ids = [oracle._sources(spec.aliases, row) for row in rows]
+        labeled = isinstance(spec, ClassifySpec)
         sink = answer_sink()
-        stream = region_stream()
-        wanted = (stream is not None and stream.wants(node)
-                  and not (isinstance(spec, ClassifySpec) and spec.probabilities))
-        streams = bool((sink is not None or wanted) and len(rows) and oracle.streams)
-        # the scheduler asks skip as it admits each row, in order
-        asked = []
+        # the scheduler asks skip as it admits each row, in order; each
+        # answered row is reported as the real loop reports a chunk's
+        asked, values, probabilities = [], [], []
         for position in range(len(rows)):
             if self.skip is not None and self.skip(position):
                 continue
             asked.append(position)
-            if streams and not isinstance(spec, ClassifySpec):
-                value = oracle.scores(spec, ids[position])
-                oracle._answered(ids[position][0], partial(
-                    self._send, rows[[position]], [value], sink, wanted))
+            value = (oracle._label(spec, ids[position]) if labeled
+                     else oracle.scores(spec, ids[position]))
+            values.append(value)
+            probability = None
+            if labeled and oracle.probabilities and spec.probabilities:
+                probability = [np.nan] * len(spec.labels) if value is None else [
+                    0.8 if label == value else 0.1 for label in spec.labels]
+                probabilities.append(probability)
+            oracle._answered(ids[position][0], partial(
+                self._send, rows[[position]], value, probability, sink))
         if len(rows):
             oracle.calls.append((spec.name, rows[asked].tolist()))
-        probabilities = None
-        if isinstance(spec, ClassifySpec):
-            values = [oracle._label(spec, ids[position]) for position in asked]
-            if oracle.probabilities and spec.probabilities:
-                probabilities = np.asarray([
-                    [np.nan] * len(spec.labels) if value is None
-                    else [0.8 if label == value else 0.1 for label in spec.labels]
-                    for value in values]).reshape(-1, len(spec.labels))
-        else:
-            values = [oracle.scores(spec, ids[position]) for position in asked]
-        if sink is not None and asked and not streams:
-            sink(scored_batch(node, rows[asked], values))
         self.result_value = scored_result(
             node, rows[asked], values, self.priors, fresh_tokens=len(asked),
-            suffix_tokens=(3 * len(asked) if isinstance(spec, ClassifySpec) else 0),
-            probabilities=probabilities)
+            suffix_tokens=(3 * len(asked) if labeled else 0),
+            probabilities=(np.asarray(probabilities).reshape(-1, len(spec.labels))
+                           if probabilities else None))
 
-    def _send(self, rows, values, sink, wanted):
-        if sink is not None:
-            sink(scored_batch(self.node, rows, values))
-        if wanted:
-            spec = self.node.spec
-            region_stream().partial(self.node, scored_outputs(
-                self.node, score_rows(rows, spec.aliases, spec.name, values,
-                                      value_type(spec)), self.priors))
+    def _send(self, rows, value, probability, sink):
+        if sink is not None and value is not None:
+            sink(scored_batch(self.node, rows, [value]))
+        self.finished = finished_scores(
+            self.node, rows, [value],
+            None if probability is None else np.asarray([probability]))
+        self.region.send_finished(self)
+
+    def take_finished(self):
+        finished, self.finished = self.finished, []
+        return finished
 
 
 class OracleDocuments(OracleOperator):
@@ -581,19 +595,41 @@ class OracleDocuments(OracleOperator):
         return operator
 
 
-class OracleExtract(OracleDocuments):
     def push(self, documents):
-        self.result_value = self.oracle._extract(self.node, self.ids)
+        port = self.node.rows_port
+        if not len(self.ids):
+            self.result_value = self.answer(self.ids)
+            return
+        # each document's answer is reported as it ends, as the real
+        # loop reports a chunk's
+        parts = []
+        for document in self.ids:
+            parts.append(self.answer([document]).outputs[port])
+            self.finished = [finished_table(self.node.node_id, port,
+                                            parts[-1].table())]
+            self.region.send_finished(self)
+        count = len(self.ids)
+        self.result_value = NodeResult({port: Rows.concat(parts)}, NodeMetrics(
+            input_rows=count, output_rows=count, evaluated_documents=count))
+
+    def take_finished(self):
+        finished, self.finished = self.finished, []
+        return finished if finished_rows() is not None else []
+
+
+class OracleExtract(OracleDocuments):
+    def answer(self, ids):
+        return self.oracle._extract(self.node, ids)
 
 
 class OracleMap(OracleDocuments):
-    def push(self, documents):
-        self.result_value = self.oracle._map(self.node, self.ids)
+    def answer(self, ids):
+        return self.oracle._map(self.node, ids)
 
 
 class OracleFeatures(OracleDocuments):
-    def push(self, documents):
-        self.result_value = self.oracle._sae_features(self.node, self.ids)
+    def answer(self, ids):
+        return self.oracle._sae_features(self.node, ids)
 
 
 def oracle_executor(oracle: Oracle, **report):

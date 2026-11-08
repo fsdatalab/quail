@@ -5,8 +5,8 @@ import os
 import time
 
 from quail.backends import BackendExecutionContext
+from quail.execution.finished import reporting
 from quail.execution.result import QueryResult
-from quail.execution.streaming import streaming
 from quail.execution.types import PhysicalRequest, PhysicalResponse
 from quail.physical import ExecutionLocation, Scan
 from quail.physical.plan import Refusal, RefusalError, graph_from_envelope
@@ -216,9 +216,13 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
     if on_execution_ready is not None:
         on_execution_ready()
     started = time.perf_counter()
-    stream = None if on_rows is None else query.region_stream(on_rows, hint)
+    finished = query.finished_rows(on_rows)
     if has_compute:
-        with streaming(stream):
+        # with no one taking rows as they finish, they are built at the end
+        alias = None if hint is None else next(
+            (scan["alias"] for scan in query.facts()["scans"]
+             if scan["provider"] == hint.table), None)
+        with reporting(None if on_rows is None else finished, hint, alias):
             response = (physical_executor(request) if physical_executor is not None
                         else _execute_physical(request, query.session.registry))
     else:
@@ -228,9 +232,7 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
         raise TypeError("a physical executor must return PhysicalResponse")
     coordinator_wall_s = time.perf_counter() - started
     finish_started = time.perf_counter()
-    result = query.finish(response, coordinator_wall_s)
-    if on_rows is not None and (stream is None or not stream.finished):
-        on_rows(result.collect())
+    result = query.finish(response, coordinator_wall_s, finished)
     finish_s = time.perf_counter() - finish_started
     model_wall_s = result.report["wall_s"]
     result.report.update(

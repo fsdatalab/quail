@@ -171,7 +171,7 @@ def test_every_check_query_derives_one_region_as_session_sql_compiles_it():
 
 def test_a_region_hands_on_rows_before_it_finishes():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    oracle = Oracle(scores=lambda spec, ids: ids[0] / 10, streams=True)
+    oracle = Oracle(scores=lambda spec, ids: ids[0] / 10)
     events = []
     executor = oracle_executor(oracle)
 
@@ -195,6 +195,75 @@ def test_a_region_hands_on_rows_before_it_finishes():
     assert events == ["rows"] * 4 + ["finished"]
     streamed = pa.concat_tables(batches)
     assert _same_rows(streamed, context.sql(text), ordered=False)
+    session.close()
+
+
+# per operator family: a query of that operator alone, and the oracle
+# truth it is answered from; `answered` records each answer
+FAMILIES = {
+    "filter": ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body))",
+               lambda answered: Oracle(filters=lambda alias, document, position:
+                                       answered(document % 2 == 0))),
+    "classify": (QUERIES["IMDB-11 classify"],
+                 lambda answered: Oracle(labels=lambda spec, ids:
+                                         answered(LABELS[ids[0]]))),
+    "score documents": (
+        "SELECT r.id, AI.SCORE(PROMPT('q7: {0}', r.body)) AS score FROM reviews r",
+        lambda answered: Oracle(scores=lambda spec, ids: answered(ids[0] / 10))),
+    "score pairs": (
+        "SELECT r.id, a.id, AI.SCORE(PROMPT('q9: {0} {1}', r.body, a.aspect)) "
+        "AS fit FROM reviews r CROSS JOIN aspects a",
+        lambda answered: Oracle(scores=lambda spec, ids: answered(sum(ids) / 10))),
+    "extract": (QUERIES["CUAD-1 extract"],
+                lambda answered: Oracle(answers=lambda spec, document: answered(
+                    ["2027", "2030", None][document]))),
+    "map": ("SELECT r.id, AI.MAP(r.body, 'q8: Summarize.', 16) AS summary "
+            "FROM reviews r",
+            lambda answered: Oracle(maps=lambda spec, document: answered(
+                f"summary {document}"))),
+    "join": (QUERIES["IMDB-2 one join"],
+             lambda answered: Oracle(joins=lambda node, assignment: answered(
+                 (assignment["r"] + assignment["a"]) % 2 == 0))),
+}
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_each_operator_hands_on_its_first_rows_before_the_region_finishes(family):
+    text, truth = FAMILIES[family]
+    events = []
+
+    def answered(value):
+        events.append("answered")
+        return value
+
+    oracle = truth(answered)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    oracle.catalog = session.catalog
+    executor = oracle_executor(oracle)
+
+    def run(request):
+        response = executor(request)
+        events.append("finished")
+        return response
+
+    context = quail.SessionContext(session, physical_executor=run)
+    for name, table in (("reviews", REVIEWS), ("aspects", ASPECTS),
+                        ("contracts", CONTRACTS)):
+        context.register(name, quail.DocumentProvider.from_table(table, id_col="id"))
+    ((_, planned),) = context._native.plans(text)
+    batches = []
+
+    def on_rows(table):
+        events.append("rows")
+        batches.append(table)
+
+    assert Engine(session, run).execute(planned, {}, on_rows) is None
+    # the first rows went on before the model gave its last answer
+    last_answer = len(events) - 1 - events[::-1].index("answered")
+    assert events.index("rows") < last_answer
+    assert events[-1] == "finished"
+    events.clear()
+    assert _same_rows(pa.concat_tables(batches), context.sql(text), ordered=False)
     session.close()
 
 
@@ -268,11 +337,11 @@ def test_a_top_k_over_a_score_asks_fewer_rows_once_it_holds_k(monkeypatch, where
             f"FROM reviews r {where} ORDER BY score DESC, r.id LIMIT 3")
     # the sort holds three rows after r02, and r00, r02, and r04 at 1.0
     # after r04
-    hinted = Oracle(**TOP_K_SCORES, streams=True, tightens_after={2, 4})
+    hinted = Oracle(**TOP_K_SCORES, tightens_after={2, 4})
     context = _reviews_context(hinted, 12)
     assert _rows(context.sql(text)) == TOP_K_ROWS
     # without the LIMIT the sort holds every row and hands no threshold
-    every = Oracle(**TOP_K_SCORES, streams=True)
+    every = Oracle(**TOP_K_SCORES)
     whole = _reviews_context(every, 12)
     assert _rows(whole.sql(text.replace(" LIMIT 3", "")))[:3] == TOP_K_ROWS
     assert _scored_rows(every) == 12

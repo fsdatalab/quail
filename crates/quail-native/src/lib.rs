@@ -884,33 +884,115 @@ fn one_batch(table: &Bound<'_, PyAny>) -> PyResult<datafusion::arrow::array::Rec
         .map_err(|error| python_error(error.into()))
 }
 
-/// Build a region's rows from its run's output relations, as
-/// `quail::results::region_rows` does.
+/// A region's rows, built as its operators report the rows they finish,
+/// as `quail::finished::FinishedRows` builds them.
 ///
-/// `request` is the AnswerRequest as JSON; `outputs` maps (node id,
-/// port) to a pyarrow Table; `evaluate(name, expression)` returns a
-/// one-column pyarrow Table of the values a source column's expression,
-/// as JSON, computes for each document. Returns the rows as a pyarrow
-/// Table.
-#[pyfunction]
-fn region_rows<'py>(
-    py: Python<'py>,
-    request: &str,
-    outputs: std::collections::HashMap<(String, String), Bound<'py, PyAny>>,
-    evaluate: Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let request: quail::results::AnswerRequest = from_json(request)?;
-    let found: quail_planner::operators::Operators = from_json(&request.operators)?;
-    let mut sources = std::collections::HashMap::new();
-    for (name, expression) in quail_planner::results::source_columns(&found) {
-        let expression = serde_json::to_string(&expression)
-            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-        let values = one_batch(&evaluate.call1((&name, expression))?)?;
-        sources.insert(name, std::sync::Arc::clone(values.column(0)));
+/// `request` is the AnswerRequest as JSON, listing the ports the run
+/// returns; `evaluate(name, expression)` returns a one-column pyarrow
+/// Table of the values a source column's expression, as JSON, computes
+/// for each document; `on_rows`, when given, is handed each pyarrow
+/// Table of rows as they are built.
+#[pyclass(name = "FinishedRows", module = "_quail_native")]
+struct NativeFinishedRows {
+    rows: quail::finished::FinishedRows,
+    on_rows: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl NativeFinishedRows {
+    #[new]
+    #[pyo3(signature = (request, evaluate, on_rows=None))]
+    fn new(
+        request: &str,
+        evaluate: Bound<'_, PyAny>,
+        on_rows: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let request: quail::results::AnswerRequest = from_json(request)?;
+        let found: quail_planner::operators::Operators = from_json(&request.operators)?;
+        let mut sources = std::collections::HashMap::new();
+        for (name, expression) in quail_planner::results::source_columns(&found) {
+            let expression = serde_json::to_string(&expression)
+                .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+            let values = one_batch(&evaluate.call1((&name, expression))?)?;
+            sources.insert(name, std::sync::Arc::clone(values.column(0)));
+        }
+        let rows = quail::finished::FinishedRows::new(&request, &sources)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(NativeFinishedRows { rows, on_rows })
     }
-    let rows = quail::results::region_rows(&request, &read_relations(outputs)?, &sources)
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    quail::pyarrow::to_pyarrow(py, rows.schema(), vec![rows])
+
+    /// Whether the rows read the reports of a node's port.
+    fn wants(&self, node: &str, port: &str) -> bool {
+        self.rows.wants(node, port)
+    }
+
+    /// Take a pyarrow Table of rows a port finished, the node and port in
+    /// its schema's `quail.node` and `quail.port` metadata; hand the
+    /// region rows they complete to `on_rows`, and return how many.
+    fn report(&mut self, py: Python<'_>, table: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let reader = quail::pyarrow::stream_from_pyarrow(table)?;
+        let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
+        let metadata = schema.metadata();
+        let (Some(node), Some(port)) = (metadata.get("quail.node"), metadata.get("quail.port"))
+        else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "finished rows need quail.node and quail.port metadata",
+            ));
+        };
+        let (node, port) = (node.clone(), port.clone());
+        let mut batches = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| python_error(error.into()))?;
+        if batches.is_empty() {
+            // an empty table still gives its columns' types
+            batches.push(datafusion::arrow::array::RecordBatch::new_empty(schema));
+        }
+        let mut count = 0;
+        for batch in batches {
+            let built = self
+                .rows
+                .report(&node, &port, &batch)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            count += self.hand_on(py, built)?;
+        }
+        Ok(count)
+    }
+
+    /// Hand `on_rows` the rows complete before any report, and return
+    /// how many.
+    fn finish(&mut self, py: Python<'_>) -> PyResult<usize> {
+        let built = self
+            .rows
+            .finish()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        self.hand_on(py, built)
+    }
+
+    /// Every row built so far, as a pyarrow Table ordered by document ids.
+    fn rows<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rows = self
+            .rows
+            .rows()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        to_pyarrow(py, rows.schema(), vec![rows])
+    }
+}
+
+impl NativeFinishedRows {
+    fn hand_on(
+        &self,
+        py: Python<'_>,
+        built: Option<datafusion::arrow::array::RecordBatch>,
+    ) -> PyResult<usize> {
+        let Some(rows) = built else {
+            return Ok(0);
+        };
+        let count = rows.num_rows();
+        if let Some(on_rows) = &self.on_rows {
+            on_rows.call1(py, (to_pyarrow(py, rows.schema(), vec![rows])?,))?;
+        }
+        Ok(count)
+    }
 }
 
 /// The report of one region's run, as `quail::results::execution_report`
@@ -1113,6 +1195,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSession>()?;
     module.add_class::<Tokenizer>()?;
     module.add_class::<NativePlanner>()?;
+    module.add_class::<NativeFinishedRows>()?;
     module.add_class::<cost::CostModel>()?;
     budgets::register(module)?;
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
@@ -1127,7 +1210,6 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
     module.add_function(wrap_pyfunction!(write_token_store, module)?)?;
     module.add_function(wrap_pyfunction!(collect_answers, module)?)?;
-    module.add_function(wrap_pyfunction!(region_rows, module)?)?;
     module.add_function(wrap_pyfunction!(edit_graph, module)?)?;
     module.add_function(wrap_pyfunction!(region_facts, module)?)?;
     module.add_function(wrap_pyfunction!(limited_operators, module)?)?;

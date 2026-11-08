@@ -28,10 +28,15 @@ from quail.backends.quail.reranker import (
 )
 from quail.common.expressions import PROBABILITIES_SUFFIX
 from quail.common.tokens import DocumentPrefixes, concat_tokens
+from quail.execution.finished import (
+    finished_rows,
+    finished_table,
+    hinted_alias,
+    keeps,
+)
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import rows_of
-from quail.execution.streaming import region_stream
 from quail.physical import ClassifySpec, ValueType
 from quail.progress import answer_sink
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
@@ -112,15 +117,14 @@ def hinted_rows(node, rows: ScoreRows):
     Only a score of one table's documents, the table the region's hint
     covers, skips rows.
     """
-    stream = region_stream()
     alias = node.spec.aliases[0]
-    if (stream is None or stream.hint is None or rows.product
-            or len(node.spec.aliases) != 1 or alias != stream.alias):
+    if (rows.product or len(node.spec.aliases) != 1
+            or alias != hinted_alias()):
         return None
     documents = rows.columns[0]
 
     def skip(position):
-        return not stream.keeps(alias, int(documents[position]))
+        return not keeps(alias, int(documents[position]))
 
     return skip
 
@@ -139,6 +143,38 @@ def scored_outputs(node, scored, priors) -> dict:
         return classify_outputs(node, scored.filter(
             pc.is_valid(scored.column(node.spec.name))))
     return {node.rows_port: scored}
+
+
+def finished_scores(node, rows, values, probabilities=None) -> list:
+    """The finished rows of a score or classification: ids and answers.
+
+    Args:
+        node: The AiScore or AiClassify.
+        rows: The rows answered, one column per alias.
+        values: Their scores or labels.
+        probabilities: A classification's label probabilities per row,
+            or None.
+    """
+    if not len(rows) or finished_rows() is None:
+        return []
+    scored = scored_rows(node, rows, values, probabilities)
+    if isinstance(node.spec, ClassifySpec):
+        # a document whose decoded answer names no label leaves the query
+        scored = scored.filter(pc.is_valid(scored.column(node.spec.name)))
+    return [finished_table(node.node_id, node.rows_port, scored.table())]
+
+
+def scored_rows(node, rows, values, probabilities=None):
+    """The Rows of a score or classification, in row order, without priors."""
+    spec = node.spec
+    scored = score_rows(rows, spec.aliases, spec.name, values, value_type(spec))
+    if isinstance(spec, ClassifySpec) and spec.probabilities:
+        scored = scored.with_column(
+            spec.name + PROBABILITIES_SUFFIX, probability_column(
+                spec.labels,
+                np.full((len(rows), len(spec.labels)), np.nan)
+                if probabilities is None else probabilities))
+    return scored
 
 
 def scored_result(node, rows, values, priors, *, fresh_tokens, cached_tokens=0,
@@ -162,15 +198,9 @@ def scored_result(node, rows, values, priors, *, fresh_tokens, cached_tokens=0,
             or None.
     """
     spec = node.spec
-    scored = score_rows(rows, spec.aliases, spec.name, values, value_type(spec))
-    if isinstance(spec, ClassifySpec) and spec.probabilities:
-        scored = scored.with_column(
-            spec.name + PROBABILITIES_SUFFIX, probability_column(
-                spec.labels,
-                np.full((len(rows), len(spec.labels)), np.nan)
-                if probabilities is None else probabilities))
     count = len(rows)
-    outputs = scored_outputs(node, scored, priors)
+    outputs = scored_outputs(node, scored_rows(node, rows, values, probabilities),
+                             priors)
     output = outputs[node.rows_port]
     return NodeResult(outputs, NodeMetrics(
         input_rows=count,
@@ -433,28 +463,34 @@ class ScoreOperator(SingleNodeOperator):
         self._fill(document, row)
         self.finished.extend(self._positions(document).tolist())
 
+    def answered(self, anchor, stage, start, end, answers):
+        """Score an anchor's rows as their requests' answers arrive.
+
+        A grouped layout asks each anchor's rows as its requests: one
+        anchor of a shared prompt head asks every document, and a left
+        document asks its partners; each row is final once answered.
+        """
+        if self.order is None or stage:
+            return False
+        positions = self._positions(anchor)[start:end]
+        self.scores[positions] = np.asarray(answers, dtype=np.float32)
+        self.finished.extend(positions.tolist())
+        return True
+
     def take_finished(self):
-        """Send newly scored rows to the answer sink; return the stream's rows."""
+        """Send newly scored rows to the answer sink; return their rows."""
         positions = sorted({position for position in self.finished
                             if not self.sent[position] and not self.skipped[position]
                             and not np.isnan(self.scores[position])})
         self.finished = []
         if not positions:
-            return None
+            return []
         self.sent[positions] = True
-        return self._send(np.asarray(positions))
-
-    def _send(self, positions):
         rows, values = self.rows[positions], self.scores[positions].tolist()
         sink = answer_sink()
         if sink is not None:
             sink(scored_batch(self.node, rows, values))
-        stream = region_stream()
-        if stream is None or not stream.wants(self.node):
-            return None
-        spec = self.node.spec
-        return scored_outputs(self.node, score_rows(
-            rows, spec.aliases, spec.name, values, value_type(spec)), self.priors)
+        return finished_scores(self.node, rows, values)
 
     def read_answers(self, every) -> int:
         """Send the scores not yet sent; return the full prompt token count."""

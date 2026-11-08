@@ -34,9 +34,9 @@ from quail.backends.quail.executor.model_operator import (
 )
 from quail.common.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.answer_stops import answer_stop
+from quail.execution.finished import finished_rows, hinted_out, report
 from quail.execution.ids import id_positions
 from quail.execution.rows import Rows
-from quail.execution.streaming import hinted_out, region_stream
 from quail.physical import AiFilter, AiJoin
 
 
@@ -115,6 +115,8 @@ class RegionExecution:
         self.operators = []
         self.executor = None
         self._ids = None
+        # operators whose rows an answer finished since the last chunk
+        self._answered = []
 
     @property
     def query(self):
@@ -211,11 +213,8 @@ class RegionExecution:
         return results
 
     def send_finished(self, operator) -> None:
-        """Send the operator's finished rows to the region's stream."""
-        outputs = operator.take_finished()
-        stream = region_stream()
-        if outputs is not None and stream is not None:
-            stream.partial(operator.nodes[0], outputs)
+        """Report the operator's finished rows to the region's FinishedRows."""
+        report(operator.take_finished())
 
     def _chain_run(self, table) -> ChainRun:
         """The GPU loop's settings for this chain."""
@@ -290,6 +289,7 @@ class RegionExecution:
             # a document a hint drops answers no first filter, so it leaves
             skip = hinted_out(keys)
         self._routes = _Routes(operators)
+        self._answered = []
         with ExitStack() as resources:
             for operator in operators:
                 resources.enter_context(operator.execution_context())
@@ -304,7 +304,8 @@ class RegionExecution:
                 paged=(paged or pipeline.needs_pages) and not pipeline.whole_sequences,
                 unit="documents", count_answers=False, label=settings.label,
                 default_attention="tree", on_chunk=self._on_chunk,
-                on_answers=None, stop_groups=settings.stop_groups,
+                on_answers=(None if finished_rows() is None else self._on_answers),
+                stop_groups=settings.stop_groups,
                 appended_tokens=max(operator.appended_tokens
                                     for operator in operators) or None,
                 gpu_timing=state.gpu_timing, decoder=decoder,
@@ -343,6 +344,20 @@ class RegionExecution:
                         decoder.answer_stops[operator.first + q] = stop
         return decoder
 
+    def _on_answers(self, anchor, stage, start, end, answers) -> None:
+        """Hand an operator the answers one group of an anchor's requests got.
+
+        An operator whose rows are an anchor's requests, such as a score
+        of pairs, finishes each row with its answer, before the anchor
+        settles; the region reports those rows after the chunk.
+        """
+        routes = self._routes
+        index = routes.owner[stage]
+        operator = routes.operators[index]
+        if operator.answered(anchor, stage - routes.slices[index][0], start, end,
+                             answers) and operator not in self._answered:
+            self._answered.append(operator)
+
     def _on_chunk(self, transitions) -> None:
         """Settle documents in the operators they left; send finished rows.
 
@@ -351,7 +366,7 @@ class RegionExecution:
         kept document then enters the next operator.
         """
         routes, answers = self._routes, self.executor.sched.answers
-        touched = []
+        touched, self._answered = self._answered, []
         for anchor, stage, passed in transitions:
             index = routes.owner[stage]
             low, high = routes.slices[index]

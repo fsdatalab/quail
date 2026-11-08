@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.execution.deduplicate import deduplicate
+from quail.execution.finished import finished_rows, finished_table, held
 from quail.execution.guard import guarded
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
-from quail.execution.streaming import region_stream
+from quail.execution.types import output_table
 from quail.physical import (
     ExecutionLocation,
     PhysicalGraph,
@@ -101,13 +103,11 @@ class GenericRunner:
             node_results[node.node_id] = result
             for observer in context.observers:
                 observer.after_node(node, result)
+            _report_outputs(node, result)
 
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
         pipelines = graph.pipelines(completed) if context.run_pipeline else {}
         ordered = graph.topological_nodes()
-        stream = region_stream()
-        # the node the runner runs last, whose step finishes the region's rows
-        last = ordered[-1].node_id if stream is not None and ordered else None
         for node in ordered:
             pipeline = pipelines.get(node.node_id)
             if pipeline is not None:
@@ -126,13 +126,12 @@ class GenericRunner:
                 if guard is not None:
                     inputs[node.node_id] = guard.inputs(inputs[node.node_id])
                 deduplicated = deduplicate(graph, pipeline, inputs, context)
-                if node.node_id == last:
-                    stream.begin(graph, node_results, None)
                 started = time.perf_counter()
-                results = context.run_pipeline(
-                    pipeline,
-                    inputs if deduplicated is None else deduplicated.inputs,
-                    context)
+                with _renumbered(guard, deduplicated):
+                    results = context.run_pipeline(
+                        pipeline,
+                        inputs if deduplicated is None else deduplicated.inputs,
+                        context)
                 if deduplicated is not None:
                     results = deduplicated.expanded(results)
                 if guard is not None:
@@ -142,8 +141,6 @@ class GenericRunner:
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
                            started if index == 0 else None)
-                if node.node_id == last:
-                    stream.finish(graph, node_results, pipeline)
                 continue
             supplied = {
                 output.name: values[(node.node_id, output.name)]
@@ -172,38 +169,52 @@ class GenericRunner:
                     inputs = guard.inputs(inputs)
                 deduplicated = deduplicate(
                     graph, (node,), {node.node_id: inputs}, context)
-                if node.node_id == last:
-                    # a guard or deduplication renumbers the rows the
-                    # operator reports, so its rows go when it finishes
-                    stream.begin(graph, node_results,
-                                 node if guard is None and deduplicated is None
-                                 else None)
                 started = time.perf_counter()
-                result = context.runtimes[node.runtime_key].execute(
-                    node,
-                    inputs if deduplicated is None
-                    else deduplicated.inputs[node.node_id],
-                    context)
+                with _renumbered(guard, deduplicated):
+                    result = context.runtimes[node.runtime_key].execute(
+                        node,
+                        inputs if deduplicated is None
+                        else deduplicated.inputs[node.node_id],
+                        context)
                 if deduplicated is not None:
                     result = deduplicated.expanded(
                         {node.node_id: result})[node.node_id]
                 if guard is not None:
                     result = guard.expanded(result)
                 record(node, result, started)
-                if node.node_id == last:
-                    stream.finish(graph, node_results, (node,))
                 continue
-            if node.node_id == last:
-                stream.begin(graph, node_results, None)
             record(node, result)
-            if node.node_id == last:
-                stream.finish(graph, node_results, (node,))
 
         root = (graph.root.node_id, graph.root.port)
         metrics = NodeMetrics()
         for node in graph.topological_nodes():
             metrics = metrics + node_results[node.node_id].metrics
         return RunResult(values[root], node_results, metrics)
+
+
+def _renumbered(guard, deduplicated):
+    """Hold back operators' reports while a node runs over renumbered rows.
+
+    A guard or deduplication renumbers the rows an operator reports, so
+    its rows go once its result is expanded.
+    """
+    return held() if guard is not None or deduplicated is not None else nullcontext()
+
+
+def _report_outputs(node, result) -> None:
+    """Report each output of a finished node that the region's rows read.
+
+    A node's outputs are final once it finishes; rows its operator
+    reported before are skipped.
+    """
+    finished = finished_rows()
+    if finished is None:
+        return
+    ports = {port.name: port for port in node.outputs}
+    for name, value in result.outputs.items():
+        if finished.wants(node.node_id, name):
+            finished.report(finished_table(
+                node.node_id, name, output_table(node, ports[name], value)))
 
 
 def compute_subgraph(graph: PhysicalGraph) -> PhysicalGraph:
