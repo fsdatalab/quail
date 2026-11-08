@@ -11,12 +11,10 @@ from quail.backends.quail.executor.model_operator import (
     ModelOperator,
     execution_prefix_tree,
     gpu_seconds,
-    input_staging,
     stage_spans,
 )
-from quail.backends.quail.executor.readout import AsyncSlotMargins
-from quail.backends.quail.executor.set_passes import split_passes
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.set_passes import Passes, split_passes
+from quail.backends.quail.executor.stages import Stage, StageRequests
 from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, join_settlement
 from quail.common.document_ends import ends_for, joined_state
@@ -333,9 +331,9 @@ def set_join_questions(node, documents) -> list:
     return questions
 
 
-def join_pass_stage(node, prefixes, anchors, members_of, documents, readout,
-                    set_size: int, budget: int):
-    """One join's passes over the anchors, as one unpaged stage.
+def join_passes(node, prefixes, anchors, members_of, documents, set_size: int,
+                budget: int) -> Passes:
+    """One join's passes over the anchors, each pass's questions its own request.
 
     Args:
         node: The AiJoin, or the JoinQuestions of a classification.
@@ -344,20 +342,19 @@ def join_pass_stage(node, prefixes, anchors, members_of, documents, readout,
         members_of: Callable(anchor) -> the member indices it asks, or
             None for every member.
         documents: alias -> the partner documents' token ids.
-        readout: The readout of each question's last row.
         set_size: The most questions in one pass.
         budget: The chunk token budget a pass fits.
 
     Returns:
-        The Stage, each pass's state tokens, and each pass's anchor;
-        the Stage is None when no anchor asks a member.
+        The Passes, each owned by its anchor, with no stages yet; an
+        anchor that asks no member has none.
     """
     questions = set_join_questions(node, documents)
     lengths = [len(question) for question in questions]
     header = list(node.question_header_token_ids)
     frame = list(node.frame_token_ids)
     ends = ends_for(node.document_ends, node.anchor, frame)
-    states, suffixes, shapes, owners = [], [], [], []
+    passes = Passes(requests=[])
     for anchor in anchors:
         members = members_of(anchor)
         members = range(len(questions)) if members is None else members
@@ -371,15 +368,11 @@ def join_pass_stage(node, prefixes, anchors, members_of, documents, readout,
                 question = (header if index else []) + questions[member]
                 suffix += question
                 shape.append(len(question))
-            states.append(prefix)
-            suffixes.append(suffix)
-            shapes.append(tuple(shape))
-            owners.append(anchor)
-    if not states:
-        return None, states, owners
-    return Stage(suffixes=suffixes, readout=readout, requests=lambda key: [key],
-                 questions=tuple(shapes), decide=lambda _, row: True,
-                 label=f"join ({len(states)} passes)"), states, owners
+            passes.states.append(prefix)
+            passes.suffix_tokens.append(len(suffix))
+            passes.owners.append(anchor)
+            passes.requests.append(StageRequests([suffix], questions=(tuple(shape),)))
+    return passes
 
 
 def settled_rows(every, asked) -> dict:
@@ -399,8 +392,8 @@ def settled_rows(every, asked) -> dict:
     return last
 
 
-def execute_set_joins(state, operator) -> dict:
-    """Run a group's joins under set attention.
+def set_joins(run, stages, join):
+    """Ask a group's joins under set attention, one step each; yields their Passes.
 
     Each anchor is the state of its passes, and each of its partner
     tuples is one question; a pass asks up to the model's set size.
@@ -408,46 +401,44 @@ def execute_set_joins(state, operator) -> dict:
     the join before it.
 
     Args:
-        state: The query's execution state.
-        operator: The group's JoinOperator, which turns the answers into
+        run: The SetPasses the joins run in.
+        stages: Per join, its stage in the run; consecutive.
+        join: The group's JoinOperator, which turns the answers into
             results.
+
+    Returns:
+        Node id -> NodeResult, for every join of the group.
     """
-    nodes, inputs = operator.nodes, operator.inputs
-    readout = AsyncSlotMargins(state.torch, state.answer_rows)
+    state = run.state
+    nodes, inputs = join.nodes, join.inputs
     keys = inputs["anchor_keys"]
     lists_for = inputs.get("anchor_partners")
-    every, own_tokens, all_spans, asked = [], [], [], []
-    reached = range(len(operator.ids))
+    every, own_tokens, asked = [], [], []
+    reached = range(len(join.ids))
     for j, node in enumerate(nodes):
         asked.append(list(reached))
-        stage, states, owners = join_pass_stage(
+        passes = join_passes(
             node, inputs["prefixes"], reached,
             lambda anchor, j=j: (None if lists_for is None
                                  else lists_for(keys[anchor][1], j)),
-            inputs["partner_documents"], readout,
-            state.loaded_model.model_spec.set_size, state.chunk_tokens)
-        rows, tokens = {}, 0
-        if stage is not None:
-            answers, spans, tokens = run_stages(
-                state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-                [stage], states, state.chunk_tokens, staging=input_staging(state),
-                gpu_timing=state.gpu_timing, paged=False,
-                label=f"join predicate {j}")
-            for position, anchor in enumerate(owners):
-                margins = np.asarray(answers[0][position][0], dtype=float)
-                rows.setdefault(anchor, []).extend((margins > 0).tolist())
-            # one run per join: its stage 0 is the group's stage j
-            all_spans += [({j: by_stage.get(0, 0)}, chunk, start, end)
-                          for by_stage, chunk, start, end in spans]
+            inputs["partner_documents"], state.loaded_model.model_spec.set_size,
+            state.chunk_tokens)
+        passes.stages = [stages[j]] * len(passes.states)
+        passes = yield passes
+        rows = {}
+        for anchor, margins in zip(passes.owners, passes.values):
+            if margins is not None:
+                rows.setdefault(anchor, []).extend(
+                    (np.asarray(margins, dtype=float) > 0).tolist())
         every.append(rows)
-        own_tokens.append(tokens)
+        own_tokens.append(passes.tokens)
         reached = [anchor for anchor in sorted(rows) if any(rows[anchor])]
     last = settled_rows(every, asked)
     for anchor in sorted(last):
-        operator.settle_kv(anchor, any(last[anchor]), last[anchor])
-    operator.read_answers(every)
-    operator.own_tokens = own_tokens
-    return operator.close(sum(own_tokens), all_spans, {}, 0)
+        join.settle_kv(anchor, any(last[anchor]), last[anchor])
+    join.read_answers(every)
+    join.own_tokens = own_tokens
+    return join.close(sum(own_tokens), run.executor.spans, {}, stages[0])
 
 
 def _predicate_tokens(join_stages, answers, lists_for, anchor_keys,

@@ -40,12 +40,16 @@ class StageRequests:
             stage's readout settings.
         discard: Tokens to remove from the previously appended KV before
             processing these suffixes.
+        questions: Under set attention, per suffix, the tokens of each
+            question in it, as Stage.questions gives them for a stage's
+            own suffixes.
     """
 
     suffixes: Any
     write_suffix_tokens: int | None = None
     read_rows: list[int] | None = None
     discard: int = 0
+    questions: tuple = ()
 
     def __post_init__(self):
         from quail.backends.quail.executor.chunk import Suffixes

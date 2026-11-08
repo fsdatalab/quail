@@ -159,7 +159,7 @@ class RegionExecution:
         Returns:
             Node id -> NodeResult.
         """
-        from quail.backends.quail.executor.pipeline import execute_set_pipeline
+        from quail.backends.quail.executor.pipeline import SetChain
 
         query = self.query
         if query is not None:
@@ -168,7 +168,7 @@ class RegionExecution:
             # whole sequences; this is the one place that choice is made
             if (query.loaded_model.pipeline.whole_sequences
                     and nodes[0].document_aliases):
-                return execute_set_pipeline(query, nodes, inputs, self.context)
+                return SetChain(query, nodes, inputs, self.context).execute()
         self.nodes, self.inputs, self._ids = tuple(nodes), inputs, None
         self.operators = self._chain(self.nodes)
         if not any(operator.stages for operator in self.operators):

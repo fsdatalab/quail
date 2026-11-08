@@ -19,6 +19,8 @@ from collections.abc import Callable, Iterable, Sequence
 
 import pyarrow as pa
 
+from quail.execution.types import output_table
+
 _ROWS = None
 _HELD = False
 _HINT = None
@@ -81,6 +83,22 @@ def report(tables: Iterable[pa.Table]) -> None:
         return
     for table in tables:
         rows.report(table)
+
+
+def report_outputs(node, result) -> None:
+    """Report each output of a finished node that the region's rows read.
+
+    A node's outputs are final once it finishes; rows its operator
+    reported before are skipped.
+    """
+    rows = finished_rows()
+    if rows is None:
+        return
+    ports = {port.name: port for port in node.outputs}
+    for name, value in result.outputs.items():
+        if rows.wants(node.node_id, name):
+            rows.report(finished_table(
+                node.node_id, name, output_table(node, ports[name], value)))
 
 
 def finished_table(node_id: str, port: str, table: pa.Table) -> pa.Table:

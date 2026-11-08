@@ -141,7 +141,8 @@ class StageExecutor:
                  default_attention, on_chunk, on_answers, stop_groups=None, skip=None,
                  appended_tokens=None, gpu_timing=False, survival=None,
                  decoder=None, dependencies=None, knee_rows=0, decode_cost=None,
-                 summary=True, num_key_survivors=1, arrivals=None):
+                 summary=True, num_key_survivors=1, arrivals=None,
+                 start_stages=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
         self.torch = torch
@@ -184,12 +185,14 @@ class StageExecutor:
                               prefill_tokens=0, pairs=0, kv_read=0, sol_s=0.0)
 
         k = len(self.stages)
-        if not self.paged and (
+        # a whole-sequence anchor is one pass: it asks one request at its
+        # start stage, its own or the stage's one suffix
+        self.whole_sequences = getattr(self.pipeline, "whole_sequences", False)
+        if not self.paged and not self.whole_sequences and (
                 k > 1 or prefix_tree is not None
                 or any(stage.own_suffixes
                        or (len(stage.suffixes) != 1 and not stage.questions)
                        for stage in self.stages)):
-            # a set-attention stage's requests pick each sequence's one suffix
             raise ValueError("the unpaged path runs one stage of one suffix")
         if any(stage.append and not stage.single for stage in self.stages):
             raise ValueError("an append stage sends one request per document")
@@ -235,8 +238,7 @@ class StageExecutor:
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
                             else stage.canvas_rows for stage in self.stages]
 
-        if (not self.paged and not getattr(self.pipeline, "whole_sequences", False)
-                and self.prefix_lengths
+        if (not self.paged and not self.whole_sequences and self.prefix_lengths
                 and max(self.prefix_lengths) + len(self.frames[0])
                 + int(self.suffixes[0].lengths.max(initial=0))
                 + self.canvas_rows[0] > budget):
@@ -312,6 +314,8 @@ class StageExecutor:
                 # a paged document writes its prefix over several passes
                 # when it is too long for one
                 chunked_prefill=self.paged,
+                start_stages=start_stages,
+                one_stage=self.whole_sequences,
             )
         except OversizedDocumentError as error:
             raise self._oversized(error) from error
@@ -440,7 +444,8 @@ class StageExecutor:
                 f"flight; a document this long needs a smaller chunk "
                 f"or a larger pool")
 
-    def add_documents(self, prefixes, keys=None, stop_groups=None):
+    def add_documents(self, prefixes, keys=None, stop_groups=None,
+                      start_stages=None):
         """Queue documents that arrive while the run is under way.
 
         They take the next document indices, after every document given
@@ -456,6 +461,8 @@ class StageExecutor:
             prefixes: The new documents' prefix token sequences.
             keys: Their arena keys; their indices when omitted.
             stop_groups: Their stop key groups, when the run has them.
+            start_stages: The stage each starts at, or None for the
+                first stage.
 
         Raises:
             ValueError: A document cannot fit the whole arena.
@@ -491,7 +498,8 @@ class StageExecutor:
                                  for a in anchors},
                 stop_groups=stop_groups,
                 stop_width=max(self._stop_width(self.stop_groups, self.budget),
-                               self.num_key_survivors))
+                               self.num_key_survivors),
+                start_stages=start_stages)
         except OversizedDocumentError as error:
             raise self._oversized(error) from error
         if self.answer_admission is not None:
@@ -546,8 +554,9 @@ class StageExecutor:
         """
         if stop_groups is None or not self.prefixes:
             return 1
-        groups = len({group for groups in stop_groups for group in
-                      (groups if isinstance(groups, tuple) else (groups,))}) or 1
+        groups = len({group for groups in stop_groups if groups is not None
+                      for group in (groups if isinstance(groups, tuple)
+                                    else (groups,))}) or 1
         mean = (sum(self.prefix_lengths) / len(self.prefix_lengths)
                 + float(np.mean(self.suffixes[0].lengths)))
         per_chunk = max(1, int(budget // max(1.0, mean)))
@@ -801,9 +810,11 @@ class StageExecutor:
             if self.read_masks[j] is not None:
                 own["read_mask"] = self.read_masks[j]
                 rows = int(own["read_mask"].sum())
-            if self.stages[j].questions:
+            questions = (request.questions if request is not None
+                         else self.stages[j].questions)
+            if questions:
                 (index,) = indices
-                own["questions"] = tuple(self.stages[j].questions[index])
+                own["questions"] = tuple(questions[index])
                 stage = self.stages[j]
                 own["read_mask"] = question_ends(own["questions"],
                                                  stage.question_slots)

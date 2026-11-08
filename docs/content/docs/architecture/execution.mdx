@@ -86,6 +86,15 @@ extractions alone use their own prompt layout. Every other chain reads
 one document table: the first node's prompt head with each document,
 keyed by alias and document id, under one prefix tree.
 
+Under set attention a pipeline also runs in one loop, but each request
+there is a *pass*: one unpaged sequence of a state, a document and the
+text after it, then the questions asked of it. A `SetChain` gives each
+pass of each pass group, each join, and each classification of a
+join's pairs a stage of one `StageExecutor`, which asks each pass at
+its own stage only. A step's passes enter the loop once every pass of
+the step before has answered, because a step asks only the rows the
+steps before it kept.
+
 ### Reading the region's input
 
 `ModelRegionExec` reads every row of each input the region reads, then
@@ -108,8 +117,10 @@ then. So the runner sends rows on as the last step reports them:
   each forward pass's finished documents. Rust builds those documents'
   rows from the last step's outputs for them and the earlier steps'
   whole outputs, and `ModelRegionExec` hands them to DataFusion at once.
-- Any other last step, such as a pipeline, an extraction, a map, a
-  join, or an operator with a guard, sends its rows when it finishes.
+- Under set attention each step of a pipeline reports its rows when
+  the step finishes, while later steps run.
+- Any other last step, such as an extraction, a map, a join, or an
+  operator with a guard, sends its rows when it finishes.
 - A region with a fetch sends its rows once every row is in, so Rust
   can keep its first rows.
 - A row is sent once: when the step finishes, the runner sends only

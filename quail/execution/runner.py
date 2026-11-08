@@ -8,10 +8,9 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.execution.deduplicate import deduplicate
-from quail.execution.finished import finished_rows, finished_table, held
+from quail.execution.finished import held, report_outputs
 from quail.execution.guard import guarded
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
-from quail.execution.types import output_table
 from quail.physical import (
     ExecutionLocation,
     PhysicalGraph,
@@ -103,7 +102,7 @@ class GenericRunner:
             node_results[node.node_id] = result
             for observer in context.observers:
                 observer.after_node(node, result)
-            _report_outputs(node, result)
+            report_outputs(node, result)
 
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
         pipelines = graph.pipelines(completed) if context.run_pipeline else {}
@@ -199,22 +198,6 @@ def _renumbered(guard, deduplicated):
     its rows go once its result is expanded.
     """
     return held() if guard is not None or deduplicated is not None else nullcontext()
-
-
-def _report_outputs(node, result) -> None:
-    """Report each output of a finished node that the region's rows read.
-
-    A node's outputs are final once it finishes; rows its operator
-    reported before are skipped.
-    """
-    finished = finished_rows()
-    if finished is None:
-        return
-    ports = {port.name: port for port in node.outputs}
-    for name, value in result.outputs.items():
-        if finished.wants(node.node_id, name):
-            finished.report(finished_table(
-                node.node_id, name, output_table(node, ports[name], value)))
 
 
 def compute_subgraph(graph: PhysicalGraph) -> PhysicalGraph:

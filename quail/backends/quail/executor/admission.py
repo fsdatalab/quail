@@ -234,6 +234,13 @@ class AdmissionReport:
     transitions: tuple[tuple[int, int, bool], ...] = ()
 
 
+def _stop_counts(group) -> Counter:
+    """An anchor's copies in each stop key group; empty for None."""
+    if group is None:
+        return Counter()
+    return Counter(group if isinstance(group, tuple) else (group,))
+
+
 class JoinAdmission:
     """Scheduler that mixes documents at different stages within each chunk.
 
@@ -287,7 +294,9 @@ class JoinAdmission:
             None admits every anchor that fits.
         stop_groups: Per anchor, its stop key group, or None. An anchor
             that stands for copies in several groups gives a tuple with
-            one group per copy, so a group may repeat. An anchor is
+            one group per copy, so a group may repeat; an anchor whose
+            entry is None has no stop key and is never held or skipped
+            for one. An anchor is
             admitted while one of its groups has fewer than stop_width
             anchors in flight. A surviving anchor counts once for each
             of its copies in a group; once a group has num_key_survivors
@@ -322,6 +331,11 @@ class JoinAdmission:
             request exceed the chunk budget writes its prefix over
             several passes (see take_prefills); otherwise it raises
             OversizedDocumentError.
+        start_stages: Per anchor, the stage it starts at, or None to
+            start every anchor at the first stage.
+        one_stage: Whether each anchor asks only its start stage and
+            settles there, as a whole-sequence pass does; a limit then
+            counts the anchors that survive the last stage.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then the
@@ -349,7 +363,7 @@ class JoinAdmission:
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
                  stop_groups=None, stop_width=1, reserve=None, dependencies=None,
                  gated=(), num_key_survivors=1, skip=None, input_open=False,
-                 chunked_prefill=False):
+                 chunked_prefill=False, start_stages=None, one_stage=False):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -370,8 +384,7 @@ class JoinAdmission:
         self.survivors = 0
         n = len(prefix_tokens)
         self.groups = None if stop_groups is None else [
-            Counter(group if isinstance(group, tuple) else (group,))
-            for group in stop_groups]
+            _stop_counts(group) for group in stop_groups]
         if self.groups is not None and len(self.groups) != n:
             raise ValueError("stop_groups must match prefix_tokens")
         self._group_width = max(1, int(stop_width))
@@ -446,6 +459,8 @@ class JoinAdmission:
         self.answers = [dict() for _ in range(k)]
         self.input_open = input_open
         self.chunked_prefill = chunked_prefill
+        self.one_stage = one_stage
+        self._starts = []          # per anchor: the stage it starts at
         self._prefill = {}         # anchor -> its next prefix token to write
         self._prefilled = []       # anchors whose last piece is in this pass
         self.prefills = []         # this pass's pieces: (anchor, start, end)
@@ -458,8 +473,10 @@ class JoinAdmission:
             pages = self.page_cost(prefix_tokens[a] - self.borrowing.tree_shared[a]
                                    + self._extra)
             self._dependent_pages[parent] = max(self._dependent_pages[parent], pages)
+        starts = [0] * n if start_stages is None else list(start_stages)
         for a, prefix in enumerate(prefix_tokens):
-            self._register(prefix, resident.get(a), anchor_partners.get(a))
+            self._register(prefix, resident.get(a), anchor_partners.get(a),
+                           starts[a])
         # resident anchors first: they cost no prefix tokens and few
         # or no pages, so they never wait behind a page-blocked anchor
         n = len(self.prefix)
@@ -477,7 +494,8 @@ class JoinAdmission:
                     self._group_members.setdefault(group, set()).add(a)
 
     def add_documents(self, prefix_tokens, documents=None, resident=None,
-                      anchor_partners=None, stop_groups=None, stop_width=None):
+                      anchor_partners=None, stop_groups=None, stop_width=None,
+                      start_stages=None):
         """Queue anchors that arrive while the run is under way.
 
         They take the next anchor indices. A fresh anchor joins the
@@ -500,6 +518,8 @@ class JoinAdmission:
                 has them.
             stop_width: The anchors of one group in flight at once, now
                 that more have arrived, or None to keep it.
+            start_stages: The new anchors' start stages, or None for the
+                first stage.
 
         Returns:
             (anchor, old parent) for each queued anchor whose borrowed
@@ -516,17 +536,17 @@ class JoinAdmission:
         if self.groups is not None:
             if len(stop_groups) != count:
                 raise ValueError("stop_groups must match prefix_tokens")
-            self.groups.extend(
-                Counter(group if isinstance(group, tuple) else (group,))
-                for group in stop_groups)
+            self.groups.extend(_stop_counts(group) for group in stop_groups)
         if stop_width is not None:
             self._group_width = max(1, int(stop_width))
         moved = self.borrowing.add(count, documents)
         self._dependent_pages = np.concatenate(
             (self._dependent_pages, np.zeros(count, dtype=np.int64)))
+        starts = [0] * count if start_stages is None else list(start_stages)
         for index, prefix in enumerate(prefix_tokens):
             a = start + index
-            self._register(prefix, resident.get(a), anchor_partners.get(a))
+            self._register(prefix, resident.get(a), anchor_partners.get(a),
+                           starts[index])
         tree_shared = self.borrowing.tree_shared
         for a, _ in moved:
             # a queued anchor's shared tokens only grow as documents arrive
@@ -540,7 +560,7 @@ class JoinAdmission:
                 self._resident.add(a)
             if self._stage[a] != -1:
                 continue        # settled on arrival, with nothing to ask
-            if self.groups is not None and all(
+            if self.groups is not None and self.groups[a] and all(
                     group in self._group_done for group in self.groups[a]):
                 self._skip_queued(a)
                 continue
@@ -645,11 +665,12 @@ class JoinAdmission:
         lst = self._lists[a][j]
         return range(start, end) if lst is None else lst[start:end]
 
-    def _register(self, prefix, resident_pages, partners):
+    def _register(self, prefix, resident_pages, partners, start=0):
         """Record one anchor's costs; returns its index."""
         a = len(self.prefix)
         k = len(self.stages)
-        j = self.dependencies.get(a, (None, 0))[1]
+        self._starts.append(start)
+        j = self.dependencies.get(a, (None, start))[1]
         lazy = None
         if partners is None:
             lists = [None] * k
@@ -923,9 +944,9 @@ class JoinAdmission:
                 if self.skip is not None and self.skip(a):
                     self._skip_queued(a)
                     continue
-                j = 0
+                j = self._starts[a]
             hold = held_waiting if dependency is not None else held
-            if self.groups is not None and not any(
+            if self.groups is not None and self.groups[a] and not any(
                     self._group_busy.get(group, 0) < self._group_width
                     for group in self.groups[a] if group not in self._group_done):
                 hold.append(a)      # the group's anchors in flight are enough
@@ -1008,6 +1029,10 @@ class JoinAdmission:
         """The stage the document is at, or a negative number once it is done."""
         return self._stage[a]
 
+    def ended(self, a) -> bool:
+        """Whether the anchor is done: answered, dropped, or skipped."""
+        return self._stage[a] == _DONE
+
     def report(self, a, j, start, end, bits):
         """Record a group's answers and update document progress.
 
@@ -1047,7 +1072,8 @@ class JoinAdmission:
         settlements = []
         transitions = []
         dependent = a in self.dependencies
-        if not dependent and j == self._stage[a] and j + 1 < k:
+        last = dependent or self.one_stage or j == k - 1
+        if not last and j == self._stage[a]:
             if self._true[a][j] and self._next[a] == num_partners:
                 # the whole stream is launched, so every later chunk
                 # is behind it on the stream and the next stage's
@@ -1063,7 +1089,7 @@ class JoinAdmission:
                 self._stage[a] = _DONE
                 transitions.append((a, j, False))
                 settlements.append(Settlement("dropped", a, False))
-        if (dependent or j == k - 1) and complete:
+        if last and complete:
             self._stage[a] = _DONE
             self._count_survivor(self.dependencies[a][0] if dependent else a)
             survived = bool(self._true[a][j])

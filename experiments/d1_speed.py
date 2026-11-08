@@ -8,7 +8,7 @@ Both cells run on one H100 SXM over the 4,995 IMDB-11 reviews at scale
 factor 0.1 and its question. The Liquid cell times
 ``model.system_one_batch`` after ``model.compile()``, at its default
 token budget and at Quail's chunk budget. The Quail cell times
-``run_pass_group`` for IMDB-11's classification alone, and one
+a pass group run for IMDB-11's classification alone, and one
 mixed pass group (a yes/no, a choice, and a read in each review's
 pass), then profiles one more run of each with the torch profiler. It
 prints the CUDA time by kernel and by kind, and the host share: the
@@ -285,7 +285,8 @@ def quail_profile() -> dict:
     """
     from dataclasses import replace
 
-    from quail.backends.quail.executor.pass_groups import run_pass_group
+    from quail.backends.quail.executor.pass_groups import PassGroup
+    from quail.backends.quail.executor.set_passes import SetPasses
     from quail.common.document_ends import document_ends
     from quail.common.tokens import DocumentPrefixes
 
@@ -300,13 +301,17 @@ def quail_profile() -> dict:
     questions = [replace(question, ends=ends)
                  for question in _mixed_questions(encoder, spec)]
     prefixes = DocumentPrefixes(first.head, documents["r"], rows)
+
+    def ask(asked):
+        run = SetPasses(state)
+        return run.run(PassGroup(run, asked, prefixes).ask(prefixes),
+                       label="pass group")
+
     result = dict(
-        classify=_profile(
-            "classify", lambda: run_pass_group(state, questions[1:2], prefixes),
-            len(rows), lambda group: group.tokens),
-        mixed=_profile(
-            "mixed", lambda: run_pass_group(state, questions, prefixes),
-            len(rows), lambda group: group.tokens))
+        classify=_profile("classify", lambda: ask(questions[1:2]), len(rows),
+                          lambda group: group.tokens),
+        mixed=_profile("mixed", lambda: ask(questions), len(rows),
+                       lambda group: group.tokens))
     modal.Volume.from_name("quail-results").commit()
     print("RESULT quail " + json.dumps(result), flush=True)
     return result

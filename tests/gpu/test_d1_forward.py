@@ -278,7 +278,7 @@ def _packs():
         prefix = list(joined_state(list(first.head) + ids(review),
                                    first.state_tail, ends))
         ((_, suffix, shape),) = group_passes(
-            [prefix], [q.tokens for q in questions], first.header, 16, BUDGET)
+            len(prefix), [q.tokens for q in questions], first.header, 16, BUDGET)
         state = len(prefix)
         groups = [-1] * state + [number for number, length in enumerate(shape, 1)
                                  for _ in range(length)]
@@ -305,8 +305,8 @@ def _join_passes():
     from types import SimpleNamespace
 
     from quail.api.prompts import bind_join_prompt
-    from quail.backends.quail.executor.operators.join import join_pass_stage
-    from quail.backends.quail.executor.stages import question_ends
+    from quail.backends.quail.executor.operators import join as join_operator
+    from quail.backends.quail.executor.stages import Stage, question_ends
     from quail.backends.quail.lowering import set_join_parts
     from quail.common.expressions import ColumnRef
     from quail.physical.lowering import lower_prompt
@@ -329,10 +329,16 @@ def _join_passes():
             ("r", tuple(frame), _ends(head, frame, [ids(r) for r in REVIEWS])),
             ("a", separator, _ends((), separator, aspects))), **parts)
     prefixes = [head + ids(review) for review in REVIEWS]
-    stage, states, owners = join_pass_stage(
+    passes = join_operator.join_passes(
         node, prefixes, range(len(REVIEWS)), lambda anchor: None,
-        {"a": aspects}, None, spec.set_size, BUDGET)
-    states = [list(state) for state in states]
+        {"a": aspects}, spec.set_size, BUDGET)
+    # each pass is one anchor of the stage, asking its own suffix
+    stage = Stage(
+        suffixes=[request.suffixes.ids.tolist() for request in passes.requests],
+        readout=None, requests=lambda key: [key],
+        questions=tuple(request.questions[0] for request in passes.requests),
+        decide=lambda _, row: True)
+    states, owners = [list(state) for state in passes.states], passes.owners
     question = prompt.tail[len("\n\n"):].split("\n\nReply")[0]
     entries, first = [], 0
     for index, (state, anchor) in enumerate(zip(states, owners)):
@@ -450,7 +456,7 @@ def quail(prompts, answer_ids, loaded):
 
 
 def _execution_state(loaded, answer_ids):
-    """The execution state run_pass_group reads, over the loaded model."""
+    """The execution state a set-attention run reads, over the loaded model."""
     from types import SimpleNamespace
 
     from quail.backends.quail.executor.readout import AnswerRows
@@ -468,15 +474,17 @@ def _ask(loaded, answer_ids, questions):
     """Each question's answers for each review, all in one pass a review."""
     from dataclasses import replace
 
-    from quail.backends.quail.executor.pass_groups import run_pass_group
+    from quail.backends.quail.executor.pass_groups import PassGroup
+    from quail.backends.quail.executor.set_passes import SetPasses
 
     ids = _tokenizer()
     first = questions[0]
     ends = _ends(first.head, first.state_tail, [ids(r) for r in REVIEWS])
-    group = run_pass_group(
-        _execution_state(loaded, answer_ids),
-        [replace(question, ends=ends) for question in questions],
-        [list(first.head) + ids(review) for review in REVIEWS])
+    prefixes = [list(first.head) + ids(review) for review in REVIEWS]
+    run = SetPasses(_execution_state(loaded, answer_ids))
+    pass_group = PassGroup(run, [replace(question, ends=ends)
+                                 for question in questions], prefixes)
+    group = run.run(pass_group.ask(prefixes), label="pass group")
     assert group.positions.tolist() == list(range(len(REVIEWS)))
     return group.answers
 
