@@ -27,6 +27,11 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # .cargo/config.toml links Linux builds with clang and lld
+      - name: Install clang and lld
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+      # an editable install builds the dev profile; cargo test then
+      # reuses its compiled dependencies
       - run: uv sync --frozen
       - run: uv run --frozen python -c "import _quail_native"
       - name: Rust format

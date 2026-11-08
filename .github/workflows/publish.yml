@@ -23,8 +23,14 @@ jobs:
           version: "0.12.13"
           enable-cache: false
           python-version: "3.12"
+      # a wheel builds the release profile (pyproject.toml); it builds once,
+      # so Quail's crates take Cargo's default release settings rather
+      # than the workspace's incremental ones
       - name: Build
         run: uv build --no-sources
+        env:
+          CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       - name: Upload release files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
