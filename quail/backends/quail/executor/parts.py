@@ -18,6 +18,7 @@ from quail.common.expressions import effective_selectivity
 from quail.common.tokens import prefix_tree
 from quail.execution.answer_stops import answer_stop
 from quail.execution.rows import Rows
+from quail.execution.streaming import hinted_out
 from quail.physical import AiFilter, AiJoin, Filter, ValueType
 from quail.progress import logger
 
@@ -315,6 +316,9 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
             staging=input_staging(state), label=label, limit=limit,
             survival=survival(parts),
             stop_groups=stop_groups, num_key_survivors=num_key_survivors,
+            # a document a hint drops answers no first filter, so it leaves
+            skip=(hinted_out(anchor_keys)
+                  if getattr(parts[0], "drops_documents", False) else None),
             paged=paged,
             on_chunk=transition_reporter(parts), on_answers=on_answers,
             appended_tokens=max(part.appended_tokens for part in parts) or None,

@@ -26,6 +26,7 @@ impl RegionRunner for KeepsFirstReview {
         region: &ModelRegion,
         _inputs: Vec<InputStream>,
         _fetch: Option<usize>,
+        _hint: &quail_datafusion::RegionHint,
     ) -> Result<RegionBatches> {
         let schema = Arc::new(region.plan.schema().as_arrow().clone());
         // one row: each id column, such as a row number, read from "0"

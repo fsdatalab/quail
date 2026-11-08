@@ -26,6 +26,7 @@ impl RegionRunner for WaitsForTheReader {
         region: &ModelRegion,
         _inputs: Vec<InputStream>,
         _fetch: Option<usize>,
+        _hint: &quail_datafusion::RegionHint,
     ) -> Result<RegionBatches> {
         let schema = Arc::new(region.plan.schema().as_arrow().clone());
         let read = self.read.lock().expect("the lock").take().expect("one run");

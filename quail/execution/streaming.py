@@ -52,14 +52,27 @@ class RegionStream:
             the region's rows: each relation by (node id, port), the
             whole ones of the steps before the last and the last step's
             for the rows finished since the last call.
+        hint: The region's hint over its one input, Rust's
+            ``InputHint``, or None: ``keep()`` says whether each input
+            row may still pass the tests above the region, and
+            ``generation()`` changes whenever a test tightens.
+        alias: The alias of the scan that reads that input.
 
     Attributes:
         finished: Whether the last step finished and its rest was sent.
+        dropped: The input rows the hint dropped before the model asked
+            about them, by position.
     """
 
-    def __init__(self, on_outputs: Callable[[dict], None]):
+    def __init__(self, on_outputs: Callable[[dict], None], hint=None,
+                 alias: str | None = None):
         self.on_outputs = on_outputs
+        self.hint = hint
+        self.alias = alias
         self.finished = False
+        self.dropped = set()
+        self._generation = None
+        self._keep = None
         # the last step's operator whose rows are sent as they finish
         self._node = None
         self._before = {}
@@ -79,6 +92,22 @@ class RegionStream:
         """
         self._before = _tables(graph, results)
         self._node = node
+
+    def keeps(self, alias: str, document: int) -> bool:
+        """Whether the model should ask about a document of the alias.
+
+        False when the hint, as it is now, rejects the document's input
+        row; the hint is read again whenever it has tightened.
+        """
+        if self.hint is None or alias != self.alias:
+            return True
+        generation = self.hint.generation()
+        if generation != self._generation:
+            self._generation, self._keep = generation, self.hint.keep()
+        if self._keep[document]:
+            return True
+        self.dropped.add(document)
+        return False
 
     def wants(self, node) -> bool:
         """Whether the node's finished rows go to ``partial``."""
@@ -127,6 +156,28 @@ class RegionStream:
                 return
         self.finished = True
         self.on_outputs({**self._before, **tables})
+
+
+def hinted_out(keys) -> Callable[[int], bool] | None:
+    """Callable(anchor) -> whether the region's hint drops that document.
+
+    Args:
+        keys: Each anchor's arena key, (alias, document) for a document.
+
+    Returns:
+        None when no hint is installed.
+    """
+    stream = _STREAM
+    if stream is None or stream.hint is None:
+        return None
+
+    def skip(anchor: int) -> bool:
+        key = keys[anchor]
+        if not (isinstance(key, tuple) and len(key) == 2):
+            return False
+        return not stream.keeps(key[0], int(key[1]))
+
+    return skip
 
 
 def _tables(graph, results: Mapping) -> dict:

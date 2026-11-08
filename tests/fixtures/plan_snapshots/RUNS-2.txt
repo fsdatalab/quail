@@ -22,7 +22,7 @@ SortPreservingMergeExec: [n@1 DESC NULLS LAST, strategy@0 ASC NULLS LAST]
                 DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
               RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
                 ProjectionExec: expr=[strategy@0 as strategy, id@1 as __quail_key_r]
-                  ModelRegionExec
+                  ModelRegionExec: hint=[DynamicFilter [ empty ]]
 
 model region:
 logical:

@@ -9,6 +9,8 @@ a port name or a result shape.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pyarrow as pa
 
@@ -27,6 +29,7 @@ from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import true_answer_rows
 from quail.execution.rows import Rows, extraction_rows
 from quail.execution.spans import locate_span
+from quail.execution.streaming import region_stream
 from quail.physical import (
     AiClassify,
     AiExtract,
@@ -74,6 +77,9 @@ class Oracle:
             retains in the arena, as the executor would.
         join_metrics: Metrics every join stage reports beside its rows.
         streams: Whether a score call reports each row as it is scored.
+        pace: Seconds the oracle waits after each filter answer or score,
+            as a forward pass takes on the GPU; with a pace a filter
+            reports each document as it finishes.
         pipelines: Whether the executor groups operators into pipelines,
             as the GPU executor does; the oracle then runs a pipeline's
             nodes in order.
@@ -85,7 +91,7 @@ class Oracle:
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
                  answers=None, features=None, maps=None, *,
                  probabilities=False, retain=0, join_metrics=None,
-                 streams=False, pipelines=False):
+                 streams=False, pipelines=False, pace=0.0):
         self.filters = filters or {}
         self.joins = joins or {}
         self.labels = labels
@@ -97,6 +103,7 @@ class Oracle:
         self.retain = retain
         self.join_metrics = join_metrics
         self.streams_answers = streams
+        self.pace = pace
         self.arena = None
         self.texts = {}
         self.documents = {}
@@ -104,6 +111,7 @@ class Oracle:
         # planted truth uses, for an input that holds some of a table's rows
         self.source_rows = {}
         self.calls = []       # (spec name, rows) of every score or label call
+        self.asked = []       # (alias, document) of every filter answer
         # characters of map and extraction answers written, one a token,
         # and the answers stopped before their end
         self.answer_tokens = 0
@@ -216,6 +224,7 @@ class Oracle:
         if on_answers is not None:
             for position, value in enumerate(scores):
                 on_answers(np.array([position]), [value])
+                time.sleep(self.pace)
         return RerankerBatch(scores, fresh_tokens=len(rows), cached_tokens=0)
 
     # ---- answering ------------------------------------------------
@@ -226,6 +235,7 @@ class Oracle:
         needed = inputs.get("num_key_survivors", 1)
         survivors = {}
         answers = {}
+        stream = region_stream()
         for local, document in enumerate(document_ids):
             # a document that stands for copies has one group per copy
             found = (() if groups is None else groups[local]
@@ -234,11 +244,18 @@ class Oracle:
             # groups has enough survivors
             if found and all(survivors.get(group, 0) >= needed for group in found):
                 continue
+            # and a document the region's hint drops, before admitting it
+            if stream is not None and not stream.keeps(node.alias, int(document)):
+                continue
+            self.asked.append((node.alias, int(document)))
             answers[local] = [self._filter_answer(node, document)]
+            if self.pace and inputs.get("document_done") is not None:
+                inputs["document_done"]([(local, 0, bool(answers[local][0]))])
+                time.sleep(self.pace)
             if answers[local][0]:
                 for group in found:
                     survivors[group] = survivors.get(group, 0) + 1
-        if inputs.get("document_done") is not None:
+        if inputs.get("document_done") is not None and not self.pace:
             # the real loop reports a chunk's finished documents by position
             inputs["document_done"]([
                 (local, 0, bool(row[0])) for local, row in answers.items()])

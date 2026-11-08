@@ -243,7 +243,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                label=None, default_attention="tree", on_chunk=None,
                on_answers=None, stop_groups=None, appended_tokens=None,
                gpu_timing=False, survival=None, decoder=None, dependencies=None,
-               knee_rows=0, decode_cost=None, summary=True, num_key_survivors=1):
+               knee_rows=0, decode_cost=None, summary=True, num_key_survivors=1,
+               skip=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -279,6 +280,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             documents never run.
         num_key_survivors: How many documents of a stop key group must
             survive before the rest of the group is skipped.
+        skip: Optional callable(document index) -> bool asked before a
+            document is admitted; True skips it, so it never runs.
         paged: Whether documents' KV is written to arena pages. False
             runs one stage of one suffix per document as a single
             causal segment without pages: the filter fast path.
@@ -333,7 +336,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         appended_tokens=appended_tokens, gpu_timing=gpu_timing,
         decoder=decoder, dependencies=dependencies, knee_rows=knee_rows,
         summary=summary,
-        decode_cost=decode_cost, num_key_survivors=num_key_survivors,
+        decode_cost=decode_cost, num_key_survivors=num_key_survivors, skip=skip,
     ).run()
 
 

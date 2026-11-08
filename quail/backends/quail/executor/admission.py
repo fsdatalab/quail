@@ -214,6 +214,9 @@ class JoinAdmission:
             widens it when the groups are too few to fill a chunk.
         num_key_survivors: How many anchors of a stop key group must
             survive before its queued anchors are skipped.
+        skip: Optional callable(anchor) -> bool asked each time a fresh
+            anchor would be admitted; True skips it: it never runs and
+            take_skipped() lists it.
         extra_tokens: Rows past the prefix an anchor's pages must
             cover, when more than its largest frame: a stage whose
             one suffix is written into the anchor's own pages.
@@ -250,7 +253,7 @@ class JoinAdmission:
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
                  stop_groups=None, stop_width=1, reserve=None, dependencies=None,
-                 gated=(), num_key_survivors=1):
+                 gated=(), num_key_survivors=1, skip=None):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -265,6 +268,7 @@ class JoinAdmission:
         for anchor, (parent, stage) in self.dependencies.items():
             self.dependents.setdefault((parent, stage), []).append(anchor)
         self.advance = advance
+        self.skip = skip
         self.limit = limit
         self.survival = survival
         self.survivors = 0
@@ -677,6 +681,9 @@ class JoinAdmission:
                 if self._stage[a] == _DONE:
                     self._dead -= 1     # skipped by its group's survivor
                     continue
+                if self.skip is not None and self.skip(a):
+                    self._skip_queued(a)
+                    continue
                 j = 0
             hold = held_waiting if dependency is not None else held
             if self.groups is not None and not any(
@@ -887,6 +894,15 @@ class JoinAdmission:
                 self._zero_cost -= 1
         self._dead += len(skipped)
         self._skipped.extend(skipped)
+
+    def _skip_queued(self, a):
+        """Skip a fresh anchor taken off the queue: it never runs."""
+        self._stage[a] = _DONE
+        if not self._page_cost[a]:
+            self._zero_cost -= 1
+        if self.groups is not None:
+            self._group_members[self.groups[a]].discard(a)
+        self._skipped.append(a)
 
     def take_skipped(self):
         """Remove and return the queued anchors a done group skipped."""

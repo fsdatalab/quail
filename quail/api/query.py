@@ -559,11 +559,16 @@ class RegionQuery:
         self._collect_answers(result, plan, tables)
         return result
 
-    def region_stream(self, on_rows) -> RegionStream | None:
+    def region_stream(self, on_rows, hint=None) -> RegionStream | None:
         """Return the stream that hands ``on_rows`` the region's rows as they finish.
 
         None for a region with a fetch: Rust keeps its first rows once
         every row is in.
+
+        Args:
+            on_rows: Callable(pyarrow Table) handed each batch of rows.
+            hint: Rust's ``InputHint`` over the region's one input, which
+                the executor skips the input's rows by, or None.
         """
         if json.loads(self.operators).get("fetch") is not None:
             return None
@@ -574,7 +579,10 @@ class RegionQuery:
             if rows.num_rows:
                 on_rows(rows)
 
-        return RegionStream(send)
+        alias = None if hint is None else next(
+            (scan["alias"] for scan in self.facts()["scans"]
+             if scan["provider"] == hint.table), None)
+        return RegionStream(send, hint, alias)
 
     def _source_values(self, name: str, expression: str) -> pa.Table:
         """Return a source column's values for each document of its table.

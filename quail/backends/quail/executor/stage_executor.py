@@ -112,7 +112,7 @@ class StageExecutor:
     def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
-                 default_attention, on_chunk, on_answers, stop_groups=None,
+                 default_attention, on_chunk, on_answers, stop_groups=None, skip=None,
                  appended_tokens=None, gpu_timing=False, survival=None,
                  decoder=None, dependencies=None, knee_rows=0, decode_cost=None,
                  summary=True, num_key_survivors=1):
@@ -276,6 +276,7 @@ class StageExecutor:
             stop_groups=stop_groups,
             stop_width=max(self._stop_width(stop_groups, budget), num_key_survivors),
             num_key_survivors=num_key_survivors,
+            skip=skip,
             extra_tokens=self.capacity_extra,
             gated=[j for j, stage in enumerate(self.stages)
                    if stage.prepare is not None],

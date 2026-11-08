@@ -93,7 +93,7 @@ region's:
 ```text
 DataFusion:
 SortExec: TopK(fetch=25), expr=[commit_score@1 DESC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[false]
-  ModelRegionExec
+  ModelRegionExec: hint=[DynamicFilter [ empty ]]
     FilterExec: deal_stage@1 = Negotiation, projection=[id@0, transcript@2]
       DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 ```
@@ -106,6 +106,9 @@ region's last operator is a filter, score, or classification, and
 otherwise its rows once that operator finishes. With several GPUs, the
 coordinator merges each GPU's outputs first and sends the rows at the
 end.
+
+`hint=[...]` lists the dynamic filters the operators above hand the
+region; see [Runtime filters](#runtime-filters).
 
 When the SELECT list reads a table's columns besides its id,
 DataFusion joins the table back above the region. For example, a query
@@ -126,6 +129,40 @@ region's rows across partitions and picks the join's build side from
 the statistics it has. When DataFusion computes a table's rows for the
 region, the join reads them through the same `SharedInputExec` as the
 region, so they are computed once.
+
+### Runtime filters
+
+A top-k sort and a hash join each make a *dynamic filter*: a test of
+the rows below them that they tighten while the query runs. A top-k
+sort's test passes only rows that would enter its top k once it holds
+k rows; a hash join's passes only rows whose key is among its build
+side's keys once that side is complete. DataFusion pushes each one down
+to the operators below that can use it.
+
+`ModelRegionExec` takes these filters as the region's hint: a row
+where the test is not TRUE leaves the query above anyway, so the
+region may drop it before asking the model. The operators above still
+apply the test. The region uses the hint when its rows each come from
+one row of one table, with no join, fetch, or stop key:
+
+- A test that reads only columns the region passes on from that table,
+  such as an id, is decided for each row before the model runs.
+- Before planning, the region drops the input rows the hint rejects
+  as it is then. A table the region reads by name keeps its rows.
+- While the region runs, the executor reads the hint again before it
+  admits each document to a first filter, and skips a document the
+  hint now rejects. The test tightens as DataFusion reads the region's
+  rows, which stream out as they finish.
+- The region starts when DataFusion first reads it. A hash join reads
+  its probe side once its build side is complete, so the join's filter
+  is final before the region reads it.
+
+For example, `SELECT c.id FROM contracts c WHERE AI.IF(...) ORDER BY
+c.id LIMIT 20` asks the filter in id order; once 20 contracts pass and
+reach the sort, every later contract has a larger id and is skipped.
+With an extraction after the filter, as in CUAD-15, the region's last
+step is a pipeline, which sends its rows when it finishes, so the sort
+holds no rows while the region runs and the hint skips nothing.
 
 Only an ORDER BY sets the order of the result rows. Without one, the
 rows can come back in any order, and a LIMIT returns any of the rows

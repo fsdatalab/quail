@@ -122,6 +122,7 @@ impl RegionRunner for KeepsTwoReviews {
         region: &ModelRegion,
         _inputs: Vec<InputStream>,
         _fetch: Option<usize>,
+        _hint: &quail_datafusion::RegionHint,
     ) -> Result<RegionBatches> {
         let schema = region.plan.schema();
         let pairs = schema

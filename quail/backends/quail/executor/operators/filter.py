@@ -53,6 +53,8 @@ class FilterPart(SingleResultPart):
     """Filter stages and result tables within a pipeline."""
 
     execute_group = staticmethod(execute_filters)
+    # a document skipped before it runs is one the filter drops
+    drops_documents = True
 
     @staticmethod
     def model_inputs(node, inputs, context, sequence=None, nodes=None):

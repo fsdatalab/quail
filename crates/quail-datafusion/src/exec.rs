@@ -7,16 +7,21 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::runtime::SpawnedTask;
-use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, internal_err};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
@@ -27,6 +32,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::{StreamExt, stream};
 
 use crate::region::ModelRegion;
+use crate::region_hint::RegionHint;
 use crate::shared::{SharedInput, SharedInputExec, SharedRowsByKey};
 
 /// The rows of one region input: its table name and its batches.
@@ -65,12 +71,14 @@ pub trait RegionRunner: fmt::Debug + Send + Sync {
     /// DataFusion computes them. Each input holds at least one batch, or
     /// has ended, when the call starts. `fetch` is the most rows
     /// DataFusion reads, when a LIMIT above the region says so; a
-    /// runner may stop the model once it has that many.
+    /// runner may stop the model once it has that many. The region may
+    /// drop each row where a test of `hint` is not TRUE.
     fn run(
         &self,
         region: &ModelRegion,
         inputs: Vec<InputStream>,
         fetch: Option<usize>,
+        hint: &RegionHint,
     ) -> Result<RegionBatches>;
 }
 
@@ -83,6 +91,8 @@ pub struct ModelRegionExec {
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     /// The most rows DataFusion reads, from its limit pushdown.
     fetch: Option<usize>,
+    /// The dynamic filters the operators above handed the region.
+    hint: RegionHint,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -107,9 +117,19 @@ impl ModelRegionExec {
             runner,
             inputs,
             fetch: None,
+            hint: RegionHint::default(),
             schema,
             properties: Arc::new(properties),
         }
+    }
+
+    /// The operator with the same region, hint, and fetch over other
+    /// inputs.
+    fn with_inputs(&self, inputs: Vec<Arc<dyn ExecutionPlan>>) -> Self {
+        let mut exec = Self::new(self.region.clone(), Arc::clone(&self.runner), inputs);
+        exec.fetch = self.fetch;
+        exec.hint = self.hint.clone();
+        exec
     }
 
     /// The region this operator runs.
@@ -123,10 +143,23 @@ impl DisplayAs for ModelRegionExec {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "ModelRegionExec")?;
-                match self.fetch.or(self.region.fetch) {
-                    Some(fetch) => write!(f, ": fetch={fetch}"),
-                    None => Ok(()),
+                let mut details = Vec::new();
+                if let Some(fetch) = self.fetch.or(self.region.fetch) {
+                    details.push(format!("fetch={fetch}"));
                 }
+                if !self.hint.is_empty() {
+                    let tests: Vec<String> = self
+                        .hint
+                        .tests
+                        .iter()
+                        .map(|test| test.to_string())
+                        .collect();
+                    details.push(format!("hint=[{}]", tests.join(", ")));
+                }
+                if details.is_empty() {
+                    return Ok(());
+                }
+                write!(f, ": {}", details.join(", "))
             }
             DisplayFormatType::TreeRender => write!(f, ""),
         }
@@ -152,11 +185,7 @@ impl ExecutionPlan for ModelRegionExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        let mut exec = Self::new(
-            self.region.clone(),
-            Arc::clone(&self.runner),
-            self.inputs.clone(),
-        );
+        let mut exec = self.with_inputs(self.inputs.clone());
         exec.fetch = limit;
         Some(Arc::new(exec))
     }
@@ -167,9 +196,43 @@ impl ExecutionPlan for ModelRegionExec {
 
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
+        // the operator that made a dynamic filter fills it only when an
+        // operator below holds it
+        for test in &self.hint.tests {
+            if f(test)? == TreeNodeRecursion::Stop {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
         Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // the operators above still apply every filter: the region only
+        // may drop the rows a filter rejects
+        let filters = vec![PushedDown::No; child_pushdown_result.parent_filters.len()];
+        let dynamic: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
+            .parent_filters
+            .into_iter()
+            .map(|found| found.filter)
+            .filter(|test| {
+                test.exists(|expr| Ok(expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some()))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let propagation = FilterPushdownPropagation::with_parent_pushdown_result(filters);
+        if phase != FilterPushdownPhase::Post || dynamic.is_empty() {
+            return Ok(propagation);
+        }
+        let mut exec = self.with_inputs(self.inputs.clone());
+        exec.hint.tests.extend(dynamic);
+        Ok(propagation.with_updated_node(Arc::new(exec)))
     }
 
     fn replace_children(
@@ -177,9 +240,7 @@ impl ExecutionPlan for ModelRegionExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
         _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut exec = Self::new(self.region.clone(), Arc::clone(&self.runner), children);
-        exec.fetch = self.fetch;
-        Ok(Arc::new(exec))
+        Ok(Arc::new(self.with_inputs(children)))
     }
 
     fn with_new_children(
@@ -204,72 +265,81 @@ impl ExecutionPlan for ModelRegionExec {
         let runner = Arc::clone(&self.runner);
         let inputs = self.inputs.clone();
         let fetch = self.fetch;
+        let hint = self.hint.clone();
         let (sender, receiver) = mpsc::unbounded::<Result<RecordBatch>>();
-        let task = SpawnedTask::spawn(async move {
-            // each input's batches go to a channel the runner reads; the
-            // tasks live as long as this one
-            let mut readers = Vec::new();
-            let mut streams: Vec<InputStream> = Vec::new();
-            let mut first = Vec::new();
-            for (name, input) in region.input_names.iter().zip(inputs) {
-                let (batches, received) = std::sync::mpsc::channel();
-                let (arrived, waiting) = oneshot::channel::<()>();
-                let context = Arc::clone(&context);
-                readers.push(SpawnedTask::spawn(async move {
-                    let mut arrived = Some(arrived);
-                    match execute_stream(input, context) {
-                        Ok(mut found) => {
-                            while let Some(batch) = found.next().await {
-                                if batches.send(batch).is_err() {
-                                    break;
-                                }
-                                if let Some(arrived) = arrived.take() {
-                                    let _ = arrived.send(());
+        // the region starts when DataFusion first reads it: a hash join
+        // reads its probe side once its build side, and so its filter, is
+        // complete
+        let start = move || {
+            SpawnedTask::spawn(async move {
+                // each input's batches go to a channel the runner reads; the
+                // tasks live as long as this one
+                let mut readers = Vec::new();
+                let mut streams: Vec<InputStream> = Vec::new();
+                let mut first = Vec::new();
+                for (name, input) in region.input_names.iter().zip(inputs) {
+                    let (batches, received) = std::sync::mpsc::channel();
+                    let (arrived, waiting) = oneshot::channel::<()>();
+                    let context = Arc::clone(&context);
+                    readers.push(SpawnedTask::spawn(async move {
+                        let mut arrived = Some(arrived);
+                        match execute_stream(input, context) {
+                            Ok(mut found) => {
+                                while let Some(batch) = found.next().await {
+                                    if batches.send(batch).is_err() {
+                                        break;
+                                    }
+                                    if let Some(arrived) = arrived.take() {
+                                        let _ = arrived.send(());
+                                    }
                                 }
                             }
+                            Err(error) => {
+                                let _ = batches.send(Err(error));
+                            }
                         }
-                        Err(error) => {
-                            let _ = batches.send(Err(error));
-                        }
-                    }
-                }));
-                streams.push((name.clone(), Box::new(received.into_iter())));
-                first.push(waiting);
-            }
-            // a region starts once each input has a batch or has ended: an
-            // input that is another region's rows then runs first, on the
-            // same thread
-            for waiting in first {
-                let _ = waiting.await;
-            }
-            // the runner blocks while the region runs; Quail's hands the
-            // region to the thread that called DataFusion
-            let run = SpawnedTask::spawn_blocking(move || {
-                let batches = match runner.run(&region, streams, fetch) {
-                    Ok(batches) => batches,
-                    Err(error) => {
-                        let _ = sender.unbounded_send(Err(error));
-                        return;
-                    }
-                };
-                for batch in (Limited {
-                    batches,
-                    remaining: fetch,
-                }) {
-                    // the receiver is gone once DataFusion stops reading
-                    if sender.unbounded_send(batch).is_err() {
-                        return;
-                    }
+                    }));
+                    streams.push((name.clone(), Box::new(received.into_iter())));
+                    first.push(waiting);
                 }
-            });
-            let _ = run.join().await;
-            drop(readers);
-        });
+                // a region starts once each input has a batch or has ended: an
+                // input that is another region's rows then runs first, on the
+                // same thread
+                for waiting in first {
+                    let _ = waiting.await;
+                }
+                // the runner blocks while the region runs; Quail's hands the
+                // region to the thread that called DataFusion
+                let run = SpawnedTask::spawn_blocking(move || {
+                    let batches = match runner.run(&region, streams, fetch, &hint) {
+                        Ok(batches) => batches,
+                        Err(error) => {
+                            let _ = sender.unbounded_send(Err(error));
+                            return;
+                        }
+                    };
+                    for batch in (Limited {
+                        batches,
+                        remaining: fetch,
+                    }) {
+                        // the receiver is gone once DataFusion stops reading
+                        if sender.unbounded_send(batch).is_err() {
+                            return;
+                        }
+                    }
+                });
+                let _ = run.join().await;
+                drop(readers);
+            })
+        };
         // the task lives as long as the stream: dropping the stream ends it
-        let batches = stream::unfold((receiver, task), |(mut receiver, task)| async move {
-            let batch = receiver.next().await?;
-            Some((batch, (receiver, task)))
-        });
+        let batches =
+            stream::once(async move { (receiver, start()) }).flat_map(|(receiver, task)| {
+                stream::unfold((receiver, task), |(mut receiver, task)| async move {
+                    let batch = receiver.next().await?;
+                    Some((batch, (receiver, task)))
+                })
+            });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
             batches,

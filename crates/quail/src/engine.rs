@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, RecordBatch};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Constraints, DataFusionError, Result};
@@ -21,7 +22,8 @@ use std::collections::HashMap;
 
 use quail_datafusion::{
     IdentifiedTable, InputBatches, InputRows, InputStream, ModelRegion, RegionBatches,
-    RegionRunner, SharedInput, collect_inputs, derive, quail_column_names,
+    RegionColumns, RegionHint, RegionRunner, SharedInput, collect_inputs, derive,
+    quail_column_names,
 };
 use quail_planner::operators::Operators;
 use quail_planner::prompts::Turn;
@@ -59,6 +61,7 @@ pub(crate) struct RegionCall {
     pub(crate) region: ModelRegion,
     pub(crate) inputs: Vec<InputStream>,
     pub(crate) fetch: Option<usize>,
+    pub(crate) hint: RegionHint,
     pub(crate) rows: RowSender,
 }
 
@@ -101,6 +104,35 @@ impl Iterator for ReceivedRows {
                 )))
             }
         }
+    }
+}
+
+/// A region's hint over the rows of its one input that the executor
+/// reads: whether each row may still pass the tests above the region, as
+/// they tighten while the region runs.
+#[pyclass(name = "InputHint", module = "_quail_native", frozen)]
+pub(crate) struct InputHint {
+    hint: RegionHint,
+    columns: RegionColumns,
+    rows: RecordBatch,
+    /// The table name the region reads the input by.
+    #[pyo3(get)]
+    table: String,
+}
+
+#[pymethods]
+impl InputHint {
+    /// A number that changes whenever a test tightens.
+    fn generation(&self) -> u64 {
+        self.hint.generation()
+    }
+
+    /// Whether each input row, in the order the executor reads them, may
+    /// still pass every test.
+    fn keep(&self) -> PyResult<Vec<bool>> {
+        self.hint
+            .keep(&self.columns, &self.table, &self.rows)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 }
 
@@ -212,7 +244,14 @@ impl PythonRunner {
 
     /// Run a call's region on this thread and send its rows, then the end.
     pub(crate) fn serve(&self, call: RegionCall) {
-        if let Err(error) = self.run_here(&call.region, call.inputs, call.fetch, &call.rows) {
+        let found = self.run_here(
+            &call.region,
+            call.inputs,
+            call.fetch,
+            &call.hint,
+            &call.rows,
+        );
+        if let Err(error) = found {
             let _ = call.rows.send(RegionRows::Batch(Err(error)));
         }
         let _ = call.rows.send(RegionRows::Done);
@@ -224,25 +263,42 @@ impl PythonRunner {
     /// A region that asks each row of its one input on its own runs the
     /// input in windows of rows as they arrive, each planned on its own
     /// rows; any other region, and an input that ends within one window,
-    /// runs once over every row.
+    /// runs once over every row. Such a region also drops each input row
+    /// a test of `hint` rejects, by the input columns it passes on, before
+    /// planning, and hands the executor the hint to drop rows by as it
+    /// tightens.
     fn run_here(
         &self,
         region: &ModelRegion,
         inputs: Vec<InputStream>,
         fetch: Option<usize>,
+        hint: &RegionHint,
         rows: &RowSender,
     ) -> Result<()> {
         let payload = self.request(region)?;
+        let columns = RegionColumns::of(region);
+        let source = match self.planning.is_some() && fetch.is_none() && !hint.is_empty() {
+            true => hinted_table(region, &payload)?,
+            false => None,
+        };
+        let hint = source.as_deref().map(|table| (hint, &columns, table));
         if !(self.planning.is_some() && fetch.is_none() && row_local(region, &payload)?) {
             let inputs = collect_inputs(inputs)?;
-            return self.run_window(region, &payload, &inputs, fetch, rows);
+            return self.run_window(region, &payload, &inputs, fetch, hint, rows);
         }
         let size = self.input_window_rows()?;
         let mut inputs = inputs;
         let (name, mut batches) = inputs.remove(0);
         loop {
             let (window, ended) = read_window(&mut batches, size)?;
-            self.run_window(region, &payload, &[(name.clone(), window)], fetch, rows)?;
+            self.run_window(
+                region,
+                &payload,
+                &[(name.clone(), window)],
+                fetch,
+                hint,
+                rows,
+            )?;
             if ended {
                 return Ok(());
             }
@@ -262,16 +318,20 @@ impl PythonRunner {
     }
 
     /// Plan and run the region over these rows of its inputs, sending
-    /// its rows to `rows`.
+    /// its rows to `rows`. With a hint over the one table the region
+    /// reads, an input's rows the hint rejects are dropped first, and
+    /// the executor reads the hint as it tightens.
     fn run_window(
         &self,
         region: &ModelRegion,
         payload: &str,
         inputs: &[InputRows],
         fetch: Option<usize>,
+        hint: Option<(&RegionHint, &RegionColumns, &str)>,
         rows: &RowSender,
     ) -> Result<()> {
-        let sorted;
+        let mut sorted;
+        let mut held = None;
         let (planned, inputs) = if self.planning.is_some() {
             sorted = inputs
                 .iter()
@@ -280,6 +340,26 @@ impl PythonRunner {
                     Ok((name.clone(), in_source_order(input, batches)?))
                 })
                 .collect::<Result<Vec<InputRows>>>()?;
+            if let Some((hint, columns, table)) = hint {
+                let found = sorted.iter().position(|(name, _)| name == table);
+                let found_rows = match found {
+                    Some(input) => {
+                        let schema = Arc::new(region.inputs[input].schema().as_arrow().clone());
+                        let window = concat_batches(&schema, &sorted[input].1)?;
+                        let keep = BooleanArray::from(hint.keep(columns, table, &window)?);
+                        let window = filter_record_batch(&window, &keep)?;
+                        sorted[input].1 = vec![window.clone()];
+                        Some(window)
+                    }
+                    None => named_rows(region, table)?,
+                };
+                held = found_rows.map(|rows| InputHint {
+                    hint: hint.clone(),
+                    columns: columns.clone(),
+                    rows,
+                    table: table.to_string(),
+                });
+            }
             (
                 self.plan_here(region, &sorted, payload, fetch)?,
                 sorted.as_slice(),
@@ -305,8 +385,9 @@ impl PythonRunner {
             let answer = match &planned {
                 Some(found) => {
                     let sink = Bound::new(py, sink)?;
+                    let hint = held.map(|hint| Bound::new(py, hint)).transpose()?;
                     self.engine
-                        .call_method1(py, "execute", (found, tables, sink))?
+                        .call_method1(py, "execute", (found, tables, sink, hint))?
                 }
                 None => self
                     .engine
@@ -338,6 +419,7 @@ impl RegionRunner for PythonRunner {
         region: &ModelRegion,
         inputs: Vec<InputStream>,
         fetch: Option<usize>,
+        hint: &RegionHint,
     ) -> Result<RegionBatches> {
         let caller = self.caller.lock().expect("the caller lock").clone();
         let (rows, receiver) = std::sync::mpsc::channel();
@@ -345,6 +427,7 @@ impl RegionRunner for PythonRunner {
             region: region.clone(),
             inputs,
             fetch,
+            hint: hint.clone(),
             rows,
         };
         match caller {
@@ -381,20 +464,61 @@ fn read_window(batches: &mut InputBatches, size: usize) -> Result<(Vec<RecordBat
 /// alone: no join, no table read by name, no fetch, and no stop key, so
 /// the region can run its input's rows in windows.
 fn row_local(region: &ModelRegion, payload: &str) -> Result<bool> {
-    use datafusion::common::tree_node::TreeNode;
-    use datafusion::datasource::source_as_provider;
-    use datafusion::logical_expr::LogicalPlan;
     let (operators, _) = read_region_json(payload)?;
-    let named = region.plan.exists(|node| {
-        Ok(matches!(node, LogicalPlan::TableScan(scan)
-            if source_as_provider(&scan.source)
-                .is_ok_and(|provider| provider.downcast_ref::<IdentifiedTable>().is_some())))
-    })?;
     Ok(region.inputs.len() == 1
-        && !named
+        && identified_scans(region)?.is_empty()
         && operators.joins.is_empty()
         && operators.fetch.is_none()
         && operators.stop_keys.is_empty())
+}
+
+/// The one table a region reads, by input name or table name, when a
+/// hint over it can drop the region's rows: each row comes from one row
+/// of that table, with no join, fetch, or stop key.
+fn hinted_table(region: &ModelRegion, payload: &str) -> Result<Option<String>> {
+    let (operators, _) = read_region_json(payload)?;
+    if !(operators.joins.is_empty() && operators.fetch.is_none() && operators.stop_keys.is_empty())
+    {
+        return Ok(None);
+    }
+    let mut tables: Vec<String> = region.input_names.clone();
+    for (name, _) in identified_scans(region)? {
+        if !tables.contains(&name) {
+            tables.push(name);
+        }
+    }
+    Ok(match tables.as_slice() {
+        [table] => Some(table.clone()),
+        _ => None,
+    })
+}
+
+/// Each identified table a region's plan reads by name, by table name.
+fn identified_scans(region: &ModelRegion) -> Result<Vec<(String, Arc<dyn TableProvider>)>> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    let mut found: Vec<(String, Arc<dyn TableProvider>)> = Vec::new();
+    region.plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = source_as_provider(&scan.source)
+            && provider.downcast_ref::<IdentifiedTable>().is_some()
+        {
+            found.push((scan.table_name.table().to_string(), provider));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(found)
+}
+
+/// Every row of a table the region reads by name, as one batch, when
+/// its rows come from Python.
+fn named_rows(region: &ModelRegion, table: &str) -> Result<Option<RecordBatch>> {
+    let found = named_tables(region)?;
+    let Some(rows) = found.get(table) else {
+        return Ok(None);
+    };
+    Ok(Some(concat_batches(&rows.schema, &rows.batches)?))
 }
 
 /// A region as JSON: `operators`, its operators as JSON text, and
@@ -510,19 +634,7 @@ fn in_source_order(
 /// The rows and identity of each identified table a region reads by
 /// name, by table name.
 fn named_tables(region: &ModelRegion) -> Result<HashMap<String, TableRows>> {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-    use datafusion::datasource::source_as_provider;
-    use datafusion::logical_expr::LogicalPlan;
-    let mut found: Vec<(String, Arc<dyn TableProvider>)> = Vec::new();
-    region.plan.apply(|node| {
-        if let LogicalPlan::TableScan(scan) = node
-            && let Ok(provider) = source_as_provider(&scan.source)
-            && provider.downcast_ref::<IdentifiedTable>().is_some()
-        {
-            found.push((scan.table_name.table().to_string(), provider));
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
+    let found = identified_scans(region)?;
     let mut tables = HashMap::new();
     for (name, provider) in found {
         let table = provider

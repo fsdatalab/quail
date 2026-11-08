@@ -221,3 +221,29 @@ def test_a_large_input_runs_in_windows_with_the_same_rows():
     assert _same_rows(windowed, whole, ordered=False)
     assert whole.num_rows == 3
     session.close()
+
+
+def _paced_context(oracle, rows: int):
+    """A context over `rows` reviews r00, r01, ..., answered by `oracle`."""
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    reviews = pa.table({
+        "id": [f"r{index:02d}" for index in range(rows)],
+        "body": [f"review number {index} " * 4 for index in range(rows)],
+        "stars": [index % 5 for index in range(rows)],
+    })
+    context.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
+    return context
+
+
+def test_a_top_k_on_an_input_column_hands_the_region_its_threshold():
+    text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
+            "ORDER BY r.id LIMIT 2")
+    every = Oracle(filters=lambda alias, document, position: True, pace=0.05)
+    context = _paced_context(every, 12)
+    assert "ModelRegionExec: hint=[DynamicFilter" in context._native.explain(text)
+    table = context.sql(text)
+    assert _rows(table) == [("r00",), ("r01",)]
+    # once two reviews pass, every later id is past the top two
+    assert len(every.asked) < 6
+    context.session.close()

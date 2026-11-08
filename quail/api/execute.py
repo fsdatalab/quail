@@ -98,7 +98,8 @@ def _execute_physical(request, registry):
 
 
 def execute_query(query, physical_executor=None, plan=None,
-                  on_backend_ready=None, on_execution_ready=None, on_rows=None):
+                  on_backend_ready=None, on_execution_ready=None, on_rows=None,
+                  hint=None):
     """Execute one query in its session's process.
 
     Args:
@@ -111,6 +112,7 @@ def execute_query(query, physical_executor=None, plan=None,
             immediately before query execution.
         on_rows: Optional callable(pyarrow Table) handed a model region's
             rows as they finish, each row once.
+        hint: Optional ``InputHint`` the region may skip input rows by.
     """
     from quail.api.query import Query
 
@@ -118,7 +120,7 @@ def execute_query(query, physical_executor=None, plan=None,
         return _execute_in_datafusion(query, physical_executor, plan,
                                       on_backend_ready, on_execution_ready)
     return _execute_region(query, physical_executor, plan,
-                           on_backend_ready, on_execution_ready, on_rows)
+                           on_backend_ready, on_execution_ready, on_rows, hint)
 
 
 def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
@@ -137,12 +139,12 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     results, region_tables, region_s = [], [], []
     started = time.perf_counter()
 
-    def run_query(region, on_rows=None):
+    def run_query(region, on_rows=None, hint=None):
         if plan is not None and results:
             raise RuntimeError("an edited plan is for a query of one model region")
         region_started = time.perf_counter()
         result = _execute_region(region, physical_executor, plan,
-                                 on_backend_ready, on_execution_ready, on_rows)
+                                 on_backend_ready, on_execution_ready, on_rows, hint)
         region_s.append(time.perf_counter() - region_started)
         results.append(result)
         table = result.collect()
@@ -173,7 +175,7 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
 
 
 def _execute_region(query, physical_executor, plan, on_backend_ready,
-                    on_execution_ready, on_rows=None):
+                    on_execution_ready, on_rows=None, hint=None):
     """Execute one model region's Query in its session's process.
 
     With ``on_rows``, the region's rows go to it as they finish, each
@@ -214,7 +216,7 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
     if on_execution_ready is not None:
         on_execution_ready()
     started = time.perf_counter()
-    stream = None if on_rows is None else query.region_stream(on_rows)
+    stream = None if on_rows is None else query.region_stream(on_rows, hint)
     if has_compute:
         with streaming(stream):
             response = (physical_executor(request) if physical_executor is not None
