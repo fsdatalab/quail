@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use arrow::ipc::reader::StreamReader;
@@ -43,7 +43,7 @@ use quail_planner::stages::{Stage, stages};
 const KEY: &str = "quail.key";
 
 /// A table's schema and batches.
-type Table = (SchemaRef, Vec<RecordBatch>);
+pub type Table = (SchemaRef, Vec<RecordBatch>);
 
 /// What one partition of a stage wrote: each output port's rows, in the
 /// order of the stage's outputs.
@@ -120,7 +120,7 @@ impl Server {
 
     /// Run one stage on the server's GPU over its inputs' rows.
     fn call(&mut self, stage: usize, inputs: &[Table]) -> Result<Reply> {
-        let header = serde_json::json!({"stage": stage}).to_string();
+        let header = serde_json::json!({"stage": stage, "inputs": inputs.len()}).to_string();
         write_frame(&mut self.writer, header.as_bytes())?;
         for input in inputs {
             write_frame(&mut self.writer, &table_bytes(input)?)?;
@@ -147,6 +147,86 @@ impl Server {
     fn end(&mut self) -> Result<()> {
         write_frame(&mut self.writer, br#"{"end": true}"#)?;
         self.writer.flush()?;
+        Ok(())
+    }
+}
+
+/// The server end of a region's connection, on one GPU: it reads the
+/// stages [`Server`] sends and writes back what each wrote.
+pub struct StageListener {
+    listener: UnixListener,
+    connection: Option<Server>,
+}
+
+impl StageListener {
+    /// Listen at `path` for the region's connection.
+    ///
+    /// # Errors
+    ///
+    /// The socket does not bind.
+    pub fn bind(path: &Path) -> Result<Self> {
+        Ok(StageListener {
+            listener: UnixListener::bind(path)?,
+            connection: None,
+        })
+    }
+
+    fn connection(&mut self) -> Result<&mut Server> {
+        if self.connection.is_none() {
+            let (stream, _) = self.listener.accept()?;
+            self.connection = Some(Server {
+                reader: BufReader::new(stream.try_clone()?),
+                writer: BufWriter::new(stream),
+            });
+        }
+        Ok(self.connection.as_mut().expect("a connection"))
+    }
+
+    /// The next stage to run and its inputs' rows, or None once the
+    /// region ended; the first call waits for the connection.
+    ///
+    /// # Errors
+    ///
+    /// The connection fails or a frame does not read.
+    pub fn next_stage(&mut self) -> Result<Option<(usize, Vec<Table>)>> {
+        let connection = self.connection()?;
+        let header: serde_json::Value =
+            serde_json::from_slice(&read_frame(&mut connection.reader)?).map_err(failure)?;
+        let Some(stage) = header["stage"].as_u64() else {
+            return Ok(None);
+        };
+        let inputs = (0..header["inputs"].as_u64().unwrap_or(0))
+            .map(|_| read_table(&read_frame(&mut connection.reader)?))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((stage as usize, inputs)))
+    }
+
+    /// Send what a stage wrote: its outputs' rows and its finished rows.
+    ///
+    /// # Errors
+    ///
+    /// The connection fails.
+    pub fn reply(&mut self, outputs: &[Table], finished: &[Table]) -> Result<()> {
+        let connection = self.connection()?;
+        let header = serde_json::json!({"outputs": outputs.len(), "finished": finished.len()});
+        write_frame(&mut connection.writer, header.to_string().as_bytes())?;
+        for table in outputs.iter().chain(finished) {
+            write_frame(&mut connection.writer, &table_bytes(table)?)?;
+        }
+        connection.writer.flush()?;
+        Ok(())
+    }
+
+    /// Send why a stage failed.
+    ///
+    /// # Errors
+    ///
+    /// The connection fails.
+    pub fn fail(&mut self, error: &str) -> Result<()> {
+        let connection = self.connection()?;
+        let header = serde_json::json!({"error": error}).to_string();
+        write_frame(&mut connection.writer, header.as_bytes())?;
+        connection.writer.flush()?;
         Ok(())
     }
 }

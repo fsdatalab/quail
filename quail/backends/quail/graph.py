@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import tempfile
 import time
 
+import _quail_native
 import pyarrow as pa
 
 from quail.backends.quail.executor.memory import memory_report, merge_memory_reports
 from quail.backends.quail.executor.operators.filter import stop_keys
 from quail.backends.quail.retention import apply_retention
 from quail.common.pairs import FIRST_DOCUMENT, columns_key
+from quail.execution.finished import finished_rows
 from quail.execution.metrics import NodeResult, scalar_node_metrics
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
     compute_subgraph,
 )
-from quail.execution.stages import merged_run, run_partitions, serve_stages
+from quail.execution.stages import merged_run, serve_stages
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiClassify,
@@ -148,26 +153,18 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     return report
 
 
-def serve_region(state, payload, graph: PhysicalGraph, listener, wanted) -> dict:
-    """Serve a region's stages on one GPU executor until the region ends.
-
-    Args:
-        state: The executor's state for this GPU and query.
-        payload: The query's runtime payload.
-        graph: The region's graph.
-        listener: The listening socket Rust sends the stages on.
-        wanted: The (node, port) pairs the region's FinishedRows reads.
+def serve_region(state, payload, graph: PhysicalGraph, server, wanted) -> dict:
+    """Serve a region's stages on one GPU until the region ends.
 
     Returns:
-        {"results": node id -> NodeResult of each node this GPU ran,
-        "kv_manager": ..., and the memory report}.
+        The results of each node the GPU ran under "results", beside the
+        GPU's KV counters and memory report.
     """
     context = execution_context(state, payload, graph)
-    torch = state["gpu"].torch
-    arena = state["gpu"].arena
+    torch, arena = state["gpu"].torch, state["gpu"].arena
     try:
         with torch.inference_mode():
-            results = serve_stages(listener, context, compute_subgraph(graph), wanted)
+            results = serve_stages(server, context, compute_subgraph(graph), wanted)
         torch.cuda.synchronize()
     finally:
         for key in arena.resident_keys():
@@ -179,34 +176,59 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
                          device) -> dict:
     """Run a region's stages on one server per GPU and report the run.
 
+    Each row a stage finishes goes to the region's FinishedRows, when
+    the region reports to one.
+
     Args:
         payload: The query's runtime payload.
         graph: The region's graph.
-        gpus: How many GPUs.
-        serve: Callable(paths, wanted) that starts each GPU's server, as
-            ``run_partitions`` takes it; each server returns what
-            ``serve_region`` returns.
+        gpus: How many GPUs, one server each.
+        serve: Callable(paths, wanted) that starts a server listening at
+            each socket path and returns a callable that waits for them
+            and returns what each one's ``serve_region`` returned.
+            wanted lists the (node, port) pairs FinishedRows reads.
         device: The GPUs' device spec.
     """
     compute = compute_subgraph(graph)
+    rows = finished_rows()
+    wanted = [] if rows is None else [
+        (node.node_id, port.name) for node in compute.nodes
+        for port in node.outputs if rows.wants(node.node_id, port.name)]
+
+    def report(data: bytes) -> None:
+        if rows is not None:
+            rows.report(pa.ipc.open_stream(data).read_all())
+
     started = time.perf_counter()
-    outputs = run_partitions(compute, stage_keys(graph, payload), gpus, serve)
+    with tempfile.TemporaryDirectory() as directory:
+        paths = [os.path.join(directory, f"gpu{index}.sock") for index in range(gpus)]
+        results = serve(paths, wanted)
+        try:
+            _quail_native.run_stages(compute.to_json(), stage_keys(graph, payload),
+                                     paths, report)
+        except BaseException:
+            # the servers have ended; their failure is in this error
+            with contextlib.suppress(Exception):
+                results()
+            raise
+        outputs = results()
     wall = time.perf_counter() - started
     result = merged_run(compute, [output["results"] for output in outputs])
     report = graph_report(graph, result, wall, device, gpus=gpus,
                           gpu_timing=payload.get("gpu_timing", False))
-    totals = {}
-    for output in outputs:
-        for name, value in output["kv_manager"].items():
-            if isinstance(value, dict):
-                counts = totals.setdefault(name, {})
-                for alias, count in value.items():
-                    counts[alias] = counts.get(alias, 0) + count
-            else:
-                totals[name] = totals.get(name, 0) + value
-    report.update(kv_manager=totals,
-                  **merge_memory_reports([output["memory"] for output in outputs]))
+    report.update(
+        kv_manager={name: _summed([output["kv_manager"][name] for output in outputs])
+                    for name in outputs[0]["kv_manager"]},
+        **merge_memory_reports([output["memory"] for output in outputs]))
     return report
+
+
+def _summed(values: list):
+    """Sum counters, and counters by alias alias by alias."""
+    if isinstance(values[0], dict):
+        return {key: sum(value.get(key, 0) for value in values)
+                for key in set().union(*values)}
+    return sum(values)
 
 
 def stage_keys(graph: PhysicalGraph, payload) -> dict:

@@ -7,9 +7,11 @@ its partition of the region's stages to Rust over a Unix socket.
 
 import atexit
 import time
-from contextlib import ExitStack, closing
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
+
+import _quail_native
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.arena import KVArena
@@ -33,7 +35,6 @@ from quail.backends.quail.graph import (
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
 from quail.common.tokens import decode_payload_documents, select_documents
-from quail.execution.stages import listening
 from quail.execution.types import PhysicalResponse
 from quail.physical import Scan
 from quail.physical.plan import graph_from_envelope
@@ -459,9 +460,9 @@ def _child_main(gpu_index, conn):
             elif kind == "region":
                 # the first reply says the socket listens, the second
                 # carries what the child ran once the region ended
-                with closing(listening(data["socket"])) as listener:
-                    conn.send(("ok", None))
-                    conn.send(("ok", _child_region(state, data, listener)))
+                server = _quail_native.StageServer(data["socket"])
+                conn.send(("ok", None))
+                conn.send(("ok", _child_region(state, data, server)))
         except Exception:
             import traceback
             conn.send(("err", traceback.format_exc()))
@@ -483,12 +484,12 @@ def _child_boot(state, sub):
     return boot
 
 
-def _child_region(state, data, listener) -> dict:
+def _child_region(state, data, server) -> dict:
     """Serve one region's stages on this child's GPU until the region ends."""
     payload = data["query"]
     graph = graph_from_envelope(payload["physical_plan"])
     return serve_region(_execution_state(state.gpu, payload, state.registry),
-                        payload, graph, listener, data["wanted"])
+                        payload, graph, server, data["wanted"])
 
 
 class GpuWorkers:

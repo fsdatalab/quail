@@ -1156,6 +1156,73 @@ fn run_stages(
         .map_err(python_error)
 }
 
+/// One GPU's server end of a region's stages, as
+/// `quail::stages::StageListener`: it listens at `path` once made.
+#[pyclass(name = "StageServer", module = "_quail_native")]
+struct StageServer {
+    listener: quail::stages::StageListener,
+}
+
+#[pymethods]
+impl StageServer {
+    #[new]
+    fn new(path: std::path::PathBuf) -> PyResult<Self> {
+        let listener = quail::stages::StageListener::bind(&path).map_err(python_error)?;
+        Ok(StageServer { listener })
+    }
+
+    /// The next stage and its inputs' rows as pyarrow Tables, or None
+    /// once the region ended.
+    #[allow(clippy::type_complexity)]
+    fn next_stage<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<Option<(usize, Vec<Bound<'py, PyAny>>)>> {
+        let listener = &mut self.listener;
+        let Some((stage, inputs)) = py.detach(|| listener.next_stage()).map_err(python_error)?
+        else {
+            return Ok(None);
+        };
+        let tables = inputs
+            .into_iter()
+            .map(|(schema, batches)| to_pyarrow(py, schema, batches))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Some((stage, tables)))
+    }
+
+    /// Send a stage's output tables and finished tables.
+    fn reply(
+        &mut self,
+        py: Python<'_>,
+        outputs: Vec<Bound<'_, PyAny>>,
+        finished: Vec<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let tables = |values: Vec<Bound<'_, PyAny>>| {
+            values
+                .iter()
+                .map(|value| {
+                    let reader = quail::pyarrow::stream_from_pyarrow(value)?;
+                    let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
+                    let batches = reader
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|error| python_error(error.into()))?;
+                    Ok((schema, batches))
+                })
+                .collect::<PyResult<Vec<quail::stages::Table>>>()
+        };
+        let (outputs, finished) = (tables(outputs)?, tables(finished)?);
+        let listener = &mut self.listener;
+        py.detach(|| listener.reply(&outputs, &finished))
+            .map_err(python_error)
+    }
+
+    /// Send why a stage failed.
+    fn fail(&mut self, py: Python<'_>, error: &str) -> PyResult<()> {
+        let listener = &mut self.listener;
+        py.detach(|| listener.fail(error)).map_err(python_error)
+    }
+}
+
 /// The `_quail_native` module. A Rust program that embeds Python adds it
 /// with `pyo3::append_to_inittab!` before Python starts.
 #[pymodule]
@@ -1165,6 +1232,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Tokenizer>()?;
     module.add_class::<NativePlanner>()?;
     module.add_class::<NativeFinishedRows>()?;
+    module.add_class::<StageServer>()?;
     module.add_class::<cost::CostModel>()?;
     budgets::register(module)?;
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;

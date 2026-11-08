@@ -7,9 +7,10 @@ length, and the join frame is [FRAME] * length.
 
 import random
 import threading
-from contextlib import closing, nullcontext
+from contextlib import nullcontext
 from types import SimpleNamespace
 
+import _quail_native
 import numpy as np
 
 from quail.backends.quail import QuailModelExecution
@@ -20,7 +21,6 @@ from quail.backends.quail.executor.pages import PageArena
 from quail.backends.quail.graph import execute_single_graph, serve_region
 from quail.builtins import built_in_registry
 from quail.common.expressions import ColumnRef
-from quail.execution.stages import listening
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -403,7 +403,8 @@ def thread_servers(states, payload, graph):
         graph: The region's graph.
     """
     def serve(paths, wanted):
-        threads = [_Serving(state, payload, graph, listening(path), wanted)
+        threads = [_Serving(state, payload, graph, _quail_native.StageServer(path),
+                            wanted)
                    for state, path in zip(states, paths, strict=True)]
         for thread in threads:
             thread.start()
@@ -424,15 +425,13 @@ def thread_servers(states, payload, graph):
 class _Serving(threading.Thread):
     """One GPU's server on a thread, keeping its result or its error."""
 
-    def __init__(self, state, payload, graph, listener, wanted):
+    def __init__(self, state, payload, graph, server, wanted):
         super().__init__(daemon=True)
-        self.arguments = (state, payload, graph, listener, wanted)
+        self.arguments = (state, payload, graph, server, wanted)
         self.result = self.error = None
 
     def run(self):
-        state, payload, graph, listener, wanted = self.arguments
         try:
-            with closing(listener):
-                self.result = serve_region(state, payload, graph, listener, wanted)
+            self.result = serve_region(*self.arguments)
         except BaseException as error:
             self.error = error

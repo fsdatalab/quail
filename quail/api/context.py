@@ -34,7 +34,14 @@ import pyarrow as pa
 from quail.api.compile import DATAFUSION_DIALECTS
 from quail.api.engine import Engine
 from quail.catalog import ScanRequest, TableProvider
-from quail.execution.stages import ipc_bytes
+
+
+def ipc_bytes(table: pa.Table) -> bytes:
+    """Return a table as Arrow IPC stream bytes."""
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return sink.getvalue().to_pybytes()
 
 
 class SessionContext:
