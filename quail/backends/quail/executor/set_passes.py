@@ -86,7 +86,6 @@ class Passes:
         owners: Per pass, the document or anchor it asks about.
         requests: Per pass, its StageRequests at a stage whose suffixes
             are each pass's own (own_stage), or None.
-        reads: Per pass, the state rows a pointer read scores, or None.
         stop_groups: Per pass, its stop key group, or None.
         values: Per pass, its answer, or None for a pass that never ran.
         tokens: The fresh tokens of the passes that ran.
@@ -100,7 +99,6 @@ class Passes:
     suffix_tokens: list = field(default_factory=list)
     owners: list = field(default_factory=list)
     requests: list | None = None
-    reads: list | None = None
     stop_groups: list | None = None
     values: list = field(default_factory=list)
     tokens: int = 0
