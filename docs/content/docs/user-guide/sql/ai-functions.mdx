@@ -376,6 +376,12 @@ In Python, `text[start:end]` returns the answer.
 Each question is a separate extraction. On the Quail backend, the
 questions about one document read the same document KV.
 
+Quail asks only the questions whose fields the query reads. For
+example, a query that reads only `x.lease.signer` from a FROM subquery
+that extracts `end_date` and `signer` asks only the `signer` question,
+and `x.lease` then has the one field `signer`. A query that returns
+`lease` itself asks every question.
+
 ### Filter on answers
 
 Use the extraction's `AS` name to filter by an answer field in `WHERE`.

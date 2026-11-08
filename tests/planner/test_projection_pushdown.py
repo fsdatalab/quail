@@ -175,3 +175,29 @@ def test_an_extraction_the_query_returns_keeps_its_spans():
     rows = finish(query, Oracle(answers=lambda spec, document: "ab")).collect()
     assert "e_span" in rows.column_names
     session.close()
+
+
+def test_an_extraction_asks_only_the_fields_the_query_reads():
+    questions = "{'w': 'which?', 'v': 'what?', 'u': 'who?'}"
+    sql = (f"SELECT x.id, x.e.w AS w FROM (SELECT r.id, "
+           f"AI_EXTRACT(r.body, {questions}) AS e FROM reviews r) x")
+    found = []
+    for rules in (LOGICAL_RULES,
+                  [name for name in LOGICAL_RULES if name != PROJECTION_RULE]):
+        session = _extract_session(rules)
+        asked = []
+
+        def answer(spec, document, asked=asked):
+            asked.append(spec.name)
+            return None if document == 1 else f"ab {spec.name}"
+
+        rows = finish(session.sql(sql), Oracle(answers=answer)).collect()
+        found.append((sorted(asked), sorted(
+            (row["x.id"], row["w"]) for row in rows.to_pylist())))
+        session.close()
+    # with the rule each document is asked the one field the query reads,
+    # instead of all three, and that field's answers do not change
+    assert found[0][0] == ["e.w"] * 3
+    assert found[1][0] == sorted(["e.u", "e.v", "e.w"] * 3)
+    assert found[0][1] == [("r0", "ab e.w"), ("r1", None), ("r2", "ab e.w")]
+    assert found[1][1] == found[0][1]

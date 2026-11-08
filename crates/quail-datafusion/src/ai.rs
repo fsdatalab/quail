@@ -258,6 +258,25 @@ impl AiNode {
         }
     }
 
+    /// This node with `rewrite` applied to its call, guard, filter, hint
+    /// test, and each test as the plan holds it and as written.
+    ///
+    /// # Errors
+    ///
+    /// `rewrite` fails.
+    pub(crate) fn map_expressions(&self, rewrite: impl Fn(Expr) -> Result<Expr>) -> Result<Self> {
+        let mut node = self.clone();
+        node.call = rewrite(node.call)?;
+        node.guard = node.guard.map(&rewrite).transpose()?;
+        node.filter = node.filter.map(&rewrite).transpose()?;
+        node.hint_test = node.hint_test.map(&rewrite).transpose()?;
+        for test in &mut node.tests {
+            test.test = rewrite(test.test.clone())?;
+            test.written = rewrite(test.written.clone())?;
+        }
+        Ok(node)
+    }
+
     /// Whether `name` is a column the node adds.
     pub(crate) fn is_field(&self, name: &str) -> bool {
         self.fields.iter().any(|field| field.name() == name)

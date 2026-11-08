@@ -130,7 +130,7 @@ region.
 | `merge_repeated_ai_calls` | Logical | Make an AI operator read the answer of the same call below it, so the model answers the call once (R17). | No |
 | `push_down_distinct` | Logical | Give the AI operator under a DISTINCT a fetch of one row per selected key: input columns, or a classification's label (R12). | No |
 | `push_down_limit_into_ai_nodes` | Logical | Make a LIMIT, with its OFFSET, the fetch of the AI operator whose rows it reads, through projections, when the node has no `HINT` (R9, R10). | No |
-| `push_down_projection_into_ai_nodes` | Logical | Make an AI operator return only its answer and the added columns the SELECT list above it reads, such as an extraction's spans (R5). | No |
+| `push_down_projection_into_ai_nodes` | Logical | Make an AI operator return only its answer and the added columns the SELECT list above it reads, such as an extraction's spans, and an extraction ask only the fields the query reads (R5). | No |
 | `push_down_case_guards` | Logical | Make the test of a `CASE WHEN c THEN <answer> END` the guard of the classification, map, or SAE features below it, so the model is asked only where `c` is TRUE (R6). | No |
 | `push_down_or_guards` | Logical | Guard an AI.IF that is one term of an OR with the OR's other terms, so the model is asked only where they are not TRUE (R7). | No |
 | `push_down_hint_tests` | Logical | Make a test of an AI column's answer directly above its node, with no fetch, also the node's hint test, so the executor may stop answers the test rejects (R3). The default order absorbs such tests first (R2). | No |

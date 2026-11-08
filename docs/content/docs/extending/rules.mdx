@@ -92,7 +92,7 @@ names the rule that makes each rewrite and when it applies.
 | R2 | `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)` | `absorb_into_ai_nodes` | `q` tests the node's answer, and the node has no fetch. |
 | R3 | `σ_q(AI(R; h)) ⇒ σ_q(AI(R; h ∧ q))` | `push_down_hint_tests` | The filter is directly above a classification, extraction, map, or SAE features node of rows with no fetch; `q` is a term of the filter that reads a column the node adds and otherwise only the node's input, with no AI call. The filter stays. |
 | R4 | `σ_{a LIKE x}(AI_{extract(d)→a}(R)) ⇒ σ_{a LIKE x}(AI_{extract(d)→a}(σ_{d ILIKE '%s%'}(R)))` | `push_down_substring_prechecks` | The node is an extraction of rows with no fetch; its filter has a term `a.f LIKE x` or `ILIKE x`, not negated, with a literal pattern; `s` is the longest word of the longest literal run of `x`. The test of the answer stays. |
-| R5 | `π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))` | `push_down_projection_into_ai_nodes` | `Q` is a projection directly above a node of rows; the node keeps its answer, and drops each other added column `Q` does not read, such as an extraction's spans under a FROM subquery. DataFusion's `optimize_projections` already prunes the input columns the node reads. |
+| R5 | `π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))`; `π_{a.f}(AI_{extract(d, {f, g})→a}(R)) ⇒ π_{a.f}(AI_{extract(d, {f})→a}(R))` | `push_down_projection_into_ai_nodes` | `Q` is a projection directly above a node of rows; the node keeps its answer, and drops each other added column `Q` does not read, such as an extraction's spans under a FROM subquery. An extraction asks only the fields the plan reads when every use of its answer and spans, through projections that pass them on or rename them, reads named fields; a use that reads the answer whole, or the query's result columns holding it, keeps every field. DataFusion's `optimize_projections` already prunes the input columns the node reads. |
 | R6 | `π_{B, (CASE WHEN c THEN a END)→z}(AI_{f→a}(R)) ⇒ π_{B, a→z}(AI_{f→a}(R; g = g ∧ c))` | `push_down_case_guards` | The node is a classification, map, or SAE features of rows with no filter, `HINT`, or fetch; the projection is directly above it; every item that reads an added column is `CASE WHEN c THEN <column> END` with the same `c`; `c` reads only columns of the one table the call reads. |
 | R7 | `AI_{f→b}(R; p = a ∨ b) ⇒ AI_{f→b}(R; g = (a IS NOT TRUE), p = a ∨ b)` | `push_down_or_guards` | The node is an AI.IF of rows with no guard, `HINT`, or fetch, and returns none of the columns it adds; a term of its filter is an OR with the answer `b` as one term and no other term reads `b`; the other terms `a` read only columns of the one table the call reads. |
 | R8 | `Limit_k(π(R)) ⇒ π(Limit_k(R))` | DataFusion's `push_down_limit`; `push_down_limit_into_ai_nodes` also reads through projections | The projection keeps one row per row. Over an `AiNode`, the LIMIT becomes the node's fetch (R9). |
@@ -120,12 +120,14 @@ the precheck ignores case and reads one word of the pattern's literal
 text. `push_down_filter` then moves the precheck to the table, where
 DataFusion runs it before the model region.
 
-R5 changes what the node returns, not what the model is asked: the
-executor still locates each extracted answer's span. A SELECT list that
-reads one field of an extraction, such as `x.e.w`, still asks every
-question of the extraction; a classification asked for probabilities
-under a FROM subquery still computes them. Neither is a column of the
-node's `P` today.
+R5 relies on each field of an `AI.EXTRACT` being its own prompt: the
+document, then one question. Leaving out a field changes no other
+field's answer, and the questions left share the document's KV as
+before. For example, `SELECT x.id, x.e.w FROM (SELECT r.id,
+AI.EXTRACT(r.body, {'w': ..., 'v': ..., 'u': ...}) AS e FROM reviews r)
+x` asks only `w`, a third of the questions, and the answer struct `e`
+has the one field `w`. A query that returns `e`, or compares it whole,
+asks every question.
 
 For R6, the executor evaluates the guard over the rows a column
 operator reads, asks the model about the rows where it is TRUE, and

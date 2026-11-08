@@ -93,28 +93,24 @@ pub fn derive_region(
 /// literal. The binder reads an AI call's options, categories, and
 /// fields from the calls the query wrote.
 fn as_bound(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
-    let read = |expr: Expr| {
-        expr.transform_up(|inner| Ok(unfold(inner)))
-            .map(|done| done.data)
-    };
     plan.transform_up(|node| {
         let Some(ai) = crate::extension::as_node::<AiNode>(&node) else {
             return Ok(Transformed::no(node));
         };
-        let mut ai = ai.clone();
-        ai.call = read(ai.call)?;
-        ai.guard = ai.guard.map(read).transpose()?;
-        ai.filter = ai.filter.map(read).transpose()?;
-        ai.hint_test = ai.hint_test.map(read).transpose()?;
-        for test in &mut ai.tests {
-            test.test = read(test.test.clone())?;
-            test.written = read(test.written.clone())?;
-        }
+        let ai = ai.map_expressions(|expr| Ok(unfolded(expr)))?;
         Ok(Transformed::yes(crate::extension::extension_node(
             ai.checked()?,
         )))
     })
     .map(|done| done.data)
+}
+
+/// `expr` with each struct or list literal in it written as the call it
+/// was folded from, as [`as_bound`] reads an `AiNode`'s expressions.
+pub(crate) fn unfolded(expr: Expr) -> Expr {
+    expr.transform_up(|inner| Ok(unfold(inner)))
+        .map(|done| done.data)
+        .expect("unfolding a literal does not fail")
 }
 
 /// `expr` as the `named_struct`, `struct`, or `make_array` call of
