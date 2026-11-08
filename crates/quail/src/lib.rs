@@ -163,7 +163,10 @@ impl Session {
     /// `run_region` takes a region's operators and DataFusion plan as
     /// [`region_json`] writes them, the rows of each input the region
     /// reads by table name, and the region's row limit, and returns a
-    /// pyarrow Table or RecordBatchReader. `turn` and `layout` are the
+    /// pyarrow Table or RecordBatchReader. An engine with a `settings`
+    /// attribute also has `execute(planned, tables, sink)`, which takes
+    /// a region Rust planned and either calls `sink` with each pyarrow
+    /// Table of rows as they finish and returns None, or returns them. `turn` and `layout` are the
     /// model's chat-turn text and prompt layout.
     /// `rules` names the optimizer rules each model region runs, in
     /// order, or is None for the built-in rules.
@@ -323,8 +326,13 @@ impl Session {
             let (sender, mut calls) = unbounded_channel::<RegionCall>();
             *runner.caller.lock().expect("the caller lock") =
                 Some((std::thread::current().id(), sender));
-            let query = async {
-                let frame = quail_datafusion::sql_in_dialect(&self.context, query, dialect).await?;
+            let context = self.context.clone();
+            let (query, dialect) = (query.to_string(), dialect.map(str::to_string));
+            // a worker runs the query, so the operators above a region
+            // read its rows while this thread runs the region
+            let query = self.runtime().spawn(async move {
+                let frame =
+                    quail_datafusion::sql_in_dialect(&context, &query, dialect.as_deref()).await?;
                 let schema = quail_schema(frame.schema());
                 // renaming the columns keeps each column's buffers
                 let batches = frame
@@ -336,17 +344,16 @@ impl Session {
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 Ok::<_, DataFusionError>((schema, batches))
-            };
+            });
             tokio::pin!(query);
             // DataFusion's workers run the operators; this thread runs
             // each model region they hand it
             let done = loop {
                 tokio::select! {
-                    done = &mut query => break done,
-                    Some(call) = calls.recv() => {
-                        let rows = runner.run_here(&call.region, &call.inputs, call.fetch);
-                        let _ = call.rows.send(rows);
-                    }
+                    done = &mut query => break done
+                        .map_err(|error| DataFusionError::External(Box::new(error)))
+                        .and_then(|done| done),
+                    Some(call) = calls.recv() => runner.serve(call),
                 }
             };
             *runner.caller.lock().expect("the caller lock") = None;

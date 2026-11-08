@@ -22,6 +22,7 @@ from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import filter_answer_table
 from quail.execution.rows import Rows
 from quail.execution.runtimes.filter import filter_scores, tested_table
+from quail.execution.streaming import region_stream
 from quail.progress import answer_sink
 
 
@@ -273,18 +274,27 @@ def filter_document_sink(node, document_ids):
     ``{"kind": "filter", "node", "alias", "stages", "documents"}`` where
     ``documents`` lists ``[row index, last stage asked, passed]`` per
     document. A document that passed its last stage survived the filter;
-    every other listed document failed at the stage given.
+    every other listed document failed at the stage given. When the
+    filter is the region's last operator, the finished documents' rows
+    also go to the region's stream.
     """
     sink = answer_sink()
-    if sink is None:
+    stream = region_stream()
+    if stream is not None and not stream.wants(node):
+        stream = None
+    if sink is None and stream is None:
         return None
     stages = 1
 
     def document_done(finished):
-        sink({"kind": "filter", "node": node.node_id, "alias": node.alias,
-              "stages": stages,
-              "documents": [[int(document_ids[position]), stage, passed]
-                            for position, stage, passed in finished]})
+        if sink is not None:
+            sink({"kind": "filter", "node": node.node_id, "alias": node.alias,
+                  "stages": stages,
+                  "documents": [[int(document_ids[position]), stage, passed]
+                                for position, stage, passed in finished]})
+        if stream is not None:
+            answers = {position: [int(passed)] for position, _, passed in finished}
+            stream.partial(node, filter_result(node, answers, 0, document_ids).outputs)
 
     return document_done
 

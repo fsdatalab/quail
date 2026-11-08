@@ -18,12 +18,13 @@ when the operator's required inputs are available.
 
 - Model operators, such as classification, use the GPU.
 - Operations that test computed labels use Apache Arrow on the CPU.
-- Once all operators finish, Rust builds the region's rows from their
-  outputs: the id column of each table and the answers.
+- Rust builds the region's rows from the operators' outputs: the id
+  column of each table and the answers.
 - DataFusion runs the relational operators above the region, such as
   ORDER BY, LIMIT, DISTINCT, and GROUP BY, on the region's rows, and
   joins each table's other columns back on its id. The region hands
-  DataFusion its rows once all its operators finish.
+  DataFusion its rows while it runs; see
+  [Streaming the region's rows](#streaming-the-regions-rows).
 - Compatible operators can pass documents to one another before they
   finish processing the whole input table.
 
@@ -61,6 +62,32 @@ Quail limits each batch by token count and available KV memory:
 
 An operator that requires all its input rows ends a pipeline. Later
 operators wait until those rows are available.
+
+### Streaming the region's rows
+
+A row of the region is final once the region's last step, one operator
+or one pipeline, has produced it. Every earlier step has finished by
+then. So the runner sends rows on as the last step reports them:
+
+- A filter, score, or classification that is the last step reports
+  each forward pass's finished documents. Rust builds those documents'
+  rows from the last step's outputs for them and the earlier steps'
+  whole outputs, and `ModelRegionExec` hands them to DataFusion at once.
+- Any other last step, such as a pipeline, an extraction, a map, a
+  join, or an operator with a guard, sends its rows when it finishes.
+- A region with a fetch sends its rows once every row is in, so Rust
+  can keep its first rows.
+- A row is sent once: when the step finishes, the runner sends only
+  the rows it has not sent.
+
+For example, imagine `SELECT r.id, AI.SCORE(...) AS score FROM reviews
+r ORDER BY score DESC LIMIT 25`. DataFusion's top-k sort reads each
+forward pass's scored reviews while the GPU scores the next ones.
+
+The thread that called DataFusion runs each region, as before, and
+DataFusion's workers run the operators above it, so they read the
+region's rows while the region runs. Rows come in the order they
+finish. Only an ORDER BY sets the order of the result.
 
 ## Query operations
 

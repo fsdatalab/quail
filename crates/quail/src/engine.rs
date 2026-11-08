@@ -14,6 +14,7 @@ use datafusion::datasource::TableType;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use std::collections::HashMap;
@@ -30,8 +31,10 @@ use crate::planning::{PlanOutcome, Planner, Settings, TableRows, planned_json};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 
 /// Runs each model region by calling the engine's
-/// `run_region(payload, tables, fetch)`, which returns the rows
-/// as a pyarrow Table or RecordBatchReader.
+/// `execute(planned, tables, sink)` or `run_region(payload, tables,
+/// fetch)`. `execute` hands the sink each batch of finished rows as the
+/// region runs and returns None, or returns the rows; `run_region`
+/// returns them, as a pyarrow Table or RecordBatchReader.
 #[derive(Debug)]
 pub(crate) struct PythonRunner {
     pub(crate) engine: Py<PyAny>,
@@ -52,7 +55,73 @@ pub(crate) struct RegionCall {
     pub(crate) region: ModelRegion,
     pub(crate) inputs: Vec<InputRows>,
     pub(crate) fetch: Option<usize>,
-    pub(crate) rows: std::sync::mpsc::Sender<Result<RegionBatches>>,
+    pub(crate) rows: RowSender,
+}
+
+/// One message of a region's rows: a batch, a failure, or the end.
+#[derive(Debug)]
+pub(crate) enum RegionRows {
+    Batch(Result<RecordBatch>),
+    Done,
+}
+
+/// Where a running region sends its rows, in order.
+pub(crate) type RowSender = std::sync::mpsc::Sender<RegionRows>;
+
+/// The rows a region sends, read as DataFusion's iterator of batches.
+///
+/// A sender dropped before the end, such as when the query stopped,
+/// reads as a failure.
+struct ReceivedRows {
+    receiver: std::sync::mpsc::Receiver<RegionRows>,
+    ended: bool,
+}
+
+impl Iterator for ReceivedRows {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ended {
+            return None;
+        }
+        match self.receiver.recv() {
+            Ok(RegionRows::Batch(batch)) => Some(batch),
+            Ok(RegionRows::Done) => {
+                self.ended = true;
+                None
+            }
+            Err(_) => {
+                self.ended = true;
+                Some(Err(DataFusionError::Execution(
+                    "the region did not finish".into(),
+                )))
+            }
+        }
+    }
+}
+
+/// The callable a region's executor hands each batch of finished rows,
+/// as a pyarrow Table or RecordBatchReader, while the region runs.
+#[pyclass(name = "RegionSink", module = "_quail_native", frozen)]
+pub(crate) struct RegionSink {
+    rows: RowSender,
+    names: Vec<String>,
+    schema: SchemaRef,
+}
+
+#[pymethods]
+impl RegionSink {
+    /// Send a table's rows on to DataFusion, in the region's schema.
+    fn __call__(&self, table: &Bound<'_, PyAny>) -> PyResult<()> {
+        let failure = |error: DataFusionError| PyRuntimeError::new_err(error.to_string());
+        for batch in stream_from_pyarrow(table)? {
+            let batch = batch.map_err(|error| failure(error.into()))?;
+            let batch = conform(batch, &self.names, &self.schema).map_err(failure)?;
+            // the receiver is gone once DataFusion stops reading
+            let _ = self.rows.send(RegionRows::Batch(Ok(batch)));
+        }
+        Ok(())
+    }
 }
 
 impl PythonRunner {
@@ -137,13 +206,23 @@ impl PythonRunner {
         Ok((payload, planned))
     }
 
-    /// Run the region on this thread.
-    pub(crate) fn run_here(
+    /// Run a call's region on this thread and send its rows, then the end.
+    pub(crate) fn serve(&self, call: RegionCall) {
+        if let Err(error) = self.run_here(&call.region, &call.inputs, call.fetch, &call.rows) {
+            let _ = call.rows.send(RegionRows::Batch(Err(error)));
+        }
+        let _ = call.rows.send(RegionRows::Done);
+    }
+
+    /// Run the region on this thread, sending its rows to `rows` as the
+    /// executor finishes them.
+    fn run_here(
         &self,
         region: &ModelRegion,
         inputs: &[InputRows],
         fetch: Option<usize>,
-    ) -> Result<RegionBatches> {
+        rows: &RowSender,
+    ) -> Result<()> {
         let payload = self.request(region)?;
         let sorted;
         let (planned, inputs) = if self.planning.is_some() {
@@ -161,6 +240,13 @@ impl PythonRunner {
         } else {
             (None, inputs)
         };
+        let schema = Arc::clone(region.plan.schema());
+        let names = quail_column_names(&schema);
+        let sink = RegionSink {
+            rows: rows.clone(),
+            names: names.clone(),
+            schema: Arc::clone(schema.inner()),
+        };
         let reader = Python::attach(|py| {
             // each input as a pyarrow Table, by the table name the region reads
             let mut tables = Vec::new();
@@ -170,20 +256,30 @@ impl PythonRunner {
             }
             let tables = tables.into_py_dict(py)?;
             let answer = match &planned {
-                Some(found) => self.engine.call_method1(py, "execute", (found, tables))?,
+                Some(found) => {
+                    let sink = Bound::new(py, sink)?;
+                    self.engine
+                        .call_method1(py, "execute", (found, tables, sink))?
+                }
                 None => self
                     .engine
                     .call_method1(py, "run_region", (&payload, tables, fetch))?,
             };
-            stream_from_pyarrow(answer.bind(py))
+            // an engine that sent every row to the sink returns None
+            let answer = answer.bind(py);
+            if answer.is_none() {
+                return Ok(None);
+            }
+            stream_from_pyarrow(answer).map(Some)
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let schema = Arc::clone(region.plan.schema());
-        let names = quail_column_names(&schema);
-        // DataFusion reads each batch as the Python stream yields it
-        Ok(Box::new(
-            reader.map(move |batch| conform(batch?, &names, schema.inner())),
-        ))
+        for batch in reader.into_iter().flatten() {
+            let batch = conform(batch?, &names, schema.inner())?;
+            if rows.send(RegionRows::Batch(Ok(batch))).is_err() {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -197,24 +293,23 @@ impl RegionRunner for PythonRunner {
         fetch: Option<usize>,
     ) -> Result<RegionBatches> {
         let caller = self.caller.lock().expect("the caller lock").clone();
+        let (rows, receiver) = std::sync::mpsc::channel();
+        let call = RegionCall {
+            region: region.clone(),
+            inputs: inputs.to_vec(),
+            fetch,
+            rows,
+        };
         match caller {
-            Some((thread, sender)) if thread != std::thread::current().id() => {
-                let (rows, answer) = std::sync::mpsc::channel();
-                let call = RegionCall {
-                    region: region.clone(),
-                    inputs: inputs.to_vec(),
-                    fetch,
-                    rows,
-                };
-                sender
-                    .send(call)
-                    .map_err(|_| DataFusionError::Execution("the query ended".into()))?;
-                answer
-                    .recv()
-                    .map_err(|_| DataFusionError::Execution("the region did not run".into()))?
-            }
-            _ => self.run_here(region, inputs, fetch),
+            Some((thread, sender)) if thread != std::thread::current().id() => sender
+                .send(call)
+                .map_err(|_| DataFusionError::Execution("the query ended".into()))?,
+            _ => self.serve(call),
         }
+        Ok(Box::new(ReceivedRows {
+            receiver,
+            ended: false,
+        }))
     }
 }
 

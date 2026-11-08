@@ -6,6 +6,7 @@ from helpers.oracle import Oracle, finish, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER, check_table
 
 import quail
+from quail.api.engine import Engine
 
 pytest.importorskip("_quail_native")
 
@@ -166,3 +167,32 @@ def test_every_check_query_derives_one_region_as_session_sql_compiles_it():
         assert (region["operators"], region["logical"]) == (
             query.operators, query.logical), entry["id"]
         session.close()
+
+
+def test_a_region_hands_on_rows_before_it_finishes():
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    oracle = Oracle(scores=lambda spec, ids: ids[0] / 10, streams=True)
+    events = []
+    executor = oracle_executor(oracle)
+
+    def run(request):
+        response = executor(request)
+        events.append("finished")
+        return response
+
+    context = quail.SessionContext(session, physical_executor=run)
+    context.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+    text = "SELECT r.id, AI.SCORE(PROMPT('q7: {0}', r.body)) AS score FROM reviews r"
+    ((_, planned),) = context._native.plans(text)
+    batches = []
+
+    def on_rows(table):
+        events.append("rows")
+        batches.append(table)
+
+    assert Engine(session, run).execute(planned, {}, on_rows) is None
+    # one batch per scored row, each before the region finished
+    assert events == ["rows"] * 4 + ["finished"]
+    streamed = pa.concat_tables(batches)
+    assert _same_rows(streamed, context.sql(text), ordered=False)
+    session.close()

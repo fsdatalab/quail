@@ -19,6 +19,7 @@ from quail.common.tokens import ColumnStore, ScanInput, TokenStore
 from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
 from quail.execution.result import QueryResult
 from quail.execution.rows import as_table
+from quail.execution.streaming import RegionStream
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
 from quail.physical import Limit, Scan, decode_plan_value
@@ -557,6 +558,23 @@ class RegionQuery:
             report["observers"] = observer_reports
         self._collect_answers(result, plan, tables)
         return result
+
+    def region_stream(self, on_rows) -> RegionStream | None:
+        """Return the stream that hands ``on_rows`` the region's rows as they finish.
+
+        None for a region with a fetch: Rust keeps its first rows once
+        every row is in.
+        """
+        if json.loads(self.operators).get("fetch") is not None:
+            return None
+        request = json.dumps(self._answer_request(self.plan()))
+
+        def send(tables):
+            rows = _quail_native.region_rows(request, tables, self._source_values)
+            if rows.num_rows:
+                on_rows(rows)
+
+        return RegionStream(send)
 
     def _source_values(self, name: str, expression: str) -> pa.Table:
         """Return a source column's values for each document of its table.

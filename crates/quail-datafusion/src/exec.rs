@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{DataFusionError, Result, internal_err};
+use datafusion::common::{Result, internal_err};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
@@ -21,7 +22,8 @@ use datafusion::physical_plan::{
     PlanProperties, ReplaceChildrenOptions,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use futures::stream;
+use futures::channel::mpsc;
+use futures::{StreamExt, stream};
 
 use crate::region::ModelRegion;
 use crate::shared::{SharedInput, SharedInputExec, SharedRowsByKey};
@@ -35,8 +37,9 @@ pub type RegionBatches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
 /// Plans and runs one model region, returning its rows as they come.
 ///
 /// Quail's executor implements this trait, in the same process or
-/// behind Quail Server. The call blocks until the region starts
-/// returning rows; DataFusion reads them as the iterator yields them.
+/// behind Quail Server. `ModelRegionExec` calls it on a thread that may
+/// block, and hands DataFusion each batch as the iterator yields it, so
+/// the operators above the region read rows while the region runs.
 pub trait RegionRunner: fmt::Debug + Send + Sync {
     /// Plan and run the region over its inputs' rows. `fetch` is the
     /// most rows DataFusion reads, when a LIMIT above the region says
@@ -74,7 +77,7 @@ impl ModelRegionExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
+            EmissionType::Incremental,
             Boundedness::Bounded,
         );
         Self {
@@ -179,22 +182,45 @@ impl ExecutionPlan for ModelRegionExec {
         let runner = Arc::clone(&self.runner);
         let inputs = self.inputs.clone();
         let fetch = self.fetch;
-        // the runner decides which thread runs the region; Quail's runs
-        // it on the thread that called DataFusion
-        let rows = async move {
+        let (sender, receiver) = mpsc::unbounded::<Result<RecordBatch>>();
+        let task = SpawnedTask::spawn(async move {
             let mut rows: Vec<InputRows> = Vec::new();
             for (name, input) in region.input_names.iter().zip(inputs) {
-                let batches =
-                    datafusion::physical_plan::collect(input, Arc::clone(&context)).await?;
-                rows.push((name.clone(), batches));
+                match datafusion::physical_plan::collect(input, Arc::clone(&context)).await {
+                    Ok(batches) => rows.push((name.clone(), batches)),
+                    Err(error) => {
+                        let _ = sender.unbounded_send(Err(error));
+                        return;
+                    }
+                }
             }
-            let batches = runner.run(&region, &rows, fetch)?;
-            Ok::<_, DataFusionError>(stream::iter(Limited {
-                batches,
-                remaining: fetch,
-            }))
-        };
-        let batches = futures::TryStreamExt::try_flatten(stream::once(rows));
+            // the runner blocks while the region runs; Quail's hands the
+            // region to the thread that called DataFusion
+            let run = SpawnedTask::spawn_blocking(move || {
+                let batches = match runner.run(&region, &rows, fetch) {
+                    Ok(batches) => batches,
+                    Err(error) => {
+                        let _ = sender.unbounded_send(Err(error));
+                        return;
+                    }
+                };
+                for batch in (Limited {
+                    batches,
+                    remaining: fetch,
+                }) {
+                    // the receiver is gone once DataFusion stops reading
+                    if sender.unbounded_send(batch).is_err() {
+                        return;
+                    }
+                }
+            });
+            let _ = run.join().await;
+        });
+        // the task lives as long as the stream: dropping the stream ends it
+        let batches = stream::unfold((receiver, task), |(mut receiver, task)| async move {
+            let batch = receiver.next().await?;
+            Some((batch, (receiver, task)))
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
             batches,

@@ -153,7 +153,8 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     return answer_table(columns, answers, "join_answers", metadata)
 
 
-def _output_table(node, port: OutputPort, value: Any) -> pa.Table:
+def output_table(node, port: OutputPort, value: Any) -> pa.Table:
+    """Return one output port's value as its Arrow relation."""
     if isinstance(value, Rows):
         return value.table()
     if isinstance(value, pa.Table):
@@ -176,7 +177,7 @@ def export_physical_outputs(graph: PhysicalGraph, run_result) -> dict:
         result = run_result.nodes[node.node_id]
         ports = {port.name: port for port in node.outputs}
         for name, value in result.outputs.items():
-            outputs[PortRef(node.node_id, name)] = _output_table(
+            outputs[PortRef(node.node_id, name)] = output_table(
                 node, ports[name], value
             )
     return outputs

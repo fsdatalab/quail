@@ -16,6 +16,7 @@ from quail.execution.result import (
     DEFAULT_BATCH_ROWS,
 )
 from quail.execution.rows import Rows, rows_of
+from quail.execution.streaming import region_stream
 from quail.physical import AiClassify, AiScore, ClassifySpec, ValueType
 from quail.progress import answer_sink
 
@@ -192,6 +193,37 @@ def classify_outputs(node, rows: Rows) -> dict:
     return {node.rows_port: rows}
 
 
+def _scored_outputs(node, scored: Rows, priors) -> dict:
+    """The node's outputs for scored rows: their priors' values, labels kept."""
+    for alias, prior in priors.items():
+        scored = scored.joined(prior, alias)
+    if isinstance(node.spec, ClassifySpec):
+        # a document whose decoded answer names no label leaves the query
+        return classify_outputs(node, scored.filter(
+            pc.is_valid(scored.column(node.spec.name))))
+    return {node.rows_port: scored}
+
+
+def _stream_scored(node, priors):
+    """Callable(rows, values) sending scored rows to the region's stream, or None.
+
+    None unless the node is the region's last operator; a classification
+    that reports label probabilities sends its rows when it finishes.
+    """
+    stream = region_stream()
+    spec = node.spec
+    if stream is None or not stream.wants(node) or (
+            isinstance(spec, ClassifySpec) and spec.probabilities):
+        return None
+
+    def on_scored(rows, values):
+        scored = score_rows(np.asarray(rows).reshape(-1, len(spec.aliases)),
+                            spec.aliases, spec.name, list(values), _value_type(spec))
+        stream.partial(node, _scored_outputs(node, scored, priors))
+
+    return on_scored
+
+
 def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeResult:
     """Score the node's candidate rows in bounded batches, in input order.
 
@@ -202,8 +234,10 @@ def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeR
     Args:
         node: The AiScore or AiClassify node.
         inputs: Its input values by port name.
-        score_batch: Callable (node, rows) returning the batch's
-            NodeResult, with one row per input row in order.
+        score_batch: Callable (node, rows, on_scored) returning the
+            batch's NodeResult, with one row per input row in order;
+            ``on_scored(rows, values)``, when not None, is run with each
+            part of the rows as it is scored.
         streamed: Whether ``score_batch`` sends its answers to the
             answer sink itself. Otherwise each batch's answers are sent
             when the batch is scored.
@@ -214,11 +248,12 @@ def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeR
         raise ValueError("AI.SCORE needs a score specification")
     started = time.perf_counter()
     rows, priors = _candidate_rows(node, inputs)
+    on_scored = _stream_scored(node, priors)
     scored = []
     metrics = NodeMetrics()
     size = DEFAULT_BATCH_ROWS if rows.product else max(1, len(rows))
     for batch in rows.batches(size):
-        result = score_batch(node, batch)
+        result = score_batch(node, batch, on_scored)
         scored.append(result.outputs[node.rows_port])
         metrics += result.metrics
         sink = answer_sink()
@@ -226,15 +261,10 @@ def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeR
             sink(scored_batch(
                 node, batch,
                 result.outputs[node.rows_port].column(node.spec.name).to_pylist()))
-    rows = Rows.concat(scored)
-    for alias, prior in priors.items():
-        rows = rows.joined(prior, alias)
-    outputs = {node.rows_port: rows}
+    outputs = _scored_outputs(node, Rows.concat(scored), priors)
+    rows = outputs[node.rows_port]
     if isinstance(node.spec, ClassifySpec):
-        # a document whose decoded answer names no label leaves the query
-        rows = rows.filter(pc.is_valid(rows.column(node.spec.name)))
         metrics = replace(metrics, output_rows=rows.num_rows)
-        outputs = classify_outputs(node, rows)
     return NodeResult(outputs, replace(
         metrics, wall_s=time.perf_counter() - started,
         extension={**metrics.extension, "output": node.spec.name,
@@ -256,8 +286,15 @@ class RerankerModelExecution:
     ) -> NodeResult:
         return score_in_batches(node, inputs, self.execute_rows, streamed=True)
 
-    def execute_rows(self, node, rows):
-        """Compute a score for each supplied row or document pair."""
+    def execute_rows(self, node, rows, on_scored=None):
+        """Compute a score for each supplied row or document pair.
+
+        Args:
+            node: The AiScore or AiClassify node.
+            rows: Document indices, one column per alias.
+            on_scored: Optional callable(rows, values) run with each
+                part of the rows as its values are read.
+        """
         started = time.perf_counter()
         spec = node.spec
         rows = np.asarray(rows, dtype=np.int32).reshape(-1, len(spec.aliases))
@@ -269,12 +306,17 @@ class RerankerModelExecution:
         empty = np.empty(0, dtype=(
             object if isinstance(spec, ClassifySpec) else np.float32))
         sink = answer_sink()
-        streams = (sink is not None and len(rows)
+        streams = ((sink is not None or on_scored is not None) and len(rows)
                    and self.reranker.streams_answers)
         extra = {}
         if streams:
-            extra["on_answers"] = lambda positions, values: sink(
-                scored_batch(node, rows[positions], values))
+            def on_answers(positions, values):
+                if sink is not None:
+                    sink(scored_batch(node, rows[positions], values))
+                if on_scored is not None:
+                    on_scored(rows[positions], values)
+
+            extra["on_answers"] = on_answers
         batch = (
             self.reranker.score(spec, rows, self.documents, **extra)
             if len(rows) else RerankerBatch(empty, 0, 0)

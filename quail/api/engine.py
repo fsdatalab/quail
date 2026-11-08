@@ -27,8 +27,9 @@ class Engine:
         physical_executor: Optional callable(PhysicalRequest) that
             returns the PhysicalResponse, for tests without a GPU.
         order: The stage order rule each region is planned with.
-        run_query: Optional callable(Query) -> pyarrow Table that runs a
-            region's query in place of the engine.
+        run_query: Optional callable(query, on_rows) -> pyarrow Table that
+            runs a region's query in place of the engine, handing each
+            batch of finished rows to ``on_rows`` when it is not None.
         owns_session: Whether ``close`` closes the session.
     """
 
@@ -84,7 +85,8 @@ class Engine:
             return None
         return json.dumps(planning_settings(self.session, self._order))
 
-    def execute(self, planned: str, tables: dict | None = None) -> pa.Table:
+    def execute(self, planned: str, tables: dict | None = None,
+                on_rows: Callable | None = None) -> pa.Table | None:
         """Run a region Rust planned and return its rows.
 
         Args:
@@ -92,6 +94,9 @@ class Engine:
                 operators it lowers, DataFusion's plan of the region, and
                 each scan's files; or its refusal.
             tables: The rows of each table the region reads, by name.
+            on_rows: Optional callable(pyarrow Table) handed the region's
+                rows as they finish, each row once; the call then
+                returns None.
 
         Raises:
             RefusalError: No configuration can run the region.
@@ -106,13 +111,15 @@ class Engine:
                              logical=found.get("logical", ""), order=self._order,
                              tables=tables, keep_order=True)
         query.adopt_plan(found)
-        return self._run(query)
+        return self._run(query, on_rows)
 
-    def _run(self, query) -> pa.Table:
+    def _run(self, query, on_rows: Callable | None = None) -> pa.Table | None:
         if self._run_query is not None:
-            return self._run_query(query)
-        result = execute_query(query, physical_executor=self._physical_executor)
-        return result.collect()
+            table = self._run_query(query, on_rows)
+        else:
+            table = execute_query(query, physical_executor=self._physical_executor,
+                                  on_rows=on_rows).collect()
+        return None if on_rows is not None else table
 
     def run_region(self, payload: str, tables: dict | None = None,
                    fetch: int | None = None) -> pa.Table:

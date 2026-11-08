@@ -6,6 +6,7 @@ import time
 
 from quail.backends import BackendExecutionContext
 from quail.execution.result import QueryResult
+from quail.execution.streaming import streaming
 from quail.execution.types import PhysicalRequest, PhysicalResponse
 from quail.physical import ExecutionLocation, Scan
 from quail.physical.plan import Refusal, RefusalError, graph_from_envelope
@@ -97,7 +98,7 @@ def _execute_physical(request, registry):
 
 
 def execute_query(query, physical_executor=None, plan=None,
-                  on_backend_ready=None, on_execution_ready=None):
+                  on_backend_ready=None, on_execution_ready=None, on_rows=None):
     """Execute one query in its session's process.
 
     Args:
@@ -108,6 +109,8 @@ def execute_query(query, physical_executor=None, plan=None,
         on_backend_ready: Optional callback after model preparation.
         on_execution_ready: Optional callback after backend preparation and
             immediately before query execution.
+        on_rows: Optional callable(pyarrow Table) handed a model region's
+            rows as they finish, each row once.
     """
     from quail.api.query import Query
 
@@ -115,7 +118,7 @@ def execute_query(query, physical_executor=None, plan=None,
         return _execute_in_datafusion(query, physical_executor, plan,
                                       on_backend_ready, on_execution_ready)
     return _execute_region(query, physical_executor, plan,
-                           on_backend_ready, on_execution_ready)
+                           on_backend_ready, on_execution_ready, on_rows)
 
 
 def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
@@ -134,12 +137,12 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     results, region_tables, region_s = [], [], []
     started = time.perf_counter()
 
-    def run_query(region):
+    def run_query(region, on_rows=None):
         if plan is not None and results:
             raise RuntimeError("an edited plan is for a query of one model region")
         region_started = time.perf_counter()
         result = _execute_region(region, physical_executor, plan,
-                                 on_backend_ready, on_execution_ready)
+                                 on_backend_ready, on_execution_ready, on_rows)
         region_s.append(time.perf_counter() - region_started)
         results.append(result)
         table = result.collect()
@@ -170,8 +173,12 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
 
 
 def _execute_region(query, physical_executor, plan, on_backend_ready,
-                    on_execution_ready):
-    """Execute one model region's Query in its session's process."""
+                    on_execution_ready, on_rows=None):
+    """Execute one model region's Query in its session's process.
+
+    With ``on_rows``, the region's rows go to it as they finish, each
+    row once, and the result holds them all as well.
+    """
     total_started = time.perf_counter()
     if plan is not None:
         if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
@@ -207,9 +214,11 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
     if on_execution_ready is not None:
         on_execution_ready()
     started = time.perf_counter()
+    stream = None if on_rows is None else query.region_stream(on_rows)
     if has_compute:
-        response = (physical_executor(request) if physical_executor is not None
-                    else _execute_physical(request, query.session.registry))
+        with streaming(stream):
+            response = (physical_executor(request) if physical_executor is not None
+                        else _execute_physical(request, query.session.registry))
     else:
         response = PhysicalResponse(
             {}, {"wall_s": 0.0, "fresh_tokens": 0, "cached_tokens": 0})
@@ -218,6 +227,8 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
     coordinator_wall_s = time.perf_counter() - started
     finish_started = time.perf_counter()
     result = query.finish(response, coordinator_wall_s)
+    if on_rows is not None and (stream is None or not stream.finished):
+        on_rows(result.collect())
     finish_s = time.perf_counter() - finish_started
     model_wall_s = result.report["wall_s"]
     result.report.update(

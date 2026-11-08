@@ -4,3 +4,4 @@
 mod claim;
 mod dynamic_filter;
 mod extension;
+mod streaming;
