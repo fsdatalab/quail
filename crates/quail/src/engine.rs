@@ -284,21 +284,18 @@ impl PythonRunner {
         let hint = source.as_deref().map(|table| (hint, &columns, table));
         if !(self.planning.is_some() && fetch.is_none() && row_local(region, &payload)?) {
             let inputs = collect_inputs(inputs)?;
-            return self.run_window(region, &payload, &inputs, fetch, hint, rows);
+            return self.run_window(region, &payload, &inputs, fetch, hint, true, rows);
         }
         let size = self.input_window_rows()?;
         let mut inputs = inputs;
         let (name, mut batches) = inputs.remove(0);
+        let mut first = true;
+        let mut rest = None;
         loop {
-            let (window, ended) = read_window(&mut batches, size)?;
-            self.run_window(
-                region,
-                &payload,
-                &[(name.clone(), window)],
-                fetch,
-                hint,
-                rows,
-            )?;
+            let (window, ended) = read_window(&mut batches, &mut rest, size)?;
+            let window = [(name.clone(), window)];
+            self.run_window(region, &payload, &window, fetch, hint, first, rows)?;
+            first = false;
             if ended {
                 return Ok(());
             }
@@ -320,7 +317,9 @@ impl PythonRunner {
     /// Plan and run the region over these rows of its inputs, sending
     /// its rows to `rows`. With a hint over the one table the region
     /// reads, an input's rows the hint rejects are dropped first, and
-    /// the executor reads the hint as it tightens.
+    /// the executor reads the hint as it tightens. A window after the
+    /// `first` that keeps no row does not run.
+    #[allow(clippy::too_many_arguments)]
     fn run_window(
         &self,
         region: &ModelRegion,
@@ -328,6 +327,7 @@ impl PythonRunner {
         inputs: &[InputRows],
         fetch: Option<usize>,
         hint: Option<(&RegionHint, &RegionColumns, &str)>,
+        first: bool,
         rows: &RowSender,
     ) -> Result<()> {
         let mut sorted;
@@ -348,6 +348,9 @@ impl PythonRunner {
                         let window = concat_batches(&schema, &sorted[input].1)?;
                         let keep = BooleanArray::from(hint.keep(columns, table, &window)?);
                         let window = filter_record_batch(&window, &keep)?;
+                        if window.num_rows() == 0 && !first {
+                            return Ok(());
+                        }
                         sorted[input].1 = vec![window.clone()];
                         Some(window)
                     }
@@ -443,19 +446,31 @@ impl RegionRunner for PythonRunner {
     }
 }
 
-/// Read batches until they hold `size` rows or the input ends.
+/// Read batches until they hold `size` rows or the input ends; a batch
+/// past `size` rows is cut, and its rest starts the next window.
 ///
 /// Returns the batches and whether the input ended.
-fn read_window(batches: &mut InputBatches, size: usize) -> Result<(Vec<RecordBatch>, bool)> {
+fn read_window(
+    batches: &mut InputBatches,
+    rest: &mut Option<RecordBatch>,
+    size: usize,
+) -> Result<(Vec<RecordBatch>, bool)> {
     let mut window = Vec::new();
     let mut held = 0;
     while held < size {
-        let Some(batch) = batches.next() else {
-            return Ok((window, true));
+        let batch = match rest.take() {
+            Some(batch) => batch,
+            None => match batches.next() {
+                Some(batch) => batch?,
+                None => return Ok((window, true)),
+            },
         };
-        let batch = batch?;
-        held += batch.num_rows();
-        window.push(batch);
+        let taken = batch.num_rows().min(size - held);
+        if taken < batch.num_rows() {
+            *rest = Some(batch.slice(taken, batch.num_rows() - taken));
+        }
+        held += taken;
+        window.push(batch.slice(0, taken));
     }
     Ok((window, false))
 }

@@ -21,7 +21,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as LogicalColumn, Result};
-use datafusion::logical_expr::{LogicalPlan, Operator};
+use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{
     BinaryExpr, Column, IsNotNullExpr, IsNullExpr, NotExpr,
@@ -31,6 +31,7 @@ use datafusion::physical_expr_common::physical_expr::{
     snapshot_generation, snapshot_physical_expr,
 };
 
+use crate::ai::AiNode;
 use crate::region::ModelRegion;
 
 /// The tests above a region that it may drop rows by, over the region's
@@ -96,9 +97,11 @@ pub struct RegionColumns(pub Vec<RegionColumn>);
 
 impl RegionColumns {
     /// Read a region's columns from its plan: each column passed on
-    /// from an input, and every answer.
+    /// from a table, each AI.SCORE answer between 0 and 1, and every
+    /// other answer.
     pub fn of(region: &ModelRegion) -> Self {
         let schema = region.plan.schema();
+        let scores = score_columns(&region.plan);
         RegionColumns(
             schema
                 .iter()
@@ -106,6 +109,9 @@ impl RegionColumns {
                     let column = LogicalColumn::new(qualifier.cloned(), field.name());
                     if let Some((table, position)) = passed_on(region, &region.plan, &column) {
                         return RegionColumn::Source(table, position);
+                    }
+                    if qualifier.is_none() && scores.contains(field.name()) {
+                        return RegionColumn::Bounded(0.0, 1.0);
                     }
                     RegionColumn::Answer
                 })
@@ -129,6 +135,41 @@ impl RegionColumns {
         }
         input
     }
+}
+
+/// The names of the region's AI.SCORE answers. A score is the model's
+/// probability of its yes answer, or the mean of several, from one
+/// readout per row: it is never NULL and lies between 0 and 1, and no
+/// partial answer bounds it more tightly before the readout.
+fn score_columns(plan: &LogicalPlan) -> Vec<String> {
+    let mut found = Vec::new();
+    let _ = plan.apply(|node| {
+        match node {
+            LogicalPlan::Extension(extension) => {
+                if let Some(ai) = extension.node.as_any().downcast_ref::<AiNode>()
+                    && ai.function() == "ai_score"
+                {
+                    found.extend(ai.fields.iter().map(|field| field.name().clone()));
+                }
+            }
+            LogicalPlan::Projection(projection) => {
+                for (expr, field) in projection.expr.iter().zip(projection.schema.fields()) {
+                    let mut inner = expr;
+                    while let Expr::Alias(alias) = inner {
+                        inner = &alias.expr;
+                    }
+                    if let Expr::ScalarFunction(call) = inner
+                        && call.name() == "ai_score"
+                    {
+                        found.push(field.name().clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 /// The table and column position a plan's column passes on unchanged,

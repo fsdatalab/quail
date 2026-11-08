@@ -102,6 +102,8 @@ names the rule that makes each rewrite and when it applies.
 | R12 | `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))` | `push_down_distinct` | `K` is input columns or a classification's label, and the node has no fetch. |
 | R13 | `S ⋉_{J=K} AI(R) ⇒ S ⋉_{J=K} AI(R; n = 1 per K)` | `push_down_semi_join_fetch` | `J = K` is the whole join condition, `K` are input columns of the node, each name once; only projections and aliases are between the join and the node; the node, and every `AiNode` below it, is an AI.IF over the same one table, with no join, fetch, `HINT`, or guard. |
 | R14 | `π_K(σ_{c ≥ k}(γ_{K; count(*)→c}(AI(R)))) ⇒ π_K(σ_{c ≥ k}(γ_{K; count(*)→c}(AI(R; n = k per K))))` | `push_down_count_threshold` | The HAVING is `COUNT(*) >= k`, `> k - 1`, or written the other way round, with `k` a positive integer; the GROUP BY keys `K` are columns; `count(*)` is the only aggregate and only the HAVING reads it; the node is under the GROUP BY as for R13. |
+| R15 | `TopK_{a↓,k}(AI(R; h)) ⇒ TopK_{a↓,k}(AI(R; h ∧ a ≥ t))` | DataFusion's `FilterPushdown` hands `ModelRegionExec` the top-k sort's dynamic filter as the region's hint | The node has no fetch (`n = ∞`) and each region row comes from one row of one table, with no join or stop key; `a` is never NULL; `t` is −∞ until the sort holds `k` rows, then the `k`-th largest `a` it holds, and rows with `a = t` stay. The region drops a row only when the test is not TRUE for every value its answers may take: an AI.SCORE answer lies between 0 and 1. |
+| R16 | `S ⋈_{J=K} AI(R; h) ⇒ S ⋈_{J=K} AI(R; h ∧ K ∈ π_J(S))` | DataFusion's `FilterPushdown` hands `ModelRegionExec` the hash join's dynamic filter as the region's hint | Inner equi-join with `S` the build side, complete before the region reads the hint, and the node with no fetch, as for R15; `K` is a column the region passes on from its table. NULL keys never match; the filter may keep a row whose key is absent, never drop one whose key is present. |
 | R17 | `AI_{f→b}(AI_{f→a}(R)) ⇒ π_{*, a→b}(AI_{f→a}(R))` | `merge_repeated_ai_calls` | Same call and guard, each column read by the name the lower node's input gives it; only filters, other `AiNode`s of the same rows, and the projections and aliases of derived tables and CTEs between them, the lower node's answer added to each projection that does not return it; no filter on the upper node across a derived table; no fetch on the upper node, each test of the upper node's answer already a test of the lower node's, and the lower node returns each column the upper one returns. The lowering already gives calls written the same way in one SELECT list and WHERE one node. |
 
 R3 gives the node a hint test, which it may drop rows by; the filter
@@ -112,6 +114,29 @@ Its practical role is small: the executor already stops a map's or
 extraction's answer by the region's exact tests of that answer alone
 (`should_stop_answers_early`), and reads a hint test the same way. See
 [Evaluation on partial answers](/docs/architecture/execution#evaluation-on-partial-answers).
+
+R15 and R16 run while the query runs, not in the optimizer: the top-k
+sort and the hash join each make a dynamic filter, DataFusion pushes it
+down to `ModelRegionExec`, and the executor reads it again whenever it
+tightens; see
+[Runtime filters](/docs/architecture/physical-plans#runtime-filters).
+What R15 saves depends on what bounds an answer before the model gives
+it:
+
+- AI.SCORE reads one readout per row, the model's probability of its
+  yes answer, so there is no partial answer to bound. A row not yet
+  asked may score anything from 0 to 1, and it can be skipped only
+  when the threshold `t` is 1, the largest score: once `k` rows score
+  1, a row that would tie at 1 and lose on the sort's next key, such
+  as a larger id, is skipped. Below 1 the threshold skips nothing.
+- A sort key the region passes on from its table, such as `ORDER BY
+  c.id LIMIT 20`, is known before the model runs, so every later row
+  past the threshold is skipped.
+
+R16 skips the rows whose join key is not among the build side's keys.
+In a query that joins a table back on its id above the region, the
+build side holds every id of the table, so nothing is skipped; a small
+build side, such as a short list of ids, skips most rows.
 
 R4 relies on `AI.EXTRACT` copying each answer from its document, so an
 answer is NULL or a substring of `d`. A decoded answer may differ from

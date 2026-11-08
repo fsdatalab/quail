@@ -247,3 +247,53 @@ def test_a_top_k_on_an_input_column_hands_the_region_its_threshold():
     # once two reviews pass, every later id is past the top two
     assert len(every.asked) < 6
     context.session.close()
+
+
+def _scored_rows(oracle) -> int:
+    """The rows the oracle scored, over every score call."""
+    return sum(len(rows) for _, rows in oracle.calls)
+
+
+# even reviews score 1.0, the highest a score can be, odd ones 0.3
+TOP_K_SCORES = {"scores": lambda spec, ids: 1.0 if ids[0] % 2 == 0 else 0.3}
+TOP_K_ROWS = [("r00", 1.0), ("r02", 1.0), ("r04", 1.0)]
+
+
+@pytest.mark.parametrize("where", ["", "WHERE r.stars > -1"])
+def test_a_top_k_over_a_score_asks_fewer_rows_once_it_holds_k(monkeypatch, where):
+    # with a WHERE the region reads DataFusion's rows in windows of one
+    # row; without one it reads the table and scores it in groups of one
+    monkeypatch.setattr("quail.backends.quail.reranker.HINTED_SCORE_ROWS", 1)
+    # one partition: DataFusion hands the region the rows in table order
+    monkeypatch.setenv("DATAFUSION_EXECUTION_TARGET_PARTITIONS", "1")
+    text = (f"SELECT r.id, AI.SCORE(PROMPT('q7: {{0}}', r.body)) AS score "
+            f"FROM reviews r {where} ORDER BY score DESC, r.id LIMIT 3")
+    hinted = Oracle(**TOP_K_SCORES, streams=True, pace=0.05)
+    context = _paced_context(hinted, 12)
+    context._engine.input_window_rows = 1
+    assert _rows(context.sql(text)) == TOP_K_ROWS
+    # without the LIMIT the sort holds every row and hands no threshold
+    every = Oracle(**TOP_K_SCORES, streams=True)
+    whole = _paced_context(every, 12)
+    assert _rows(whole.sql(text.replace(" LIMIT 3", "")))[:3] == TOP_K_ROWS
+    assert _scored_rows(every) == 12
+    # once r00, r02, and r04 hold 1.0, a later review can only tie at 1.0
+    # with a larger id, which the top 3 does not take
+    assert _scored_rows(hinted) < 9
+    context.session.close()
+    whole.session.close()
+
+
+def test_a_join_with_a_small_build_side_skips_probe_rows_whose_key_is_absent():
+    text = ("SELECT r.id FROM picked p JOIN reviews r ON r.id = p.review "
+            "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))")
+    every = Oracle(filters=lambda alias, document, position: True)
+    context = _paced_context(every, 12)
+    picked = pa.table({"id": ["p0", "p1"], "review": ["r03", "r07"]})
+    context.register("picked", quail.DocumentProvider.from_table(picked, id_col="id"))
+    plan = context._native.explain(text)
+    assert "HashJoinExec" in plan and "ModelRegionExec: hint=[DynamicFilter" in plan
+    assert sorted(_rows(context.sql(text))) == [("r03",), ("r07",)]
+    # the join's keys are complete before the region starts
+    assert sorted(every.asked) == [("r", 3), ("r", 7)]
+    context.session.close()

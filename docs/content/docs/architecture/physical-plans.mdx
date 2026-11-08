@@ -146,12 +146,14 @@ apply the test. The region uses the hint when its rows each come from
 one row of one table, with no join, fetch, or stop key:
 
 - A test that reads only columns the region passes on from that table,
-  such as an id, is decided for each row before the model runs.
+  such as an id, is decided for each row before the model runs. A test
+  of an AI.SCORE answer is decided only when every score from 0 to 1
+  gives the same result (R15).
 - Before planning, the region drops the input rows the hint rejects
   as it is then. A table the region reads by name keeps its rows.
 - While the region runs, the executor reads the hint again before it
-  admits each document to a first filter, and skips a document the
-  hint now rejects. The test tightens as DataFusion reads the region's
+  admits each document to a first filter, and before each group of
+  1,024 rows a score asks, and skips a row the hint now rejects. The test tightens as DataFusion reads the region's
   rows, which stream out as they finish.
 - The region starts when DataFusion first reads it. A hash join reads
   its probe side once its build side is complete, so the join's filter

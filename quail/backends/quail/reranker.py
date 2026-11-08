@@ -20,6 +20,10 @@ from quail.execution.streaming import region_stream
 from quail.physical import AiClassify, AiScore, ClassifySpec, ValueType
 from quail.progress import answer_sink
 
+# the rows a score asks at once when a hint above the region may drop
+# rows; the hint is read again before each group
+HINTED_SCORE_ROWS = 1024
+
 # one kernel per entry of quail.common.expressions.SCORE_COMPARISONS
 _COMPARE = {
     "<": pc.less, "<=": pc.less_equal,
@@ -249,10 +253,22 @@ def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeR
     started = time.perf_counter()
     rows, priors = _candidate_rows(node, inputs)
     on_scored = _stream_scored(node, priors)
+    stream = region_stream()
+    alias = node.spec.aliases[0]
+    # a hint over the scored table is read again before each group of rows
+    hinted = (stream is not None and stream.hint is not None and not rows.product
+              and len(node.spec.aliases) == 1 and alias == stream.alias)
     scored = []
     metrics = NodeMetrics()
     size = DEFAULT_BATCH_ROWS if rows.product else max(1, len(rows))
+    if hinted:
+        size = HINTED_SCORE_ROWS
     for batch in rows.batches(size):
+        if hinted:
+            batch = batch[[stream.keeps(alias, int(document))
+                           for document in batch[:, 0]]]
+            if not len(batch):
+                continue
         result = score_batch(node, batch, on_scored)
         scored.append(result.outputs[node.rows_port])
         metrics += result.metrics
@@ -261,6 +277,10 @@ def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeR
             sink(scored_batch(
                 node, batch,
                 result.outputs[node.rows_port].column(node.spec.name).to_pylist()))
+    if not scored:
+        scored.append(score_rows(np.empty((0, len(node.spec.aliases)), dtype=np.int32),
+                                 node.spec.aliases, node.spec.name, [],
+                                 _value_type(node.spec)))
     outputs = _scored_outputs(node, Rows.concat(scored), priors)
     rows = outputs[node.rows_port]
     if isinstance(node.spec, ClassifySpec):
