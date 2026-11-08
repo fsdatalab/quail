@@ -86,16 +86,10 @@ def fever_oracle(capacity, empty):
 def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
                    empty=False):
     """Return a physical executor that runs the FEVER fakes on one or two GPUs."""
-    from quail.backends.quail import worker
-    from quail.backends.quail.distributed import execute_distributed_graph
-    from quail.specs import H100_SXM
+    from helpers.fakes import thread_servers
 
-    def child(documents):
-        model = fever_oracle(capacity=1, empty=False)
-        state = graph_state(model, documents)
-        model.arena = state["gpu"].arena
-        return worker.ChildState(
-            gpu_index=0, gpu=state["gpu"], registry=session.registry)
+    from quail.backends.quail.graph import execute_staged_graph
+    from quail.specs import H100_SXM
 
     def execute(request):
         graph = graph_from_envelope(request.plan)
@@ -110,20 +104,18 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
             report = execute_single_graph(state, request.plan["settings"], graph)
             assert not state["gpu"].arena.accounting.owned
             return PhysicalResponse(report.pop("_outputs"), report)
-        children = [child(documents), child(documents)]
-
-        def round_fn(kind, subs):
-            assert kind == "execute"
-            return [worker._child_execute(state, sub)
-                    for state, sub in zip(children, subs)]
-
-        report = execute_distributed_graph(
-            {**request.plan["settings"], "model": "qwen3-4b-fp8",
-             "documents": documents, **extra, "physical_plan": request.plan},
-            graph, 2, round_fn, H100_SXM, session.registry.runtimes,
-            session.registry,
-        )
-        assert all(not child.gpu.arena.accounting.owned for child in children)
+        states = []
+        for _ in range(gpus):
+            model = fever_oracle(capacity=1, empty=False)
+            state = graph_state(model, documents)
+            model.arena = state["gpu"].arena
+            state.update(extra)
+            states.append(state)
+        payload = {**request.plan["settings"], **extra,
+                   "columns": request.column_tables()}
+        report = execute_staged_graph(
+            payload, graph, gpus, thread_servers(states, payload, graph), H100_SXM)
+        assert all(not state["gpu"].arena.accounting.owned for state in states)
         for node in graph.nodes:
             if isinstance(node, AiJoin):
                 metrics = report["node_metrics"][node.node_id]

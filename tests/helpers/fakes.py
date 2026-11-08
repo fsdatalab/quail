@@ -6,7 +6,8 @@ length, and the join frame is [FRAME] * length.
 """
 
 import random
-from contextlib import nullcontext
+import threading
+from contextlib import closing, nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,9 +17,10 @@ from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.pages import PageArena
-from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.graph import execute_single_graph, serve_region
 from quail.builtins import built_in_registry
 from quail.common.expressions import ColumnRef
+from quail.execution.stages import listening
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -387,3 +389,50 @@ def fake_readout(**attributes):
         "trailing_rows": 1, "normalize": False, "dtype": None,
         "submit": lambda value, rows_per_answer=None: value,
         "result": lambda value: value, **attributes})
+
+
+def thread_servers(states, payload, graph):
+    """Return a serve callable that runs each GPU's server on a thread.
+
+    Each thread serves its partition of the region's stages with the
+    executor state given for that GPU, as a GPU child does.
+
+    Args:
+        states: Per GPU, the executor's state, as ``graph_state`` builds it.
+        payload: The query's runtime payload.
+        graph: The region's graph.
+    """
+    def serve(paths, wanted):
+        threads = [_Serving(state, payload, graph, listening(path), wanted)
+                   for state, path in zip(states, paths, strict=True)]
+        for thread in threads:
+            thread.start()
+
+        def results():
+            for thread in threads:
+                thread.join()
+            for thread in threads:
+                if thread.error is not None:
+                    raise thread.error
+            return [thread.result for thread in threads]
+
+        return results
+
+    return serve
+
+
+class _Serving(threading.Thread):
+    """One GPU's server on a thread, keeping its result or its error."""
+
+    def __init__(self, state, payload, graph, listener, wanted):
+        super().__init__(daemon=True)
+        self.arguments = (state, payload, graph, listener, wanted)
+        self.result = self.error = None
+
+    def run(self):
+        state, payload, graph, listener, wanted = self.arguments
+        try:
+            with closing(listener):
+                self.result = serve_region(state, payload, graph, listener, wanted)
+        except BaseException as error:
+            self.error = error

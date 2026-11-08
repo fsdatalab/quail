@@ -2445,6 +2445,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "datafusion",
+ "futures",
  "pyo3",
  "pyo3-build-config",
  "quail-cost",

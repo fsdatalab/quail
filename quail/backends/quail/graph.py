@@ -6,15 +6,17 @@ import time
 
 import pyarrow as pa
 
-from quail.backends.quail.executor.memory import memory_report
+from quail.backends.quail.executor.memory import memory_report, merge_memory_reports
+from quail.backends.quail.executor.operators.filter import stop_keys
 from quail.backends.quail.retention import apply_retention
-from quail.common.pairs import columns_key
+from quail.common.pairs import FIRST_DOCUMENT, columns_key
 from quail.execution.metrics import NodeResult, scalar_node_metrics
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
     compute_subgraph,
 )
+from quail.execution.stages import merged_run, run_partitions, serve_stages
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiClassify,
@@ -144,6 +146,103 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     measurements = execution_measurements(context)
     report.update(kv_manager=measurements["kv_manager"], **measurements["memory"])
     return report
+
+
+def serve_region(state, payload, graph: PhysicalGraph, listener, wanted) -> dict:
+    """Serve a region's stages on one GPU executor until the region ends.
+
+    Args:
+        state: The executor's state for this GPU and query.
+        payload: The query's runtime payload.
+        graph: The region's graph.
+        listener: The listening socket Rust sends the stages on.
+        wanted: The (node, port) pairs the region's FinishedRows reads.
+
+    Returns:
+        {"results": node id -> NodeResult of each node this GPU ran,
+        "kv_manager": ..., and the memory report}.
+    """
+    context = execution_context(state, payload, graph)
+    torch = state["gpu"].torch
+    arena = state["gpu"].arena
+    try:
+        with torch.inference_mode():
+            results = serve_stages(listener, context, compute_subgraph(graph), wanted)
+        torch.cuda.synchronize()
+    finally:
+        for key in arena.resident_keys():
+            arena.free_key(key)
+    return {"results": results, **execution_measurements(context)}
+
+
+def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
+                         device) -> dict:
+    """Run a region's stages on one server per GPU and report the run.
+
+    Args:
+        payload: The query's runtime payload.
+        graph: The region's graph.
+        gpus: How many GPUs.
+        serve: Callable(paths, wanted) that starts each GPU's server, as
+            ``run_partitions`` takes it; each server returns what
+            ``serve_region`` returns.
+        device: The GPUs' device spec.
+    """
+    compute = compute_subgraph(graph)
+    started = time.perf_counter()
+    outputs = run_partitions(compute, stage_keys(graph, payload), gpus, serve)
+    wall = time.perf_counter() - started
+    result = merged_run(compute, [output["results"] for output in outputs])
+    report = graph_report(graph, result, wall, device, gpus=gpus,
+                          gpu_timing=payload.get("gpu_timing", False))
+    totals = {}
+    for output in outputs:
+        for name, value in output["kv_manager"].items():
+            if isinstance(value, dict):
+                counts = totals.setdefault(name, {})
+                for alias, count in value.items():
+                    counts[alias] = counts.get(alias, 0) + count
+            else:
+                totals[name] = totals.get(name, 0) + value
+    report.update(kv_manager=totals,
+                  **merge_memory_reports([output["memory"] for output in outputs]))
+    return report
+
+
+def stage_keys(graph: PhysicalGraph, payload) -> dict:
+    """Each document's key, by alias, for a table hashed by more than its ids.
+
+    A stop key's group goes to one GPU, so its per-key stop sees the
+    whole group; copies of one text go with the copy that is asked. A
+    document's key is the smallest id it is grouped with, through
+    copies and groups alike.
+    """
+    columns = payload.get("columns", {})
+    scans = {node.alias: node.num_documents for node in graph.nodes
+             if isinstance(node, Scan)}
+    groupings = {alias: [columns[alias].column(FIRST_DOCUMENT).to_pylist()]
+                 for alias in payload.get("deduplicate", {})}
+    for node in graph.nodes:
+        if isinstance(node, AiFilter) and node.stop_key:
+            groupings.setdefault(node.alias, []).append(
+                list(stop_keys(payload, node).of(range(scans[node.alias]))))
+    keys = {}
+    for alias, found in groupings.items():
+        parent = list(range(scans[alias]))
+
+        def root(document):
+            while parent[document] != document:
+                parent[document] = parent[parent[document]]
+                document = parent[document]
+            return document
+
+        for groups in found:
+            first = {}
+            for document, group in enumerate(groups):
+                left, right = root(document), root(first.setdefault(group, document))
+                parent[max(left, right)] = min(left, right)
+        keys[alias] = [root(document) for document in range(scans[alias])]
+    return keys
 
 
 def graph_report(graph, result, wall, device, *, gpus=1, gpu_timing=False):

@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 async-trait = "0.1"
+futures = "0.3"
 datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
 # the Arrow C stream interface, to share buffers with pyarrow
 arrow = { version = "59.3.2", default-features = false, features = ["ffi", "ipc"] }

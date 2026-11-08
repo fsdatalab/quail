@@ -1119,6 +1119,43 @@ fn parse_expression<'py>(
     }
 }
 
+/// Cut a region's compute graph, as JSON, into stages for several GPUs,
+/// as `quail_planner::stages::stages` cuts it; returns the stages as
+/// JSON.
+#[pyfunction]
+fn region_stages(graph: &str) -> PyResult<String> {
+    let graph: quail_physical::PhysicalGraph = from_json(graph)?;
+    let cut = quail_planner::stages::stages(&graph).map_err(PyValueError::new_err)?;
+    serde_json::to_string(&cut).map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+/// Run a region's stages on GPU servers, as `quail::stages::run_stages`
+/// runs them.
+///
+/// `graph` is the region's compute graph as JSON; `keys` gives, by
+/// alias, each document's key for a table hashed by a key other than
+/// its ids; `servers` names each GPU's Unix socket; `report(data)` takes
+/// each finished table as Arrow IPC bytes.
+#[pyfunction]
+fn run_stages(
+    py: Python<'_>,
+    graph: &str,
+    keys: std::collections::HashMap<String, Vec<i32>>,
+    servers: Vec<std::path::PathBuf>,
+    report: Py<PyAny>,
+) -> PyResult<()> {
+    let graph: quail_physical::PhysicalGraph = from_json(graph)?;
+    let report: quail::stages::Report = Box::new(move |table: Vec<u8>| {
+        Python::attach(|py| {
+            report.call1(py, (pyo3::types::PyBytes::new(py, &table),))?;
+            Ok::<_, PyErr>(())
+        })
+        .map_err(|error| DataFusionError::External(Box::new(error)))
+    });
+    py.detach(|| quail::stages::run_stages(&graph, keys, &servers, report))
+        .map_err(python_error)
+}
+
 /// The `_quail_native` module. A Rust program that embeds Python adds it
 /// with `pyo3::append_to_inittab!` before Python starts.
 #[pymodule]
@@ -1147,6 +1184,8 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(limited_operators, module)?)?;
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
     module.add_function(wrap_pyfunction!(prefix_statistics, module)?)?;
+    module.add_function(wrap_pyfunction!(region_stages, module)?)?;
+    module.add_function(wrap_pyfunction!(run_stages, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }
 

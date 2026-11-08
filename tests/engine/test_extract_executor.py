@@ -19,14 +19,11 @@ from helpers.extract_fakes import (
     make_spec as make_extract_spec,
 )
 from helpers.extract_reference import AnswerState, Decoder
-from helpers.fakes import fake_pipeline, fake_readout
+from helpers.fakes import fake_pipeline, fake_readout, thread_servers
 from helpers.kv_checker import Setup, make_arena
 from test_map_decode import cpu_staging, events_torch
 
 from quail.backends.quail import QuailModelExecution
-from quail.backends.quail.distributed import (
-    execute_distributed_graph,
-)
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract.candidates import Stream
 from quail.backends.quail.executor.extract.vocabulary import same_word
@@ -34,8 +31,8 @@ from quail.backends.quail.executor.operators import operator_types
 from quail.backends.quail.executor.operators.extract import ExtractOperator
 from quail.backends.quail.executor.region import RegionExecution
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
-from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.worker import ChildState, _child_execute
+from quail.backends.quail.graph import execute_single_graph, execute_staged_graph
+from quail.backends.quail.worker import _execution_state
 from quail.builtins import built_in_registry
 from quail.physical import (
     AiExtract,
@@ -457,13 +454,12 @@ def test_a_pipeline_of_extractions_reads_each_document_once(
 
 
 @pytest.mark.parametrize("gpus", [2])
-def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
-    import pickle
-
+def test_extractions_on_several_gpus_keep_spans_and_free_kv(monkeypatch, gpus):
     state, model, _, run_pipeline = _setup(monkeypatch, share_prefixes=True)
     expected, _ = run_pipeline("ends", "starts")
     spec, tables = make_spec()
-    nodes = [Scan(node_id="input:c", alias="c", input_id="c")]
+    nodes = [Scan(node_id="input:c", alias="c", input_id="c",
+                  num_documents=len(DOCS))]
     for name in ("ends", "starts"):
         previous = nodes[-1]
         nodes.append(AiExtract(
@@ -473,7 +469,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
             keep_kv=name == "starts"))
     graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "rows:c"))
     registry = built_in_registry()
-    children = []
+    gpu_states = []
     for _ in range(gpus):
         local = _state(model)
         torch, arena = local.torch, local.loaded_model.arena
@@ -487,9 +483,9 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
         execution.bind_query(torch=torch, answer_rows=object(),
                              chunk_tokens=state.chunk_tokens,
                              async_answers=fake_readout())
-        children.append(ChildState(gpu_index=0, registry=registry, gpu=SimpleNamespace(
+        gpu_states.append(SimpleNamespace(
             execution=execution, torch=torch, arena=arena, pipeline=pipeline,
-            spec=MODELS["qwen3-4b-fp8"])))
+            spec=MODELS["qwen3-4b-fp8"]))
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": state.chunk_tokens,
         "true_ids": [1], "false_ids": [2],
@@ -499,31 +495,18 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
             "backend": "quail", "model": "qwen3-4b-fp8", "device": "h100-sxm",
             "gpus": gpus, "settings": {}, "graph": json.loads(graph.to_json())},
     }
-    rounds = []
-
-    def round_fn(kind, subs):
-        assert kind == "execute"
-        subs = pickle.loads(pickle.dumps(subs))
-        rounds.append(subs)
-        return [_child_execute(child, sub) for child, sub in zip(children, subs)]
-
-    result = execute_distributed_graph(
-        payload, graph, gpus, round_fn, DEVICES["h100-sxm"], registry.runtimes,
-        registry)
-    assert len(rounds) == 1
-    # every worker ran the whole pipeline over its own documents
-    shards = [sub["inputs"]["ai-extract:ends"]["input:0"].ids["c"].to_pylist()
-              for sub in rounds[0]]
-    assert sorted(document for shard in shards for document in shard) == [0, 1, 2]
-    assert all(sub["final"] for sub in rounds[0])
+    states = [_execution_state(gpu, payload, registry) for gpu in gpu_states]
+    result = execute_staged_graph(payload, graph, gpus,
+                                  thread_servers(states, payload, graph),
+                                  DEVICES["h100-sxm"])
     for node in nodes[1:]:
-        actual = result["_outputs"][PortRef(node.node_id, "rows:c")]
+        actual = result["_outputs"][PortRef(node.node_id, "rows:c")].sort_by("c")
         assert actual.equals(expected[node.node_id].outputs["rows:c"].table())
     assert result["fresh_tokens"] == sum(
         item.metrics.fresh_tokens for item in expected.values())
     assert result["evaluated_documents"] == 2 * len(DOCS)
     assert result["backend_metrics"]["inferences"][0]["none"] == 1
-    assert all(not child.gpu.arena.accounting.owned for child in children)
+    assert all(not gpu.arena.accounting.owned for gpu in gpu_states)
 
 
 def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(

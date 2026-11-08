@@ -1,17 +1,17 @@
 """Load and run Quail models on the process's GPUs.
 
 One GPU runs in the calling process. Several GPUs use one child process
-per GPU, each with its own CUDA context and arena.
+per GPU, each with its own CUDA context and arena; each child serves
+its partition of the region's stages to Rust over a Unix socket.
 """
 
 import atexit
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from typing import Any
 
 from quail.backends.base import GpuContext
-from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
 from quail.backends.quail.executor.model_loading import load_model
@@ -27,15 +27,13 @@ from quail.backends.quail.executor.state import GpuRuntime
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
     execute_single_graph,
-    execution_context,
-    execution_measurements,
+    execute_staged_graph,
+    serve_region,
 )
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
-from quail.common.tokens import (
-    decode_payload_documents,
-)
-from quail.execution.runner import ExecutionContext
+from quail.common.tokens import decode_payload_documents, select_documents
+from quail.execution.stages import listening
 from quail.execution.types import PhysicalResponse
 from quail.physical import Scan
 from quail.physical.plan import graph_from_envelope
@@ -439,7 +437,6 @@ class ChildState:
     gpu: LoadedGpu | None = None
     registry: Any = None
     model_path: str | None = None
-    runtime_context: ExecutionContext | None = None
 
 
 def _child_main(gpu_index, conn):
@@ -459,8 +456,12 @@ def _child_main(gpu_index, conn):
                 state.registry = data["registry"]
                 state.model_path = data["model_path"]
                 conn.send(("ok", _child_boot(state, data)))
-            elif kind == "execute":
-                conn.send(("ok", _child_execute(state, data)))
+            elif kind == "region":
+                # the first reply says the socket listens, the second
+                # carries what the child ran once the region ended
+                with closing(listening(data["socket"])) as listener:
+                    conn.send(("ok", None))
+                    conn.send(("ok", _child_region(state, data, listener)))
         except Exception:
             import traceback
             conn.send(("err", traceback.format_exc()))
@@ -473,7 +474,6 @@ def _child_boot(state, sub):
     device = registry.device(envelope["device"])
     backend = registry.backend(envelope["backend"])
     gpu, state.gpu = state.gpu, None
-    state.runtime_context = None
     state.gpu, boot = _boot_gpu(
         gpu, backend, GpuContext(
             gpu_index=state.gpu_index, gpus=sub["gpus"],
@@ -483,29 +483,12 @@ def _child_boot(state, sub):
     return boot
 
 
-def _child_execute(state, sub) -> dict:
-    """Run one graph group on this worker's share of its documents.
-
-    The first group of a query carries the query itself; the worker
-    binds it to the same execution context a single GPU uses.
-    """
-    if "query" in sub:
-        payload = sub["query"]
-        graph = graph_from_envelope(payload["physical_plan"])
-        state.runtime_context = execution_context(
-            _execution_state(state.gpu, payload, state.registry), payload, graph)
-    context = state.runtime_context
-    context.state["filter_limit"] = sub["limit"]
-    nodes, inputs = sub["nodes"], sub["inputs"]
-    gpu = state.gpu
-    with gpu.torch.inference_mode():
-        results = context.model_execution.execute_pipeline(nodes, inputs, context)
-    gpu.torch.cuda.synchronize()
-    if sub["final"]:
-        for key in gpu.arena.resident_keys():
-            gpu.arena.free_key(key)
-    return {"results": results, "retained": tuple(gpu.arena.retained_keys()),
-            **execution_measurements(context)}
+def _child_region(state, data, listener) -> dict:
+    """Serve one region's stages on this child's GPU until the region ends."""
+    payload = data["query"]
+    graph = graph_from_envelope(payload["physical_plan"])
+    return serve_region(_execution_state(state.gpu, payload, state.registry),
+                        payload, graph, listener, data["wanted"])
 
 
 class GpuWorkers:
@@ -546,12 +529,20 @@ class GpuWorkers:
             process.is_alive() for process, _ in self.children)
 
     def round(self, kind, subs):
-        """Send one round to the children and collect their results."""
+        """Send one message to each child and collect their replies."""
+        self.send(kind, subs)
+        return self.receive()
+
+    def send(self, kind, subs):
+        """Send one message to each child."""
         for (_, conn), sub in zip(self.children, subs):
             conn.send((kind, sub))
+
+    def receive(self):
+        """Collect one reply from each child."""
         # every reply is read before an error is raised, so the pipes
-        # stay in step with the children for the next round
-        replies = [conn.recv() for (_, conn), _sub in zip(self.children, subs)]
+        # stay in step with the children for the next message
+        replies = [conn.recv() for _, conn in self.children]
         for status, data in replies:
             if status != "ok":
                 raise RuntimeError(f"GPU child failed:\n{data}")
@@ -574,11 +565,11 @@ class GpuWorkers:
             process.close()
 
 
-def _close_children():
+def _close_children(terminate=False):
     global _WORKERS
     workers, _WORKERS = _WORKERS, None
     if workers is not None:
-        workers.close()
+        workers.close(terminate=terminate)
 
 
 atexit.register(_close_children)
@@ -595,9 +586,7 @@ def _ensure_children(count, configuration) -> GpuWorkers:
 
 
 def execute_quail_multi(payload, registry, graph):
-    """Execute the typed Quail graph across GPU child processes."""
-    payload = dict(payload)
-    payload["documents"] = decode_payload_documents(payload["documents"])
+    """Execute the typed Quail graph as stages on GPU child processes."""
     gpus = payload["gpus"]
     spec = registry.model(payload["model"])
     started = time.perf_counter()
@@ -614,10 +603,25 @@ def execute_quail_multi(payload, registry, graph):
     boots = workers.round("boot", [setup] * gpus)
     boot_s = round(time.perf_counter() - started, 2)
     say(f"all {gpus} GPUs ready; running the query")
-    report = execute_distributed_graph(
-        payload, graph, gpus, workers.round,
-        registry.device(payload["physical_plan"]["device"]),
-        registry.runtimes, registry)
+
+    # file backed token buffers go to the children by reference
+    documents = decode_payload_documents(payload["documents"])
+    query = {**payload, "documents": {
+        alias: select_documents(found, range(len(found)))
+        for alias, found in documents.items()}}
+
+    def serve(paths, wanted):
+        try:
+            workers.round("region", [{"query": query, "socket": path,
+                                      "wanted": wanted} for path in paths])
+        except BaseException:
+            # the children that listen would wait for the region forever
+            _close_children(terminate=True)
+            raise
+        return workers.receive
+
+    report = execute_staged_graph(
+        payload, graph, gpus, serve, registry.device(envelope["device"]))
     slowest = max(boots, key=lambda boot: boot["boot_s"])
     report["boot_s"] = boot_s
     report["boot_kind"] = "cold" if any(b["kind"] == "cold" for b in boots) else "warm"

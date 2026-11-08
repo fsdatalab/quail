@@ -1,6 +1,5 @@
 """Quail backend execution tests without a GPU."""
 
-import json
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -15,17 +14,12 @@ from helpers.fakes import (
 )
 
 from quail.backends.quail import QuailModelExecution
-from quail.backends.quail.distributed import execute_distributed_graph
-from quail.builtins import built_in_registry
-from quail.execution.result import filter_answer_table
 from quail.physical import (
     AiFilter,
-    PhysicalGraph,
     PortRef,
-    Scan,
     input_ports,
 )
-from quail.specs import DEVICES, MODELS
+from quail.specs import MODELS
 
 
 def test_filter_execution_and_retention_inputs(monkeypatch):
@@ -34,51 +28,6 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
         node_id="filter:d", inputs=input_ports((PortRef("input:d", "rows:d"),)),
         alias="d", question_token_ids=(9,), written_position=0, question_tokens=1,
         preamble_tokens=1, selectivity=None, expected_rows=4)
-    graph = PhysicalGraph((Scan(node_id="input:d", alias="d", input_id="d"),
-                           filtered), PortRef("filter:d", "rows:d"))
-
-    def round_fn(kind, subs):
-        assert kind == "execute"
-        outputs = []
-        for sub in subs:
-            indices = sub["inputs"]["filter:d"]["input:0"].ids["d"].to_pylist()
-            from quail.execution.metrics import NodeMetrics, NodeResult
-
-            result = NodeResult({
-                "rows:d": [index for index in indices if index % 2 == 0],
-                "filter_answers:d": filter_answer_table(
-                    "d", indices, [0] * len(indices),
-                    [index % 2 == 0 for index in indices])},
-                NodeMetrics(fresh_tokens=len(indices)))
-            outputs.append({
-                "results": {"filter:d": result}, "retained": (),
-                "kv_manager": {"evicted_keys": 1},
-                "memory": {"peak_gib": 1.0,
-                           "memory_capacity": {"pages": 16, "slots": 2}},
-            })
-        return outputs
-
-    registry = built_in_registry()
-    payload = {
-        "model": "qwen3-4b-fp8", "chunk_tokens": 8192, "true_ids": [1],
-        "false_ids": [2], "filter_limit": None,
-        "order_rule": "by_cost", "documents": {"d": [[1], [2], [3], [4]]},
-        "joins": [], "filters": {}, "filter_arena_writes": {},
-        "shards": {"d": ((0, 2), (1, 3))},
-        "physical_plan": {
-            "backend": "quail", "model": "qwen3-4b-fp8", "device": "h100-sxm",
-            "gpus": 2, "settings": {}, "graph": json.loads(graph.to_json())},
-    }
-    result = execute_distributed_graph(
-        payload, graph, 2, round_fn, DEVICES["h100-sxm"], registry.runtimes,
-        registry)
-    answers = result["filters"]["d"].sort_by("d")
-    assert answers.column(2).to_pylist() == [True, False, True, False]
-    assert result["fresh_tokens"] == 4
-    assert result["kv_manager"]["evicted_keys"] == 2 and result["peak_gib"] == 1.0
-    assert result["memory_capacity"] == {"pages": 32, "slots": 4}
-    assert len(result["memory_workers"]) == 2
-
     arena = FakeArena()
     arena.owned.add(("d", 10))
 

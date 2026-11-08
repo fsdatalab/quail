@@ -22,6 +22,7 @@ pub mod finished;
 pub mod planning;
 pub mod pyarrow;
 pub mod results;
+pub mod stages;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

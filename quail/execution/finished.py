@@ -5,7 +5,8 @@ operator reports, each tagged with the node and port that wrote it, and
 hands each region row on once every operator writing it has reported
 it. The operators and the runner read it from module state: the region
 runs on one thread, and the operators sit several calls below the code
-that starts it, as with ``quail.progress.answer_sink``.
+that starts it, as with ``quail.progress.answer_sink``. The state is
+per thread: a test runs each GPU's stages on a thread of its own.
 
 The region's hint, Rust's ``InputHint`` over the rows of the tables the
 region reads, lives here too: an operator asks ``keeps`` before the
@@ -15,24 +16,30 @@ model reads a document.
 from __future__ import annotations
 
 import contextlib
+import threading
 from collections.abc import Callable, Iterable, Sequence
 
 import pyarrow as pa
 
 from quail.execution.types import output_table
 
-_ROWS = None
-_HELD = False
-_HINT = None
-# alias -> the table the hint holds rows of
-_TABLES = {}
-# table -> (the hint's generation, whether each row is kept)
-_KEEP = {}
+
+class _Region(threading.local):
+    rows = None
+    held = False
+    hint = None
+    # alias -> the table the hint holds rows of
+    tables = {}
+    # table -> (the hint's generation, whether each row is kept)
+    keep = {}
+
+
+_REGION = _Region()
 
 
 def finished_rows():
     """Return the FinishedRows the running region reports to, or None."""
-    return None if _HELD else _ROWS
+    return None if _REGION.held else _REGION.rows
 
 
 @contextlib.contextmanager
@@ -48,16 +55,16 @@ def reporting(rows, hint=None, tables: dict | None = None):
             ``generation()`` changes whenever a test tightens.
         tables: Each scan alias's table name.
     """
-    global _ROWS, _HINT, _TABLES, _KEEP
-    previous = _ROWS, _HINT, _TABLES, _KEEP
+    region = _REGION
+    previous = region.rows, region.hint, region.tables, region.keep
     held = set() if hint is None else set(hint.tables())
-    _ROWS, _HINT, _KEEP = rows, hint, {}
-    _TABLES = {alias: table for alias, table in (tables or {}).items()
-               if table in held}
+    region.rows, region.hint, region.keep = rows, hint, {}
+    region.tables = {alias: table for alias, table in (tables or {}).items()
+                     if table in held}
     try:
         yield rows
     finally:
-        _ROWS, _HINT, _TABLES, _KEEP = previous
+        region.rows, region.hint, region.tables, region.keep = previous
 
 
 @contextlib.contextmanager
@@ -68,12 +75,11 @@ def held():
     ids that are not the region's; its rows go once its whole result is
     expanded.
     """
-    global _HELD
-    previous, _HELD = _HELD, True
+    previous, _REGION.held = _REGION.held, True
     try:
         yield
     finally:
-        _HELD = previous
+        _REGION.held = previous
 
 
 def report(tables: Iterable[pa.Table]) -> None:
@@ -110,7 +116,7 @@ def finished_table(node_id: str, port: str, table: pa.Table) -> pa.Table:
 
 def region_hint():
     """Return the running region's ``InputHint``, or None."""
-    return _HINT
+    return _REGION.hint
 
 
 def keeps(alias, document: int) -> bool:
@@ -119,19 +125,20 @@ def keeps(alias, document: int) -> bool:
     False when the hint, as it is now, rejects the document's row of
     its table; the hint is read again whenever it has tightened.
     """
-    table = _TABLES.get(alias) if isinstance(alias, str) else None
+    region = _REGION
+    table = region.tables.get(alias) if isinstance(alias, str) else None
     if table is None:
         return True
-    generation = _HINT.generation()
-    found = _KEEP.get(table)
+    generation = region.hint.generation()
+    found = region.keep.get(table)
     if found is None or found[0] != generation:
-        found = _KEEP[table] = (generation, _HINT.keep(table))
+        found = region.keep[table] = (generation, region.hint.keep(table))
     return bool(found[1][document])
 
 
 def hinting() -> bool:
     """Whether the region's hint holds the rows of a table the region reads."""
-    return bool(_TABLES)
+    return bool(_REGION.tables)
 
 
 def hinted(key) -> bool:

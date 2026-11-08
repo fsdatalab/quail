@@ -15,6 +15,7 @@ shape.
 
 from __future__ import annotations
 
+import copy
 import time
 from functools import partial
 
@@ -641,15 +642,22 @@ class OracleFeatures(OracleDocuments):
 def oracle_executor(oracle: Oracle, **report):
     """Return a physical executor that runs each request's graph on the oracle.
 
+    A plan on several GPUs runs as stages, each GPU's on a thread with a
+    copy of the oracle; the copies share the lists of what was asked.
+
     Args:
         oracle: The oracle answering the model operators.
         **report: Report fields the response carries, such as wall_s.
     """
     def execute(request):
-        from helpers.fakes import graph_state
-        from quail.backends.quail.graph import execute_single_graph
+        from helpers.fakes import graph_state, thread_servers
+        from quail.backends.quail.graph import (
+            execute_single_graph,
+            execute_staged_graph,
+        )
         from quail.execution.types import PhysicalResponse
         from quail.physical import Scan
+        from quail.specs import DEVICES
 
         graph = graph_from_envelope(request.plan)
         scans = [node for node in graph.nodes if isinstance(node, Scan)]
@@ -659,14 +667,23 @@ def oracle_executor(oracle: Oracle, **report):
                         for node in scans}
         oracle.source_rows = {alias: rows.to_pylist()
                               for alias, rows in request.source_rows.items()}
-        state = graph_state(oracle, oracle.documents)
-        state["texts"] = oracle.texts
-        oracle.arena = state["gpu"].arena
-        if getattr(request, "relations", None):
-            state["columns"] = request.column_tables()
-        result = execute_single_graph(state, {
-            "filter_limit": None,
-            "deduplicate": request.plan["settings"].get("deduplicate", {})}, graph)
+        payload = {
+            "filter_limit": None, "columns": request.column_tables(),
+            "deduplicate": request.plan["settings"].get("deduplicate", {})}
+        states = []
+        for model in [oracle] if request.gpus == 1 else [
+                copy.copy(oracle) for _ in range(request.gpus)]:
+            state = graph_state(model, oracle.documents)
+            state["texts"] = oracle.texts
+            state["columns"] = payload["columns"]
+            model.arena = state["gpu"].arena
+            states.append(state)
+        if request.gpus == 1:
+            result = execute_single_graph(states[0], payload, graph)
+        else:
+            result = execute_staged_graph(
+                payload, graph, request.gpus,
+                thread_servers(states, payload, graph), DEVICES["h100-sxm"])
         outputs = result.pop("_outputs")
         return PhysicalResponse(outputs, {
             **result, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234, **report})
