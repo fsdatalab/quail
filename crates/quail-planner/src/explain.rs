@@ -1008,7 +1008,6 @@ impl Graph {
                     .copied()
                     .flatten()
                     .map(|value| value * effective_selectivity(filter.attributes.selectivity)),
-                Some(PhysicalNode::Exchange(_)) => single,
                 Some(PhysicalNode::Limit(limit)) => {
                     single.map(|value| value.min(limit.attributes.count as f64))
                 }
@@ -1358,10 +1357,6 @@ impl TreeRows<'_> {
                 ));
                 format!("HashJoin: {}", on.join(" and "))
             }
-            PhysicalNode::Exchange(exchange) => format!(
-                "Exchange: {} to the GPU holding its KV",
-                exchange.attributes.anchor
-            ),
             PhysicalNode::Barrier(barrier) => {
                 format!("Barrier: next_anchor={}", barrier.attributes.next_anchor)
             }

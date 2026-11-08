@@ -188,12 +188,6 @@ static KINDS: &[Kind] = &[
         fields: fields!(NODE; "next_anchor" = S, "aliases" = EMPTY),
     },
     Kind {
-        class: "Exchange",
-        tag: "quail.exchange",
-        node: true,
-        fields: fields!(NODE; "anchor" = S),
-    },
-    Kind {
         class: "HashJoin",
         tag: "quail.hash_join",
         node: true,
@@ -1306,7 +1300,6 @@ leaf_classes! {
     AiFilter = "AiFilter": NodeBase [NodeBase] {},
     Filter = "Filter": NodeBase [NodeBase] {},
     Barrier = "Barrier": NodeBase [NodeBase] {},
-    Exchange = "Exchange": NodeBase [NodeBase] {},
     HashJoin = "HashJoin": NodeBase [NodeBase] {},
     AiJoin = "AiJoin": NodeBase [NodeBase] {
     /// Return which anchors the join keeps, given whether each matched.

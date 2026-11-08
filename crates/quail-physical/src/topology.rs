@@ -328,10 +328,6 @@ impl PhysicalNode {
                 .iter()
                 .map(|alias| rows(format!("rows:{alias}"), of(alias)))
                 .collect(),
-            PhysicalNode::Exchange(node) => {
-                let anchor = &node.attributes.anchor;
-                vec![rows(format!("rows:{anchor}"), of(anchor))]
-            }
             PhysicalNode::HashJoin(node) => {
                 let attributes = &node.attributes;
                 vec![output(

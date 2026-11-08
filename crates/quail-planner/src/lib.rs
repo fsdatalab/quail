@@ -40,6 +40,7 @@ pub mod retention;
 pub mod scores;
 pub mod search;
 pub mod sol;
+pub mod stages;
 pub mod statistics;
 pub mod validation;
 

@@ -1,5 +1,5 @@
-//! Edits to a planned graph: put a node on an edge, take a Barrier or
-//! Exchange out, or move one to another edge.
+//! Edits to a planned graph: put a node on an edge, take a Barrier out,
+//! or move one to another edge.
 //!
 //! [`edit_graph`] applies an edit, then sets KV retention again and
 //! validates the graph, as `PhysicalPlan.insert`, `remove`, and `move`
@@ -23,7 +23,7 @@ pub enum Edit {
         node: Box<PhysicalNode>,
         between: (String, String),
     },
-    /// Take a Barrier or Exchange out; its consumers read its producer.
+    /// Take a Barrier out; its consumers read its producer.
     Remove { node_id: String },
     /// Take a node out and put it on another edge.
     Move {
@@ -191,10 +191,10 @@ fn insert(
 
 fn remove(graph: &Graph, node_id: &str) -> Result<Graph, String> {
     let node = find(graph, node_id)?;
-    if !matches!(node, PhysicalNode::Barrier(_) | PhysicalNode::Exchange(_)) {
+    if !matches!(node, PhysicalNode::Barrier(_)) {
         return Err(format!(
             "{node_id:?} is a {}; removing it would change what the query means (only Barrier \
-             and Exchange nodes can be removed)",
+             nodes can be removed)",
             node.type_name()
         ));
     }
