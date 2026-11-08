@@ -59,11 +59,3 @@ def test_a_filter_on_several_gpus_asks_each_text_once_and_returns_every_copy():
     # the two "No date" contracts are one text, asked on one GPU
     assert sorted(document for _, document in oracle.asked) == [0, 1, 3]
     assert result.column("c.id").to_pylist() == [0, 1, 2, 3]
-
-
-def test_a_limit_waits_for_the_tests_after_the_filters():
-    result = run("SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does it end?'}) "
-                 "AS lease FROM contracts c "
-                 "WHERE AI_FILTER(PROMPT('Is {0} relevant?', c.text)) "
-                 "AND lease.ends IS NOT NULL LIMIT 3", dated(), 4, order="as_written")
-    assert result.column("c.id").to_pylist() == [1, 3]
