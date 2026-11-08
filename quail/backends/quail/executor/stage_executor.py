@@ -25,7 +25,7 @@ from quail.backends.quail.executor.stages import (
 from quail.progress import Progress, logger
 
 ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
-ANSWER_ADMISSION_MODES = ("headroom=0", "headroom")
+ANSWER_ADMISSION_MODES = ("headroom=0", "headroom", "partial")
 # a directory each headroom run writes a file of its headroom over time
 # and its curves to
 HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
@@ -36,6 +36,7 @@ def answer_admission_mode() -> str:
 
     - headroom=0: admit when the prompt fits; every answer's headroom is 0.
     - headroom: admit when the prompt and each answer's chosen headroom fit.
+    - partial: headroom, admitting a document's answers one at a time.
 
     Raises:
         ValueError: The variable names no mode.
@@ -148,6 +149,8 @@ class StageExecutor:
         # per pass: its rows, and whether documents were still queued
         self.pass_rows = []
         self.pass_queued = []
+        # per pass that decodes, its decode rows
+        self.pass_decode_rows = []
         self.knee_rows = knee_rows
         self.recomputed_tokens = 0
         self.decode_cost = decode_cost
@@ -297,7 +300,8 @@ class StageExecutor:
                 decoder, self.prefix_lengths, self.capacity_extra,
                 self.sched.dependencies, self.borrowing.tree_shared,
                 self.arena.page_cost, decode_cost, self.arena.page_holds,
-                choose_headroom=self.admission_mode == "headroom",
+                choose_headroom=self.admission_mode != "headroom=0",
+                partial=self.admission_mode == "partial",
                 chunk_tokens=self.sched.chunk_budget,
                 trace=bool(os.environ.get(HEADROOM_TRACE_ENV)))
         # a Gated DeltaNet layer starts a borrower from the parent's state
@@ -952,6 +956,8 @@ class StageExecutor:
         self._count_pass(part, chunk.tokens, decode, replays, reads)
         self.tokens += chunk.tokens
         self.pass_rows.append(chunk.tokens)
+        if decode is not None:
+            self.pass_decode_rows.append(len(decode.positions))
         self.pass_queued.append(bool(self.sched.pending or self.sched.waiting))
         if self.gpu_timing:
             e0 = self.torch.cuda.Event(enable_timing=True)
@@ -1020,6 +1026,8 @@ class StageExecutor:
                 self.answer_admission.refresh(
                     self.sched._stage, replays, self._replay_pages(replays),
                     self.arena.free_pages if self.paged else None)
+                if self.answer_admission.partial:
+                    self.answer_admission.order_waiting(self.sched.waiting)
                 self.admission_s += time.perf_counter() - started
             started = time.perf_counter()
             groups = self.sched.next_chunk(
@@ -1085,6 +1093,9 @@ class StageExecutor:
             self.stats["headroom_granted"] = getattr(
                 self.answer_admission, "granted", [])
             self.stats["pass_work"] = dict(self.pass_work)
+            if self.pass_decode_rows:
+                self.stats["pass_work"]["median_decode_rows"] = float(
+                    np.median(self.pass_decode_rows))
             self.stats["admission_s"] = self.admission_s
         # one indented line under the run's "done" line
         details = []

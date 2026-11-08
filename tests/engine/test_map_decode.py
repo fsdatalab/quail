@@ -517,8 +517,8 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
     """Run maps over twelve documents in a 20-page pool.
 
     Returns:
-        The run's stats and the token model, after checking every answer
-        equals greedy decoding.
+        The run's stats, the token model, and each map's answers, after
+        checking every answer equals greedy decoding.
     """
     cpu_staging(monkeypatch)
     monkeypatch.setenv("QUAIL_ANSWER_ADMISSION", mode)
@@ -550,12 +550,14 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
                budget, anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
                decoder=decoder, stats=stats, attention_mode=path,
                decode_cost=DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"]))
+    answers = []
     for q, (tail, answer_limit) in enumerate(zip(tails, limits)):
         got = [answer.tolist() for answer in decoder.answers(q, maps._slots(q, ids))]
         assert got == [greedy(documents[a] + tail, answer_limit) for a in ids]
+        answers.append(got)
     assert not decoder.active
     assert not arena.accounting.owned
-    return stats, model
+    return stats, model, answers
 
 
 @pytest.mark.parametrize("mode,num_maps,budget,lag,path", [
@@ -564,13 +566,23 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
 ])
 def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
         monkeypatch, mode, num_maps, budget, lag, path):
-    stats, model = run_maps_under_eviction(monkeypatch, mode, num_maps, budget,
-                                           lag, path)
+    stats, model, _ = run_maps_under_eviction(monkeypatch, mode, num_maps, budget,
+                                              lag, path)
     assert stats["answer_admission"] == mode
     work = stats["pass_work"]
     assert work["replay_tokens"] == stats["recomputed_tokens"]
     assert work["decode_rows"] == sum(len(slots) for slots in model.decode_slots)
     assert work["sol_s"] > 0
+
+
+def test_partial_admission_writes_the_same_answers_as_admitting_a_document_whole(
+        monkeypatch):
+    _, _, expected = run_maps_under_eviction(monkeypatch, "headroom", 3, 20, 2,
+                                             "tree")
+    stats, _, answers = run_maps_under_eviction(monkeypatch, "partial", 3, 20, 2,
+                                                "tree")
+    assert stats["answer_admission"] == "partial"
+    assert answers == expected
 
 
 def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,

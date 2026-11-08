@@ -126,15 +126,23 @@ class HeadroomAdmission:
     least the rebuild seconds that fitting it adds (admission_cost).
     Its answers' headroom is then re-chosen with everyone else's at the
     next admission. Every refresh rebuilds the curves of maps whose
-    answers moved and the headroom of running answers. With trace,
-    each refresh also records the running answers' headroom by map and
-    bucket.
+    answers moved and the headroom of running answers.
+
+    With partial, a document's answers are admitted one at a time. The
+    document's own answer is admitted with its prompt; each branch is
+    then priced alone when the scheduler reaches it, and a refused
+    branch waits in the queue, its prompt unplaced, while the
+    document's KV stays held for it. Its decode work counts only the
+    reads the document's running answers do not already make.
+
+    With trace, each refresh also records the running answers' headroom
+    by map and bucket.
     """
 
     def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
                  shared, page_cost, decode_cost=None, page_holds=None, *,
-                 choose_headroom=True, chunk_tokens=0, bucket_answers=30,
-                 trace=False):
+                 choose_headroom=True, partial=False, chunk_tokens=0,
+                 bucket_answers=30, trace=False):
         self.decoder = decoder
         self.prefix = np.asarray(prefix_lengths, dtype=np.int64)
         self.parent = np.arange(len(self.prefix))
@@ -155,6 +163,7 @@ class HeadroomAdmission:
         self.lead = np.zeros(len(self.prefix), dtype=np.int64)
         np.maximum.at(self.lead, self.parent, self.borrowed)
         self.choose_headroom = choose_headroom and decode_cost is not None
+        self.partial = partial and self.choose_headroom
         # each anchor's dependents, the anchor first: order[start[a]:start[a + 1]]
         order = np.argsort(self.parent, kind="stable")
         self.child_order = order
@@ -288,6 +297,11 @@ class HeadroomAdmission:
     def _started(self, anchor):
         return bool(self.committed[anchor] or self.stages[anchor] >= 0)
 
+    def _priced(self, anchor):
+        """Whether admitting the anchor commits answers allows() must price."""
+        return not self._started(self.parent[anchor]) or (
+            self.partial and not self.committed[anchor])
+
     def _observation(self, slots):
         """Each slot's last token count and whether its answer ended."""
         decoder = self.decoder
@@ -408,7 +422,11 @@ class HeadroomAdmission:
         self.work = cost.row_work(contexts, groups, shared).total()
 
     def _added_work(self, anchor):
-        """A document's answers' expected tokens and the decode work they add."""
+        """The admitted answers' expected tokens and the decode work they add.
+
+        With partial, the running answers of the same document already
+        read its shared KV, so only the reads they do not cover count.
+        """
         if anchor not in self._added:
             decoder = self.decoder
             slots = self._answer_slots(anchor)
@@ -416,13 +434,26 @@ class HeadroomAdmission:
             unended = (decoder.lengths[maps, slots] < 0) & ~decoder.paused[slots]
             slots, maps = slots[unended], maps[unended]
             expected = self._expected[maps]
-            groups, shared = (decode_groups(slots, self.parent, self.borrowed,
-                                            self.lead)
-                              if decoder.share else (None, None))
-            work = (Work() if self.decode_cost is None else self.decode_cost.row_work(
-                self.prompt[slots] + expected / 2, groups, shared).total())
+            contexts = self.prompt[slots] + expected / 2
+            work = self._work(slots, contexts)
+            if self.partial and len(slots):
+                children = self._children(self.parent[anchor])
+                running = children[(decoder.map[children] >= 0)
+                                   & ~decoder.paused[children]]
+                if len(running):
+                    held = decoder.origin[running] + decoder.fed[running]
+                    work = (self._work(np.r_[running, slots], np.r_[held, contexts])
+                            + self._work(running, held) * -1)
             self._added[anchor] = (float(expected.sum()), work)
         return self._added[anchor]
+
+    def _work(self, slots, contexts):
+        """Decode work of one pass of the slots' rows at the given contexts."""
+        if self.decode_cost is None:
+            return Work()
+        groups, shared = (decode_groups(slots, self.parent, self.borrowed, self.lead)
+                          if self.decoder.share else (None, None))
+        return self.decode_cost.row_work(contexts, groups, shared).total()
 
     def _remaining(self, slots):
         """Headroom pages the slots' answers have not grown into yet."""
@@ -445,8 +476,35 @@ class HeadroomAdmission:
         return self.child_order[self.child_start[anchor]:self.child_start[anchor + 1]]
 
     def _answer_slots(self, anchor):
-        children = self._children(anchor)
+        """The answer slots admitting the anchor commits.
+
+        A document commits its own and its branches' answers; with
+        partial, an anchor commits only its own.
+        """
+        children = (np.array([anchor], dtype=np.int64) if self.partial
+                    else self._children(anchor))
         return children[self.slot_map[children] >= 0]
+
+    def order_waiting(self, waiting):
+        """Put each document's waiting branches expected-longest first, in place.
+
+        Documents keep the order of their first waiting branch. A
+        branch's expected tokens come from its map and bucket curve.
+
+        Args:
+            waiting: The scheduler's deque of released branches.
+        """
+        if len(waiting) < 2 or self.curves is None:
+            return
+        anchors = np.fromiter(waiting, dtype=np.int64, count=len(waiting))
+        _, inverse = np.unique(self.parent[anchors], return_inverse=True)
+        first = np.full(inverse.max() + 1, len(anchors))
+        np.minimum.at(first, inverse, np.arange(len(anchors)))
+        rows = self.slot_row[anchors]
+        expected = np.where(rows >= 0, self.curves[rows].sum(axis=1), 0.0)
+        order = np.lexsort((-expected, first[inverse]))
+        waiting.clear()
+        waiting.extend(anchors[order].tolist())
 
     def _hold_running(self, running, free_pages):
         """Price running answers' risk; choose their headroom within the free pages."""
@@ -536,13 +594,13 @@ class HeadroomAdmission:
             free_pages: Free KV pages.
             prompt_pages: Pages the document's prompt takes now.
         """
-        if self._started(self.parent[anchor]):
+        if not self._priced(anchor):
             return True
         self._decision = None
         if not self.choose_headroom:
             return free_pages - self.headroom_pages - self.replay_pages >= prompt_pages
         budget = free_pages - self.fixed_pages - self.replay_pages
-        need = prompt_pages + self._branch_pages(anchor)
+        need = prompt_pages + (0 if self.partial else self._branch_pages(anchor))
         if need > budget:
             return False
         if self.held_budget != budget:
@@ -562,7 +620,7 @@ class HeadroomAdmission:
 
     def admit(self, anchor):
         """Count an admitted document's headroom, or a branch's allocated prompt."""
-        if self._started(self.parent[anchor]):
+        if not self._priced(anchor):
             if anchor in self.unplaced:
                 self.unplaced.discard(anchor)
                 pages = int(self.prompt_pages[anchor])
@@ -580,7 +638,7 @@ class HeadroomAdmission:
         self.granted.extend(granted.tolist())
         self.granted_at.extend(zip([self._refreshes] * len(slots),
                                    self.bucket[slots].tolist(), granted.tolist()))
-        branches = self._branches(anchor)
+        branches = [] if self.partial else self._branches(anchor)
         branch_pages = int(sum(int(self.prompt_pages[b]) for b in branches))
         self.unplaced.update(branches)
         self.fixed_pages += branch_pages
