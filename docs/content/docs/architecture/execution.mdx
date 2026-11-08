@@ -63,6 +63,31 @@ Quail limits each batch by token count and available KV memory:
 An operator that requires all its input rows ends a pipeline. Later
 operators wait until those rows are available.
 
+### Reading the region's input
+
+`ModelRegionExec` reads each input the region reads as a stream of
+batches and hands the batches to the region as DataFusion computes
+them. The planner needs every document's length, so the region plans
+on the rows it has:
+
+- A region whose rows each come from one row of its one input, with no
+  join, no fetch, and no stop key, runs its input in windows of 65,536
+  rows (`Engine.input_window_rows`). Each window is planned on its own
+  rows and run as soon as it is complete, and its rows stream out
+  before the next window runs.
+- An input that ends within one window runs once over every row. Its
+  plan is the plan of the whole input, the same as when every row is
+  in before the region starts.
+- Any other region, such as one with a join, reads every row of its
+  inputs before it plans.
+
+For a large input, each window is a separate plan and run: the planner
+sees only that window's document lengths, KV and prefix sharing do not
+cross windows, and the GPU waits while the next window is planned. A
+region starts once each of its inputs has a batch or has ended, so a
+region whose input is another region's rows runs after that region has
+started, on the same thread.
+
 ### Streaming the region's rows
 
 A row of the region is final once the region's last step, one operator

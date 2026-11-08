@@ -14,7 +14,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionContext;
-use quail_datafusion::{InputRows, ModelRegion, QuailExtension, RegionBatches, RegionRunner};
+use quail_datafusion::{InputStream, ModelRegion, QuailExtension, RegionBatches, RegionRunner};
 
 /// Stands in for Quail's executor: the model keeps the first review.
 #[derive(Debug)]
@@ -24,7 +24,7 @@ impl RegionRunner for KeepsFirstReview {
     fn run(
         &self,
         region: &ModelRegion,
-        _inputs: &[InputRows],
+        _inputs: Vec<InputStream>,
         _fetch: Option<usize>,
     ) -> Result<RegionBatches> {
         let schema = Arc::new(region.plan.schema().as_arrow().clone());

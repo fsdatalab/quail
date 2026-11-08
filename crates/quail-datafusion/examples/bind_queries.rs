@@ -19,7 +19,7 @@ impl RegionRunner for NoRows {
     fn run(
         &self,
         _region: &ModelRegion,
-        _inputs: &[quail_datafusion::InputRows],
+        _inputs: Vec<quail_datafusion::InputStream>,
         _fetch: Option<usize>,
     ) -> Result<quail_datafusion::RegionBatches> {
         Ok(Box::new(std::iter::empty()))

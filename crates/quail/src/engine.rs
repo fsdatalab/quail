@@ -20,8 +20,8 @@ use pyo3::types::IntoPyDict;
 use std::collections::HashMap;
 
 use quail_datafusion::{
-    IdentifiedTable, InputRows, ModelRegion, RegionBatches, RegionRunner, SharedInput, derive,
-    quail_column_names,
+    IdentifiedTable, InputBatches, InputRows, InputStream, ModelRegion, RegionBatches,
+    RegionRunner, SharedInput, collect_inputs, derive, quail_column_names,
 };
 use quail_planner::operators::Operators;
 use quail_planner::prompts::Turn;
@@ -49,11 +49,15 @@ pub(crate) struct PythonRunner {
     pub(crate) planning: Option<(Arc<Planner>, Settings)>,
 }
 
+/// The rows of a region input the executor runs at once, when the
+/// region asks each row on its own: a larger input runs in windows of
+/// this many rows, each planned and run as it arrives.
+pub const INPUT_WINDOW_ROWS: usize = 65_536;
+
 /// A region a DataFusion worker hands to the calling thread to run.
-#[derive(Debug)]
 pub(crate) struct RegionCall {
     pub(crate) region: ModelRegion,
-    pub(crate) inputs: Vec<InputRows>,
+    pub(crate) inputs: Vec<InputStream>,
     pub(crate) fetch: Option<usize>,
     pub(crate) rows: RowSender,
 }
@@ -208,7 +212,7 @@ impl PythonRunner {
 
     /// Run a call's region on this thread and send its rows, then the end.
     pub(crate) fn serve(&self, call: RegionCall) {
-        if let Err(error) = self.run_here(&call.region, &call.inputs, call.fetch, &call.rows) {
+        if let Err(error) = self.run_here(&call.region, call.inputs, call.fetch, &call.rows) {
             let _ = call.rows.send(RegionRows::Batch(Err(error)));
         }
         let _ = call.rows.send(RegionRows::Done);
@@ -216,14 +220,57 @@ impl PythonRunner {
 
     /// Run the region on this thread, sending its rows to `rows` as the
     /// executor finishes them.
+    ///
+    /// A region that asks each row of its one input on its own runs the
+    /// input in windows of rows as they arrive, each planned on its own
+    /// rows; any other region, and an input that ends within one window,
+    /// runs once over every row.
     fn run_here(
         &self,
         region: &ModelRegion,
-        inputs: &[InputRows],
+        inputs: Vec<InputStream>,
         fetch: Option<usize>,
         rows: &RowSender,
     ) -> Result<()> {
         let payload = self.request(region)?;
+        if !(self.planning.is_some() && fetch.is_none() && row_local(region, &payload)?) {
+            let inputs = collect_inputs(inputs)?;
+            return self.run_window(region, &payload, &inputs, fetch, rows);
+        }
+        let size = self.input_window_rows()?;
+        let mut inputs = inputs;
+        let (name, mut batches) = inputs.remove(0);
+        loop {
+            let (window, ended) = read_window(&mut batches, size)?;
+            self.run_window(region, &payload, &[(name.clone(), window)], fetch, rows)?;
+            if ended {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The rows of an input window, from the engine's
+    /// `input_window_rows` when it has one.
+    fn input_window_rows(&self) -> Result<usize> {
+        Python::attach(
+            |py| match self.engine.bind(py).getattr("input_window_rows") {
+                Ok(found) => found.extract::<usize>(),
+                Err(_) => Ok(INPUT_WINDOW_ROWS),
+            },
+        )
+        .map_err(|error| DataFusionError::External(Box::new(error)))
+    }
+
+    /// Plan and run the region over these rows of its inputs, sending
+    /// its rows to `rows`.
+    fn run_window(
+        &self,
+        region: &ModelRegion,
+        payload: &str,
+        inputs: &[InputRows],
+        fetch: Option<usize>,
+        rows: &RowSender,
+    ) -> Result<()> {
         let sorted;
         let (planned, inputs) = if self.planning.is_some() {
             sorted = inputs
@@ -234,7 +281,7 @@ impl PythonRunner {
                 })
                 .collect::<Result<Vec<InputRows>>>()?;
             (
-                self.plan_here(region, &sorted, &payload, fetch)?,
+                self.plan_here(region, &sorted, payload, fetch)?,
                 sorted.as_slice(),
             )
         } else {
@@ -263,7 +310,7 @@ impl PythonRunner {
                 }
                 None => self
                     .engine
-                    .call_method1(py, "run_region", (&payload, tables, fetch))?,
+                    .call_method1(py, "run_region", (payload, tables, fetch))?,
             };
             // an engine that sent every row to the sink returns None
             let answer = answer.bind(py);
@@ -289,14 +336,14 @@ impl RegionRunner for PythonRunner {
     fn run(
         &self,
         region: &ModelRegion,
-        inputs: &[InputRows],
+        inputs: Vec<InputStream>,
         fetch: Option<usize>,
     ) -> Result<RegionBatches> {
         let caller = self.caller.lock().expect("the caller lock").clone();
         let (rows, receiver) = std::sync::mpsc::channel();
         let call = RegionCall {
             region: region.clone(),
-            inputs: inputs.to_vec(),
+            inputs,
             fetch,
             rows,
         };
@@ -311,6 +358,43 @@ impl RegionRunner for PythonRunner {
             ended: false,
         }))
     }
+}
+
+/// Read batches until they hold `size` rows or the input ends.
+///
+/// Returns the batches and whether the input ended.
+fn read_window(batches: &mut InputBatches, size: usize) -> Result<(Vec<RecordBatch>, bool)> {
+    let mut window = Vec::new();
+    let mut held = 0;
+    while held < size {
+        let Some(batch) = batches.next() else {
+            return Ok((window, true));
+        };
+        let batch = batch?;
+        held += batch.num_rows();
+        window.push(batch);
+    }
+    Ok((window, false))
+}
+
+/// Whether each of a region's rows comes from one row of its one input
+/// alone: no join, no table read by name, no fetch, and no stop key, so
+/// the region can run its input's rows in windows.
+fn row_local(region: &ModelRegion, payload: &str) -> Result<bool> {
+    use datafusion::common::tree_node::TreeNode;
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    let (operators, _) = read_region_json(payload)?;
+    let named = region.plan.exists(|node| {
+        Ok(matches!(node, LogicalPlan::TableScan(scan)
+            if source_as_provider(&scan.source)
+                .is_ok_and(|provider| provider.downcast_ref::<IdentifiedTable>().is_some())))
+    })?;
+    Ok(region.inputs.len() == 1
+        && !named
+        && operators.joins.is_empty()
+        && operators.fetch.is_none()
+        && operators.stop_keys.is_empty())
 }
 
 /// A region as JSON: `operators`, its operators as JSON text, and

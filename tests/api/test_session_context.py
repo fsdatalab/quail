@@ -196,3 +196,28 @@ def test_a_region_hands_on_rows_before_it_finishes():
     streamed = pa.concat_tables(batches)
     assert _same_rows(streamed, context.sql(text), ordered=False)
     session.close()
+
+
+def test_a_large_input_runs_in_windows_with_the_same_rows():
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    calls = []
+    executor = oracle_executor(ORACLE)
+
+    def run(request):
+        calls.append(request)
+        return executor(request)
+
+    context = quail.SessionContext(session, physical_executor=run)
+    context.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+    text = ("SELECT r.id, AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
+            "['positive', 'negative', 'mixed']) AS sentiment "
+            "FROM reviews r WHERE r.stars > 1")
+    whole = context.sql(text)
+    assert len(calls) == 1
+    # each window holds at least one row of the three DataFusion keeps
+    context._engine.input_window_rows = 1
+    windowed = context.sql(text)
+    assert len(calls) > 2
+    assert _same_rows(windowed, whole, ordered=False)
+    assert whole.num_rows == 3
+    session.close()

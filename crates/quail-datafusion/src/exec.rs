@@ -15,6 +15,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -22,7 +23,7 @@ use datafusion::physical_plan::{
     PlanProperties, ReplaceChildrenOptions,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use futures::{StreamExt, stream};
 
 use crate::region::ModelRegion;
@@ -34,6 +35,25 @@ pub type InputRows = (String, Vec<RecordBatch>);
 /// A region's rows, in the region's schema, as the runner produces them.
 pub type RegionBatches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
 
+/// One region input's batches, read as DataFusion computes them; a read
+/// blocks until the next batch arrives.
+pub type InputBatches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
+
+/// One region input: its table name and its batches as they arrive.
+pub type InputStream = (String, InputBatches);
+
+/// Read each input stream to its end.
+///
+/// # Errors
+///
+/// An input fails.
+pub fn collect_inputs(inputs: Vec<InputStream>) -> Result<Vec<InputRows>> {
+    inputs
+        .into_iter()
+        .map(|(name, batches)| Ok((name, batches.collect::<Result<Vec<_>>>()?)))
+        .collect()
+}
+
 /// Plans and runs one model region, returning its rows as they come.
 ///
 /// Quail's executor implements this trait, in the same process or
@@ -41,13 +61,15 @@ pub type RegionBatches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
 /// block, and hands DataFusion each batch as the iterator yields it, so
 /// the operators above the region read rows while the region runs.
 pub trait RegionRunner: fmt::Debug + Send + Sync {
-    /// Plan and run the region over its inputs' rows. `fetch` is the
-    /// most rows DataFusion reads, when a LIMIT above the region says
-    /// so; a runner may stop the model once it has that many.
+    /// Plan and run the region over its inputs' rows, which arrive as
+    /// DataFusion computes them. Each input holds at least one batch, or
+    /// has ended, when the call starts. `fetch` is the most rows
+    /// DataFusion reads, when a LIMIT above the region says so; a
+    /// runner may stop the model once it has that many.
     fn run(
         &self,
         region: &ModelRegion,
-        inputs: &[InputRows],
+        inputs: Vec<InputStream>,
         fetch: Option<usize>,
     ) -> Result<RegionBatches>;
 }
@@ -125,7 +147,7 @@ impl ExecutionPlan for ModelRegionExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        // `execute` collects each input into one partition
+        // `execute` reads each input as one stream
         vec![false; self.inputs.len()]
     }
 
@@ -184,20 +206,46 @@ impl ExecutionPlan for ModelRegionExec {
         let fetch = self.fetch;
         let (sender, receiver) = mpsc::unbounded::<Result<RecordBatch>>();
         let task = SpawnedTask::spawn(async move {
-            let mut rows: Vec<InputRows> = Vec::new();
+            // each input's batches go to a channel the runner reads; the
+            // tasks live as long as this one
+            let mut readers = Vec::new();
+            let mut streams: Vec<InputStream> = Vec::new();
+            let mut first = Vec::new();
             for (name, input) in region.input_names.iter().zip(inputs) {
-                match datafusion::physical_plan::collect(input, Arc::clone(&context)).await {
-                    Ok(batches) => rows.push((name.clone(), batches)),
-                    Err(error) => {
-                        let _ = sender.unbounded_send(Err(error));
-                        return;
+                let (batches, received) = std::sync::mpsc::channel();
+                let (arrived, waiting) = oneshot::channel::<()>();
+                let context = Arc::clone(&context);
+                readers.push(SpawnedTask::spawn(async move {
+                    let mut arrived = Some(arrived);
+                    match execute_stream(input, context) {
+                        Ok(mut found) => {
+                            while let Some(batch) = found.next().await {
+                                if batches.send(batch).is_err() {
+                                    break;
+                                }
+                                if let Some(arrived) = arrived.take() {
+                                    let _ = arrived.send(());
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = batches.send(Err(error));
+                        }
                     }
-                }
+                }));
+                streams.push((name.clone(), Box::new(received.into_iter())));
+                first.push(waiting);
+            }
+            // a region starts once each input has a batch or has ended: an
+            // input that is another region's rows then runs first, on the
+            // same thread
+            for waiting in first {
+                let _ = waiting.await;
             }
             // the runner blocks while the region runs; Quail's hands the
             // region to the thread that called DataFusion
             let run = SpawnedTask::spawn_blocking(move || {
-                let batches = match runner.run(&region, &rows, fetch) {
+                let batches = match runner.run(&region, streams, fetch) {
                     Ok(batches) => batches,
                     Err(error) => {
                         let _ = sender.unbounded_send(Err(error));
@@ -215,6 +263,7 @@ impl ExecutionPlan for ModelRegionExec {
                 }
             });
             let _ = run.join().await;
+            drop(readers);
         });
         // the task lives as long as the stream: dropping the stream ends it
         let batches = stream::unfold((receiver, task), |(mut receiver, task)| async move {

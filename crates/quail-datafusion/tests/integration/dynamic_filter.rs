@@ -34,7 +34,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use quail_datafusion::{
-    IdentifiedTable, InputRows, ModelRegion, ModelRegionExec, RegionBatches, RegionRunner,
+    IdentifiedTable, InputStream, ModelRegion, ModelRegionExec, RegionBatches, RegionRunner,
     session_context, sql,
 };
 
@@ -120,7 +120,7 @@ impl RegionRunner for KeepsTwoReviews {
     fn run(
         &self,
         region: &ModelRegion,
-        _inputs: &[InputRows],
+        _inputs: Vec<InputStream>,
         _fetch: Option<usize>,
     ) -> Result<RegionBatches> {
         let schema = region.plan.schema();

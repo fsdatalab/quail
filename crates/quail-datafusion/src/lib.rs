@@ -64,7 +64,10 @@ pub use aliases::{
 };
 pub use claim::ClaimModelRegions;
 pub use distinct::{EliminateDistinct, PushDownDistinct};
-pub use exec::{InputRows, ModelRegionExec, ModelRegionPlanner, RegionBatches, RegionRunner};
+pub use exec::{
+    InputBatches, InputRows, InputStream, ModelRegionExec, ModelRegionPlanner, RegionBatches,
+    RegionRunner, collect_inputs,
+};
 pub use extension::QuailExtension;
 pub use functions::{AI_FUNCTION_NAMES, brace_structs, is_ai_call, quail_functions};
 pub use guards::PushDownCaseGuards;

@@ -10,7 +10,7 @@ use datafusion::common::{Constraint, Constraints, DataFusionError, Result};
 use datafusion::datasource::MemTable;
 use futures::StreamExt;
 use quail_datafusion::{
-    IdentifiedTable, InputRows, ModelRegion, RegionBatches, RegionRunner, session_context,
+    IdentifiedTable, InputStream, ModelRegion, RegionBatches, RegionRunner, session_context,
 };
 
 /// Stands in for Quail's executor: it yields one row per review, and
@@ -24,7 +24,7 @@ impl RegionRunner for WaitsForTheReader {
     fn run(
         &self,
         region: &ModelRegion,
-        _inputs: &[InputRows],
+        _inputs: Vec<InputStream>,
         _fetch: Option<usize>,
     ) -> Result<RegionBatches> {
         let schema = Arc::new(region.plan.schema().as_arrow().clone());

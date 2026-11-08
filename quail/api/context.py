@@ -63,6 +63,7 @@ class SessionContext:
 
         self.session = session
         engine = Engine(session, physical_executor, order=order, run_query=run_query)
+        self._engine = engine
         self._native = NativeSession(engine, session.planner)
         for name, provider in session.catalog.providers.items():
             self._register_table(name, provider)
