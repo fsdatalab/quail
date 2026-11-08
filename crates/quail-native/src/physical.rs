@@ -126,8 +126,7 @@ static KINDS: &[Kind] = &[
         tag: "quail.scan",
         node: true,
         fields: fields!(NODE; "alias" = S, "input_id" = S, "num_documents" = ZERO,
-            "total_tokens" = ZERO, "shard_ranges" = EMPTY, "shard_token_loads" = EMPTY,
-            "predicates" = EMPTY, "expected_rows" = NONE),
+            "total_tokens" = ZERO, "predicates" = EMPTY, "expected_rows" = NONE),
     },
     Kind {
         class: "AiFilter",
@@ -860,16 +859,6 @@ fn fill_node(
                 "share_prefixes",
                 shares.map_or(Ok(false), |found| found.extract())?,
             )?;
-        }
-        physical::PhysicalNode::Scan(scan) => {
-            let range = py.import("builtins")?.getattr("range")?;
-            let shards = scan
-                .attributes
-                .shard_ranges
-                .iter()
-                .map(|(start, stop)| range.call1((*start, *stop)))
-                .collect::<PyResult<Vec<_>>>()?;
-            dict.set_item("shards", PyTuple::new(py, shards)?)?;
         }
         physical::PhysicalNode::Extension(extension) => {
             dict.set_item("type_name", &extension.type_name)?;

@@ -53,7 +53,6 @@ class ExecutionContext:
     state: dict[str, Any] = field(default_factory=dict)
     observers: tuple[ExecutionObserver, ...] = ()
     functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
-    gpus: int = 1
     run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
     # alias -> the row columns its documents are grouped by beside their
     # tokens; empty leaves every model operator asking per row

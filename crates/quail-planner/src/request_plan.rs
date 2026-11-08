@@ -76,8 +76,6 @@ pub fn request_plan(
                 input_id: scan.alias.clone(),
                 num_documents: table.num_documents,
                 total_tokens: table.total_tokens,
-                shard_ranges: vec![(0, table.num_documents)],
-                shard_token_loads: vec![table.kept_tokens],
                 predicates: scan.predicates.clone(),
                 expected_rows: (!scan.predicates.is_empty()).then_some(table.kept_documents as f64),
             },

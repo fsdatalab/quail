@@ -170,8 +170,6 @@ physical_nodes! {
         input_id: String,
         num_documents: i64,
         total_tokens: i64,
-        shard_ranges: Vec<(i64, i64)>,
-        shard_token_loads: Vec<i64>,
         predicates: Vec<ValueExpression>,
         expected_rows: Option<f64>,
     }

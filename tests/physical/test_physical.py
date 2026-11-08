@@ -123,10 +123,10 @@ def test_an_extension_node_encodes_validates_and_runs(monkeypatch):
     assert "test.first_documents" in plan.graph.to_json()
 
     scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=1,
-                shard_ranges=((0, 1),), shard_token_loads=(1,))
+                total_tokens=1)
     encoded = json.loads(PhysicalGraph((scan,), PortRef("input:d", "rows:d")).to_json())
     missing = copy.deepcopy(encoded)
-    del missing["nodes"][0]["attributes"]["shard_ranges"]
+    del missing["nodes"][0]["attributes"]["total_tokens"]
     with pytest.raises(ValueError, match="missing field"):
         PhysicalGraph.from_json(json.dumps(missing))
 

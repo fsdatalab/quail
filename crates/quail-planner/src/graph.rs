@@ -130,70 +130,6 @@ pub fn hash_join_nodes(
     nodes
 }
 
-/// Split ordered documents into compact token balanced ranges.
-pub fn contiguous_shards(
-    lengths: &[i64],
-    gpus: i64,
-    total: Option<i64>,
-) -> (Vec<(i64, i64)>, Vec<i64>) {
-    let num_documents = lengths.len() as i64;
-    if let (1, Some(total)) = (gpus, total) {
-        return (vec![(0, num_documents)], vec![total]);
-    }
-    let mut cumulative = vec![0i64];
-    for length in lengths {
-        cumulative.push(cumulative.last().expect("a sum") + length);
-    }
-    let total = *cumulative.last().expect("a sum");
-    let zeros: Vec<i64> = lengths
-        .iter()
-        .enumerate()
-        .filter(|(_, length)| **length == 0)
-        .map(|(index, _)| index as i64)
-        .collect();
-    // numpy's searchsorted on the left: the first index whose value is at least x
-    let left = |values: &[i64], x: f64| {
-        values
-            .iter()
-            .position(|v| *v as f64 >= x)
-            .unwrap_or(values.len()) as i64
-    };
-    let right =
-        |values: &[i64], x: i64| values.iter().position(|v| *v > x).unwrap_or(values.len()) as i64;
-    let (mut ranges, mut loads) = (Vec::new(), Vec::new());
-    let (mut start, mut consumed) = (0i64, 0i64);
-    for worker in 0..gpus {
-        let (stop, load);
-        if worker == gpus - 1 {
-            stop = num_documents;
-            load = total - consumed;
-        } else {
-            let remaining = (gpus - worker) as f64;
-            let target = (total - consumed) as f64 / remaining;
-            let mut found =
-                num_documents.min((start + 1).max(left(&cumulative, consumed as f64 + target)));
-            let before = cumulative[start.max(found - 1) as usize] - consumed;
-            let after = cumulative[found as usize] - consumed;
-            if before > 0 && (target - before as f64).abs() <= (target - after as f64).abs() {
-                found -= 1;
-            }
-            // the greedy rule stops before a zero-length document once load is positive
-            let positive = right(&cumulative, consumed);
-            let zero = left(&zeros, positive as f64);
-            if (zero as usize) < zeros.len() {
-                found = found.min(zeros[zero as usize]);
-            }
-            stop = found;
-            load = cumulative[stop as usize] - consumed;
-        }
-        ranges.push((start, stop));
-        loads.push(load);
-        start = stop;
-        consumed += load;
-    }
-    (ranges, loads)
-}
-
 /// The longest input of a score: its resident prefix and streamed suffix
 /// tokens, as `score_input_tokens`.
 fn score_input_tokens(
@@ -401,7 +337,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         for scan in &self.operators.scans {
             let lengths = &self.context.document_tokens[&scan.alias];
             let total: i64 = lengths.iter().sum();
-            let (shard_ranges, loads) = contiguous_shards(lengths, self.context.gpus, Some(total));
             let scan_id = format!("scan:{}", scan.alias);
             self.nodes.push(PhysicalNode::Scan(tagged_node(
                 &scan_id,
@@ -411,8 +346,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     input_id: scan.alias.clone(),
                     num_documents: lengths.len() as i64,
                     total_tokens: total,
-                    shard_ranges,
-                    shard_token_loads: loads,
                     predicates: scan.predicates.clone(),
                     expected_rows: (!scan.predicates.is_empty())
                         .then(|| stats[&scan.alias].num_documents as f64),
@@ -1778,38 +1711,4 @@ pub fn plan_region(found: &Operators, context: &PlanningContext) -> Result<Plann
     }
     bind_runtime_data(&mut physical, found, context)?;
     Ok(Ok(physical))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::contiguous_shards;
-
-    #[test]
-    fn shards_split_documents_by_tokens_as_python_does() {
-        type Case<'a> = (&'a [i64], i64, Vec<(i64, i64)>, Vec<i64>);
-        let cases: [Case; 5] = [
-            (
-                &[5, 0, 3, 0, 0, 7, 2],
-                3,
-                vec![(0, 1), (1, 3), (3, 7)],
-                vec![5, 3, 9],
-            ),
-            (
-                &[1, 1, 1, 1],
-                4,
-                vec![(0, 1), (1, 2), (2, 3), (3, 4)],
-                vec![1, 1, 1, 1],
-            ),
-            (&[0, 0, 4], 2, vec![(0, 3), (3, 3)], vec![4, 0]),
-            (&[10, 1, 1, 1, 10], 2, vec![(0, 2), (2, 5)], vec![11, 12]),
-            (&[3, 3, 3], 1, vec![(0, 3)], vec![9]),
-        ];
-        for (lengths, gpus, ranges, loads) in cases {
-            assert_eq!(
-                contiguous_shards(lengths, gpus, None),
-                (ranges, loads),
-                "{lengths:?}"
-            );
-        }
-    }
 }

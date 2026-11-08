@@ -779,22 +779,7 @@ fn known_fields(node: &PhysicalNode) -> (Vec<(String, Shown)>, bool) {
     match node {
         PhysicalNode::Scan(scan) => {
             let scan = &scan.attributes;
-            let mut fields = pick(&[
-                "alias",
-                "input_id",
-                "num_documents",
-                "total_tokens",
-                "shard_token_loads",
-            ]);
-            fields.push((
-                "shard_docs".to_string(),
-                Shown::List(
-                    scan.shard_ranges
-                        .iter()
-                        .map(|(start, stop)| Shown::Number((stop - start).into()))
-                        .collect(),
-                ),
-            ));
+            let mut fields = pick(&["alias", "input_id", "num_documents", "total_tokens"]);
             fields.push((
                 "predicates".to_string(),
                 Shown::List(

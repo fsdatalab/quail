@@ -16,7 +16,6 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     Barrier,
-    Scan,
 )
 from quail.physical.plan import Refusal
 from quail.specs import QWEN3_4B_FP8, QWEN3_32B_FP8
@@ -77,8 +76,6 @@ def test_gpu_copies_and_memory_refusals(catalog):
             plan = _plan(operators, {"r": [100] * 8}, model=model, gpus=gpus)
             assert plan.model == model.name
             assert plan.gpus == gpus
-            scan_node = next(node for node in plan.nodes if isinstance(node, Scan))
-            assert len(scan_node.shards) == gpus
 
     big = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
     operators = _five_filter_plan(catalog, (0.9,))
