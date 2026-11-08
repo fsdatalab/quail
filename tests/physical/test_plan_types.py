@@ -58,6 +58,9 @@ NODE_CASES = {
     "quail.limit": ("qwen3-4b-fp8", 1,
                     "SELECT r.id FROM reviews r "
                     "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) LIMIT 2"),
+    "quail.exchange": ("qwen3-4b-fp8", 2,
+                       "SELECT r.id, a.id FROM reviews r JOIN aspects a "
+                       "ON AI_FILTER(PROMPT('q4: {0} {1}', r.body, a.aspect))"),
     "quail.ai_sae_features": ("qwen3.5-2b-sae-bf16", 1,
                      "SELECT r.id, f.feature FROM reviews r, UNNEST(AI.SAE_FEATURES("
                      "PROMPT('{0} What is this about?', r.body), pooling => 'last')) "

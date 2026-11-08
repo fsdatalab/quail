@@ -3,6 +3,7 @@
 from quail.execution.runner import NodeRuntime
 from quail.execution.runtimes.dataflow import (
     BarrierRuntime,
+    ExchangeRuntime,
     HashJoinRuntime,
     ModelNodeRuntime,
 )
@@ -13,6 +14,7 @@ from quail.execution.runtimes.relational import (
 )
 from quail.physical import (
     Barrier,
+    Exchange,
     Filter,
     HashJoin,
     Limit,
@@ -21,6 +23,7 @@ from quail.physical import (
 
 __all__ = [
     "BarrierRuntime",
+    "ExchangeRuntime",
     "FilterRuntime",
     "HashJoinRuntime",
     "LimitRuntime",
@@ -35,6 +38,7 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
     return {
         Scan.runtime_key: ScanRuntime(),
         Barrier.runtime_key: BarrierRuntime(),
+        Exchange.runtime_key: ExchangeRuntime(),
         HashJoin.runtime_key: HashJoinRuntime(),
         Limit.runtime_key: LimitRuntime(),
         Filter.runtime_key: FilterRuntime(),

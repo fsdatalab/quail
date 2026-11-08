@@ -295,6 +295,10 @@ physical_nodes! {
         next_anchor: String,
         aliases: Vec<String>,
     }
+    /// Routes a join's anchor ids to the GPUs that hold their KV.
+    Exchange(ExchangeAttributes) = "quail.exchange" {
+        anchor: String,
+    }
     /// An equality join that asks no model.
     HashJoin(HashJoinAttributes) = "quail.hash_join" {
         left: String,

@@ -32,12 +32,14 @@ pub fn streamed_aliases(
     sequence: &[(PricedJoin, String)],
     groups: &[Vec<usize>],
     ask_aliases: &BTreeSet<String>,
+    gpus: i64,
 ) -> BTreeSet<String> {
     let mut streamed = BTreeSet::new();
     let mut partner_before = BTreeSet::new();
     for group in groups {
         let anchor = &sequence[group[0]].1;
-        if ask_aliases.contains(anchor)
+        if gpus == 1
+            && ask_aliases.contains(anchor)
             && !streamed.contains(anchor)
             && !partner_before.contains(anchor)
         {

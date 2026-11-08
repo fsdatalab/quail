@@ -179,8 +179,8 @@ class PhysicalPlan:
     def remove(self, node_id: str) -> "PhysicalPlan":
         """Take a node out; its consumers read its producer instead.
 
-        Allowed only for Barrier nodes with one input and one
-        output of the same value type. Removing a Scan,
+        Allowed only for Barrier and Exchange nodes with one
+        input and one output of the same value type. Removing a Scan,
         AiFilter, AiJoin, or Limit would change
         what the query means.
         """
