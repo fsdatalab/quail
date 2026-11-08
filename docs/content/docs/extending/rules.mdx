@@ -180,9 +180,14 @@ subquery's AI calls as a part of its own, and DataFusion's
 subquery's model region. The executor stops a key's documents once one
 passes the table's AI filters, as for R12, and only in a region that
 asks one table's AI.IF filters and joins nothing; the rule's conditions
-are that region's. A correlated `EXISTS` with an AI call on the
-subquery's table alone is still refused: its semi-join is inside the
-region, which Quail does not bind.
+are that region's. A correlated `EXISTS` whose AI calls read the
+subquery's table alone, with one equality of an outer and an inner
+column, is read as that `IN`: `WHERE EXISTS (SELECT 1 FROM reviews r
+WHERE r.product = p.number AND AI.IF(...))` runs as `WHERE p.number IN
+(SELECT r.product FROM reviews r WHERE AI.IF(...))`, and R13 applies.
+Both keep a product with a review of its number that passes; a filter
+drops an `IN` that is NULL as it drops an `EXISTS` that is FALSE, so
+only a WHERE term is read this way.
 
 R14 uses the same stop as R13 with `n = k`: the executor skips a key's
 remaining documents once `k` of them pass the table's AI filters. With

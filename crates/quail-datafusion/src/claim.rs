@@ -272,6 +272,7 @@ fn passed_fetch(plan: &LogicalPlan, fetch: Option<usize>) -> Option<usize> {
 /// A model call is in an operator Quail cannot plan.
 pub(crate) fn lower_regions(plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
     let plan = drop_written_names(plan)?;
+    let plan = plan.transform_up(exists_terms_as_in)?.data;
     let mut extracted = Extracted {
         config: config.clone(),
         ..Extracted::default()
@@ -609,7 +610,9 @@ impl Extracted {
 
     /// `plan` with the model regions of each uncorrelated `IN` subquery
     /// claimed: DataFusion runs the `IN` as a semi-join, whose subquery
-    /// side is then a part of its own.
+    /// side is then a part of its own. [`lower_regions`] reads a
+    /// correlated `EXISTS` of AI calls on the subquery's table alone as
+    /// such an `IN` ([`exists_terms_as_in`]).
     fn claim_in_subqueries(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let mut failed = None;
         let claimed = plan.map_expressions(|expr| {
@@ -870,6 +873,106 @@ fn derive_error(plan: &LogicalPlan) -> Option<String> {
 /// optimizer, when the refusal is of a shape DataFusion can run instead.
 fn refusal_of(plan: &LogicalPlan) -> Option<String> {
     derive_error(plan).filter(|error| error.contains(UNSUPPORTED))
+}
+
+/// `plan` with each term of its filter that is a correlated `EXISTS` of
+/// AI calls on the subquery's table alone read as an `IN` subquery
+/// ([`exists_as_in`]). An EXISTS is TRUE or FALSE and an IN may be NULL,
+/// so only a filter's term, which drops both, reads one as the other.
+fn exists_terms_as_in(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    let LogicalPlan::Filter(filter) = &plan else {
+        return Ok(Transformed::no(plan));
+    };
+    let terms: Vec<Expr> = split_conjunction(&filter.predicate)
+        .into_iter()
+        .cloned()
+        .map(exists_as_in)
+        .collect();
+    if conjunction(terms.clone()).as_ref() == Some(&filter.predicate) {
+        return Ok(Transformed::no(plan));
+    }
+    Ok(Transformed::yes(LogicalPlan::Filter(Filter::try_new(
+        conjunction(terms).expect("a term"),
+        Arc::clone(&filter.input),
+    )?)))
+}
+
+/// `expr` as an uncorrelated `IN` subquery when it is an `EXISTS` whose
+/// subquery is a SELECT list over a filter of one equality of an outer
+/// column and an inner one, and terms that read no outer column, with an
+/// AI call among them; else `expr` as it is.
+///
+/// For example, `EXISTS (SELECT 1 FROM reviews r WHERE r.product =
+/// p.number AND AI.IF(...r.body...))` is `p.number IN (SELECT r.product
+/// FROM reviews r WHERE AI.IF(...r.body...))`: both keep the outer rows
+/// with an inner row that has their key and passes the rest.
+fn exists_as_in(expr: Expr) -> Expr {
+    let Expr::Exists(exists) = &expr else {
+        return expr;
+    };
+    if exists.negated {
+        return expr;
+    }
+    let LogicalPlan::Projection(projection) = exists.subquery.subquery.as_ref() else {
+        return expr;
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        return expr;
+    };
+    let outer = |found: &Expr| {
+        found
+            .exists(|inner| Ok(matches!(inner, Expr::OuterReferenceColumn(..))))
+            .unwrap_or(true)
+    };
+    let mut keys = Vec::new();
+    let mut rest = Vec::new();
+    for term in split_conjunction(&filter.predicate) {
+        let key = match term {
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Eq => {
+                match (binary.left.as_ref(), binary.right.as_ref()) {
+                    (Expr::OuterReferenceColumn(_, outer), inner @ Expr::Column(_))
+                    | (inner @ Expr::Column(_), Expr::OuterReferenceColumn(_, outer)) => {
+                        Some((Expr::Column(outer.clone()), inner.clone()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match key {
+            Some(key) => keys.push(key),
+            None if outer(term) => return expr,
+            None => rest.push(term.clone()),
+        }
+    }
+    let [(key, read)] = keys.as_slice() else {
+        return expr;
+    };
+    let asks = rest
+        .iter()
+        .any(|term| term.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false));
+    if !asks {
+        return expr;
+    }
+    let body = match conjunction(rest) {
+        Some(predicate) => match Filter::try_new(predicate, Arc::clone(&filter.input)) {
+            Ok(kept) => LogicalPlan::Filter(kept),
+            Err(_) => return expr,
+        },
+        None => filter.input.as_ref().clone(),
+    };
+    let Ok(selected) = Projection::try_new(vec![read.clone()], Arc::new(body)) else {
+        return expr;
+    };
+    Expr::InSubquery(datafusion::logical_expr::expr::InSubquery::new(
+        Box::new(key.clone()),
+        datafusion::logical_expr::Subquery {
+            subquery: Arc::new(LogicalPlan::Projection(selected)),
+            outer_ref_columns: Vec::new(),
+            spans: exists.subquery.spans.clone(),
+        },
+        false,
+    ))
 }
 
 /// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,

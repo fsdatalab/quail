@@ -145,6 +145,22 @@ WHERE NOT EXISTS (
 
 The subquery must be `SELECT 1 FROM <table> WHERE AI.IF(...)`.
 
+An `EXISTS` may also match on a key and ask about the subquery's table
+alone. The following query finds products with at least one review that
+mentions a defect:
+
+```sql
+SELECT p.sku
+FROM products p
+WHERE EXISTS (
+    SELECT 1 FROM reviews r
+    WHERE r.product = p.number
+      AND AI.IF(PROMPT('Does this review mention a defect?\n\n{0}', r.body)))
+```
+
+Quail runs it as `p.number IN (SELECT r.product FROM reviews r WHERE
+AI.IF(...))`, and stops asking about a product's reviews once one passes.
+
 ### Options
 
 Both `AI.IF` and `AI_FILTER` accept an optional second argument with

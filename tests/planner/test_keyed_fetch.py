@@ -1,7 +1,8 @@
 """An AI filter stops each key once the operator above has enough rows.
 
 push_down_semi_join_fetch gives the AI filter on an IN subquery's side
-of a semi-join one row per join key (R13); push_down_count_threshold
+of a semi-join one row per join key (R13), and so to a correlated EXISTS
+whose AI filter reads the subquery's table alone; push_down_count_threshold
 gives the AI filter under HAVING COUNT(*) >= k k rows per group key
 (R14). Each test runs a query with the rule on and off, checks that both
 return the same rows, and counts the documents the model read.
@@ -70,6 +71,16 @@ def test_an_in_subquery_keeps_its_other_filters_before_the_model():
     on, off = _rows_and_read(SEMI_JOIN_RULE, sql)
     assert on[0] == off[0] == [("p2",)]
     assert (len(on[1]), len(off[1])) == (3, 4)
+
+
+def test_a_correlated_exists_of_an_ai_filter_stops_each_key_at_its_first_match():
+    sql = (f"SELECT p.sku FROM products p WHERE EXISTS (SELECT 1 FROM reviews r "
+           f"WHERE r.product = p.number AND {AI_IF})")
+    on, off = _rows_and_read(SEMI_JOIN_RULE, sql)
+    # the same rows as asking every review, as the IN subquery returns
+    assert on[0] == off[0] == [("p1",), ("p2",)]
+    # r1 and r3 share a product with a review that already passed
+    assert (on[1], off[1]) == ([0, 2, 4, 5], [0, 1, 2, 3, 4, 5])
 
 
 @pytest.mark.parametrize("subquery", [
