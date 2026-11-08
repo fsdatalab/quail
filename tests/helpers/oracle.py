@@ -10,6 +10,7 @@ a port name or a result shape.
 from __future__ import annotations
 
 import time
+from functools import partial
 
 import numpy as np
 import pyarrow as pa
@@ -42,6 +43,10 @@ from quail.physical import (
 )
 from quail.physical.plan import graph_from_envelope
 from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+# the most seconds an operator above a region may take to tighten the
+# region's hint after receiving a row; a slower one fails the test
+HINT_WAIT_SECONDS = 30.0
 
 
 def question_text(token_ids) -> str:
@@ -77,9 +82,11 @@ class Oracle:
             retains in the arena, as the executor would.
         join_metrics: Metrics every join stage reports beside its rows.
         streams: Whether a score call reports each row as it is scored.
-        pace: Seconds the oracle waits after each filter answer or score,
-            as a forward pass takes on the GPU; with a pace a filter
-            reports each document as it finishes.
+        tightens_after: Source rows of the first alias after whose
+            filter answer or score the oracle waits until the region's
+            hint tightens, so a test decides when the operator above the
+            region tightens its test. With it, a filter reports each
+            document as it finishes.
         pipelines: Whether the executor groups operators into pipelines,
             as the GPU executor does; the oracle then runs a pipeline's
             nodes in order.
@@ -91,7 +98,7 @@ class Oracle:
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
                  answers=None, features=None, maps=None, *,
                  probabilities=False, retain=0, join_metrics=None,
-                 streams=False, pipelines=False, pace=0.0):
+                 streams=False, pipelines=False, tightens_after=()):
         self.filters = filters or {}
         self.joins = joins or {}
         self.labels = labels
@@ -103,7 +110,7 @@ class Oracle:
         self.retain = retain
         self.join_metrics = join_metrics
         self.streams_answers = streams
-        self.pace = pace
+        self.tightens_after = frozenset(tightens_after)
         self.arena = None
         self.texts = {}
         self.documents = {}
@@ -223,8 +230,8 @@ class Oracle:
         scores = [self.scores(spec, row) for row in ids]
         if on_answers is not None:
             for position, value in enumerate(scores):
-                on_answers(np.array([position]), [value])
-                time.sleep(self.pace)
+                self._answered(ids[position][0], partial(
+                    on_answers, np.array([position]), [value]))
         return RerankerBatch(scores, fresh_tokens=len(rows), cached_tokens=0)
 
     # ---- answering ------------------------------------------------
@@ -249,13 +256,13 @@ class Oracle:
                 continue
             self.asked.append((node.alias, int(document)))
             answers[local] = [self._filter_answer(node, document)]
-            if self.pace and inputs.get("document_done") is not None:
-                inputs["document_done"]([(local, 0, bool(answers[local][0]))])
-                time.sleep(self.pace)
+            if self.tightens_after and inputs.get("document_done") is not None:
+                self._answered(self._source(node.alias, document), partial(
+                    inputs["document_done"], [(local, 0, bool(answers[local][0]))]))
             if answers[local][0]:
                 for group in found:
                     survivors[group] = survivors.get(group, 0) + 1
-        if inputs.get("document_done") is not None and not self.pace:
+        if inputs.get("document_done") is not None and not self.tightens_after:
             # the real loop reports a chunk's finished documents by position
             inputs["document_done"]([
                 (local, 0, bool(row[0])) for local, row in answers.items()])
@@ -265,6 +272,30 @@ class Oracle:
             for document in kept[:self.retain]:
                 self.arena.retain((node.alias, document), 16)
         return filter_result(node, answers, 10 * len(answers), document_ids)
+
+    def _answered(self, row: int, send) -> None:
+        """Send one answer on; after a row in tightens_after, wait for the hint.
+
+        Args:
+            row: The answered row of the registered table.
+            send: Sends the answer on toward the operator above the region.
+
+        Raises:
+            AssertionError: The hint did not tighten within
+                HINT_WAIT_SECONDS.
+        """
+        stream = region_stream()
+        hint = None if stream is None else stream.hint
+        if hint is None or row not in self.tightens_after:
+            send()
+            return
+        before = hint.generation()
+        send()
+        deadline = time.monotonic() + HINT_WAIT_SECONDS
+        while hint.generation() == before:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"the hint did not tighten after row {row}")
+            time.sleep(0.001)
 
     def _filter_answer(self, node, document) -> bool:
         document = self._source(node.alias, document)

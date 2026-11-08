@@ -223,7 +223,7 @@ def test_a_large_input_runs_in_windows_with_the_same_rows():
     session.close()
 
 
-def _paced_context(oracle, rows: int):
+def _reviews_context(oracle, rows: int):
     """A context over `rows` reviews r00, r01, ..., answered by `oracle`."""
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
@@ -239,13 +239,15 @@ def _paced_context(oracle, rows: int):
 def test_a_top_k_on_an_input_column_hands_the_region_its_threshold():
     text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
             "ORDER BY r.id LIMIT 2")
-    every = Oracle(filters=lambda alias, document, position: True, pace=0.05)
-    context = _paced_context(every, 12)
+    # once r00 and r01 pass, the sort holds two rows and tightens
+    every = Oracle(filters=lambda alias, document, position: True,
+                   tightens_after={1})
+    context = _reviews_context(every, 12)
     assert "ModelRegionExec: hint=[DynamicFilter" in context._native.explain(text)
     table = context.sql(text)
     assert _rows(table) == [("r00",), ("r01",)]
-    # once two reviews pass, every later id is past the top two
-    assert len(every.asked) < 6
+    # every later id is past the top two
+    assert every.asked == [("r", 0), ("r", 1)]
     context.session.close()
 
 
@@ -268,18 +270,21 @@ def test_a_top_k_over_a_score_asks_fewer_rows_once_it_holds_k(monkeypatch, where
     monkeypatch.setenv("DATAFUSION_EXECUTION_TARGET_PARTITIONS", "1")
     text = (f"SELECT r.id, AI.SCORE(PROMPT('q7: {{0}}', r.body)) AS score "
             f"FROM reviews r {where} ORDER BY score DESC, r.id LIMIT 3")
-    hinted = Oracle(**TOP_K_SCORES, streams=True, pace=0.05)
-    context = _paced_context(hinted, 12)
+    # the sort holds three rows after r02, and r00, r02, and r04 at 1.0
+    # after r04
+    hinted = Oracle(**TOP_K_SCORES, streams=True, tightens_after={2, 4})
+    context = _reviews_context(hinted, 12)
     context._engine.input_window_rows = 1
     assert _rows(context.sql(text)) == TOP_K_ROWS
     # without the LIMIT the sort holds every row and hands no threshold
     every = Oracle(**TOP_K_SCORES, streams=True)
-    whole = _paced_context(every, 12)
+    whole = _reviews_context(every, 12)
     assert _rows(whole.sql(text.replace(" LIMIT 3", "")))[:3] == TOP_K_ROWS
     assert _scored_rows(every) == 12
-    # once r00, r02, and r04 hold 1.0, a later review can only tie at 1.0
-    # with a larger id, which the top 3 does not take
-    assert _scored_rows(hinted) < 9
+    # r03 may still score above r01's 0.3; once r00, r02, and r04 hold
+    # 1.0, a later review can only tie at 1.0 with a larger id, which the
+    # top 3 does not take
+    assert _scored_rows(hinted) == 5
     context.session.close()
     whole.session.close()
 
@@ -288,7 +293,7 @@ def test_a_join_with_a_small_build_side_skips_probe_rows_whose_key_is_absent():
     text = ("SELECT r.id FROM picked p JOIN reviews r ON r.id = p.review "
             "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))")
     every = Oracle(filters=lambda alias, document, position: True)
-    context = _paced_context(every, 12)
+    context = _reviews_context(every, 12)
     picked = pa.table({"id": ["p0", "p1"], "review": ["r03", "r07"]})
     context.register("picked", quail.DocumentProvider.from_table(picked, id_col="id"))
     plan = context._native.explain(text)
