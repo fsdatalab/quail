@@ -1,4 +1,4 @@
-"""Runtimes for the dataflow nodes: exchange, barrier, and join."""
+"""Runtimes for the dataflow nodes: barrier and join."""
 
 from __future__ import annotations
 
@@ -10,18 +10,7 @@ from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import joined_survivors, true_answer_rows
 from quail.execution.rows import Rows
-from quail.physical import Barrier, Exchange, HashJoin, ValueType
-
-
-class ExchangeRuntime:
-    """Pass anchor ids through; several GPUs route them to their KV."""
-
-    def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, Exchange):
-            raise TypeError(type(node).__name__)
-        if len(inputs) != 1:
-            raise ValueError("Exchange takes one survivor input")
-        return NodeResult({f"rows:{node.anchor}": next(iter(inputs.values()))})
+from quail.physical import Barrier, HashJoin, ValueType
 
 
 class BarrierRuntime:

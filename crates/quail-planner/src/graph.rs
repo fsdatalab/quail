@@ -10,9 +10,8 @@ use quail_cost::work::Work;
 use quail_physical::{
     AiClassifyAttributes, AiExtractAttributes, AiFilterAttributes, AiJoinAttributes,
     AiMapAttributes, AiSaeFeaturesAttributes, AiScoreAttributes, Asked, BarrierAttributes,
-    ClassifySpec, ColumnRef, ExchangeAttributes, Expression, FilterAttributes, HashJoinAttributes,
-    ModelCall, Node, PhysicalNode, PortRef, Prompt, ScanAttributes, ScoreSpec, ValueExpression,
-    input_ports, port,
+    ClassifySpec, ColumnRef, Expression, FilterAttributes, HashJoinAttributes, ModelCall, Node,
+    PhysicalNode, PortRef, Prompt, ScanAttributes, ScoreSpec, ValueExpression, input_ports, port,
 };
 use serde_json::{Map, Value};
 
@@ -362,12 +361,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 format!("ai_join:{anchor}:{seen}")
             });
         }
-        self.streamed = streamed_aliases(
-            sequence,
-            &self.sequence_groups,
-            &self.ask_filters,
-            self.context.gpus,
-        );
+        self.streamed = streamed_aliases(sequence, &self.sequence_groups, &self.ask_filters);
         for column in self.operators.columns() {
             if call_aliases(&column.call).len() != 1 {
                 continue;
@@ -441,11 +435,9 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         let between: BTreeSet<&String> =
             self.classified.difference(&self.classified_after).collect();
         self.pipelined = self.streamed.clone();
-        if self.context.gpus == 1 {
-            for alias in &self.ask_filters {
-                if between.contains(alias) {
-                    self.pipelined.insert(alias.clone());
-                }
+        for alias in &self.ask_filters {
+            if between.contains(alias) {
+                self.pipelined.insert(alias.clone());
             }
         }
         ports
@@ -1238,21 +1230,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 for alias in &ahead {
                     ports.insert(alias.clone(), port_of(&barrier_id, format!("rows:{alias}")));
                 }
-            }
-            if self.context.gpus > 1 {
-                // anchors go to the GPU holding their KV, else balanced
-                let exchange_id = self.unique_id("exchange", &anchor);
-                self.nodes.push(PhysicalNode::Exchange(tagged_node(
-                    &exchange_id,
-                    &[ports[&anchor].clone()],
-                    ExchangeAttributes {
-                        anchor: anchor.clone(),
-                    },
-                )));
-                ports.insert(
-                    anchor.clone(),
-                    port_of(&exchange_id, format!("rows:{anchor}")),
-                );
             }
             let group_id = self.group_ids[g].clone();
             for (rank, member) in group.iter().enumerate() {

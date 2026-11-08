@@ -124,7 +124,7 @@ We can remove the barrier and get back the original plan:
 assert edited.remove("barrier:c") == plan
 ```
 
-Only `Barrier` and `Exchange` nodes can be removed. The removal of an
+Only `Barrier` nodes can be removed. The removal of an
 LLM node raises an error:
 
 ```text
@@ -148,7 +148,7 @@ editing it.
 Each edit returns a new plan, validates port connections and cycles, and
 re-estimates the graph. An invalid edit raises `PlanEditError`.
 
-Only `Barrier` and `Exchange` nodes can be removed. Quail rejects
+Only `Barrier` nodes can be removed. Quail rejects
 removal of a scan, model operator, or filter.
 
 [demoscript]: https://github.com/fsdatalab/quail/blob/main/demos/plan_walkthrough.py
