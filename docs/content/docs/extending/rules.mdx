@@ -93,7 +93,7 @@ names the rule that makes each rewrite and when it applies.
 | R3 | `σ_q(AI(R; h)) ⇒ σ_q(AI(R; h ∧ q))` | `push_down_hint_tests` | The filter is directly above a classification, extraction, map, or SAE features node of rows with no fetch; `q` is a term of the filter that reads a column the node adds and otherwise only the node's input, with no AI call. The filter stays. |
 | R4 | `σ_{a LIKE x}(AI_{extract(d)→a}(R)) ⇒ σ_{a LIKE x}(AI_{extract(d)→a}(σ_{d ILIKE '%s%'}(R)))` | `push_down_substring_prechecks` | The node is an extraction of rows with no fetch; its filter has a term `a.f LIKE x` or `ILIKE x`, not negated, with a literal pattern; `s` is the longest word of the longest literal run of `x`. The test of the answer stays. |
 | R5 | `π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))`; `π_{a.f}(AI_{extract(d, {f, g})→a}(R)) ⇒ π_{a.f}(AI_{extract(d, {f})→a}(R))` | `push_down_projection_into_ai_nodes` | `Q` is a projection directly above a node of rows; the node keeps its answer, and drops each other added column `Q` does not read, such as an extraction's spans under a FROM subquery. An extraction asks only the fields the plan reads when every use of its answer and spans, through projections that pass them on or rename them, reads named fields; a use that reads the answer whole, or the query's result columns holding it, keeps every field. DataFusion's `optimize_projections` already prunes the input columns the node reads. |
-| R6 | `π_{B, (CASE WHEN c THEN a END)→z}(AI_{f→a}(R)) ⇒ π_{B, a→z}(AI_{f→a}(R; g = g ∧ c))` | `push_down_case_guards` | The node is a classification, map, or SAE features of rows with no filter, `HINT`, or fetch; the projection is directly above it; every item that reads an added column is `CASE WHEN c THEN <column> END` with the same `c`; `c` reads only columns of the one table the call reads. |
+| R6 | `π_{B, (CASE WHEN c THEN a END)→z}(AI_{f→a}(R)) ⇒ π_{B, a→z}(AI_{f→a}(R; g = g ∧ c))`; an extraction keeps its `CASE`: `π_{B, (CASE WHEN c THEN e END)→z}(AI_{extract→e}(R)) ⇒ π_{B, (CASE WHEN c THEN e END)→z}(AI_{extract→e}(R; g = g ∧ c))` | `push_down_case_guards` | The node is a classification, extraction, map, or SAE features of rows with no filter, `HINT`, or fetch; the projection is directly above it; every item that reads an added column is `CASE WHEN c THEN <column> END` with the same `c`; `c` reads only columns of the one table the call reads. |
 | R7 | `AI_{f→b}(R; p = a ∨ b) ⇒ AI_{f→b}(R; g = (a IS NOT TRUE), p = a ∨ b)`; with earlier AI.IFs `b_1 … b_{k-1}` of the OR below, `AI_{f_j→b_j}(R) ⇒ AI_{f_j→b_j}(R; g = (a ∨ b_1 ∨ … ∨ b_{j-1}) IS NOT TRUE)` | `push_down_or_guards` | The node is an AI.IF of rows with no guard, `HINT`, or fetch, and returns none of the columns it adds; a term of its filter is an OR with the answer `b` as one term and no other term reads `b`; the other terms `a` read only columns of the one table the call reads, or are the answers `b_j` of AI.IF nodes below that return their answer and have no filter, guard, `HINT`, or fetch. |
 | R8 | `Limit_k(π(R)) ⇒ π(Limit_k(R))` | DataFusion's `push_down_limit`; `push_down_limit_into_ai_nodes` also reads through projections | The projection keeps one row per row. Over an `AiNode`, the LIMIT becomes the node's fetch (R9). |
 | R9 | `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))` | `push_down_limit_into_ai_nodes` | Only projections and aliases are between them, the node has no `HINT` and no per-key fetch, and `k > 0`. |
@@ -133,9 +133,10 @@ For R6, the executor evaluates the guard over the rows a column
 operator reads, asks the model about the rows where it is TRUE, and
 gives every other row a NULL answer. A guarded operator runs in a
 pipeline of its own, and stock vLLM refuses a plan with a guard. An
-extraction keeps its `CASE`: its answer is a struct of one answer per
-question, and an unasked row would read as a struct of NULL answers
-rather than NULL.
+extraction is guarded the same way and keeps its `CASE` above it: its
+answer is a struct of one answer per question, the executor gives an
+unasked row a struct of NULL answers and NULL spans, and the `CASE`
+makes that row's answer NULL as a whole.
 
 The planner prices a guarded operator on the rows its guard passes: its
 expected rows are the rows it reads times the guard's estimated

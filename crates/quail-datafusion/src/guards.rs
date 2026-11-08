@@ -13,8 +13,8 @@
 //!
 //! For example, `SELECT r.id, CASE WHEN r.long THEN AI.MAP(...) END AS
 //! summary` writes summaries of the long reviews only. The rule rewrites
-//! a projection directly above a classification, map, or SAE features
-//! node when:
+//! a projection directly above a classification, extraction, map, or SAE
+//! features node when:
 //!
 //! - every item that reads a column the node adds reads it as `CASE WHEN
 //!   c THEN <column> END`, with the same `c`, and no other item reads
@@ -23,15 +23,22 @@
 //! - the node has no filter, `HINT`, or fetch.
 //!
 //! The executor asks the model about the rows where the guard is TRUE
-//! and gives every other row a NULL answer. An extraction is left
-//! alone: its answer is a struct of one answer per question, and an
-//! unasked row would read as a struct of NULL answers, not as NULL.
+//! and gives every other row a NULL answer. An extraction keeps its
+//! `CASE` above the guarded node: its answer is a struct of one answer
+//! per question, and the executor gives an unasked row a struct of NULL
+//! answers, which the `CASE` makes NULL as a whole:
+//!
+//! ```text
+//! π_{B, (CASE WHEN c THEN e END) → z}(AI_{extract → e}(R))
+//!     ⇒ π_{B, (CASE WHEN c THEN e END) → z}(AI_{extract → e}(R; g = g ∧ c))
+//! ```
 
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::expr::Case;
+use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
@@ -66,7 +73,6 @@ fn push_down_case(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     };
     let plain = node.semantics == Semantics::Rows
         && !node.is_predicate()
-        && node.function() != "ai_extract"
         && node.filter.is_none()
         && node.tests.is_empty()
         && node.hint.is_none()
@@ -74,6 +80,7 @@ fn push_down_case(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     if !plain {
         return Ok(Transformed::no(plan));
     }
+    let extracts = node.function() == "ai_extract";
     let mut test: Option<Expr> = None;
     let mut exprs = Vec::new();
     for (index, expr) in projection.expr.iter().enumerate() {
@@ -96,6 +103,11 @@ fn push_down_case(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             Some(found) if found != when => return Ok(Transformed::no(plan)),
             _ => test = Some(when.clone()),
         }
+        if extracts {
+            // an unasked row's struct of NULL answers reads as NULL
+            exprs.push(expr.clone());
+            continue;
+        }
         let (qualifier, field) = projection.schema.qualified_field(index);
         exprs.push(Expr::Column(answer).alias_qualified(qualifier.cloned(), field.name()));
     }
@@ -103,6 +115,14 @@ fn push_down_case(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         return Ok(Transformed::no(plan));
     };
     if !reads_call_table(&test, node) {
+        return Ok(Transformed::no(plan));
+    }
+    // an extraction's CASE stays above it, once its test is the guard
+    let guarded_already = node
+        .guard
+        .as_ref()
+        .is_some_and(|guard| split_conjunction(guard).contains(&&test));
+    if extracts && guarded_already {
         return Ok(Transformed::no(plan));
     }
     let mut guarded = node.clone();

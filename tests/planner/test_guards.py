@@ -229,6 +229,7 @@ def test_stock_vllm_refuses_an_or_of_a_column_and_an_ai_filter():
     assert isinstance(plan, Refusal)
     assert plan.constraint == "or_filter_needs_quail_backend"
 
+
 def test_a_guarded_classification_is_priced_on_the_rows_its_guard_passes(sessions):
     def classified_rows(sql):
         plan = sessions[0].sql(sql).plan()
@@ -255,3 +256,27 @@ def test_an_ai_filter_in_an_or_is_priced_on_the_rows_where_the_rest_is_not_true(
     # r.long IS NOT TRUE passes 1 - 20% of rows
     assert guarded.expected_rows == pytest.approx(0.8 * everything.expected_rows)
 
+
+EXTRACT = "AI.EXTRACT(r.body, {'w': 'Which word?'})"
+
+
+def test_a_case_over_an_extraction_is_null_where_its_test_is_not_true(sessions):
+    sql = f"SELECT r.id, CASE WHEN r.long THEN {EXTRACT} END AS e FROM reviews r"
+    assert "guard: r.long" in sessions[0].sql(sql).logical
+    found = []
+    for session in sessions:
+        asked = []
+
+        def answer(spec, document, asked=asked):
+            asked.append(document)
+            return f"b{document}"
+
+        result = finish(session.sql(sql), Oracle(answers=answer)).collect()
+        found.append((sorted(tuple(row.values()) for row in result.to_pylist()),
+                      sorted(asked)))
+    on, off = found
+    # an unasked row is NULL as a whole, not a struct of NULL answers
+    assert on[0] == off[0] == [
+        ("r0", {"w": "b0"}), ("r1", None), ("r2", None), ("r3", {"w": "b3"}),
+        ("r4", None), ("r5", {"w": "b5"})]
+    assert (on[1], off[1]) == ([0, 3, 5], [0, 1, 2, 3, 4, 5])
