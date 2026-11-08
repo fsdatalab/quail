@@ -104,8 +104,9 @@ It returns one stream of the region's rows, which DataFusion reads
 while the region runs: each forward pass's finished rows when the
 region's last operator is a filter, score, or classification, and
 otherwise its rows once that operator finishes. With several GPUs, the
-coordinator merges each GPU's outputs first and sends the rows at the
-end.
+region runs as stages, one partition per GPU (see
+[Multiple GPUs](/docs/architecture/execution#multiple-gpus)), and each
+row is sent once the stage that completes it finishes on its GPU.
 
 `hint=[...]` lists the dynamic filters the operators above hand the
 region; see [Runtime filters](#runtime-filters).

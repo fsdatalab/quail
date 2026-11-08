@@ -110,7 +110,10 @@ edited = plan.insert(
 
 The barrier separates the filter and join into two pipelines. The edited
 plan sets `keep_kv=True` on the filter so passing claims' KV can be retained
-for the join. Retention is limited by available KV memory:
+for the join. On several GPUs, the barrier also starts a new
+[stage](/docs/architecture/execution#multiple-gpus): the join starts once
+the filter has finished on every GPU, and each claim returns to the GPU
+that holds its KV. Retention is limited by available KV memory:
 
 ```text
       Barrier: next_anchor=c

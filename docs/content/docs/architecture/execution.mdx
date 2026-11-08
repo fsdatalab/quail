@@ -311,16 +311,48 @@ unified attention because it requires extra answer positions. See
 
 ### Multiple GPUs
 
-Each GPU holds a complete model copy and its own KV. A *coordinator* is
-the process that divides the work among GPU workers and collects their
-results.
+On several GPUs, a region runs as *stages*, with one DataFusion
+partition per GPU. A stage is a run of operators whose rows are spread
+over the GPUs by the ids of one table, the stage's *key*: partition p
+runs on GPU p, over the rows whose key id hashes to p. Each document's
+question, and each pair's, is asked once, on one GPU.
 
-- For filters, it assigns documents using their token lengths to balance
-  work across GPUs.
-- For joins, anchors stay on the GPU that filtered them so their KV can
-  be reused. Each GPU receives the partner documents needed for its anchors.
-- Between groups of joins, it combines the results and distributes the
-  next group's anchors.
+- A table's filters run in the stage of the join anchored on it, so a
+  surviving anchor enters the join with its KV on the GPU that read it.
+- A partner's filters are a stage of their own. Their survivors go
+  whole to every partition of the join's stage once that stage has
+  finished.
+- A `Barrier` starts a stage keyed by the next anchor. It reads the
+  join answers so far whole, and the next anchors hashed by their ids,
+  so an anchor whose filter kept its KV reaches the GPU that holds it.
+- A table with a stop key, or with copies of one text, is hashed by
+  the smallest id it is grouped with, so a per-key stop sees its whole
+  group and a text is asked once.
+
+DataFusion moves the rows between stages. A hashed input goes through a
+`RepartitionExec` on the key's ids; a whole input goes through a
+`CoalescePartitionsExec`, collected once. A stage's partition starts
+once its inputs have ended. Each GPU has its own process, which holds
+every document, the model, and the GPU's KV for the region; Rust sends
+it a stage's input rows and reads back the rows the stage writes, as
+Arrow IPC over a Unix socket.
+
+For example, FEV-9 filters claims c1 and c2 and evidence e1 and e2,
+joins e1 with c1 and with c2, then joins c2 with e2. On two GPUs it
+runs five stages:
+
+| Stage key | Operators | Inputs |
+|---|---|---|
+| c1 | c1's filter | c1, hashed |
+| e1 | e1's filter and both joins with e1 | e1 hashed; c1's and c2's survivors whole |
+| c2 | c2's filter, which keeps its survivors' KV | c2, hashed |
+| e2 | e2's filter | e2, hashed |
+| c2 | the barrier and the join of c2 with e2 | c2's survivors hashed; the join answers and e2's survivors whole |
+
+Hashing balances document counts, not tokens. Stages ready at once on
+one GPU run one after the other, not in the same forward passes. A LIMIT
+without ORDER BY stops each GPU at the limit, so a run may ask more
+documents than one GPU would, and may return other rows.
 
 Quail supports up to eight GPUs on one host. Each GPU holds all model
 weights; the weights are not divided between GPUs.
