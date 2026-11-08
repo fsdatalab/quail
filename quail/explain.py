@@ -158,6 +158,7 @@ _COLUMNS = (
     ("est_pass", "est. pass"),
     ("pass", "pass"),
     ("est_time", "est. time"),
+    ("pred_time", "pred. time"),
     ("time", "time"),
     ("tokens", "fresh tokens"),
 )
@@ -510,6 +511,8 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             cells["est_rows"] = _number(value)
         if "seconds" in estimate:
             cells["est_time"] = _seconds(estimate["seconds"])
+        if "predicted_seconds" in estimate:
+            cells["pred_time"] = _seconds(estimate["predicted_seconds"])
         if metrics is not None:
             if node.node_id in metrics:
                 measured = metrics[node.node_id]

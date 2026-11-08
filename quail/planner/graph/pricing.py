@@ -15,6 +15,7 @@ import numpy as np
 
 from quail.cost import budgets
 from quail.cost.extract import estimate as extract_estimate
+from quail.cost.predict import load_table, predict_seconds
 from quail.cost.score import score_fixed_tokens
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, packed, scan
@@ -141,6 +142,7 @@ class PlanPricer:
                     1 / budgets.parallel_copies(self.context.gpus,
                                                 node.expected_rows)))
                 entry["seconds"] = self._seconds(price.work)
+                self._add_predicted(entry, price.work)
                 if node.alias in anchored and last_filters[node.alias] == node.node_id:
                     entry.update(self._release_recompute(node))
             elif isinstance(node, AiJoin):
@@ -153,6 +155,7 @@ class PlanPricer:
                         work = work * self._distinct(alias)
                 price = NodePrice(work=work)
                 entry["seconds"] = self._seconds(price.work)
+                self._add_predicted(entry, price.work)
             elif isinstance(node, (AiScore, AiClassify, AiExtract, AiMap,
                                    AiSaeFeatures)) \
                     and node.spec is not None:
@@ -166,6 +169,17 @@ class PlanPricer:
     def _seconds(self, work: Work) -> float:
         return speed_of_light(work, self.context.model, self.context.device,
                               self.statistics.chunk).seconds
+
+    def _add_predicted(self, entry: dict, work: Work) -> None:
+        """Add predicted wall seconds when a table was measured for this device.
+
+        The plan is still chosen on speed of light seconds.
+        """
+        table = load_table(self.context.model.name, self.context.device.name)
+        if table is not None and work.total().tokens > 0:
+            entry["predicted_seconds"] = predict_seconds(
+                table, work, self.context.model, self.context.device,
+                self.statistics.chunk)
 
     def _filter_work(self, node: AiFilter, resident: bool) -> Work:
         """A filter's work: its question over resident KV, else a scan of each."""
