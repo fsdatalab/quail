@@ -99,7 +99,7 @@ impl JoinBack {
         // own. DataFusion 55.2 maps a dynamic join filter's columns into
         // a probe side by name, so two region columns of one name, such
         // as `r.id` and `p.id`, would send one table's ids to the other's
-        // column (tests/dynamic_filter.rs)
+        // column (tests/integration/dynamic_filter.rs)
         let renamed = region
             .schema()
             .iter()
