@@ -15,3 +15,9 @@ rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
 
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+# pyo3 builds against the project's Python, the one an embedded
+# interpreter loads Quail from (crates/quail/tests). Not forced: maturin
+# sets its own, the base interpreter (use-base-python in pyproject.toml).
+[env]
+PYO3_PYTHON = { value = ".venv/bin/python", relative = true }
