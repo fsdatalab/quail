@@ -68,15 +68,8 @@ class DistributedQuailExecution:
                             for shard in shards])
         return [ids[owners[ids] == worker] for worker in range(self.gpus)]
 
-    def execute(self, node, inputs):
-        return self._execute((node,), {node.node_id: inputs}, pipeline=False)[
-            node.node_id]
-
     def execute_pipeline(self, nodes, inputs, context):
-        """Run one pipeline on every worker's share of its documents."""
-        return self._execute(nodes, inputs, pipeline=True)
-
-    def _execute(self, nodes, inputs, *, pipeline):
+        """Run one chain of model nodes on every worker's share of its documents."""
         first = nodes[0]
         alias = (first.document_aliases or first.spec.aliases)[0]
         source = next(
@@ -90,7 +83,7 @@ class DistributedQuailExecution:
         subs = []
         for shard in self._shards(alias, ids):
             subs.append({
-                "nodes": nodes, "pipeline": pipeline, "final": final,
+                "nodes": nodes, "final": final,
                 "limit": self.limit if final else None,
                 "inputs": {
                     node.node_id: {

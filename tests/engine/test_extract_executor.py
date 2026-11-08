@@ -30,10 +30,9 @@ from quail.backends.quail.distributed import (
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract.candidates import Stream
 from quail.backends.quail.executor.extract.vocabulary import same_word
-from quail.backends.quail.executor.operators.extract import (
-    ExtractPart,
-    execute_extractions,
-)
+from quail.backends.quail.executor.operators import operator_types
+from quail.backends.quail.executor.operators.extract import ExtractOperator
+from quail.backends.quail.executor.region import RegionExecution
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_execute
@@ -49,6 +48,17 @@ from quail.physical import (
 from quail.specs import DEVICES, MODELS, QWEN3_4B_FP8
 
 
+def execute_extractions(state, nodes, inputs) -> dict:
+    """Run extraction nodes alone over the documents, as a region runs them."""
+    region = RegionExecution(
+        SimpleNamespace(query=state, operator_types=operator_types()),
+        SimpleNamespace(sources={}, state={
+            "documents": inputs["documents"], "texts": inputs["texts"],
+            "gpu_timing": inputs.get("gpu_timing", False)}))
+    return region.run(nodes, {node.node_id: {"input:0": inputs["document_ids"]}
+                              for node in nodes})
+
+
 def make_spec(*texts):
     spec, vocabulary = make_extract_spec(*texts)
     return spec.replace(top_tokens=4), vocabulary
@@ -57,7 +67,7 @@ def make_spec(*texts):
 @pytest.fixture(autouse=True)
 def packed_scripted_inputs(monkeypatch):
     cpu_staging(monkeypatch)
-    monkeypatch.setattr("quail.backends.quail.executor.parts.input_staging",
+    monkeypatch.setattr("quail.backends.quail.executor.region.input_staging",
                         lambda state: None)
     pack = chunk_mod.pack_chunk
 
@@ -302,7 +312,7 @@ def _extract_spec(monkeypatch, text, gold, spec=None, vocabulary=None, recurrent
     state.loaded_model.vocabulary = vocabulary
     state.loaded_model.tokenizer = vocabulary.tokenizer
     seen = []
-    original = ExtractPart.__init__
+    original = ExtractOperator.__init__
 
     def initialize(self, *args, **kwargs):
         original(self, *args, **kwargs)
@@ -311,7 +321,7 @@ def _extract_spec(monkeypatch, text, gold, spec=None, vocabulary=None, recurrent
             model.gold[document.key] = gold
         seen.append(self)
 
-    monkeypatch.setattr(ExtractPart, "__init__", initialize)
+    monkeypatch.setattr(ExtractOperator, "__init__", initialize)
     node = AiExtract(node_id="extract", backend_name="quail", model=QWEN3_4B_FP8.name,
                      spec=spec)
     execute_extractions(state, [node], {
@@ -342,7 +352,7 @@ def _setup(monkeypatch, documents=None, token_documents=None,
     tokens = {"c": ([tables.tokenizer(text) for text in documents]
                     if token_documents is None else token_documents)}
     stages_seen = {}
-    original = ExtractPart.__init__
+    original = ExtractOperator.__init__
 
     def init(self, *args, **kwargs):
         original(self, *args, **kwargs)
@@ -351,7 +361,7 @@ def _setup(monkeypatch, documents=None, token_documents=None,
             model.gold[document.key] = GOLD[documents.index(document.text)]
         stages_seen["stages"] = self
 
-    monkeypatch.setattr(ExtractPart, "__init__", init)
+    monkeypatch.setattr(ExtractOperator, "__init__", init)
 
     def node(name):
         return AiExtract(node_id=f"ai-extract:{name}", backend_name="quail",
@@ -505,7 +515,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     shards = [sub["inputs"]["ai-extract:ends"]["input:0"].ids["c"].to_pylist()
               for sub in rounds[0]]
     assert sorted(document for shard in shards for document in shard) == [0, 1, 2]
-    assert all(sub["pipeline"] and sub["final"] for sub in rounds[0])
+    assert all(sub["final"] for sub in rounds[0])
     for node in nodes[1:]:
         actual = result["_outputs"][PortRef(node.node_id, "rows:c")]
         assert actual.equals(expected[node.node_id].outputs["rows:c"].table())

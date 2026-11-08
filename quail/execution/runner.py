@@ -46,10 +46,6 @@ class ExecutionContext:
     runtimes: Mapping[str, NodeRuntime]
     model_execution: Any = None
     sources: Mapping[str, Any] = field(default_factory=dict)
-    model_inputs: Callable[
-        [PhysicalNode, Mapping[str, Any], "ExecutionContext"],
-        Mapping[str, Any],
-    ] | None = None
     model_result: Callable[
         [PhysicalNode, NodeResult, "ExecutionContext"], None,
     ] | None = None

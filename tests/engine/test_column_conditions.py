@@ -8,7 +8,7 @@ from helpers.conditions import condition as sql_condition
 from helpers.kv_checker import cpu_torch
 
 from quail.backends.quail.executor.operators.filter import ConditionGate
-from quail.backends.quail.executor.operators.sae_features import SaeFeaturesPart
+from quail.backends.quail.executor.operators.sae_features import SaeFeaturesOperator
 from quail.backends.quail.executor.sae import feature_lists_of_rows
 from quail.backends.quail.executor.stages import Stage
 from quail.common.expressions import FEATURE_LIST
@@ -30,7 +30,7 @@ def test_feature_lists_are_tested_after_settling_and_cached_as_values(pooling):
 
     accumulator = (SimpleNamespace(settle=lambda key: key[1], harvest=harvest)
                    if pooling == "max" else None)
-    part = SaeFeaturesPart(state, node, [0, 1, 2], {"r": [[0], [1], [2]]},
+    part = SaeFeaturesOperator(state, node, [0, 1, 2], {"r": [[0], [1], [2]]},
                            accumulator=accumulator)
     for position in range(3):
         part.stages[0].decide(position, packed[position:position + 1])

@@ -1,15 +1,15 @@
-"""Run compatible physical nodes through the shared document scheduler."""
-
-from itertools import groupby
+"""Run a pipeline's steps under set attention, as passes over whole sequences."""
 
 import numpy as np
 
-from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.executor.operators.filter import (
-    filter_inputs,
     filter_result,
+    filter_stop_groups,
 )
-from quail.backends.quail.executor.operators.join import JoinPart, execute_set_joins
+from quail.backends.quail.executor.operators.join import (
+    execute_set_joins,
+    upstream_join,
+)
 from quail.backends.quail.executor.operators.set_classify import (
     SetLabels,
     classify_result,
@@ -22,12 +22,10 @@ from quail.backends.quail.executor.operators.set_extract import (
     read_result,
     read_texts,
 )
-from quail.backends.quail.executor.parts import execute_parts, execution_prefix_tree
 from quail.backends.quail.executor.pass_groups import node_question, run_pass_group
-from quail.backends.quail.executor.state import QueryExecutionState
-from quail.common.tokens import DocumentKeys, DocumentPrefixes
+from quail.backends.quail.executor.region import pipeline_ids, pipeline_rows
+from quail.common.tokens import DocumentPrefixes
 from quail.execution.ids import id_positions
-from quail.execution.rows import Rows
 from quail.execution.runtimes.filter import FilterRuntime
 from quail.physical import (
     AiClassify,
@@ -38,66 +36,6 @@ from quail.physical import (
     Filter,
     ValueType,
 )
-
-
-def execute_pipeline(state: QueryExecutionState, nodes, inputs, context) -> dict:
-    """Prepare compatible operators, run their stages, and return node results."""
-    state.gpu_timing = bool(context.state.get("gpu_timing", False))
-    # a set-attention model runs every pipeline as passes over whole
-    # sequences; this is the one place that choice is made
-    if state.loaded_model.pipeline.whole_sequences:
-        return execute_set_pipeline(state, nodes, inputs, context)
-    first = nodes[0]
-    implementations = execution_parts()
-    implementation = implementations[first.type_name]
-    if (implementation.execute_group is not None
-            and all(node.type_name == first.type_name for node in nodes)):
-        prepared = context.model_inputs(first, inputs, context, nodes=nodes)
-        return implementation.execute_group(state, nodes, prepared)
-
-    alias = first.document_aliases[0]
-    ids = pipeline_ids(first, inputs)
-    last = max(index for index, node in enumerate(nodes)
-               if node.backend is not None)
-
-    def group_key(node):
-        implementation = implementations[node.type_name]
-        return node.type_name, None if implementation.combine else node.node_id
-
-    parts = []
-    for _, group in groupby(nodes, group_key):
-        members = list(group)
-        parts.append(implementations[members[0].type_name].prepare(
-            state, members, ids, parts, inputs, context))
-    prefixes = DocumentPrefixes(
-        first.document_head, context.state["documents"][alias], ids
-    )
-    # a trailing condition gates the documents before they complete,
-    # so a result limit counts only the documents that pass it
-    return execute_parts(
-        state, parts, prefixes, DocumentKeys(alias, ids),
-        keep_kv=nodes[last].keep_kv,
-        prefix_tree=execution_prefix_tree(first, prefixes, state.loaded_model.arena),
-        limit=context.state.get("filter_limit"),
-        attention=(first.attention or None
-                   if isinstance(first, (AiFilter, AiJoin)) else None),
-        label=f"pipeline {alias}")
-
-
-def pipeline_rows(first, inputs):
-    """The rows, or ids, a pipeline's first operator reads."""
-    alias = first.document_aliases[0]
-    anchor_port = next((port.name for port in first.inputs
-                        if port.source.port == f"rows:{alias}"), None)
-    return (inputs[first.node_id][anchor_port] if anchor_port is not None
-            else next(iter(inputs[first.node_id].values())))
-
-
-def pipeline_ids(first, inputs) -> np.ndarray:
-    """The document ids a pipeline's first operator reads."""
-    alias = first.document_aliases[0]
-    source = pipeline_rows(first, inputs)
-    return id_positions(source.ids[alias] if isinstance(source, Rows) else source)
 
 
 def _kind(node) -> str:
@@ -245,7 +183,7 @@ def execute_set_steps(state, nodes, ids, prefixes, *, texts=None, inputs=None,
                 if _kind(later) != "join":
                     break
                 run.append(later)
-            join = JoinPart.prepare(state, run, ids[kept], [], inputs, context)
+            join = upstream_join(state, run, ids[kept], (), inputs, context)
             results.update(execute_set_joins(state, join))
             node = run[-1]
         else:
@@ -264,10 +202,9 @@ def execute_set_pipeline(state, nodes, inputs, context) -> dict:
     head = next((node.document_head for node in nodes
                  if _kind(node) in PACKED), ())
     first_filter = next((node for node in nodes if isinstance(node, AiFilter)), None)
-    stops = (None if first_filter is None else filter_inputs(
+    stops = (None if first_filter is None else filter_stop_groups(
         context.state, first_filter,
-        pipeline_rows(nodes[0], inputs) if first_filter is nodes[0] else ids)[
-            "stop_groups"])
+        pipeline_rows(nodes[0], inputs) if first_filter is nodes[0] else ids))
     num_key_survivors = (1 if first_filter is None
                          else first_filter.num_key_survivors)
     return execute_set_steps(

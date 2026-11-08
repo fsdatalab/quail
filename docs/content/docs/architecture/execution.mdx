@@ -74,6 +74,18 @@ document there must fit one forward pass.
 An operator that requires all its input rows ends a pipeline. Later
 operators wait until those rows are available.
 
+On one GPU, a `RegionExecution` runs each pipeline, and each model
+operator alone, through the same loop. Each physical node, or group of
+consecutive nodes of one kind, is a `ModelOperator`. The region pushes
+documents into the first operator. When a document leaves an
+operator's stages, the region settles it there; a kept document goes
+on to the next operator. After each forward pass the region takes the
+rows each operator finished. Once the loop ends, it closes each
+operator, which returns its nodes' results. A score of pairs and
+extractions alone use their own prompt layout. Every other chain reads
+one document table: the first node's prompt head with each document,
+keyed by alias and document id, under one prefix tree.
+
 ### Reading the region's input
 
 `ModelRegionExec` reads every row of each input the region reads, then

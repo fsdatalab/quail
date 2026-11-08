@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from quail.backends.quail.executor.model_loading import full_output_head
-from quail.backends.quail.executor.parts import gpu_seconds, input_staging
+from quail.backends.quail.executor.model_operator import gpu_seconds, input_staging
 from quail.backends.quail.executor.readout import AsyncPassReadout
 from quail.backends.quail.executor.set_passes import group_passes
 from quail.backends.quail.executor.stages import Stage, run_stages

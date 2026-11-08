@@ -6,11 +6,11 @@ import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail.executor.model_loading import full_output_head
+from quail.backends.quail.executor.model_operator import gpu_seconds, input_staging
 from quail.backends.quail.executor.operators.join import (
     JoinQuestions,
     join_pass_stage,
 )
-from quail.backends.quail.executor.parts import gpu_seconds, input_staging
 from quail.backends.quail.executor.pass_groups import (
     option_columns,
     option_probabilities,
@@ -119,7 +119,7 @@ def joined_label_passes(state, node, join) -> NodeResult:
     Args:
         state: The query's execution state.
         node: The AiClassify over the join's pairs.
-        join: The JoinPart that ran the join, under set attention.
+        join: The JoinOperator that ran the join, under set attention.
     """
     spec = node.spec
     (join_node,) = [member for member in join.nodes if node.classifies_join(member)]

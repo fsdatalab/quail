@@ -63,8 +63,6 @@ class ModelNodeRuntime:
     def execute(self, node, inputs, context) -> NodeResult:
         if context.model_execution is None:
             raise RuntimeError("model node has no model execution object")
-        if context.model_inputs is not None:
-            inputs = context.model_inputs(node, inputs, context)
         result = context.model_execution.execute(node, inputs)
         if not isinstance(result, NodeResult):
             raise TypeError("model execution must return NodeResult")

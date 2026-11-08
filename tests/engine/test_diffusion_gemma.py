@@ -14,8 +14,8 @@ from helpers.fakes import (
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.admission import JoinAdmission
-from quail.backends.quail.executor.operators.filter import FilterPart
-from quail.backends.quail.executor.parts import gated_stages
+from quail.backends.quail.executor.model_operator import gated_stages
+from quail.backends.quail.executor.operators.filter import FilterOperator
 from quail.backends.quail.executor.stages import filter_stages, frame_writes, run_stages
 
 
@@ -27,14 +27,14 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
     # the questions' shared preamble is the frame, written once; each
     # stage's suffix is its question past it, and canvas rows follow
     # every suffix
-    parts = [FilterPart(SimpleNamespace(question_token_ids=q), [0, 1],
+    parts = [FilterOperator(SimpleNamespace(question_token_ids=q), [0, 1],
                         answers, canvas_tokens=3) for q in questions]
     stages = gated_stages(parts)
     assert [stage.frame for stage in stages] == [[40, 41], [40, 41]]
     assert [stage.suffixes for stage in stages] == [[[42]], [[43, 44]]]
     assert frame_writes(stages) == [True, False]
-    assert parts[0].finish([{0: [1], 1: [0]}]) == 2 * (3 + 3)
-    assert parts[1].finish([{0: [1]}]) == 2 + 3
+    assert parts[0].read_answers([{0: [1], 1: [0]}]) == 2 * (3 + 3)
+    assert parts[1].read_answers([{0: [1]}]) == 2 + 3
     # the stages' suffix counts include their canvas rows; a frame
     # entry's canvas is counted from frame_canvas_tokens
     sched = JoinAdmission([20, 30], [[1 + 3], [2 + 3]], 200, arena_pages=64,

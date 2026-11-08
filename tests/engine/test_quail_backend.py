@@ -82,19 +82,26 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     arena = FakeArena()
     arena.owned.add(("d", 10))
 
-    def fake_run_stages(*args, on_settled, **kwargs):
-        on_settled(0, True, [True])
-        return [{0: [True]}], [], 3
+    class SettlingExecutor:
+        def __init__(self, *args, on_settled, **kwargs):
+            self.on_settled = on_settled
 
-    monkeypatch.setattr("quail.backends.quail.executor.parts.run_stages",
-                        fake_run_stages)
+        def run(self):
+            self.on_settled(0, True, [True])
+            return [{0: [True]}], [], 3
+
+    monkeypatch.setattr(
+        "quail.backends.quail.executor.stage_executor.StageExecutor",
+        SettlingExecutor)
     execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
     execution.bind_loaded_model(
         model=object(), arena=arena, pipeline=fake_pipeline())
     execution.bind_query(torch=fake_torch(), async_answers=fake_readout(),
                          answer_rows=object(), chunk_tokens=8192)
-    result = execution.execute(filtered, {
-        "documents": [[1]], "document_ids": [10]})
+    context = SimpleNamespace(sources={}, state={
+        "documents": {"d": [[1]] * 11}, "filter_limit": None})
+    result = execution.execute_pipeline(
+        (filtered,), {"filter:d": {"input:0": [10]}}, context)["filter:d"]
     assert not arena.owned
     assert result.outputs["rows:d"].ids["d"].to_pylist() == [10]
 

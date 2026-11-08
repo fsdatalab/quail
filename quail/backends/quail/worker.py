@@ -499,19 +499,7 @@ def _child_execute(state, sub) -> dict:
     nodes, inputs = sub["nodes"], sub["inputs"]
     gpu = state.gpu
     with gpu.torch.inference_mode():
-        if sub["pipeline"] and context.run_pipeline is not None:
-            results = context.run_pipeline(nodes, inputs, context)
-        else:
-            # an executor without pipelines runs the group node by node
-            results = {}
-            for node in nodes:
-                node_inputs = dict(inputs[node.node_id])
-                for port in node.inputs:
-                    if port.source.node_id in results:
-                        node_inputs[port.name] = results[
-                            port.source.node_id].outputs[port.source.port]
-                results[node.node_id] = context.runtimes[node.runtime_key].execute(
-                    node, node_inputs, context)
+        results = context.model_execution.execute_pipeline(nodes, inputs, context)
     gpu.torch.cuda.synchronize()
     if sub["final"]:
         for key in gpu.arena.resident_keys():

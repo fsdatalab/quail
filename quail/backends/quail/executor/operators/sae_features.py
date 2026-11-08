@@ -1,14 +1,13 @@
-"""AI.SAE_FEATURES through the shared document scheduler."""
+"""AI.SAE_FEATURES in a region's GPU loop."""
 
 from contextlib import contextmanager
 
 import numpy as np
 import pyarrow as pa
 
-from quail.backends.quail.executor.parts import (
-    ColumnPart,
-    SingleResultPart,
-    document_inputs,
+from quail.backends.quail.executor.model_operator import (
+    ColumnOperator,
+    SingleNodeOperator,
     join_prior_rows,
     prior_inputs,
 )
@@ -43,36 +42,34 @@ def _feature_column(lengths, indices, strengths) -> pa.ListArray:
     return pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), values)
 
 
-class SaeFeaturesPart(ColumnPart, SingleResultPart):
-    """One feature call's stage and result table within a pipeline."""
-
-    model_inputs = staticmethod(document_inputs)
+class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
+    """One feature call's stage and result table within a chain."""
 
     @classmethod
-    def prepare(cls, state, nodes, ids, parts, inputs, context):
+    def build(cls, region, nodes, chain):
         node = nodes[0]
         accumulator = next(
-            (part.accumulator for part in parts
-             if isinstance(part, SaeFeaturesPart)
-             and part.accumulator is not None), None)
-        priors, prior_tables = prior_inputs(node, parts, inputs[node.node_id])
-        return cls(state, node, ids, context.state["documents"],
+            (operator.accumulator for operator in chain
+             if isinstance(operator, SaeFeaturesOperator)
+             and operator.accumulator is not None), None)
+        priors, prior_tables = prior_inputs(node, chain, region.node_inputs(node))
+        return cls(region.query, node, region.document_ids(), region.documents,
                    accumulator=accumulator, priors=priors,
                    prior_tables=prior_tables)
 
     @staticmethod
-    def prepare_group(parts):
+    def prepare_group(operators):
         """Clear each question's maxima when its call finishes, for either pooling."""
-        accumulator = next((part.accumulator for part in parts
-                            if part.accumulator is not None), None)
+        accumulator = next((operator.accumulator for operator in operators
+                            if operator.accumulator is not None), None)
         if accumulator is not None:
-            for part in parts:
-                part.accumulator = accumulator
+            for operator in operators:
+                operator.accumulator = accumulator
                 accumulator.register_call()
 
     @contextmanager
     def execution_context(self):
-        """Attach the forward hook for the scheduler's lifetime."""
+        """Attach the forward hook for the GPU loop's lifetime."""
         if self._pipeline is None:
             yield
             return
@@ -149,7 +146,7 @@ class SaeFeaturesPart(ColumnPart, SingleResultPart):
         return (_feature_column(*feature_lists_of_rows(
             [self.values[position] for position in positions], self.keep)),)
 
-    def finish(self, every) -> int:
+    def read_answers(self, every) -> int:
         """Read the settled maxima that have landed; return the suffix tokens."""
         self._harvest(completed_only=True)
         head, tail = self.node.spec.prompt_token_parts
@@ -158,7 +155,7 @@ class SaeFeaturesPart(ColumnPart, SingleResultPart):
     def _harvest(self, *, completed_only: bool, positions=None) -> None:
         """Unpack settled handles, optionally waiting for their copies.
 
-        finish() reads completed slabs only. A condition reads its
+        read_answers() reads completed slabs only. A condition reads its
         requested positions; result() reads everything left.
         """
         if self.accumulator is None or not self.pending:

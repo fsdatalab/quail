@@ -222,7 +222,7 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
         tree = PrefixTree(order=list(order), parent=[None, 0, None],
                           shared=[0, 32, 0])
     stats = {}
-    from quail.backends.quail.executor.parts import settle_documents
+    from quail.backends.quail.executor.model_operator import settle_documents
 
     keys = [("r", d) for d in range(len(documents))]
     got, _, tokens = run_stages(

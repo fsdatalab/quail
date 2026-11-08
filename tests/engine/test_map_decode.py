@@ -24,10 +24,10 @@ from quail.backends.quail.executor.answer_admission import (
     allocate_headroom,
 )
 from quail.backends.quail.executor.map_decoder import MapDecoder
-from quail.backends.quail.executor.operators.classify import ClassifyPart
-from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
-from quail.backends.quail.executor.operators.map import MapPart
-from quail.backends.quail.executor.parts import gated_stages
+from quail.backends.quail.executor.model_operator import gated_stages
+from quail.backends.quail.executor.operators.classify import ClassifyOperator
+from quail.backends.quail.executor.operators.filter import ConditionGate, FilterOperator
+from quail.backends.quail.executor.operators.map import MapOperator
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.common.answers import answer_survival
 from quail.common.decode import DecodeCost
@@ -155,7 +155,7 @@ def classification_and_condition(ids):
         labels[anchor] = "keep" if row[0] else "drop"
         return True
 
-    classification = ClassifyPart(
+    classification = ClassifyOperator(
         SimpleNamespace(spec=SimpleNamespace(name="label", aliases=("d",),
                                               output_columns=("d", "label"))), ids,
         SimpleNamespace(labels=labels, stages=[Stage(
@@ -188,11 +188,11 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
                              tree_attention=True, canvas_ids=())
     torch_ = events_torch(lag)
     ids = list(range(len(documents)))
-    maps = MapPart(None, [map_node("a", tails[0], limits[0]),
+    maps = MapOperator(None, [map_node("a", tails[0], limits[0]),
                           map_node("b", tails[1], limits[1])], ids, 0)
     parts = [maps]
     if question is not None:
-        parts = [FilterPart(SimpleNamespace(question_token_ids=question), ids,
+        parts = [FilterOperator(SimpleNamespace(question_token_ids=question), ids,
                             Bits(), 0), maps]
     stages = gated_stages(parts)
     prefixes, keys, tree, dependencies = maps.branch_inputs(
@@ -248,7 +248,7 @@ def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(
     torch_ = events_torch(lag)
     classification, condition = classification_and_condition(ids)
     labels = classification.plan.labels
-    maps = MapPart(None, [map_node(f"m{q}", tail, answer_limit, "tree")
+    maps = MapOperator(None, [map_node(f"m{q}", tail, answer_limit, "tree")
                           for q, (tail, answer_limit) in enumerate(zip(tails, limits))],
                    ids, 0)
     stages = gated_stages([classification, condition, maps])
@@ -312,7 +312,7 @@ def test_fused_document_operators_equal_running_each_operator_alone(
         torch_ = events_torch(3)
         stages = gated_stages(parts)
         prefixes, keys = [documents[d] for d in ids], [("d", d) for d in ids]
-        maps = next((part for part in parts if isinstance(part, MapPart)), None)
+        maps = next((part for part in parts if isinstance(part, MapOperator)), None)
         decoder, tree, dependencies = None, None, {}
         if maps is not None:
             prefixes, keys, tree, dependencies = maps.branch_inputs(
@@ -328,8 +328,8 @@ def test_fused_document_operators_equal_running_each_operator_alone(
         return every
 
     classification, condition = classification_and_condition(ids)
-    maps = MapPart(None, nodes, ids, 0)
-    run([FilterPart(question, ids, Bits()), classification, condition, maps],
+    maps = MapOperator(None, nodes, ids, 0)
+    run([FilterOperator(question, ids, Bits()), classification, condition, maps],
         ids, limit)
     kept = np.flatnonzero(maps.asked[0]).tolist()
     fused = [{"id": ids[d], "label": classification.plan.labels[d], **{
@@ -337,7 +337,7 @@ def test_fused_document_operators_equal_running_each_operator_alone(
         for q, node in enumerate(nodes)}} for d in kept]
     assert all(np.flatnonzero(asked).tolist() == kept for asked in maps.asked)
 
-    every = run([FilterPart(question, ids, Bits())], ids)
+    every = run([FilterOperator(question, ids, Bits())], ids)
     survivors = [ids[d] for d in sorted(every[0]) if every[0][d][0]]
     classification, condition = classification_and_condition(survivors)
     run([classification], survivors)
@@ -346,7 +346,7 @@ def test_fused_document_operators_equal_running_each_operator_alone(
                 if condition.gate(("d", d)) is not Stage.DROP]
     survivors = [row["id"] for row in separate]
     for node in nodes:
-        maps = MapPart(None, [node], survivors, 0)
+        maps = MapOperator(None, [node], survivors, 0)
         run([maps], survivors)
         for a, row in enumerate(separate):
             answer = maps.decoder.answers(0, [a])[0].tolist()
@@ -399,7 +399,7 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
                              tree_attention=True)
     torch_ = events_torch(lag)
     classification, condition = classification_and_condition(ids)
-    maps = MapPart(None, [map_node(f"m{q}", tail, answer_limit, "tree")
+    maps = MapOperator(None, [map_node(f"m{q}", tail, answer_limit, "tree")
                           for q, (tail, answer_limit) in enumerate(zip(tails, limits))],
                    ids, 0)
     stages = gated_stages([classification, condition, maps])
@@ -481,10 +481,10 @@ def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
     limits = [16, 28, 20, 24]
     nodes = [map_node(f"m{q}", tail, answer_limit, "tree")
              for q, (tail, answer_limit) in enumerate(zip(tails, limits))]
-    first = MapPart(None, nodes[:2], ids, 0)
-    second = MapPart(None, nodes[2:], ids, 2)
+    first = MapOperator(None, nodes[:2], ids, 0)
+    second = MapOperator(None, nodes[2:], ids, 2)
     question = [750, 751]
-    parts = [first, FilterPart(SimpleNamespace(question_token_ids=question), ids,
+    parts = [first, FilterOperator(SimpleNamespace(question_token_ids=question), ids,
                                Bits(), 0), second]
     stages = gated_stages(parts)
     prefixes, keys, tree, dependencies = first.branch_inputs(
@@ -533,7 +533,7 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
     model = TokenModel(arena)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=(),
                              tree_attention=True)
-    maps = MapPart(None, [map_node(f"m{q}", tail, answer_limit, "tree")
+    maps = MapOperator(None, [map_node(f"m{q}", tail, answer_limit, "tree")
                           for q, (tail, answer_limit) in enumerate(zip(tails, limits))],
                    ids, 0)
     prefixes, keys, tree, dependencies = maps.branch_inputs(
@@ -745,7 +745,7 @@ def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
     ids = list(range(len(documents)))
     node = map_node("a", tail, limit)
     node.stop_tests, node.hint_tests, node.stop_when_true = (test,), (), True
-    maps = MapPart(None, [node], ids, 0)
+    maps = MapOperator(None, [node], ids, 0)
     stages = gated_stages([maps])
     prefixes, keys, tree, dependencies = maps.branch_inputs(
         documents, [("d", i) for i in ids], None, setup.page_tokens, 0)

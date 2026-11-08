@@ -148,9 +148,9 @@ def test_copy_branches_match_reference_after_filters_and_limits(
     from helpers.kv_checker import Setup, chain, make_arena
     from test_map_decode import Bits, TokenModel, next_token
 
-    from quail.backends.quail.executor.operators.extract import ExtractPart
-    from quail.backends.quail.executor.operators.filter import FilterPart
-    from quail.backends.quail.executor.parts import gated_stages
+    from quail.backends.quail.executor.model_operator import gated_stages
+    from quail.backends.quail.executor.operators.extract import ExtractOperator
+    from quail.backends.quail.executor.operators.filter import FilterOperator
     from quail.backends.quail.executor.stages import run_stages
     from quail.physical import AiExtract
 
@@ -200,12 +200,12 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         },
         "texts": {"c": texts},
     }
-    part = ExtractPart(state, nodes, ids, inputs)
+    part = ExtractOperator(state, nodes, ids, inputs)
     parts = [part]
     question = [700, 701]
     if filtered:
         parts.insert(
-            0, FilterPart(SimpleNamespace(question_token_ids=question), ids, Bits())
+            0, FilterOperator(SimpleNamespace(question_token_ids=question), ids, Bits())
         )
     stages = gated_stages(parts)
     prefixes, keys, tree, dependencies = part.branch_inputs(
@@ -304,8 +304,8 @@ def test_copy_branches_match_reference_after_filters_and_limits(
         assert spans == [
             part.extraction.documents[d].answers[q].span for d in survivors
         ]
-    part.finish(every)
-    part.complete(fresh, timed_spans, {}, len(stages) - 1)
+    part.read_answers(every)
+    part.close(fresh, timed_spans, {}, len(stages) - 1)
     results = part.results()
     assert sum(result.metrics.fresh_tokens for result in results.values()) == fresh
     for q, node in enumerate(nodes):
@@ -362,15 +362,15 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         next_token,
     )
 
-    from quail.backends.quail.executor.operators.extract import ExtractPart
+    from quail.backends.quail.executor.operators.extract import ExtractOperator
     from quail.backends.quail.executor.operators.filter import ConditionGate
-    from quail.backends.quail.executor.operators.map import MapPart
-    from quail.backends.quail.executor.parts import execute_parts
+    from quail.backends.quail.executor.operators.map import MapOperator
+    from quail.backends.quail.executor.region import RegionDocuments, RegionExecution
     from quail.physical import AiExtract, Filter, PortRef, input_ports
 
     cpu_staging(monkeypatch)
     monkeypatch.setattr(
-        "quail.backends.quail.executor.parts.input_staging", lambda state: None
+        "quail.backends.quail.executor.region.input_staging", lambda state: None
     )
     texts = ["five days or five years", "five years", "lease for five days"]
     spec, vocabulary = make_spec(*texts, "five days years lease", "or", "for")
@@ -390,7 +390,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     state.loaded_model.model.quail_full_head = head
     ids = np.arange(len(texts))
     tokens = vocabulary.document_batch(texts, [None] * len(texts))
-    extracts = ExtractPart(
+    extracts = ExtractOperator(
         state,
         [
             AiExtract(
@@ -410,7 +410,7 @@ def test_maps_and_extracts_share_branches_without_changing_results(
     def mapped(name, first):
         node = map_node(name, [10, 11], 6, map_attention)
         node.node_id, node.rows_port, node.spec.aliases = name, "rows:c", ("c",)
-        return MapPart(state, [node], ids, first)
+        return MapOperator(state, [node], ids, first)
 
     maps = mapped("summary", 0 if map_first else 2)
     parts = [maps, extracts] if map_first else [extracts, maps]
@@ -430,13 +430,9 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         )
         parts.extend([ConditionGate(condition, {column: producer}, producer, None),
                       after])
-    results = execute_parts(
-        state,
-        parts,
-        extracts.extraction.prefixes,
-        extracts.extraction.keys,
-        keep_kv=False,
-    )
+    region = RegionExecution(SimpleNamespace(query=state), SimpleNamespace(state={}))
+    results = region.run_operators(
+        parts, RegionDocuments(extracts.extraction.prefixes, extracts.extraction.keys))
     add_answers(extracts.extraction)
     reference = Decoder(vocabulary, 4, 9, 2, spec)
     for d, document in enumerate(extracts.extraction.documents):

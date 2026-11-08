@@ -1,21 +1,16 @@
-"""Execute LLM filters and conditions on classification results."""
+"""Run AI filters and conditions on computed columns."""
 
+from dataclasses import replace
 
 import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.backends.quail.executor.parts import (
-    SingleResultPart,
-    execute_parts,
-    execution_prefix_tree,
-)
+from quail.backends.quail.executor.model_operator import SingleNodeOperator
 from quail.backends.quail.executor.stages import Stage, filter_stages
-from quail.backends.quail.executor.state import QueryExecutionState
 from quail.common.expressions import accepts
 from quail.common.pairs import COPIES, columns_key
 from quail.common.selection import group_ids
-from quail.common.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
@@ -26,47 +21,36 @@ from quail.execution.streaming import region_stream
 from quail.progress import answer_sink
 
 
-def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
-    """Run filter predicates together while each document retains its KV."""
-    state.gpu_timing = bool(inputs.get("gpu_timing", False))
-    node = nodes[0]
-    documents, ids = inputs["documents"], inputs["document_ids"]
-    parts = [FilterPart(member, ids, state.async_answers,
-                        len(state.loaded_model.pipeline.canvas_ids))
-             for member in nodes]
-    if len(parts) == 1 and "document_done" in inputs:
-        parts[0].document_done = inputs["document_done"]
-    # the rows a limit keeps follow admission order, which borrowing
-    # sorts by prefix; a query without ORDER BY promises no rows
-    tree = execution_prefix_tree(node, documents, state.loaded_model.arena)
-    return execute_parts(
-        state, parts, documents, DocumentKeys(node.alias, ids),
-        keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
-        attention=node.attention or "unified",
-        limit=inputs.get("limit"), stop_groups=inputs.get("stop_groups"),
-        num_key_survivors=inputs.get("num_key_survivors", 1),
-        paged=node.arena_writes or len(nodes) > 1,
-        label=f"filter ({len(nodes)} predicates)")
+class FilterOperator(SingleNodeOperator):
+    """One AI filter's stage, its answers, and its result table."""
 
-
-class FilterPart(SingleResultPart):
-    """Filter stages and result tables within a pipeline."""
-
-    execute_group = staticmethod(execute_filters)
-    # a document skipped before it runs is one the filter drops
     drops_documents = True
 
-    @staticmethod
-    def model_inputs(node, inputs, context, sequence=None, nodes=None):
-        if nodes is not None:
-            inputs = inputs[node.node_id]
-        return filter_inputs(context.state, node, next(iter(inputs.values())))
+    @classmethod
+    def build(cls, region, nodes, chain):
+        """Build one filter over the chain's documents."""
+        query = region.query
+        return cls(nodes[0], region.document_ids(), query.async_answers,
+                   len(query.loaded_model.pipeline.canvas_ids))
 
     @classmethod
-    def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Prepare one filter's requests and answer notifications."""
-        return cls(nodes[0], ids, state.async_answers,
-                   len(state.loaded_model.pipeline.canvas_ids))
+    def alone(cls, region, operators, table, settings):
+        """Filters alone keep each stop key group's documents apart.
+
+        One filter writes no KV unless the plan asks; several share
+        the document's KV between their questions.
+        """
+        from quail.backends.quail.executor.region import pipeline_rows
+
+        node = operators[0].node
+        return replace(
+            settings, label=f"filter ({len(operators)} predicates)",
+            attention=node.attention or "unified",
+            paged=node.arena_writes or len(operators) > 1,
+            stop_groups=filter_stop_groups(
+                region.context.state, node,
+                pipeline_rows(node, region.inputs)),
+            num_key_survivors=node.num_key_survivors)
 
     def __init__(self, node, ids, async_answers, canvas_tokens=0):
         self.node = node
@@ -75,20 +59,45 @@ class FilterPart(SingleResultPart):
         self.stages = filter_stages(
             [list(node.question_token_ids)],
             async_answers)
-        self.document_done = filter_document_sink(node, ids)
         self.answers = {}
+        self.finished = []      # (document, passed) settled since the last take
 
     @staticmethod
-    def prepare_group(parts):
+    def prepare_group(operators):
         """Retain the common question preamble across consecutive filters."""
         stages = filter_stages(
-            [part.node.question_token_ids for part in parts],
-            parts[0].stages[0].readout)
-        for part, stage in zip(parts, stages):
-            part.stages = [stage]
+            [operator.node.question_token_ids for operator in operators],
+            operators[0].stages[0].readout)
+        for operator, stage in zip(operators, stages):
+            operator.stages = [stage]
 
-    def finish(self, every) -> int | None:
-        """Record filter answers and leave token accounting to the pipeline."""
+    def settle(self, document, survived, row):
+        self.finished.append((document, survived))
+
+    def take_finished(self):
+        """Report the settled documents to the answer sink and the stream.
+
+        The sink receives ``{"kind": "filter", "node", "alias", "stages",
+        "documents"}``, where ``documents`` lists ``[document id, stage,
+        passed]`` per document; the stream, when the filter is the
+        region's last operator, the documents' rows.
+        """
+        finished, self.finished = self.finished, []
+        sink = answer_sink()
+        if sink is not None and finished:
+            sink({"kind": "filter", "node": self.node.node_id,
+                  "alias": self.node.alias, "stages": 1,
+                  "documents": [[int(self.ids[document]), 0, passed]
+                                for document, passed in finished]})
+        stream = region_stream()
+        if not finished or stream is None or not stream.wants(self.node):
+            return None
+        return filter_result(
+            self.node, {document: [int(passed)] for document, passed in finished},
+            0, self.ids).outputs
+
+    def read_answers(self, every) -> int | None:
+        """Record filter answers and leave token accounting to the region."""
         for stage in every:
             for document, row in stage.items():
                 self.answers.setdefault(document, []).append(int(row[0]))
@@ -103,41 +112,43 @@ class FilterPart(SingleResultPart):
             pack_s=stats.get("pack_s", 0.0))
 
 
-class ConditionGate(SingleResultPart):
-    """Pipeline condition that drops documents whose tested values fail.
+class ConditionGate(SingleNodeOperator):
+    """A chain's condition that drops documents whose tested values fail.
 
     A value is a settled column-operator result, such as a label, an
     extracted answer or span, or a map answer, or a source column of
-    the table; the pipeline then skips the document's later stages and
+    the table; the region then skips the document's later stages and
     frees its KV.
     """
 
     stages = ()
 
     @classmethod
-    def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Bind a condition to the parts computing its columns and the source table."""
+    def build(cls, region, nodes, chain):
+        """Bind a condition to the operators computing its columns and the table."""
         node = nodes[0]
         source_id = node.inputs[0].source.node_id
         producers = {}
         for name in node.tested_columns:
-            part = next((part for part in reversed(parts)
-                         if name in part.tested_columns), None)
-            if part is not None:
-                producers[name] = part
-        source = next(part for part in reversed(parts)
-                      if any(member.node_id == source_id for member in part.nodes))
+            operator = next((operator for operator in reversed(chain)
+                             if name in operator.tested_columns), None)
+            if operator is not None:
+                producers[name] = operator
+        source = next(operator for operator in reversed(chain)
+                      if any(member.node_id == source_id
+                             for member in operator.nodes))
         return cls(node, producers, source,
-                   context.sources.get(columns_key(node.aliases[0])))
+                   region.context.sources.get(columns_key(node.aliases[0])))
 
     def __init__(self, node, producers, source, columns):
         self.node = node
-        self.producers = producers  # column -> the part computing it
-        self.source = source  # the part whose rows the Filter reads
+        self.producers = producers  # column -> the operator computing it
+        self.source = source  # the operator whose rows the Filter reads
         self.columns = columns  # the table's source columns, by document
         self.positions = {
-            id(part): {document: index for index, document in enumerate(part.ids)}
-            for part in producers.values()}
+            id(operator): {document: index
+                           for index, document in enumerate(operator.ids)}
+            for operator in producers.values()}
         self.accepted = {}
         self.decided = {}  # key -> kept, from decide, until gate asks
 
@@ -145,16 +156,17 @@ class ConditionGate(SingleResultPart):
     def answer_dependencies(self):
         """The decoder answer streams the tested columns wait for."""
         return tuple(dict.fromkeys(
-            part.first + part.column_sources[name][0]
-            for name, part in self.producers.items() if part.answer_limits))
+            operator.first + operator.column_sources[name][0]
+            for name, operator in self.producers.items()
+            if operator.answer_limits))
 
     def read(self, name: str, documents):
         """Return a tested column's values for documents, by document id."""
-        part = self.producers.get(name)
-        if part is not None:
-            positions = self.positions[id(part)]
-            return part.tested_values(name, [positions[document]
-                                             for document in documents])
+        operator = self.producers.get(name)
+        if operator is not None:
+            positions = self.positions[id(operator)]
+            return operator.tested_values(name, [positions[document]
+                                                 for document in documents])
         if self.columns is None or name not in self.columns.column_names:
             raise KeyError(f"{self.node.node_id!r} reads {name!r}, which no "
                            f"operator computes and the scan does not hold")
@@ -166,7 +178,7 @@ class ConditionGate(SingleResultPart):
     def decide(self, keys):
         """Test the documents of keys together; return the keys kept.
 
-        The pipeline calls this with the documents entering the next
+        The region calls this with the documents entering the next
         stage in one chunk, so the condition runs once per chunk; gate
         then answers each document from the saved decision.
         """
@@ -195,7 +207,7 @@ class ConditionGate(SingleResultPart):
                 accepts(self.node.predicate, pa.table(values))[0].as_py())
         return None if self.accepted[token] else Stage.DROP
 
-    def finish(self, every):
+    def read_answers(self, every):
         return None
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
@@ -269,38 +281,6 @@ def filter_result(node, answers, tokens, document_ids,
     )
 
 
-def filter_document_sink(node, document_ids):
-    """The sequence's document_done callback, or None when nobody listens.
-
-    Reports each chunk's finished documents to the answer sink as
-    ``{"kind": "filter", "node", "alias", "stages", "documents"}`` where
-    ``documents`` lists ``[row index, last stage asked, passed]`` per
-    document. A document that passed its last stage survived the filter;
-    every other listed document failed at the stage given. When the
-    filter is the region's last operator, the finished documents' rows
-    also go to the region's stream.
-    """
-    sink = answer_sink()
-    stream = region_stream()
-    if stream is not None and not stream.wants(node):
-        stream = None
-    if sink is None and stream is None:
-        return None
-    stages = 1
-
-    def document_done(finished):
-        if sink is not None:
-            sink({"kind": "filter", "node": node.node_id, "alias": node.alias,
-                  "stages": stages,
-                  "documents": [[int(document_ids[position]), stage, passed]
-                                for position, stage, passed in finished]})
-        if stream is not None:
-            answers = {position: [int(passed)] for position, _, passed in finished}
-            stream.partial(node, filter_result(node, answers, 0, document_ids).outputs)
-
-    return document_done
-
-
 def stop_groups(node, columns, document_ids, copies=None) -> list | None:
     """Return each document's stop key group, or None without a stop key.
 
@@ -336,27 +316,16 @@ def stop_groups(node, columns, document_ids, copies=None) -> list | None:
     return [tuple(groups[start:end]) for start, end in zip(offsets, offsets[1:])]
 
 
-def filter_inputs(state, node, rows) -> dict:
-    """Scheduler inputs for one filter sequence over the given documents.
+def filter_stop_groups(state, node, rows) -> list | None:
+    """Each document's stop key group for a filter over the given rows.
 
     Args:
-        state: The query's execution state.
+        state: The query's runtime state, with the value columns.
         node: The AiFilter.
         rows: The documents it reads, as Rows or ids. Deduplicated Rows
             carry a COPIES column for a stop key.
     """
     copies = (rows.column(COPIES) if isinstance(rows, Rows)
               and COPIES in rows.column_names else None)
-    document_ids = id_positions(rows)
-    return {
-        "documents": DocumentPrefixes(
-            node.document_head, state["documents"][node.alias], document_ids
-        ),
-        "document_ids": document_ids,
-        "limit": state["filter_limit"],
-        "stop_groups": stop_groups(
-            node, state.get("columns", {}).get(node.alias), document_ids,
-            copies),
-        "num_key_survivors": node.num_key_survivors,
-        "document_done": filter_document_sink(node, document_ids),
-    }
+    return stop_groups(node, state.get("columns", {}).get(node.alias),
+                       id_positions(rows), copies)

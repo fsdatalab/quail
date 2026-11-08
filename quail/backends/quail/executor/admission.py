@@ -1004,6 +1004,10 @@ class JoinAdmission:
 
     # ---- gating --------------------------------------------------------
 
+    def stage_of(self, a) -> int:
+        """The stage the document is at, or a negative number once it is done."""
+        return self._stage[a]
+
     def report(self, a, j, start, end, bits):
         """Record a group's answers and update document progress.
 

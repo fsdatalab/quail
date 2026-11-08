@@ -136,15 +136,13 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     query.async_scores = SimpleNamespace(rows=query.answer_rows)
     query.gpu_timing = True
     old_query = weakref.ref(query)
-    reranker = execution._reranker_execution({"d": [[1]]})
-    old_reranker = weakref.ref(reranker)
-    del query, reranker
+    del query
 
     second = worker.execute_quail_payload(
         PAYLOAD, registry, object(), backend, runtime_state)
 
     assert second.metrics["boot_kind"] == "warm"
-    assert old_query() is None and old_reranker() is None
+    assert old_query() is None
     assert execution.query.loaded_model is loaded
     assert execution.query.async_answers is gpu.async_ans
     assert execution.query.async_scores is None

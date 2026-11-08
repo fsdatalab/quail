@@ -18,8 +18,8 @@ import torch
 
 from helpers.fakes import fake_pipeline, fake_readout, fake_torch
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.operators.filter import FilterPart
-from quail.backends.quail.executor.parts import gated_stages
+from quail.backends.quail.executor.model_operator import gated_stages
+from quail.backends.quail.executor.operators.filter import FilterOperator
 from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 from quail.common.tokens import prefix_tree
 
@@ -388,7 +388,7 @@ def check_filter(documents, questions, setup):
             h = chain(document + q + tail)
             answers[h] = answer(h)
     run = Run(setup, answers)
-    parts = [FilterPart(SimpleNamespace(question_token_ids=q),
+    parts = [FilterOperator(SimpleNamespace(question_token_ids=q),
                         list(range(len(documents))), passthrough(), len(tail))
              for q in questions]
     got, _, _ = run_stages(

@@ -1,10 +1,14 @@
 """One fake model for the end-to-end tests: it answers from planted truth.
 
-The oracle stands in for the GPU. It answers every model operator
-from the truth it was given and builds each result with the
-production builders (filter_result, score_rows, extraction_rows, and
-the join answer record the executor writes), so a test never spells
-a port name or a result shape.
+The oracle stands in for the GPU. Its ModelOperators run in the
+production RegionExecution, one node at a time: the region prepares
+each node's documents, its stop key groups, its join inputs, and its
+candidate rows, and sends finished rows to the region's stream. The
+oracle answers each pushed document from the truth it was given and
+builds each result with the production builders (filter_result,
+scored_result, extraction_rows, and the join answer record the
+executor writes), so a test never spells a port name or a result
+shape.
 """
 
 from __future__ import annotations
@@ -15,16 +19,29 @@ from functools import partial
 import numpy as np
 import pyarrow as pa
 
-from quail.backends.base import GpuContext
-from quail.backends.quail.executor.operators.filter import filter_result
+from quail.backends.quail.executor.model_operator import ModelOperator
+from quail.backends.quail.executor.operators.filter import (
+    FilterOperator,
+    filter_result,
+    filter_stop_groups,
+)
+from quail.backends.quail.executor.operators.join import prepare_join_inputs
 from quail.backends.quail.executor.operators.sae_features import (
     FEATURE_LIST,
 )
-from quail.backends.quail.reranker import (
-    RerankerBatch,
-    RerankerModelExecution,
-    score_rows,
+from quail.backends.quail.executor.operators.score import (
+    candidate_rows,
+    hinted_rows,
+    scored_outputs,
+    scored_result,
+    value_type,
 )
+from quail.backends.quail.executor.region import (
+    RegionDocuments,
+    pipeline_rows,
+    region_of,
+)
+from quail.backends.quail.reranker import score_rows, scored_batch
 from quail.execution.answer_stops import Stop, answer_stop, copied_completions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import true_answer_rows
@@ -42,7 +59,7 @@ from quail.physical import (
     ClassifySpec,
 )
 from quail.physical.plan import graph_from_envelope
-from quail.specs import H100_SXM, QWEN3_4B_FP8
+from quail.progress import answer_sink
 
 # the most seconds an operator above a region may take to tighten the
 # region's hint after receiving a row; a slower one fails the test
@@ -87,13 +104,13 @@ class Oracle:
             hint tightens, so a test decides when the operator above the
             region tightens its test. With it, a filter reports each
             document as it finishes.
-        pipelines: Whether the executor groups operators into pipelines,
-            as the GPU executor does; the oracle then runs a pipeline's
-            nodes in order.
+        pipelines: Whether the runner groups operators into chains, as
+            it does for the GPU executor; the oracle then runs a chain's
+            nodes one at a time, in order.
     """
 
-    # the oracle runs one node at a time; a pipeline falls back to that
-    execute_pipeline = None
+    # the oracle has no GPU loop
+    query = None
 
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
                  answers=None, features=None, maps=None, *,
@@ -109,7 +126,8 @@ class Oracle:
         self.probabilities = probabilities
         self.retain = retain
         self.join_metrics = join_metrics
-        self.streams_answers = streams
+        self.streams = streams
+        self.groups_operators = pipelines
         self.tightens_after = frozenset(tightens_after)
         self.arena = None
         self.texts = {}
@@ -123,8 +141,11 @@ class Oracle:
         # and the answers stopped before their end
         self.answer_tokens = 0
         self.stopped_early = 0
-        if pipelines:
-            self.execute_pipeline = self._execute_pipeline
+        self.operator_types = {
+            AiFilter.type_name: OracleFilter, AiJoin.type_name: OracleJoin,
+            AiScore.type_name: OracleScore, AiClassify.type_name: OracleScore,
+            AiExtract.type_name: OracleExtract, AiMap.type_name: OracleMap,
+            AiSaeFeatures.type_name: OracleFeatures}
 
     def _source(self, alias, document) -> int:
         """The registered table's row of an input's document position."""
@@ -137,8 +158,10 @@ class Oracle:
 
     # ---- the executor's model execution interface ----------------
 
-    def _execute_pipeline(self, nodes, inputs, context) -> dict:
-        """Run a pipeline's nodes in order, each reading the one before it."""
+    def execute_pipeline(self, nodes, inputs, context) -> dict:
+        """Run each node in order, as a chain of its own in the context's region."""
+        if len(nodes) == 1:
+            return region_of(self, context).run(nodes, inputs)
         results = {}
         for node in nodes:
             node_inputs = dict(inputs[node.node_id])
@@ -150,139 +173,7 @@ class Oracle:
                 node, node_inputs, context)
         return results
 
-    def execute(self, node, inputs) -> NodeResult:
-        if isinstance(node, AiFilter):
-            return self._filter(node, inputs)
-        if isinstance(node, AiJoin):
-            return self.execute_predicates((node,), inputs)[node.node_id]
-        if isinstance(node, AiExtract):
-            return self._extract(node, inputs)
-        if isinstance(node, AiSaeFeatures):
-            return self._sae_features(node, inputs)
-        if isinstance(node, AiMap):
-            return self._map(node, inputs)
-        if isinstance(node, AiClassify) and node.spec.partner is not None:
-            return self._classify_joined(node, inputs)
-        if isinstance(node, (AiScore, AiClassify)):
-            return self._reranker().execute(node, inputs.get("score_inputs", inputs))
-        raise TypeError(f"the oracle has no answers for {node.type_name}")
-
-    def execute_predicates(self, nodes, inputs) -> dict:
-        """Answer a group of join stages, each over the survivors of the last."""
-        anchor_ids = list(inputs["anchor_ids"])
-        lists_for = inputs.get("anchor_partners")
-        survivors = set(range(len(anchor_ids)))
-        results = {}
-        for index, node in enumerate(nodes):
-            partners = inputs["partner_indices"][node.written_position]
-            members = {} if lists_for and node.pairs_from else None
-            rows = {}
-            for local in sorted(survivors):
-                mine = (range(len(partners)) if members is None
-                        else list(lists_for(anchor_ids[local], index)))
-                if members is not None:
-                    members[local] = mine
-                rows[local] = [
-                    self._join_answer(node, anchor_ids[local], partners[member])
-                    for member in mine]
-            if inputs.get("anchor_done") is not None:
-                for local, row in rows.items():
-                    inputs["anchor_done"](local, row)
-            passing = {local for local, row in rows.items() if any(row)}
-            survivors = (survivors - passing if node.semantics == "anti"
-                         else passing)
-            kept = [anchor_ids[local] for local in sorted(survivors)]
-            answer = {
-                "rows": rows, "anchor_index": anchor_ids,
-                "partner_index": partners, "anchor_partners": members,
-                "anchor": node.anchor, "partners": list(node.partners),
-                "semantics": node.semantics, "selectivity": node.selectivity,
-                "written_position": node.written_position,
-            }
-            metrics = self.join_metrics or NodeMetrics()
-            results[node.node_id] = NodeResult(
-                {f"rows:{node.anchor}": Rows({node.anchor: kept}),
-                 f"join_answers:{node.written_position}": answer},
-                NodeMetrics(
-                    input_rows=len(anchor_ids), output_rows=len(kept),
-                    evaluated_document_pairs=sum(len(row) for row in rows.values()),
-                    gpu_s=metrics.gpu_s, peak_gpu_bytes=metrics.peak_gpu_bytes,
-                    extension={**metrics.extension, "answers": [rows]}))
-        return results
-
-    # ---- the reranker interface, for scores and labels -------------
-
-    def score(self, spec, rows, documents, on_answers=None,
-              skip=None) -> RerankerBatch:
-        rows = np.asarray(rows).reshape(-1, len(spec.aliases))
-        ids = [self._sources(spec.aliases, row) for row in rows]
-        # the scheduler asks skip as it admits each row, in order
-        asked = []
-        for position in range(len(rows)):
-            if skip is not None and skip(position):
-                continue
-            asked.append(position)
-            if on_answers is not None and not isinstance(spec, ClassifySpec):
-                value = self.scores(spec, ids[position])
-                self._answered(ids[position][0], partial(
-                    on_answers, np.array([position]), [value]))
-        self.calls.append((spec.name, rows[asked].tolist()))
-        if isinstance(spec, ClassifySpec):
-            values = np.full(len(rows), None, dtype=object)
-            for position in asked:
-                values[position] = self._label(spec, ids[position])
-            probabilities = None
-            if self.probabilities and spec.probabilities:
-                probabilities = np.asarray([
-                    [np.nan] * len(spec.labels) if value is None
-                    else [0.8 if label == value else 0.1 for label in spec.labels]
-                    for value in values])
-            return RerankerBatch(values, fresh_tokens=len(asked), cached_tokens=0,
-                                 suffix_tokens=3 * len(asked),
-                                 probabilities=probabilities)
-        scores = np.full(len(rows), None, dtype=object)
-        for position in asked:
-            scores[position] = self.scores(spec, ids[position])
-        return RerankerBatch(scores, fresh_tokens=len(asked), cached_tokens=0)
-
     # ---- answering ------------------------------------------------
-
-    def _filter(self, node, inputs) -> NodeResult:
-        document_ids = list(inputs["document_ids"])
-        groups = inputs.get("stop_groups")
-        needed = inputs.get("num_key_survivors", 1)
-        survivors = {}
-        answers = {}
-        stream = region_stream()
-        for local, document in enumerate(document_ids):
-            # a document that stands for copies has one group per copy
-            found = (() if groups is None else groups[local]
-                     if isinstance(groups[local], tuple) else (groups[local],))
-            # the scheduler skips a document once each of its stop key
-            # groups has enough survivors
-            if found and all(survivors.get(group, 0) >= needed for group in found):
-                continue
-            # and a document the region's hint drops, before admitting it
-            if stream is not None and not stream.keeps(node.alias, int(document)):
-                continue
-            self.asked.append((node.alias, int(document)))
-            answers[local] = [self._filter_answer(node, document)]
-            if self.tightens_after and inputs.get("document_done") is not None:
-                self._answered(self._source(node.alias, document), partial(
-                    inputs["document_done"], [(local, 0, bool(answers[local][0]))]))
-            if answers[local][0]:
-                for group in found:
-                    survivors[group] = survivors.get(group, 0) + 1
-        if inputs.get("document_done") is not None and not self.tightens_after:
-            # the real loop reports a chunk's finished documents by position
-            inputs["document_done"]([
-                (local, 0, bool(row[0])) for local, row in answers.items()])
-        if node.keep_kv and self.arena is not None:
-            kept = [document for local, document in enumerate(document_ids)
-                    if answers[local][0]]
-            for document in kept[:self.retain]:
-                self.arena.retain((node.alias, document), 16)
-        return filter_result(node, answers, 10 * len(answers), document_ids)
 
     def _answered(self, row: int, send) -> None:
         """Send one answer on; after a row in tightens_after, wait for the hint.
@@ -336,7 +227,7 @@ class Oracle:
 
     def _classify_joined(self, node, inputs) -> NodeResult:
         """Label the pairs a join kept; a pair without a label has no row."""
-        (answers,) = inputs["score_inputs"].values()
+        (answers,) = inputs.values()
         spec = node.spec
         pairs = []
         if isinstance(answers, pa.Table):
@@ -363,9 +254,9 @@ class Oracle:
                                         pa.string())},
             NodeMetrics(input_rows=len(pairs), output_rows=len(labeled)))
 
-    def _extract(self, node, inputs) -> NodeResult:
+    def _extract(self, node, document_ids) -> NodeResult:
         spec = node.spec
-        ids = [int(document) for document in inputs["document_ids"]]
+        ids = [int(document) for document in document_ids]
         texts = self.texts.get(spec.alias)
         found = [self._answer(spec, self._source(spec.alias, document))
                  for document in ids]
@@ -381,9 +272,9 @@ class Oracle:
             NodeMetrics(input_rows=len(ids), output_rows=len(ids),
                         evaluated_documents=len(ids)))
 
-    def _sae_features(self, node, inputs) -> NodeResult:
+    def _sae_features(self, node, document_ids) -> NodeResult:
         spec = node.spec
-        ids = [int(document) for document in inputs["document_ids"]]
+        ids = [int(document) for document in document_ids]
         values = [self._feature_list(spec, self._source(spec.aliases[0], document))
                   for document in ids]
         rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
@@ -393,9 +284,9 @@ class Oracle:
             NodeMetrics(input_rows=len(ids), output_rows=len(ids),
                         evaluated_documents=len(ids)))
 
-    def _map(self, node, inputs) -> NodeResult:
+    def _map(self, node, document_ids) -> NodeResult:
         spec = node.spec
-        ids = [int(document) for document in inputs["document_ids"]]
+        ids = [int(document) for document in document_ids]
         rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
         return NodeResult(
             {node.rows_port: score_rows(
@@ -442,10 +333,267 @@ class Oracle:
             return self.answers(spec, document)
         return None if self.answers is None else self.answers[document]
 
-    def _reranker(self) -> RerankerModelExecution:
-        return RerankerModelExecution(GpuContext(
-            gpu_index=0, gpus=1, model=QWEN3_4B_FP8, device=H100_SXM,
-            query_settings={"reranker": self, "documents": self.documents}))
+
+class OracleOperator(ModelOperator):
+    """A node the oracle answers from planted truth as documents are pushed.
+
+    Args:
+        region: The RegionExecution running the node.
+        node: The physical node.
+        num_documents: How many documents, or rows, the node reads.
+    """
+
+    def __init__(self, region, node, num_documents):
+        self.region = region
+        self.oracle = region.model
+        self.node = node
+        self.nodes = (node,)
+        self.num_documents = num_documents
+        self.result_value = None
+
+    def layout(self, region):
+        return RegionDocuments(range(self.num_documents), None)
+
+    def read_answers(self, every):
+        return None
+
+    def close(self, tokens, spans, stats, offset) -> dict:
+        return self.results()
+
+    def results(self) -> dict:
+        return {self.node.node_id: self.result_value}
+
+
+class OracleFilter(FilterOperator):
+    """An AI filter answered from truth, streamed as the production one is.
+
+    It skips a document whose stop key groups have enough survivors, or
+    that the region's hint drops, before asking it, as admission does.
+    """
+
+    @classmethod
+    def build(cls, region, nodes, chain):
+        node = nodes[0]
+        operator = cls.__new__(cls)
+        operator.region, operator.oracle, operator.node = region, region.model, node
+        operator.ids = list(region.document_ids())
+        operator.groups = filter_stop_groups(
+            region.context.state, node, pipeline_rows(node, region.inputs))
+        operator.answers, operator.finished = {}, []
+        return operator
+
+    def layout(self, region):
+        return RegionDocuments(range(len(self.ids)), None)
+
+    def push(self, documents):
+        oracle, node = self.oracle, self.node
+        survivors = {}
+        stream = region_stream()
+        reporting = answer_sink() is not None or (
+            stream is not None and stream.wants(node))
+        for local in documents:
+            document = self.ids[local]
+            # a document that stands for copies has one group per copy
+            found = (() if self.groups is None else self.groups[local]
+                     if isinstance(self.groups[local], tuple)
+                     else (self.groups[local],))
+            if found and all(survivors.get(group, 0) >= node.num_key_survivors
+                             for group in found):
+                continue
+            if stream is not None and not stream.keeps(node.alias, int(document)):
+                continue
+            oracle.asked.append((node.alias, int(document)))
+            passed = oracle._filter_answer(node, document)
+            self.answers[local] = [passed]
+            self.finished.append((local, passed))
+            if oracle.tightens_after and reporting:
+                oracle._answered(oracle._source(node.alias, document),
+                                 partial(self.region.send_finished, self))
+            if passed:
+                for group in found:
+                    survivors[group] = survivors.get(group, 0) + 1
+        if not oracle.tightens_after:
+            # the real loop reports a chunk's finished documents together
+            self.region.send_finished(self)
+        if node.keep_kv and oracle.arena is not None:
+            kept = [document for local, document in enumerate(self.ids)
+                    if self.answers[local][0]]
+            for document in kept[:oracle.retain]:
+                oracle.arena.retain((node.alias, document), 16)
+
+    def read_answers(self, every):
+        return None
+
+    def close(self, tokens, spans, stats, offset) -> dict:
+        self.result_value = filter_result(
+            self.node, self.answers, 10 * len(self.answers), self.ids)
+        return self.results()
+
+
+class OracleJoin(OracleOperator):
+    """A group of join stages answered from truth over the region's join inputs."""
+
+    combine = True
+
+    @classmethod
+    def build(cls, region, nodes, chain):
+        inputs = prepare_join_inputs(nodes, region.inputs, region.context)
+        operator = cls(region, nodes[0], len(inputs["anchor_ids"]))
+        operator.nodes, operator.inputs = tuple(nodes), inputs
+        return operator
+
+    def push(self, documents):
+        self._results = self._predicates(self.nodes, self.inputs)
+
+    def results(self) -> dict:
+        return self._results
+
+    def _predicates(self, nodes, inputs) -> dict:
+        """Answer a group of join stages, each over the survivors of the last."""
+        oracle = self.oracle
+        anchor_ids = list(inputs["anchor_ids"])
+        lists_for = inputs.get("anchor_partners")
+        survivors = set(range(len(anchor_ids)))
+        results = {}
+        for index, node in enumerate(nodes):
+            partners = inputs["partner_indices"][node.written_position]
+            members = {} if lists_for and node.pairs_from else None
+            rows = {}
+            for local in sorted(survivors):
+                mine = (range(len(partners)) if members is None
+                        else list(lists_for(anchor_ids[local], index)))
+                if members is not None:
+                    members[local] = mine
+                rows[local] = [
+                    oracle._join_answer(node, anchor_ids[local], partners[member])
+                    for member in mine]
+            for local, row in rows.items():
+                inputs["anchor_done"](local, row)
+            passing = {local for local, row in rows.items() if any(row)}
+            survivors = (survivors - passing if node.semantics == "anti"
+                         else passing)
+            kept = [anchor_ids[local] for local in sorted(survivors)]
+            answer = {
+                "rows": rows, "anchor_index": anchor_ids,
+                "partner_index": partners, "anchor_partners": members,
+                "anchor": node.anchor, "partners": list(node.partners),
+                "semantics": node.semantics, "selectivity": node.selectivity,
+                "written_position": node.written_position,
+            }
+            metrics = oracle.join_metrics or NodeMetrics()
+            results[node.node_id] = NodeResult(
+                {f"rows:{node.anchor}": Rows({node.anchor: kept}),
+                 f"join_answers:{node.written_position}": answer},
+                NodeMetrics(
+                    input_rows=len(anchor_ids), output_rows=len(kept),
+                    evaluated_document_pairs=sum(len(row) for row in rows.values()),
+                    gpu_s=metrics.gpu_s, peak_gpu_bytes=metrics.peak_gpu_bytes,
+                    extension={**metrics.extension, "answers": [rows]}))
+        return results
+
+
+class OracleScore(OracleOperator):
+    """A score or classification of its candidate rows, answered from truth.
+
+    The rows, their priors, and the rows the region's hint skips come
+    from the production score operator's helpers; a classification of
+    the pairs a join kept labels them from the join's answers.
+    """
+
+    @classmethod
+    def build(cls, region, nodes, chain):
+        node = nodes[0]
+        inputs = region.node_inputs(node)
+        if isinstance(node, AiClassify) and node.spec.partner is not None:
+            operator = cls(region, node, 1)
+            operator.joined = inputs
+            return operator
+        if node.spec is None:
+            raise ValueError("AI.SCORE needs a score specification")
+        rows, priors = candidate_rows(node, inputs)
+        operator = cls(region, node, len(rows))
+        operator.joined = None
+        operator.rows = np.asarray(rows.array(), dtype=np.int32).reshape(
+            -1, len(node.spec.aliases))
+        operator.priors, operator.skip = priors, hinted_rows(node, rows)
+        return operator
+
+    def push(self, documents):
+        if self.joined is not None:
+            self.result_value = self.oracle._classify_joined(self.node, self.joined)
+            return
+        oracle, node, spec, rows = self.oracle, self.node, self.node.spec, self.rows
+        if len(spec.arguments) != len(spec.aliases):
+            raise ValueError(
+                "AI.SCORE needs one prompt argument per document relation")
+        ids = [oracle._sources(spec.aliases, row) for row in rows]
+        sink = answer_sink()
+        stream = region_stream()
+        wanted = (stream is not None and stream.wants(node)
+                  and not (isinstance(spec, ClassifySpec) and spec.probabilities))
+        streams = bool((sink is not None or wanted) and len(rows) and oracle.streams)
+        # the scheduler asks skip as it admits each row, in order
+        asked = []
+        for position in range(len(rows)):
+            if self.skip is not None and self.skip(position):
+                continue
+            asked.append(position)
+            if streams and not isinstance(spec, ClassifySpec):
+                value = oracle.scores(spec, ids[position])
+                oracle._answered(ids[position][0], partial(
+                    self._send, rows[[position]], [value], sink, wanted))
+        if len(rows):
+            oracle.calls.append((spec.name, rows[asked].tolist()))
+        probabilities = None
+        if isinstance(spec, ClassifySpec):
+            values = [oracle._label(spec, ids[position]) for position in asked]
+            if oracle.probabilities and spec.probabilities:
+                probabilities = np.asarray([
+                    [np.nan] * len(spec.labels) if value is None
+                    else [0.8 if label == value else 0.1 for label in spec.labels]
+                    for value in values]).reshape(-1, len(spec.labels))
+        else:
+            values = [oracle.scores(spec, ids[position]) for position in asked]
+        if sink is not None and asked and not streams:
+            sink(scored_batch(node, rows[asked], values))
+        self.result_value = scored_result(
+            node, rows[asked], values, self.priors, fresh_tokens=len(asked),
+            suffix_tokens=(3 * len(asked) if isinstance(spec, ClassifySpec) else 0),
+            probabilities=probabilities)
+
+    def _send(self, rows, values, sink, wanted):
+        if sink is not None:
+            sink(scored_batch(self.node, rows, values))
+        if wanted:
+            spec = self.node.spec
+            region_stream().partial(self.node, scored_outputs(
+                self.node, score_rows(rows, spec.aliases, spec.name, values,
+                                      value_type(spec)), self.priors))
+
+
+class OracleDocuments(OracleOperator):
+    """An extraction, a map, or a feature call over the chain's documents."""
+
+    @classmethod
+    def build(cls, region, nodes, chain):
+        operator = cls(region, nodes[0], len(region.document_ids()))
+        operator.ids = region.document_ids()
+        return operator
+
+
+class OracleExtract(OracleDocuments):
+    def push(self, documents):
+        self.result_value = self.oracle._extract(self.node, self.ids)
+
+
+class OracleMap(OracleDocuments):
+    def push(self, documents):
+        self.result_value = self.oracle._map(self.node, self.ids)
+
+
+class OracleFeatures(OracleDocuments):
+    def push(self, documents):
+        self.result_value = self.oracle._sae_features(self.node, self.ids)
 
 
 def oracle_executor(oracle: Oracle, **report):

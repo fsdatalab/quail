@@ -7,7 +7,6 @@ import time
 import pyarrow as pa
 
 from quail.backends.quail.executor.memory import memory_report
-from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.retention import apply_retention
 from quail.common.pairs import columns_key
 from quail.execution.metrics import NodeResult, scalar_node_metrics
@@ -16,7 +15,6 @@ from quail.execution.runner import (
     GenericRunner,
     compute_subgraph,
 )
-from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiClassify,
@@ -33,9 +31,17 @@ from quail.physical import (
 )
 
 
+class RegionRuntime:
+    """Run one model node as a chain of its own in the model execution."""
+
+    def execute(self, node, inputs, context) -> NodeResult:
+        return context.model_execution.execute_pipeline(
+            (node,), {node.node_id: inputs}, context)[node.node_id]
+
+
 def quail_runtimes() -> dict:
     """Return runtimes for the Quail backend's physical nodes."""
-    model_runtime = ModelNodeRuntime()
+    model_runtime = RegionRuntime()
     return {
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
@@ -45,32 +51,6 @@ def quail_runtimes() -> dict:
         AiSaeFeatures.runtime_key: model_runtime,
         AiMap.runtime_key: model_runtime,
     }
-
-
-def prepare_model_inputs(node, inputs, context: ExecutionContext,
-                         upstream=None, nodes=None):
-    """Convert graph input ports into backend scheduler inputs.
-
-    Args:
-        node: Physical operator to execute.
-        inputs: Port values supplied by preceding operators.
-        context: Execution context containing document tokens and settings.
-        nodes: Join predicates sharing one scheduler run.
-        upstream: Optional preceding pipeline state for a join, containing its
-            documents, document IDs, operator parts, and selected pairs.
-
-    Returns:
-        A scheduler input mapping for filters, joins, and scores. Other
-        operators receive the original input mapping.
-    """
-    implementation = execution_parts().get(node.type_name)
-    prepared = (None if implementation is None
-                else implementation.model_inputs(
-                    node, inputs, context, upstream, nodes))
-    if prepared is None:
-        return inputs
-    return {**prepared,
-            "gpu_timing": context.state.get("gpu_timing", False)}
 
 
 def record_model_result(node, result: NodeResult,
@@ -123,10 +103,11 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
         runtimes=state["runtimes"],
         model_execution=execution,
         sources=sources,
-        model_inputs=prepare_model_inputs,
         model_result=record_model_result,
         state=runtime_state,
-        run_pipeline=execution.execute_pipeline,
+        # an execution that runs node by node leaves the runner's chains out
+        run_pipeline=(execution.execute_pipeline if execution.groups_operators
+                      else None),
         deduplicate=payload.get("deduplicate", {}),
     )
 
