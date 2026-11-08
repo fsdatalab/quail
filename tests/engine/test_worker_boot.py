@@ -131,7 +131,6 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     staging = loaded.input_staging = InputStaging(gpu.torch)
     buffers = staging.buffers
     buffers["tokens"] = object()
-    staging.fixed_tokens[1] = object()
     query = execution.query
     query.async_scores = SimpleNamespace(rows=query.answer_rows)
     query.gpu_timing = True
@@ -150,7 +149,6 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     assert loaded.label_readout is readout
     assert loaded.input_staging is staging
     assert staging.buffers is buffers and "tokens" in buffers
-    assert not staging.fixed_tokens
     assert len(boots) == 2
     assert runtime_state["gpu"] is gpu
     resized = []

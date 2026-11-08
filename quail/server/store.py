@@ -151,11 +151,6 @@ class Store:
         with self._lock:
             self._listeners.append(listener)
 
-    def remove_listener(self, listener) -> None:
-        with self._lock:
-            if listener in self._listeners:
-                self._listeners.remove(listener)
-
     # -- transactions -----------------------------------------------------
 
     def _write(self, statement: str, parameters=(), *,
@@ -270,9 +265,6 @@ class Store:
             return self.get(query_id)
         except UnknownQueryError:
             return None
-
-    def execution_epoch(self, query_id: str) -> int:
-        return int(self._row(query_id)["execution_epoch"])
 
     def list_recent(self, limit: int | None = 50,
                     session_id: str | None = None) -> list[QueryStatus]:

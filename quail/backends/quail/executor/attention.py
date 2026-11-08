@@ -340,11 +340,6 @@ class Engine:
             BLOCK=1 << (width - 1).bit_length(), num_warps=8)
         return q, scales
 
-    def norm_rows2(self, x, weight1, weight2, eps):
-        """Two RMS norms of the same rows from one read."""
-        first, _, second = self._norm_rows2(x, weight1, weight2, eps, False)
-        return first, second
-
     def norm_router_quant(self, x, weight, router_weight, eps):
         """Return FP8 expert input, per-row scales, and BF16 router input."""
         return self._norm_rows2(x, weight, router_weight, eps, True)

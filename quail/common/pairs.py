@@ -121,34 +121,6 @@ def pair_partner(anchor: str, partners) -> str:
     return partners[0]
 
 
-def estimate_pair_fraction(left_keys, right_keys) -> float:
-    """Estimate the equality pairs over the cross product from key samples.
-
-    Each side is a list of key arrays sampled from its table; a row's
-    key is its values across them, and a null never matches. The
-    estimate is the sum, over the keys seen on both sides, of the
-    product of the two sides' value counts, over the product of the
-    sample sizes.
-    """
-    left, right = _join_key_tables(left_keys, right_keys)
-    num_left, num_right = len(left), len(right)
-    if not num_left or not num_right:
-        return 0.0
-    names = left.column_names
-
-    def value_counts(table, count):
-        return table.drop_null().group_by(names).aggregate(
-            [([], "count_all")]).rename_columns([*names, count])
-
-    matched = value_counts(left, "left").join(
-        value_counts(right, "right"), keys=names, join_type="inner")
-    pairs = pc.sum(pc.multiply(matched.column("left"),
-                               matched.column("right"))).as_py() or 0
-    # samples that share no key still say little about the tables, so
-    # the estimate stays off zero
-    return max(pairs, 1) / (num_left * num_right)
-
-
 class RowGroups:
     """Row IDs grouped by a sorted key column, preserving order within each key."""
 

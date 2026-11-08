@@ -110,22 +110,6 @@ def label_requests(spec, targets=None) -> LabelRequests:
     raise ValueError(f"unknown label scoring rule {spec.scoring!r}")
 
 
-def document_prefixes(spec, documents, rows) -> list:
-    """Combine the prompt head and document tokens for each input row.
-
-    Args:
-        spec: Single-document classification specification.
-        documents: Tokenized documents indexed by table alias and document ID.
-        rows: Document IDs to classify, in input order.
-
-    Returns:
-        One token sequence per input row.
-    """
-    head, _ = spec.prompt_token_parts
-    (alias,) = spec.aliases
-    return [concat_tokens(head, documents[alias][document]) for document in rows]
-
-
 @dataclass
 class JoinPartners:
     """Partner documents and the pairs retained by a join.

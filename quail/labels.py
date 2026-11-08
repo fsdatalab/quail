@@ -16,18 +16,6 @@ DECISION_SCORING = "decision_choice"
 SET_CHOICE_SCORING = "set_choice"
 
 
-def decodable(labels) -> bool:
-    """Return whether every label's token sequence ends at a trie leaf.
-
-    A label that is a proper prefix of another would make the decode
-    choose between stopping and continuing, and no rule scores an end
-    token.
-    """
-    ids = {tuple(label) for label in labels}
-    return not any(tuple(label[:depth]) in ids
-                   for label in labels for depth in range(1, len(label)))
-
-
 def label_trie(label_ids) -> dict[tuple[int, ...], list[int]]:
     """Return each proper label prefix and the tokens that can follow it.
 
@@ -44,36 +32,6 @@ def label_trie(label_ids) -> dict[tuple[int, ...], list[int]]:
         for depth in range(len(ids)):
             children.setdefault(tuple(ids[:depth]), set()).add(ids[depth])
     return {prefix: sorted(tokens) for prefix, tokens in children.items()}
-
-
-def word_starts(label_ids, decode) -> tuple[tuple[bool, ...], ...]:
-    """Return which tokens of each label begin a new word.
-
-    A token begins a word when its text starts with whitespace and the
-    token before it holds a letter or digit; a label's first token never
-    does. Punctuation such as "," joins the word after it.
-
-    Args:
-        label_ids: One token id sequence per label.
-        decode: Callable from a token id list to its text, as str or
-            bytes. None marks no token, so every trie node is read.
-    """
-    if decode is None:
-        return tuple((False,) * len(ids) for ids in label_ids)
-
-    def text(token) -> str:
-        piece = decode([token])
-        return (piece.decode("utf-8", errors="replace")
-                if isinstance(piece, bytes) else str(piece))
-
-    flags = []
-    for ids in label_ids:
-        pieces = [text(token) for token in ids]
-        flags.append(tuple(
-            depth > 0 and pieces[depth][:1].isspace()
-            and any(ch.isalnum() for ch in pieces[depth - 1])
-            for depth in range(len(ids))))
-    return tuple(flags)
 
 
 def choice_nodes(label_ids) -> set:
@@ -99,7 +57,7 @@ def read_nodes(label_ids, starts=()) -> set:
     Args:
         label_ids: One token id sequence per label.
         starts: Per label, which tokens begin a new word, from
-            ``word_starts``. Empty marks no token, so every node is read.
+            the planner. Empty marks no token, so every node is read.
     """
     trie = label_trie(label_ids)
     ends = {tuple(ids) for ids in label_ids}

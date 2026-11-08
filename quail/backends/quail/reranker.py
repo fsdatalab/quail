@@ -1,24 +1,10 @@
-"""Build score and label columns and evaluate numeric score comparisons."""
+"""Build score and label columns."""
 
 import numpy as np
 import pyarrow as pa
-from pyarrow import compute as pc
 
 from quail.execution.rows import Rows
 from quail.physical import ClassifySpec
-
-# one kernel per entry of quail.common.expressions.SCORE_COMPARISONS
-_COMPARE = {
-    "<": pc.less, "<=": pc.less_equal,
-    ">": pc.greater, ">=": pc.greater_equal,
-}
-
-
-def compare_score(scores, comparison: str, threshold: float):
-    """Compare a score array with a scalar threshold."""
-    if comparison not in _COMPARE:
-        raise ValueError(f"unsupported AI.SCORE comparison {comparison!r}")
-    return _COMPARE[comparison](scores, threshold)
 
 
 def probability_column(labels, probabilities) -> pa.MapArray:

@@ -267,7 +267,6 @@ class InputStaging:
         self.torch = torch
         self.buffers = {}     # name -> the buffer in use: host, device, event
         self.rings = {}       # name -> (next slot, list of buffers or None)
-        self.fixed_tokens = {}
 
     def host(self, name, count, dtype):
         torch = self.torch
@@ -297,12 +296,6 @@ class InputStaging:
         host = self.host(name, source.numel(), dtype)
         host.copy_(source.reshape(-1))
         return self.upload(name, source.numel())
-
-    def fixed(self, tokens):
-        key = id(tokens)
-        if key not in self.fixed_tokens:
-            self.fixed_tokens[key] = tokens, self.torch.as_tensor(tokens)
-        return self.fixed_tokens[key][1]
 
 
 def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):

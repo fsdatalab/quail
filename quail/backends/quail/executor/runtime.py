@@ -72,9 +72,6 @@ class QuailModelExecution:
         loaded = self.loaded_model
         if loaded is None:
             raise RuntimeError("Quail model execution has no loaded model")
-        if loaded.input_staging is not None:
-            # Retain allocated transfer buffers, not the previous query's tokens.
-            loaded.input_staging.fixed_tokens.clear()
         device = getattr(self.context, "device", None)
         decode_cost = (None if device is None else DecodeCost.from_specs(
             self.context.model, device))

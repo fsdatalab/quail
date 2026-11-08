@@ -47,10 +47,9 @@ def shared_prefix_tree(name, prefixes, arena):
 
 
 def input_staging(state: QueryExecutionState):
-    """Return reusable transfer buffers with an empty fixed-token cache."""
+    """Return the model's reusable transfer buffers, made on first use."""
     if state.loaded_model.input_staging is None:
         state.loaded_model.input_staging = InputStaging(state.torch)
-    state.loaded_model.input_staging.fixed_tokens.clear()
     return state.loaded_model.input_staging
 
 

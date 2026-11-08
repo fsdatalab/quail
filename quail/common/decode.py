@@ -63,26 +63,6 @@ class DecodeCost:
                    + policy.sliding_pair_seconds * work.sliding_pairs)
         return max(memory, compute) if work.tokens else 0.0
 
-    def lower_bound_seconds(self, work, passes):
-        """Return the fewest seconds `passes` passes doing `work` in all take.
-
-        A pass takes the larger of its memory and compute time, so the
-        passes take at least the larger of their summed memory and summed
-        compute time, and each reads the weights once.
-
-        Args:
-            work: The work of all the passes together.
-            passes: How many passes there are.
-        """
-        policy = self.recompute_cost
-        memory = (passes * self.weight_seconds + self.kv_seconds * work.kv_read
-                  + self.sliding_kv_seconds * work.sliding_kv_read
-                  + self.state_seconds * (work.state_read + work.state_written))
-        compute = (policy.linear_seconds * work.tokens
-                   + policy.pair_seconds * work.pairs
-                   + policy.sliding_pair_seconds * work.sliding_pairs)
-        return max(memory, compute)
-
     def replay_seconds(self, work, tokens, chunk_tokens=0):
         """Return the seconds rebuilding prefixes of these lengths adds to a pass.
 

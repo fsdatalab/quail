@@ -243,10 +243,6 @@ class ModelSpec:
         """Return the kind of one layer."""
         return self.layer_kinds[layer] if self.layer_kinds else "full_attention"
 
-    def keeps_kv(self, layer: int) -> bool:
-        """Whether the layer stores KV; Gated DeltaNet and convolution layers do not."""
-        return self.layer_kind(layer) in ("full_attention", "sliding_attention")
-
     @property
     def reuses_kv(self) -> bool:
         """Whether a document's KV can be kept and read again by later questions."""
@@ -296,10 +292,6 @@ class ModelSpec:
     def checkpoint_bytes(self) -> int:
         """Bytes of the state a sequence leaves in every state layer."""
         return self._properties()["checkpoint_bytes"]
-
-    def is_full_layer(self, layer: int) -> bool:
-        """Whether the layer keeps every token with the full KV geometry."""
-        return self.layer_kind(layer) == "full_attention"
 
     @property
     def kv_shapes(self) -> tuple:

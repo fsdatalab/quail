@@ -61,21 +61,6 @@ class Work:
             self.sliding_pairs, self.sliding_kv_read, self.state_written,
             self.state_read, self.sae_encoded)))
 
-    def dominates(self, other: "Work") -> bool:
-        """Return whether every count is no larger than the other record."""
-        return (
-            self.tokens <= other.tokens
-            and self.pairs <= other.pairs
-            and self.kv_written <= other.kv_written
-            and self.kv_read <= other.kv_read
-            and self.sliding_pairs <= other.sliding_pairs
-            and self.sliding_kv_read <= other.sliding_kv_read
-            and self.state_written <= other.state_written
-            and self.state_read <= other.state_read
-            and self.sae_encoded <= other.sae_encoded
-        )
-
-
 def triangle(n: float, window: int = 0) -> float:
     """Count causal attention pairs, including each token's own key."""
     if window:

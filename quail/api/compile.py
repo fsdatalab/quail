@@ -12,8 +12,6 @@ from __future__ import annotations
 import re
 from enum import StrEnum
 
-import pyarrow as pa
-
 
 class SQLDialect(StrEnum):
     """The SQL dialects Quail accepts."""
@@ -32,13 +30,6 @@ DATAFUSION_DIALECTS = {"snowflake": "Snowflake", "bq": "BigQuery"}
 # the start of a DataFusion error, which names its kind
 _ERROR_KINDS = ("Error during planning: ", "SQL error: ", "Schema error: ",
                 "External error: ")
-
-
-def _schema_bytes(schema: pa.Schema) -> bytes:
-    sink = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, schema) as writer:
-        writer.write_table(schema.empty_table())
-    return sink.getvalue().to_pybytes()
 
 
 # what WHERE tests besides an AI call, in the refusal of anything else
