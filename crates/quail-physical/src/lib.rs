@@ -64,6 +64,93 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_saved_before_guards_and_key_survivors_reads_with_their_defaults() {
+        let filter = PhysicalNode::AiFilter(Node {
+            id: "ai_filter:r".into(),
+            inputs: Vec::new(),
+            attributes: AiFilterAttributes {
+                alias: "r".into(),
+                arena_writes: false,
+                keep_kv: false,
+                written_position: 0,
+                question_tokens: 4,
+                preamble_tokens: 2,
+                selectivity: None,
+                expected_rows: 6.0,
+                question_token_ids: Vec::new(),
+                document_head: Vec::new(),
+                share_prefixes: false,
+                attention: String::new(),
+                stop_key: Vec::new(),
+                pass_group: -1,
+                state_tail_tokens: 0,
+                question_header_token_ids: Vec::new(),
+                document_ends: serde_json::Value::Array(Vec::new()),
+                num_key_survivors: 1,
+                guard: None,
+                alternative: None,
+                answer: None,
+            },
+        });
+        let map = PhysicalNode::AiMap(Node {
+            id: "ai-map:0".into(),
+            inputs: Vec::new(),
+            attributes: AiMapAttributes {
+                backend_name: "quail".into(),
+                model: String::new(),
+                spec: None,
+                keep_kv: false,
+                pass_group: -1,
+                document_ends: serde_json::Value::Array(Vec::new()),
+                attention: String::new(),
+                guard: None,
+                stop_tests: Vec::new(),
+                stop_when_true: false,
+                hint_tests: Vec::new(),
+            },
+        });
+        let added = [
+            "num_key_survivors",
+            "guard",
+            "alternative",
+            "answer",
+            "stop_tests",
+            "stop_when_true",
+            "hint_tests",
+        ];
+        for node in [filter, map] {
+            let mut saved = serde_json::to_value(&node).unwrap();
+            let attributes = saved["attributes"].as_object_mut().unwrap();
+            for name in added {
+                attributes.remove(name);
+            }
+            let read: PhysicalNode = serde_json::from_value(saved).unwrap();
+            assert_eq!(read, node);
+        }
+        let predicate = r#"{"type":"quail.common.expressions.FilterPredicate","expression":
+            {"type":"quail.common.expressions.ModelCall","prompt":{"type":
+            "quail.common.expressions.Prompt","template":"t","args":[],"preamble":"",
+            "tail":"","frame":"","frame_text":"","kind":"boolean","layout":"",
+            "tail_segments":[],"label_texts":[],"label_prefix":"","categories":[],
+            "descriptions":[],"task_description":"","turn":["",""],"source":"",
+            "letters":[]},"kind":"boolean","labels":null,"descriptions":null,
+            "probabilities":false,"question":"","pooling":"","max_answer_tokens":0},
+            "selectivity":null}"#;
+        let predicate: FilterPredicate = serde_json::from_str(predicate).unwrap();
+        assert_eq!(
+            (predicate.guard, predicate.alternative, predicate.answer),
+            (None, None, None)
+        );
+        assert_eq!(predicate.guard_selectivity, None);
+        let text = r#"{"type":"quail.common.expressions.Expression","encoded":"",
+            "columns":[],"text":"TRUE"}"#;
+        let ValueExpression::Value(expression) = serde_json::from_str(text).unwrap() else {
+            panic!("an expression");
+        };
+        assert!(expression.types.is_empty());
+    }
+
+    #[test]
     fn an_expression_names_its_columns_in_its_text() {
         let column = |alias: &str, name: &str| ColumnRef {
             alias: alias.into(),

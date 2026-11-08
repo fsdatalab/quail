@@ -83,6 +83,8 @@ pub struct GetField {
 pub struct Expression {
     pub encoded: String,
     pub columns: Vec<ColumnRef>,
+    /// Empty in an expression saved before types were written.
+    #[serde(default)]
     pub types: Vec<String>,
     pub text: String,
 }

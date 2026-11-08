@@ -242,6 +242,15 @@ impl PhysicalExpression {
                 expression.text_with(true)
             ))
         };
+        // an expression saved before types were written is built over the
+        // types of the rows it is evaluated on
+        if expression.types.is_empty() && !expression.columns.is_empty() {
+            return Ok(Self {
+                expression: expression.clone(),
+                schema: Arc::new(Schema::empty()),
+                physical: datafusion::physical_expr::expressions::lit(true),
+            });
+        }
         if expression.types.len() != expression.columns.len() {
             return Err(failed(format!(
                 "it reads {} columns but names {} types",
@@ -284,6 +293,15 @@ impl PhysicalExpression {
     /// evaluate it.
     pub fn evaluate(&self, batch: &RecordBatch, qualified: bool) -> Result<ArrayRef, CompileError> {
         let text = || self.expression.text_with(qualified);
+        if self.schema.fields().len() != self.expression.columns.len() {
+            let mut typed = self.expression.clone();
+            typed.types = Vec::new();
+            for column in &self.expression.columns {
+                let values = column_of(batch, &column.name(qualified))?;
+                typed.types.push(plain_type(values.data_type()).to_string());
+            }
+            return Self::new(&typed)?.evaluate(batch, qualified);
+        }
         let mut arrays = Vec::new();
         for (column, field) in self.expression.columns.iter().zip(self.schema.fields()) {
             let name = column.name(qualified);
@@ -623,11 +641,21 @@ mod tests {
             ),
         ])
         .unwrap();
-        let built = PhysicalValue::new(&ValueExpression::Value(found)).unwrap();
+        let built = PhysicalValue::new(&ValueExpression::Value(found.clone())).unwrap();
         let mask = built.evaluate(&batch, false).unwrap();
         assert_eq!(
             mask.as_boolean(),
             &BooleanArray::from(vec![Some(true), Some(false), None])
+        );
+        // a plan saved before types were written reads them from the rows
+        let saved = Expression {
+            types: Vec::new(),
+            ..found
+        };
+        let built = PhysicalValue::new(&ValueExpression::Value(saved)).unwrap();
+        assert_eq!(
+            built.evaluate(&batch, false).unwrap().as_boolean(),
+            mask.as_boolean()
         );
     }
 }

@@ -27,7 +27,7 @@ macro_rules! physical_nodes {
     ($(
         $(#[$doc:meta])*
         $variant:ident($attributes:ident) = $type_name:literal {
-            $($field:ident: $field_type:ty),* $(,)?
+            $($(#[$field_attr:meta])* $field:ident: $field_type:ty),* $(,)?
         }
     )*) => {
         $(
@@ -35,7 +35,7 @@ macro_rules! physical_nodes {
             #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
             #[serde(deny_unknown_fields)]
             pub struct $attributes {
-                $(pub $field: $field_type,)*
+                $($(#[$field_attr])* pub $field: $field_type,)*
             }
         )*
 
@@ -140,6 +140,10 @@ fn coordinator() -> Location {
     Location::Coordinator
 }
 
+fn one() -> i64 {
+    1
+}
+
 /// A node of a type Quail does not define: an extension's.
 ///
 /// It carries what Quail cannot derive from its attributes: its outputs,
@@ -190,9 +194,14 @@ physical_nodes! {
         state_tail_tokens: i64,
         question_header_token_ids: TokenIds,
         document_ends: Value,
+        // plans saved before these fields read with the behavior they had
+        #[serde(default = "one")]
         num_key_survivors: i64,
+        #[serde(default)]
         guard: Option<ValueExpression>,
+        #[serde(default)]
         alternative: Option<ValueExpression>,
+        #[serde(default)]
         answer: Option<String>,
     }
     /// An `AI.SCORE` call.
@@ -219,6 +228,7 @@ physical_nodes! {
         keep_kv: bool,
         pass_group: i64,
         document_ends: Value,
+        #[serde(default)]
         guard: Option<ValueExpression>,
     }
     /// One `AI.EXTRACT` question.
@@ -236,9 +246,13 @@ physical_nodes! {
         pass_group: i64,
         document_ends: Value,
         attention: String,
+        #[serde(default)]
         guard: Option<ValueExpression>,
+        #[serde(default)]
         stop_tests: Vec<ValueExpression>,
+        #[serde(default)]
         stop_when_true: bool,
+        #[serde(default)]
         hint_tests: Vec<ValueExpression>,
     }
     /// An `AI.MAP` call.
@@ -256,9 +270,13 @@ physical_nodes! {
         pass_group: i64,
         document_ends: Value,
         attention: String,
+        #[serde(default)]
         guard: Option<ValueExpression>,
+        #[serde(default)]
         stop_tests: Vec<ValueExpression>,
+        #[serde(default)]
         stop_when_true: bool,
+        #[serde(default)]
         hint_tests: Vec<ValueExpression>,
     }
     /// An `AI.SAE_FEATURES` call.
@@ -269,6 +287,7 @@ physical_nodes! {
         keep_kv: bool,
         pass_group: i64,
         document_ends: Value,
+        #[serde(default)]
         guard: Option<ValueExpression>,
     }
     /// Prunes each table's survivors with the join answers so far.
