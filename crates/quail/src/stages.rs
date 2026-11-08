@@ -345,10 +345,25 @@ impl Staged {
                     .ok_or_else(|| failure(format!("stage {from} does not write {wanted:?}")))?;
                 let runs = (0..self.partitions()).map(|partition| self.run(from, partition));
                 let written = try_join_all(runs).await.map_err(failure)?;
-                let schema = Arc::clone(&written[0][output].0);
+                // a GPU that wrote no rows may type a column apart from
+                // the others: its empty batches are left out
+                let rows = |batches: &Vec<RecordBatch>| -> Vec<RecordBatch> {
+                    batches
+                        .iter()
+                        .filter(|batch| batch.num_rows() > 0)
+                        .cloned()
+                        .collect()
+                };
+                let schema = written
+                    .iter()
+                    .map(|tables| &tables[output])
+                    .find(|(_, batches)| !rows(batches).is_empty())
+                    .unwrap_or(&written[0][output])
+                    .0
+                    .clone();
                 let partitions = written
                     .iter()
-                    .map(|tables| tables[output].1.clone())
+                    .map(|tables| rows(&tables[output].1))
                     .collect::<Vec<_>>();
                 (schema, partitions)
             }
