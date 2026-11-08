@@ -32,6 +32,7 @@ from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.common.answers import answer_survival
 from quail.common.decode import DecodeCost
 from quail.common.tokens import prefix_tree
+from quail.execution.answer_stops import answer_stop
 from quail.specs import DEVICES, QWEN3_4B_FP8
 
 VOCABULARY = 1024
@@ -713,3 +714,52 @@ def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():
     StageExecutor._count_pass(executor, [(1, 1, 0, 1, False)], 2, None, ())
     assert executor.pass_work["pairs"] == sum(range(5, 13)) + 11 + 12
 
+
+
+class LetterTokenizer:
+    """Write token t as the letter t mod 26, so a test can read answers as text."""
+
+    @staticmethod
+    def decode_batch(batch):
+        return ["".join(chr(97 + int(token) % 26) for token in tokens)
+                for tokens in batch]
+
+
+def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
+    cpu_staging(monkeypatch)
+    rng = np.random.default_rng(3)
+    documents = [rng.integers(20, 900, size=int(n)).tolist()
+                 for n in rng.integers(3, 30, size=16)]
+    tail, limit = [500, 501, 502], 8
+    wanted = [greedy(document + tail, limit) for document in documents]
+    text = LetterTokenizer.decode_batch(wanted)
+    # the letter most answers start with; the others are rejected at once
+    first = max(set(found[0] for found in text if found), key=[
+        found[:1] for found in text].count)
+    test = sql_condition(f"a LIKE '{first}%'", {"a": pa.string()}, "d")
+    setup = Setup(path="unified", pages=200, budget=400)
+    arena = make_arena(setup)
+    model = TokenModel(arena)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk, canvas_ids=())
+    torch_ = events_torch(2)
+    ids = list(range(len(documents)))
+    node = map_node("a", tail, limit)
+    node.stop_tests, node.hint_tests, node.stop_when_true = (test,), (), True
+    maps = MapPart(None, [node], ids, 0)
+    stages = gated_stages([maps])
+    prefixes, keys, tree, dependencies = maps.branch_inputs(
+        documents, [("d", i) for i in ids], None, setup.page_tokens, 0)
+    decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), [limit],
+                         [STOP], setup.page_tokens)
+    decoder.tokenizer = LetterTokenizer()
+    decoder.answer_stops[0] = answer_stop(node)
+    maps.decoder = decoder
+    run_stages(torch_, arena, pipeline, stages, prefixes, 400, anchor_keys=keys,
+               prefix_tree=tree, decoder=decoder, dependencies=dependencies)
+    got = [answer.tolist() for answer in decoder.answers(0, maps._slots(0, ids))]
+    # an answer the test settles stops after its first token, either way
+    assert got == [want[:1] for want in wanted]
+    assert decoder.stopped_early[0] == sum(1 for want in wanted if want)
+    assert decoder.rows_fed[0] < sum(map(len, wanted))
+    assert not decoder.active
+    assert not arena.accounting.owned

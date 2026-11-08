@@ -90,6 +90,7 @@ names the rule that makes each rewrite and when it applies.
 | --- | --- | --- | --- |
 | R1 | `σ_q(AI(R)) ⇒ AI(σ_q(R))` | Quail's region claim, then DataFusion's `push_down_filter` | `q` reads only columns of `R`, and the node has no fetch. Above a per-key fetch, only a test of the key columns moves. |
 | R2 | `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)` | `absorb_into_ai_nodes` | `q` tests the node's answer, and the node has no fetch. |
+| R3 | `σ_q(AI(R; h)) ⇒ σ_q(AI(R; h ∧ q))` | `push_down_hint_tests` | The filter is directly above a classification, extraction, map, or SAE features node of rows with no fetch; `q` is a term of the filter that reads a column the node adds and otherwise only the node's input, with no AI call. The filter stays. |
 | R4 | `σ_{a LIKE x}(AI_{extract(d)→a}(R)) ⇒ σ_{a LIKE x}(AI_{extract(d)→a}(σ_{d ILIKE '%s%'}(R)))` | `push_down_substring_prechecks` | The node is an extraction of rows with no fetch; its filter has a term `a.f LIKE x` or `ILIKE x`, not negated, with a literal pattern; `s` is the longest word of the longest literal run of `x`. The test of the answer stays. |
 | R5 | `π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))` | `push_down_projection_into_ai_nodes` | `Q` is a projection directly above a node of rows; the node keeps its answer, and drops each other added column `Q` does not read, such as an extraction's spans under a FROM subquery. DataFusion's `optimize_projections` already prunes the input columns the node reads. |
 | R6 | `π_{B, (CASE WHEN c THEN a END)→z}(AI_{f→a}(R)) ⇒ π_{B, a→z}(AI_{f→a}(R; g = g ∧ c))` | `push_down_case_guards` | The node is a classification, map, or SAE features of rows with no filter, `HINT`, or fetch; the projection is directly above it; every item that reads an added column is `CASE WHEN c THEN <column> END` with the same `c`; `c` reads only columns of the one table the call reads. |
@@ -102,6 +103,15 @@ names the rule that makes each rewrite and when it applies.
 | R13 | `S ⋉_{J=K} AI(R) ⇒ S ⋉_{J=K} AI(R; n = 1 per K)` | `push_down_semi_join_fetch` | `J = K` is the whole join condition, `K` are input columns of the node, each name once; only projections and aliases are between the join and the node; the node, and every `AiNode` below it, is an AI.IF over the same one table, with no join, fetch, `HINT`, or guard. |
 | R14 | `π_K(σ_{c ≥ k}(γ_{K; count(*)→c}(AI(R)))) ⇒ π_K(σ_{c ≥ k}(γ_{K; count(*)→c}(AI(R; n = k per K))))` | `push_down_count_threshold` | The HAVING is `COUNT(*) >= k`, `> k - 1`, or written the other way round, with `k` a positive integer; the GROUP BY keys `K` are columns; `count(*)` is the only aggregate and only the HAVING reads it; the node is under the GROUP BY as for R13. |
 | R17 | `AI_{f→b}(AI_{f→a}(R)) ⇒ π_{*, a→b}(AI_{f→a}(R))` | `merge_repeated_ai_calls` | Same call and guard, only filters and other `AiNode`s of the same rows between them, no fetch on the upper node, each test of the upper node's answer already a test of the lower node's, and the lower node returns each column the upper one returns. The lowering already gives calls written the same way in one SELECT list and WHERE one node. |
+
+R3 gives the node a hint test, which it may drop rows by; the filter
+above still decides which rows the query returns. R2 absorbs the same
+terms into the node's exact filter, and runs first, so in the default
+order R3 finds a term only when `absorb_into_ai_nodes` is turned off.
+Its practical role is small: the executor already stops a map's or
+extraction's answer by the region's exact tests of that answer alone
+(`should_stop_answers_early`), and reads a hint test the same way. See
+[Evaluation on partial answers](/docs/architecture/execution#evaluation-on-partial-answers).
 
 R4 relies on `AI.EXTRACT` copying each answer from its document, so an
 answer is NULL or a substring of `d`. A decoded answer may differ from

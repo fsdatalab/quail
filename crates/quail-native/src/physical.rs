@@ -164,13 +164,15 @@ static KINDS: &[Kind] = &[
         class: "AiExtract",
         tag: "quail.ai_extract",
         node: true,
-        fields: fields!(NODE, MODEL_NODE; "attention" = S, "guard" = NONE),
+        fields: fields!(NODE, MODEL_NODE; "attention" = S, "guard" = NONE,
+            "stop_tests" = EMPTY, "stop_when_true" = NO, "hint_tests" = EMPTY),
     },
     Kind {
         class: "AiMap",
         tag: "quail.ai_map",
         node: true,
-        fields: fields!(NODE, MODEL_NODE; "attention" = S, "guard" = NONE),
+        fields: fields!(NODE, MODEL_NODE; "attention" = S, "guard" = NONE,
+            "stop_tests" = EMPTY, "stop_when_true" = NO, "hint_tests" = EMPTY),
     },
     Kind {
         class: "AiSaeFeatures",
@@ -1443,6 +1445,55 @@ leaf_classes! {
         qualified: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         evaluate_rows(slf.as_any(), rows, qualified)
+    }
+
+    /// Decide the condition on a partial answer.
+    ///
+    /// Args:
+    ///     answer: The name of the column that holds the answer.
+    ///     prefix: The answer's text so far.
+    ///     complete: Whether the answer is complete.
+    ///     may_be_null: Whether the answer may still be NULL.
+    ///     tails: The texts the answer may go on with, each cut
+    ///         anywhere, or None for any text.
+    ///     max_chars: The most characters the answer may add, or None.
+    ///
+    /// Returns:
+    ///     ``"true"`` when the condition is TRUE for every complete
+    ///     answer still possible, ``"not true"`` when it is TRUE for
+    ///     none, and ``"undecided"`` otherwise.
+    ///
+    /// Raises:
+    ///     CompileError: The expression does not decode.
+    #[pyo3(signature = (answer, prefix, complete=false, may_be_null=false, tails=None, max_chars=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn decide(
+        slf: &Bound<'_, Self>,
+        answer: &str,
+        prefix: &str,
+        complete: bool,
+        may_be_null: bool,
+        tails: Option<Vec<String>>,
+        max_chars: Option<usize>,
+    ) -> PyResult<&'static str> {
+        use quail_datafusion::partial::{Completions, Decision, decide};
+        let physical::ValueExpression::Value(expression) = held_value(slf.as_any())? else {
+            return Err(compile_error(slf.py(), "an Expression holds an expression".into()));
+        };
+        let answers = Completions {
+            prefix: prefix.to_string(),
+            complete,
+            may_be_null,
+            tails,
+            max_chars,
+        };
+        let decided = decide(&expression, answer, &answers)
+            .map_err(|error| compile_error(slf.py(), error.0))?;
+        Ok(match decided {
+            Decision::True => "true",
+            Decision::NotTrue => "not true",
+            Decision::Undecided => "undecided",
+        })
     }
     },
     Alias = "Alias": Tagged [] {

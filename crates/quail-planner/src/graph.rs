@@ -1124,6 +1124,9 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         document_ends: Value::Array(Vec::new()),
                         attention: String::new(),
                         guard: column.guard.clone(),
+                        stop_tests: Vec::new(),
+                        stop_when_true: false,
+                        hint_tests: column.hint_tests.clone(),
                     },
                 ))
             }
@@ -1141,6 +1144,9 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         document_ends: Value::Array(Vec::new()),
                         attention: String::new(),
                         guard: column.guard.clone(),
+                        stop_tests: Vec::new(),
+                        stop_when_true: false,
+                        hint_tests: column.hint_tests.clone(),
                     },
                 ))
             }

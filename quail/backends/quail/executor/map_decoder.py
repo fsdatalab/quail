@@ -109,6 +109,10 @@ class MapDecoder:
         self.num_streams = np.zeros(n, dtype=np.int64)
         self.steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
         self.drafts = np.zeros(n, dtype=np.int64)
+        # per map, its AnswerStop; the tokenizer decodes a map's text so far
+        self.answer_stops = {}
+        self.tokenizer = None
+        self.stopped_early = np.zeros(len(self.limits), dtype=np.int64)
 
     def configure_copy(self, first, slots, documents, specs):
         """Register extraction fields for setup after the first forward launch."""
@@ -672,6 +676,55 @@ class MapDecoder:
             group.prepared_written[local[ready]] = written[ready]
             group.prepared_drafts[local[ready]] = spec.draft_tokens
             self.copy_pending[slots] = ~ready
+        if self.answer_stops:
+            self._stop_decided(np.unique(documents))
+
+    def _stop_decided(self, slots) -> None:
+        """End each answer whose tests are decided on its tokens so far."""
+        from quail.execution.answer_stops import Stop
+
+        for q, stop in self.answer_stops.items():
+            mine = slots[(self.map[slots] == q) & ~self.stopped[slots]]
+            mine = mine[self.written[q][mine] > 0]
+            for slot in mine.tolist():
+                prefix, length, extra = self._partial_answer(q, slot)
+                if stop.decide(prefix, **extra) is Stop.CONTINUE:
+                    continue
+                self.lengths[q][slot] = length
+                self.stopped[slot] = True
+                self.map[slot] = -1
+                self.copy_pending[slot] = False
+                if self.ended_log is not None:
+                    self.ended_log.append(np.array([slot]))
+                self.finished.append((slot, q))
+                self.stopped_early[q] += 1
+
+    def _partial_answer(self, q, slot):
+        """Return an answer's text so far, its length in tokens, and C(w).
+
+        A map's text is its decoded tokens up to the last whole character.
+        An extraction's is the document span its tokens copy, which goes
+        on only with the document's text and is NULL no more.
+        """
+        from quail.execution.answer_stops import copied_tails
+
+        written = int(self.written[q][slot])
+        if q in self.copy_constraints:
+            state = self.copy_constraints[q]
+            document = self.copy_document[slot]
+            (text,), _ = state.constraint.output_answers(
+                [document], [state.sources[slot]], [written])
+            text = text or ""
+            source = state.constraint.documents.documents[document].text
+            return text, written, dict(tails=copied_tails(source, text))
+        tokens = self.tokens[q][slot]
+        length = written
+        (text,) = self.tokenizer.decode_batch([tokens[:length]])
+        # a token may hold part of a character the next token completes
+        while length and text.endswith("\ufffd"):
+            length -= 1
+            (text,) = self.tokenizer.decode_batch([tokens[:length]])
+        return text, length, {}
 
     def _read_copy(self, q, documents, indices, values):
         from quail.common.draft_policy import live_buckets
@@ -712,10 +765,12 @@ def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapD
     from quail.backends.quail.executor.model_loading import full_output_head
     from quail.common.budgets import copy_verification_workspace_bytes
 
-    return MapDecoder(
+    decoder = MapDecoder(
         state.torch, full_output_head(state.loaded_model.model), num_documents,
         limits, state.loaded_model.tokenizer.stop_ids,
         state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens,
         workspace_bytes=copy_verification_workspace_bytes(
             state.loaded_model.model_spec, state.chunk_tokens),
         row_budget=state.chunk_tokens)
+    decoder.tokenizer = state.loaded_model.tokenizer
+    return decoder

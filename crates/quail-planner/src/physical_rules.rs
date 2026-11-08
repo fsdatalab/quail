@@ -20,7 +20,7 @@ use crate::pricing::{expected_documents, head_tokens, pass_question_tokens, set_
 use crate::retention::schedule;
 
 /// The built-in physical rules, in the order the registry applies them.
-pub const PHYSICAL_RULES: [&str; 8] = [
+pub const PHYSICAL_RULES: [&str; 9] = [
     "should_push_down_limit",
     "choose_classify_implementation",
     "pack_set_passes",
@@ -29,6 +29,7 @@ pub const PHYSICAL_RULES: [&str; 8] = [
     "should_share_prefixes",
     "choose_attention_path",
     "should_deduplicate",
+    "should_stop_answers_early",
 ];
 
 /// An executable graph: its nodes and the port that returns the result.
@@ -1021,6 +1022,104 @@ fn should_deduplicate(
     Ok(None)
 }
 
+/// Give each map and extraction the region's exact tests of its answer
+/// alone, so the executor stops an answer once one is decided.
+///
+/// A test is a `Filter` of the node's table whose condition reads only
+/// the node's answer column. The executor may also stop once every such
+/// test is decided TRUE when nothing else reads the answer: no other
+/// `Filter` and not the region's projection, which reads an extraction's
+/// answers as one struct.
+fn should_stop_answers_early(graph: &Graph, context: &PlanningContext) -> Rewrite {
+    let Some(found) = &context.operators else {
+        return Ok(None);
+    };
+    let projected: Vec<String> = found
+        .projection
+        .columns
+        .iter()
+        .flat_map(|column| {
+            let mut names = vec![crate::expressions::projected_name(column)];
+            if let quail_physical::Projected::Expression(expression) = column {
+                names.extend(
+                    crate::expressions::column_references(expression)
+                        .into_iter()
+                        .map(|reference| reference.column),
+                );
+            }
+            names
+        })
+        .collect();
+    let filters: Vec<(
+        Vec<quail_physical::ColumnRef>,
+        &quail_physical::ValueExpression,
+    )> = graph
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            PhysicalNode::Filter(filter) => filter.attributes.predicate.as_ref(),
+            _ => None,
+        })
+        .map(|predicate| (crate::expressions::column_references(predicate), predicate))
+        .collect();
+    let mut nodes = graph.nodes.clone();
+    let mut changed = false;
+    for node in &mut nodes {
+        let (alias, name) = match node {
+            PhysicalNode::AiMap(map) => match &map.attributes.spec {
+                Some(spec) => (spec.aliases[0].clone(), spec.name.clone()),
+                None => continue,
+            },
+            PhysicalNode::AiExtract(extract) => match &extract.attributes.spec {
+                Some(spec) => (spec.aliases[0].clone(), spec.name.clone()),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let reads = |column: &str| {
+            column == name
+                || column == format!("{name}{}", crate::expressions::SPAN_SUFFIX)
+                || name.starts_with(&format!("{column}."))
+        };
+        let mut tests = Vec::new();
+        let mut read_elsewhere = projected.iter().any(|column| reads(column));
+        for (references, predicate) in &filters {
+            let mine = |reference: &quail_physical::ColumnRef| {
+                reference.alias == alias && reads(&reference.column)
+            };
+            if !references.iter().any(mine) {
+                continue;
+            }
+            let alone = matches!(predicate, quail_physical::ValueExpression::Value(_))
+                && references
+                    .iter()
+                    .all(|reference| reference.alias == alias && reference.column == name);
+            if alone {
+                tests.push((*predicate).clone());
+            } else {
+                read_elsewhere = true;
+            }
+        }
+        if tests.is_empty() {
+            continue;
+        }
+        let when_true = !read_elsewhere;
+        match node {
+            PhysicalNode::AiMap(map) => {
+                map.attributes.stop_tests = tests;
+                map.attributes.stop_when_true = when_true;
+            }
+            PhysicalNode::AiExtract(extract) => {
+                extract.attributes.stop_tests = tests;
+                extract.attributes.stop_when_true = when_true;
+            }
+            _ => unreachable!("a map or an extraction"),
+        }
+        changed = true;
+    }
+    Ok(changed.then(|| graph.with_nodes(nodes)))
+}
+
 /// Apply one rule by name.
 ///
 /// # Errors
@@ -1044,6 +1143,7 @@ pub fn apply_rule(
         "should_share_prefixes" => should_share_prefixes(graph, context),
         "choose_attention_path" => choose_attention_path(graph, context),
         "should_deduplicate" => should_deduplicate(graph, context, settings),
+        "should_stop_answers_early" => should_stop_answers_early(graph, context),
         other => Err(CompileError::new(format!(
             "unknown physical rule {other:?}"
         ))),

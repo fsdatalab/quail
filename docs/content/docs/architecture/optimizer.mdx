@@ -113,7 +113,7 @@ are DataFusion optimizer rules that run over the whole plan, Quail's
 `AiNode`s included; physical rules rewrite Quail's executable graphs.
 
 The logical rules are DataFusion's default rules, from
-`rewrite_set_comparison` to `optimize_projections`, with Quail's twelve
+`rewrite_set_comparison` to `optimize_projections`, with Quail's thirteen
 before `replace_distinct_aggregate`, which turns a DISTINCT into a
 GROUP BY. Each rewrite of an AI operator has a number, such as R1;
 [Rules](/docs/extending/rules#rewrites-by-number) gives each one's
@@ -133,6 +133,7 @@ region.
 | `push_down_projection_into_ai_nodes` | Logical | Make an AI operator return only its answer and the added columns the SELECT list above it reads, such as an extraction's spans (R5). | No |
 | `push_down_case_guards` | Logical | Make the test of a `CASE WHEN c THEN <answer> END` the guard of the classification, map, or SAE features below it, so the model is asked only where `c` is TRUE (R6). | No |
 | `push_down_or_guards` | Logical | Guard an AI.IF that is one term of an OR with the OR's other terms, so the model is asked only where they are not TRUE (R7). | No |
+| `push_down_hint_tests` | Logical | Make a test of an AI column's answer directly above its node, with no fetch, also the node's hint test, so the executor may stop answers the test rejects (R3). The default order absorbs such tests first (R2). | No |
 | `push_down_substring_prechecks` | Logical | Before an extraction whose answer a `LIKE` tests, keep only the documents that contain the pattern's literal text, ignoring case (R4). | No |
 | `push_down_semi_join_fetch` | Logical | Give the AI.IF filter on the subquery side of a semi-join, such as an `IN` subquery, one row per join key (R13). | No |
 | `push_down_count_threshold` | Logical | Give the AI.IF filter under `GROUP BY K HAVING COUNT(*) >= k` a fetch of `k` rows per key, when nothing else reads the count (R14). | No |
@@ -146,6 +147,7 @@ region.
 | `should_retain_kv` | Physical | Keep selected document KV for later operators. | No |
 | `should_share_prefixes` | Physical | Reuse KV between documents with a shared prefix. | Yes |
 | `choose_attention_path` | Physical | Choose unified or tree attention for filters and joins. | Yes |
+| `should_stop_answers_early` | Physical | Give each map and extraction the region's exact tests of its answer alone, so the executor stops an answer once a test is decided on the tokens decoded so far. | No |
 
 The logical rules are listed in
 [`rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/rules.rs);

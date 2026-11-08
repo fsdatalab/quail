@@ -1146,6 +1146,19 @@ impl TreeRows<'_> {
                 condition_text(guard)
             ));
         }
+        let (stops, hints, when_true) = known.answer_stops();
+        let tests: Vec<String> = stops.iter().chain(hints).map(condition_text).collect();
+        if !tests.is_empty() {
+            let also = if when_true {
+                ", or once every one is TRUE"
+            } else {
+                ""
+            };
+            details.push(format!(
+                "stops an answer once {} is not TRUE on its tokens so far{also}",
+                tests.join(" or ")
+            ));
+        }
         if let Some(alternative) = known.alternative() {
             details.push(format!(
                 "passes each row where {}, whatever the model answers",

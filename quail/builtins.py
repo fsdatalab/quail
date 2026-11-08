@@ -8,7 +8,7 @@ from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
 from quail.specs import DEVICES, MODELS
 
 # the logical optimizer rules, in order, as quail_datafusion::LOGICAL_RULES
-# names them: DataFusion's default rules with Quail's twelve before
+# names them: DataFusion's default rules with Quail's thirteen before
 # replace_distinct_aggregate; claim_model_regions always runs after them
 LOGICAL_RULES = (
     "rewrite_set_comparison", "optimize_unions", "unions_to_filter",
@@ -16,8 +16,8 @@ LOGICAL_RULES = (
     "eliminate_distinct", "place_ai_nodes", "absorb_into_ai_nodes",
     "merge_repeated_ai_calls", "push_down_distinct", "push_down_limit_into_ai_nodes",
     "push_down_projection_into_ai_nodes", "push_down_case_guards",
-    "push_down_or_guards", "push_down_substring_prechecks", "push_down_semi_join_fetch",
-    "push_down_count_threshold",
+    "push_down_or_guards", "push_down_hint_tests", "push_down_substring_prechecks",
+    "push_down_semi_join_fetch", "push_down_count_threshold",
     "replace_distinct_aggregate", "eliminate_join",
     "decorrelate_predicate_subquery", "scalar_subquery_to_join",
     "decorrelate_lateral_join", "extract_equijoin_predicate",
@@ -32,16 +32,20 @@ LOGICAL_RULES = (
 PHYSICAL_RULES = (
     "should_push_down_limit", "choose_classify_implementation", "pack_set_passes",
     "join_document_ends", "should_retain_kv", "should_share_prefixes",
-    "choose_attention_path", "should_deduplicate",
+    "choose_attention_path", "should_deduplicate", "should_stop_answers_early",
 )
 
 
-def built_in_registry(logical_rules=LOGICAL_RULES) -> ExtensionRegistry:
+def built_in_registry(logical_rules=LOGICAL_RULES,
+                      physical_rules=None) -> ExtensionRegistry:
     """Create one registry with Quail built ins.
 
     Args:
         logical_rules: The names of the logical rules to register, in the
             order they apply; leaving a rule out turns it off.
+        physical_rules: The names of the physical rules to register, in
+            the order they apply; leaving a rule out turns it off. None
+            registers PHYSICAL_RULES as the module holds it when called.
     """
     registry = ExtensionRegistry()
     for model in MODELS.values():
@@ -51,7 +55,7 @@ def built_in_registry(logical_rules=LOGICAL_RULES) -> ExtensionRegistry:
     registry.register_backend(QuailBackend())
     for name in logical_rules:
         registry.register_logical_rule(LogicalRule(name))
-    for name in PHYSICAL_RULES:
+    for name in PHYSICAL_RULES if physical_rules is None else physical_rules:
         registry.register_physical_rule(PhysicalRule(name))
     for runtimes in (built_in_runtimes(), quail_runtimes()):
         for runtime_key, runtime in runtimes.items():

@@ -16,6 +16,7 @@ from quail.backends.quail.executor.stages import Stage, frame_writes, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.common.expressions import effective_selectivity
 from quail.common.tokens import prefix_tree
+from quail.execution.answer_stops import answer_stop
 from quail.execution.rows import Rows
 from quail.physical import AiFilter, AiJoin, Filter, ValueType
 from quail.progress import logger
@@ -297,6 +298,10 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
         for part in parts:
             if part.answer_limits:
                 part.decoder = decoder
+                for q, node in enumerate(part.nodes):
+                    stop = answer_stop(node)
+                    if stop is not None:
+                        decoder.answer_stops[part.first + q] = stop
     with ExitStack() as resources:
         for part in parts:
             resources.enter_context(part.execution_context())

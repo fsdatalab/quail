@@ -10,7 +10,10 @@
 //!
 //! - `g`, the guard, says which rows the model is asked about.
 //! - `p`, the filter, is an exact test of the input's columns and `a`.
-//! - `h`, the hint, is the query's inexact `HINT` options.
+//! - `h`, the hint, is the query's inexact `HINT` options, and the hint
+//!   test: the node may drop rows where it is not TRUE. A node with a
+//!   hint test has no fetch, and the filter that holds the test stays
+//!   above it.
 //! - `P`, the projection, names the added columns the node returns.
 //! - `n`, the fetch, keeps the first rows: of all rows, or of each key.
 //!
@@ -117,6 +120,10 @@ pub struct AiNode {
     /// The options of the `HINT` the query wraps the call's term in,
     /// such as `{'selectivity': 0.4}`.
     pub hint: Option<Expr>,
+    /// A test of the input's columns and the added columns: the node may
+    /// drop rows where it is not TRUE, as an executor that stops an
+    /// answer once the test is decided.
+    pub hint_test: Option<Expr>,
     /// The positions in `fields` of the added columns the node returns;
     /// None returns every one.
     pub projection: Option<Vec<usize>>,
@@ -150,6 +157,7 @@ impl AiNode {
             guard: None,
             filter: None,
             hint: None,
+            hint_test: None,
             projection: None,
             fetch: None,
             semantics: Semantics::Rows,
@@ -272,6 +280,9 @@ impl AiNode {
         if let Some(hint) = &self.hint {
             write!(f, ", hint: {hint}")?;
         }
+        if let Some(test) = &self.hint_test {
+            write!(f, ", hint test: {test}")?;
+        }
         match &self.fetch {
             Some(Fetch::Global(n)) => write!(f, ", fetch: {n}")?,
             Some(Fetch::PerKey { key, n }) => write!(f, ", fetch: {n} per [{}]", key.join(", "))?,
@@ -371,6 +382,7 @@ impl UserDefinedLogicalNodeCore for AiNode {
             .expressions()
             .into_iter()
             .chain(self.filter.clone())
+            .chain(self.hint_test.clone())
             .chain(self.tests.iter().map(|test| test.test.clone()));
         for expr in read {
             for column in expr.column_refs() {

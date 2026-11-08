@@ -22,6 +22,7 @@ from quail.backends.quail.reranker import (
     RerankerModelExecution,
     score_rows,
 )
+from quail.execution.answer_stops import Stop, answer_stop, copied_tails
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import true_answer_rows
 from quail.execution.rows import Rows, extraction_rows
@@ -103,6 +104,10 @@ class Oracle:
         # planted truth uses, for an input that holds some of a table's rows
         self.source_rows = {}
         self.calls = []       # (spec name, rows) of every score or label call
+        # characters of map and extraction answers written, one a token,
+        # and the answers stopped before their end
+        self.answer_tokens = 0
+        self.stopped_early = 0
         if pipelines:
             self.execute_pipeline = self._execute_pipeline
 
@@ -300,6 +305,9 @@ class Oracle:
         texts = self.texts.get(spec.alias)
         found = [self._answer(spec, self._source(spec.alias, document))
                  for document in ids]
+        found = [self._written(node, text, None if texts is None
+                               else str(texts[document]))
+                 for document, text in zip(ids, found)]
         spans = [None if text is None or texts is None
                  else locate_span(str(texts[document]), text)
                  for document, text in zip(ids, found)]
@@ -328,9 +336,30 @@ class Oracle:
         return NodeResult(
             {node.rows_port: score_rows(
                 rows, spec.aliases, spec.name,
-                [self.maps(spec, document) for document in ids], pa.string())},
+                [self._written(node, self.maps(spec, document), None)
+                 for document in ids], pa.string())},
             NodeMetrics(input_rows=len(ids), output_rows=len(ids),
                         evaluated_documents=len(ids)))
+
+    def _written(self, node, text, source):
+        """Write an answer one character a token, as far as the executor would.
+
+        The executor stops once the node's tests are decided on the
+        answer so far; source is an extraction's document text.
+        """
+        stop = answer_stop(node)
+        if text is None or stop is None:
+            self.answer_tokens += 0 if text is None else len(text)
+            return text
+        for length in range(1, len(text)):
+            prefix = text[:length]
+            tails = None if source is None else copied_tails(source, prefix)
+            if stop.decide(prefix, tails=tails) is not Stop.CONTINUE:
+                self.answer_tokens += length
+                self.stopped_early += 1
+                return prefix
+        self.answer_tokens += len(text)
+        return text
 
     def _feature_list(self, spec, document) -> list:
         if callable(self.features):

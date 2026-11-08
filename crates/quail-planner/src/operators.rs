@@ -129,6 +129,10 @@ pub struct SemanticColumn {
     /// answer is NULL. None asks about every row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<ValueExpression>,
+    /// Tests of the answer the operator may drop rows by, conditions
+    /// over the answer column: the `AiNode`'s hint test.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hint_tests: Vec<ValueExpression>,
 }
 
 impl SemanticColumn {

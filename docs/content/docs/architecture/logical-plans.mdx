@@ -59,7 +59,9 @@ f_g = CASE WHEN g THEN f END
   the rest.
 - `p`, the filter, is an exact test of the input's columns and `a`.
 - `h`, the hint, is the query's inexact `HINT` options, such as
-  `{'selectivity': 0.4}`.
+  `{'selectivity': 0.4}`, and the hint test: the node may drop rows
+  where it is not TRUE. A node with a hint test has no fetch, and the
+  filter the test came from stays above it.
 - `P`, the projection, names the added columns the node returns.
 - `n`, the fetch, keeps the first rows: of all rows, or of each key.
 

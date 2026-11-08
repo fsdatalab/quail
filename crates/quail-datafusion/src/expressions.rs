@@ -159,7 +159,7 @@ pub fn parse(
 
 /// The DataFusion expression an [`Expression`] encodes, reading column
 /// `#i` for its `i`th column.
-fn decode(expression: &Expression) -> Result<Expr, CompileError> {
+pub(crate) fn decode(expression: &Expression) -> Result<Expr, CompileError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&expression.encoded)
         .map_err(|error| CompileError::new(error.to_string()))?;

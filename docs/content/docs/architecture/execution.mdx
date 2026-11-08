@@ -100,6 +100,60 @@ An anchor that passes a filter in the same pipeline can enter the join
 with its document KV already available. A later join can also reuse that
 KV if the plan keeps it. See [KV retention](/docs/architecture/kv#kv-retention).
 
+### Evaluation on partial answers
+
+A map or an extraction writes its answer one token at a time. When the
+region tests that answer, Quail decides the test on the tokens decoded
+so far and stops the answer once the test is settled.
+
+- `w` is the answer's text so far.
+- `C(w)` is the set of complete answers still possible. A map's answer
+  goes on with any text within its answer limit. An extraction copies a
+  span of its document, so its answer goes on only with the text that
+  follows a place where the document holds `w`. Before its first token,
+  an extraction may still answer NULL, which means it found nothing.
+- A test is *decided TRUE* at `w` when it is TRUE for every answer in
+  `C(w)`, and *decided not TRUE* when it is FALSE or NULL for every one.
+  Otherwise it is *undecided*. Undecided is a state of the executor, not
+  a NULL.
+
+The physical rule `should_stop_answers_early` gives each map and
+extraction the region's exact tests that read its answer alone. The
+executor stops an answer, and frees its KV, once one of them, or one of
+the node's hint tests (R3), is decided not TRUE: the region would drop
+the row. When nothing else reads the answer, it also stops once every
+exact test is decided TRUE: the region keeps the row whatever the rest
+of the answer says. The answer keeps its text so far, which is itself
+in `C(w)`, so the region's filter gives it the value it was decided to
+have.
+
+For example, imagine `SELECT r.id FROM reviews r WHERE
+LEFT(AI.MAP(r.body, 'Is it kind?'), 3) = 'yes'`. An answer that starts
+with `n` is decided not TRUE after one token. An answer that starts
+with `yes` is decided TRUE after it, and the map stops there, since the
+SELECT list does not read the answer.
+
+The decision runs in Rust, on DataFusion's expression of the test
+(`crates/quail-datafusion/src/partial.rs`). It reads these shapes of
+the answer `a` with literals, and AND, OR, NOT, and `IS [NOT] TRUE` or
+`FALSE` of them:
+
+- `a LIKE 'x%'`, `a LIKE 'x'`, `STARTS_WITH(a, 'x')`,
+  `LEFT(a, k) = 'x'`, and `SUBSTR(a, 1, k) = 'x'`;
+- `a = 'x'`, `a <> 'x'`, and `a IN ('x', ...)`;
+- `a IS NULL` and `a IS NOT NULL`;
+- `LENGTH(a)` or `CHARACTER_LENGTH(a)` compared with an integer.
+
+The executor does not bound how many characters a map's remaining
+tokens may add, so a length test of a map's answer is decided only once
+the text so far passes the bound, or once the answer ends. Any other part stays
+undecided until the answer is complete, and the
+region's filter then tests the answer as usual. Parts are decided one at
+a time, so a test that reads the answer twice may be decided later than
+it could be, never wrongly. A classification needs none of this: it
+scores its labels. A test of an AI.SCORE needs an upper bound on the
+score, which Quail does not compute yet.
+
 ### Classification
 
 Classification assigns one of the supplied labels to each input row.

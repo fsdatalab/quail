@@ -105,6 +105,7 @@ fn as_bound(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
         ai.call = read(ai.call)?;
         ai.guard = ai.guard.map(read).transpose()?;
         ai.filter = ai.filter.map(read).transpose()?;
+        ai.hint_test = ai.hint_test.map(read).transpose()?;
         for test in &mut ai.tests {
             test.test = read(test.test.clone())?;
             test.written = read(test.written.clone())?;
@@ -1809,6 +1810,15 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
     }
 
+    /// A column node's hint test as a condition over its answer columns;
+    /// None when it has none or it does not bind, as a hint may be left
+    /// out.
+    fn bound_hint(&mut self, node: &AiNode) -> Option<ValueExpression> {
+        let test = node.hint_test.as_ref()?;
+        let written = self.walk.written(test, &self.walk.answers());
+        self.binder.bind_condition(&written).ok()
+    }
+
     fn place_column(&mut self, id: usize, node: &AiNode) -> Option<()> {
         let read: Vec<String> = self.call_tables(id).into_iter().collect();
         let is_column = |kind: &Kind| matches!(kind, Kind::Ai(found) if !found.is_predicate() && found.semantics == Semantics::Rows);
@@ -1843,6 +1853,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
                         name,
                         above_joins,
                         guard: guard.clone(),
+                        hint_tests: Vec::new(),
                     });
                     let position = self.found.classifies.len() - 1;
                     self.columns_at
@@ -1857,13 +1868,25 @@ impl<'w, 'a> Assembly<'w, 'a> {
         let above_joins = self.walk.get(self.walk.get(id).inputs[0]).ai_join;
         let guard = self.bound_guard(node)?;
         let (kind, columns) = self.bound_columns(node)?;
+        let hint = self.bound_hint(node);
         for (call, name) in columns {
+            // a hint test that reads this column alone
+            let hint_tests = hint
+                .iter()
+                .filter(|test| {
+                    column_references(test)
+                        .iter()
+                        .all(|found| found.alias == alias && found.column == name)
+                })
+                .cloned()
+                .collect();
             let list = self.list(kind);
             list.push(SemanticColumn {
                 call,
                 name,
                 above_joins,
                 guard: guard.clone(),
+                hint_tests,
             });
             let position = list.len() - 1;
             self.columns_at

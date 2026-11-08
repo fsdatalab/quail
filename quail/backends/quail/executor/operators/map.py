@@ -233,6 +233,8 @@ class MapPart(ColumnPart, ExecutionPart):
                         "input_rows": len(asked),
                         "answer_tokens": int(sum(map(len, tokens))),
                         "decode_rows": self.fed[q],
+                        "answers_stopped_early": int(
+                            self.decoder.stopped_early[self.first + q]),
                         "suffix_tokens": tail,
                         "borrowed_prefix_tokens": (
                             stats.get("borrowed_tokens", 0) if q == 0 else 0),
