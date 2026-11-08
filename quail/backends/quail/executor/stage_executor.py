@@ -367,7 +367,8 @@ class StageExecutor:
         """
         if stop_groups is None or not self.prefixes:
             return 1
-        groups = len(set(stop_groups)) or 1
+        groups = len({group for groups in stop_groups for group in
+                      (groups if isinstance(groups, tuple) else (groups,))}) or 1
         mean = (sum(self.prefix_lengths) / len(self.prefix_lengths)
                 + float(np.mean(self.suffixes[0].lengths)))
         per_chunk = max(1, int(budget // max(1.0, mean)))

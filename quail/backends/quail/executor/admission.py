@@ -7,7 +7,7 @@ Tensor construction is handled by chunk.py.
 """
 
 from bisect import bisect_right
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -202,11 +202,14 @@ class JoinAdmission:
             stage, or None. Under a limit, anchors are admitted only
             while the ones in flight are expected to fall short of it;
             None admits every anchor that fits.
-        stop_groups: Per anchor, its stop key group, or None. At most
-            stop_width anchors of a group are admitted at a time, and
-            once num_key_survivors of them survive the last stage the
-            group's queued anchors are skipped: they never run and
-            take_skipped() lists them.
+        stop_groups: Per anchor, its stop key group, or None. An anchor
+            that stands for copies in several groups gives a tuple with
+            one group per copy, so a group may repeat. An anchor is
+            admitted while one of its groups has fewer than stop_width
+            anchors in flight. A surviving anchor counts once for each
+            of its copies in a group; once a group has num_key_survivors
+            survivors, a queued anchor whose groups are all done is
+            skipped: it never runs and take_skipped() lists it.
         stop_width: Anchors of one group in flight at once; the caller
             widens it when the groups are too few to fill a chunk.
         num_key_survivors: How many anchors of a stop key group must
@@ -266,7 +269,9 @@ class JoinAdmission:
         self.survival = survival
         self.survivors = 0
         n = len(prefix_tokens)
-        self.groups = None if stop_groups is None else list(stop_groups)
+        self.groups = None if stop_groups is None else [
+            Counter(group if isinstance(group, tuple) else (group,))
+            for group in stop_groups]
         if self.groups is not None and len(self.groups) != n:
             raise ValueError("stop_groups must match prefix_tokens")
         self._group_width = max(1, int(stop_width))
@@ -363,7 +368,8 @@ class JoinAdmission:
             self.borrowing.detach(a)
         if self.groups is not None:
             for a in self.pending:
-                self._group_members.setdefault(self.groups[a], set()).add(a)
+                for group in self.groups[a]:
+                    self._group_members.setdefault(group, set()).add(a)
 
 
     def num_partners(self, a, j):
@@ -673,8 +679,9 @@ class JoinAdmission:
                     continue
                 j = 0
             hold = held_waiting if dependency is not None else held
-            if self.groups is not None and self._group_busy.get(
-                    self.groups[a], 0) >= self._group_width:
+            if self.groups is not None and not any(
+                    self._group_busy.get(group, 0) < self._group_width
+                    for group in self.groups[a] if group not in self._group_done):
                 hold.append(a)      # the group's anchors in flight are enough
                 continue
             borrow = self.borrowing.decide(a, admitted)
@@ -724,9 +731,9 @@ class JoinAdmission:
             admitted.add(a)
             expected_rows += int(dependency is None)
             if self.groups is not None:
-                group = self.groups[a]
-                self._group_busy[group] = self._group_busy.get(group, 0) + 1
-                self._group_members[group].discard(a)
+                for group in self.groups[a]:
+                    self._group_busy[group] = self._group_busy.get(group, 0) + 1
+                    self._group_members.get(group, set()).discard(a)
             self.borrowing.record(a, borrow)
             if self._launch(a, j, end):
                 continued.append(a)
@@ -853,21 +860,28 @@ class JoinAdmission:
                 self._settled.append(Settlement("dropped", dependent, False))
         if self.groups is None:
             return
-        group = self.groups[a]
-        busy = self._group_busy.get(group, 0) - 1
-        if busy > 0:
-            self._group_busy[group] = busy
-        else:
-            self._group_busy.pop(group, None)
-        if not survived or group in self._group_done:
-            return
-        survivors = self._group_survivors.get(group, 0) + 1
-        self._group_survivors[group] = survivors
-        if survivors < self._num_key_survivors:
-            return
-        self._group_done.add(group)
-        skipped = sorted(self._group_members.pop(group, ()))
+        finished = []
+        for group, copies in self.groups[a].items():
+            busy = self._group_busy.get(group, 0) - 1
+            if busy > 0:
+                self._group_busy[group] = busy
+            else:
+                self._group_busy.pop(group, None)
+            if not survived or group in self._group_done:
+                continue
+            survivors = self._group_survivors.get(group, 0) + copies
+            self._group_survivors[group] = survivors
+            if survivors >= self._num_key_survivors:
+                self._group_done.add(group)
+                finished.append(group)
+        candidates = set()
+        for group in finished:
+            candidates.update(self._group_members.pop(group, ()))
+        skipped = sorted(b for b in candidates
+                         if all(group in self._group_done for group in self.groups[b]))
         for b in skipped:
+            for group in self.groups[b]:
+                self._group_members.get(group, set()).discard(b)
             self._stage[b] = _DONE
             if not self._page_cost[b]:
                 self._zero_cost -= 1

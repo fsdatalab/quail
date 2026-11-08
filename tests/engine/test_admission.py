@@ -252,6 +252,22 @@ def test_a_stop_key_group_skips_its_rest_once_enough_documents_survive(
     assert sorted(got) == {1: [0], 2: [0, 1, 2]}[num_key_survivors]
 
 
+def test_a_document_standing_for_copies_counts_once_per_copy_in_each_group(
+        monkeypatch):
+    from helpers.fakes import DOC
+
+    # a chunk holds one document and every document passes; document 0
+    # stands for two copies in group 7, so it alone completes group 7
+    documents = [[DOC + index] * 64 for index in range(4)]
+    tree = PrefixTree(order=list(range(4)), parent=[None] * 4, shared=[0] * 4)
+    got, _, _, _ = _tree_filter(
+        monkeypatch, truth={index: [1] for index in range(4)}, budget=80,
+        documents=documents, tree=tree, stop_groups=[(7, 7), (8,), (7,), (8,)],
+        num_key_survivors=2)
+    # document 2 never runs; group 8 needs document 3 as well as 1
+    assert sorted(got) == [0, 1, 3]
+
+
 def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
     from helpers.fakes import DOC, fake_pack
 

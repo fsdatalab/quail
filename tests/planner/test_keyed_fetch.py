@@ -119,3 +119,28 @@ def test_a_count_threshold_the_select_list_reads_reads_every_document():
     on, off = _rows_and_read(COUNT_RULE, sql, THREE_EACH, passing=(0, 1, 3, 6))
     assert on == off
     assert on[0] == [(1, 2)]
+
+
+# texts repeat across products, and r0 and r1 share a text within product 1
+REPEATED = pa.table({
+    "id": [f"r{index}" for index in range(6)],
+    "body": ["b0", "b0", "b1", "b0", "b2", "b2"],
+    "product": [1, 1, 1, 2, 2, 2],
+})
+
+
+def test_a_per_key_stop_asks_each_repeated_text_at_most_once():
+    in_sql = (f"SELECT p.sku FROM products p WHERE p.number IN "
+              f"(SELECT r.product FROM reviews r WHERE {AI_IF})")
+    count_sql = (f"SELECT r.product FROM reviews r WHERE {AI_IF} "
+                 "GROUP BY r.product HAVING COUNT(*) >= 2")
+    # the model passes every copy of b0
+    on, off = _rows_and_read(SEMI_JOIN_RULE, in_sql, REPEATED, passing=(0, 1, 3))
+    assert on[0] == off[0] == [("p1",), ("p2",)]
+    # r0 passes for products 1 and 2, so no other text is asked
+    assert (on[1], off[1]) == ([0], [0, 2, 4])
+    on, off = _rows_and_read(COUNT_RULE, count_sql, REPEATED, passing=(0, 1, 3))
+    assert on[0] == off[0] == [(1,)]
+    # r0 counts twice for product 1, so b1 is not asked; product 2 has one
+    # match and asks b2
+    assert (on[1], off[1]) == ([0, 4], [0, 2, 4])

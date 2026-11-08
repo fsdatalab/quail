@@ -84,13 +84,19 @@ def execute_pipeline(state: QueryExecutionState, nodes, inputs, context) -> dict
         label=f"pipeline {alias}")
 
 
-def pipeline_ids(first, inputs) -> np.ndarray:
-    """The document ids a pipeline's first operator reads."""
+def pipeline_rows(first, inputs):
+    """The rows, or ids, a pipeline's first operator reads."""
     alias = first.document_aliases[0]
     anchor_port = next((port.name for port in first.inputs
                         if port.source.port == f"rows:{alias}"), None)
-    source = (inputs[first.node_id][anchor_port] if anchor_port is not None
-              else next(iter(inputs[first.node_id].values())))
+    return (inputs[first.node_id][anchor_port] if anchor_port is not None
+            else next(iter(inputs[first.node_id].values())))
+
+
+def pipeline_ids(first, inputs) -> np.ndarray:
+    """The document ids a pipeline's first operator reads."""
+    alias = first.document_aliases[0]
+    source = pipeline_rows(first, inputs)
     return id_positions(source.ids[alias] if isinstance(source, Rows) else source)
 
 
@@ -259,7 +265,9 @@ def execute_set_pipeline(state, nodes, inputs, context) -> dict:
                  if _kind(node) in PACKED), ())
     first_filter = next((node for node in nodes if isinstance(node, AiFilter)), None)
     stops = (None if first_filter is None else filter_inputs(
-        context.state, first_filter, ids)["stop_groups"])
+        context.state, first_filter,
+        pipeline_rows(nodes[0], inputs) if first_filter is nodes[0] else ids)[
+            "stop_groups"])
     num_key_survivors = (1 if first_filter is None
                          else first_filter.num_key_survivors)
     return execute_set_steps(

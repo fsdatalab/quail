@@ -13,7 +13,7 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.common.expressions import accepts
-from quail.common.pairs import columns_key
+from quail.common.pairs import COPIES, columns_key
 from quail.common.selection import group_ids
 from quail.common.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import document_ids as arrow_ids
@@ -289,31 +289,53 @@ def filter_document_sink(node, document_ids):
     return document_done
 
 
-def stop_groups(node, columns, document_ids) -> list | None:
+def stop_groups(node, columns, document_ids, copies=None) -> list | None:
     """Return each document's stop key group, or None without a stop key.
 
     Documents with equal values in the node's ``stop_key`` columns
     share a group number; the scheduler reads one document of a group
     at a time and skips the rest once the node's num_key_survivors
-    survive.
+    survive. A deduplicated document stands for its copies, which may
+    sit in several groups: its entry is then a tuple with each copy's
+    group.
 
     Args:
         node: The AiFilter.
         columns: The alias's value table, one row per document.
         document_ids: The documents' positions in that table.
+        copies: Per document, the positions of the documents it stands
+            for, as an Arrow list array; None when each stands for itself.
     """
     if not node.stop_key:
         return None
     if columns is None:
         raise KeyError(
             f"the stop key of {node.alias!r} needs its value columns")
-    positions = arrow_ids(document_ids)
-    return group_ids([columns.column(name).take(positions) for name in node.stop_key])
+    if copies is None:
+        positions = arrow_ids(document_ids)
+        return group_ids([columns.column(name).take(positions)
+                          for name in node.stop_key])
+    if isinstance(copies, pa.ChunkedArray):
+        copies = copies.combine_chunks()
+    positions = arrow_ids(copies.flatten())
+    groups = group_ids([columns.column(name).take(positions)
+                        for name in node.stop_key]).tolist()
+    offsets = copies.offsets.to_numpy()
+    return [tuple(groups[start:end]) for start, end in zip(offsets, offsets[1:])]
 
 
-def filter_inputs(state, node, document_ids) -> dict:
-    """Scheduler inputs for one filter sequence over the given documents."""
-    document_ids = id_positions(document_ids)
+def filter_inputs(state, node, rows) -> dict:
+    """Scheduler inputs for one filter sequence over the given documents.
+
+    Args:
+        state: The query's execution state.
+        node: The AiFilter.
+        rows: The documents it reads, as Rows or ids. Deduplicated Rows
+            carry a COPIES column for a stop key.
+    """
+    copies = (rows.column(COPIES) if isinstance(rows, Rows)
+              and COPIES in rows.column_names else None)
+    document_ids = id_positions(rows)
     return {
         "documents": DocumentPrefixes(
             node.document_head, state["documents"][node.alias], document_ids
@@ -321,7 +343,8 @@ def filter_inputs(state, node, document_ids) -> dict:
         "document_ids": document_ids,
         "limit": state["filter_limit"],
         "stop_groups": stop_groups(
-            node, state.get("columns", {}).get(node.alias), document_ids),
+            node, state.get("columns", {}).get(node.alias), document_ids,
+            copies),
         "num_key_survivors": node.num_key_survivors,
         "document_done": filter_document_sink(node, document_ids),
     }

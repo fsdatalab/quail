@@ -227,12 +227,17 @@ class Oracle:
         survivors = {}
         answers = {}
         for local, document in enumerate(document_ids):
-            # the scheduler skips a stop key group once enough of it survived
-            if groups is not None and survivors.get(groups[local], 0) >= needed:
+            # a document that stands for copies has one group per copy
+            found = (() if groups is None else groups[local]
+                     if isinstance(groups[local], tuple) else (groups[local],))
+            # the scheduler skips a document once each of its stop key
+            # groups has enough survivors
+            if found and all(survivors.get(group, 0) >= needed for group in found):
                 continue
             answers[local] = [self._filter_answer(node, document)]
-            if groups is not None and answers[local][0]:
-                survivors[groups[local]] = survivors.get(groups[local], 0) + 1
+            if answers[local][0]:
+                for group in found:
+                    survivors[group] = survivors.get(group, 0) + 1
         if inputs.get("document_done") is not None:
             # the real loop reports a chunk's finished documents by position
             inputs["document_done"]([

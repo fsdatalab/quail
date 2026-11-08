@@ -990,15 +990,10 @@ fn should_deduplicate(
     if context.backend != "quail" {
         return Ok(None);
     }
-    let mut stop_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut aliases: BTreeSet<String> = BTreeSet::new();
     for node in &graph.nodes {
         match node {
             PhysicalNode::AiFilter(filter) => {
-                stop_keys.insert(
-                    filter.attributes.alias.clone(),
-                    filter.attributes.stop_key.clone(),
-                );
                 aliases.insert(filter.attributes.alias.clone());
             }
             PhysicalNode::AiJoin(join) => {
@@ -1008,13 +1003,12 @@ fn should_deduplicate(
             _ => aliases.extend(node.spec_aliases()),
         }
     }
+    // a key document stands for copies in several stop key groups; the
+    // executor counts each copy's survival in its own group
     let chosen: Map<String, Value> = aliases
         .into_iter()
         .filter(|alias| context.key_documents(alias).is_some())
-        .map(|alias| {
-            let key = stop_keys.get(&alias).cloned().unwrap_or_default();
-            (alias, Value::from(key))
-        })
+        .map(|alias| (alias, Value::Array(Vec::new())))
         .collect();
     if !chosen.is_empty() {
         settings.insert("deduplicate".into(), Value::Object(chosen));
