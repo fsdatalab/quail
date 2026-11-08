@@ -30,11 +30,11 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
     executors = []
     original = StageExecutor._run_one
 
-    def launch(self, groups, decode=None, replays=()):
+    def launch(self, groups, decode=None, replays=(), prefills=()):
         assert len(self.own) <= len(documents)
         executors[:] = [self]
         events.append(("launch", tuple(groups)))
-        return original(self, groups, decode, replays)
+        return original(self, groups, decode, replays, prefills)
 
     def decide(j):
         def keep(a, row):

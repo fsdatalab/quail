@@ -284,7 +284,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             document is admitted; True skips it, so it never runs.
         paged: Whether documents' KV is written to arena pages. False
             runs one stage of one suffix per document as a single
-            causal segment without pages: the filter fast path.
+            causal segment without pages: the filter fast path. A
+            document too long for one pass makes the run paged, so its
+            prefix is written over several passes (chunked prefill).
         unit: The progress unit.
         count_answers: Whether progress counts answers, one per partner
             of each document at each stage, instead of finished documents.

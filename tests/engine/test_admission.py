@@ -645,3 +645,29 @@ def test_a_document_arriving_for_a_finished_stop_group_is_skipped():
     assert not sched.done()
     sched.input_ended()
     assert sched.done()
+
+
+def test_a_document_longer_than_a_pass_prefills_in_pieces_before_its_borrowers():
+    # document 0 needs 100 prefix tokens and a 4-token question on a
+    # 48-token pass: three pieces, then its question; document 1
+    # borrows its first 32 tokens only once every piece has run
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32],
+                      page_tokens=16)
+    sched = JoinAdmission([100, 40], [[4]], 48, arena_pages=100, page_tokens=16,
+                          tree=tree, chunked_prefill=True)
+    passes = []
+    while not sched.done():
+        groups = sched.next_chunk(100)
+        passes.append((groups, sched.take_prefills()))
+        for a, j, start, end, _ in groups:
+            sched.report(a, j, start, end, [1])
+    assert passes == [
+        ([], [(0, 0, 48)]),
+        ([], [(0, 48, 96)]),
+        ([], [(0, 96, 100)]),
+        ([(0, 0, 0, 1, False), (1, 0, 0, 1, True)], []),
+    ]
+    assert sched.borrowing.shared(1) == 32
+    # unpaged, a prefix is never split
+    with pytest.raises(OversizedDocumentError, match="48-token forward pass"):
+        JoinAdmission([100], [[4]], 48, arena_pages=100, page_tokens=16)

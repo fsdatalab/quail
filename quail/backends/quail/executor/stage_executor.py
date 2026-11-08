@@ -235,6 +235,15 @@ class StageExecutor:
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
                             else stage.canvas_rows for stage in self.stages]
 
+        if (not self.paged and not getattr(self.pipeline, "whole_sequences", False)
+                and self.prefix_lengths
+                and max(self.prefix_lengths) + len(self.frames[0])
+                + int(self.suffixes[0].lengths.max(initial=0))
+                + self.canvas_rows[0] > budget):
+            # a document too long for one pass writes its prefix over
+            # several, which needs its KV in pages
+            self.paged = True
+
         # A frame's canvas occupies document pages after the frame.
         frame_max = max(len(f) + (len(self.canvas) if f else 0) for f in self.frames)
         self.capacity_extra = frame_max
@@ -300,6 +309,9 @@ class StageExecutor:
                 reserve=self._reserve if self.paged else None,
                 dependencies=dependencies,
                 input_open=arrivals is not None,
+                # a paged document writes its prefix over several passes
+                # when it is too long for one
+                chunked_prefill=self.paged,
             )
         except OversizedDocumentError as error:
             raise self._oversized(error) from error
@@ -354,6 +366,7 @@ class StageExecutor:
 
         self._held_parents = set()
         self._reserved_parents = {}
+        self._prefill_keys = set()    # keys of prefixes part way written
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
@@ -740,8 +753,13 @@ class StageExecutor:
                 max(self.prefix_lengths[a] + self.capacity_extra, length))
         return pages
 
-    def _build(self, chunk_groups, decode=None, replays=()):
+    def _build(self, chunk_groups, decode=None, replays=(), prefills=()):
         """Pack a chunk and identify each entry's stage and answer row count.
+
+        A chunked prefill piece writes prefix tokens start to end after
+        the KV of the tokens before start, read from the document's own
+        pages, or its parent's for a first piece that borrows, and from
+        the matching recurrent state. It reads no answer.
 
         Returns:
             The chunk, its entries as (stage, answer rows), and the rows
@@ -870,6 +888,19 @@ class StageExecutor:
                 resumed.append(a)
                 firsts.append((sum(n for _, n in entries), a, j))
             entries.append((j, int(bool(len(ids)))))
+        for a, start, end in prefills:
+            key = self.keys[a]
+            parent, shared = self.borrowing.parent(a), self.borrowing.shared(a)
+            if end < self.prefix_lengths[a]:
+                self._prefill_keys.add(key)
+            else:
+                self._prefill_keys.discard(key)
+            specs.append(dict(
+                key=key, prefix=self.prefixes[a][start:end], start=start, f=end,
+                suffixes=Suffixes(np.empty(0, dtype=np.int64), []),
+                borrow_key=(self.keys[parent] if start == shared and shared
+                            else key if start else None),
+                share_points=self.share_points[a]))
         for a, start, end in self.arena.answer_replays(decode):
             q = self.decoder.map[a]
             origin = self.decoder.origin[a]
@@ -1037,12 +1068,15 @@ class StageExecutor:
                                     else "rows")
             log(kind, **detail)
 
-    def _run_part(self, part, decode=None, replays=()):
-        """Run one chunk of groups, halving it when its pages do not fit."""
+    def _run_part(self, part, decode=None, replays=(), prefills=()):
+        """Run one chunk of groups, halving it when its pages do not fit.
+
+        Chunked prefill pieces hold reserved pages and go in the first half.
+        """
         from quail.backends.quail.executor.chunk import ArenaFullError
 
         try:
-            self._run_one(part, decode, replays)
+            self._run_one(part, decode, replays, prefills)
         except ArenaFullError as error:
             # retained KV nothing here reads makes room first
             need = self.arena.page_cost(sum(self._entry_rows(*e) for e in part))
@@ -1051,7 +1085,7 @@ class StageExecutor:
                 logger.info("%s: a forward pass of %d groups ran out of KV; "
                             "freed KV kept for later operators and retried",
                             self.label, len(part))
-                self._run_part(part, decode, replays)
+                self._run_part(part, decode, replays, prefills)
                 return
             if len(part) < 2:
                 raise
@@ -1059,7 +1093,7 @@ class StageExecutor:
             logger.info("%s: a forward pass of %d groups did not fit (%s); "
                         "splitting it in two", self.label, len(part), error)
             half = len(part) // 2
-            self._run_part(part[:half], decode, replays)
+            self._run_part(part[:half], decode, replays, prefills)
             self._run_part(part[half:])
 
     @staticmethod
@@ -1067,7 +1101,8 @@ class StageExecutor:
         """KV tokens decode rows read: alone, beside a shared read, and shared."""
         return read_tokens["alone"], read_tokens["own"], read_tokens["shared"]
 
-    def _count_pass(self, part, tokens, decode, replays, decode_reads=None):
+    def _count_pass(self, part, tokens, decode, replays, decode_reads=None,
+                    prefills=()):
         """Add one pass's tokens, attention pairs, KV reads, and SoL seconds.
 
         A decode row attends to its whole context. Its KV reads are the
@@ -1090,6 +1125,9 @@ class StageExecutor:
             pairs += float(triangle(end) - triangle(start))
             kv_read += start
         prefill = max(0.0, tokens - decode_rows - replay_tokens)
+        for _, start, end in prefills:
+            pairs += float(triangle(end) - triangle(start))
+            kv_read += start
         for a, j, start, end, carried in part:
             rows = self._entry_rows(a, j, start, end, carried)
             # a carried entry's rows count its whole prompt from token 0,
@@ -1109,15 +1147,15 @@ class StageExecutor:
             work["sol_s"] += self.decode_cost.seconds(
                 Work(tokens=float(tokens), pairs=pairs, kv_read=kv_read))
 
-    def _run_one(self, part, decode=None, replays=()):
+    def _run_one(self, part, decode=None, replays=(), prefills=()):
         started = time.perf_counter()
         reads = (None if self.decoder is None
                  else sum(self._decode_reads(self.decoder.read_tokens)))
-        chunk, entries, firsts = self._build(part, decode, replays)
+        chunk, entries, firsts = self._build(part, decode, replays, prefills)
         self.pack_s += time.perf_counter() - started
         if reads is not None:
             reads = sum(self._decode_reads(self.decoder.read_tokens)) - reads
-        self._count_pass(part, chunk.tokens, decode, replays, reads)
+        self._count_pass(part, chunk.tokens, decode, replays, reads, prefills)
         self.tokens += chunk.tokens
         self.pass_rows.append(chunk.tokens)
         self.pass_queued.append(bool(self.sched.pending or self.sched.waiting))
@@ -1135,6 +1173,9 @@ class StageExecutor:
             for a, start, end in replays:
                 stage = int(self.answer_stage[a])
                 by_stage[stage] = by_stage.get(stage, 0) + end - start
+            for a, start, end in prefills:
+                stage = self.sched._stage[a]
+                by_stage[stage] = by_stage.get(stage, 0) + end - start
             if decode is not None:
                 # a decode row counts toward its answer's stage
                 stages = self.answer_stage[decode.slots]
@@ -1143,7 +1184,9 @@ class StageExecutor:
                         by_stage[j] = by_stage.get(j, 0) + count
             self.spans.append((by_stage, chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
-            self.arena.trim_window(key)
+            # a prefix written in pieces keeps its window until written
+            if key not in self._prefill_keys:
+                self.arena.trim_window(key)
         # the earlier passes' readouts finished before this forward pass
         # started, so their answers are decided while the GPU runs it;
         # a readout of many rows launches enough kernels to fill the
@@ -1159,6 +1202,21 @@ class StageExecutor:
             self.decoder.submit(normed, [row for row, _ in firsts],
                                 [a for _, a in firsts], chunk.decode_rows)
         self.outstanding.append(PendingAnswers(part, handles))
+
+    def _prefilled(self, prefills):
+        """Let go of the parents first prefill pieces read.
+
+        Once its first piece has run, a document reads its own pages
+        and state; its parent's hold for it and its read are released.
+        """
+        for a, start, _ in prefills:
+            if start != self.borrowing.shared(a):
+                continue
+            parent = self.borrowing.tree_parent[a]
+            if parent is not None:
+                self.arena.release(self.keys[parent])
+            if a in self._reserved_parents:
+                self.arena.done_reading((self._reserved_parents.pop(a),))
 
     def _take_arrivals(self) -> bool:
         """Ask the arrivals callback for documents; whether any came or input ended."""
@@ -1201,10 +1259,12 @@ class StageExecutor:
             started = time.perf_counter()
             groups = self.sched.next_chunk(
                 self.arena.free_pages if self.paged else 1 << 62, room=room)
+            prefills = self.sched.take_prefills()
             if self.answer_admission is not None:
                 self.admission_s += time.perf_counter() - started
-            if not groups and (decode is not None or replays):
-                self._run_part([], decode, replays)
+            if not groups and (decode is not None or replays or prefills):
+                self._run_part([], decode, replays, prefills)
+                self._prefilled(prefills)
                 continue
             if not groups:
                 if self.outstanding:
@@ -1233,7 +1293,8 @@ class StageExecutor:
                     raise AssertionError("nothing in flight and no document "
                                          "arrived while the input is open")
                 raise AssertionError("nothing buildable and nothing in flight")
-            self._run_part(groups, decode, replays)
+            self._run_part(groups, decode, replays, prefills)
+            self._prefilled(prefills)
             # the packed children hold their parents' pages now
             for a, _, start, _, carried in groups:
                 parent = (self.borrowing.tree_parent[a]

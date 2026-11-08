@@ -60,6 +60,17 @@ Quail limits each batch by token count and available KV memory:
 - The *KV budget* limits the GPU memory used for saved KV. Long documents
   can fill that memory before the token budget is reached.
 
+A document whose prefix and first request exceed the token budget is
+written over several forward passes, as vLLM's chunked prefill does. It
+reserves its KV pages when admitted, and each pass writes the next piece
+of its prefix into those pages, reading the pieces before it. Its first
+request runs in the pass after the last piece. Documents that borrow its
+prefix wait for that pass. On a hybrid model each piece starts from the
+recurrent state the previous piece saved. Only a document whose KV does
+not fit the whole KV budget fails, with an error that names it. A model
+under set attention runs every request as one unpaged sequence, so a
+document there must fit one forward pass.
+
 An operator that requires all its input rows ends a pipeline. Later
 operators wait until those rows are available.
 

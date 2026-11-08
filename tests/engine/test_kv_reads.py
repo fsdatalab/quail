@@ -110,3 +110,72 @@ def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
                   canvas=(99,) if canvas else (), pages=12,
                   sliding_pages=12, budget=200, page_tokens=16)
     check_join_after_join([parent, child], *join_parts(), setup)
+
+
+@pytest.mark.parametrize("path,window,canvas,state_slots", [
+    ("tree", None, (), 0),
+    ("tree", 32, (), 0),
+    ("unified", None, (), 0),
+    ("unified", 32, (99,), 0),
+    ("unified", None, (), 24),
+    ("unified", 32, (), 24),
+], ids=["tree", "tree-sliding", "unified", "sliding-canvas", "hybrid",
+        "hybrid-sliding"])
+def test_a_document_longer_than_a_pass_prefills_over_passes_and_answers_alike(
+        monkeypatch, path, window, canvas, state_slots):
+    """Documents of up to 160 tokens on a 40-token pass, then a roomy one.
+
+    A document longer than two passes writes its prefix over three or
+    more, its KV accumulating in its pages; borrowers wait for it, and
+    the checking model fails any read of a row not yet written.
+    """
+    from quail.backends.quail.executor import chunk as chunk_mod
+
+    cpu_staging(monkeypatch)
+    pieces = {}
+    real_pack = chunk_mod.pack_chunk
+
+    def counting_pack(torch_, arena, specs, **options):
+        for spec in specs:
+            if spec.get("prefix") is not None:
+                pieces[spec["key"]] = pieces.get(spec["key"], 0) + 1
+        return real_pack(torch_, arena, specs, **options)
+
+    monkeypatch.setattr(chunk_mod, "pack_chunk", counting_pack)
+    rng = random.Random(11)
+    documents = corpus(rng, 16, (0, 20, 40), (30, 45, 60))
+    assert max(map(len, documents)) > 80
+    for budget in (40, 400):
+        setup = Setup(path=path, window=window, canvas=canvas, pages=120,
+                      sliding_pages=120, budget=budget, state_slots=state_slots)
+        pieces.clear()
+        named(f"filter budget {budget}", check_filter, documents,
+              [[90, 91, 92, 93], [90, 91, 94]], setup)
+        assert (max(pieces.values()) >= 3) == (budget == 40)
+        named(f"join budget {budget}", check_join, documents, *join_parts(),
+              setup, retain=True)
+        named(f"feed budget {budget}", check_feed, documents, [90, 91, 92],
+              *join_parts(), setup)
+
+
+def test_an_unpaged_filter_writes_a_long_document_in_pages_over_passes(
+        monkeypatch):
+    from helpers.kv_checker import Run, answer, chain, passthrough
+
+    from quail.backends.quail.executor.stages import filter_stages, run_stages
+
+    cpu_staging(monkeypatch)
+    documents = [list(range(100)), [7] * 20]
+    question = [90, 91, 92]
+    answers = {chain(document + question): answer(chain(document + question))
+               for document in documents}
+    run = Run(Setup(path="unified", pages=40, budget=32), answers)
+    got, _, tokens = run_stages(
+        run.torch, run.arena, run.pipeline,
+        filter_stages([question], passthrough()), documents, 32,
+        anchor_keys=[("d", 0), ("d", 1)], paged=False)
+    assert {d: [int(bit) for bit in row] for d, row in got[0].items()} == {
+        d: [answers[chain(document + question)]]
+        for d, document in enumerate(documents)}
+    assert tokens == 100 + 20 + 2 * len(question)
+    assert not run.arena.accounting.owned
