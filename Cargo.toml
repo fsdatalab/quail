@@ -16,15 +16,24 @@ members = [
 # release speed; Quail's own crates rebuild incrementally at opt-level 1.
 # Full debug info for DataFusion's dependency tree takes many gigabytes,
 # and linking it dominates a rebuild; dependencies get none.
+#
+# Quail's crates keep their line tables in the object files
+# (split-debuginfo "off"). "unpacked" wrote a .dwo file per codegen unit,
+# and every incremental rebuild left the old ones in target/debug/deps.
+# On macOS, "off" also leaves debug info in the object files and skips
+# dsymutil, as "unpacked" did. Dependencies keep "unpacked": it is part
+# of their artifact hash, so changing it would recompile all of them,
+# and with debug = false it writes no .dwo files.
 [profile.dev]
 opt-level = 1
 debug = "line-tables-only"
-split-debuginfo = "unpacked"
+split-debuginfo = "off"
 incremental = true
 
 [profile.dev.package."*"]
 opt-level = 3
 debug = false
+split-debuginfo = "unpacked"
 
 # Rebuilding the Python module after an edit recompiles only Quail's
 # crates: incrementally, in many codegen units. Dependencies, compiled
