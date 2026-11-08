@@ -14,7 +14,7 @@ import numpy as np
 
 from quail.backends.quail.coordinator import keyed_shards, merge_results, shard_input
 from quail.backends.quail.executor.memory import merge_memory_reports
-from quail.backends.quail.executor.operators.filter import stop_groups
+from quail.backends.quail.executor.operators.filter import stop_keys
 from quail.backends.quail.graph import graph_report
 from quail.common.pairs import columns_key
 from quail.common.shards import balanced_shards
@@ -45,8 +45,7 @@ class DistributedQuailExecution:
                 # a per-key stop needs a key's documents on one worker
                 documents = self.documents[node.alias]
                 self._place(node.alias, keyed_shards(
-                    stop_groups(node, payload.get("columns", {}).get(node.alias),
-                                range(len(documents))),
+                    stop_keys(payload, node).of(range(len(documents))),
                     [len(document) for document in documents], gpus))
         self.last_compute = compute_subgraph(graph).nodes[-1].node_id
         self.limit = (None if any(isinstance(node, AiJoin) for node in graph.nodes)

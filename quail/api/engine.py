@@ -87,20 +87,24 @@ class Engine:
         return json.dumps(planning_settings(self.session, self._order))
 
     def execute(self, planned: str, tables: dict | None = None,
-                on_rows: Callable | None = None, hint=None) -> pa.Table | None:
+                on_rows: Callable | None = None, hint=None,
+                reader=None) -> pa.Table | None:
         """Run a region Rust planned and return its rows.
 
         Args:
             planned: The planned region as JSON: its physical plan, the
                 operators it lowers, DataFusion's plan of the region, and
                 each scan's files; or its refusal.
-            tables: The rows of each table the region reads, by name.
+            tables: The rows of each table the region reads, by name,
+                except the one ``reader`` reads.
             on_rows: Optional callable(pyarrow Table) handed the region's
                 rows as they finish, each row once; the call then
                 returns None.
-            hint: Optional ``InputHint`` over the region's one input: the
-                tests above the region, by which it may skip rows before
-                the model asks about them.
+            hint: Optional ``InputHint`` over the rows of the tables the
+                region reads: the tests above the region, by which it may
+                skip rows before the model asks about them.
+            reader: Optional ``InputReader`` over the input the region
+                reads as DataFusion produces it.
 
         Raises:
             RefusalError: No configuration can run the region.
@@ -113,7 +117,7 @@ class Engine:
             raise RefusalError(refusal_from_fields(found["refusal"]))
         query = region_query(self.session, found["operators"],
                              logical=found.get("logical", ""), order=self._order,
-                             tables=tables, keep_order=True)
+                             tables=tables, keep_order=True, reader=reader)
         query.adopt_plan(found)
         return self._run(query, on_rows, hint)
 

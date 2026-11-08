@@ -1,7 +1,5 @@
 """Classify documents, or the pairs a join kept, and build their label rows."""
 
-from dataclasses import replace
-
 import numpy as np
 import pyarrow as pa
 
@@ -21,16 +19,34 @@ from quail.backends.quail.reranker import (
 )
 from quail.common.expressions import PROBABILITIES_SUFFIX
 from quail.common.selection import document_positions
-from quail.execution.finished import finished_rows, finished_table, hinted_out
+from quail.execution.finished import finished_rows, finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.labels import DECISION_SCORING
 from quail.progress import answer_sink
+
+
+class Positions:
+    """Each document id's position among ids that may grow as documents arrive.
+
+    Args:
+        ids: The document ids, a sequence the region extends.
+    """
+
+    def __init__(self, ids):
+        self.ids = ids
+        self.found = document_positions(ids)
+        self.seen = len(ids)
+
+    def __call__(self, key) -> int:
+        """The position of an arena key's document."""
+        if len(self.ids) != self.seen:
+            self.found, self.seen = document_positions(self.ids), len(self.ids)
+        return self.found[key[1]]
 
 
 def classification_operator(state: QueryExecutionState, node, ids, chain, inputs):
     """Prepare a classification with the labels its inputs provide."""
-    position = document_positions(ids)
-    plan = ClassifyStages(state, node.spec, len(ids),
-                          lambda key: position[key[1]])
+    plan = ClassifyStages(state, node.spec, len(ids), Positions(ids))
     plan.seeds = ids
     priors, prior_tables = prior_inputs(node, chain, inputs)
     return ClassifyOperator(node, ids, plan, priors, prior_tables=prior_tables)
@@ -53,9 +69,7 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
         ids=partner_ids,
         documents=[documents[partner] for partner in partner_ids],
         kept=kept.of)
-    position = document_positions(ids)
-    plan = ClassifyStages(state, spec, len(ids),
-                          lambda key: position[key[1]], partners=partners)
+    plan = ClassifyStages(state, spec, len(ids), Positions(ids), partners=partners)
     return ClassifyOperator(node, ids, plan, kept=kept)
 
 
@@ -89,14 +103,12 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         return operator
 
     @classmethod
-    def alone(cls, region, operators, table, settings):
-        """Classifications of documents alone skip what the region's hint drops.
+    def streams(cls, node) -> bool:
+        """A classification of documents takes them as they arrive."""
+        return node.spec.partner is None and node.spec.scoring != DECISION_SCORING
 
-        A skipped document gets no label from any of them, so it has no row.
-        """
-        if any(operator.plan.partners is not None for operator in operators):
-            return settings
-        return replace(settings, skip=hinted_out(table.keys))
+    def add_documents(self, count):
+        self.plan.add_documents(count)
 
     def __init__(self, node, ids, plan: ClassifyStages, priors=(), kept=None,
                  prior_tables=()):

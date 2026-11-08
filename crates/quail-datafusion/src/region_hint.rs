@@ -55,6 +55,22 @@ impl RegionHint {
         })
     }
 
+    /// The tables whose passed-on columns a test reads, in the order
+    /// the tests first read them.
+    pub fn tables(&self, columns: &RegionColumns) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for test in &self.tests {
+            for column in collect_columns(test) {
+                if let Some(RegionColumn::Source(table, _)) = columns.0.get(column.index())
+                    && !found.contains(table)
+                {
+                    found.push(table.clone());
+                }
+            }
+        }
+        found
+    }
+
     /// Whether each row of `rows`, rows of the table `input` the region
     /// reads, may still pass every test as the tests are now.
     ///
@@ -99,13 +115,29 @@ impl RegionColumns {
     /// Read a region's columns from its plan: each column passed on
     /// from a table, each AI.SCORE answer between 0 and 1, and every
     /// other answer.
+    ///
+    /// A name two of the region's columns share, such as `id` of two
+    /// joined tables, is an answer of any value: DataFusion's filter
+    /// pushdown binds a test's column by name, so the test may read
+    /// either column.
     pub fn of(region: &ModelRegion) -> Self {
         let schema = region.plan.schema();
         let scores = score_columns(&region.plan);
+        let shared = |name: &String| {
+            schema
+                .fields()
+                .iter()
+                .filter(|field| field.name() == name)
+                .count()
+                > 1
+        };
         RegionColumns(
             schema
                 .iter()
                 .map(|(qualifier, field)| {
+                    if shared(field.name()) {
+                        return RegionColumn::Answer;
+                    }
                     let column = LogicalColumn::new(qualifier.cloned(), field.name());
                     if let Some((table, position)) = passed_on(region, &region.plan, &column) {
                         return RegionColumn::Source(table, position);

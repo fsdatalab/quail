@@ -386,3 +386,29 @@ def test_a_join_with_a_small_build_side_skips_probe_rows_whose_key_is_absent():
     # the join's keys are complete before the region starts
     assert sorted(every.asked) == [("r", 3), ("r", 7)]
     context.session.close()
+
+
+def test_a_top_k_over_a_join_skips_the_anchors_past_its_threshold():
+    # the tables' id columns have different names: a test above the
+    # region reads a column by its name
+    text = ("SELECT r.id, t.tid FROM reviews r JOIN topics t "
+            "ON AI_FILTER(PROMPT('q4: {0} {1}', r.body, t.topic)) "
+            "ORDER BY t.tid LIMIT 1")
+    asked = []
+
+    def joins(node, assignment):
+        asked.append(assignment["t"])
+        return True
+
+    # the join's anchor is the topic; once t0's pairs are in, the sort
+    # holds its one row and tightens
+    oracle = Oracle(joins=joins, tightens_after={0})
+    context = _reviews_context(oracle, 12)
+    topics = pa.table({"tid": ["t0", "t1", "t2"],
+                       "topic": ["ending", "pacing", "cast"]})
+    context.register("topics", quail.DocumentProvider.from_table(topics, id_col="tid"))
+    assert "ModelRegionExec: hint=[DynamicFilter" in context._native.explain(text)
+    assert [row[1] for row in _rows(context.sql(text))] == ["t0"]
+    # t1 and t2 are past the top row
+    assert sorted(set(asked)) == [0]
+    context.session.close()

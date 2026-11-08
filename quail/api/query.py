@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import asdict, replace
+from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import _quail_native
@@ -16,6 +17,7 @@ from quail.api.region_inputs import input_scans
 from quail.common.expressions import CompileError
 from quail.common.pairs import FIRST_DOCUMENT, columns_key
 from quail.common.tokens import ColumnStore, ScanInput, TokenStore
+from quail.execution.arrivals import Arrivals
 from quail.execution.finished import finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
 from quail.execution.result import QueryResult
@@ -322,6 +324,8 @@ class RegionQuery:
         self.source_rows = {}
         # each input that holds a registered table whole: its identity
         self.input_identities = {}
+        # each input read as it arrives: its Arrivals, by scan alias
+        self.arrivals = {}
 
     def facts(self, operators: str | None = None) -> dict:
         """Return what Rust reads from the region's operators, once per value.
@@ -372,7 +376,13 @@ class RegionQuery:
     def _adopt_scans(self, found: dict) -> None:
         """Read the token store and column files Rust wrote as the inputs."""
         self._token_inputs, self._document_tokens = {}, {}
+        for alias, arrivals in self.arrivals.items():
+            self._token_inputs[alias] = arrivals
+            self._document_tokens[alias] = arrivals.lengths
         for alias, files in found["scans"].items():
+            if alias in self.arrivals:
+                # the files Rust planned an arriving input from are not its rows
+                continue
             store = TokenStore(files["tokens"])
             self._token_inputs[alias] = ScanInput(store, {
                 name: ColumnStore(path) for name, path in files["columns"]})
@@ -473,6 +483,10 @@ class RegionQuery:
             raise RefusalError(plan)
         plan.graph.validate(runtime_keys=set(self.session.registry.runtimes))
         plan.graph.validate_backend(plan.backend)
+        for alias, arrivals in self.arrivals.items():
+            if alias in plan.settings.get("deduplicate", {}):
+                # a table's copies are found over every row
+                arrivals.wait()
         inputs = {}
         documents = {scan["alias"]: decode_plan_value(json.dumps(scan["column"]))
                      for scan in self.facts()["scans"]}
@@ -481,15 +495,12 @@ class RegionQuery:
                 continue
             store = self._token_inputs[node.alias]
             column = documents[node.alias]
-            inputs[node.input_id] = document_input(
-                store.tokens,
-                (
-                    column.evaluate(store)
-                    if {ref.column for ref in column.references}
-                    <= set(store.projected_columns)
-                    else None
-                ),
-            )
+            texts = None
+            if ({ref.column for ref in column.references}
+                    <= set(store.projected_columns)):
+                texts = (store.texts(column) if isinstance(store, Arrivals)
+                         else column.evaluate(store))
+            inputs[node.input_id] = document_input(store.tokens, texts)
         envelope = plan.to_envelope()
         source_rows = self._alias_source_rows()
         return PhysicalRequest(envelope, inputs, self._column_tables(),
@@ -517,6 +528,10 @@ class RegionQuery:
         tables = {}
         for alias, columns in needed.items():
             store = self._token_inputs[alias]
+            if isinstance(store, Arrivals) and alias not in deduplicated:
+                # an input's columns grow as its rows arrive
+                tables[columns_key(alias)] = store
+                continue
             values = {name: store.column(name) for name in columns}
             if alias in deduplicated:
                 values[FIRST_DOCUMENT] = store.tokens.first_documents_with(
@@ -532,8 +547,11 @@ class RegionQuery:
                 of rows as it is built, each row once.
         """
         request = self._answer_request(self.plan(), returned=True)
-        return _quail_native.FinishedRows(json.dumps(request), self._source_values,
-                                          on_rows)
+        finished = _quail_native.FinishedRows(json.dumps(request), self._source_values,
+                                              on_rows)
+        for alias, arrivals in self.arrivals.items():
+            arrivals.listeners.append(partial(_add_documents, finished, alias))
+        return finished
 
     def finish(self, response, coordinator_wall: float = 0.0,
                finished=None) -> QueryResult:
@@ -661,6 +679,18 @@ class RegionQuery:
                                    for alias, table in survivors}
         result.true_join_tables = dict(true_joins)
         result.report["stages"] = json.loads(stages)
+
+
+def _add_documents(finished, alias: str, columns: pa.Table) -> None:
+    """Hand FinishedRows the rows of an input that just arrived.
+
+    Args:
+        finished: The region's FinishedRows.
+        alias: The scan alias whose documents the input holds.
+        columns: The input columns of the rows that arrived.
+    """
+    finished.add_documents(alias, columns.num_rows, lambda name, expression: pa.table(
+        {name: decode_plan_value(expression).evaluate(columns)}))
 
 
 def _output_tables(outputs) -> dict:

@@ -31,7 +31,7 @@ from quail.common.tokens import DocumentPrefixes, concat_tokens
 from quail.execution.finished import (
     finished_rows,
     finished_table,
-    hinted_alias,
+    hinting,
     keeps,
 )
 from quail.execution.ids import id_positions
@@ -114,17 +114,19 @@ def candidate_rows(node, inputs):
 def hinted_rows(node, rows: ScoreRows):
     """Callable(row position) -> whether the region's hint drops the row, or None.
 
-    Only a score of one table's documents, the table the region's hint
-    covers, skips rows.
+    A row is dropped when the hint drops the document of any of its
+    tables.
     """
-    alias = node.spec.aliases[0]
-    if (rows.product or len(node.spec.aliases) != 1
-            or alias != hinted_alias()):
+    if not hinting():
         return None
-    documents = rows.columns[0]
+    aliases = node.spec.aliases
+    width = len(rows.columns[-1])
 
     def skip(position):
-        return not keeps(alias, int(documents[position]))
+        places = ((position // width, position % width) if rows.product
+                  else (position,) * len(aliases))
+        return not all(keeps(alias, int(documents[place])) for alias, documents, place
+                       in zip(aliases, rows.columns, places))
 
     return skip
 

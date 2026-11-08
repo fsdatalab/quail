@@ -200,13 +200,11 @@ impl Planner {
                 .iter()
                 .map(|alternative| &alternative.operators),
         );
-        // AI.EXTRACT places its answers in its documents' text by the
-        // character range of each token
-        let extracted: Vec<String> = alternatives
-            .iter()
-            .flat_map(|alternative| &alternative.operators.extracts)
-            .flat_map(|extract| quail_planner::expressions::call_aliases(&extract.call))
-            .collect();
+        let extracted = extracted_aliases(
+            alternatives
+                .iter()
+                .map(|alternative| &alternative.operators),
+        );
         if scans.iter().any(|scan| match &scan.column {
             ScanColumn::Unnamed(_) => false,
             ScanColumn::Expression(expression) => !is_column(expression),
@@ -494,9 +492,20 @@ fn scans_of<'a>(alternatives: impl Iterator<Item = &'a Operators>) -> Vec<Scan> 
     found
 }
 
+/// The aliases whose token stores hold each token's character range:
+/// AI.EXTRACT places its answers in its documents' text by them.
+pub(crate) fn extracted_aliases<'a>(
+    alternatives: impl Iterator<Item = &'a Operators>,
+) -> Vec<String> {
+    alternatives
+        .flat_map(|operators| &operators.extracts)
+        .flat_map(|extract| quail_planner::expressions::call_aliases(&extract.call))
+        .collect()
+}
+
 /// The text of a scan's document column in one batch, the column
 /// built as `built` when it is an expression.
-fn document_texts(
+pub(crate) fn document_texts(
     column: &ScanColumn,
     built: Option<&PhysicalValue>,
     batch: &RecordBatch,
@@ -613,7 +622,7 @@ fn estimate_pair_fraction(left: &[ArrayRef], right: &[ArrayRef]) -> Result<f64, 
 
 /// The table column a document reads, or a struct column it reads a
 /// field of.
-fn source_column(column: &ScanColumn) -> Option<String> {
+pub(crate) fn source_column(column: &ScanColumn) -> Option<String> {
     fn root(expression: &ValueExpression) -> Option<String> {
         match expression {
             ValueExpression::ColumnRef(column) => Some(column.column.clone()),

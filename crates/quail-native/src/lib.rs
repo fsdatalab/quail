@@ -896,6 +896,8 @@ fn one_batch(table: &Bound<'_, PyAny>) -> PyResult<datafusion::arrow::array::Rec
 struct NativeFinishedRows {
     rows: quail::finished::FinishedRows,
     on_rows: Option<Py<PyAny>>,
+    /// Each source column's name, expression as JSON, and alias.
+    sources: Vec<(String, String, String)>,
 }
 
 #[pymethods]
@@ -909,16 +911,45 @@ impl NativeFinishedRows {
     ) -> PyResult<Self> {
         let request: quail::results::AnswerRequest = from_json(request)?;
         let found: quail_planner::operators::Operators = from_json(&request.operators)?;
-        let mut sources = std::collections::HashMap::new();
+        let mut sources = Vec::new();
         for (name, expression) in quail_planner::results::source_columns(&found) {
+            let alias = quail_planner::expressions::column_references(&expression)
+                .into_iter()
+                .next()
+                .map(|column| column.alias)
+                .unwrap_or_default();
             let expression = serde_json::to_string(&expression)
                 .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-            let values = one_batch(&evaluate.call1((&name, expression))?)?;
-            sources.insert(name, std::sync::Arc::clone(values.column(0)));
+            sources.push((name, expression, alias));
         }
-        let rows = quail::finished::FinishedRows::new(&request, &sources)
+        let values = evaluated(&sources, &evaluate, None)?;
+        let rows = quail::finished::FinishedRows::new(&request, &values)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        Ok(NativeFinishedRows { rows, on_rows })
+        Ok(NativeFinishedRows {
+            rows,
+            on_rows,
+            sources,
+        })
+    }
+
+    /// Take `count` more documents of `alias`, numbered after the ones
+    /// before; `evaluate(name, expression)` returns a source column's
+    /// values for them, as the constructor's does for every document.
+    /// Hand the region rows they complete to `on_rows`, and return how
+    /// many.
+    fn add_documents(
+        &mut self,
+        py: Python<'_>,
+        alias: &str,
+        count: usize,
+        evaluate: Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
+        let values = evaluated(&self.sources, &evaluate, Some(alias))?;
+        let built = self
+            .rows
+            .add_documents(alias, count, &values)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        self.hand_on(py, built)
     }
 
     /// Whether the rows read the reports of a node's port.
@@ -976,6 +1007,24 @@ impl NativeFinishedRows {
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         to_pyarrow(py, rows.schema(), vec![rows])
     }
+}
+
+/// Each source column's values, by name, from `evaluate(name,
+/// expression)`: every source column's, or those of one alias.
+fn evaluated(
+    sources: &[(String, String, String)],
+    evaluate: &Bound<'_, PyAny>,
+    alias: Option<&str>,
+) -> PyResult<std::collections::HashMap<String, datafusion::arrow::array::ArrayRef>> {
+    let mut values = std::collections::HashMap::new();
+    for (name, expression, found) in sources {
+        if alias.is_some_and(|alias| alias != found) {
+            continue;
+        }
+        let batch = one_batch(&evaluate.call1((name, expression))?)?;
+        values.insert(name.clone(), std::sync::Arc::clone(batch.column(0)));
+    }
+    Ok(values)
 }
 
 impl NativeFinishedRows {

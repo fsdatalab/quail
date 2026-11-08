@@ -9,6 +9,7 @@ import pyarrow as pa
 from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.retention import apply_retention
 from quail.common.pairs import columns_key
+from quail.execution.arrivals import Arrivals
 from quail.execution.metrics import NodeResult, scalar_node_metrics
 from quail.execution.runner import (
     ExecutionContext,
@@ -75,8 +76,9 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     retention = payload.get("retention", {})
     apply_retention(arena, retention, retention.get("initial", {}))
     documents = state["documents"]
+    # an input read as it arrives is its own source while it grows
     sources = {
-        alias: range(len(tokens))
+        alias: tokens if isinstance(tokens, Arrivals) else range(len(tokens))
         for alias, tokens in documents.items()
     }
     for alias, table in state.get("columns", {}).items():

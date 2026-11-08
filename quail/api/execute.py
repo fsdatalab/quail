@@ -112,7 +112,8 @@ def execute_query(query, physical_executor=None, plan=None,
             immediately before query execution.
         on_rows: Optional callable(pyarrow Table) handed a model region's
             rows as they finish, each row once.
-        hint: Optional ``InputHint`` the region may skip input rows by.
+        hint: Optional ``InputHint`` the region may skip the rows of the
+            tables it reads by.
     """
     from quail.api.query import Query
 
@@ -219,10 +220,8 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
     finished = query.finished_rows(on_rows)
     if has_compute:
         # with no one taking rows as they finish, they are built at the end
-        alias = None if hint is None else next(
-            (scan["alias"] for scan in query.facts()["scans"]
-             if scan["provider"] == hint.table), None)
-        with reporting(None if on_rows is None else finished, hint, alias):
+        tables = {scan["alias"]: scan["provider"] for scan in query.facts()["scans"]}
+        with reporting(None if on_rows is None else finished, hint, tables):
             response = (physical_executor(request) if physical_executor is not None
                         else _execute_physical(request, query.session.registry))
     else:

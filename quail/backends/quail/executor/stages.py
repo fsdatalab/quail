@@ -315,11 +315,12 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             answer_tokens, or None. A document's row at such a stage is
             reported once its answer ends; until then the decoder packs
             one row for it per pass.
-        arrivals: Optional callable(StageExecutor) asked before each
-            forward pass, and whenever nothing is in flight, while the
-            input is open. It may queue documents with add_documents
-            and end the input with input_ended. None ends the input
-            with the documents given.
+        arrivals: Optional callable(StageExecutor, block) asked before
+            each forward pass, and whenever nothing is in flight, while
+            the input is open; block is True when nothing is in flight,
+            so it may wait for documents. It may queue documents with
+            add_documents and end the input with input_ended. None ends
+            the input with the documents given.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is

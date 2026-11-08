@@ -19,6 +19,7 @@
 
 mod engine;
 pub mod finished;
+mod input;
 pub mod planning;
 pub mod pyarrow;
 pub mod results;

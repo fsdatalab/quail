@@ -22,6 +22,7 @@ from quail.backends.quail.executor.stages import Stage, frame_writes
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.common.expressions import effective_selectivity
 from quail.common.tokens import prefix_tree
+from quail.execution.arrivals import Arrivals
 from quail.physical import AiFilter, AiJoin, Filter, ValueType
 from quail.progress import logger
 
@@ -63,7 +64,8 @@ def prior_inputs(node, operators, inputs):
         if port.value_type is ValueType.ROWS:
             if port.source.node_id in by_node:
                 priors.append((by_node[port.source.node_id], port.source))
-            else:
+            elif not isinstance(inputs[port.name], Arrivals):
+                # an input read as it arrives is a scan's rows: ids alone
                 prior_tables.append(inputs[port.name])
     return priors, prior_tables
 
@@ -100,8 +102,6 @@ class ModelOperator(ABC):
     # the computed columns a later condition may test
     tested_columns: tuple = ()
     combine: ClassVar[bool] = False
-    # whether a document skipped before it runs is one this operator drops
-    drops_documents = False
     appended_tokens = 0
     # the frame tokens the operator's first stage writes; 0 when the
     # stage before it left the same frame
@@ -113,6 +113,22 @@ class ModelOperator(ABC):
     answer_dependencies = ()
     # the documents pushed into the operator so far
     pushed = 0
+
+    @classmethod
+    def streams(cls, node) -> bool:
+        """Whether the operator for node takes documents while the GPU loop runs.
+
+        A chain streams an input as it arrives only when each of its
+        operators does; add_documents then makes room for each batch.
+        """
+        return False
+
+    def add_documents(self, count: int) -> None:
+        """Make room for count more documents of the region's table.
+
+        The region's document ids, which the operator holds, have grown
+        by count already; the documents are pushed after.
+        """
 
     @classmethod
     def build(cls, region, nodes, chain):
@@ -304,7 +320,7 @@ def _prepare(gates, prepare):
     return prepared
 
 
-def gated_stages(operators) -> list:
+def gated_stages(operators, gate=None) -> list:
     """Combine operator stages and attach conditions to the stages after them.
 
     Args:
@@ -312,6 +328,9 @@ def gated_stages(operators) -> list:
             without stages contribute a condition checked before the
             next stage, or before the document completes when no stage
             follows.
+        gate: A condition checked before each operator's first stage
+            after the chain's first stage, such as the region's hint,
+            or None.
 
     Returns:
         The combined Stage list, with conditions attached to stage requests.
@@ -334,15 +353,16 @@ def gated_stages(operators) -> list:
             dependencies.extend(operator.answer_dependencies)
             continue
         first = operator.stages[0]
+        gates = tuple(pending) + ((gate,) if gate is not None and stages else ())
         if pending:
             first.answer_dependencies = tuple(dict.fromkeys(dependencies))
             dependencies = []
-            gates = tuple(pending)
+        if gates:
             asked = first.suffixes if first.own_suffixes else first.requests
 
             def guarded(key, gates=gates, asked=asked):
-                for gate in gates:
-                    if gate.gate(key) is Stage.DROP:
+                for condition in gates:
+                    if condition.gate(key) is Stage.DROP:
                         return Stage.DROP
                 return None if asked is None else asked(key)
 

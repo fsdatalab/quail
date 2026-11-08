@@ -3,7 +3,6 @@
 import json
 import os
 import time
-from bisect import bisect_right
 from functools import partial
 from itertools import groupby
 
@@ -24,6 +23,7 @@ from quail.backends.quail.executor.stages import (
     question_ends,
     state_share_points,
 )
+from quail.common.tokens import DocumentBatches
 from quail.progress import Progress, logger
 
 ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
@@ -106,30 +106,6 @@ def lowest_borrows(borrowing):
             shared = borrowing.tree_shared[document]
             lowest[parent] = min(lowest.get(parent, shared), shared)
     return lowest
-
-
-class DocumentBatches:
-    """Token sequences that arrive in batches, indexed as one sequence."""
-
-    def __init__(self, first):
-        self.batches = [first]
-        self.starts = [0]
-        self.total = len(first)
-
-    def add(self, batch):
-        """Append a batch after the sequences so far."""
-        self.batches.append(batch)
-        self.starts.append(self.total)
-        self.total += len(batch)
-
-    def __len__(self):
-        return self.total
-
-    def __getitem__(self, index):
-        if not 0 <= index < self.total:
-            raise IndexError(index)
-        batch = bisect_right(self.starts, index) - 1
-        return self.batches[batch][index - self.starts[batch]]
 
 
 class StageExecutor:
@@ -1220,12 +1196,17 @@ class StageExecutor:
             if a in self._reserved_parents:
                 self.arena.done_reading((self._reserved_parents.pop(a),))
 
-    def _take_arrivals(self) -> bool:
-        """Ask the arrivals callback for documents; whether any came or input ended."""
+    def _take_arrivals(self, block: bool = False) -> bool:
+        """Ask the arrivals callback for documents; whether any came or input ended.
+
+        Args:
+            block: Whether the run has nothing else to do, so the
+                callback may wait for documents or the input's end.
+        """
         if self.arrivals is None or not self.sched.input_open:
             return False
         seen = len(self.keys)
-        self.arrivals(self)
+        self.arrivals(self, block)
         return len(self.keys) > seen or not self.sched.input_open
 
     def run(self):
@@ -1285,7 +1266,7 @@ class StageExecutor:
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):
                     continue
-                if self._take_arrivals():
+                if self._take_arrivals(block=True):
                     continue
                 # parents freed but held for queued children hold the
                 # pages: the children pack their whole prefixes

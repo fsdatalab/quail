@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
+from quail.execution.arrivals import Arrivals
 from quail.execution.deduplicate import deduplicate
 from quail.execution.finished import finished_rows, finished_table, held
 from quail.execution.guard import guarded
@@ -17,6 +18,7 @@ from quail.physical import (
     PhysicalGraph,
     PhysicalNode,
     PortRef,
+    Scan,
 )
 
 
@@ -108,16 +110,39 @@ class GenericRunner:
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
         pipelines = graph.pipelines(completed) if context.run_pipeline else {}
         ordered = graph.topological_nodes()
+        # the scans of inputs read as they arrive, until they have ended
+        arriving = {node.node_id: node for node in ordered
+                    if isinstance(node, Scan)
+                    and isinstance(context.sources.get(node.input_id), Arrivals)}
+
+        def scan_arrived(node_id):
+            """Read an arriving input to its end, then record its scan."""
+            scan = arriving.pop(node_id)
+            context.sources[scan.input_id].wait()
+            started = time.perf_counter()
+            record(scan, context.runtimes[scan.runtime_key].execute(
+                scan, {}, context), started)
+
         for node in ordered:
+            if node.node_id in arriving:
+                # scanned once a node reads it whole, or at the end
+                continue
             pipeline = pipelines.get(node.node_id)
             if pipeline is not None:
                 if node is not pipeline[-1]:
                     continue
                 inside = {member.node_id for member in pipeline}
+                read = {port.source.node_id for member in pipeline
+                        for port in member.inputs if port.source.node_id in arriving}
+                streamed = _streamed(pipeline, read, context)
+                for scan_id in read - {streamed}:
+                    scan_arrived(scan_id)
                 inputs = {
                     member.node_id: {
-                        port.name: values[(port.source.node_id,
-                                           port.source.port)]
+                        port.name: (
+                            context.sources[arriving[streamed].input_id]
+                            if port.source.node_id == streamed
+                            else values[(port.source.node_id, port.source.port)])
                         for port in member.inputs
                         if port.source.node_id not in inside}
                     for member in pipeline}
@@ -132,6 +157,9 @@ class GenericRunner:
                         pipeline,
                         inputs if deduplicated is None else deduplicated.inputs,
                         context)
+                if streamed is not None:
+                    # the pipeline read the input to its end
+                    scan_arrived(streamed)
                 if deduplicated is not None:
                     results = deduplicated.expanded(results)
                 if guard is not None:
@@ -158,6 +186,9 @@ class GenericRunner:
                     (initial_metrics or {}).get(node.node_id, NodeMetrics()),
                 )
             else:
+                for input_port in node.inputs:
+                    if input_port.source.node_id in arriving:
+                        scan_arrived(input_port.source.node_id)
                 inputs = {
                     input_port.name: values[
                         (input_port.source.node_id, input_port.source.port)
@@ -185,11 +216,36 @@ class GenericRunner:
                 continue
             record(node, result)
 
+        for node_id in tuple(arriving):
+            scan_arrived(node_id)
         root = (graph.root.node_id, graph.root.port)
         metrics = NodeMetrics()
         for node in graph.topological_nodes():
             metrics = metrics + node_results[node.node_id].metrics
         return RunResult(values[root], node_results, metrics)
+
+
+def _streamed(pipeline, read, context) -> str | None:
+    """The arriving scan a pipeline reads while its rows arrive, or None.
+
+    Its first node alone reads it, and no node needs every row first, as
+    a guard or a deduplicated table does.
+
+    Args:
+        pipeline: The pipeline's nodes, in order.
+        read: The ids of the arriving scans the pipeline reads.
+        context: The execution context.
+    """
+    if len(read) != 1 or context.deduplicate:
+        return None
+    (scan_id,) = read
+    readers = [member for member in pipeline for port in member.inputs
+               if port.source.node_id == scan_id]
+    guards = any(getattr(member, name, None) is not None for member in pipeline
+                 for name in ("guard", "alternative", "answer"))
+    if readers != [pipeline[0]] or guards:
+        return None
+    return scan_id
 
 
 def _renumbered(guard, deduplicated):

@@ -8,7 +8,7 @@ import quail
 from quail.api.config import EngineConfig
 from quail.api.execute import execute_query
 from quail.backends.quail.distributed import execute_distributed_graph
-from quail.backends.quail.executor.operators.filter import stop_groups
+from quail.backends.quail.executor.operators.filter import filter_stop_groups
 from quail.backends.quail.worker import quail_runtime_payload
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
@@ -71,8 +71,7 @@ class FixedWorkers:
                                        else source).tolist()
                 if isinstance(node, AiFilter):
                     self.filter_limits.append(sub["limit"])
-                    groups = stop_groups(node, sub.get("query", {}).get(
-                        "columns", {}).get("c"), ids)
+                    groups = filter_stop_groups(sub.get("query", {}), node, ids)
                     if groups is not None:
                         firsts = {}
                         for document, group in zip(ids, groups):

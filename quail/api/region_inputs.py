@@ -22,6 +22,7 @@ from quail.catalog import (
     ScanRequest,
     table_name,
 )
+from quail.execution.arrivals import Arrivals
 
 # planning before a run assumes this many rows of this many tokens each
 ASSUMED_INPUT_ROWS = 1_000
@@ -66,7 +67,7 @@ def source_rows(catalog, name: str, table) -> pa.Array | None:
 
 
 def region_query(session, operators: str, *, tables: dict | None = None,
-                 keep_order: bool = False, **options):
+                 keep_order: bool = False, reader=None, **options):
     """Return the RegionQuery for a model region, over its input tables.
 
     Args:
@@ -76,6 +77,8 @@ def region_query(session, operators: str, *, tables: dict | None = None,
             to plan before the inputs exist.
         keep_order: Read each input in the order given, as a plan Rust
             made over these rows expects, rather than in the table's order.
+        reader: Rust's InputReader over the input the region reads as
+            it arrives, or None.
         **options: Passed to RegionQuery.
 
     Returns:
@@ -90,8 +93,12 @@ def region_query(session, operators: str, *, tables: dict | None = None,
     providers = dict(session.catalog.providers)
     assumed = {}
     rows, identities = {}, {}
+    arrivals = {}
     for name, scan in scans.items():
-        if tables is not None and name in tables:
+        if reader is not None and name == reader.table:
+            arrivals[scan["alias"]] = Arrivals(reader)
+            table = scan_schema(scan).empty_table()
+        elif tables is not None and name in tables:
             table = tables[name]
             found = source_rows(session.catalog, name, table)
             if found is not None and keep_order:
@@ -116,4 +123,5 @@ def region_query(session, operators: str, *, tables: dict | None = None,
                         **options)
     query.source_rows = rows
     query.input_identities = identities
+    query.arrivals = arrivals
     return query

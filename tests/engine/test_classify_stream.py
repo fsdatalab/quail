@@ -24,6 +24,7 @@ from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
+from quail.execution.arrivals import Arrivals
 from quail.execution.finished import reporting
 from quail.physical import (
     AiClassify,
@@ -603,8 +604,16 @@ RECORDED_CHUNKS = {
 }
 
 
-def _run_recorded_region(monkeypatch, region):
-    """Run one region of RECORDED_CHUNKS; return its report and its model."""
+def _run_recorded_region(monkeypatch, region, batches=None):
+    """Run one region of RECORDED_CHUNKS; return its report and its model.
+
+    Args:
+        monkeypatch: The test's monkeypatch.
+        region: The region's name in RECORDED_CHUNKS.
+        batches: The sizes of the batches r's documents arrive in, as an
+            input read as DataFusion produces it, or None for every
+            document at once.
+    """
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     from quail.backends.quail.executor import label_stages as label_stages_module
 
@@ -630,6 +639,9 @@ def _run_recorded_region(monkeypatch, region):
     model = ScoringModel(filter_truth if region in ("filter", "filters", "fused")
                          else [], join_truth,
                          label_truth, joined_truth)
+    if batches is not None:
+        model.reader = BatchReader(documents["r"], batches, model)
+        documents["r"] = Arrivals(model.reader)
     torch = fake_torch()
     torch.nn = SimpleNamespace(functional=None)
     arena = cpu_arena(64)
@@ -686,6 +698,44 @@ def _run_recorded_region(monkeypatch, region):
     return result, model
 
 
+class BatchReader:
+    """Hand on documents in batches, as Rust's InputReader hands on an input.
+
+    A batch arrives once the model launched a forward pass since the last
+    batch, or when the GPU loop waits for one.
+
+    Args:
+        documents: Every document's tokens.
+        sizes: The number of documents in each batch.
+        model: The model whose forward passes are counted.
+
+    Attributes:
+        passes: The forward passes launched before each batch arrived.
+    """
+
+    schema = pa.schema([("id", pa.int32())])
+
+    def __init__(self, documents, sizes, model):
+        self.documents = documents
+        ends = np.cumsum(sizes)
+        self.batches = [range(end - size, end) for size, end in zip(sizes, ends)]
+        self.model = model
+        self.ended = False
+        self.passes = []
+
+    def next(self, block):
+        if not self.batches:
+            self.ended = True
+            return None
+        if not block and self.passes and len(self.model.launched) == self.passes[-1]:
+            return None
+        batch = self.batches.pop(0)
+        self.passes.append(len(self.model.launched))
+        ids = pa.array(batch, pa.int32())
+        tokens = pa.array([self.documents[d] for d in batch], pa.large_list(pa.int32()))
+        return ids, tokens, None, pa.table({"id": ids})
+
+
 def _recorded(result, model) -> tuple:
     """The chunks, their digest, fresh tokens, and output digest of a run."""
     import hashlib
@@ -708,6 +758,17 @@ def test_each_region_packs_the_chunks_it_packed_before_streaming(
         monkeypatch, region):
     assert _recorded(*_run_recorded_region(monkeypatch, region)) \
         == RECORDED_CHUNKS[region]
+
+
+@pytest.mark.parametrize("region", ["filters", "classifies"])
+def test_a_region_starts_asking_before_its_input_ends(monkeypatch, region):
+    streamed, model = _run_recorded_region(monkeypatch, region, batches=[3, 5, 6])
+    # every batch after the first arrived once the model had run a pass
+    assert model.reader.passes[0] == 0
+    assert all(passes > 0 for passes in model.reader.passes[1:])
+    # the same rows as with every document at once
+    whole = _recorded(*_run_recorded_region(monkeypatch, region))
+    assert _recorded(streamed, model)[3] == whole[3]
 
 
 def test_a_score_hands_on_each_row_once_its_request_is_answered(monkeypatch):
@@ -743,17 +804,21 @@ def test_a_score_hands_on_each_row_once_its_request_is_answered(monkeypatch):
                for d in range(14)) > 1
 
 
+class EvenDocuments:
+    """A region's hint that keeps the even documents of reviews, read as r."""
+
+    def generation(self):
+        return 0
+
+    def tables(self):
+        return ["reviews"]
+
+    def keep(self, table):
+        return [d % 2 == 0 for d in range(14)]
+
+
 def test_a_classification_alone_skips_the_documents_the_hint_drops(monkeypatch):
-    class EvenDocuments:
-        """A region's hint that keeps the even documents of r."""
-
-        def generation(self):
-            return 0
-
-        def keep(self):
-            return [d % 2 == 0 for d in range(14)]
-
-    with reporting(None, EvenDocuments(), "r"):
+    with reporting(None, EvenDocuments(), {"r": "reviews"}):
         result, model = _run_recorded_region(monkeypatch, "classify")
     labeled = result["_outputs"][PortRef("classify:r", "rows:r")]
     assert labeled.column("r").to_pylist() == list(range(0, 14, 2))
@@ -764,16 +829,7 @@ def test_a_classification_alone_skips_the_documents_the_hint_drops(monkeypatch):
 
 def test_a_chain_of_classifications_alone_skips_the_documents_the_hint_drops(
         monkeypatch):
-    class EvenDocuments:
-        """A region's hint that keeps the even documents of r."""
-
-        def generation(self):
-            return 0
-
-        def keep(self):
-            return [d % 2 == 0 for d in range(14)]
-
-    with reporting(None, EvenDocuments(), "r"):
+    with reporting(None, EvenDocuments(), {"r": "reviews"}):
         result, _ = _run_recorded_region(monkeypatch, "classifies")
     labeled = result["_outputs"][PortRef("classify:kind", "rows:r")].to_pydict()
     assert labeled["r"] == list(range(0, 14, 2))

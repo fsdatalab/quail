@@ -5,6 +5,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 from quail.common.pairs import columns_key
+from quail.execution.arrivals import Arrivals
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
@@ -21,9 +22,12 @@ class ScanRuntime:
             raise KeyError(
                 f"no prepared source for input {node.input_id!r}"
             )
+        source = context.sources[node.input_id]
+        if isinstance(source, Arrivals):
+            # an input read as it arrives is scanned once it has ended
+            source = range(len(source))
         value = document_ids(
-            _tested_documents(node, context) if node.predicates
-            else context.sources[node.input_id])
+            _tested_documents(node, context) if node.predicates else source)
         return NodeResult({f"rows:{node.alias}": Rows({node.alias: value})},
                           NodeMetrics(output_rows=len(value)))
 

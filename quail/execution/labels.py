@@ -106,6 +106,12 @@ class GreedyDecoder:
         self.label = np.full(documents, -1, dtype=np.int64)
         self.tokens = 0     # tokens requested so far
 
+    def add_documents(self, count: int) -> None:
+        """Track count more documents, after the ones before."""
+        self.node.extend([self.runs.first] * count)
+        self.pending.extend([0] * count)
+        self.label = np.concatenate((self.label, np.full(count, -1, dtype=np.int64)))
+
     def requests(self, document):
         """Return the request that feeds the document's next run.
 

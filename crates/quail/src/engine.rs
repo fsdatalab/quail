@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
+use datafusion::arrow::array::{ArrayRef, RecordBatch, new_null_array};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::compute::{concat_batches, filter_record_batch};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Constraints, DataFusionError, Result};
@@ -21,14 +21,17 @@ use pyo3::types::IntoPyDict;
 use std::collections::HashMap;
 
 use quail_datafusion::{
-    IdentifiedTable, InputRows, InputStream, ModelRegion, RegionBatches, RegionColumns, RegionHint,
-    RegionRunner, SharedInput, collect_inputs, derive, quail_column_names,
+    IdentifiedTable, InputBatches, InputRows, InputStream, ModelRegion, RegionBatches,
+    RegionColumns, RegionHint, RegionRunner, SharedInput, derive, quail_column_names,
 };
-use quail_planner::operators::Operators;
+use quail_planner::operators::{Operators, Scan};
 use quail_planner::prompts::Turn;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::planning::{PlanOutcome, Planner, Settings, TableRows, planned_json};
+use crate::input::{Documents, HintRows, InputHint, InputReader, hinted_rows};
+use crate::planning::{
+    PlanOutcome, Planner, Settings, TableRows, extracted_aliases, planned_json, source_column,
+};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 use crate::python_failure;
 
@@ -102,35 +105,6 @@ impl Iterator for ReceivedRows {
     }
 }
 
-/// A region's hint over the rows of its one input that the executor
-/// reads: whether each row may still pass the tests above the region, as
-/// they tighten while the region runs.
-#[pyclass(name = "InputHint", module = "_quail_native", frozen)]
-pub(crate) struct InputHint {
-    hint: RegionHint,
-    columns: RegionColumns,
-    rows: RecordBatch,
-    /// The table name the region reads the input by.
-    #[pyo3(get)]
-    table: String,
-}
-
-#[pymethods]
-impl InputHint {
-    /// A number that changes whenever a test tightens.
-    fn generation(&self) -> u64 {
-        self.hint.generation()
-    }
-
-    /// Whether each input row, in the order the executor reads them, may
-    /// still pass every test.
-    fn keep(&self) -> PyResult<Vec<bool>> {
-        self.hint
-            .keep(&self.columns, &self.table, &self.rows)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
-    }
-}
-
 /// The callable a region's executor hands each batch of finished rows,
 /// as a pyarrow Table or RecordBatchReader, while the region runs.
 #[pyclass(name = "RegionSink", module = "_quail_native", frozen)]
@@ -167,11 +141,12 @@ impl PythonRunner {
 
     /// Plan a region in Rust, or None when Python plans it: a region that
     /// asks no model. `payload` is the region as [`region_json`] writes it;
-    /// the plan carries its DataFusion plan on to Python.
+    /// `tables` holds the rows of each input, by name. The plan carries
+    /// the region's DataFusion plan on to Python.
     fn plan_here(
         &self,
         region: &ModelRegion,
-        inputs: &[InputRows],
+        tables: HashMap<String, TableRows>,
         payload: &str,
         fetch: Option<usize>,
     ) -> Result<Option<String>> {
@@ -182,32 +157,15 @@ impl PythonRunner {
         if let Some(fetch) = fetch {
             operators = operators.limited(fetch as i64);
         }
-        // Python plans a region that asks no model
-        let asks_model = !(operators.filters.is_empty()
-            && operators.joins.is_empty()
-            && operators.classifies.is_empty()
-            && operators.extracts.is_empty()
-            && operators.sae_features.is_empty()
-            && operators.maps.is_empty()
-            && operators.projections.is_empty());
-        if !asks_model {
+        if !asks_model(&operators) {
             return Ok(None);
         }
-        let mut tables = named_tables(region)?;
-        for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
-            tables.insert(
-                name.clone(),
-                TableRows {
-                    identity: whole_table_identity(input),
-                    schema: Arc::new(input.schema().as_arrow().clone()),
-                    batches: batches.clone(),
-                },
-            );
-        }
+        let mut all = named_tables(region)?;
+        all.extend(tables);
         let compile = |error: quail_planner::CompileError| {
             DataFusionError::Plan(format!("CompileError: {}", error.0))
         };
-        let mut planned = match planner.plan(&operators, &tables, settings) {
+        let mut planned = match planner.plan(&operators, &all, settings) {
             Ok(PlanOutcome::Planned(planned)) => planned_json(&planned).map_err(compile)?,
             Ok(PlanOutcome::Refused(refused)) => crate::planning::refused_json(&refused),
             Ok(PlanOutcome::Fixed(plan)) => plan,
@@ -228,12 +186,11 @@ impl PythonRunner {
         inputs: &[InputRows],
     ) -> Result<(String, Option<String>)> {
         let payload = self.request(region)?;
-        let sorted = inputs
-            .iter()
-            .zip(&region.inputs)
-            .map(|((name, batches), input)| Ok((name.clone(), in_source_order(input, batches)?)))
-            .collect::<Result<Vec<InputRows>>>()?;
-        let planned = self.plan_here(region, &sorted, &payload, None)?;
+        let mut sorted = Vec::new();
+        for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
+            sorted.push((name.clone(), in_source_order(input, batches)?));
+        }
+        let planned = self.plan_here(region, input_tables(region, &sorted), &payload, None)?;
         Ok((payload, planned))
     }
 
@@ -255,10 +212,14 @@ impl PythonRunner {
     /// Run the region on this thread, sending its rows to `rows` as the
     /// executor finishes them.
     ///
-    /// The region runs once, as one plan over every row of its inputs. A
-    /// region over one table also drops each input row a test of `hint`
-    /// rejects, by the input columns it passes on, before planning, and
-    /// hands the executor the hint to drop rows by as it tightens.
+    /// The region runs once, as one plan. It waits for each input to end
+    /// and plans on its exact rows, except the one input it reads while
+    /// DataFusion produces it (see [`streamed_input`]), which it plans
+    /// from the rows of the table its documents come from. With a hint,
+    /// each row an input or a table the region reads by name holds is
+    /// dropped where a test rejects it: an input's rows before planning,
+    /// a streamed input's as they arrive, and the executor reads the
+    /// hint to drop more as it tightens.
     fn run_here(
         &self,
         region: &ModelRegion,
@@ -268,66 +229,98 @@ impl PythonRunner {
         rows: &RowSender,
     ) -> Result<()> {
         let payload = self.request(region)?;
-        let columns = RegionColumns::of(region);
-        let source = match self.planning.is_some() && fetch.is_none() && !hint.is_empty() {
-            true => hinted_table(region, &payload)?,
-            false => None,
+        let Some((planner, settings)) = &self.planning else {
+            let mut read = Vec::new();
+            for (name, batches) in inputs {
+                read.push((name, read_to_end(batches)?));
+            }
+            return self.call_engine(region, Call::Python(&payload, &read, fetch), rows);
         };
-        let hint = source.as_deref().map(|table| (hint, &columns, table));
-        let inputs = collect_inputs(inputs)?;
-        self.run_rows(region, &payload, &inputs, fetch, hint, rows)
+        let (operators, _) = read_region_json(&payload)?;
+        let columns = RegionColumns::of(region);
+        // a fetch or a stop key keeps the first rows: dropping one changes
+        // which rows those are
+        let hinted = fetch.is_none() && operators.stop_keys.is_empty() && !hint.is_empty();
+        let hint_tables = match hinted {
+            true => hint.tables(&columns),
+            false => Vec::new(),
+        };
+        let hint_rows = HintRows::default();
+        // several GPUs' workers take every document at the start
+        let streamed = match fetch {
+            None if settings.gpus == 1 && asks_model(&operators) => {
+                streamed_input(region, &operators)
+            }
+            _ => None,
+        };
+        let mut read = Vec::new();
+        let mut reader = None;
+        for (index, (name, batches)) in inputs.into_iter().enumerate() {
+            if let Some((_, scan)) = streamed.as_ref().filter(|(found, _)| *found == index) {
+                let hint = hint_tables
+                    .contains(&name)
+                    .then(|| (hint.clone(), columns.clone(), Arc::clone(&hint_rows)));
+                let documents = Documents {
+                    planner: Arc::clone(planner),
+                    column: scan.column.clone(),
+                    with_offsets: extracted_aliases(std::iter::once(&operators))
+                        .contains(&scan.alias),
+                };
+                let handed = handed_columns(region, index, scan)?;
+                reader = Some((
+                    index,
+                    scan.clone(),
+                    InputReader::new(name, batches, documents, handed, hint),
+                ));
+                continue;
+            }
+            let mut batches = in_source_order(&region.inputs[index], &read_to_end(batches)?)?;
+            if hint_tables.contains(&name) {
+                let schema = Arc::new(region.inputs[index].schema().as_arrow().clone());
+                let all = concat_batches(&schema, &batches)?;
+                let kept = hinted_rows(hint, &columns, &name, &all)?;
+                hint_rows
+                    .lock()
+                    .expect("the hint rows lock")
+                    .insert(name.clone(), vec![kept.clone()]);
+                batches = vec![kept];
+            }
+            read.push((name, batches));
+        }
+        for table in &hint_tables {
+            let known = hint_rows
+                .lock()
+                .expect("the hint rows lock")
+                .contains_key(table);
+            if !known && let Some(found) = named_rows(region, table)? {
+                hint_rows
+                    .lock()
+                    .expect("the hint rows lock")
+                    .insert(table.clone(), vec![found]);
+            }
+        }
+        let mut tables = input_tables(region, &read);
+        if let Some((index, scan, reader)) = &reader {
+            tables.insert(reader.table_name(), table_statistics(region, *index, scan)?);
+        }
+        let planned = self.plan_here(region, tables, &payload, fetch)?;
+        let hint =
+            (!hint_tables.is_empty()).then(|| InputHint::new(hint.clone(), columns, hint_rows));
+        let call = match &planned {
+            Some(planned) => Call::Planned {
+                planned,
+                inputs: &read,
+                hint,
+                reader: reader.map(|(_, _, reader)| Box::new(reader)),
+            },
+            None => Call::Python(&payload, &read, fetch),
+        };
+        self.call_engine(region, call, rows)
     }
 
-    /// Plan and run the region over every row of its inputs, sending
-    /// its rows to `rows`. With a hint over the one table the region
-    /// reads, an input's rows the hint rejects are dropped first, and
-    /// the executor reads the hint as it tightens.
-    fn run_rows(
-        &self,
-        region: &ModelRegion,
-        payload: &str,
-        inputs: &[InputRows],
-        fetch: Option<usize>,
-        hint: Option<(&RegionHint, &RegionColumns, &str)>,
-        rows: &RowSender,
-    ) -> Result<()> {
-        let mut sorted;
-        let mut held = None;
-        let (planned, inputs) = if self.planning.is_some() {
-            sorted = inputs
-                .iter()
-                .zip(&region.inputs)
-                .map(|((name, batches), input)| {
-                    Ok((name.clone(), in_source_order(input, batches)?))
-                })
-                .collect::<Result<Vec<InputRows>>>()?;
-            if let Some((hint, columns, table)) = hint {
-                let found = sorted.iter().position(|(name, _)| name == table);
-                let found_rows = match found {
-                    Some(input) => {
-                        let schema = Arc::new(region.inputs[input].schema().as_arrow().clone());
-                        let all = concat_batches(&schema, &sorted[input].1)?;
-                        let keep = BooleanArray::from(hint.keep(columns, table, &all)?);
-                        let kept = filter_record_batch(&all, &keep)?;
-                        sorted[input].1 = vec![kept.clone()];
-                        Some(kept)
-                    }
-                    None => named_rows(region, table)?,
-                };
-                held = found_rows.map(|rows| InputHint {
-                    hint: hint.clone(),
-                    columns: columns.clone(),
-                    rows,
-                    table: table.to_string(),
-                });
-            }
-            (
-                self.plan_here(region, &sorted, payload, fetch)?,
-                sorted.as_slice(),
-            )
-        } else {
-            (None, inputs)
-        };
+    /// Hand the region to the engine's `execute`, or to `run_region`
+    /// when Python plans it, and send its rows to `rows`.
+    fn call_engine(&self, region: &ModelRegion, call: Call<'_>, rows: &RowSender) -> Result<()> {
         let schema = Arc::clone(region.plan.schema());
         let names = quail_column_names(&schema);
         let sink = RegionSink {
@@ -336,23 +329,28 @@ impl PythonRunner {
             schema: Arc::clone(schema.inner()),
         };
         let reader = Python::attach(|py| {
-            // each input as a pyarrow Table, by the table name the region reads
-            let mut tables = Vec::new();
-            for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
-                let schema = Arc::new(input.schema().as_arrow().clone());
-                tables.push((name.clone(), to_pyarrow(py, schema, batches.clone())?));
-            }
-            let tables = tables.into_py_dict(py)?;
-            let answer = match &planned {
-                Some(found) => {
+            let answer = match call {
+                Call::Planned {
+                    planned,
+                    inputs,
+                    hint,
+                    reader,
+                } => {
+                    let tables = pyarrow_tables(py, region, inputs)?;
                     let sink = Bound::new(py, sink)?;
-                    let hint = held.map(|hint| Bound::new(py, hint)).transpose()?;
-                    self.engine
-                        .call_method1(py, "execute", (found, tables, sink, hint))?
+                    let hint = hint.map(|hint| Bound::new(py, hint)).transpose()?;
+                    let reader = reader.map(|reader| Bound::new(py, *reader)).transpose()?;
+                    self.engine.call_method1(
+                        py,
+                        "execute",
+                        (planned, tables, sink, hint, reader),
+                    )?
                 }
-                None => self
-                    .engine
-                    .call_method1(py, "run_region", (payload, tables, fetch))?,
+                Call::Python(payload, inputs, fetch) => {
+                    let tables = pyarrow_tables(py, region, inputs)?;
+                    self.engine
+                        .call_method1(py, "run_region", (payload, tables, fetch))?
+                }
             };
             // an engine that sent every row to the sink returns None
             let answer = answer.bind(py);
@@ -370,6 +368,216 @@ impl PythonRunner {
         }
         Ok(())
     }
+}
+
+/// Each input as a pyarrow Table, by the table name the region reads.
+fn pyarrow_tables<'py>(
+    py: Python<'py>,
+    region: &ModelRegion,
+    inputs: &[InputRows],
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let mut tables = Vec::new();
+    for (name, batches) in inputs {
+        let input = region
+            .input_names
+            .iter()
+            .position(|found| found == name)
+            .expect("an input of the region");
+        let schema = Arc::new(region.inputs[input].schema().as_arrow().clone());
+        tables.push((name.clone(), to_pyarrow(py, schema, batches.clone())?));
+    }
+    tables.into_py_dict(py)
+}
+
+/// How a region goes to the engine.
+enum Call<'a> {
+    /// Planned in Rust: the plan as JSON, the inputs read to their end,
+    /// the hint, and the input read as it arrives.
+    Planned {
+        planned: &'a str,
+        inputs: &'a [InputRows],
+        hint: Option<InputHint>,
+        reader: Option<Box<InputReader>>,
+    },
+    /// Planned by Python: the region as JSON, its inputs, and its fetch.
+    Python(&'a str, &'a [InputRows], Option<usize>),
+}
+
+/// The columns of a streamed input the executor reads with each row: the
+/// scan's value columns and the column its documents come from.
+fn handed_columns(region: &ModelRegion, index: usize, scan: &Scan) -> Result<SchemaRef> {
+    let schema = region.inputs[index].schema().as_arrow().clone();
+    let mut fields = Vec::new();
+    for name in scan
+        .columns
+        .iter()
+        .cloned()
+        .chain(source_column(&scan.column))
+    {
+        let field = schema.field_with_name(&name)?.clone();
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
+    }
+    Ok(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)))
+}
+
+/// Read an input's batches to its end.
+fn read_to_end(batches: InputBatches) -> Result<Vec<RecordBatch>> {
+    batches.into_iter().collect()
+}
+
+/// Whether a region's operators ask the model; Python plans a region
+/// that does not.
+fn asks_model(operators: &Operators) -> bool {
+    !(operators.filters.is_empty()
+        && operators.joins.is_empty()
+        && operators.classifies.is_empty()
+        && operators.extracts.is_empty()
+        && operators.sae_features.is_empty()
+        && operators.maps.is_empty()
+        && operators.projections.is_empty())
+}
+
+/// The input the region reads while DataFusion produces it, by position,
+/// with the scan whose documents it holds.
+///
+/// It is the first input that holds one scan's documents, which the
+/// scan does not test itself, and that DataFusion computes with more than
+/// a table's filters and projections, such as a join, from tables alone.
+/// The region waits for every other input to end: a scan's rows arrive
+/// at once, and another region's rows are complete before this region
+/// starts, as both run on the calling thread one after the other.
+fn streamed_input(region: &ModelRegion, operators: &Operators) -> Option<(usize, Scan)> {
+    use datafusion::common::tree_node::TreeNode;
+    use datafusion::logical_expr::LogicalPlan;
+    let scanned = |input: &LogicalPlan| {
+        !input
+            .exists(|node| {
+                Ok(match node {
+                    LogicalPlan::TableScan(_)
+                    | LogicalPlan::Filter(_)
+                    | LogicalPlan::Projection(_)
+                    | LogicalPlan::SubqueryAlias(_) => false,
+                    LogicalPlan::Extension(extension) => extension
+                        .node
+                        .as_any()
+                        .downcast_ref::<SharedInput>()
+                        .is_none(),
+                    _ => true,
+                })
+            })
+            .unwrap_or(true)
+    };
+    let calls_model = |input: &LogicalPlan| {
+        input
+            .exists(|node| {
+                Ok(matches!(node, LogicalPlan::Extension(extension)
+                    if extension.node.as_any().downcast_ref::<ModelRegion>().is_some()))
+            })
+            .unwrap_or(true)
+    };
+    region
+        .input_names
+        .iter()
+        .zip(&region.inputs)
+        .enumerate()
+        .find_map(|(index, (name, input))| {
+            let mut scans = operators.scans.iter().filter(|scan| &scan.provider == name);
+            let scan = scans.next()?;
+            let streamed = scans.next().is_none()
+                && scan.predicates.is_empty()
+                && !scanned(input)
+                && !calls_model(input);
+            streamed.then(|| (index, scan.clone()))
+        })
+}
+
+/// The rows a streamed input is planned over, in the input's schema: the
+/// rows of a registered table the input reads that holds the input's
+/// document column, each input column taken from the table's column of
+/// the same name, or no rows when no such table is found.
+fn table_statistics(region: &ModelRegion, index: usize, scan: &Scan) -> Result<TableRows> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    let input = &region.inputs[index];
+    // a column the table lacks is planned as nulls
+    let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(
+        input
+            .schema()
+            .as_arrow()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+    ));
+    let source = source_column(&scan.column);
+    let mut found: Option<(String, Arc<dyn TableProvider>)> = None;
+    input.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = source_as_provider(&scan.source)
+            && let Some(table) = provider.downcast_ref::<IdentifiedTable>()
+            && let Some(python) = table.inner().downcast_ref::<PythonTable>()
+            && source
+                .as_ref()
+                .is_some_and(|name| python.schema.index_of(name).is_ok())
+        {
+            found = Some((table.identity().to_string(), Arc::clone(&provider)));
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let Some((identity, provider)) = found else {
+        return Ok(TableRows {
+            identity: None,
+            schema,
+            batches: Vec::new(),
+        });
+    };
+    let python = provider
+        .downcast_ref::<IdentifiedTable>()
+        .and_then(|table| table.inner().downcast_ref::<PythonTable>())
+        .expect("a Python table");
+    let mut batches = Vec::new();
+    for batch in python.rows()? {
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let column = batch
+                    .column_by_name(field.name())
+                    .and_then(|column| cast(column, field.data_type()).ok());
+                column.unwrap_or_else(|| new_null_array(field.data_type(), batch.num_rows()))
+            })
+            .collect();
+        batches.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
+    }
+    // the token store is the table's, kept by its identity
+    Ok(TableRows {
+        identity: Some(identity),
+        schema,
+        batches,
+    })
+}
+
+/// The rows of each input read to its end, by name, for planning.
+fn input_tables(region: &ModelRegion, inputs: &[InputRows]) -> HashMap<String, TableRows> {
+    let mut tables = HashMap::new();
+    for (name, batches) in inputs {
+        let Some(input) = region.input_names.iter().position(|found| found == name) else {
+            continue;
+        };
+        tables.insert(
+            name.clone(),
+            TableRows {
+                identity: whole_table_identity(&region.inputs[input]),
+                schema: Arc::new(region.inputs[input].schema().as_arrow().clone()),
+                batches: batches.clone(),
+            },
+        );
+    }
+    tables
 }
 
 impl RegionRunner for PythonRunner {
@@ -402,27 +610,6 @@ impl RegionRunner for PythonRunner {
             ended: false,
         }))
     }
-}
-
-/// The one table a region reads, by input name or table name, when a
-/// hint over it can drop the region's rows: each row comes from one row
-/// of that table, with no join, fetch, or stop key.
-fn hinted_table(region: &ModelRegion, payload: &str) -> Result<Option<String>> {
-    let (operators, _) = read_region_json(payload)?;
-    if !(operators.joins.is_empty() && operators.fetch.is_none() && operators.stop_keys.is_empty())
-    {
-        return Ok(None);
-    }
-    let mut tables: Vec<String> = region.input_names.clone();
-    for (name, _) in identified_scans(region)? {
-        if !tables.contains(&name) {
-            tables.push(name);
-        }
-    }
-    Ok(match tables.as_slice() {
-        [table] => Some(table.clone()),
-        _ => None,
-    })
 }
 
 /// Each identified table a region's plan reads by name, by table name.

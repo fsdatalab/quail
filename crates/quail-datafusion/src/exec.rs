@@ -41,24 +41,13 @@ pub type InputRows = (String, Vec<RecordBatch>);
 /// A region's rows, in the region's schema, as the runner produces them.
 pub type RegionBatches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
 
-/// One region input's batches, read as DataFusion computes them; a read
-/// blocks until the next batch arrives.
-pub type InputBatches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
+/// One region input's batches, as DataFusion computes them: `recv`
+/// waits for the next batch, `try_recv` does not, and both fail once the
+/// input has ended.
+pub type InputBatches = std::sync::mpsc::Receiver<Result<RecordBatch>>;
 
 /// One region input: its table name and its batches as they arrive.
 pub type InputStream = (String, InputBatches);
-
-/// Read each input stream to its end.
-///
-/// # Errors
-///
-/// An input fails.
-pub fn collect_inputs(inputs: Vec<InputStream>) -> Result<Vec<InputRows>> {
-    inputs
-        .into_iter()
-        .map(|(name, batches)| Ok((name, batches.collect::<Result<Vec<_>>>()?)))
-        .collect()
-}
 
 /// Plans and runs one model region, returning its rows as they come.
 ///
@@ -299,7 +288,7 @@ impl ExecutionPlan for ModelRegionExec {
                             }
                         }
                     }));
-                    streams.push((name.clone(), Box::new(received.into_iter())));
+                    streams.push((name.clone(), received));
                     first.push(waiting);
                 }
                 // a region starts once each input has a batch or has ended: an

@@ -7,23 +7,25 @@ it. The operators and the runner read it from module state: the region
 runs on one thread, and the operators sit several calls below the code
 that starts it, as with ``quail.progress.answer_sink``.
 
-The region's hint, Rust's ``InputHint`` over its one input, lives here
-too: an operator asks ``keeps`` before the model reads a document.
+The region's hint, Rust's ``InputHint`` over the rows of the tables the
+region reads, lives here too: an operator asks ``keeps`` before the
+model reads a document.
 """
 
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 
 import pyarrow as pa
 
 _ROWS = None
 _HELD = False
 _HINT = None
-_ALIAS = None
-_GENERATION = None
-_KEEP = None
+# alias -> the table the hint holds rows of
+_TABLES = {}
+# table -> (the hint's generation, whether each row is kept)
+_KEEP = {}
 
 
 def finished_rows():
@@ -32,24 +34,28 @@ def finished_rows():
 
 
 @contextlib.contextmanager
-def reporting(rows, hint=None, alias: str | None = None):
-    """Report to rows, and skip input rows by hint, while the block runs.
+def reporting(rows, hint=None, tables: dict | None = None):
+    """Report to rows, and skip the rows of tables by hint, while the block runs.
 
     Args:
         rows: The region's FinishedRows, or None to report nowhere.
-        hint: Rust's ``InputHint`` over the region's one input, or None:
-            ``keep()`` says whether each input row may still pass the
-            tests above the region, and ``generation()`` changes
-            whenever a test tightens.
-        alias: The alias of the scan that reads that input.
+        hint: Rust's ``InputHint`` over the rows of the tables the
+            region reads, or None: ``keep(table)`` says whether each row
+            of a table may still pass the tests above the region,
+            ``tables()`` names the tables it holds rows of, and
+            ``generation()`` changes whenever a test tightens.
+        tables: Each scan alias's table name.
     """
-    global _ROWS, _HINT, _ALIAS, _GENERATION, _KEEP
-    previous = _ROWS, _HINT, _ALIAS, _GENERATION, _KEEP
-    _ROWS, _HINT, _ALIAS, _GENERATION, _KEEP = rows, hint, alias, None, None
+    global _ROWS, _HINT, _TABLES, _KEEP
+    previous = _ROWS, _HINT, _TABLES, _KEEP
+    held = set() if hint is None else set(hint.tables())
+    _ROWS, _HINT, _KEEP = rows, hint, {}
+    _TABLES = {alias: table for alias, table in (tables or {}).items()
+               if table in held}
     try:
         yield rows
     finally:
-        _ROWS, _HINT, _ALIAS, _GENERATION, _KEEP = previous
+        _ROWS, _HINT, _TABLES, _KEEP = previous
 
 
 @contextlib.contextmanager
@@ -89,42 +95,47 @@ def region_hint():
     return _HINT
 
 
-def keeps(alias: str, document: int) -> bool:
+def keeps(alias, document: int) -> bool:
     """Whether the model should ask about a document of the alias.
 
-    False when the hint, as it is now, rejects the document's input
-    row; the hint is read again whenever it has tightened.
+    False when the hint, as it is now, rejects the document's row of
+    its table; the hint is read again whenever it has tightened or the
+    table has grown.
     """
-    global _GENERATION, _KEEP
-    if _HINT is None or alias != _ALIAS:
+    table = _TABLES.get(alias) if isinstance(alias, str) else None
+    if table is None:
         return True
     generation = _HINT.generation()
-    if generation != _GENERATION:
-        _GENERATION, _KEEP = generation, _HINT.keep()
-    return bool(_KEEP[document])
+    found = _KEEP.get(table)
+    if found is None or found[0] != generation or document >= len(found[1]):
+        found = _KEEP[table] = (generation, _HINT.keep(table))
+    return document >= len(found[1]) or bool(found[1][document])
 
 
-def hinted_alias() -> str | None:
-    """The alias whose documents the hint covers, or None without a hint."""
-    return None if _HINT is None else _ALIAS
+def hinting() -> bool:
+    """Whether the region's hint holds the rows of a table the region reads."""
+    return bool(_TABLES)
 
 
-def hinted_out(keys) -> Callable[[int], bool] | None:
+def hinted(key) -> bool:
+    """Whether the region's hint drops the document of an arena key.
+
+    Args:
+        key: An arena key, (alias, document) for a document.
+    """
+    return (isinstance(key, tuple) and len(key) == 2
+            and not keeps(key[0], int(key[1])))
+
+
+def hinted_out(keys: Sequence) -> Callable[[int], bool] | None:
     """Callable(anchor) -> whether the region's hint drops that document.
 
     Args:
         keys: Each anchor's arena key, (alias, document) for a document.
 
     Returns:
-        None when no hint is installed.
+        None when the hint holds the rows of no table the region reads.
     """
-    if _HINT is None:
+    if not hinting():
         return None
-
-    def skip(anchor: int) -> bool:
-        key = keys[anchor]
-        if not (isinstance(key, tuple) and len(key) == 2):
-            return False
-        return not keeps(key[0], int(key[1]))
-
-    return skip
+    return lambda anchor: hinted(keys[anchor])

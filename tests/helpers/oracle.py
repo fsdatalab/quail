@@ -108,10 +108,10 @@ class Oracle:
             retains in the arena, as the executor would.
         join_metrics: Metrics every join stage reports beside its rows.
         tightens_after: Source rows of the first alias after whose
-            filter answer or score the oracle waits until the region's
-            hint tightens, so a test decides when the operator above the
-            region tightens its test. With it, a filter reports each
-            document as it finishes.
+            filter answer, join anchor, or score the oracle waits until
+            the region's hint tightens, so a test decides when the
+            operator above the region tightens its test. With it, a
+            filter reports each document as it finishes.
         pipelines: Whether the runner groups operators into chains, as
             it does for the GPU executor; the oracle then runs a chain's
             nodes one at a time, in order.
@@ -467,12 +467,17 @@ class OracleJoin(OracleOperator):
         anchor_ids = list(inputs["anchor_ids"])
         lists_for = inputs.get("anchor_partners")
         survivors = set(range(len(anchor_ids)))
+        skipped = set()
         results = {}
         for index, node in enumerate(nodes):
             partners = inputs["partner_indices"][node.written_position]
             members = {} if lists_for and node.pairs_from else None
             rows = {}
             for local in sorted(survivors):
+                if index == 0 and not keeps(node.anchor, int(anchor_ids[local])):
+                    # admission skips an anchor the region's hint drops
+                    skipped.add(local)
+                    continue
                 mine = (range(len(partners)) if members is None
                         else list(lists_for(anchor_ids[local], index)))
                 if members is not None:
@@ -484,12 +489,13 @@ class OracleJoin(OracleOperator):
                 self.finished = settled_pairs(node, int(anchor_ids[local]), [
                     partners[member] for member, answer in zip(mine, rows[local])
                     if answer])
-                self.region.send_finished(self)
+                oracle._answered(oracle._source(node.anchor, anchor_ids[local]),
+                                 partial(self.region.send_finished, self))
             for local, row in rows.items():
                 inputs["anchor_done"](local, row)
             passing = {local for local, row in rows.items() if any(row)}
             survivors = (survivors - passing if node.semantics == "anti"
-                         else passing)
+                         else passing) - skipped
             kept = [anchor_ids[local] for local in sorted(survivors)]
             answer = {
                 "rows": rows, "anchor_index": anchor_ids,
