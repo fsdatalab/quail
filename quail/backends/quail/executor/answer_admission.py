@@ -673,6 +673,7 @@ class HeadroomAdmission:
                     return True
             return False
         budget = free_pages - self.fixed_pages - self.replay_pages
+        held = None
         for members in choices:
             need = prompt_pages + self._branch_pages(members)
             if need > budget:
@@ -681,16 +682,52 @@ class HeadroomAdmission:
                 self._hold(self._allocate_held(budget), budget)
                 self.headroom_pages = self.fixed_pages + int(self.held_pages.sum())
             _, risk = self._admission_risk(members)
-            extra, chosen = admission_cost(self.held_risk, self.held_pages, risk,
-                                           budget - need, self.price)
             expected, added = self._added_work(members)
             # with nothing running, price joining a pass that holds such answers
             base = self.work if self.work.tokens else added
             gain = self.decode_cost.gain(base, added, expected)
+            if held is None:
+                held = self._held_bound()
+            if self._least_extra(held, risk, budget - need) > gain * (1 + 1e-9):
+                continue
+            extra, chosen = admission_cost(self.held_risk, self.held_pages, risk,
+                                           budget - need, self.price)
             if extra <= gain * (1 + 1e-9):
                 self._decision = (anchor, members, budget - need, chosen)
                 return True
         return False
+
+    def _held_bound(self):
+        """The held answers' summed least risk plus page cost at the last price.
+
+        Returns:
+            That sum, and the held answers' risk at their chosen headroom.
+        """
+        rows = np.arange(len(self.held_risk))
+        before = float(self.held_risk[rows, self.held_pages].sum())
+        if not self.price:
+            return 0.0, before
+        pages = np.arange(self.held_risk.shape[1])
+        return float(np.min(self.held_risk + self.price * pages, axis=1).sum()), before
+
+    def _least_extra(self, held, risk, budget):
+        """A lower bound on the seconds admission_cost would add.
+
+        At any page price p, headroom within a budget risks at least the
+        sum over rows of min_j (risk[r, j] + p * j), less p * budget.
+
+        Args:
+            held: _held_bound() for the held answers.
+            risk: Risk grid of the candidate answers.
+            budget: As admission_cost.
+        """
+        if not self.price:
+            return 0.0
+        bound, before = held
+        pages = np.arange(risk.shape[1])
+        candidate = float(np.min(risk + self.price * pages, axis=1).sum())
+        least = float(np.min(risk, axis=1).sum())
+        return bound + candidate - self.price * budget - before - least
 
     def _branch_pages(self, members):
         """Prompt pages the anchors after the first will place later."""

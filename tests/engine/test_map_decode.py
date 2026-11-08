@@ -675,6 +675,30 @@ def test_headroom_searched_from_a_nearby_price_matches_a_search_from_scratch():
             assert np.array_equal(_allocate(risk, budget, hint)[0], chosen)
 
 
+def test_the_quick_bound_never_exceeds_the_rebuild_seconds_admission_adds():
+    _, admission = headroom_admission(num_documents=60)
+    rng = np.random.default_rng(4)
+
+    def grids(rows):
+        risk = np.cumsum(-rng.exponential(1.0, size=(rows, 17)), axis=1)
+        risk = risk - risk.min(axis=1, keepdims=True)
+        risk[np.arange(17) > rng.integers(4, 17, size=rows)[:, None]] = np.inf
+        return risk
+
+    for _ in range(50):
+        admission.held_slots = np.arange(40)
+        admission.held_base = np.zeros(40, dtype=np.int64)
+        admission.held_risk = grids(40)
+        budget = int(rng.integers(20, 200))
+        admission._hold(admission._allocate_held(budget), budget)
+        candidate = grids(int(rng.integers(1, 5)))
+        left = budget - int(rng.integers(0, 20))
+        extra, _ = admission_cost(admission.held_risk, admission.held_pages,
+                                  candidate, left)
+        bound = admission._least_extra(admission._held_bound(), candidate, left)
+        assert bound <= extra + 1e-9
+
+
 def test_admitting_a_document_costs_the_rebuild_risk_it_pushes_onto_held_answers():
     held = np.array([[100.0, 80.0, 0.0]])
     candidate = np.array([[3.0, 3.0, 3.0]])
