@@ -147,6 +147,34 @@ def test_classify_probabilities_beside_an_extract(session):
                                                 {"item": None}]
 
 
+
+def test_probabilities_nothing_reads_are_not_computed(session):
+    asked = f"{TOPIC}, {{'probabilities': true}})"
+    read = session.sql(f"SELECT d.id, {asked} AS topic FROM documents d")
+    # DataFusion groups the labels above the region, which then returns
+    # no probabilities, and a test alone does not return them either
+    grouped = session.sql(
+        f"SELECT x.topic, COUNT(*) AS n FROM (SELECT d.id, {asked} AS topic "
+        "FROM documents d) x GROUP BY x.topic")
+    tested = session.sql(
+        f"SELECT d.id FROM documents d WHERE {asked} IN ('praise')")
+    specs = {}
+    for name, query in (("read", read), ("grouped", grouped), ("tested", tested)):
+        (classify,) = [n for n in query.plan().nodes if isinstance(n, AiClassify)]
+        specs[name] = classify.spec
+    assert specs["read"].probabilities
+    assert specs["read"].scoring != "trie_decode"
+    for name in ("grouped", "tested"):
+        # the label is decoded greedily, which the probabilities rule out,
+        # at a lower estimate than scoring every label
+        assert not specs[name].probabilities
+        assert specs[name].scoring == "trie_decode"
+        assert specs[name].estimated_seconds < specs["read"].estimated_seconds
+    rows = finish(grouped, _labels(["praise", "praise"])).collect()
+    assert rows.to_pylist() == [{"x.topic": "praise", "n": 2}]
+    rows = finish(tested, _labels(["refund", "praise"])).collect()
+    assert rows.column("d.id").to_pylist() == [9]
+
 def _classify_then_filter(session, *, filters=1, later_filters=()):
     tests = [("topic", ("refund", "shipping"))]
     if filters > 1:

@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DataFusionError, Result, TableReference, plan_err};
+use datafusion::common::{Column, DataFusionError, Result, ScalarValue, TableReference, plan_err};
 use datafusion::datasource::{MemTable, provider_as_source, source_as_provider};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
@@ -94,8 +94,93 @@ impl OptimizerRule for ClaimModelRegions {
         }
         let optimized =
             Optimizer::with_rules(self.rules.clone()).optimize(plan, config, |_, _| {})?;
-        claim_regions(optimized, None).map(Transformed::yes)
+        let claimed = claim_regions(optimized, None)?;
+        drop_unread_probabilities(claimed).map(Transformed::yes)
     }
+}
+
+/// `plan` with each classification that asks for its labels'
+/// probabilities asking for none where nothing reads them.
+///
+/// A region's probabilities column is not a column of its DataFusion
+/// schema: only a region that is the whole query returns it, as the
+/// column after its label in the SELECT list. A classification only a
+/// test reads, or one in a region below operators DataFusion runs,
+/// scores its labels without the probabilities readout.
+fn drop_unread_probabilities(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let whole = as_node::<ModelRegion>(&plan).is_some();
+    plan.transform_up(|node| {
+        let Some(region) = as_node::<ModelRegion>(&node) else {
+            return Ok(Transformed::no(node));
+        };
+        let returned: Vec<String> = if whole {
+            region
+                .plan
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut unread = Vec::new();
+        region.plan.apply(|found| {
+            if let Some(ai) = as_node::<AiNode>(found)
+                && ai.function() == "ai_classify"
+                && !returned.contains(&ai.answer)
+                && let Some(call) = without_probabilities(&ai.call)
+                && !unread.iter().any(|(known, _)| *known == call.0)
+            {
+                unread.push(call);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        if unread.is_empty() {
+            return Ok(Transformed::no(node));
+        }
+        let mut region = region.clone();
+        for (old, new) in &unread {
+            region.plan = crate::projection::replace_call(region.plan, old, new)?;
+        }
+        Ok(Transformed::yes(extension_node(region)))
+    })
+    .map(|done| done.data)
+}
+
+/// A classification call unfolded, and the same call with its
+/// `probabilities` option false, when the option is true.
+fn without_probabilities(call: &Expr) -> Option<(Expr, Expr)> {
+    use datafusion::logical_expr::expr::ScalarFunction;
+    let Expr::ScalarFunction(unfolded) = crate::derive::unfolded(call.clone()) else {
+        return None;
+    };
+    let Some(Expr::ScalarFunction(config)) = unfolded.args.get(2) else {
+        return None;
+    };
+    if config.name() != "named_struct" {
+        return None;
+    }
+    let mut options = config.args.clone();
+    let mut asked = false;
+    for pair in options.chunks_mut(2) {
+        let [key, value] = pair else {
+            return None;
+        };
+        let named = matches!(key, Expr::Literal(found, _)
+            if found.try_as_str().flatten().is_some_and(|name| name.eq_ignore_ascii_case("probabilities")));
+        if named && matches!(value, Expr::Literal(ScalarValue::Boolean(Some(true)), _)) {
+            *value = Expr::Literal(ScalarValue::Boolean(Some(false)), None);
+            asked = true;
+        }
+    }
+    if !asked {
+        return None;
+    }
+    let mut args = unfolded.args.clone();
+    args[2] = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&config.func), options));
+    let pruned = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&unfolded.func), args));
+    Some((Expr::ScalarFunction(unfolded), pruned))
 }
 
 /// Claim the model regions of an optimized plan.

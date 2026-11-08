@@ -380,23 +380,24 @@ impl Reads<'_> {
     }
 }
 
-/// `plan` with each extraction call `old` makes, and the spans call of
-/// the same arguments, as `new`, in every `AiNode`, and each node that
-/// makes it adding the columns of `new`'s types.
-fn replace_call(plan: LogicalPlan, old: &Expr, new: &Expr) -> Result<LogicalPlan> {
+/// `plan` with each AI call `old`, an unfolded call, as `new` in every
+/// `AiNode`, an extraction's spans call of the same arguments included,
+/// and each node that makes `new` adding the columns of its types.
+pub(crate) fn replace_call(plan: LogicalPlan, old: &Expr, new: &Expr) -> Result<LogicalPlan> {
     let Expr::ScalarFunction(old) = old else {
-        unreachable!("an extraction call")
+        unreachable!("an AI call")
     };
     let Expr::ScalarFunction(new) = new else {
-        unreachable!("an extraction call")
+        unreachable!("an AI call")
     };
+    let extraction = old.name() == "ai_extract";
     let rewrite = |expr: Expr| -> Result<Expr> {
         expr.transform_down(|found| {
             let Expr::ScalarFunction(call) = &found else {
                 return Ok(Transformed::no(found));
             };
-            let span = call.name() == "ai_extract_span";
-            if !(span || call.name() == "ai_extract")
+            let span = extraction && call.name() == "ai_extract_span";
+            if !(span || call.name() == old.name())
                 || call
                     .args
                     .iter()

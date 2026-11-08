@@ -280,6 +280,12 @@ Pass an object as the third argument, such as `{'probabilities': true}`.
 The probabilities sum to 1. They are available for individual documents;
 classifications of joined rows return labels only.
 
+Only a query whose result is the classification's own rows returns
+`<name>_probabilities`, beside the label in `SELECT`. When the label is
+only tested in `WHERE`, or SQL such as a `GROUP BY` runs above the
+classification, Quail computes no probabilities, and may then decode the
+label instead of scoring every category.
+
 ### Query examples
 
 #### Filter by category
