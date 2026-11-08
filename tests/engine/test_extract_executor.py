@@ -24,9 +24,6 @@ from helpers.kv_checker import Setup, make_arena
 from test_map_decode import cpu_staging, events_torch
 
 from quail.backends.quail import QuailModelExecution
-from quail.backends.quail.distributed import (
-    execute_distributed_graph,
-)
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract.candidates import Stream
 from quail.backends.quail.executor.extract.vocabulary import same_word
@@ -34,7 +31,7 @@ from quail.backends.quail.executor.operators import operator_types
 from quail.backends.quail.executor.operators.extract import ExtractOperator
 from quail.backends.quail.executor.region import RegionExecution
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
-from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.graph import execute_sharded_graph, execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_execute
 from quail.builtins import built_in_registry
 from quail.physical import (
@@ -463,7 +460,8 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     state, model, _, run_pipeline = _setup(monkeypatch, share_prefixes=True)
     expected, _ = run_pipeline("ends", "starts")
     spec, tables = make_spec()
-    nodes = [Scan(node_id="input:c", alias="c", input_id="c")]
+    nodes = [Scan(node_id="input:c", alias="c", input_id="c",
+                  shard_ranges=[(0, 2), (2, len(DOCS))])]
     for name in ("ends", "starts"):
         previous = nodes[-1]
         nodes.append(AiExtract(
@@ -501,21 +499,19 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     }
     rounds = []
 
-    def round_fn(kind, subs):
+    def round_fn(kind, payloads):
         assert kind == "execute"
-        subs = pickle.loads(pickle.dumps(subs))
-        rounds.append(subs)
-        return [_child_execute(child, sub) for child, sub in zip(children, subs)]
+        payloads = pickle.loads(pickle.dumps(payloads))
+        rounds.append(payloads)
+        return [_child_execute(child, payload)
+                for child, payload in zip(children, payloads)]
 
-    result = execute_distributed_graph(
-        payload, graph, gpus, round_fn, DEVICES["h100-sxm"], registry.runtimes,
-        registry)
+    result = execute_sharded_graph(payload, graph, gpus, round_fn,
+                                   DEVICES["h100-sxm"])
     assert len(rounds) == 1
-    # every worker ran the whole pipeline over its own documents
-    shards = [sub["inputs"]["ai-extract:ends"]["input:0"].ids["c"].to_pylist()
-              for sub in rounds[0]]
+    # every worker ran the whole region over its own documents
+    shards = [list(payload["shard"]["c"]) for payload in rounds[0]]
     assert sorted(document for shard in shards for document in shard) == [0, 1, 2]
-    assert all(sub["final"] for sub in rounds[0])
     for node in nodes[1:]:
         actual = result["_outputs"][PortRef(node.node_id, "rows:c")]
         assert actual.equals(expected[node.node_id].outputs["rows:c"].table())

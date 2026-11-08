@@ -139,7 +139,7 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
     monkeypatch.setattr(worker.time, "perf_counter", lambda: next(clock))
     monkeypatch.setattr(worker, "resolve_model_path", resolve)
     monkeypatch.setattr(worker, "_ensure_children", ensure)
-    monkeypatch.setattr(worker, "execute_distributed_graph", run_graph)
+    monkeypatch.setattr(worker, "execute_sharded_graph", run_graph)
     result = worker.execute_quail_multi({
         "documents": {}, "gpus": 8, "model": "qwen3-4b-fp8",
         "physical_plan": {"device": "h100-sxm", "backend": "quail"},

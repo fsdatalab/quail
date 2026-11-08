@@ -1,15 +1,30 @@
-"""Quail runtimes for the typed model graph."""
+"""Quail runtimes for the typed model graph.
+
+One GPU runs a region's graph. Several GPUs each run it over their
+shard of one table, the region's split table, and read every other
+table whole, so each row of the region is built on the GPU holding its
+document of the split table.
+"""
 
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
+import numpy as np
 import pyarrow as pa
 
-from quail.backends.quail.executor.memory import memory_report
+from quail.backends.quail.executor.memory import memory_report, merge_memory_reports
+from quail.backends.quail.executor.operators.filter import stop_keys
 from quail.backends.quail.retention import apply_retention
-from quail.common.pairs import columns_key
-from quail.execution.metrics import NodeResult, scalar_node_metrics
+from quail.common.pairs import FIRST_DOCUMENT, columns_key
+from quail.execution.finished import report_outputs
+from quail.execution.metrics import (
+    NodeMetrics,
+    NodeResult,
+    RunResult,
+    scalar_node_metrics,
+)
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -27,6 +42,7 @@ from quail.physical import (
     AiScore,
     Barrier,
     PhysicalGraph,
+    PortRef,
     Scan,
 )
 
@@ -64,7 +80,9 @@ def record_model_result(node, result: NodeResult,
 def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     """Bind a query's inputs, retention, and runtimes to one GPU executor.
 
-    The arena is emptied first: nothing survives from the last query.
+    The arena is emptied first: nothing survives from the last query. A
+    payload's ``shard``, alias -> document ids, limits the scans of
+    those tables to the ids.
     """
     arena = state["gpu"].arena
     for key in arena.resident_keys():
@@ -74,11 +92,9 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     state["gpu"].torch.cuda.reset_peak_memory_stats()
     retention = payload.get("retention", {})
     apply_retention(arena, retention, retention.get("initial", {}))
-    documents = state["documents"]
-    sources = {
-        alias: range(len(tokens))
-        for alias, tokens in documents.items()
-    }
+    shard = payload.get("shard", {})
+    sources = {alias: shard.get(alias, range(len(tokens)))
+               for alias, tokens in state["documents"].items()}
     for alias, table in state.get("columns", {}).items():
         sources[columns_key(alias)] = table
     runtime_state = {
@@ -127,8 +143,8 @@ def execution_measurements(context: ExecutionContext) -> dict:
     }
 
 
-def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
-    """Execute one Quail model graph on one GPU executor."""
+def _run(state, payload, graph: PhysicalGraph) -> tuple:
+    """Run a region on one GPU; return its RunResult, wall seconds, and context."""
     context = execution_context(state, payload, graph)
     torch = state["gpu"].torch
     arena = state["gpu"].arena
@@ -139,11 +155,140 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     wall = time.perf_counter() - started
     for key in arena.resident_keys():
         arena.free_key(key)
+    return result, wall, context
+
+
+def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
+    """Execute one Quail model graph on one GPU executor."""
+    result, wall, context = _run(state, payload, graph)
     report = graph_report(graph, result, wall, state["device"],
                           gpu_timing=state.get("gpu_timing", False))
     measurements = execution_measurements(context)
     report.update(kv_manager=measurements["kv_manager"], **measurements["memory"])
     return report
+
+
+def run_shard(state, payload, graph: PhysicalGraph) -> dict:
+    """Run a region on one of several GPUs, over its shard of the split table.
+
+    Returns:
+        {"outputs": PortRef -> Arrow table, "metrics": node id ->
+        NodeMetrics, "kv_manager": ..., "memory": ...}.
+    """
+    result, _, context = _run(state, payload, graph)
+    return {"outputs": export_physical_outputs(compute_subgraph(graph), result),
+            "metrics": {node_id: found.metrics
+                        for node_id, found in result.nodes.items()},
+            **execution_measurements(context)}
+
+
+def region_shards(payload, graph: PhysicalGraph, gpus: int) -> list[dict]:
+    """Each GPU's documents of the region's split table, as {alias: ids}.
+
+    The split table is the anchor of the region's first AI join, else
+    the table of its first model operator. The documents of one stop key
+    group, or the copies of one text in a deduplicated table, go to one
+    GPU. A region whose split table is a partner of an anti join runs
+    on one GPU.
+
+    Args:
+        payload: The query's settings, documents, and value columns.
+        graph: The region's physical graph.
+        gpus: The GPU count.
+    """
+    nodes = graph.topological_nodes()
+    joins = [node for node in nodes if isinstance(node, AiJoin)]
+    readers = [node for node in nodes if node.document_aliases]
+    if not readers or any(join.semantics == "anti" and joins[0].anchor in join.partners
+                          for join in joins):
+        return [{}]
+    alias = joins[0].anchor if joins else readers[0].document_aliases[0]
+    documents = payload["documents"][alias]
+    groups = next((stop_keys(payload, node).of(range(len(documents)))
+                   for node in nodes if isinstance(node, AiFilter)
+                   and node.alias == alias and node.stop_key), None)
+    if groups is None and alias in payload.get("deduplicate", {}):
+        groups = payload["columns"][alias].column(FIRST_DOCUMENT).to_pylist()
+    if groups is None:
+        scan = next(node for node in nodes
+                    if isinstance(node, Scan) and node.alias == alias)
+        return [{alias: shard} for shard in scan.shards]
+    # each group goes whole to the GPU with the fewest tokens so far
+    tokens = {}
+    for group, document in zip(groups, documents):
+        tokens[group] = tokens.get(group, 0) + len(document)
+    loads, placed = [0] * gpus, {}
+    for group in sorted(tokens, key=lambda group: -tokens[group]):
+        placed[group] = loads.index(min(loads))
+        loads[placed[group]] += tokens[group]
+    owners = np.asarray([placed[group] for group in groups])
+    return [{alias: np.flatnonzero(owners == gpu)} for gpu in range(gpus)]
+
+
+def execute_sharded_graph(payload, graph: PhysicalGraph, gpus: int,
+                          round_fn, device) -> dict:
+    """Run a region on several GPUs, each over its shard of the split table.
+
+    Each GPU runs the region as one GPU does, with run_shard, and its
+    rows go to the region's FinishedRows. A port's output is the union
+    of the GPUs' rows, each row once; a node's metrics are their sum.
+
+    Args:
+        payload: The query's settings, documents, and value columns.
+        graph: The region's physical graph.
+        gpus: The GPU count.
+        round_fn: Callable("execute", payloads) -> each GPU's run_shard
+            result, one payload per GPU.
+        device: The device spec, for the run's cost.
+    """
+    shards = region_shards(payload, graph, gpus)
+    started = time.perf_counter()
+    runs = round_fn("execute", [{**payload, "shard": shard} for shard in shards])
+    wall = time.perf_counter() - started
+    compute = compute_subgraph(graph)
+    nodes = {}
+    for node in compute.nodes:
+        parts = [NodeResult({port.name: run["outputs"][ref] for port in node.outputs
+                             if (ref := PortRef(node.node_id, port.name))
+                             in run["outputs"]},
+                            run["metrics"][node.node_id]) for run in runs]
+        for part in parts:
+            report_outputs(node, part)
+        metrics = sum((part.metrics for part in parts), NodeMetrics())
+        nodes[node.node_id] = NodeResult(
+            {name: union_rows([part.outputs[name] for part in parts])
+             for name in parts[0].outputs},
+            replace(metrics, wall_s=max(part.metrics.wall_s for part in parts)))
+    root = compute.root
+    result = RunResult(nodes[root.node_id].outputs[root.port], nodes,
+                       sum((node.metrics for node in nodes.values()), NodeMetrics()))
+    report = graph_report(graph, result, wall, device, gpus=gpus,
+                          gpu_timing=payload.get("gpu_timing", False))
+    counters = {}
+    for run in runs:
+        for name, value in run["kv_manager"].items():
+            if isinstance(value, dict):
+                counts = counters.setdefault(name, {})
+                for alias, count in value.items():
+                    counts[alias] = counts.get(alias, 0) + count
+            else:
+                counters[name] = counters.get(name, 0) + value
+    report.update(kv_manager=counters,
+                  **merge_memory_reports([run["memory"] for run in runs]))
+    return report
+
+
+def union_rows(tables: list) -> pa.Table:
+    """The rows of the tables, the first row of each set of document ids."""
+    table = pa.concat_tables(tables, promote_options="permissive")
+    ids = [field.name for field in table.schema
+           if b"quail.alias" in (field.metadata or {})]
+    if len(tables) == 1 or not ids:
+        return table
+    first = (table.select(ids)
+             .append_column("position", pa.array(np.arange(table.num_rows)))
+             .group_by(ids, use_threads=False).aggregate([("position", "min")]))
+    return table.take(np.sort(first["position_min"].to_numpy()))
 
 
 def graph_report(graph, result, wall, device, *, gpus=1, gpu_timing=False):

@@ -69,6 +69,7 @@ from quail.physical import (
 )
 from quail.physical.plan import graph_from_envelope
 from quail.progress import answer_sink
+from quail.specs import DEVICES
 
 # the most seconds an operator above a region may take to tighten the
 # region's hint after receiving a row; a slower one fails the test
@@ -647,7 +648,11 @@ def oracle_executor(oracle: Oracle, **report):
     """
     def execute(request):
         from helpers.fakes import graph_state
-        from quail.backends.quail.graph import execute_single_graph
+        from quail.backends.quail.graph import (
+            execute_sharded_graph,
+            execute_single_graph,
+            run_shard,
+        )
         from quail.execution.types import PhysicalResponse
         from quail.physical import Scan
 
@@ -659,14 +664,27 @@ def oracle_executor(oracle: Oracle, **report):
                         for node in scans}
         oracle.source_rows = {alias: rows.to_pylist()
                               for alias, rows in request.source_rows.items()}
-        state = graph_state(oracle, oracle.documents)
-        state["texts"] = oracle.texts
-        oracle.arena = state["gpu"].arena
-        if getattr(request, "relations", None):
+
+        def gpu_state():
+            state = graph_state(oracle, oracle.documents)
+            state["texts"] = oracle.texts
+            oracle.arena = state["gpu"].arena
             state["columns"] = request.column_tables()
-        result = execute_single_graph(state, {
-            "filter_limit": None,
-            "deduplicate": request.plan["settings"].get("deduplicate", {})}, graph)
+            return state
+
+        payload = {
+            "filter_limit": None, "documents": oracle.documents,
+            "columns": request.column_tables(),
+            "deduplicate": request.plan["settings"].get("deduplicate", {})}
+        if request.gpus == 1:
+            result = execute_single_graph(gpu_state(), payload, graph)
+        else:
+            # each GPU runs the region over its shard, one after another
+            result = execute_sharded_graph(
+                payload, graph, request.gpus,
+                lambda kind, payloads: [run_shard(gpu_state(), shard, graph)
+                                        for shard in payloads],
+                DEVICES["h100-sxm"])
         outputs = result.pop("_outputs")
         return PhysicalResponse(outputs, {
             **result, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234, **report})

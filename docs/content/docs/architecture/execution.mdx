@@ -311,16 +311,18 @@ unified attention because it requires extra answer positions. See
 
 ### Multiple GPUs
 
-Each GPU holds a complete model copy and its own KV. A *coordinator* is
-the process that divides the work among GPU workers and collects their
-results.
+Each GPU holds a complete model copy and its own KV. Each GPU runs the
+whole region, as one GPU would, over its shard of one table, the
+region's *split table*: the anchor of the first join, or else the table
+the first model operator reads. Every other table is read whole on
+every GPU.
 
-- For filters, it assigns documents using their token lengths to balance
-  work across GPUs.
-- For joins, anchors stay on the GPU that filtered them so their KV can
-  be reused. Each GPU receives the partner documents needed for its anchors.
-- Between groups of joins, it combines the results and distributes the
-  next group's anchors.
+- The split table's documents are divided by token count, in contiguous
+  ranges. Documents that share a stop key, or copies of one text in a
+  deduplicated table, stay on one GPU.
+- A join pairs each GPU's anchors with every partner, so each pair is
+  asked on one GPU. Filters on the partner tables run on every GPU.
+- Each GPU's rows go to the region's rows, which keep each row once.
 
 Quail supports up to eight GPUs on one host. Each GPU holds all model
 weights; the weights are not divided between GPUs.

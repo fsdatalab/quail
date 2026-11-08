@@ -1,7 +1,8 @@
 """Load and run Quail models on the process's GPUs.
 
 One GPU runs in the calling process. Several GPUs use one child process
-per GPU, each with its own CUDA context and arena.
+per GPU, each with its own CUDA context and arena, and each runs the
+region over its shard as one GPU does.
 """
 
 import atexit
@@ -11,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from quail.backends.base import GpuContext
-from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
 from quail.backends.quail.executor.model_loading import load_model
@@ -26,16 +26,13 @@ from quail.backends.quail.executor.readout import (
 from quail.backends.quail.executor.state import GpuRuntime
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
+    execute_sharded_graph,
     execute_single_graph,
-    execution_context,
-    execution_measurements,
+    run_shard,
 )
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
-from quail.common.tokens import (
-    decode_payload_documents,
-)
-from quail.execution.runner import ExecutionContext
+from quail.common.tokens import decode_payload_documents, select_documents
 from quail.execution.types import PhysicalResponse
 from quail.physical import Scan
 from quail.physical.plan import graph_from_envelope
@@ -439,7 +436,6 @@ class ChildState:
     gpu: LoadedGpu | None = None
     registry: Any = None
     model_path: str | None = None
-    runtime_context: ExecutionContext | None = None
 
 
 def _child_main(gpu_index, conn):
@@ -473,7 +469,6 @@ def _child_boot(state, sub):
     device = registry.device(envelope["device"])
     backend = registry.backend(envelope["backend"])
     gpu, state.gpu = state.gpu, None
-    state.runtime_context = None
     state.gpu, boot = _boot_gpu(
         gpu, backend, GpuContext(
             gpu_index=state.gpu_index, gpus=sub["gpus"],
@@ -483,29 +478,10 @@ def _child_boot(state, sub):
     return boot
 
 
-def _child_execute(state, sub) -> dict:
-    """Run one graph group on this worker's share of its documents.
-
-    The first group of a query carries the query itself; the worker
-    binds it to the same execution context a single GPU uses.
-    """
-    if "query" in sub:
-        payload = sub["query"]
-        graph = graph_from_envelope(payload["physical_plan"])
-        state.runtime_context = execution_context(
-            _execution_state(state.gpu, payload, state.registry), payload, graph)
-    context = state.runtime_context
-    context.state["filter_limit"] = sub["limit"]
-    nodes, inputs = sub["nodes"], sub["inputs"]
-    gpu = state.gpu
-    with gpu.torch.inference_mode():
-        results = context.model_execution.execute_pipeline(nodes, inputs, context)
-    gpu.torch.cuda.synchronize()
-    if sub["final"]:
-        for key in gpu.arena.resident_keys():
-            gpu.arena.free_key(key)
-    return {"results": results, "retained": tuple(gpu.arena.retained_keys()),
-            **execution_measurements(context)}
+def _child_execute(state, payload) -> dict:
+    """Run the region on this GPU over its shard; return run_shard's result."""
+    return run_shard(_execution_state(state.gpu, payload, state.registry), payload,
+                     graph_from_envelope(payload["physical_plan"]))
 
 
 class GpuWorkers:
@@ -597,7 +573,10 @@ def _ensure_children(count, configuration) -> GpuWorkers:
 def execute_quail_multi(payload, registry, graph):
     """Execute the typed Quail graph across GPU child processes."""
     payload = dict(payload)
-    payload["documents"] = decode_payload_documents(payload["documents"])
+    # every child reads every table; a selection shares file backed tokens
+    payload["documents"] = {
+        alias: select_documents(documents, range(len(documents)))
+        for alias, documents in decode_payload_documents(payload["documents"]).items()}
     gpus = payload["gpus"]
     spec = registry.model(payload["model"])
     started = time.perf_counter()
@@ -614,10 +593,9 @@ def execute_quail_multi(payload, registry, graph):
     boots = workers.round("boot", [setup] * gpus)
     boot_s = round(time.perf_counter() - started, 2)
     say(f"all {gpus} GPUs ready; running the query")
-    report = execute_distributed_graph(
+    report = execute_sharded_graph(
         payload, graph, gpus, workers.round,
-        registry.device(payload["physical_plan"]["device"]),
-        registry.runtimes, registry)
+        registry.device(payload["physical_plan"]["device"]))
     slowest = max(boots, key=lambda boot: boot["boot_s"])
     report["boot_s"] = boot_s
     report["boot_kind"] = "cold" if any(b["kind"] == "cold" for b in boots) else "warm"
