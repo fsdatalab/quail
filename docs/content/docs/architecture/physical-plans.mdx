@@ -166,6 +166,23 @@ With an extraction after the filter, as in CUAD-15, the region's last
 step is a pipeline, which sends its rows when it finishes, so the sort
 holds no rows while the region runs and the hint skips nothing.
 
+Of the QUAIL-B check queries, two plans take a hint, and both show
+`ModelRegionExec: hint=[DynamicFilter [ empty ]]` under their top-k
+sort:
+
+| Query | Region and operators above | What the hint can skip |
+| --- | --- | --- |
+| SALES-5 | A score of the calls in the Negotiation stage, then a top 25 by score, then id | A call not yet scored, once 25 calls score 1 and the call's id is past the 25th of them (R15). Below a threshold of 1, nothing. |
+| CUAD-15 | A filter and an extraction in one pipeline, then a top 20 by id | Nothing while the region runs: the pipeline sends its rows when it finishes, so the sort holds no rows until then. |
+
+IMDB-2, IMDB-4, FEV-9, and IMDB-15 run their joins inside the region,
+as model joins, so no hash join sits above the region and their plans
+do not change. Of the other QUAIL-B plans, ten take a hint: REL-AGENT-4
+and WRENCH-2 from a top-k sort directly above the region, and eight
+from the hash join that joins a table back on its id. That join's
+build side holds every id of the table, or of the rows a relational
+filter keeps, so it skips only the rows that filter rejects.
+
 Only an ORDER BY sets the order of the result rows. Without one, the
 rows can come back in any order, and a LIMIT returns any of the rows
 that qualify.
