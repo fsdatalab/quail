@@ -5,6 +5,8 @@ linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 # pyo3 builds against the project's Python, the one an embedded
-# interpreter loads Quail from; maturin sets its own
+# interpreter loads Quail from. Forced, because maturin otherwise passes
+# the path of a fresh build environment on every install, which makes
+# pyo3 and every crate above it rebuild.
 [env]
-PYO3_PYTHON = { value = ".venv/bin/python", relative = true }
+PYO3_PYTHON = { value = ".venv/bin/python", relative = true, force = true }

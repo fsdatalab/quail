@@ -64,6 +64,9 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
+# a development install builds Quail's crates unoptimized; dependencies
+# are optimized once by [profile.dev.package."*"] and stay cached
+profile = "dev"
 manifest-path = "crates/quail-native/Cargo.toml"
 module-name = "_quail_native"
 python-packages = ["quail"]
