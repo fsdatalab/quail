@@ -30,6 +30,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::planning::{PlanOutcome, Planner, Settings, TableRows, planned_json};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
+use crate::python_failure;
 
 /// Runs each model region by calling the engine's
 /// `execute(planned, tables, sink)` or `run_region(payload, tables,
@@ -360,7 +361,7 @@ impl PythonRunner {
             }
             stream_from_pyarrow(answer).map(Some)
         })
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        .map_err(python_failure)?;
         for batch in reader.into_iter().flatten() {
             let batch = conform(batch?, &names, schema.inner())?;
             if rows.send(RegionRows::Batch(Ok(batch))).is_err() {
@@ -686,7 +687,7 @@ impl PythonTable {
             let answer = self.scan.call1(py, (columns,))?;
             from_pyarrow(answer.bind(py))
         })
-        .map_err(|error| DataFusionError::External(Box::new(error)))
+        .map_err(python_failure)
     }
 }
 
@@ -720,7 +721,7 @@ impl TableProvider for PythonTable {
             let answer = self.scan.call1(py, (columns,))?;
             from_pyarrow(answer.bind(py))
         })
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        .map_err(python_failure)?;
         // one partition per thread DataFusion runs, each a slice of the
         // rows, so the operators above read the table in parallel
         let num_partitions = state.config().target_partitions().max(1);

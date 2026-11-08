@@ -90,12 +90,11 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
 
     @classmethod
     def alone(cls, region, operators, table, settings):
-        """A classification of documents alone skips what the region's hint drops.
+        """Classifications of documents alone skip what the region's hint drops.
 
-        A skipped document gets no label, so it has no row.
+        A skipped document gets no label from any of them, so it has no row.
         """
-        (operator,) = operators
-        if operator.plan.partners is not None:
+        if any(operator.plan.partners is not None for operator in operators):
             return settings
         return replace(settings, skip=hinted_out(table.keys))
 

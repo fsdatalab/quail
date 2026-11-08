@@ -544,6 +544,18 @@ def classify_graph():
     return PhysicalGraph((scan, classify), PortRef("classify:r", "rows:r"))
 
 
+def classifies_graph():
+    """Classify each document of r, then classify it again over its KV."""
+    first = classify_graph().nodes[1]
+    second = first.replace(
+        node_id="classify:kind",
+        inputs=input_ports((PortRef("classify:r", "rows:r"),)),
+        spec=first.spec.replace(name="kind", labels=("b", "a"),
+                                prompt_token_parts=((), (CLASSIFY_FRAME + 1, CUE))))
+    return PhysicalGraph((classify_graph().nodes[0], first, second),
+                         PortRef("classify:kind", "rows:r"))
+
+
 def filter_graph(num_filters):
     """Ask each document of r one filter question after another."""
     nodes = [Scan(node_id="input:r", alias="r", input_id="r")]
@@ -610,7 +622,7 @@ def _run_recorded_region(monkeypatch, region):
     graph = {"fused": fused_graph, "scores": score_graph,
              "joined": joined_graph, "filter": lambda: filter_graph(1),
              "filters": lambda: filter_graph(2),
-             "classify": classify_graph}[region]()
+             "classify": classify_graph, "classifies": classifies_graph}[region]()
     if region == "joined":
         documents["q"] = [[PARTNER + num_partners] * 2]
         join_truth = {key: values + [1] for key, values in join_truth.items()}
@@ -748,3 +760,23 @@ def test_a_classification_alone_skips_the_documents_the_hint_drops(monkeypatch):
     prefilled = [entry["key"][1] for chunk in model.launched for entry in chunk
                  if entry["prefix"] is not None]
     assert sorted(prefilled) == list(range(0, 14, 2))
+
+
+def test_a_chain_of_classifications_alone_skips_the_documents_the_hint_drops(
+        monkeypatch):
+    class EvenDocuments:
+        """A region's hint that keeps the even documents of r."""
+
+        def generation(self):
+            return 0
+
+        def keep(self):
+            return [d % 2 == 0 for d in range(14)]
+
+    with reporting(None, EvenDocuments(), "r"):
+        result, _ = _run_recorded_region(monkeypatch, "classifies")
+    labeled = result["_outputs"][PortRef("classify:kind", "rows:r")].to_pydict()
+    assert labeled["r"] == list(range(0, 14, 2))
+    # the second classification names the labels the other way round
+    assert labeled["topic"] == ["a"] * 7
+    assert labeled["kind"] == ["b"] * 7

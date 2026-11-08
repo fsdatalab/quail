@@ -289,6 +289,26 @@ def test_a_region_plans_and_runs_once_over_its_whole_input(monkeypatch):
     session.close()
 
 
+def test_a_failure_inside_a_region_names_its_line_in_the_error():
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+
+    def run(request):
+        raise ValueError("the executor failed")
+
+    context = quail.SessionContext(session, physical_executor=run)
+    context.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+    with pytest.raises(RuntimeError) as failure:
+        context.sql("SELECT r.id FROM reviews r "
+                    "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))")
+    message = str(failure.value)
+    assert "ValueError: the executor failed" in message
+    # the Python traceback is lost once the error crosses Rust, so the
+    # error text carries it
+    assert "Traceback (most recent call last)" in message
+    assert 'raise ValueError("the executor failed")' in message
+    session.close()
+
+
 def _reviews_context(oracle, rows: int):
     """A context over `rows` reviews r00, r01, ..., answered by `oracle`."""
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)

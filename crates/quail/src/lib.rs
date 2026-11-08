@@ -90,8 +90,17 @@ impl std::fmt::Debug for Session {
     }
 }
 
-fn python_failure(error: PyErr) -> DataFusionError {
-    DataFusionError::External(Box::new(error))
+/// A Python exception as a DataFusion error whose text ends with the
+/// exception's traceback: the traceback is lost once the error leaves
+/// Python, so a failure inside a callback names its line.
+pub(crate) fn python_failure(error: PyErr) -> DataFusionError {
+    let text = Python::attach(
+        |py| match error.traceback(py).map(|traceback| traceback.format()) {
+            Some(Ok(traceback)) => format!("{error}\n{}", traceback.trim_end()),
+            _ => error.to_string(),
+        },
+    );
+    DataFusionError::External(text.into())
 }
 
 /// Add the site-packages of the virtual environment `VIRTUAL_ENV`
