@@ -8,7 +8,8 @@ publish = false
 
 [lib]
 name = "_quail_native"
-crate-type = ["cdylib"]
+# the rlib lets a Rust test embed the module built from this source
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 quail = { path = "../quail" }

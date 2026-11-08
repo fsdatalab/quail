@@ -24,5 +24,10 @@ tempfile = "3"
 quail-planner = { path = "../quail-planner" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 
+[dev-dependencies]
+# tests import the Python module built from this workspace, not the one
+# `uv sync` last installed
+quail-native = { path = "../quail-native" }
+
 [build-dependencies]
 pyo3-build-config = "0.30"

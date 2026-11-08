@@ -1,9 +1,13 @@
 //! A Rust program runs a query through Quail's Python executor, with
 //! the model answered by the test oracle in `tests/helpers/oracle.py`.
+//!
+//! The interpreter imports `_quail_native` built from this workspace, so
+//! the test does not depend on the module `uv sync` last installed.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
+use _quail_native::_quail_native;
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::Result;
@@ -31,6 +35,10 @@ fn engine() -> Py<PyAny> {
         // SAFETY: set before Python starts, while no other thread reads it
         unsafe { std::env::set_var("VIRTUAL_ENV", root.join(".venv")) };
     }
+    // Python imports a built-in module before one on its path; the table
+    // of built-in modules is read when Python starts
+    static BUILT_IN: Once = Once::new();
+    BUILT_IN.call_once(|| pyo3::append_to_inittab!(_quail_native));
     quail::start_python().expect("Python starts");
     let tests = root.join("tests");
     Python::attach(|py| {

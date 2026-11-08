@@ -2450,6 +2450,7 @@ dependencies = [
  "quail-cost",
  "quail-datafusion",
  "quail-inputs",
+ "quail-native",
  "quail-physical",
  "quail-planner",
  "serde",

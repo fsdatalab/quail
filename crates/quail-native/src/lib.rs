@@ -1105,8 +1105,10 @@ fn parse_expression<'py>(
     }
 }
 
+/// The `_quail_native` module. A Rust program that embeds Python adds it
+/// with `pyo3::append_to_inittab!` before Python starts.
 #[pymodule]
-fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     physical::register(module)?;
     module.add_class::<NativeSession>()?;
     module.add_class::<Tokenizer>()?;
