@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from quail.common.pairs import columns_key
 from quail.execution.ids import document_ids
@@ -22,11 +21,9 @@ class ScanRuntime:
             raise KeyError(
                 f"no prepared source for input {node.input_id!r}"
             )
-        value = document_ids(context.sources[node.input_id])
-        if node.predicates:
-            tested = document_ids(_tested_documents(node, context))
-            # a GPU's shard holds some of the table's documents
-            value = pc.filter(tested, pc.is_in(tested, value_set=value))
+        value = document_ids(
+            _tested_documents(node, context) if node.predicates
+            else context.sources[node.input_id])
         return NodeResult({f"rows:{node.alias}": Rows({node.alias: value})},
                           NodeMetrics(output_rows=len(value)))
 
