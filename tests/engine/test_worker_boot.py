@@ -1,6 +1,7 @@
 """Booting a GPU for a query, reusing it, and releasing it for another model."""
 
 import contextlib
+import gc
 import sys
 import types
 import weakref
@@ -197,3 +198,18 @@ def test_a_failed_boot_releases_the_gpu_and_the_next_boot_loads_again(
     again, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
     assert again is gpu and boot["kind"] == "warm"
     assert calls == [("release", ["gpu"])]
+
+
+def test_a_cold_boot_leaves_the_loaded_objects_out_of_later_collections(
+        booted, monkeypatch):
+    monkeypatch.setattr(worker.LoadedGpu, "warm", lambda self: (0.0, None))
+    registry = built_in_registry()
+    context = worker._single_gpu_context(registry, ENVELOPE)
+    gc.unfreeze()
+    try:
+        gpu, _ = worker._boot_for_query({}, registry.backend("quail"), context,
+                                        100, [1], [2])
+        # a full collection inside a query skips the loaded model's objects
+        assert not any(found is gpu for found in gc.get_objects())
+    finally:
+        gc.unfreeze()

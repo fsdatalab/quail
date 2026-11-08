@@ -268,6 +268,16 @@ def test_a_document_standing_for_copies_counts_once_per_copy_in_each_group(
     assert sorted(got) == [0, 1, 3]
 
 
+def test_a_hint_skips_a_document_of_a_stop_key_group():
+    # document 0, in groups a and b, is skipped by the hint; the others
+    # run, one per group in flight
+    admission = JoinAdmission([10, 10, 10], [[5]], 1000, 1 << 20, 16,
+                              stop_groups=[("a", "b"), ("a",), ("b",)],
+                              skip=lambda document: document == 0)
+    assert [group[0] for group in admission.next_chunk(1 << 20)] == [1, 2]
+    assert admission.take_skipped() == [0]
+
+
 def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
     from helpers.fakes import DOC, fake_pack
 

@@ -901,7 +901,8 @@ class JoinAdmission:
         if not self._page_cost[a]:
             self._zero_cost -= 1
         if self.groups is not None:
-            self._group_members[self.groups[a]].discard(a)
+            for group in self.groups[a]:
+                self._group_members.get(group, set()).discard(a)
         self._skipped.append(a)
 
     def take_skipped(self):

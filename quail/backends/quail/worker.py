@@ -30,7 +30,7 @@ from quail.backends.quail.graph import (
     execution_context,
     execution_measurements,
 )
-from quail.backends.resources import release_models
+from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
 from quail.common.tokens import (
     decode_payload_documents,
@@ -344,6 +344,8 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
         state["gpu"] = gpu
         gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
         warm_s, warm_tier = gpu.warm()
+        if cold:
+            freeze_loaded_objects()
         boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
         say(f"model ready after {boot['boot_s']} s ({boot['kind']} start)")
         rollback.pop_all()
