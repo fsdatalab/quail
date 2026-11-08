@@ -12,6 +12,11 @@ whatever the rest of the answer says.
 The answer then holds its text so far, which is itself one of the
 complete answers still possible, so the region's tests give it the
 value they were decided to have.
+
+An extraction's answer is a span of its document with the whitespace
+around it stripped. While the copy decoder still has several document
+positions in play, the answer may become the span of any of them, so a
+test is decided only when it is decided the same way for each.
 """
 
 from __future__ import annotations
@@ -57,11 +62,29 @@ class AnswerStop:
                 anywhere, or None for any text.
             max_chars: The most characters the answer may add, or None.
         """
-        decided = [
-            test.decide(self.answer, prefix, may_be_null=may_be_null,
-                        tails=tails, max_chars=max_chars)
-            if hasattr(test, "decide") else "undecided"
-            for test in (*self.stop_tests, *self.hint_tests)]
+        return self.decide_any([dict(prefix=prefix, may_be_null=may_be_null,
+                                     tails=tails, max_chars=max_chars)])
+
+    def decide_any(self, completions: list[dict]) -> Stop:
+        """Return whether to stop an answer that may go on as any of completions.
+
+        A test is decided only when it is decided the same way for every
+        completion, as when an extraction may still copy any of several
+        document positions.
+
+        Args:
+            completions: Each a set of complete answers still possible,
+                as keyword arguments of ``Expression.decide``: prefix,
+                and optionally may_be_null, tails, and max_chars.
+        """
+        if not completions:
+            return Stop.CONTINUE
+        decided = []
+        for test in (*self.stop_tests, *self.hint_tests):
+            found = {test.decide(self.answer, **completion)
+                     if hasattr(test, "decide") else "undecided"
+                     for completion in completions}
+            decided.append(found.pop() if len(found) == 1 else "undecided")
         if "not true" in decided:
             return Stop.REJECTED
         exact = decided[:len(self.stop_tests)]
@@ -80,18 +103,29 @@ def answer_stop(node) -> AnswerStop | None:
                       bool(getattr(node, "stop_when_true", False)))
 
 
-def copied_tails(text: str, prefix: str) -> list[str] | None:
-    """Return the text after each place the document text holds the prefix.
+def copied_completions(text: str, spans) -> list[dict]:
+    """Return the complete answers an extraction may still give, by span.
 
-    An extraction copies a span of its document, so an answer that
-    starts with the prefix goes on with one of these texts. An empty
-    prefix may go on with any text, which None stands for.
+    An extraction copies a span of its document text and strips the
+    whitespace around it. Each (start, end) is the span one document
+    position still in play covers so far; its answer so far is that
+    span stripped, and goes on only with the document text after it.
+
+    Args:
+        text: The document text.
+        spans: Each live position's start and end characters so far.
+
+    Returns:
+        One set of completions per span, as ``AnswerStop.decide_any``
+        reads them.
     """
-    if not prefix:
-        return None
-    tails = []
-    start = text.find(prefix)
-    while start >= 0:
-        tails.append(text[start + len(prefix):])
-        start = text.find(prefix, start + 1)
-    return tails
+    completions = []
+    for start, end in spans:
+        span = text[start:end]
+        prefix = span.strip()
+        if prefix:
+            tail = text[start + len(span.rstrip()):]
+        else:
+            tail = text[start:].lstrip()
+        completions.append(dict(prefix=prefix, tails=[tail]))
+    return completions

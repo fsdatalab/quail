@@ -24,7 +24,7 @@ from quail.backends.quail.reranker import (
     RerankerModelExecution,
     score_rows,
 )
-from quail.execution.answer_stops import Stop, answer_stop, copied_tails
+from quail.execution.answer_stops import Stop, answer_stop, copied_completions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import true_answer_rows
 from quail.execution.rows import Rows, extraction_rows
@@ -375,11 +375,18 @@ class Oracle:
             return text
         for length in range(1, len(text)):
             prefix = text[:length]
-            tails = None if source is None else copied_tails(source, prefix)
-            if stop.decide(prefix, tails=tails) is not Stop.CONTINUE:
+            if source is None:
+                completions = [dict(prefix=prefix)]
+            else:
+                # the copy is at any place the document holds the prefix
+                completions = copied_completions(source, [
+                    (start, start + length)
+                    for start in range(len(source))
+                    if source.startswith(prefix, start)])
+            if stop.decide_any(completions) is not Stop.CONTINUE:
                 self.answer_tokens += length
                 self.stopped_early += 1
-                return prefix
+                return prefix if source is None else prefix.strip()
         self.answer_tokens += len(text)
         return text
 

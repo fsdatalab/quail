@@ -13,6 +13,7 @@ from helpers.extract_reference import ReferenceInputs as ExtractionInputs
 from test_map_decode import events_torch
 
 from quail.backends.quail.executor.map_decoder import MapDecoder
+from quail.execution.answer_stops import AnswerStop
 
 
 # a draft policy matters only with draft tokens, and drafts only past one token
@@ -523,3 +524,47 @@ def test_copy_tables_match_each_documents_candidate_index():
         len(CandidateIndex.of(document.scan, vocabulary).kids)
         for document in documents.documents)
     assert np.all(np.diff(tables.option_lookup) >= 0)
+
+
+def test_an_extraction_goes_on_while_any_live_position_can_pass_its_test():
+    # the first token " State" also begins "state courts", the first
+    # position in document order; only the second can pass the test
+    texts = ["Disputes go to the state courts. The laws of the State of California"
+             " govern.",
+             "Disputes go to the state courts. The laws of the State of New York"
+             " govern."]
+    spec, vocabulary = make_spec(*texts)
+    spec = spec.replace(draft_tokens=0, max_answer_tokens=8, top_tokens=4)
+    state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
+    documents = ExtractionInputs(
+        state, [spec], vocabulary, np.arange(len(texts)), None, texts)
+    num_tokens = len(vocabulary.vocab)
+    logits = torch.full((len(texts), 8, num_tokens), -8.0)
+    for document, answer in enumerate([" State of California", " State of New York"]):
+        written = [*vocabulary.tokenizer(answer), vocabulary.tokenizer.stop_ids[0]]
+        for at, token in enumerate(written):
+            logits[document, at, token] = 8.0
+    test = sql_condition("ends = 'State of California'", {"ends": pa.string()}, "c")
+    decoder = MapDecoder(events_torch(0), torch.eye(num_tokens), len(texts), [8],
+                         vocabulary.tokenizer.stop_ids, 16,
+                         workspace_bytes=64 * 2**20)
+    decoder.answer_stops[0] = AnswerStop("ends", (test,), (), False)
+    slots = np.arange(len(texts))[None]
+    decoder.configure_copy(0, slots, documents, [spec])
+    for slot in slots[0]:
+        decoder.start(int(slot), 0, 0, [0, 1])
+    decoder.submit(logits[:, 0], np.arange(len(texts)), slots[0], None)
+    decoder.harvest(wait=True)
+    while decoder.active:
+        rows = decoder.rows()
+        decoder.feed(SimpleNamespace(
+            decode_rows=rows, tokens=len(rows),
+            input_ids=torch.empty(len(rows), dtype=torch.int64), meta={}))
+        decoder.submit(logits[rows.slots, rows.positions + 1], [], [], rows)
+        decoder.harvest(wait=True)
+    values, _ = decoder.output_answers(0, slots[0])
+    # neither position of New York's " State" can become California, so
+    # it stops at once and holds the first position's text
+    assert values == ["State of California", "state"]
+    assert decoder.lengths[0].tolist() == [3, 1]
+    assert decoder.stopped_early[0] == 1

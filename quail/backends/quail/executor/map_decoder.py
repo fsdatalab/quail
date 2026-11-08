@@ -687,8 +687,8 @@ class MapDecoder:
             mine = slots[(self.map[slots] == q) & ~self.stopped[slots]]
             mine = mine[self.written[q][mine] > 0]
             for slot in mine.tolist():
-                prefix, length, extra = self._partial_answer(q, slot)
-                if stop.decide(prefix, **extra) is Stop.CONTINUE:
+                completions, length = self._partial_answer(q, slot)
+                if stop.decide_any(completions) is Stop.CONTINUE:
                     continue
                 self.lengths[q][slot] = length
                 self.stopped[slot] = True
@@ -700,23 +700,27 @@ class MapDecoder:
                 self.stopped_early[q] += 1
 
     def _partial_answer(self, q, slot):
-        """Return an answer's text so far, its length in tokens, and C(w).
+        """Return an answer's completions still possible and its length in tokens.
 
         A map's text is its decoded tokens up to the last whole character.
-        An extraction's is the document span its tokens copy, which goes
-        on only with the document's text and is NULL no more.
+        An extraction's is, for each document position still in play, the
+        stripped span its tokens copy, which goes on only with the
+        document's text and is NULL no more; an extraction whose
+        positions are not known gives no completions.
         """
-        from quail.execution.answer_stops import copied_tails
+        from quail.execution.answer_stops import copied_completions
 
         written = int(self.written[q][slot])
         if q in self.copy_constraints:
             state = self.copy_constraints[q]
             document = self.copy_document[slot]
-            (text,), _ = state.constraint.output_answers(
-                [document], [state.sources[slot]], [written])
-            text = text or ""
-            source = state.constraint.documents.documents[document].text
-            return text, written, dict(tails=copied_tails(source, text))
+            spans = state.constraint.live_spans(
+                document, state.masks[document], int(self.tokens[q][slot, 0]),
+                written)
+            if spans is None:
+                return [], written
+            text = state.constraint.documents.documents[document].text
+            return copied_completions(text, spans), written
         tokens = self.tokens[q][slot]
         length = written
         (text,) = self.tokenizer.decode_batch([tokens[:length]])
@@ -724,7 +728,7 @@ class MapDecoder:
         while length and text.endswith("\ufffd"):
             length -= 1
             (text,) = self.tokenizer.decode_batch([tokens[:length]])
-        return text, length, {}
+        return [dict(prefix=text)], length
 
     def _read_copy(self, q, documents, indices, values):
         from quail.common.draft_policy import live_buckets

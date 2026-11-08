@@ -17,6 +17,7 @@ from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
+from quail.execution.answer_stops import Stop, answer_stop, copied_completions
 
 STOP_RULE = "should_stop_answers_early"
 REVIEWS = pa.table({
@@ -126,3 +127,49 @@ def test_an_expression_decides_a_prefix_test_on_a_partial_answer(prefix, decided
     (node,) = [node for node in plan.graph.nodes if node.type_name == "quail.ai_map"]
     (test,) = node.stop_tests
     assert test.decide(node.spec.name, prefix) == decided
+
+
+LAWS = ("Disputes go to the state courts. This Agreement is governed by the laws "
+        "of the State of California.")
+
+
+def _plan_test(sql):
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    session.register("reviews",
+                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+    plan = session.sql(sql).plan()
+    session.close()
+    (node,) = [node for node in plan.graph.nodes
+               if node.type_name in ("quail.ai_map", "quail.ai_extract")]
+    return answer_stop(node)
+
+
+@pytest.mark.parametrize("prefix", [" State", "State", "State of", "State of ",
+                                    "State of Cal", " "])
+def test_an_extraction_goes_on_while_a_copied_span_can_still_pass(prefix):
+    stop = _plan_test("SELECT r.id, AI_EXTRACT(r.body, {'law': 'Which law?'}) AS e "
+                      "FROM reviews r WHERE e.law = 'State of California'")
+    # the copy may still be at any place the document holds the prefix,
+    # in any case, and its answer is that span stripped
+    spans = [(start, start + len(prefix)) for start in range(len(LAWS))
+             if LAWS[start:start + len(prefix)].lower() == prefix.lower()]
+    assert stop.decide_any(copied_completions(LAWS, spans)) is Stop.CONTINUE
+
+
+def test_an_extraction_stops_once_no_copied_span_can_pass():
+    stop = _plan_test("SELECT r.id, AI_EXTRACT(r.body, {'law': 'Which law?'}) AS e "
+                      "FROM reviews r WHERE e.law = 'State of California'")
+    start = LAWS.index("State of")
+    spans = [(LAWS.index("state courts"), LAWS.index(" courts")),
+             (start, start + len("State"))]
+    assert stop.decide_any(copied_completions(LAWS.replace(
+        "California", "New York"), spans)) is Stop.REJECTED
+
+
+@pytest.mark.parametrize(("prefix", "decided"), [
+    (" ", Stop.CONTINUE), (" Ye", Stop.CONTINUE), ("Ye", Stop.REJECTED),
+    (" No", Stop.REJECTED)])
+def test_a_map_answer_is_decided_on_its_text_with_its_leading_space(prefix, decided):
+    stop = _plan_test("SELECT r.id FROM reviews r "
+                      "WHERE AI_MAP(r.body, 'Is it kind?') = ' Yes'")
+    assert stop.decide(prefix) is decided
