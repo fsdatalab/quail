@@ -25,6 +25,21 @@ class OwnRequests(list):
         super().__init__(range(len(lengths)))
         self.lengths = np.asarray(lengths, dtype=np.int64)
 
+
+class OversizedDocumentError(ValueError):
+    """A document too long for one forward pass or for the whole arena.
+
+    Attributes:
+        anchor: The document's anchor index.
+        reason: What it exceeds.
+    """
+
+    def __init__(self, anchor: int, reason: str):
+        super().__init__(f"document {anchor}: {reason}")
+        self.anchor = anchor
+        self.reason = reason
+
+
 def pages_for(tokens: int, page_tokens: int) -> int:
     """Pages needed for `tokens` rows (suffix KV is never paged)."""
     return -(-tokens // page_tokens)
@@ -344,7 +359,6 @@ class JoinAdmission:
         self._next = []            # next partner index at the stage
         self._true = []
         self._settled = []         # events for anchors that never ran
-        self.oversized = []        # anchors too long for a chunk or the arena
         self.in_flight = 0         # launched groups not yet reported
         self.blocked_pages = 0
         self.reserve = reserve
@@ -493,21 +507,21 @@ class JoinAdmission:
         shared = self.borrowing.tree_shared[a] if a in self.dependencies else 0
         fresh = prefix - shared
         reserve = self._dependent_pages[a] if a < len(self._dependent_pages) else 0
-        oversized = False
         if resident_pages is not None:
             need = max(0, need - resident_pages)
         elif self.page_cost(fresh + self._extra) + reserve > self.arena_pages:
-            oversized = True
+            raise OversizedDocumentError(a, (
+                f"its {fresh}-token prefix needs "
+                f"{self.page_cost(fresh + self._extra) + reserve} KV pages, "
+                f"more than the {self.arena_pages} pages of the whole arena"))
         cum = self._cum[j] if lists[j] is None else cums[j]
-        if not oversized and resident_pages is None and len(cum) > 1:
+        if resident_pages is None and len(cum) > 1:
             first = self.frame_rows[j] + int(cum[1] - cum[0])
-            oversized = fresh + first > self.chunk_budget
-        if oversized:
-            # a document that cannot fit one chunk or the arena is
-            # skipped: it settles unanswered, like one with nothing to ask
-            self.oversized.append(a)
-            need = 0
-            lists[j], cums[j] = self._partner_list(a, j, [])
+            if fresh + first > self.chunk_budget:
+                raise OversizedDocumentError(a, (
+                    f"its {fresh}-token prefix and {first}-token first request "
+                    f"exceed the {self.chunk_budget}-token forward pass, and a "
+                    f"document's prefix is not split across passes"))
         carried = 0 if resident_pages is not None else prefix
         self.prefix.append(prefix)
         self._lists.append(lists)

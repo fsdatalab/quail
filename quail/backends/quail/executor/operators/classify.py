@@ -69,7 +69,8 @@ class QuailClassifier:
     def __init__(self, state: QueryExecutionState):
         self.state = state
 
-    def classify(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
+    def classify(self, spec, rows, documents, on_answers=None,
+                 skip=None) -> RerankerBatch:
         """Classify document rows using the shared scheduler and KV arena.
 
         Args:
@@ -78,6 +79,9 @@ class QuailClassifier:
             documents: Tokenized documents indexed by scored alias and document ID.
             on_answers: Optional callable(row positions, labels) run with each
                 chunk's newly labeled rows.
+            skip: Optional callable(row position) -> bool, asked when a row
+                would be admitted; a row it is true for is not asked and
+                has no label.
 
         Returns:
             A RerankerBatch containing labels, optional label probabilities,
@@ -96,7 +100,7 @@ class QuailClassifier:
         part = ClassifyBatch(plan, on_answers, sum(map(len, prefixes)))
         return execute_parts(
             state, [part], prefixes, keys, keep_kv=False, prefix_tree=tree,
-            label=f"classify {spec.name}")[spec.name]
+            label=f"classify {spec.name}", skip=skip)[spec.name]
 
 def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     """Prepare a classification with the labels its inputs provide."""

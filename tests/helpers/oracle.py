@@ -212,27 +212,38 @@ class Oracle:
 
     # ---- the reranker interface, for scores and labels -------------
 
-    def score(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
+    def score(self, spec, rows, documents, on_answers=None,
+              skip=None) -> RerankerBatch:
         rows = np.asarray(rows).reshape(-1, len(spec.aliases))
-        self.calls.append((spec.name, rows.tolist()))
         ids = [self._sources(spec.aliases, row) for row in rows]
+        # the scheduler asks skip as it admits each row, in order
+        asked = []
+        for position in range(len(rows)):
+            if skip is not None and skip(position):
+                continue
+            asked.append(position)
+            if on_answers is not None and not isinstance(spec, ClassifySpec):
+                value = self.scores(spec, ids[position])
+                self._answered(ids[position][0], partial(
+                    on_answers, np.array([position]), [value]))
+        self.calls.append((spec.name, rows[asked].tolist()))
         if isinstance(spec, ClassifySpec):
-            values = np.asarray([self._label(spec, row) for row in ids], dtype=object)
+            values = np.full(len(rows), None, dtype=object)
+            for position in asked:
+                values[position] = self._label(spec, ids[position])
             probabilities = None
             if self.probabilities and spec.probabilities:
                 probabilities = np.asarray([
                     [np.nan] * len(spec.labels) if value is None
                     else [0.8 if label == value else 0.1 for label in spec.labels]
                     for value in values])
-            return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0,
-                                 suffix_tokens=3 * len(rows),
+            return RerankerBatch(values, fresh_tokens=len(asked), cached_tokens=0,
+                                 suffix_tokens=3 * len(asked),
                                  probabilities=probabilities)
-        scores = [self.scores(spec, row) for row in ids]
-        if on_answers is not None:
-            for position, value in enumerate(scores):
-                self._answered(ids[position][0], partial(
-                    on_answers, np.array([position]), [value]))
-        return RerankerBatch(scores, fresh_tokens=len(rows), cached_tokens=0)
+        scores = np.full(len(rows), None, dtype=object)
+        for position in asked:
+            scores[position] = self.scores(spec, ids[position])
+        return RerankerBatch(scores, fresh_tokens=len(asked), cached_tokens=0)
 
     # ---- answering ------------------------------------------------
 

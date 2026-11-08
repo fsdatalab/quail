@@ -12,6 +12,7 @@ from quail.backends.quail.executor.admission import (
     DROP,
     SKIP,
     JoinAdmission,
+    OversizedDocumentError,
     OwnRequests,
 )
 from quail.backends.quail.executor.readout_groups import ReadoutGroups
@@ -253,36 +254,42 @@ class StageExecutor:
                           for stage in self.stages)
         if prefix_tree is not None and not prefix_tree.shared_tokens:
             prefix_tree = None
-        self.sched = JoinAdmission(
-            self.prefix_lengths,
-            [s.lengths + rows
-             for s, rows in zip(self.suffixes, self.canvas_rows)],
-            budget,
-            self.arena.num_pages if self.paged else 1 << 62,
-            self.arena.page_tokens,
-            frame_tokens=[len(f) for f in self.frames], resident=resident,
-            anchor_partners={a: self._requests_of(a, key)
-                             for a, key in enumerate(self.keys)},
-            # a windowed model may pack any chunk unified, so it reserves
-            # the unified path's temporary pages throughout
-            temporary_suffix_pages=self.paged and self.mode == "unified",
-            answer_dtype=[stage.readout.dtype for stage in self.stages],
-            frame_canvas_tokens=len(self.canvas),
-            page_cost=self.arena.page_cost if self.paged else (lambda *args: 0),
-            tree=prefix_tree,
-            advance=partial(_advance_stage, stages),
-            frame_writes=self.writes,
-            limit=limit, survival=survival,
-            stop_groups=stop_groups,
-            stop_width=max(self._stop_width(stop_groups, budget), num_key_survivors),
-            num_key_survivors=num_key_survivors,
-            skip=skip,
-            extra_tokens=self.capacity_extra,
-            gated=[j for j, stage in enumerate(self.stages)
-                   if stage.prepare is not None],
-            reserve=self._reserve if self.paged else None,
-            dependencies=dependencies,
-        )
+        try:
+            self.sched = JoinAdmission(
+                self.prefix_lengths,
+                [s.lengths + rows
+                 for s, rows in zip(self.suffixes, self.canvas_rows)],
+                budget,
+                self.arena.num_pages if self.paged else 1 << 62,
+                self.arena.page_tokens,
+                frame_tokens=[len(f) for f in self.frames], resident=resident,
+                anchor_partners={a: self._requests_of(a, key)
+                                 for a, key in enumerate(self.keys)},
+                # a windowed model may pack any chunk unified, so it reserves
+                # the unified path's temporary pages throughout
+                temporary_suffix_pages=self.paged and self.mode == "unified",
+                answer_dtype=[stage.readout.dtype for stage in self.stages],
+                frame_canvas_tokens=len(self.canvas),
+                page_cost=self.arena.page_cost if self.paged else (lambda *args: 0),
+                tree=prefix_tree,
+                advance=partial(_advance_stage, stages),
+                frame_writes=self.writes,
+                limit=limit, survival=survival,
+                stop_groups=stop_groups,
+                stop_width=max(self._stop_width(stop_groups, budget),
+                               num_key_survivors),
+                num_key_survivors=num_key_survivors,
+                skip=skip,
+                extra_tokens=self.capacity_extra,
+                gated=[j for j, stage in enumerate(self.stages)
+                       if stage.prepare is not None],
+                reserve=self._reserve if self.paged else None,
+                dependencies=dependencies,
+            )
+        except OversizedDocumentError as error:
+            raise ValueError(
+                f"{self.label}: document {self.keys[error.anchor]}: "
+                f"{error.reason}") from error
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         self.admission_mode = answer_admission_mode()
@@ -1072,14 +1079,9 @@ class StageExecutor:
                 self.arena.free_key(self.keys[anchor])
         self.progress.finish(f"{self.label} done", f"{self.tokens:,} fresh tokens")
         self.arena.drop_holds(self.held)
-        if self.sched.oversized:
-            logger.warning(
-                "%s: skipped %d documents too long for one forward pass; "
-                "they get no answer", self.label, len(self.sched.oversized))
         if self.stats is not None:
             self.stats["borrowed_tokens"] = self.borrowing.borrowed_tokens
             self.stats["pack_s"] = self.pack_s
-            self.stats["skipped_documents"] = len(self.sched.oversized)
             self.stats["num_evictions"] = self.num_evictions
             self.stats["recomputed_tokens"] = self.recomputed_tokens
             self.stats["answer_admission"] = self.admission_mode

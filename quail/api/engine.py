@@ -34,10 +34,6 @@ class Engine:
         owns_session: Whether ``close`` closes the session.
     """
 
-    # the rows of a region input Rust runs at once, when the region asks
-    # each row on its own; a larger input runs in windows of this size
-    input_window_rows = 65_536
-
     def __init__(self, session, physical_executor: Callable | None = None, *,
                  order: str | None = None, run_query: Callable | None = None,
                  owns_session: bool = False):

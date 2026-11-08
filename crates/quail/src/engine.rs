@@ -21,9 +21,8 @@ use pyo3::types::IntoPyDict;
 use std::collections::HashMap;
 
 use quail_datafusion::{
-    IdentifiedTable, InputBatches, InputRows, InputStream, ModelRegion, RegionBatches,
-    RegionColumns, RegionHint, RegionRunner, SharedInput, collect_inputs, derive,
-    quail_column_names,
+    IdentifiedTable, InputRows, InputStream, ModelRegion, RegionBatches, RegionColumns, RegionHint,
+    RegionRunner, SharedInput, collect_inputs, derive, quail_column_names,
 };
 use quail_planner::operators::Operators;
 use quail_planner::prompts::Turn;
@@ -50,11 +49,6 @@ pub(crate) struct PythonRunner {
     /// calls the engine's `execute`; None calls `run_region`.
     pub(crate) planning: Option<(Arc<Planner>, Settings)>,
 }
-
-/// The rows of a region input the executor runs at once, when the
-/// region asks each row on its own: a larger input runs in windows of
-/// this many rows, each planned and run as it arrives.
-pub const INPUT_WINDOW_ROWS: usize = 65_536;
 
 /// A region a DataFusion worker hands to the calling thread to run.
 pub(crate) struct RegionCall {
@@ -260,13 +254,10 @@ impl PythonRunner {
     /// Run the region on this thread, sending its rows to `rows` as the
     /// executor finishes them.
     ///
-    /// A region that asks each row of its one input on its own runs the
-    /// input in windows of rows as they arrive, each planned on its own
-    /// rows; any other region, and an input that ends within one window,
-    /// runs once over every row. Such a region also drops each input row
-    /// a test of `hint` rejects, by the input columns it passes on, before
-    /// planning, and hands the executor the hint to drop rows by as it
-    /// tightens.
+    /// The region runs once, as one plan over every row of its inputs. A
+    /// region over one table also drops each input row a test of `hint`
+    /// rejects, by the input columns it passes on, before planning, and
+    /// hands the executor the hint to drop rows by as it tightens.
     fn run_here(
         &self,
         region: &ModelRegion,
@@ -282,52 +273,21 @@ impl PythonRunner {
             false => None,
         };
         let hint = source.as_deref().map(|table| (hint, &columns, table));
-        if !(self.planning.is_some() && fetch.is_none() && row_local(region, &payload)?) {
-            let inputs = collect_inputs(inputs)?;
-            return self.run_window(region, &payload, &inputs, fetch, hint, true, rows);
-        }
-        let size = self.input_window_rows()?;
-        let mut inputs = inputs;
-        let (name, mut batches) = inputs.remove(0);
-        let mut first = true;
-        let mut rest = None;
-        loop {
-            let (window, ended) = read_window(&mut batches, &mut rest, size)?;
-            let window = [(name.clone(), window)];
-            self.run_window(region, &payload, &window, fetch, hint, first, rows)?;
-            first = false;
-            if ended {
-                return Ok(());
-            }
-        }
+        let inputs = collect_inputs(inputs)?;
+        self.run_rows(region, &payload, &inputs, fetch, hint, rows)
     }
 
-    /// The rows of an input window, from the engine's
-    /// `input_window_rows` when it has one.
-    fn input_window_rows(&self) -> Result<usize> {
-        Python::attach(
-            |py| match self.engine.bind(py).getattr("input_window_rows") {
-                Ok(found) => found.extract::<usize>(),
-                Err(_) => Ok(INPUT_WINDOW_ROWS),
-            },
-        )
-        .map_err(|error| DataFusionError::External(Box::new(error)))
-    }
-
-    /// Plan and run the region over these rows of its inputs, sending
+    /// Plan and run the region over every row of its inputs, sending
     /// its rows to `rows`. With a hint over the one table the region
     /// reads, an input's rows the hint rejects are dropped first, and
-    /// the executor reads the hint as it tightens. A window after the
-    /// `first` that keeps no row does not run.
-    #[allow(clippy::too_many_arguments)]
-    fn run_window(
+    /// the executor reads the hint as it tightens.
+    fn run_rows(
         &self,
         region: &ModelRegion,
         payload: &str,
         inputs: &[InputRows],
         fetch: Option<usize>,
         hint: Option<(&RegionHint, &RegionColumns, &str)>,
-        first: bool,
         rows: &RowSender,
     ) -> Result<()> {
         let mut sorted;
@@ -345,14 +305,11 @@ impl PythonRunner {
                 let found_rows = match found {
                     Some(input) => {
                         let schema = Arc::new(region.inputs[input].schema().as_arrow().clone());
-                        let window = concat_batches(&schema, &sorted[input].1)?;
-                        let keep = BooleanArray::from(hint.keep(columns, table, &window)?);
-                        let window = filter_record_batch(&window, &keep)?;
-                        if window.num_rows() == 0 && !first {
-                            return Ok(());
-                        }
-                        sorted[input].1 = vec![window.clone()];
-                        Some(window)
+                        let all = concat_batches(&schema, &sorted[input].1)?;
+                        let keep = BooleanArray::from(hint.keep(columns, table, &all)?);
+                        let kept = filter_record_batch(&all, &keep)?;
+                        sorted[input].1 = vec![kept.clone()];
+                        Some(kept)
                     }
                     None => named_rows(region, table)?,
                 };
@@ -444,47 +401,6 @@ impl RegionRunner for PythonRunner {
             ended: false,
         }))
     }
-}
-
-/// Read batches until they hold `size` rows or the input ends; a batch
-/// past `size` rows is cut, and its rest starts the next window.
-///
-/// Returns the batches and whether the input ended.
-fn read_window(
-    batches: &mut InputBatches,
-    rest: &mut Option<RecordBatch>,
-    size: usize,
-) -> Result<(Vec<RecordBatch>, bool)> {
-    let mut window = Vec::new();
-    let mut held = 0;
-    while held < size {
-        let batch = match rest.take() {
-            Some(batch) => batch,
-            None => match batches.next() {
-                Some(batch) => batch?,
-                None => return Ok((window, true)),
-            },
-        };
-        let taken = batch.num_rows().min(size - held);
-        if taken < batch.num_rows() {
-            *rest = Some(batch.slice(taken, batch.num_rows() - taken));
-        }
-        held += taken;
-        window.push(batch.slice(0, taken));
-    }
-    Ok((window, false))
-}
-
-/// Whether each of a region's rows comes from one row of its one input
-/// alone: no join, no table read by name, no fetch, and no stop key, so
-/// the region can run its input's rows in windows.
-fn row_local(region: &ModelRegion, payload: &str) -> Result<bool> {
-    let (operators, _) = read_region_json(payload)?;
-    Ok(region.inputs.len() == 1
-        && identified_scans(region)?.is_empty()
-        && operators.joins.is_empty()
-        && operators.fetch.is_none()
-        && operators.stop_keys.is_empty())
 }
 
 /// The one table a region reads, by input name or table name, when a

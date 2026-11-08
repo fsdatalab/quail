@@ -255,12 +255,18 @@ def execute_alone(state, nodes, inputs, build, *, label: str) -> dict:
 
 def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
-                  paged=True, on_answers=None, num_key_survivors=1) -> dict:
+                  paged=True, on_answers=None, num_key_survivors=1,
+                  skip=None) -> dict:
     """Run prepared operator work together and collect per-node results.
 
     A limit ends the run once that many documents passed every part;
     documents are admitted only while the ones in flight are expected
     to fall short of it, by the parts' selectivities.
+
+    ``skip``, a callable(anchor) -> bool, is asked when a fresh anchor
+    would be admitted; an anchor it is true for never runs. Without it,
+    a first part that drops documents skips those the region's hint
+    rejects.
     """
     from quail.backends.quail.executor.operators.map import branch_parts
 
@@ -317,7 +323,7 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
             survival=survival(parts),
             stop_groups=stop_groups, num_key_survivors=num_key_survivors,
             # a document a hint drops answers no first filter, so it leaves
-            skip=(hinted_out(anchor_keys)
+            skip=(skip if skip is not None else hinted_out(anchor_keys)
                   if getattr(parts[0], "drops_documents", False) else None),
             paged=paged,
             on_chunk=transition_reporter(parts), on_answers=on_answers,

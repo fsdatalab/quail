@@ -198,7 +198,9 @@ def test_a_region_hands_on_rows_before_it_finishes():
     session.close()
 
 
-def test_a_large_input_runs_in_windows_with_the_same_rows():
+def test_a_region_plans_and_runs_once_over_its_whole_input(monkeypatch):
+    # one row a batch: DataFusion hands the region its rows in pieces
+    monkeypatch.setenv("DATAFUSION_EXECUTION_BATCH_SIZE", "1")
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     calls = []
     executor = oracle_executor(ORACLE)
@@ -212,14 +214,9 @@ def test_a_large_input_runs_in_windows_with_the_same_rows():
     text = ("SELECT r.id, AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
             "['positive', 'negative', 'mixed']) AS sentiment "
             "FROM reviews r WHERE r.stars > 1")
-    whole = context.sql(text)
+    table = context.sql(text)
     assert len(calls) == 1
-    # each window holds at least one row of the three DataFusion keeps
-    context._engine.input_window_rows = 1
-    windowed = context.sql(text)
-    assert len(calls) > 2
-    assert _same_rows(windowed, whole, ordered=False)
-    assert whole.num_rows == 3
+    assert table.num_rows == 3
     session.close()
 
 
@@ -263,9 +260,8 @@ TOP_K_ROWS = [("r00", 1.0), ("r02", 1.0), ("r04", 1.0)]
 
 @pytest.mark.parametrize("where", ["", "WHERE r.stars > -1"])
 def test_a_top_k_over_a_score_asks_fewer_rows_once_it_holds_k(monkeypatch, where):
-    # with a WHERE the region reads DataFusion's rows in windows of one
-    # row; without one it reads the table and scores it in groups of one
-    monkeypatch.setattr("quail.backends.quail.reranker.HINTED_SCORE_ROWS", 1)
+    # with a WHERE the region reads DataFusion's rows; without one it
+    # reads the table; either way one run skips rows as the hint tightens
     # one partition: DataFusion hands the region the rows in table order
     monkeypatch.setenv("DATAFUSION_EXECUTION_TARGET_PARTITIONS", "1")
     text = (f"SELECT r.id, AI.SCORE(PROMPT('q7: {{0}}', r.body)) AS score "
@@ -274,7 +270,6 @@ def test_a_top_k_over_a_score_asks_fewer_rows_once_it_holds_k(monkeypatch, where
     # after r04
     hinted = Oracle(**TOP_K_SCORES, streams=True, tightens_after={2, 4})
     context = _reviews_context(hinted, 12)
-    context._engine.input_window_rows = 1
     assert _rows(context.sql(text)) == TOP_K_ROWS
     # without the LIMIT the sort holds every row and hands no threshold
     every = Oracle(**TOP_K_SCORES, streams=True)

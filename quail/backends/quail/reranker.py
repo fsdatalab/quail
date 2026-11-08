@@ -12,17 +12,10 @@ from quail.backends.base import GpuContext
 from quail.common.expressions import PROBABILITIES_SUFFIX
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import (
-    DEFAULT_BATCH_ROWS,
-)
 from quail.execution.rows import Rows, rows_of
 from quail.execution.streaming import region_stream
 from quail.physical import AiClassify, AiScore, ClassifySpec, ValueType
 from quail.progress import answer_sink
-
-# the rows a score asks at once when a hint above the region may drop
-# rows; the hint is read again before each group
-HINTED_SCORE_ROWS = 1024
 
 # one kernel per entry of quail.common.expressions.SCORE_COMPARISONS
 _COMPARE = {
@@ -50,28 +43,17 @@ class ScoreRows:
             return len(self.columns[0]) * len(self.columns[1])
         return len(self.columns[0])
 
-    def batches(self, size=DEFAULT_BATCH_ROWS):
-        """Yield bounded arrays in input order.
+    def array(self) -> np.ndarray:
+        """Every row as one array, one column per alias, in input order.
 
-        A product batch ends on a first-document boundary when a
-        document's partners fit in one batch, so its prefix KV is
-        computed once.
+        A product's rows run through the second alias for each row of the
+        first.
         """
         if self.product:
-            width = len(self.columns[1])
-            if 0 < width <= size:
-                size -= size % width
-        for start in range(0, max(1, len(self)), size):
-            end = min(start + size, len(self))
-            if self.product and end > start:
-                indices = np.arange(start, end, dtype=np.int64)
-                left, right = self.columns
-                yield np.column_stack((left[indices // len(right)],
-                                       right[indices % len(right)]))
-            elif self.product:
-                yield np.empty((0, 2), dtype=np.int32)
-            else:
-                yield np.column_stack([column[start:end] for column in self.columns])
+            left, right = self.columns
+            return np.column_stack((np.repeat(left, len(right)),
+                                    np.tile(right, len(left))))
+        return np.column_stack(self.columns)
 
 
 @dataclass(frozen=True)
@@ -228,23 +210,22 @@ def _stream_scored(node, priors):
     return on_scored
 
 
-def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeResult:
-    """Score the node's candidate rows in bounded batches, in input order.
+def score_node(node, inputs, score_batch) -> NodeResult:
+    """Score the node's candidate rows in one call, in input order.
 
-    A Cartesian product is scored in batches of DEFAULT_BATCH_ROWS
-    pairs, built per batch: the whole product may not fit in host
-    memory.
+    Under a region hint over the scored table, the call skips each row
+    the hint rejects when the row would be admitted, reading the hint
+    again whenever it tightens; a skipped row has no output row.
 
     Args:
         node: The AiScore or AiClassify node.
         inputs: Its input values by port name.
-        score_batch: Callable (node, rows, on_scored) returning the
-            batch's NodeResult, with one row per input row in order;
-            ``on_scored(rows, values)``, when not None, is run with each
-            part of the rows as it is scored.
-        streamed: Whether ``score_batch`` sends its answers to the
-            answer sink itself. Otherwise each batch's answers are sent
-            when the batch is scored.
+        score_batch: Callable (node, rows, on_scored, skip) returning
+            the NodeResult, with one row per input row it did not skip,
+            in order; ``on_scored(rows, values)``, when not None, is run
+            with each part of the rows as it is scored, and ``skip``,
+            when not None, is a callable(row position) -> bool, true for
+            a row to leave unasked.
     """
     if not isinstance(node, (AiScore, AiClassify)):
         raise TypeError(type(node).__name__)
@@ -255,33 +236,15 @@ def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeR
     on_scored = _stream_scored(node, priors)
     stream = region_stream()
     alias = node.spec.aliases[0]
-    # a hint over the scored table is read again before each group of rows
-    hinted = (stream is not None and stream.hint is not None and not rows.product
-              and len(node.spec.aliases) == 1 and alias == stream.alias)
-    scored = []
-    metrics = NodeMetrics()
-    size = DEFAULT_BATCH_ROWS if rows.product else max(1, len(rows))
-    if hinted:
-        size = HINTED_SCORE_ROWS
-    for batch in rows.batches(size):
-        if hinted:
-            batch = batch[[stream.keeps(alias, int(document))
-                           for document in batch[:, 0]]]
-            if not len(batch):
-                continue
-        result = score_batch(node, batch, on_scored)
-        scored.append(result.outputs[node.rows_port])
-        metrics += result.metrics
-        sink = answer_sink()
-        if sink is not None and not streamed and len(batch):
-            sink(scored_batch(
-                node, batch,
-                result.outputs[node.rows_port].column(node.spec.name).to_pylist()))
-    if not scored:
-        scored.append(score_rows(np.empty((0, len(node.spec.aliases)), dtype=np.int32),
-                                 node.spec.aliases, node.spec.name, [],
-                                 _value_type(node.spec)))
-    outputs = _scored_outputs(node, Rows.concat(scored), priors)
+    batch = rows.array()
+    skip = None
+    if (stream is not None and stream.hint is not None and not rows.product
+            and len(node.spec.aliases) == 1 and alias == stream.alias):
+        def skip(position):
+            return not stream.keeps(alias, int(batch[position, 0]))
+    result = score_batch(node, batch, on_scored, skip)
+    metrics = result.metrics
+    outputs = _scored_outputs(node, result.outputs[node.rows_port], priors)
     rows = outputs[node.rows_port]
     if isinstance(node.spec, ClassifySpec):
         metrics = replace(metrics, output_rows=rows.num_rows)
@@ -304,9 +267,9 @@ class RerankerModelExecution:
         node: AiScore,
         inputs: Mapping[str, object],
     ) -> NodeResult:
-        return score_in_batches(node, inputs, self.execute_rows, streamed=True)
+        return score_node(node, inputs, self.execute_rows)
 
-    def execute_rows(self, node, rows, on_scored=None):
+    def execute_rows(self, node, rows, on_scored=None, skip=None):
         """Compute a score for each supplied row or document pair.
 
         Args:
@@ -314,6 +277,9 @@ class RerankerModelExecution:
             rows: Document indices, one column per alias.
             on_scored: Optional callable(rows, values) run with each
                 part of the rows as its values are read.
+            skip: Optional callable(row position) -> bool, asked when a
+                row of one alias would be admitted; a row it is true for
+                is not asked and has no output row.
         """
         started = time.perf_counter()
         spec = node.spec
@@ -329,8 +295,20 @@ class RerankerModelExecution:
         streams = ((sink is not None or on_scored is not None) and len(rows)
                    and self.reranker.streams_answers)
         extra = {}
+        skipped = np.zeros(len(rows), dtype=bool)
+        if skip is not None:
+            def skip_row(position):
+                skipped[position] = skip(position)
+                return bool(skipped[position])
+
+            extra["skip"] = skip_row
         if streams:
             def on_answers(positions, values):
+                asked = ~skipped[positions]
+                positions = np.asarray(positions)[asked]
+                values = [value for value, kept in zip(values, asked) if kept]
+                if not len(positions):
+                    return
                 if sink is not None:
                     sink(scored_batch(node, rows[positions], values))
                 if on_scored is not None:
@@ -341,16 +319,19 @@ class RerankerModelExecution:
             self.reranker.score(spec, rows, self.documents, **extra)
             if len(rows) else RerankerBatch(empty, 0, 0)
         )
+        asked = ~skipped
+        rows, values = rows[asked], np.asarray(batch.scores)[asked]
         if sink is not None and len(rows) and not streams:
-            sink(scored_batch(node, rows, batch.scores))
-        scored = score_rows(rows, spec.aliases, spec.name, batch.scores,
+            sink(scored_batch(node, rows, values))
+        scored = score_rows(rows, spec.aliases, spec.name, values,
                            _value_type(spec))
         if isinstance(spec, ClassifySpec) and spec.probabilities:
             scored = scored.with_column(
                 spec.name + PROBABILITIES_SUFFIX, probability_column(
                     spec.labels,
                     np.full((len(rows), len(spec.labels)), np.nan)
-                    if batch.probabilities is None else batch.probabilities))
+                    if batch.probabilities is None
+                    else np.asarray(batch.probabilities)[asked]))
         count = len(rows)
         return NodeResult(
             {node.rows_port: scored},

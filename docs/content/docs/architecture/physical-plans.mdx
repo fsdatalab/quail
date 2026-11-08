@@ -152,9 +152,11 @@ one row of one table, with no join, fetch, or stop key:
 - Before planning, the region drops the input rows the hint rejects
   as it is then. A table the region reads by name keeps its rows.
 - While the region runs, the executor reads the hint again before it
-  admits each document to a first filter, and before each group of
-  1,024 rows a score asks, and skips a row the hint now rejects. The test tightens as DataFusion reads the region's
-  rows, which stream out as they finish.
+  admits each document to a first filter, a score, or a
+  classification, and skips a document the hint now rejects. The
+  test tightens as DataFusion reads the region's rows, which stream
+  out as they finish. A score or classification asks all its rows in
+  one run, so its prefix sharing spans every row.
 - The region starts when DataFusion first reads it. A hash join reads
   its probe side once its build side is complete, so the join's filter
   is final before the region reads it.

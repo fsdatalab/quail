@@ -9,6 +9,7 @@ from quail.backends.quail.executor.admission import (
     DROP,
     SKIP,
     JoinAdmission,
+    OversizedDocumentError,
     Settlement,
     pages_for,
 )
@@ -398,17 +399,26 @@ def test_join_admission_limit_ends_the_run_and_drains_the_queue():
     assert sched.drain() == [1, 2]
 
 
-def test_a_document_too_long_for_a_chunk_or_the_arena_settles_unanswered():
-    # anchor 1 cannot fit a 250-token chunk with its question, anchor 2
-    # cannot fit the 20-page arena; both settle without a chunk
-    sched = JoinAdmission([50, 245, 400, 60], [[10], [10]], 250,
-                          arena_pages=20, page_tokens=16)
-    assert sched.oversized == [1, 2]
-    assert sched.take_settled() == [Settlement("dropped", 1, False),
-                                    Settlement("dropped", 2, False)]
-    groups = sched.next_chunk(20)
-    assert sorted(a for a, *_ in groups) == [0, 3]
+@pytest.mark.parametrize(("prefixes", "exceeds"), [
+    # 245 tokens and a 10-token question exceed the 250-token chunk
+    ([50, 245, 60], "250-token forward pass"),
+    # 400 tokens need 26 pages of 16 tokens, more than the 20-page arena
+    ([50, 400, 60], "20 pages of the whole arena"),
+])
+def test_a_document_too_long_for_a_chunk_or_the_arena_fails_by_name(prefixes, exceeds):
+    with pytest.raises(OversizedDocumentError, match=exceeds) as raised:
+        JoinAdmission(prefixes, [[10], [10]], 250, arena_pages=20, page_tokens=16)
+    assert raised.value.anchor == 1
 
+
+def test_a_long_document_that_fits_the_arena_waits_for_free_pages():
+    # anchor 1 needs 13 of the 20 pages; with 19 free, anchor 0 takes 7,
+    # and anchor 1 is admitted once anchor 0's pages are free again
+    sched = JoinAdmission([100, 200], [[10]], 250, arena_pages=20, page_tokens=16)
+    assert [a for a, *_ in sched.next_chunk(19)] == [0]
+    assert sched.blocked_pages == 1
+    sched.report(0, 0, 0, 1, [1])
+    assert [a for a, *_ in sched.next_chunk(20)] == [1]
 
 
 def test_documents_entering_a_gated_stage_wait_in_place_and_are_asked_together():
@@ -450,7 +460,6 @@ def test_dependents_wait_for_their_parent_and_price_only_the_unshared_tokens(kep
         tree=PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32]),
         dependencies={1: (0, 1)}, anchor_partners={1: requests},
         limit=1, survival=1.0)
-    assert not sched.oversized
     assert not requested
     assert sched.next_chunk(20) == [(0, 0, 0, 1, True)]
     sched.report(0, 0, 0, 1, [kept])

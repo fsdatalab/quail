@@ -27,7 +27,7 @@ class QuailScorer:
     def __init__(self, state: QueryExecutionState):
         self.state = state
 
-    def score(self, spec, rows, documents, on_answers=None):
+    def score(self, spec, rows, documents, on_answers=None, skip=None):
         """Score or classify the rows.
 
         Args:
@@ -36,13 +36,22 @@ class QuailScorer:
             documents: Tokenized documents indexed by table alias and document ID.
             on_answers: Optional callable(row positions, values) run as each
                 chunk's answers are read.
+            skip: Optional callable(row position) -> bool, asked when a row
+                of a one-alias score would be admitted; a row it is true
+                for is not asked and keeps no value. A score whose prompt
+                ends with the document asks every row.
 
         Returns:
             A RerankerBatch with one value per row, in row order.
+
+        Raises:
+            ValueError: ``skip`` is given for a score over pairs.
         """
+        if skip is not None and len(spec.aliases) != 1:
+            raise ValueError("only a score over one table skips rows")
         if isinstance(spec, ClassifySpec):
             return QuailClassifier(self.state).classify(
-                spec, rows, documents, on_answers=on_answers)
+                spec, rows, documents, on_answers=on_answers, skip=skip)
         state = self.state
         rows = np.asarray(rows, dtype=np.int32)
         parts = spec.prompt_token_parts
@@ -50,9 +59,13 @@ class QuailScorer:
             raise ValueError("AI.SCORE needs tokenized prompt parts")
         if (len(spec.aliases) == 1 and spec.draws > 1
                 and state.loaded_model.pipeline.canvas_ids):
-            return self._drawn(spec, rows, documents, on_answers)
-        if len(spec.aliases) == 1 and spec.share_prefixes:
-            return self._shared(spec, rows, documents, on_answers)
+            return self._drawn(spec, rows, documents, on_answers, skip)
+        # admission skips whole documents, so a score that skips rows
+        # gives each document its own prefix, sharing the prompt head's
+        # pages; with no prompt after the document, it asks every row
+        if len(spec.aliases) == 1 and (spec.share_prefixes
+                                       or (skip is not None and parts[1])):
+            return self._shared(spec, rows, documents, on_answers, skip)
         if len(spec.aliases) == 1:
             prefixes = [parts[0]]
             suffixes = [concat_tokens(documents[spec.aliases[0]][document_id], parts[1])
@@ -94,13 +107,14 @@ class QuailScorer:
 
         return self._execute(spec, batch, prefixes, on_answers=report)
 
-    def _execute(self, spec, batch, prefixes, *, prefix_tree=None, on_answers=None):
+    def _execute(self, spec, batch, prefixes, *, prefix_tree=None, on_answers=None,
+                 skip=None):
         """Execute prepared scores and collect common timing and token metrics."""
         return execute_parts(
             self.state, [batch], prefixes,
             [("score", spec.name, index) for index in range(len(prefixes))],
             keep_kv=False, prefix_tree=prefix_tree, label=f"score {spec.name}",
-            on_answers=on_answers)[spec.name]
+            on_answers=on_answers, skip=skip)[spec.name]
 
     def _scores(self) -> AsyncScores:
         """Return the score readout for the current model."""
@@ -116,7 +130,8 @@ class QuailScorer:
             state.async_scores = async_scores
         return async_scores
 
-    def _shared(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
+    def _shared(self, spec, rows, documents, on_answers=None,
+                skip=None) -> RerankerBatch:
         """Score documents that borrow the KV pages of shared prefixes.
 
         Each document's prompt head and tokens are its prefix; a
@@ -130,6 +145,8 @@ class QuailScorer:
             documents: Tokenized documents indexed by table alias and document ID.
             on_answers: Optional callable(row positions, values) run with each
                 chunk's finished scores.
+            skip: Optional callable(row position) -> bool; a row it is
+                true for is not asked.
 
         Returns:
             A RerankerBatch of scores and execution metrics.
@@ -157,9 +174,10 @@ class QuailScorer:
                     for document_id in document_ids)
         batch = ScoreBatch(spec.name, stages, scores, lambda: total, on_answers)
         return self._execute(spec, batch, prefixes, prefix_tree=shared_prefix_tree(
-            spec.name, prefixes, state.loaded_model.arena))
+            spec.name, prefixes, state.loaded_model.arena), skip=skip)
 
-    def _drawn(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
+    def _drawn(self, spec, rows, documents, on_answers=None,
+               skip=None) -> RerankerBatch:
         """Score documents with reproducible diffusion draws.
 
         A low-entropy first answer uses one draw. Other documents run the remaining
@@ -171,6 +189,8 @@ class QuailScorer:
             documents: Tokenized documents indexed by table alias and document ID.
             on_answers: Optional callable(row positions, values) run with each
                 chunk's finished scores.
+            skip: Optional callable(row position) -> bool; a row it is
+                true for is not asked.
 
         Returns:
             A RerankerBatch of scores and execution metrics.
@@ -229,7 +249,7 @@ class QuailScorer:
         ) + len(document_ids) * (len(tail) - 1 + read)
         batch = ScoreBatch(spec.name, stages, scores,
                            lambda: base + extended[0] * more * read, on_answers)
-        return self._execute(spec, batch, prefixes, prefix_tree=tree)
+        return self._execute(spec, batch, prefixes, prefix_tree=tree, skip=skip)
 
 
 class ScoreBatch(SingleResultPart):
