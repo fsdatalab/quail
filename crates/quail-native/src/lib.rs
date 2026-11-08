@@ -13,7 +13,7 @@ use datafusion::arrow::array::AsArray;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlan;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use quail::planning::PlanOutcome;
 use quail::planning::pricer_fields;
@@ -165,9 +165,8 @@ impl NativeSession {
 #[pyfunction]
 fn read_and_write_plan(text: &str) -> PyResult<String> {
     let plan = quail_physical::read_plan(text)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
-    quail_physical::write_plan(&plan)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    quail_physical::write_plan(&plan).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 /// Bind one AI function call's prompt, as `PromptBinder.bind` does.
@@ -185,8 +184,7 @@ fn bind_prompt(
     turn: (String, String),
     layout: &str,
 ) -> PyResult<(Option<String>, Option<String>)> {
-    let invalid =
-        |error: serde_json::Error| pyo3::exceptions::PyValueError::new_err(error.to_string());
+    let invalid = |error: serde_json::Error| PyValueError::new_err(error.to_string());
     let args: Vec<quail_physical::ValueExpression> = serde_json::from_str(args).map_err(invalid)?;
     match quail_planner::prompts::bind(
         kind,
@@ -209,8 +207,7 @@ fn bind_prompt(
 /// Returns [(operators JSON, rewrite names), ...].
 #[pyfunction]
 fn column_placements(operators: &str) -> PyResult<Vec<(String, Vec<String>)>> {
-    let invalid =
-        |error: serde_json::Error| pyo3::exceptions::PyValueError::new_err(error.to_string());
+    let invalid = |error: serde_json::Error| PyValueError::new_err(error.to_string());
     let found: quail_planner::operators::Operators =
         serde_json::from_str(operators).map_err(invalid)?;
     quail_planner::placements::placements(&found)
@@ -245,7 +242,7 @@ fn lowering_result<T: serde::Serialize>(
         Ok(value) => Ok((
             Some(
                 serde_json::to_string(&value)
-                    .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?,
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?,
             ),
             None,
         )),
@@ -254,8 +251,7 @@ fn lowering_result<T: serde::Serialize>(
 }
 
 fn from_json<T: serde::de::DeserializeOwned>(text: &str) -> PyResult<T> {
-    serde_json::from_str(text)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+    serde_json::from_str(text).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 /// Run one function of `quail/planner/prompt_lowering.py` in Rust.
@@ -297,7 +293,7 @@ fn prompt_lowering<'py>(
             &from_json::<Vec<String>>(&get(1))?,
             &tokens,
         )),
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+        other => Err(PyValueError::new_err(format!(
             "no prompt lowering function {other}"
         ))),
     }
@@ -333,8 +329,7 @@ fn model_answers<'py>(
 #[pyfunction]
 fn read_specs(kind: &str, directory: &str) -> PyResult<String> {
     let directory = std::path::Path::new(directory);
-    let failed =
-        |error: quail_cost::specs::SpecError| pyo3::exceptions::PyValueError::new_err(error.0);
+    let failed = |error: quail_cost::specs::SpecError| PyValueError::new_err(error.0);
     let found = if kind == "models" {
         serde_json::to_value(quail_cost::specs::read_models(directory).map_err(failed)?)
     } else {
@@ -349,7 +344,7 @@ fn read_specs(kind: &str, directory: &str) -> PyResult<String> {
 #[pyfunction]
 fn prompt_layout(name: &str) -> PyResult<String> {
     let layout = quail_planner::prompts::prompt_layout(name)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.0))?;
+        .map_err(|error| PyValueError::new_err(error.0))?;
     serde_json::to_string(&layout).map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
@@ -446,7 +441,7 @@ fn plan_operator<'py>(
     match name {
         "speed_of_light" => {
             let Some(callbacks) = callbacks else {
-                return Err(pyo3::exceptions::PyValueError::new_err(
+                return Err(PyValueError::new_err(
                     "the speed of light estimate needs its oracles",
                 ));
             };
@@ -547,15 +542,14 @@ fn plan_operator<'py>(
                 ),
             )
         }
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+        other => Err(PyValueError::new_err(format!(
             "no operator planning function {other}"
         ))),
     }
 }
 
 fn json_value<T: serde::de::DeserializeOwned>(found: serde_json::Value) -> PyResult<T> {
-    serde_json::from_value(found)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+    serde_json::from_value(found).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 /// A refusal, as the test helpers compare it.
@@ -719,46 +713,6 @@ impl Tokenizer {
         ))
     }
 
-    /// The tokens of each text in `table`'s first column, as a pyarrow
-    /// Table of one large list of int32 column, `tokens`.
-    fn encode_arrow(&self, table: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        let py = table.py();
-        let batches = quail::pyarrow::from_pyarrow(table)?;
-        let lists = py
-            .detach(|| {
-                batches
-                    .iter()
-                    .map(|batch| {
-                        let tokens: datafusion::arrow::array::ArrayRef = std::sync::Arc::new(
-                            self.inner
-                                .encode_batch(batch.column(0).as_string::<i32>())?,
-                        );
-                        Ok(tokens)
-                    })
-                    .collect::<Result<Vec<_>, datafusion::arrow::error::ArrowError>>()
-            })
-            .map_err(arrow_error)?;
-        let item = Field::new_list_field(DataType::Int32, true);
-        let field = Field::new(
-            "tokens",
-            DataType::LargeList(std::sync::Arc::new(item)),
-            true,
-        );
-        let schema = std::sync::Arc::new(Schema::new(vec![field]));
-        let batches = lists
-            .into_iter()
-            .map(|tokens| {
-                datafusion::arrow::array::RecordBatch::try_new(
-                    std::sync::Arc::clone(&schema),
-                    vec![tokens],
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(arrow_error)?;
-        Ok(quail::pyarrow::to_pyarrow(py, schema, batches)?.unbind())
-    }
-
     /// The bytes of each token id's text, or None for an id the
     /// vocabulary does not hold.
     fn token_bytes<'py>(&self, py: Python<'py>) -> Vec<Option<Bound<'py, pyo3::types::PyBytes>>> {
@@ -786,11 +740,6 @@ impl Tokenizer {
     /// The text of each token id list, without special tokens.
     fn decode_batch(&self, lists: Vec<Vec<u32>>) -> PyResult<Vec<String>> {
         self.inner.decode_batch(&lists).map_err(arrow_error)
-    }
-
-    /// The id of an added token, such as `<|im_end|>`, or None.
-    fn added_token_id(&self, token: &str) -> Option<u32> {
-        self.inner.added_token_id(token)
     }
 }
 
@@ -825,8 +774,8 @@ fn collect_answers<'py>(
     use pyo3::IntoPyObjectExt;
     let request: quail::results::AnswerRequest = from_json(request)?;
     let relations = read_relations(outputs)?;
-    let found = quail::results::collect_answers(&request, &relations)
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let found =
+        quail::results::collect_answers(&request, &relations).map_err(PyValueError::new_err)?;
     let table = |batch: datafusion::arrow::array::RecordBatch| -> PyResult<Py<PyAny>> {
         Ok(quail::pyarrow::to_pyarrow(py, batch.schema(), vec![batch])?.unbind())
     };
@@ -912,12 +861,12 @@ impl NativeFinishedRows {
         let mut sources = std::collections::HashMap::new();
         for (name, expression) in quail_planner::results::source_columns(&found) {
             let expression = serde_json::to_string(&expression)
-                .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
             let values = one_batch(&evaluate.call1((&name, expression))?)?;
             sources.insert(name, std::sync::Arc::clone(values.column(0)));
         }
         let rows = quail::finished::FinishedRows::new(&request, &sources)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            .map_err(PyValueError::new_err)?;
         Ok(NativeFinishedRows { rows, on_rows })
     }
 
@@ -928,18 +877,16 @@ impl NativeFinishedRows {
 
     /// Take a pyarrow Table of rows a port finished, the node and port in
     /// its schema's `quail.node` and `quail.port` metadata; hand the
-    /// region rows they complete to `on_rows`, and return how many.
-    fn report(&mut self, py: Python<'_>, table: &Bound<'_, PyAny>) -> PyResult<usize> {
+    /// region rows they complete to `on_rows`.
+    fn report(&mut self, py: Python<'_>, table: &Bound<'_, PyAny>) -> PyResult<()> {
         let reader = quail::pyarrow::stream_from_pyarrow(table)?;
         let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
-        let metadata = schema.metadata();
-        let (Some(node), Some(port)) = (metadata.get("quail.node"), metadata.get("quail.port"))
-        else {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "finished rows need quail.node and quail.port metadata",
-            ));
+        let tag = |key: &str| {
+            schema.metadata().get(key).cloned().ok_or_else(|| {
+                PyValueError::new_err("finished rows need quail.node and quail.port metadata")
+            })
         };
-        let (node, port) = (node.clone(), port.clone());
+        let (node, port) = (tag("quail.node")?, tag("quail.port")?);
         let mut batches = reader
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| python_error(error.into()))?;
@@ -947,33 +894,22 @@ impl NativeFinishedRows {
             // an empty table still gives its columns' types
             batches.push(datafusion::arrow::array::RecordBatch::new_empty(schema));
         }
-        let mut count = 0;
         for batch in batches {
-            let built = self
-                .rows
-                .report(&node, &port, &batch)
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            count += self.hand_on(py, built)?;
+            let built = self.rows.report(&node, &port, &batch);
+            self.hand_on(py, built)?;
         }
-        Ok(count)
+        Ok(())
     }
 
-    /// Hand `on_rows` the rows complete before any report, and return
-    /// how many.
-    fn finish(&mut self, py: Python<'_>) -> PyResult<usize> {
-        let built = self
-            .rows
-            .finish()
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    /// Hand `on_rows` the rows complete before any report.
+    fn finish(&mut self, py: Python<'_>) -> PyResult<()> {
+        let built = self.rows.finish();
         self.hand_on(py, built)
     }
 
     /// Every row built so far, as a pyarrow Table ordered by document ids.
     fn rows<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let rows = self
-            .rows
-            .rows()
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let rows = self.rows.rows().map_err(PyValueError::new_err)?;
         to_pyarrow(py, rows.schema(), vec![rows])
     }
 }
@@ -982,16 +918,13 @@ impl NativeFinishedRows {
     fn hand_on(
         &self,
         py: Python<'_>,
-        built: Option<datafusion::arrow::array::RecordBatch>,
-    ) -> PyResult<usize> {
-        let Some(rows) = built else {
-            return Ok(0);
-        };
-        let count = rows.num_rows();
-        if let Some(on_rows) = &self.on_rows {
+        built: Result<Option<datafusion::arrow::array::RecordBatch>, String>,
+    ) -> PyResult<()> {
+        if let (Some(rows), Some(on_rows)) = (built.map_err(PyValueError::new_err)?, &self.on_rows)
+        {
             on_rows.call1(py, (to_pyarrow(py, rows.schema(), vec![rows])?,))?;
         }
-        Ok(count)
+        Ok(())
     }
 }
 
@@ -1049,12 +982,11 @@ fn region_facts(operators: &str) -> PyResult<String> {
 #[pyfunction]
 fn limited_operators(operators: &str, fetch: i64) -> PyResult<String> {
     serde_json::to_string(&read_operators(operators)?.limited(fetch))
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+        .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 fn read_operators(operators: &str) -> PyResult<quail_planner::operators::Operators> {
-    serde_json::from_str(operators)
-        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+    serde_json::from_str(operators).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 /// A region's operators, its tables' rows, and the settings, read from
@@ -1269,7 +1201,7 @@ mod erased_json {
 
 /// Read a plan's pricer from the JSON [`pricer_fields`] writes.
 fn read_pricer(value: &serde_json::Value) -> PyResult<quail_planner::pricing::PlanPricer> {
-    let bad = || pyo3::exceptions::PyValueError::new_err("a malformed plan pricer");
+    let bad = || PyValueError::new_err("a malformed plan pricer");
     let stats: std::collections::BTreeMap<String, (i64, i64, i64)> =
         json_value(value["stats"].clone())?;
     let works: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>> =

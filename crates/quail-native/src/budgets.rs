@@ -451,19 +451,6 @@ pub fn draft_lengths<'py>(
     Ok(le_bytes(py, &lengths, i64::to_le_bytes))
 }
 
-/// The draft policy's prior curve: `DraftPolicy(cap, max_answer_tokens,
-/// expected).curve()`, as float64 bytes.
-#[pyfunction]
-pub fn draft_policy_curve(
-    py: Python<'_>,
-    cap: usize,
-    max_answer_tokens: usize,
-    expected: f64,
-) -> Bound<'_, PyBytes> {
-    let curve = draft_policy::DraftPolicy::new(cap, max_answer_tokens, expected).curve();
-    le_bytes(py, &curve, f64::to_le_bytes)
-}
-
 /// A model's derived sizes, from its spec as JSON: layer sets, state and
 /// KV bytes, weight memory, and activation memory, by name, as JSON.
 #[pyfunction]
@@ -515,7 +502,6 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(draft_gains, module)?,
         wrap_pyfunction!(fit_drafts, module)?,
         wrap_pyfunction!(kv_pool_cap_tokens, module)?,
-        wrap_pyfunction!(draft_policy_curve, module)?,
     ] {
         module.add_function(function)?;
     }

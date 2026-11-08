@@ -15,10 +15,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, DictionaryArray, Int32Array, RecordBatch, RecordBatchOptions,
-    StringArray, StructArray, new_null_array,
+    Array, ArrayRef, AsArray, BooleanArray, DictionaryArray, Int32Array, RecordBatch,
+    RecordBatchOptions, StringArray, StructArray, new_null_array,
 };
-use arrow::compute::{SortColumn, cast, concat_batches, interleave, lexsort_to_indices, take};
+use arrow::compute::{
+    SortColumn, cast, concat_batches, interleave, is_not_null, lexsort_to_indices, take,
+};
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use quail_planner::expressions::{
     PROBABILITIES_SUFFIX, asked_call, call_aliases, column_references,
@@ -27,7 +29,7 @@ use quail_planner::operators::Operators;
 use quail_planner::results::{answer_columns, region_columns, region_structs, source_columns};
 use serde_json::Value;
 
-use crate::results::{AnswerRequest, OutputPort, arrow_error, document_ids};
+use crate::results::{AnswerRequest, arrow_error, document_ids};
 
 type Error = String;
 
@@ -67,20 +69,22 @@ struct Relation {
     keys: Vec<Vec<i32>>,
     /// Per row, its (batch, row) in `batches`.
     places: Vec<(usize, usize)>,
+    /// (alias, id) -> the rows with that id, for a relation of several
+    /// aliases.
+    by_alias: HashMap<(usize, i32), Vec<usize>>,
     /// The reported values of `columns`, one batch per report.
     batches: Vec<Vec<ArrayRef>>,
     /// Each column's type, once a report held it.
     types: Vec<Option<DataType>>,
-    /// (aliases looked up on, ids on them -> row numbers).
-    indexes: Vec<(Vec<usize>, Index)>,
 }
 
 impl Relation {
-    fn new(step: (String, String), aliases: Vec<usize>) -> Self {
+    fn new(step: (String, String), aliases: Vec<usize>, columns: Vec<String>) -> Self {
         Relation {
             step,
             aliases,
-            columns: Vec::new(),
+            types: vec![None; columns.len()],
+            columns,
             keep: Keep::All,
             known: false,
             survivors: false,
@@ -88,46 +92,28 @@ impl Relation {
             rows: HashMap::new(),
             keys: Vec::new(),
             places: Vec::new(),
+            by_alias: HashMap::new(),
             batches: Vec::new(),
-            types: Vec::new(),
-            indexes: Vec::new(),
         }
     }
 
-    /// The index on the given aliases, created on first use.
-    fn index_on(&mut self, on: &[usize]) -> usize {
-        if let Some(found) = self.indexes.iter().position(|(known, _)| known == on) {
-            return found;
-        }
-        self.indexes.push((on.to_vec(), HashMap::new()));
-        self.indexes.len() - 1
-    }
-
-    /// Add a row under its ids; false when a row with those ids is in.
-    fn insert(&mut self, key: Vec<i32>, place: (usize, usize)) -> bool {
+    /// Add a row under its ids; its number, or None when a row with those
+    /// ids is in.
+    fn insert(&mut self, key: Vec<i32>, place: (usize, usize)) -> Option<usize> {
         if self.rows.contains_key(&key) {
-            return false;
+            return None;
         }
         let row = self.keys.len();
-        for (on, index) in &mut self.indexes {
-            let found = on
-                .iter()
-                .map(|alias| key_of(&self.aliases, &key, *alias))
-                .collect();
-            index.entry(found).or_default().push(row);
+        if self.aliases.len() > 1 {
+            for (alias, id) in self.aliases.iter().zip(&key) {
+                self.by_alias.entry((*alias, *id)).or_default().push(row);
+            }
         }
         self.rows.insert(key.clone(), row);
         self.keys.push(key);
         self.places.push(place);
-        true
+        Some(row)
     }
-}
-
-/// A relation row's id of an alias, from its ids in the relation's
-/// alias order.
-fn key_of(aliases: &[usize], key: &[i32], alias: usize) -> i32 {
-    let position = aliases.iter().position(|found| *found == alias);
-    key[position.expect("an index's aliases are the relation's")]
 }
 
 /// A region column and where its values come from.
@@ -148,56 +134,20 @@ enum Column {
     },
 }
 
-/// One looked-up step of building rows from a new row of a relation: the
-/// relation joined next and the aliases already known it is looked up on.
-#[derive(Debug, Clone)]
-struct Probe {
-    relation: usize,
-    on: Vec<usize>,
-}
-
 /// A region row: its ids by alias and its row in each relation.
 type Found = (Vec<i32>, Vec<usize>);
 
-/// A relation's rows by their ids on some of its aliases.
-type Index = HashMap<Vec<i32>, Vec<usize>>;
-
-/// The relation computing an answer column, and the labels that make
-/// it a dictionary.
+/// The step computing an answer column, and the labels that make it a
+/// dictionary.
 type Producer = (usize, Option<Value>);
-
-/// A port the rows read, before the rows' aliases are known.
-struct Step {
-    step: (String, String),
-    aliases: Vec<String>,
-    columns: Vec<String>,
-    keep: Keep,
-}
-
-/// The index of the port's step, added with the aliases when new.
-fn step_of(steps: &mut Vec<Step>, port: &OutputPort, aliases: Vec<String>) -> usize {
-    let step = (port.node.clone(), port.port.clone());
-    match steps.iter().position(|known| known.step == step) {
-        Some(index) => index,
-        None => {
-            steps.push(Step {
-                step,
-                aliases,
-                columns: Vec::new(),
-                keep: Keep::All,
-            });
-            steps.len() - 1
-        }
-    }
-}
 
 /// A region's rows, built as operators report the rows they finish.
 #[derive(Debug)]
 pub struct FinishedRows {
     aliases: Vec<String>,
     relations: Vec<Relation>,
-    /// Per relation, the probes that join a new row of it to the others.
-    probes: Vec<Vec<Probe>>,
+    /// Per relation, the order to join the others to a new row of it.
+    orders: Vec<Vec<usize>>,
     columns: Vec<Column>,
     structs: Vec<(String, Vec<(String, String)>)>,
     fetch: Option<usize>,
@@ -211,6 +161,28 @@ pub struct FinishedRows {
     keys: Vec<Vec<i32>>,
     /// Rows complete before any report: those of known relations alone.
     pending: Vec<Found>,
+}
+
+/// A port the rows read, before the rows' aliases are known.
+struct Step {
+    step: (String, String),
+    aliases: Vec<String>,
+    columns: Vec<String>,
+    keep: Keep,
+}
+
+/// The index of the port's step, added with the aliases when new.
+fn step_of(steps: &mut Vec<Step>, step: (String, String), aliases: Vec<String>) -> usize {
+    if let Some(index) = steps.iter().position(|known| known.step == step) {
+        return index;
+    }
+    steps.push(Step {
+        step,
+        aliases,
+        columns: Vec::new(),
+        keep: Keep::All,
+    });
+    steps.len() - 1
 }
 
 impl FinishedRows {
@@ -241,27 +213,21 @@ impl FinishedRows {
         let answers = answer_columns(&found);
         let mut steps: Vec<Step> = Vec::new();
         for port in &request.ports {
-            if port.value_type != "join_answers" {
-                continue;
-            }
-            let Some(position) = port
+            let join = port
                 .port
                 .strip_prefix("join_answers:")
                 .and_then(|position| position.parse::<usize>().ok())
-            else {
-                continue;
-            };
-            let Some(join) = found.joins.get(position) else {
-                continue;
-            };
-            if join.semantics != "full" {
-                continue;
+                .and_then(|position| found.joins.get(position));
+            if let Some(join) =
+                join.filter(|join| port.value_type == "join_answers" && join.semantics == "full")
+            {
+                let aliases = call_aliases(asked_call(&join.predicate));
+                let index = step_of(&mut steps, (port.node.clone(), port.port.clone()), aliases);
+                steps[index].keep = Keep::True;
             }
-            let aliases = call_aliases(asked_call(&join.predicate));
-            let index = step_of(&mut steps, port, aliases);
-            steps[index].keep = Keep::True;
         }
-        // each answer column's port and whether it holds labels
+        // each answer column's step and the labels that make it a
+        // dictionary
         let mut wanted: Vec<(String, Option<Producer>)> = Vec::new();
         for name in region_columns(&found) {
             if source_aliases.contains_key(&name) {
@@ -286,13 +252,11 @@ impl FinishedRows {
                 }
                 return Err(format!("the run returned no column {name}"));
             };
-            let aliases: Vec<String> = answer
-                .columns
-                .iter()
+            let aliases = (answer.columns.iter())
                 .filter(|column| scans.contains(column))
                 .cloned()
                 .collect();
-            let index = step_of(&mut steps, port, aliases);
+            let index = step_of(&mut steps, (port.node.clone(), port.port.clone()), aliases);
             if answer.kind == "classifies" {
                 steps[index].keep = Keep::Valid(answer.name.clone());
             }
@@ -312,15 +276,12 @@ impl FinishedRows {
         let mut aliases: Vec<String> = Vec::new();
         let (pairs, single): (Vec<_>, Vec<_>) =
             steps.iter().partition(|step| step.aliases.len() > 1);
-        for alias in pairs
-            .into_iter()
-            .chain(single)
+        let sourced = wanted
+            .iter()
+            .filter_map(|(name, _)| source_aliases.get(name));
+        for alias in (pairs.into_iter().chain(single))
             .flat_map(|step| step.aliases.iter())
-            .chain(
-                wanted
-                    .iter()
-                    .filter_map(|(name, _)| source_aliases.get(name)),
-            )
+            .chain(sourced)
         {
             if !aliases.contains(alias) {
                 aliases.push(alias.clone());
@@ -333,7 +294,7 @@ impl FinishedRows {
         // document when no operator drops any
         let mut known: Vec<(usize, usize)> = Vec::new();
         let mut survivors: Vec<usize> = Vec::new();
-        for alias in aliases.clone() {
+        for alias in &aliases {
             let rows_port = format!("rows:{alias}");
             match request
                 .ports
@@ -341,11 +302,13 @@ impl FinishedRows {
                 .rev()
                 .find(|port| port.port == rows_port)
             {
-                Some(port) => {
-                    survivors.push(step_of(&mut steps, port, vec![alias.clone()]));
-                }
+                Some(port) => survivors.push(step_of(
+                    &mut steps,
+                    (port.node.clone(), port.port.clone()),
+                    vec![alias.clone()],
+                )),
                 None => {
-                    let count = request.num_documents.get(&alias).copied().unwrap_or(0);
+                    let count = request.num_documents.get(alias).copied().unwrap_or(0);
                     steps.push(Step {
                         step: (String::new(), rows_port),
                         aliases: vec![alias.clone()],
@@ -357,18 +320,17 @@ impl FinishedRows {
             }
         }
         let position = |alias: &String| {
-            aliases
-                .iter()
-                .position(|found| found == alias)
+            (aliases.iter().position(|found| found == alias))
                 .expect("every relation's alias is a row alias")
         };
         let mut relations: Vec<Relation> = steps
             .into_iter()
             .map(|step| {
-                let aliases = step.aliases.iter().map(position).collect();
-                let mut relation = Relation::new(step.step, aliases);
-                relation.types = vec![None; step.columns.len()];
-                relation.columns = step.columns;
+                let mut relation = Relation::new(
+                    step.step,
+                    step.aliases.iter().map(position).collect(),
+                    step.columns,
+                );
                 relation.keep = step.keep;
                 relation
             })
@@ -379,38 +341,32 @@ impl FinishedRows {
             // too, such as a guard's for a row it did not ask
             relations[index].keep = Keep::All;
         }
-        let probes = join_order(&mut relations);
         let mut columns = Vec::new();
         for (name, producer) in wanted {
-            match producer {
+            columns.push(match producer {
                 None => {
-                    let alias = position(&source_aliases[&name]);
                     let values = sources
                         .get(&name)
                         .ok_or_else(|| format!("the column {name} has no source"))?;
-                    columns.push(Column::Source(name, alias, Arc::clone(values)));
+                    let alias = position(&source_aliases[&name]);
+                    Column::Source(name, alias, Arc::clone(values))
                 }
-                Some((relation, labels)) => {
+                Some((relation, labels)) => Column::Answer {
                     // a classification's own rows port carries its labels
                     // as they are
-                    let labels = labels.filter(|_| !relations[relation].survivors);
-                    let answer = answers
-                        .iter()
-                        .find(|column| column.0 == name)
-                        .is_none_or(|column| column.4);
-                    columns.push(Column::Answer {
-                        name,
-                        relation,
-                        labels,
-                        answer,
-                    });
-                }
-            }
+                    labels: labels.filter(|_| !relations[relation].survivors),
+                    answer: (answers.iter().find(|column| column.0 == name))
+                        .is_none_or(|column| column.4),
+                    name,
+                    relation,
+                },
+            });
         }
+        let orders = join_orders(&relations);
         let mut rows = FinishedRows {
             aliases,
             relations,
-            probes,
+            orders,
             columns,
             structs: region_structs(&found),
             fetch: found.fetch.map(|fetch| fetch.max(0) as usize),
@@ -423,8 +379,7 @@ impl FinishedRows {
             rows.relations[relation].known = true;
             rows.relations[relation].batches.push(Vec::new());
             for document in 0..count {
-                if rows.relations[relation].insert(vec![document as i32], (0, 0)) {
-                    let row = rows.relations[relation].keys.len() - 1;
+                if let Some(row) = rows.relations[relation].insert(vec![document as i32], (0, 0)) {
                     let mut found = rows.joined(relation, row);
                     rows.pending.append(&mut found);
                 }
@@ -435,9 +390,7 @@ impl FinishedRows {
 
     /// Whether the rows read the port's reports.
     pub fn wants(&self, node: &str, port: &str) -> bool {
-        self.relations
-            .iter()
-            .any(|relation| !relation.known && relation.step.0 == node && relation.step.1 == port)
+        (0..self.relations.len()).any(|relation| self.wants_relation(relation, node, port))
     }
 
     /// Take a batch of rows a port finished; return the region rows they
@@ -458,13 +411,16 @@ impl FinishedRows {
     ) -> Result<Option<RecordBatch>, Error> {
         let mut found = std::mem::take(&mut self.pending);
         for relation in 0..self.relations.len() {
-            let step = &self.relations[relation].step;
-            if self.relations[relation].known || step.0 != node || step.1 != port {
-                continue;
+            if self.wants_relation(relation, node, port) {
+                found.extend(self.take_rows(relation, batch)?);
             }
-            found.extend(self.take_rows(relation, batch)?);
         }
         self.build(found)
+    }
+
+    fn wants_relation(&self, relation: usize, node: &str, port: &str) -> bool {
+        let relation = &self.relations[relation];
+        !relation.known && relation.step.0 == node && relation.step.1 == port
     }
 
     /// The rows complete before any report, when every relation was known
@@ -488,12 +444,9 @@ impl FinishedRows {
     ///
     /// The rows' columns do not build.
     pub fn rows(&mut self) -> Result<RecordBatch, Error> {
-        let rows = match self.built.is_empty() {
-            true => self.columns_of(&[])?,
-            false => {
-                let schema = self.built[0].schema();
-                concat_batches(&schema, &self.built).map_err(arrow_error)?
-            }
+        let rows = match self.built.first() {
+            None => self.columns_of(&[])?,
+            Some(first) => concat_batches(&first.schema(), &self.built).map_err(arrow_error)?,
         };
         let order = match self.keys.is_empty() || self.aliases.is_empty() {
             true => None,
@@ -525,7 +478,7 @@ impl FinishedRows {
             fields.push(Field::new(field.name(), column.data_type().clone(), true));
             arrays.push(column);
         }
-        self.packed_batch(fields, arrays, rows.num_rows())
+        packed_batch(fields, arrays, rows.num_rows(), &self.structs)
     }
 
     /// Whether a table's surviving documents carry a label column whose
@@ -535,79 +488,50 @@ impl FinishedRows {
             matches!(column, Column::Answer { name: found, labels: Some(_), .. } if found == name)
         });
         labeled
-            && self
-                .relations
-                .iter()
+            && (self.relations.iter())
                 .any(|relation| relation.survivors && relation.seen.contains(name))
-    }
-
-    /// The rows with each struct column's members packed into it.
-    fn packed_batch(
-        &self,
-        fields: Vec<Field>,
-        arrays: Vec<ArrayRef>,
-        num_rows: usize,
-    ) -> Result<RecordBatch, Error> {
-        let (fields, arrays) = packed(fields, arrays, &self.structs)?;
-        RecordBatch::try_new_with_options(
-            Arc::new(Schema::new(fields)),
-            arrays,
-            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
-        )
-        .map_err(arrow_error)
     }
 
     /// Keep a batch's new rows in a relation and return the region rows
     /// each completes.
     fn take_rows(&mut self, relation: usize, batch: &RecordBatch) -> Result<Vec<Found>, Error> {
         let schema = batch.schema();
-        let kept: Option<arrow::array::BooleanArray> = match &self.relations[relation].keep {
+        let kept: Option<BooleanArray> = match &self.relations[relation].keep {
             Keep::All => None,
             Keep::True => Some(
-                batch
-                    .columns()
-                    .last()
+                (batch.columns().last())
                     .and_then(|column| column.as_boolean_opt())
                     .ok_or("a join's rows have no answer column")?
                     .clone(),
             ),
-            Keep::Valid(name) => schema
-                .index_of(name)
-                .ok()
-                .map(|index| arrow::compute::is_not_null(batch.column(index)))
+            Keep::Valid(name) => (schema.index_of(name).ok())
+                .map(|index| is_not_null(batch.column(index)))
                 .transpose()
                 .map_err(arrow_error)?,
         };
-        let names: Vec<String> = self.relations[relation]
-            .aliases
-            .iter()
-            .map(|alias| self.aliases[*alias].clone())
-            .collect();
-        let ids = names
-            .iter()
-            .map(|name| {
+        let ids = (self.relations[relation].aliases.iter())
+            .map(|alias| {
+                let name = &self.aliases[*alias];
                 let index = schema.index_of(name).map_err(|_| {
-                    format!("the rows of {} have no ids of {name}", self.step(relation))
+                    let (node, port) = &self.relations[relation].step;
+                    format!("the rows of {node}:{port} have no ids of {name}")
                 })?;
                 document_ids(batch.column(index))
             })
             .collect::<Result<Vec<Int32Array>, Error>>()?;
         let target = &mut self.relations[relation];
-        target
-            .seen
-            .extend(schema.fields().iter().map(|field| field.name().clone()));
+        (target.seen).extend(schema.fields().iter().map(|field| field.name().clone()));
         let mut values = Vec::new();
         for (column, known) in target.columns.iter().zip(target.types.iter_mut()) {
-            let value = match schema.index_of(column) {
+            values.push(match schema.index_of(column) {
                 Ok(index) => {
                     let value = Arc::clone(batch.column(index));
                     match known {
                         Some(data_type) if data_type != value.data_type() => {
                             cast(&value, data_type).map_err(arrow_error)?
                         }
-                        Some(_) => value,
-                        None => {
-                            *known = Some(value.data_type().clone());
+                        _ => {
+                            known.get_or_insert_with(|| value.data_type().clone());
                             value
                         }
                     }
@@ -615,8 +539,7 @@ impl FinishedRows {
                 Err(_) => {
                     new_null_array(known.as_ref().unwrap_or(&DataType::Null), batch.num_rows())
                 }
-            };
-            values.push(value);
+            });
         }
         let place = target.batches.len();
         target.batches.push(values);
@@ -629,17 +552,11 @@ impl FinishedRows {
                 continue;
             }
             let key: Vec<i32> = ids.iter().map(|column| column.value(row)).collect();
-            if self.relations[relation].insert(key, (place, row)) {
-                let inserted = self.relations[relation].keys.len() - 1;
+            if let Some(inserted) = self.relations[relation].insert(key, (place, row)) {
                 found.extend(self.joined(relation, inserted));
             }
         }
         Ok(found)
-    }
-
-    fn step(&self, relation: usize) -> String {
-        let (node, port) = &self.relations[relation].step;
-        format!("{node}:{port}")
     }
 
     /// The region rows a relation's row completes with the rows the other
@@ -653,58 +570,58 @@ impl FinishedRows {
         let mut rows = vec![usize::MAX; self.relations.len()];
         rows[relation] = row;
         let mut found = Vec::new();
-        self.extend(&self.probes[relation], &mut binding, &mut rows, &mut found);
+        self.extend(&self.orders[relation], &mut binding, &mut rows, &mut found);
         found
     }
 
+    /// Join the next relation of `order` to a partly bound row: on its
+    /// ids when they are all bound, else through the rows with one bound
+    /// id, else with every row.
     fn extend(
         &self,
-        probes: &[Probe],
+        order: &[usize],
         binding: &mut Vec<Option<i32>>,
         rows: &mut Vec<usize>,
         found: &mut Vec<Found>,
     ) {
-        let Some((probe, rest)) = probes.split_first() else {
-            let ids = binding
-                .iter()
-                .map(|id| id.expect("every alias is bound"))
-                .collect();
-            found.push((ids, rows.clone()));
+        let Some((&next, rest)) = order.split_first() else {
+            let ids = binding.iter().map(|id| id.expect("every alias is bound"));
+            found.push((ids.collect(), rows.clone()));
             return;
         };
-        let relation = &self.relations[probe.relation];
-        let key: Vec<i32> = probe
-            .on
+        let relation = &self.relations[next];
+        let bound: Vec<Option<i32>> = relation
+            .aliases
             .iter()
-            .map(|alias| binding[*alias].expect("a probe looks up bound aliases"))
+            .map(|alias| binding[*alias])
             .collect();
-        let (_, index) = relation
-            .indexes
-            .iter()
-            .find(|(on, _)| *on == probe.on)
-            .expect("every probe has its index");
-        let Some(matches) = index.get(&key) else {
-            return;
-        };
-        for &matched in matches {
-            let unbound: Vec<usize> = relation
-                .aliases
-                .iter()
+        let matches: Vec<usize> = if bound.iter().all(Option::is_some) {
+            let key: Vec<i32> = bound.iter().flatten().copied().collect();
+            relation.rows.get(&key).into_iter().copied().collect()
+        } else if let Some((alias, id)) =
+            (relation.aliases.iter().zip(&bound)).find_map(|(alias, id)| id.map(|id| (*alias, id)))
+        {
+            (relation.by_alias.get(&(alias, id)).into_iter().flatten())
                 .copied()
-                .filter(|alias| binding[*alias].is_none())
-                .collect();
+                .filter(|matched| {
+                    (bound.iter().zip(&relation.keys[*matched]))
+                        .all(|(id, key)| id.is_none_or(|id| id == *key))
+                })
+                .collect()
+        } else {
+            (0..relation.keys.len()).collect()
+        };
+        for matched in matches {
             for (alias, id) in relation.aliases.iter().zip(&relation.keys[matched]) {
-                if binding[*alias].is_none() {
-                    binding[*alias] = Some(*id);
-                }
+                binding[*alias] = Some(*id);
             }
-            rows[probe.relation] = matched;
+            rows[next] = matched;
             self.extend(rest, binding, rows, found);
-            for alias in unbound {
-                binding[alias] = None;
+            for (alias, id) in relation.aliases.iter().zip(&bound) {
+                binding[*alias] = *id;
             }
         }
-        rows[probe.relation] = usize::MAX;
+        rows[next] = usize::MAX;
     }
 
     /// Build the region rows found, up to the fetch, and keep them.
@@ -718,15 +635,16 @@ impl FinishedRows {
         let rows = self.columns_of(&found)?;
         self.keys.extend(found.into_iter().map(|(ids, _)| ids));
         self.built.push(rows.clone());
-        let fields = rows
-            .schema()
-            .fields()
-            .iter()
+        let fields = (rows.schema().fields().iter())
             .map(|field| field.as_ref().clone())
             .collect();
-        let num_rows = rows.num_rows();
-        self.packed_batch(fields, rows.columns().to_vec(), num_rows)
-            .map(Some)
+        packed_batch(
+            fields,
+            rows.columns().to_vec(),
+            rows.num_rows(),
+            &self.structs,
+        )
+        .map(Some)
     }
 
     /// The region's columns for the rows found, before struct packing, in
@@ -750,10 +668,7 @@ impl FinishedRows {
                     answer,
                 } => {
                     let relation = &self.relations[*read];
-                    let index = relation
-                        .columns
-                        .iter()
-                        .position(|known| known == name)
+                    let index = (relation.columns.iter().position(|known| known == name))
                         .expect("a relation holds its columns");
                     let Some(data_type) = relation.types[index].clone() else {
                         if *answer {
@@ -768,14 +683,12 @@ impl FinishedRows {
                         .iter()
                         .map(|batch| batch[index].as_ref())
                         .collect();
-                    let places: Vec<(usize, usize)> = found
-                        .iter()
+                    let places: Vec<(usize, usize)> = (found.iter())
                         .map(|(_, rows)| relation.places[rows[*read]])
                         .collect();
-                    let values = if places.is_empty() {
-                        new_null_array(&data_type, 0)
-                    } else {
-                        interleave(&parts, &places).map_err(arrow_error)?
+                    let values = match places.is_empty() {
+                        true => new_null_array(&data_type, 0),
+                        false => interleave(&parts, &places).map_err(arrow_error)?,
                     };
                     let values = match labels {
                         Some(labels) => label_dictionary(&values, labels)?,
@@ -814,61 +727,36 @@ impl FinishedRows {
 }
 
 /// For each relation, the order to join the others to a new row of it:
-/// next the first one sharing a known alias, looked up on the aliases it
-/// shares, or, when none shares one, the first, crossed with every row.
-fn join_order(relations: &mut [Relation]) -> Vec<Vec<Probe>> {
-    let mut orders = Vec::new();
-    for start in 0..relations.len() {
-        let mut bound: Vec<usize> = relations[start].aliases.clone();
-        let mut rest: Vec<usize> = (0..relations.len())
-            .filter(|other| *other != start)
-            .collect();
-        let mut probes = Vec::new();
-        while !rest.is_empty() {
-            let next = rest
-                .iter()
-                .position(|other| {
-                    relations[*other]
-                        .aliases
-                        .iter()
-                        .any(|alias| bound.contains(alias))
-                })
-                .unwrap_or(0);
-            let other = rest.remove(next);
-            let on: Vec<usize> = relations[other]
-                .aliases
-                .iter()
-                .copied()
-                .filter(|alias| bound.contains(alias))
+/// next the first one sharing a known alias, or, when none shares one,
+/// the first.
+fn join_orders(relations: &[Relation]) -> Vec<Vec<usize>> {
+    (0..relations.len())
+        .map(|start| {
+            let mut bound: Vec<usize> = relations[start].aliases.clone();
+            let mut rest: Vec<usize> = (0..relations.len())
+                .filter(|other| *other != start)
                 .collect();
-            relations[other].index_on(&on);
-            for alias in &relations[other].aliases {
-                if !bound.contains(alias) {
-                    bound.push(*alias);
-                }
+            let mut order = Vec::new();
+            while !rest.is_empty() {
+                let next = (rest.iter())
+                    .position(|other| relations[*other].aliases.iter().any(|a| bound.contains(a)))
+                    .unwrap_or(0);
+                let other = rest.remove(next);
+                bound.extend(&relations[other].aliases);
+                order.push(other);
             }
-            probes.push(Probe {
-                relation: other,
-                on,
-            });
-        }
-        orders.push(probes);
-    }
-    orders
+            order
+        })
+        .collect()
 }
 
 /// A label column as a dictionary over the call's labels, in order.
 fn label_dictionary(values: &ArrayRef, labels: &Value) -> Result<ArrayRef, Error> {
-    let order: Vec<&str> = labels
-        .as_array()
-        .into_iter()
-        .flatten()
+    let order: Vec<&str> = (labels.as_array().into_iter().flatten())
         .filter_map(Value::as_str)
         .collect();
     let values = cast(values, &DataType::Utf8).map_err(arrow_error)?;
-    let keys: Int32Array = values
-        .as_string::<i32>()
-        .iter()
+    let keys: Int32Array = (values.as_string::<i32>().iter())
         .map(|value| value.and_then(|value| order.iter().position(|label| *label == value)))
         .map(|position| position.map(|position| position as i32))
         .collect();
@@ -878,45 +766,46 @@ fn label_dictionary(values: &ArrayRef, labels: &Value) -> Result<ArrayRef, Error
     Ok(Arc::new(dictionary))
 }
 
-/// The columns with each struct column's members packed into it: the
+/// The rows with each struct column's members packed into it: the
 /// struct takes its first member's place, and the members leave.
-fn packed(
+fn packed_batch(
     fields: Vec<Field>,
     arrays: Vec<ArrayRef>,
+    num_rows: usize,
     structs: &[(String, Vec<(String, String)>)],
-) -> Result<(Vec<Field>, Vec<ArrayRef>), Error> {
-    let mut out: (Vec<Field>, Vec<ArrayRef>) = (Vec::new(), Vec::new());
+) -> Result<RecordBatch, Error> {
+    let (mut out_fields, mut out_arrays) = (Vec::new(), Vec::new());
     let mut done: Vec<&String> = Vec::new();
     for (field, array) in fields.iter().zip(&arrays) {
-        let owner = structs
-            .iter()
+        let owner = (structs.iter())
             .find(|(_, members)| members.iter().any(|(_, member)| member == field.name()));
         let Some((name, members)) = owner else {
-            out.0.push(field.clone());
-            out.1.push(Arc::clone(array));
+            out_fields.push(field.clone());
+            out_arrays.push(Arc::clone(array));
             continue;
         };
         if done.contains(&name) {
             continue;
         }
         done.push(name);
-        let mut parts: Vec<(Arc<Field>, ArrayRef)> = Vec::new();
-        for (member_field, member) in members {
-            let Some(position) = fields.iter().position(|found| found.name() == member) else {
-                continue;
-            };
-            let part = Arc::clone(&arrays[position]);
-            parts.push((
-                Arc::new(Field::new(member_field, part.data_type().clone(), true)),
-                part,
-            ));
-        }
+        let parts: Vec<(Arc<Field>, ArrayRef)> = (members.iter())
+            .filter_map(|(member_field, member)| {
+                let position = fields.iter().position(|found| found.name() == member)?;
+                let part = Arc::clone(&arrays[position]);
+                let field = Field::new(member_field, part.data_type().clone(), true);
+                Some((Arc::new(field), part))
+            })
+            .collect();
         let packed = StructArray::from(parts);
-        out.0
-            .push(Field::new(name, packed.data_type().clone(), true));
-        out.1.push(Arc::new(packed));
+        out_fields.push(Field::new(name, packed.data_type().clone(), true));
+        out_arrays.push(Arc::new(packed) as ArrayRef);
     }
-    Ok(out)
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(out_fields)),
+        out_arrays,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )
+    .map_err(arrow_error)
 }
 
 #[cfg(test)]
@@ -932,19 +821,21 @@ mod tests {
         Arc::new(Int32Array::from(values))
     }
 
-    /// The rows of a filter's survivors joined to a score's answers, with
-    /// a fetch of two.
-    fn scored_survivors() -> FinishedRows {
-        let survivors = Relation::new(("filter".into(), "rows:r".into()), vec![0]);
-        let mut scores = Relation::new(("score".into(), "rows:r".into()), vec![0]);
-        scores.columns = vec!["fun".into()];
-        scores.types = vec![None];
-        let mut relations = vec![survivors, scores];
-        let probes = join_order(&mut relations);
-        FinishedRows {
+    #[test]
+    fn a_row_is_built_once_every_port_writing_it_reported_it() {
+        // a filter's survivors joined to a score's answers, with a fetch
+        // of two
+        let survivors = Relation::new(("filter".into(), "rows:r".into()), vec![0], vec![]);
+        let scores = Relation::new(
+            ("score".into(), "rows:r".into()),
+            vec![0],
+            vec!["fun".into()],
+        );
+        let relations = vec![survivors, scores];
+        let mut rows = FinishedRows {
             aliases: vec!["r".into()],
+            orders: join_orders(&relations),
             relations,
-            probes,
             columns: vec![Column::Answer {
                 name: "fun".into(),
                 relation: 1,
@@ -957,19 +848,9 @@ mod tests {
             built: Vec::new(),
             keys: Vec::new(),
             pending: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn a_row_is_built_once_every_port_writing_it_reported_it() {
-        let mut rows = scored_survivors();
-        let scored = batch(vec![
-            ("r", ids(vec![0, 1, 2])),
-            (
-                "fun",
-                Arc::new(Float64Array::from(vec![0.1, 0.2, 0.3])) as ArrayRef,
-            ),
-        ]);
+        };
+        let fun = Arc::new(Float64Array::from(vec![0.1, 0.2, 0.3])) as ArrayRef;
+        let scored = batch(vec![("r", ids(vec![0, 1, 2])), ("fun", fun)]);
         // no document has passed the filter yet
         assert!(
             rows.report("score", "rows:r", &scored)
