@@ -109,7 +109,7 @@ def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
     assert [column.above_joins for column in lifted.found.maps] == [True]
 
 
-@pytest.mark.parametrize("form,dialect", [("alias", "bq"), ("cte", "snowflake")])
+@pytest.mark.parametrize("form,dialect", [("call", "bq"), ("cte", "snowflake")])
 def test_a_plain_test_keeps_only_matching_map_answers(session, form, dialect):
     call = "AI.MAP(r.body, 'Name the topic.', 16)"
     select = f"SELECT r.id, {call} AS topic FROM reviews r"
@@ -117,8 +117,7 @@ def test_a_plain_test_keeps_only_matching_map_answers(session, form, dialect):
         sql = (f"WITH m AS ({select}) SELECT m.id, m.topic FROM m "
                "WHERE m.topic = 'topic 1'")
     else:
-        operand = call if form == "call" else "topic"
-        sql = f"{select} WHERE {operand} = 'topic 1'"
+        sql = f"{select} WHERE {call} = 'topic 1'"
     query = session.sql(sql, dialect=dialect)
     plan = query.plan()
     (node,) = _maps(plan)
@@ -139,21 +138,22 @@ def test_a_map_only_used_by_a_test_is_computed_once(session):
         .collect().to_pylist() == [{"r.id": 2}]
 
 
-@pytest.mark.parametrize("kind, call, operand", [
-    ("label", "AI.CLASSIFY(PROMPT('Topic? {0}', r.body), ARRAY['a', 'b'])", "value"),
-    ("extract", "AI.EXTRACT(r.body, {'topic': 'Topic?'})", "value.topic"),
-    ("map", "AI.MAP(r.body, 'Topic?', 16)", "value"),
+@pytest.mark.parametrize("kind, call, field", [
+    ("label", "AI.CLASSIFY(PROMPT('Topic? {0}', r.body), ARRAY['a', 'b'])", ""),
+    ("extract", "AI.EXTRACT(r.body, {'topic': 'Topic?'})", "['topic']"),
+    ("map", "AI.MAP(r.body, 'Topic?', 16)", ""),
     ("features", "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), pooling => 'last')",
-     "value"),
+     ""),
 ])
 def test_every_column_operator_supports_a_plain_result_test(session, kind, call,
-                                                           operand):
+                                                           field):
     model = "qwen3.5-2b-sae-bf16" if kind == "features" else "qwen3-4b-fp8"
     with quail.Session(EngineConfig(model=model, device="h100-sxm"),
                        tokenizer=TOKENIZER) as value:
         value.register("reviews", session.catalog.get("reviews"))
         query = value.sql(f"SELECT r.id, {call} AS value FROM reviews r "
-                          f"WHERE HINT({operand} IS NOT NULL, {{'selectivity': 0.4}})")
+                          f"WHERE HINT({call}{field} IS NOT NULL, "
+                          "{'selectivity': 0.4})")
         (test,) = column_tests(operators_of(query))
         # the test follows the column operator whose answer it reads
         assert test.call.kind == kind

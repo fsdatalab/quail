@@ -76,7 +76,8 @@ def test_map_answer_tests_follow_maps_on_both_sides_of_join_placement(query,
         "SELECT d.id, q.id, AI.MAP(d.text, 'Name the topic.', 16) AS topic "
         "FROM leases d JOIN questions q "
         "ON AI_FILTER(PROMPT('Does {0} answer {1}?', d.text, q.text)) "
-        "WHERE HINT(topic = 'leases', {'selectivity': 0.25})")
+        "WHERE HINT(AI.MAP(d.text, 'Name the topic.', 16) = 'leases', "
+        "{'selectivity': 0.25})")
     candidates = alternative_plans(mapped)
     assert len(candidates) == 2
     for candidate in candidates:

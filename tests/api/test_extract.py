@@ -293,12 +293,13 @@ def _answers_executor(answers):
 def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     from quail.api.execute import execute_query
 
+    fields = f"c.text, {{'ends': '{QUESTION}', 'rent': 'How much?'}}"
+    lease, span = f"AI.EXTRACT({fields})", f"AI.EXTRACT_SPAN({fields})"
     tests = " AND ".join(f"HINT({test}, {{'selectivity': 0.5}})" for test in (
-        "lease.ends IS NOT NULL", "lease.ends ILIKE '%march%'",
-        "lease_span.ends.start < 20", "LENGTH(lease.rent) < 20"))
+        f"{lease}['ends'] IS NOT NULL", f"{lease}['ends'] ILIKE '%march%'",
+        f"{span}['ends']['start'] < 20", f"LENGTH({lease}['rent']) < 20"))
     query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-        f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE {tests}")
+        f"SELECT c.id, {lease} AS lease FROM contracts c WHERE {tests}")
     # each test follows its field's extraction
     found = operators_of(query)
     assert [column.name for column in found.extracts] == ["lease.ends", "lease.rent"]
@@ -346,9 +347,10 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     assert passed[("c", 0)].column("answer").to_pylist() == [True, False]
     assert passed[("c", 2)].column("answer").to_pylist() == [True]
     # a negated text test drops the null answer as SQL does
+    lease = f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})"
     negated = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-        "FROM contracts c WHERE NOT (lease.ends LIKE 'March%')")
+        f"SELECT c.id, {lease} AS lease "
+        f"FROM contracts c WHERE NOT ({lease}['ends'] LIKE 'March%')")
     (test,) = column_tests(operators_of(negated))
     assert str(test.condition) == "NOT (c.lease.ends like 'March%')"
     result = execute_query(negated, physical_executor=_answers_executor(
@@ -360,9 +362,10 @@ def test_a_datafusion_function_arrow_compute_lacks_tests_an_answer(session):
     from quail.api.execute import execute_query
 
     # SPLIT_PART is DataFusion's; Arrow compute has no such function
+    lease = f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})"
     query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-        "FROM contracts c WHERE SPLIT_PART(lease.ends, ' ', 1) = 'March'")
+        f"SELECT c.id, {lease} AS lease "
+        f"FROM contracts c WHERE SPLIT_PART({lease}['ends'], ' ', 1) = 'March'")
     (test,) = column_tests(operators_of(query))
     assert str(test.condition) == "split_part(c.lease.ends, ' ', 1) = 'March'"
     result = execute_query(query, physical_executor=_answers_executor(
@@ -372,8 +375,10 @@ def test_a_datafusion_function_arrow_compute_lacks_tests_an_answer(session):
 def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
     from quail.api.execute import execute_query
 
-    head = (f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-            f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE ")
+    fields = f"c.text, {{'ends': '{QUESTION}', 'rent': 'How much?'}}"
+    lease, span = f"AI.EXTRACT({fields})", f"AI.EXTRACT_SPAN({fields})"
+    head = f"SELECT c.id, {lease} AS lease FROM contracts c WHERE "
+    ends, rent, start = f"{lease}['ends']", f"{lease}['rent']", f"{span}['ends']['start']"
 
     def placed(query):
         found = operators_of(query)
@@ -385,22 +390,22 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
         return result.collect().column("c.id").to_pylist()
 
     # one extraction's answer and span: the Filter follows the extraction
-    one = session.sql(head + "NOT (lease.ends IS NULL OR lease_span.ends.start < 0)")
+    one = session.sql(head + f"NOT ({ends} IS NULL OR {start} < 0)")
     assert placed(one) == [
         ("extraction", "c.lease.ends IS NOT NULL"),
         ("extraction", "NOT (c.lease.ends_span.start < 0)")]
-    one = session.sql(head + "lease.ends IS NULL OR lease_span.ends.start >= 0")
+    one = session.sql(head + f"{ends} IS NULL OR {start} >= 0")
     assert placed(one) == [
         ("extraction", "c.lease.ends IS NULL OR c.lease.ends_span.start >= 0")]
     assert kept(one) == [1, 2]
     # an answer and a source column, or two extractions: after the last
     # extraction read, each other column read by document ID
-    mixed = session.sql(head + "NOT (lease.ends IS NULL AND c.id = 2)")
+    mixed = session.sql(head + f"NOT ({ends} IS NULL AND c.id = 2)")
     # DataFusion computes the source column's test, c.id = 2
     assert placed(mixed) == [
         ("extraction", "c.lease.ends IS NOT NULL OR NOT (c.__quail_expr_0)")]
     assert kept(mixed) == [1]
-    fields = session.sql(head + "lease.ends = 'x' OR lease.rent IS NOT NULL")
+    fields = session.sql(head + f"{ends} = 'x' OR {rent} IS NOT NULL")
     assert placed(fields) == [
         ("extraction", "c.lease.ends = 'x' OR c.lease.rent IS NOT NULL")]
     (test,) = [node for node in fields.plan().nodes if isinstance(node, Filter)]
@@ -412,7 +417,8 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
         session.sql(
             "SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind, "
             f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-            "FROM contracts c WHERE kind = 'lease' OR lease.ends IS NULL")
+            "FROM contracts c WHERE AI.CLASSIFY(c.text, ['lease', 'deed']) = 'lease' "
+            f"OR AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})['ends'] IS NULL")
 
 
 def test_an_extracted_tables_token_store_holds_each_tokens_characters(session):

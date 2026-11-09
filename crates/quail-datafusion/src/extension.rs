@@ -23,13 +23,14 @@ use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::physical_planner::ExtensionPlanner;
 
-use crate::LowerAiCalls;
+use crate::{LowerAiCalls, StructFieldAccess};
 use crate::exec::{ModelRegionPlanner, QuailQueryPlanner, RegionRunner};
 use crate::functions::quail_functions;
 use crate::rules::{logical_rules, with_quail_rules};
 
 /// Quail's additions to a DataFusion session: the AI functions, the
-/// rules that lower AI calls, optimize around them, and claim model
+/// planner of `value['field']` on a struct in Snowflake SQL, the rules
+/// that lower AI calls, optimize around them, and claim model
 /// regions, and the planner that runs each region on `runner`.
 #[derive(Debug)]
 pub struct QuailExtension {
@@ -105,6 +106,7 @@ impl QuailExtension {
         for function in quail_functions() {
             state.register_udf(function)?;
         }
+        state.register_expr_planner(Arc::new(StructFieldAccess))?;
         Ok(state)
     }
 

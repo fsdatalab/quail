@@ -47,10 +47,11 @@ QUERIES = {
     "IMDB-11 classify":
         "SELECT r.id, AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
         "['positive', 'negative', 'mixed']) AS sentiment FROM reviews r",
-    "IMDB-15 classify filtered by its alias":
+    "IMDB-15 classify filtered by the same call":
         "SELECT r.id, AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
         "['positive', 'negative', 'mixed']) AS sentiment FROM reviews r "
-        "WHERE sentiment IN ('negative', 'mixed')",
+        "WHERE AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
+        "['positive', 'negative', 'mixed']) IN ('negative', 'mixed')",
     "CUAD-1 extract":
         "SELECT c.id, AI.EXTRACT(c.text, {'end': 'q6: When does it end?'}) "
         "AS lease FROM contracts c",
@@ -144,8 +145,9 @@ def test_session_sql_runs_a_query_that_needs_sql_around_its_model_region(context
 
 
 def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
-    text = ("SELECT c.id, AI.EXTRACT(c.text, {'end': 'q6: When does it end?'}) "
-            "AS lease FROM contracts c WHERE lease_span.end.start < 15")
+    fields = "c.text, {'end': 'q6: When does it end?'}"
+    text = (f"SELECT c.id, AI.EXTRACT({fields}) AS lease FROM contracts c "
+            f"WHERE AI.EXTRACT_SPAN({fields})['end']['start'] < 15")
     expected = finish(context.session.sql(text), ORACLE).collect()
     table = context.sql(text)
     assert table.column_names == ["c.id", "lease", "lease_span"]

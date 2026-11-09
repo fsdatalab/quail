@@ -26,6 +26,7 @@ mod distinct;
 mod exec;
 pub mod expressions;
 mod extension;
+mod field_access;
 mod functions;
 mod guards;
 mod hints;
@@ -60,8 +61,7 @@ use datafusion::sql::parser::Statement;
 
 pub use absorb::AbsorbIntoAiNodes;
 pub use aliases::{
-    SPAN_SUFFIX, add_extract_spans, distinct_order_ordinals, inline_select_aliases,
-    positional_ai_arguments, remove_select_calls, restore_select_aliases,
+    SPAN_SUFFIX, add_extract_spans, distinct_order_ordinals, positional_ai_arguments,
 };
 pub use claim::ClaimModelRegions;
 pub use distinct::{EliminateDistinct, PushDownDistinct};
@@ -70,6 +70,7 @@ pub use exec::{
     RegionRunner, collect_inputs,
 };
 pub use extension::QuailExtension;
+pub use field_access::StructFieldAccess;
 pub use functions::{AI_FUNCTION_NAMES, brace_structs, is_ai_call, quail_functions};
 pub use guards::PushDownCaseGuards;
 pub use identified::IdentifiedTable;
@@ -148,9 +149,8 @@ pub fn session_context_with_rules(
 ///
 /// The query is parsed in the session's SQL dialect. Before DataFusion
 /// binds it, each regular expression test matches as the dialect says
-/// (see [`regexps`]), each extraction gets its answer positions column (see
-/// [`add_extract_spans`]), and `SELECT` aliases named in `WHERE` are
-/// replaced by their expressions (see [`inline_select_aliases`]).
+/// (see [`regexps`]), and each extraction gets its answer positions column (see
+/// [`add_extract_spans`]).
 pub async fn sql(context: &SessionContext, query: &str) -> Result<DataFrame> {
     sql_in_dialect(context, query, None).await
 }
@@ -190,7 +190,6 @@ pub async fn sql_in_dialect(
         take_unnests(inner);
         positional_ai_arguments(inner);
         add_extract_spans(inner);
-        inline_select_aliases(inner);
         distinct_order_ordinals(inner);
     }
     let plan = state.statement_to_plan(statement).await?;

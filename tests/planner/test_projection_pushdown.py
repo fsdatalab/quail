@@ -118,7 +118,7 @@ LABELLED_JOIN_SQL = """
            AI.CLASSIFY(PROMPT('topic of {0}', r.review), ['a', 'b']) AS topic
     FROM reviews r
     JOIN products p ON AI_FILTER(PROMPT('same {0} {1}', r.review, p.description))
-    WHERE topic IN ('a')
+    WHERE AI.CLASSIFY(PROMPT('topic of {0}', r.review), ['a', 'b']) IN ('a')
 """
 
 

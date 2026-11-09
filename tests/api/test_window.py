@@ -17,8 +17,9 @@ STEPS = pa.table({
     "text": ["one", "two", "three", "four", "five"],
 })
 OVER = "OVER (PARTITION BY s.run_id ORDER BY s.step_index)"
-TONE = "AI.CLASSIFY(PROMPT('tone: {0}', s.text), ['good', 'bad']) AS tone"
-WINDOWS = (f"SELECT s.id, {TONE}, LAG(tone) {OVER} AS previous, "
+TONE_CALL = "AI.CLASSIFY(PROMPT('tone: {0}', s.text), ['good', 'bad'])"
+TONE = f"{TONE_CALL} AS tone"
+WINDOWS = (f"SELECT s.id, {TONE}, LAG({TONE_CALL}) {OVER} AS previous, "
            f"ROW_NUMBER() {OVER} AS n, SUM(s.cost) {OVER} AS spent FROM steps s ")
 SQL = WINDOWS + "ORDER BY s.run_id, s.step_index"
 NUMBERED = (f"SELECT s.id, ROW_NUMBER() {OVER} AS n FROM steps s "

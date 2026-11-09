@@ -71,7 +71,7 @@ def test_a_map_the_select_list_reads_writes_each_answer_it_keeps_whole():
 
 def test_an_extraction_stops_once_no_span_of_its_document_can_pass():
     sql = ("SELECT r.id, AI_EXTRACT(r.body, {'w': 'When?'}) AS e FROM reviews r "
-           "WHERE LEFT(e.w, 7) = 'March 3'")
+           "WHERE LEFT(AI_EXTRACT(r.body, {'w': 'When?'})['w'], 7) = 'March 3'")
 
     def when(spec, document):
         return str(REVIEWS["body"][document]).rsplit(" ", 1)[0]
@@ -144,11 +144,15 @@ def _plan_test(sql):
     return answer_stop(node)
 
 
+LAW_SQL = ("SELECT r.id, AI_EXTRACT(r.body, {'law': 'Which law?'}) AS e "
+           "FROM reviews r "
+           "WHERE AI_EXTRACT(r.body, {'law': 'Which law?'})['law'] = 'State of California'")
+
+
 @pytest.mark.parametrize("prefix", [" State", "State", "State of", "State of ",
                                     "State of Cal", " "])
 def test_an_extraction_goes_on_while_a_copied_span_can_still_pass(prefix):
-    stop = _plan_test("SELECT r.id, AI_EXTRACT(r.body, {'law': 'Which law?'}) AS e "
-                      "FROM reviews r WHERE e.law = 'State of California'")
+    stop = _plan_test(LAW_SQL)
     # the copy may still be at any place the document holds the prefix,
     # in any case, and its answer is that span stripped
     spans = [(start, start + len(prefix)) for start in range(len(LAWS))
@@ -157,8 +161,7 @@ def test_an_extraction_goes_on_while_a_copied_span_can_still_pass(prefix):
 
 
 def test_an_extraction_stops_once_no_copied_span_can_pass():
-    stop = _plan_test("SELECT r.id, AI_EXTRACT(r.body, {'law': 'Which law?'}) AS e "
-                      "FROM reviews r WHERE e.law = 'State of California'")
+    stop = _plan_test(LAW_SQL)
     start = LAWS.index("State of")
     spans = [(LAWS.index("state courts"), LAWS.index(" courts")),
              (start, start + len("State"))]
