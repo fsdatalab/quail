@@ -65,8 +65,8 @@ can share model-region work. Other expression shapes use the
 
 `NOT AI.IF(...)` keeps the rows the model answers no for. It is the same
 filter: Quail orders it by cost with the other filters, and a `LIMIT`
-stops it early. A `selectivity` option still gives the fraction of rows
-the model answers yes for. E.g., keep reviews that do not discuss the
+stops it early. `AI.IF(...) = FALSE` is the same test. A `selectivity`
+option still gives the fraction of rows the model answers yes for. E.g., keep reviews that do not discuss the
 ending:
 
 ```sql

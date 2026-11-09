@@ -5,16 +5,16 @@
 //! plans so each call is an [`AiNode`] of its own, and DataFusion's
 //! operators hold only the relational work:
 //!
-//! - A `Filter` keeps its other terms; each `AI.IF` term, or comparison
-//!   of an `AI.SCORE` call, is an `AiNode` above it whose filter tests
-//!   the answer. A `NOT AI.IF` term is the same node with the filter
-//!   `NOT answer`. A term that reads two tables is an AI join. An OR of
-//!   one `AI.IF` and terms that ask no model, such as `r.flagged OR
-//!   AI.IF(...)`, is an `AiNode` whose filter is the OR with the answer
-//!   in the call's place. With more `AI.IF`s, such as `r.flagged OR
-//!   AI.IF(q1) OR AI.IF(q2)`, each but the last is an `AiNode` that
-//!   returns its answer `b1` and drops no row, in written order, and the
-//!   last is the node whose filter is `r.flagged OR b1 OR b2`.
+//! - A `Filter` keeps its other terms. Each `AI.IF` call of a term is an
+//!   `AiNode` above it that returns its answer, in written order, and
+//!   the term is a `Filter` above them that reads each answer in its
+//!   call's place: `b` for `AI.IF(...)`, `NOT b` for `NOT AI.IF(...)`,
+//!   `r.flagged OR b1 OR b2` for an OR of two calls.
+//!   [`crate::rules::absorb`] then makes the `Filter` the last node's
+//!   own, as DataFusion has simplified it. A call that reads two tables
+//!   is an AI join.
+//! - A comparison of an `AI.SCORE` call is an `AiNode` whose filter is
+//!   the comparison.
 //! - An inner `Join` keeps its other ON terms; each `AI.IF` term is an
 //!   `AiNode` above it.
 //! - Each such node records where the query wrote its term
@@ -43,7 +43,7 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::simplify::SimplifyContext;
-use datafusion::logical_expr::utils::{conjunction, split_binary, split_conjunction};
+use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Expr, ExprSchemable, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
 };
@@ -97,49 +97,64 @@ fn unhint(expr: &Expr) -> (Expr, Option<Expr>) {
     }
 }
 
-/// The `AI.IF` call of a term that is one or the `NOT` of one.
-fn filter_call(term: &Expr) -> Option<&Expr> {
-    let call = match term {
-        Expr::Not(inner) => inner.as_ref(),
-        other => other,
-    };
-    (function_name(call) == Some("ai_filter")).then_some(call)
+/// Whether a term is a comparison of an `AI.SCORE` call.
+fn is_score_test(term: &Expr) -> bool {
+    matches!(term, Expr::BinaryExpr(binary)
+        if matches!(
+            binary.op,
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+        ) && (function_name(&binary.left) == Some("ai_score")
+            || function_name(&binary.right) == Some("ai_score")))
 }
 
-/// Whether a term is a predicate the model answers: an `AI.IF` call, a
-/// `NOT` of one, or a comparison of an `AI.SCORE` call.
-fn is_asked(term: &Expr) -> bool {
-    match hinted(term) {
-        found if filter_call(found).is_some() => true,
-        Expr::BinaryExpr(binary)
-            if matches!(
-                binary.op,
-                Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq
-            ) =>
-        {
-            function_name(&binary.left) == Some("ai_score")
-                || function_name(&binary.right) == Some("ai_score")
+/// The `AI.IF` calls of a term that asks the model nothing else and has
+/// no subquery, in written order: `AI.IF(...)` itself, or any expression
+/// of such calls and the input's columns, such as `NOT AI.IF(...)` or
+/// `r.flagged OR AI.IF(...)`. None for any other term.
+fn filter_calls(term: &Expr) -> Option<Vec<Expr>> {
+    let mut calls: Vec<Expr> = Vec::new();
+    let mut other = false;
+    let _ = term.apply(|found| {
+        if function_name(found) == Some("ai_filter") {
+            if !calls.contains(found) {
+                calls.push(found.clone());
+            }
+            return Ok(TreeNodeRecursion::Jump);
         }
-        _ => false,
-    }
+        other = other
+            || crate::is_ai_call(found)
+            || matches!(
+                found,
+                Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+            );
+        Ok(TreeNodeRecursion::Continue)
+    });
+    (!other && !calls.is_empty()).then_some(calls)
+}
+
+/// Whether a term is a predicate the model answers: an `AI.IF` call or a
+/// comparison of an `AI.SCORE` call.
+fn is_asked(term: &Expr) -> bool {
+    let term = hinted(term);
+    function_name(term) == Some("ai_filter") || is_score_test(term)
 }
 
 /// Terms of one WHERE or ON, each with its position among them.
 type Terms = Vec<(usize, Expr)>;
 
-/// A predicate's asked terms and the rest, in written order, and how many
-/// terms it has. An OR with one `AI.IF` term, [`or_asked`], is asked.
+/// A predicate's terms of `AI.IF` answers and comparisons of `AI.SCORE`
+/// calls, and the rest, in written order, and how many terms it has.
 fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
     let terms = split_conjunction(predicate);
     let num_terms = terms.len();
     let (mut asked, mut rest) = (Vec::new(), Vec::new());
     for (position, term) in terms.into_iter().enumerate() {
-        if is_asked(term) || or_asked(term).is_some() {
+        if is_score_test(hinted(term)) || filter_calls(hinted(term)).is_some() {
             asked.push((position, term.clone()));
         } else {
             rest.push((position, term.clone()));
@@ -148,36 +163,13 @@ fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
     (asked, rest, num_terms)
 }
 
-/// The `AI.IF` calls of an OR whose other terms ask no model and read no
-/// model answer, such as `r.flagged OR AI.IF(...) OR NOT AI.IF(...)`, in
-/// written order, and the OR's terms.
-fn or_asked(term: &Expr) -> Option<(Vec<&Expr>, Vec<&Expr>)> {
-    let terms = split_binary(term, Operator::Or);
-    if terms.len() < 2 {
-        return None;
-    }
-    let calls: Vec<&Expr> = terms
-        .iter()
-        .filter_map(|found| filter_call(found))
-        .collect();
-    let others = terms.iter().filter(|found| filter_call(found).is_none());
-    let plain = |found: &Expr| {
-        !found
-            .exists(|inner| Ok(crate::is_ai_call(inner) || matches!(inner, Expr::Exists(_))))
-            .unwrap_or(true)
-    };
-    (!calls.is_empty() && others.into_iter().all(|found| plain(found))).then_some((calls, terms))
-}
-
-/// `term` with its first occurrence of `call` replaced by `with`.
-fn replace_first(term: Expr, call: &Expr, with: &Expr) -> Result<Expr> {
-    let mut done = false;
+/// `term` with each occurrence of `call` replaced by `with`.
+fn replace_call(term: Expr, call: &Expr, with: &Expr) -> Result<Expr> {
     Ok(term
         .transform_down(|found| {
-            if done || found != *call {
+            if found != *call {
                 return Ok(Transformed::no(found));
             }
-            done = true;
             Ok(Transformed::new(
                 with.clone(),
                 true,
@@ -187,15 +179,14 @@ fn replace_first(term: Expr, call: &Expr, with: &Expr) -> Result<Expr> {
         .data)
 }
 
-/// An `AiNode` over `input` asking an `AI.IF` call of an OR and
-/// returning its answer as the column `answer` instead of filtering:
-/// the OR's last `AI.IF` reads it as one of the OR's other terms.
+/// An `AiNode` over `input` asking an `AI.IF` call and returning its
+/// answer as the column `answer`: the term's `Filter` above reads it.
 fn answer_node(
     input: LogicalPlan,
     call: &Expr,
     (answer, index): (String, usize),
     written: &Written,
-) -> Result<LogicalPlan> {
+) -> Result<AiNode> {
     let (_, field) = call.to_field(input.schema())?;
     let field = field.as_ref().clone().with_name(answer.clone());
     let mut node = AiNode::try_new(Arc::new(input), call.clone(), answer, vec![field])?;
@@ -203,7 +194,7 @@ fn answer_node(
         index,
         ..written.clone()
     });
-    Ok(extension_node(node.checked()?))
+    node.checked()
 }
 
 /// An `AiNode` over `input` asking `term`, an `AI.IF` call or a
@@ -217,22 +208,7 @@ fn asked_node(
 ) -> Result<LogicalPlan> {
     let (term, hint) = unhint(term);
     let read = Expr::Column(Column::from_name(answer.clone()));
-    let ored = or_asked(&term).map(|(calls, terms)| {
-        // the OR's terms in written order, the call's answer in its place
-        let call = calls[0];
-        let filter = terms
-            .into_iter()
-            .map(|found| match found {
-                found if found == call => read.clone(),
-                Expr::Not(inner) if inner.as_ref() == call => Expr::Not(Box::new(read.clone())),
-                found => found.clone(),
-            })
-            .reduce(Expr::or)
-            .expect("an OR's terms");
-        (call.clone(), filter)
-    });
     let (call, filter) = match term {
-        _ if ored.is_some() => ored.expect("an OR"),
         Expr::BinaryExpr(mut binary) if function_name(&binary.left) == Some("ai_score") => {
             let call = std::mem::replace(binary.left.as_mut(), read);
             (call, Expr::BinaryExpr(binary))
@@ -241,7 +217,6 @@ fn asked_node(
             let call = std::mem::replace(binary.right.as_mut(), read);
             (call, Expr::BinaryExpr(binary))
         }
-        Expr::Not(call) => (*call, Expr::Not(Box::new(read))),
         call => (call, read),
     };
     let (_, field) = call.to_field(input.schema())?;
@@ -255,7 +230,12 @@ fn asked_node(
     Ok(extension_node(node.checked()?))
 }
 
-/// Stack one `AiNode` per asked term on `input`, in written order.
+/// Stack the `AiNode`s of each asked term on `input`, in written order.
+///
+/// A term of `AI.IF` answers is one node per call, each returning its
+/// answer, below a `Filter` of the term with each answer in its call's
+/// place. A comparison of an `AI.SCORE` call is one node whose filter
+/// is the comparison.
 ///
 /// `on` is the alias of the table whose JOIN's ON holds the terms, or
 /// None for a WHERE.
@@ -266,7 +246,7 @@ fn stack_asked(
     on: Option<&str>,
     columns: &mut Columns,
 ) -> Result<LogicalPlan> {
-    for (position, mut term) in asked {
+    for (position, term) in asked {
         let written = Written {
             position,
             num_terms,
@@ -274,24 +254,28 @@ fn stack_asked(
             index: 0,
             on: on.map(str::to_string),
         };
-        // each AI.IF of an OR but the last returns its answer, which the
-        // last reads as one of the OR's other terms
-        let calls: Vec<Expr> = or_asked(hinted(&term))
-            .map(|(calls, _)| calls.into_iter().cloned().collect())
-            .unwrap_or_default();
-        for call in calls.iter().rev().skip(1).rev() {
+        let Some(calls) = filter_calls(hinted(&term)) else {
+            input = asked_node(
+                input,
+                &term,
+                columns.answer_name(),
+                Semantics::Rows,
+                written,
+            )?;
+            continue;
+        };
+        let (mut test, hint) = unhint(&term);
+        for (number, call) in calls.iter().enumerate() {
             let (answer, index) = columns.answer_name();
             let read = Expr::Column(Column::from_name(answer.clone()));
-            input = answer_node(input, call, (answer, index), &written)?;
-            term = replace_first(term, call, &read)?;
+            let mut node = answer_node(input, call, (answer, index), &written)?;
+            if number + 1 == calls.len() {
+                node.hint = hint.clone();
+            }
+            input = extension_node(node);
+            test = replace_call(test, call, &read)?;
         }
-        input = asked_node(
-            input,
-            &term,
-            columns.answer_name(),
-            Semantics::Rows,
-            written,
-        )?;
+        input = LogicalPlan::Filter(Filter::try_new(test, Arc::new(input))?);
     }
     Ok(input)
 }

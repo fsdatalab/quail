@@ -81,8 +81,8 @@ conditions.
 | Rule | Change |
 | --- | --- |
 | `eliminate_distinct` | Remove a redundant `DISTINCT` when selected primary keys make rows unique. |
+| `absorb_into_ai_nodes` | Make tests of answers the node's exact filter (R2). An `AI.IF` in `WHERE` becomes a filter here. |
 | `place_ai_nodes` | Place AI calls at the tables they read. |
-| `absorb_into_ai_nodes` | Make tests of answers the node's exact filter (R2). |
 | `merge_repeated_ai_calls` | Reuse an identical earlier call's answer (R17). |
 | `push_down_distinct` | Stop after one passing row per selected key (R12). |
 | `push_down_limit_into_ai_nodes` | Give an eligible node a fetch, including `OFFSET` (R9–R10). |

@@ -204,6 +204,13 @@ def test_datafusion_sql_shapes_with_model_calls(constant_model, shape):
 
 NEGATED = {
     "alone": (f"SELECT r.id FROM r WHERE NOT {PREDICATE}", ["r1", "r3"]),
+    "compared with FALSE": (
+        f"SELECT r.id FROM r WHERE {PREDICATE} = FALSE", ["r1", "r3"]),
+    "beside a second AI.IF in an OR": (
+        f"SELECT r.id FROM r WHERE NOT {PREDICATE} "
+        "OR AI.IF(PROMPT('q2: {0}', r.body))",
+        ["r0", "r1", "r3"],
+    ),
     "after another AI filter": (
         "SELECT r.id FROM r WHERE AI.IF(PROMPT('q2: {0}', r.body)) "
         f"AND NOT {PREDICATE}",

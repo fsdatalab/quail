@@ -63,7 +63,7 @@ constraints; the rule implementation defines every accepted plan shape.
 | Number | Rule | Change and conditions |
 | --- | --- | --- |
 | R1 | DataFusion `push_down_filter` | Move an input-only filter below an `AiNode` without a fetch. Above a per-key fetch, move only filters of key columns. |
-| R2 | `absorb_into_ai_nodes` | Add an answer test to the node's exact filter when the node has no fetch. |
+| R2 | `absorb_into_ai_nodes` | Add an answer test to the node's exact filter when the node has no fetch. An `AI.IF` node whose answer no operator above reads then returns no column. |
 | R3 | `push_down_hint_tests` | Copy a directly preceding answer test into a column-producing node's hint test. Require no fetch; keep the original filter. |
 | R4 | `push_down_substring_prechecks` | Before extraction, test the document for literal text required by an answer's `LIKE` or `ILIKE` pattern. Require no fetch and a non-negated literal pattern; keep the answer test. |
 | R5 | `push_down_projection_into_ai_nodes` | Remove unused added columns and extraction questions. Keep all extraction fields when any use reads the whole struct. |

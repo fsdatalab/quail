@@ -186,19 +186,17 @@ impl Relation {
             Some(filter) if node.answer_term(filter).is_some() => {
                 (None, node.answer_term(filter) == Some(true))
             }
-            Some(filter) if split_conjunction(filter).len() == 1 => {
-                match crate::rules::or_guards::or_terms(node) {
-                    Some((rest, negated)) => {
-                        let rest = walk.filter_answers(&rest, binder);
-                        (Some(binder.bind_condition(&rest)?), negated)
-                    }
-                    None => {
-                        return unsupported(
-                            "DataFusion must evaluate this condition over the model's Boolean answer.",
-                        );
-                    }
+            Some(_) => match crate::rules::or_guards::or_terms(node) {
+                Some((rest, negated)) => {
+                    let rest = walk.filter_answers(&rest, binder);
+                    (Some(binder.bind_condition(&rest)?), negated)
                 }
-            }
+                None => {
+                    return unsupported(
+                        "DataFusion must evaluate this condition over the model's Boolean answer.",
+                    );
+                }
+            },
             _ => (None, false),
         };
         let guard = match &node.guard {

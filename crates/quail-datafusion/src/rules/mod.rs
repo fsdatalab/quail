@@ -34,8 +34,8 @@ use datafusion::optimizer::{Optimizer, OptimizerRule};
 /// Quail's own rules, in the order they run.
 pub const QUAIL_RULES: [&str; 13] = [
     "eliminate_distinct",
-    "place_ai_nodes",
     "absorb_into_ai_nodes",
+    "place_ai_nodes",
     "merge_repeated_ai_calls",
     "push_down_distinct",
     "push_down_limit_into_ai_nodes",
@@ -58,8 +58,8 @@ const EXPECTED_DEFAULT_RULES: [&str; 38] = [
     "unions_to_filter",
     "simplify_expressions",
     "eliminate_distinct",
-    "place_ai_nodes",
     "absorb_into_ai_nodes",
+    "place_ai_nodes",
     "merge_repeated_ai_calls",
     "push_down_distinct",
     "push_down_limit_into_ai_nodes",
