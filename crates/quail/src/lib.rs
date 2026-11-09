@@ -343,7 +343,7 @@ impl Session {
             // read its rows while this thread runs the region
             let query = self.runtime().spawn(async move {
                 let frame = frame(&context, &query, dialect.as_deref()).await?;
-                let schema = quail_schema(frame.schema());
+                let schema = quail_schema(frame.logical_plan());
                 // renaming the columns keeps each column's buffers
                 let batches = frame
                     .collect()

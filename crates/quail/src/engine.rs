@@ -295,7 +295,7 @@ impl PythonRunner {
             (None, inputs.as_slice())
         };
         let schema = Arc::clone(region.plan.schema());
-        let names = quail_column_names(&schema);
+        let names = quail_column_names(&region.plan);
         let sink = RegionSink {
             rows: rows.clone(),
             names: names.clone(),

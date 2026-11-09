@@ -52,9 +52,10 @@ mod substring;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
-use datafusion::common::{DFSchema, Result};
+use datafusion::common::{Result, ScalarValue};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
+use datafusion::logical_expr::{Expr, LogicalPlan};
 
 pub use absorb::AbsorbIntoAiNodes;
 pub use claim::ClaimModelRegions;
@@ -139,47 +140,103 @@ pub fn session_context_with_rules(
     )?))
 }
 
-/// Quail's name for each column of a schema: `alias.column` for a
-/// table's column, as in `r.id`, and the bare name otherwise.
-pub fn quail_column_names(schema: &DFSchema) -> Vec<String> {
-    schema
+/// Quail's name for each column `plan` returns: `alias.column` for a
+/// table's column, as in `r.id`; `r.details.body` for a struct field
+/// the SELECT list reads without an `AS` name; and otherwise the name
+/// DataFusion gives it, such as an `AS` name, as written.
+pub fn quail_column_names(plan: &LogicalPlan) -> Vec<String> {
+    let selected = select_list(plan);
+    plan.schema()
         .iter()
-        .map(|(qualifier, field)| match qualifier {
-            Some(qualifier) => format!("{qualifier}.{}", field.name()),
-            None => quail_name(field.name()),
+        .enumerate()
+        .map(|(index, (qualifier, field))| {
+            let path = selected
+                .and_then(|(exprs, input)| Some((exprs.get(index)?, input)))
+                .and_then(|(expr, input)| field_path(expr, input));
+            match (path, qualifier) {
+                (Some(path), _) => path,
+                (None, Some(qualifier)) => format!("{qualifier}.{}", field.name()),
+                (None, None) => field.name().clone(),
+            }
         })
         .collect()
 }
 
-/// Quail's name for a column DataFusion names by its expression: a
-/// struct field `r.details[body]` is `r.details.body`. Any other name is
-/// unchanged.
-fn quail_name(name: &str) -> String {
-    let Some((column, fields)) = name.split_once('[') else {
-        return name.to_string();
-    };
-    let word = |text: &str| {
-        !text.is_empty()
-            && text
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-    };
-    let fields: Vec<&str> = fields
-        .strip_suffix(']')
-        .map(|inner| inner.split("][").collect())
-        .unwrap_or_default();
-    if !word(column) || fields.is_empty() || !fields.iter().all(|field| word(field)) {
-        return name.to_string();
+/// The SELECT list whose columns `plan` returns as they are, through the
+/// operators that keep their input's columns, and the plan it reads.
+fn select_list(plan: &LogicalPlan) -> Option<(&[Expr], &LogicalPlan)> {
+    match plan {
+        LogicalPlan::Projection(projection) => Some((&projection.expr, &projection.input)),
+        LogicalPlan::Sort(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Distinct(datafusion::logical_expr::Distinct::All(_)) => {
+            select_list(plan.inputs()[0])
+        }
+        _ => None,
     }
-    format!("{column}.{}", fields.join("."))
 }
 
-/// An Arrow schema with Quail's column names and the schema's types.
-pub fn quail_schema(schema: &DFSchema) -> SchemaRef {
-    let fields: Vec<Field> = schema
+/// `column.field.inner` for a SELECT list item that reads a struct
+/// field of a column, `get_field(column, 'field', 'inner')`, without an
+/// `AS` name, or that reads such a field `input` computes, as a `GROUP
+/// BY` key; None for any other item.
+fn field_path(expr: &Expr, input: &LogicalPlan) -> Option<String> {
+    match expr {
+        Expr::ScalarFunction(call) if call.name() == "get_field" => {
+            let (base, names) = call.args.split_first()?;
+            let mut path = match base {
+                Expr::Column(column) => column.flat_name(),
+                nested => field_path(nested, input)?,
+            };
+            for name in names {
+                let Expr::Literal(ScalarValue::Utf8(Some(name)), _) = name else {
+                    return None;
+                };
+                path.push('.');
+                path.push_str(name);
+            }
+            Some(path)
+        }
+        Expr::Column(column) if column.relation.is_none() => {
+            let (computed, below) = computed_by(input, &column.name)?;
+            field_path(computed, below)
+        }
+        _ => None,
+    }
+}
+
+/// The expression of `plan`, or of a plan below it that keeps its
+/// columns, that computes the column `name`, and the plan it reads.
+fn computed_by<'a>(plan: &'a LogicalPlan, name: &str) -> Option<(&'a Expr, &'a LogicalPlan)> {
+    let named = |expr: &&Expr| expr.schema_name().to_string() == name;
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => aggregate
+            .group_expr
+            .iter()
+            .find(named)
+            .map(|expr| (expr, aggregate.input.as_ref())),
+        LogicalPlan::Projection(projection) => projection
+            .expr
+            .iter()
+            .find(named)
+            .map(|expr| (expr, projection.input.as_ref())),
+        LogicalPlan::Sort(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Window(_)
+        | LogicalPlan::Distinct(_) => computed_by(plan.inputs()[0], name),
+        _ => None,
+    }
+}
+
+/// An Arrow schema of `plan`'s columns with Quail's names.
+pub fn quail_schema(plan: &LogicalPlan) -> SchemaRef {
+    let fields: Vec<Field> = plan
+        .schema()
         .fields()
         .iter()
-        .zip(quail_column_names(schema))
+        .zip(quail_column_names(plan))
         .map(|(field, name)| field.as_ref().clone().with_name(name))
         .collect();
     Arc::new(Schema::new(fields))
