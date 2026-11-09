@@ -11,8 +11,10 @@
 pub(crate) mod claim;
 pub(crate) mod exec;
 pub(crate) mod identified;
+mod inputs;
 pub(crate) mod join_back;
 pub(crate) mod lift;
+mod lowering;
 pub mod region_hint;
 pub(crate) mod shared;
 
