@@ -25,7 +25,7 @@ DATAFUSION_DIALECTS = {"snowflake": "Snowflake", "bq": "BigQuery"}
 
 # the start of a DataFusion error, which names its kind
 _ERROR_KINDS = ("Error during planning: ", "SQL error: ", "Schema error: ",
-                "External error: ")
+                "External error: ", "CompileError: ")
 
 
 # what WHERE tests besides an AI call, in the refusal of anything else
@@ -44,14 +44,20 @@ def _sql_text(expression: str) -> str:
 
 def compile_message(error: Exception, sql: str) -> str:
     """A DataFusion error's message, in the front end's words where it has them."""
-    lines = str(error).splitlines()
-    # an optimizer rule's error names the rule, then its cause
-    causes = [index for index, line in enumerate(lines) if line == "caused by"]
-    text = lines[causes[-1] + 1] if causes and causes[-1] + 1 < len(lines) else lines[0]
-    for kind in _ERROR_KINDS:
-        if kind in text:
-            text = text.split(kind, 1)[1]
-    text = text.removeprefix("CompileError: ")
+    text = str(error).strip()
+    # DataFusion wraps rule failures (including lower_ai_calls) in a cause chain.
+    text = re.split(r"\n\s*caused by\s*\n", text)[-1].strip()
+    while prefix := next(
+        (kind for kind in _ERROR_KINDS if text.startswith(kind)), None
+    ):
+        text = text.removeprefix(prefix)
+    if 'List(Struct("feature"' in text:
+        if "character_length" in text:
+            return ("LENGTH needs text, so use array_length for a feature list "
+                    "or UNNEST to test its fields.")
+        if "Cannot infer common argument type" in text:
+            return ("AI.SAE_FEATURES returns a list, so use UNNEST "
+                    "before testing its fields.")
     if found := re.match(r"Invalid function '(\w+)'", text):
         name = found[1]
         if name.lower() == "mod":

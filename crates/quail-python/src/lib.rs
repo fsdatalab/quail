@@ -308,6 +308,22 @@ impl Session {
             // read its rows while this thread runs the region
             let query = self.runtime().spawn(async move {
                 let frame = frame(&context, &query, dialect.as_deref()).await?;
+                let (state, plan) = frame.into_parts();
+                let frame = match plan {
+                    // SET, PREPARE, and related statements update this session,
+                    // not a temporary copy of its state.
+                    LogicalPlan::Statement(_) => context.execute_logical_plan(plan).await?,
+                    // DDL needs DataFusion's execution dispatcher: collecting a
+                    // DataFrame containing CreateMemoryTable does not create it.
+                    // The per-query state preserves dialect settings and shares
+                    // the session's catalog, where created tables and views live.
+                    LogicalPlan::Ddl(_) => {
+                        SessionContext::new_with_state(state)
+                            .execute_logical_plan(plan)
+                            .await?
+                    }
+                    _ => datafusion::dataframe::DataFrame::new(state, plan),
+                };
                 let schema = quail_schema(frame.logical_plan());
                 // renaming the columns keeps each column's buffers
                 let batches = frame
@@ -378,7 +394,7 @@ impl Session {
         let mut regions = Vec::new();
         // a shared input's rows are computed once, however often it is read
         let mut shared = Vec::new();
-        plan.apply(|node| {
+        plan.apply_with_subqueries(|node| {
             if let LogicalPlan::Extension(extension) = node {
                 if let Some(region) = extension.node.as_any().downcast_ref::<ModelRegion>() {
                     regions.push(region.clone());
@@ -518,6 +534,15 @@ async fn frame(
             options.sql_parser.default_null_ordering = "nulls_min".to_string();
         }
     }
-    let plan = state.create_logical_plan(query).await?;
+    let dialect = state.config().options().sql_parser.dialect;
+    let statement = match state.sql_to_statement(query, &dialect) {
+        // Keep Snowflake's expression semantics, but accept standard syntax
+        // such as aggregate FILTER that its parser does not implement.
+        Err(original) if matches!(dialect, datafusion::config::Dialect::Snowflake) => state
+            .sql_to_statement(query, &datafusion::config::Dialect::Generic)
+            .map_err(|_| original)?,
+        parsed => parsed?,
+    };
+    let plan = state.statement_to_plan(statement).await?;
     Ok(datafusion::dataframe::DataFrame::new(state, plan))
 }

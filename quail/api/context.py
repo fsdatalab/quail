@@ -31,7 +31,7 @@ from collections.abc import Callable
 
 import pyarrow as pa
 
-from quail.api.compile import DATAFUSION_DIALECTS
+from quail.api.compile import DATAFUSION_DIALECTS, compile_message
 from quail.api.engine import Engine
 from quail.catalog import ScanRequest, TableProvider
 
@@ -89,7 +89,10 @@ class SessionContext:
     def sql(self, text: str, dialect: str = "snowflake") -> pa.Table:
         """Run a query and return its rows."""
         # DataFusion's batches, shared through the Arrow C stream interface
-        return self._native.sql(text, DATAFUSION_DIALECTS[dialect])
+        try:
+            return self._native.sql(text, DATAFUSION_DIALECTS[dialect])
+        except RuntimeError as error:
+            raise RuntimeError(compile_message(error, text)) from None
 
     def region_plans(self, text: str) -> list[dict]:
         """Return each model region Rust derives, as a dict.
@@ -103,8 +106,11 @@ class SessionContext:
         from quail.common.expressions import CompileError
 
         model = self.session.model
-        derived, _ = self._native.region_plans(text, tuple(model.turn),
-                                               model.prompt_layout)
+        try:
+            derived, _ = self._native.region_plans(text, tuple(model.turn),
+                                                 model.prompt_layout)
+        except RuntimeError as error:
+            raise CompileError(compile_message(error, text)) from None
         regions = []
         for found, message, _ in derived:
             if message is not None:
@@ -114,4 +120,7 @@ class SessionContext:
 
     def explain(self, text: str, dialect: str = "snowflake") -> str:
         """Return DataFusion's optimized logical plan for a query."""
-        return self._native.explain(text, DATAFUSION_DIALECTS[dialect])
+        try:
+            return self._native.explain(text, DATAFUSION_DIALECTS[dialect])
+        except RuntimeError as error:
+            raise RuntimeError(compile_message(error, text)) from None

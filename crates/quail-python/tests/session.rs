@@ -72,6 +72,33 @@ fn reviews() -> Result<MemTable> {
 }
 
 #[test]
+fn a_rust_program_creates_a_table_from_model_results() -> Result<()> {
+    let session = Session::with_engine(engine())?;
+    session.register_table("reviews", Arc::new(reviews()?))?;
+    session.sql(
+        "CREATE TABLE kept AS SELECT r.id FROM reviews r \
+         WHERE AI.IF(PROMPT('q1: {0}', r.body))",
+    )?;
+    let batches = session.sql("SELECT id FROM kept ORDER BY id")?;
+    let ids: Vec<&str> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string ids")
+                .iter()
+                .flatten()
+        })
+        .collect();
+    assert_eq!(ids, ["r0", "r2", "r3"]);
+    session.sql("DROP TABLE kept")?;
+    assert!(session.sql("SELECT * FROM kept").is_err());
+    Ok(())
+}
+
+#[test]
 fn a_rust_program_runs_an_ai_filter_over_its_own_table() -> Result<()> {
     let session = Session::with_engine(engine())?;
     session.register_table("reviews", Arc::new(reviews()?))?;
