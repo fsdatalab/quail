@@ -7,7 +7,6 @@ import pyarrow as pa
 import pytest
 from helpers.sessions import TOKENIZER, encoder
 
-from quail.common.document_ends import last_tokens
 from quail.common.tokens import TokenStore, prefix_tree
 
 native = pytest.importorskip("_quail_native")
@@ -21,23 +20,16 @@ TOKENIZER_FILE = str(TOKENIZER / "tokenizer.json")
 
 def python_statistics(store: TokenStore, page_tokens: int, columns=()):
     tree = prefix_tree(store, page_tokens)
-    shared, count, rows = tree.reader_groups(store.lengths)
-    first = (store.first_documents_with(list(columns)) if columns
-             else store.first_documents)
     return {
         "order": list(tree.order),
         "parent": list(tree.parent),
         "shared": [int(value) for value in tree.shared],
-        "reader_groups": sorted(zip(shared.tolist(), count.tolist(), rows.tolist())),
-        "first_documents": first.to_pylist(),
-        "last_tokens": last_tokens(store.arrow_array).tolist(),
+        "first_documents": store.first_documents_with(list(columns)).to_pylist(),
     }
 
 
 def rust_statistics(path, page_tokens: int, columns=None):
-    found = native.prefix_statistics(str(path), page_tokens, columns)
-    found["reader_groups"] = sorted(found["reader_groups"])
-    return found
+    return native.prefix_statistics(str(path), page_tokens, columns)
 
 
 @pytest.mark.parametrize("page_tokens", [1, 2])

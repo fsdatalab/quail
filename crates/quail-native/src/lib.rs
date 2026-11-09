@@ -577,9 +577,8 @@ fn write_token_store(path: &str, table: &Bound<'_, PyAny>, tokenizer_file: &str)
 
 /// Return the planner's statistics of the token store at `path`: the
 /// prefix index order and parent and shared tokens of its tree at
-/// `page_tokens`, the reader groups, each document's first equal
-/// document (equal also in each column of `columns`, a pyarrow Table),
-/// and the distinct last tokens.
+/// `page_tokens`, and each document's first equal document (equal also
+/// in each column of `columns`, a pyarrow Table).
 #[pyfunction]
 #[pyo3(signature = (path, page_tokens, columns=None))]
 fn prefix_statistics<'py>(
@@ -606,20 +605,13 @@ fn prefix_statistics<'py>(
     let documents = store.documents();
     let index = quail_inputs::PrefixIndex::new(&documents);
     let tree = index.tree(page_tokens);
-    let groups: Vec<(i64, i64, i64)> = tree
-        .reader_groups(store.lengths())
-        .iter()
-        .map(|group| (group.shared, group.count, group.rows))
-        .collect();
     let first = quail_inputs::first_documents(&documents, &values)
         .map_err(|error| python_error(error.into()))?;
     let found = pyo3::types::PyDict::new(py);
     found.set_item("order", &tree.order)?;
     found.set_item("parent", &tree.parent)?;
     found.set_item("shared", &tree.shared)?;
-    found.set_item("reader_groups", groups)?;
     found.set_item("first_documents", first)?;
-    found.set_item("last_tokens", quail_inputs::last_tokens(&documents))?;
     Ok(found)
 }
 

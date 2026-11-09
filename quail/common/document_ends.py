@@ -9,27 +9,7 @@ and joins each with the text after it once (document_ends); a pass
 then ends the document with that join (joined_state).
 """
 
-import numpy as np
-import pyarrow as pa
-
 from quail.common.tokens import concat_tokens
-
-
-def last_tokens(documents) -> np.ndarray:
-    """The distinct last tokens of a table's documents.
-
-    Args:
-        documents: The documents' tokens, an Arrow list array or a
-            chunked array of them.
-    """
-    chunks = (documents.chunks if isinstance(documents, pa.ChunkedArray)
-              else [documents])
-    ends = [np.zeros(0, dtype=np.int64)]
-    for chunk in chunks:
-        offsets = chunk.offsets.to_numpy()
-        stops = offsets[1:][offsets[1:] > offsets[:-1]]
-        ends.append(chunk.values.to_numpy()[stops - 1].astype(np.int64))
-    return np.unique(np.concatenate(ends))
 
 
 def document_ends(last, tail, tokenizer) -> tuple:

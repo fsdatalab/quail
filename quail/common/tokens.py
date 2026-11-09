@@ -284,7 +284,6 @@ class TokenStore(Sequence):
             self._lengths = TokenLengths(
                 pa.chunked_array(self._length_batches, type=pa.int64()), self)
             self._prefix_index = None
-            self._first_documents = None
             self._resources = resources.pop_all()
 
     @property
@@ -298,16 +297,6 @@ class TokenStore(Sequence):
         if self._prefix_index is None:
             self._prefix_index = PrefixIndex(self)
         return self._prefix_index
-
-    @property
-    def first_documents(self) -> pa.Array:
-        """Return each document's first document with the same tokens, as int32.
-
-        A document whose tokens no earlier document has is its own first.
-        """
-        if self._first_documents is None:
-            self._first_documents = self.first_documents_with([])
-        return self._first_documents
 
     def first_documents_with(self, columns) -> pa.Array:
         """Each document's first document with its tokens and its row values.
@@ -346,7 +335,6 @@ class TokenStore(Sequence):
     def close(self) -> None:
         """Close the memory mapped Arrow file."""
         self._prefix_index = None
-        self._first_documents = None
         self._resources.close()
 
     def select(self, indices) -> "TokenSelection":
@@ -525,26 +513,11 @@ class PrefixTree:
         self.order = order
         self.parent = parent
         self.shared = shared
-        self._reader_groups = None
 
     @property
     def shared_tokens(self) -> int:
         """Tokens the tree lets the engine read instead of compute."""
         return sum(self.shared)
-
-    def reader_groups(self, lengths):
-        """Group document rows by their borrowed parent and prefix length."""
-        if self._reader_groups is None:
-            rows = pc.subtract(lengths.arrow_array, pa.array(self.shared, pa.int64()))
-            table = pa.table({"parent": pa.array(self.parent, pa.int64()),
-                              "shared": pa.array(self.shared, pa.int64()),
-                              "rows": rows}).drop_null()
-            groups = table.group_by(["parent", "shared"]).aggregate(
-                [("rows", "count"), ("rows", "sum")])
-            self._reader_groups = tuple(
-                groups[name].to_numpy()
-                for name in ("shared", "rows_count", "rows_sum"))
-        return self._reader_groups
 
 
 class PrefixIndex:
