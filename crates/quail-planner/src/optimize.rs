@@ -1,5 +1,5 @@
 //! Lower and refine every alternative's operators, then select the
-//! cheapest, as `quail/planner/optimize.py` does.
+//! cheapest.
 
 use serde_json::{Map, Value};
 

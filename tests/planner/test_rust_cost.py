@@ -1,4 +1,4 @@
-"""The Rust cost model (crates/quail-cost) reads the specs and labels as Python does."""
+"""The Rust cost model (crates/quail-planner/src/cost/) reads the specs and labels as Python does."""
 
 
 import numpy as np

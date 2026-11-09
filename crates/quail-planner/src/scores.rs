@@ -1,12 +1,12 @@
-//! AI.SCORE's statistics, cost, and spec, as `quail/planner/operators/score.py`.
+//! AI.SCORE's statistics, cost, and spec.
 
 use std::collections::BTreeMap;
 
-use quail_cost::quantity::python_sum;
-use quail_cost::score::ScoreCost;
-use quail_cost::statistics::AliasStats;
-use quail_cost::work::Work;
-use quail_physical::{Prompt, ScoreSpec};
+use crate::cost::quantity::python_sum;
+use crate::cost::score::ScoreCost;
+use crate::cost::statistics::AliasStats;
+use crate::cost::work::Work;
+use crate::physical::{Prompt, ScoreSpec};
 
 use crate::context::PlanningContext;
 use crate::expressions::{CompileError, argument_alias, column_name};

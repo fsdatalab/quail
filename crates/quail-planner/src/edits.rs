@@ -7,7 +7,9 @@
 
 use std::collections::BTreeSet;
 
-use quail_physical::{InputPort, PhysicalGraph, PhysicalNode, PortRef, ValueType, build_pipelines};
+use crate::physical::{
+    InputPort, PhysicalGraph, PhysicalNode, PortRef, ValueType, build_pipelines,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -86,17 +88,17 @@ pub fn recompute_seconds(
         .sum()
 }
 
-/// Check the graph as [`quail_physical::validate_graph`] does.
+/// Check the graph as [`crate::physical::validate_graph`] does.
 ///
 /// # Errors
 ///
 /// The graph breaks one of its rules.
 pub fn validate_graph(graph: &PhysicalGraph) -> Result<(), String> {
-    quail_physical::validate_graph(&graph.nodes, &graph.root)
+    crate::physical::validate_graph(&graph.nodes, &graph.root)
 }
 
 fn type_name(value_type: ValueType) -> String {
-    quail_physical::value_type_name(value_type).to_string()
+    crate::physical::value_type_name(value_type).to_string()
 }
 
 fn find<'a>(graph: &'a PhysicalGraph, node_id: &str) -> Result<&'a PhysicalNode, String> {

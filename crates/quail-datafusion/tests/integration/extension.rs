@@ -142,8 +142,8 @@ async fn a_host_writes_ai_functions_by_their_dotted_names() -> Result<()> {
 #[test]
 fn an_expression_that_calls_a_hosts_function_is_refused_by_name() -> Result<()> {
     use datafusion::logical_expr::{ColumnarValue, Volatility, col, create_udf};
-    use quail_datafusion::expressions::{PhysicalExpression, expression};
-    use quail_physical::ColumnRef;
+    use quail_datafusion::derive::expressions::{PhysicalExpression, expression};
+    use quail_planner::physical::ColumnRef;
 
     // a host function Quail's executor does not have
     let shout = create_udf(

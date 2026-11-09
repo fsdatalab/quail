@@ -1,13 +1,12 @@
 //! What filter ordering and join search price: each AI.IF predicate's
-//! cost and each join's token counts, as `quail/planner/operators/filter.py`
-//! and `join.py` prepare them.
+//! cost and each join's token counts.
 
 use std::collections::BTreeMap;
 
-use quail_cost::filters::filter_cost;
-use quail_cost::joins::PricedJoin;
-use quail_cost::score::ScoreCost;
-use quail_physical::{Equality, FilterPredicate, Prompt};
+use crate::cost::filters::filter_cost;
+use crate::cost::joins::PricedJoin;
+use crate::cost::score::ScoreCost;
+use crate::physical::{Equality, FilterPredicate, Prompt};
 
 use crate::context::PlanningContext;
 use crate::expressions::asked_call;

@@ -1,6 +1,6 @@
 """Run a region's stages on several GPUs, one partition per GPU.
 
-Rust's ``quail::stages`` runs partition p of each stage on the server of
+Rust's ``quail_python::stages`` runs partition p of each stage on the server of
 GPU p: a process, or a test's thread, holding every document and one
 execution context for the region. Over a Unix socket, Rust sends a
 stage's input rows; the server runs the stage's nodes with the

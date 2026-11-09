@@ -1,12 +1,11 @@
-//! Execution constraints checked before a graph is built, as
-//! `quail/planner/validation.py` checks them.
+//! Execution constraints checked before a graph is built.
 
-use quail_cost::budgets::{
+use crate::cost::budgets::{
     POOL_FRACTION, arena_bytes, chunk_budget, chunk_memory_bytes, minimum_weight_gpus,
     sliding_kv_fits, transient_sliding_pages,
 };
-use quail_cost::specs::{DeviceSpec, ModelSpec};
-use quail_physical::{Asked, Prompt, ValueExpression};
+use crate::cost::specs::{DeviceSpec, ModelSpec};
+use crate::physical::{Asked, Prompt, ValueExpression};
 
 use crate::context::PlanningContext;
 use crate::expressions::asked_call;
@@ -39,13 +38,13 @@ pub fn has_score(found: &Operators) -> bool {
 }
 
 /// The `AI.SCORE` columns SELECT returns, as `score_projections`.
-pub fn score_projections(found: &Operators) -> Vec<(String, quail_physical::ModelCall)> {
+pub fn score_projections(found: &Operators) -> Vec<(String, crate::physical::ModelCall)> {
     found
         .projection
         .columns
         .iter()
         .filter_map(|column| match column {
-            quail_physical::Projected::Expression(expression @ ValueExpression::Alias(alias)) => {
+            crate::physical::Projected::Expression(expression @ ValueExpression::Alias(alias)) => {
                 aliased_call(expression, &["score"]).map(|call| (alias.name.clone(), call.clone()))
             }
             _ => None,

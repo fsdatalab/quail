@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use quail_physical::{PhysicalNode, PortRef};
+use crate::physical::{PhysicalNode, PortRef};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -460,7 +460,7 @@ fn width(text: &str) -> usize {
 
 // ---------------------------------------------------------------- prompts
 
-fn short_prompt(prompt: &quail_physical::Prompt) -> String {
+fn short_prompt(prompt: &crate::physical::Prompt) -> String {
     let mut template = prompt.template.clone();
     if width(&template) > PROMPT_CHARS {
         template = prefix(&template, PROMPT_CHARS) + "…";
@@ -560,7 +560,7 @@ fn short_text(text: &str) -> String {
 
 /// A request backend's node fields: its backend and tables, then each
 /// filter's questions, join, classification, extraction, and map.
-fn request_fields(request: &quail_physical::RequestExecutionAttributes) -> Vec<(String, Shown)> {
+fn request_fields(request: &crate::physical::RequestExecutionAttributes) -> Vec<(String, Shown)> {
     let text = |value: Value| Shown::Text(py_str(&value));
     let mut fields = vec![
         (
@@ -1099,7 +1099,7 @@ struct TreeRows<'a> {
     estimates: HashMap<&'a str, &'a Value>,
     stages: Stages,
     scans: HashMap<String, crate::operators::Scan>,
-    filters: HashMap<String, Vec<quail_physical::FilterPredicate>>,
+    filters: HashMap<String, Vec<crate::physical::FilterPredicate>>,
     joins: Vec<SemanticJoin>,
     rows_estimate: HashMap<(String, String), Option<f64>>,
     shared: HashMap<String, usize>,
@@ -1684,7 +1684,7 @@ fn physical_tree(
     let known: Option<Vec<PhysicalNode>> =
         graph.nodes.iter().map(|node| node.known.clone()).collect();
     if let Some(known) = known {
-        let pipelines = quail_physical::build_pipelines(&known, &[]);
+        let pipelines = crate::physical::build_pipelines(&known, &[]);
         for members in &pipelines.members {
             if members.len() < 2 {
                 continue;

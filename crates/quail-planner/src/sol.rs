@@ -1,5 +1,4 @@
-//! The speed of light estimate of one query, as `quail/planner/sol`
-//! computes it: every distinct document prefix computed once and kept
+//! The speed of light estimate of one query: every distinct document prefix computed once and kept
 //! without limit, passes packed across the query, and exact survivors
 //! from the caller's answer and label oracles.
 //!
@@ -10,14 +9,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quail_cost::decode::DecodeCost;
-use quail_cost::joins::{longest_join_input, partner_stream_work};
-use quail_cost::quantity::Quantity;
-use quail_cost::sae_features::sae_encoded_tokens;
-use quail_cost::sol::speed_of_light;
-use quail_cost::statistics::int_true_divide;
-use quail_cost::work::{Work, ask, scan};
-use quail_physical::{ModelCall, Prompt, ValueExpression};
+use crate::cost::decode::DecodeCost;
+use crate::cost::joins::{longest_join_input, partner_stream_work};
+use crate::cost::quantity::Quantity;
+use crate::cost::sae_features::sae_encoded_tokens;
+use crate::cost::sol::speed_of_light;
+use crate::cost::statistics::int_true_divide;
+use crate::cost::work::{Work, ask, scan};
+use crate::physical::{ModelCall, Prompt, ValueExpression};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -117,11 +116,11 @@ fn refuse_unpriced(found: &Operators) -> Result<(), CompileError> {
     }
     for (alias, predicates) in &found.filters {
         for predicate in predicates {
-            if !matches!(&predicate.expression, quail_physical::Asked::Call(call) if call.kind == "boolean")
+            if !matches!(&predicate.expression, crate::physical::Asked::Call(call) if call.kind == "boolean")
             {
                 let shown = match &predicate.expression {
-                    quail_physical::Asked::Call(call) => crate::expressions::explain_call(call),
-                    quail_physical::Asked::Compare(test) => {
+                    crate::physical::Asked::Call(call) => crate::expressions::explain_call(call),
+                    crate::physical::Asked::Compare(test) => {
                         crate::expressions::column_name(&test.test, true)
                     }
                 };
@@ -167,7 +166,7 @@ fn refuse_unpriced(found: &Operators) -> Result<(), CompileError> {
         );
     }
     for join in &found.joins {
-        let quail_physical::Asked::Call(call) = &join.predicate else {
+        let crate::physical::Asked::Call(call) = &join.predicate else {
             return not_priced(
                 "the speed of light estimate does not price a join on ScoreTest; it \
                  prices AI.IF joins",
@@ -193,7 +192,7 @@ fn refuse_unpriced(found: &Operators) -> Result<(), CompileError> {
         let call = aliased_call(column, &[]).expect("a model call");
         if !["label", "extract", "features", "map"].contains(&call.kind.as_str()) {
             let name = match column {
-                quail_physical::ValueExpression::Alias(alias) => alias.name.clone(),
+                crate::physical::ValueExpression::Alias(alias) => alias.name.clone(),
                 _ => String::new(),
             };
             return not_priced(format!(
@@ -710,7 +709,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         alias: &str,
         rows: &[i64],
         order: &[usize],
-        predicates: &[quail_physical::FilterPredicate],
+        predicates: &[crate::physical::FilterPredicate],
     ) -> Result<Vec<Vec<i64>>, CompileError> {
         let tokens = &self.aliases[alias].tokens;
         let keys = &self.inputs.stop_groups[alias];
@@ -942,7 +941,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
     fn ask_stage(
         &mut self,
         alias: &str,
-        predicate: &quail_physical::FilterPredicate,
+        predicate: &crate::physical::FilterPredicate,
         position: usize,
         rows: &[i64],
         first: bool,
@@ -1411,7 +1410,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 .sum::<f64>()
     }
 
-    fn latency(&self, candidate: &Candidate) -> quail_cost::sol::SpeedOfLight {
+    fn latency(&self, candidate: &Candidate) -> crate::cost::sol::SpeedOfLight {
         speed_of_light(
             &candidate.work,
             &self.context.model,

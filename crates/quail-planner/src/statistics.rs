@@ -1,11 +1,10 @@
-//! Survivor and pair counts, and the arena's size, as
-//! `quail/planner/statistics/tables.py` and `memory.py` compute them.
+//! Survivor and pair counts, and the arena's size.
 
 use std::collections::BTreeMap;
 
-use quail_cost::budgets::arena_pages;
-use quail_cost::joins::PricedJoin;
-use quail_cost::statistics::AliasStats;
+use crate::cost::budgets::arena_pages;
+use crate::cost::joins::PricedJoin;
+use crate::cost::statistics::AliasStats;
 
 use crate::context::PlanningContext;
 use crate::expressions::CompileError;
@@ -20,7 +19,7 @@ pub fn effective_selectivity(selectivity: Option<f64>) -> f64 {
 
 /// The fraction of the rows an AI filter reads that it passes on: every
 /// row for a filter that returns its answer, else its selectivity.
-pub fn row_selectivity(predicate: &quail_physical::FilterPredicate) -> f64 {
+pub fn row_selectivity(predicate: &crate::physical::FilterPredicate) -> f64 {
     if predicate.answer.is_some() {
         1.0
     } else {
@@ -32,7 +31,7 @@ pub fn row_selectivity(predicate: &quail_physical::FilterPredicate) -> f64 {
 /// guard's estimated selectivity, the default selectivity for a guard
 /// without an estimate, and every row without a guard.
 pub fn guarded_fraction(
-    guard: Option<&quail_physical::ValueExpression>,
+    guard: Option<&crate::physical::ValueExpression>,
     selectivity: Option<f64>,
 ) -> f64 {
     match guard {
@@ -42,7 +41,7 @@ pub fn guarded_fraction(
 }
 
 /// The fraction of the rows an AI filter reads that it asks about.
-pub fn predicate_asked_fraction(predicate: &quail_physical::FilterPredicate) -> f64 {
+pub fn predicate_asked_fraction(predicate: &crate::physical::FilterPredicate) -> f64 {
     guarded_fraction(predicate.guard.as_ref(), predicate.guard_selectivity)
 }
 

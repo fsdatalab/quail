@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quail_physical::{Location, PhysicalGraph, PhysicalNode, PortRef, topological_nodes};
+use crate::physical::{Location, PhysicalGraph, PhysicalNode, PortRef, topological_nodes};
 use serde::{Deserialize, Serialize};
 
 /// One port a stage reads from outside it.
@@ -272,7 +272,7 @@ mod tests {
             role,
             inputs: inputs
                 .iter()
-                .map(|(node_id, port)| quail_physical::port(node_id, *port))
+                .map(|(node_id, port)| crate::physical::port(node_id, *port))
                 .collect(),
         }
     }

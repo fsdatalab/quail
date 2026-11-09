@@ -1,15 +1,14 @@
-//! Each column operator's priced spec, as the column planners of
-//! `quail/planner/operators` build it.
+//! Each column operator's priced spec.
 
-use quail_cost::budgets::chunk_budget;
-use quail_cost::extract::{self, ExtractInputs};
-use quail_cost::quantity::Quantity;
-use quail_cost::retention::coefficients;
-use quail_cost::sae_features::SaeFeaturesCost;
-use quail_cost::sol::unrounded_seconds;
-use quail_cost::statistics::AliasStats;
-use quail_cost::work::packed;
-use quail_physical::{ExtractSpec, MapSpec, ModelCall, Prompt, SaeFeaturesSpec};
+use crate::cost::budgets::chunk_budget;
+use crate::cost::extract::{self, ExtractInputs};
+use crate::cost::quantity::Quantity;
+use crate::cost::retention::coefficients;
+use crate::cost::sae_features::SaeFeaturesCost;
+use crate::cost::sol::unrounded_seconds;
+use crate::cost::statistics::AliasStats;
+use crate::cost::work::packed;
+use crate::physical::{ExtractSpec, MapSpec, ModelCall, Prompt, SaeFeaturesSpec};
 use serde::Serialize;
 
 use crate::context::PlanningContext;

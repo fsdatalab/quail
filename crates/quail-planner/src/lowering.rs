@@ -1,12 +1,11 @@
-//! Lower a prompt's text to the token ids one model reads, as
-//! `quail/planner/prompt_lowering.py` does.
+//! Lower a prompt's text to the token ids one model reads.
 //!
 //! Rust does not tokenize: the planner passes a [`Tokenizer`], which in
 //! Quail calls back into Python's gigatoken tokenizer.
 
 use std::collections::BTreeSet;
 
-use quail_physical::Prompt;
+use crate::physical::Prompt;
 use serde::{Deserialize, Serialize};
 
 use crate::expressions::{CompileError, argument_alias, compile_error, repr_str};

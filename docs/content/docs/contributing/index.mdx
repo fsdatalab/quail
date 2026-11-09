@@ -40,9 +40,9 @@ Include tests and documentation with the change.
 | --- | --- |
 | `quail/api/` | `Session` and `Query` |
 | `quail/catalog/` | Table providers |
-| `crates/quail-datafusion/` | SQL support and model regions in DataFusion |
-| `crates/quail-planner/` | Physical planning |
-| `crates/quail-cost/` | Cost model |
+| `crates/quail-datafusion/` | DataFusion extension: AI functions, optimizer rules, model regions |
+| `crates/quail-planner/` | Planner of one model region, with the cost model (`src/cost/`) and physical plan types (`src/physical/`) |
+| `crates/quail-python/` | Rust `Session` and `Executor`, and the `_quail_native` Python module (`src/native/`) |
 | `quail/physical/` | Python physical plan definitions |
 | `quail/backends/quail/` | GPU executor |
 | `quail/specs/` | Model and device specifications |

@@ -1,4 +1,4 @@
-"""The Rust cost model (crates/quail-cost) as tests call it."""
+"""The Rust cost model (crates/quail-planner/src/cost/) as tests call it."""
 
 import json
 import shutil

@@ -1,4 +1,4 @@
-//! Prompt text for each model call, as `quail/common/prompts.py` binds it.
+//! Prompt text for each model call.
 //!
 //! A front end binds each AI function call's template and column
 //! arguments into a `Prompt`: the text before the document, the text
@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use quail_physical::{Prompt, ValueExpression};
+use crate::physical::{Prompt, ValueExpression};
 use serde_json::Value;
 
 use crate::expressions::{

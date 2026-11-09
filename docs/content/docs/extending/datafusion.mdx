@@ -6,16 +6,16 @@ Quail adds AI functions to DataFusion through one extension:
 
 - `quail_datafusion::QuailExtension` registers AI functions and optimizer
   rules. It hands each model region to a `RegionRunner`.
-- `quail::Executor` implements `RegionRunner`. It plans model regions
+- `quail_python::Executor` implements `RegionRunner`. It plans model regions
   and runs them on Quail's GPU executor through an embedded Python interpreter.
-- `quail::Session` is the shortcut: a DataFusion session with that
+- `quail_python::Session` is the shortcut: a DataFusion session with that
   extension and executor, plus a blocking `sql()` method.
   Python's `quail.Session` uses it.
 
 DataFusion runs SQL outside model regions. The GPU executor requires
 Python even when the application is Rust.
 
-Use `quail::Session` unless you need to extend an existing DataFusion
+Use `quail_python::Session` unless you need to extend an existing DataFusion
 session. E.g., given a DataFusion table provider containing reviews:
 
 ```rust
@@ -25,8 +25,8 @@ use datafusion::catalog::TableProvider;
 use datafusion::common::Result;
 
 fn negative_reviews(reviews: Arc<dyn TableProvider>) -> Result<Vec<RecordBatch>> {
-    let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
-    let session = quail::Session::new(&config)?;
+    let config = quail_python::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
+    let session = quail_python::Session::new(&config)?;
     session.register_table("reviews", reviews)?;
     session.sql(
         "SELECT r.id FROM reviews r \
@@ -55,8 +55,8 @@ use datafusion::execution::context::SessionState;
 use quail_datafusion::QuailExtension;
 
 fn add_quail(state: SessionState) -> Result<SessionState> {
-    let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
-    let executor = Arc::new(quail::Executor::open(&config)?);
+    let config = quail_python::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
+    let executor = Arc::new(quail_python::Executor::open(&config)?);
     QuailExtension::new(executor).register(state)
 }
 ```

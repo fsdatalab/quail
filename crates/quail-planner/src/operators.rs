@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use quail_physical::{
+use crate::physical::{
     Asked, Equality, ExtractStruct, FilterPredicate, ModelCall, Projected, ValueExpression,
-    tagged_struct,
 };
+use crate::tagged_struct;
 use serde_json::Value;
 
 use crate::expressions::{PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_references};

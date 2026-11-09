@@ -1,13 +1,12 @@
 //! Build the physical graph of one plan's operators in the chosen operator
-//! order, as `quail/planner/graph/builder.py` and the operators'
-//! `emit_*` functions build it.
+//! order.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quail_cost::budgets::pages;
-use quail_cost::quantity::python_sum;
-use quail_cost::work::Work;
-use quail_physical::{
+use crate::cost::budgets::pages;
+use crate::cost::quantity::python_sum;
+use crate::cost::work::Work;
+use crate::physical::{
     AiClassifyAttributes, AiExtractAttributes, AiFilterAttributes, AiJoinAttributes,
     AiMapAttributes, AiSaeFeaturesAttributes, AiScoreAttributes, Asked, BarrierAttributes,
     ClassifySpec, ColumnRef, Expression, FilterAttributes, HashJoinAttributes, ModelCall, Node,
@@ -59,14 +58,14 @@ pub struct PhysicalPlan {
 
 impl PhysicalPlan {
     /// The plan as it crosses to the executor.
-    pub fn envelope(&self) -> quail_physical::PlanEnvelope {
-        quail_physical::PlanEnvelope {
+    pub fn envelope(&self) -> crate::physical::PlanEnvelope {
+        crate::physical::PlanEnvelope {
             backend: self.backend.clone(),
             model: self.model.clone(),
             device: self.device.clone(),
             gpus: self.gpus,
             settings: self.settings.clone(),
-            graph: quail_physical::PhysicalGraph {
+            graph: crate::physical::PhysicalGraph {
                 nodes: self.nodes.clone(),
                 root: self.root.clone(),
             },
@@ -492,7 +491,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             .unwrap_or(&[])
     }
 
-    fn filters_of(&self, alias: &str) -> &[quail_physical::FilterPredicate] {
+    fn filters_of(&self, alias: &str) -> &[crate::physical::FilterPredicate] {
         self.operators
             .filters
             .iter()
@@ -1534,7 +1533,7 @@ pub fn build_physical_plan(
 /// A refusal when a pair classification cannot run in its join's
 /// pipeline, as `joined_classification_refusal`.
 pub fn joined_classification_refusal(nodes: &[PhysicalNode]) -> Option<Refusal> {
-    let pipelines = quail_physical::build_pipelines(nodes, &[]);
+    let pipelines = crate::physical::build_pipelines(nodes, &[]);
     for node in nodes {
         let PhysicalNode::AiClassify(classify) = node else {
             continue;

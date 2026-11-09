@@ -1,20 +1,21 @@
-//! Quail's planner, ported from `quail/planner` and the deleted
-//! `quail/logical` package.
+//! Quail's planner of one model region. It reads the region's operators,
+//! which `quail_datafusion` derives from DataFusion's plan, and chooses a
+//! physical plan for the GPU. It depends on neither DataFusion nor Python.
 //!
-//! | module | Python |
-//! |---|---|
-//! | `expressions` | the columns, names, and model calls of expressions |
-//! | `context` | `PlanningContext` |
-//! | `costs` | the filter costs and join specs of `quail/planner/operators` |
-//! | `columns` | the column planners of `quail/planner/operators` |
-//! | `classify` | `quail/planner/operators/classify.py` |
-//! | `lowering` | `quail/planner/prompt_lowering.py`, with a tokenizer callback |
-//! | `operators` | a region's operators, grouped by kind, and its scans |
-//! | `plan_statistics` | `quail/planner/search/statistics.py` |
-//! | `search` | the step order, join order, and anchor search of `quail/planner/search` |
-//! | `scores` | `quail/planner/operators/score.py` |
-//! | `statistics` | `quail/planner/statistics` |
-//! | `prompts` | the prompt binding of `quail/common/prompts.py` |
+//! - [`operators`], [`expressions`], [`facts`]: a region's operators and
+//!   what the planner reads from them.
+//! - [`physical`]: the physical plan types the executor runs.
+//! - [`cost`]: model and device specs, and the cost model.
+//! - [`inputs`]: tokenized document columns and prefix statistics.
+//! - [`search`], [`optimize`], [`pricing`], [`physical_rules`]: the choice
+//!   of a plan: operator order, join order, prices, and graph rewrites.
+//! - [`prompts`], [`lowering`]: prompt text and its token ids.
+//! - [`explain`], [`sol`], [`request_plan`]: plan text, speed-of-light
+//!   estimates, and the plans of the request baselines.
+
+pub mod cost;
+pub mod inputs;
+pub mod physical;
 
 pub mod classify;
 pub mod columns;

@@ -1,7 +1,7 @@
 """Memory and time budgets of a model on a device, from Rust's cost model.
 
 The planner prices plans with the same functions in
-``crates/quail-cost/src/budgets.rs``; this module reads them for the
+``crates/quail-planner/src/cost/budgets.rs``; this module reads them for the
 GPU executor, so the two never disagree.
 """
 

@@ -1,7 +1,7 @@
 """Counted work of the cost model's request shapes, as a test oracle.
 
 Tests build expected work from these and compare it with what Rust's
-cost model (``crates/quail-cost/src/work.rs``) prices.
+cost model (``crates/quail-planner/src/cost/work.rs``) prices.
 """
 
 from dataclasses import replace

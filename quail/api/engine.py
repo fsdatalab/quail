@@ -1,6 +1,6 @@
 """Plan and run the model regions of Quail's Rust ``Session``.
 
-Rust's ``quail::Session`` runs SQL in DataFusion. Each model region
+Rust's ``quail_python::Session`` runs SQL in DataFusion. Each model region
 DataFusion reaches calls ``Engine.run_region`` with the region's plan
 and the rows of the tables it reads from DataFusion. A Rust program
 opens an engine with ``Engine.open``; Python's ``quail.Session`` makes

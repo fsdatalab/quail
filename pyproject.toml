@@ -64,7 +64,7 @@ requires = ["maturin>=1.10,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
-manifest-path = "crates/quail-native/Cargo.toml"
+manifest-path = "crates/quail-python/Cargo.toml"
 module-name = "_quail_native"
 python-packages = ["quail"]
 include = ["LICENSE", "README.md"]

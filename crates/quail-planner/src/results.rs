@@ -2,7 +2,7 @@
 //! name them, and the Limit of the region's fetch that a physical plan
 //! ends with.
 
-use quail_physical::{
+use crate::physical::{
     LimitAttributes, ModelCall, Node, PhysicalNode, PortRef, Projected, ValueExpression,
     input_ports,
 };

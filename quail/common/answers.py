@@ -4,7 +4,7 @@ S(t) is the chance an answer is still being written after t tokens,
 so S(0) = 1 and S(limit) = 0. Before any answer has ended the curve is
 a prior: answer lengths geometric with the planner's expected length,
 cut off at the answer limit. The curves are computed by Rust's cost
-model (``crates/quail-cost/src/answers.rs``), which the planner prices
+model (``crates/quail-planner/src/cost/answers.rs``), which the planner prices
 extraction with.
 """
 

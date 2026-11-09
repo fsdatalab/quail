@@ -2439,35 +2439,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quail"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-trait",
- "datafusion",
- "futures",
- "pyo3",
- "pyo3-build-config",
- "quail-cost",
- "quail-datafusion",
- "quail-inputs",
- "quail-native",
- "quail-physical",
- "quail-planner",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "quail-cost"
-version = "0.1.0"
-dependencies = [
- "serde",
- "toml",
-]
-
-[[package]]
 name = "quail-datafusion"
 version = "0.1.0"
 dependencies = [
@@ -2476,7 +2447,6 @@ dependencies = [
  "datafusion",
  "datafusion-proto",
  "futures",
- "quail-physical",
  "quail-planner",
  "serde_json",
  "sqlparser",
@@ -2484,49 +2454,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "quail-inputs"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "serde_json",
- "tokenizers",
-]
-
-[[package]]
-name = "quail-native"
-version = "0.1.0"
-dependencies = [
- "datafusion",
- "pyo3",
- "quail",
- "quail-cost",
- "quail-datafusion",
- "quail-inputs",
- "quail-physical",
- "quail-planner",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "quail-physical"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "quail-planner"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "arrow-ipc",
  "arrow-schema",
  "base64 0.23.1",
- "quail-cost",
- "quail-physical",
  "serde",
  "serde_json",
+ "tokenizers",
+ "toml",
+]
+
+[[package]]
+name = "quail-python"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "futures",
+ "pyo3",
+ "pyo3-build-config",
+ "quail-datafusion",
+ "quail-planner",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

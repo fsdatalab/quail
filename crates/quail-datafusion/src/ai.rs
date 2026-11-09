@@ -712,11 +712,12 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let distinct = Optimizer::with_rules(vec![Arc::new(crate::distinct::PushDownDistinct)])
-            .optimize(plan, &OptimizerContext::new(), |_, _| {})
-            .unwrap()
-            .display_indent()
-            .to_string();
+        let distinct =
+            Optimizer::with_rules(vec![Arc::new(crate::rules::distinct::PushDownDistinct)])
+                .optimize(plan, &OptimizerContext::new(), |_, _| {})
+                .unwrap()
+                .display_indent()
+                .to_string();
         let lines: Vec<String> = distinct
             .lines()
             .map(|line| line.trim().to_string())

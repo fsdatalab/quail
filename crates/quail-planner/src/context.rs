@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use quail_cost::specs::{DeviceSpec, ModelSpec};
+use crate::cost::specs::{DeviceSpec, ModelSpec};
 
 use crate::expressions::CompileError;
 use crate::lowering::{Decoder, LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
@@ -66,7 +66,7 @@ impl PlanningContext<'_> {
     /// # Errors
     ///
     /// The tokenizer fails.
-    pub fn lowered(&self, prompt: &quail_physical::Prompt) -> Result<LoweredPrompt, CompileError> {
+    pub fn lowered(&self, prompt: &crate::physical::Prompt) -> Result<LoweredPrompt, CompileError> {
         lower_prompt(prompt, self.tokenizer)
     }
 

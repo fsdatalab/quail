@@ -1,13 +1,12 @@
-//! What the cost model knows about a plan before any decision, as
-//! `quail/planner/search/statistics.py` gathers it.
+//! What the cost model knows about a plan before any decision.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quail_cost::budgets::{arena_pages, chunk_budget};
-use quail_cost::joins::PricedJoin;
-use quail_cost::retention::retention_pages;
-use quail_cost::statistics::{AliasStats, int_true_divide};
-use quail_physical::Prompt;
+use crate::cost::budgets::{arena_pages, chunk_budget};
+use crate::cost::joins::PricedJoin;
+use crate::cost::retention::retention_pages;
+use crate::cost::statistics::{AliasStats, int_true_divide};
+use crate::physical::Prompt;
 
 use crate::context::PlanningContext;
 use crate::costs::join_specs;
@@ -76,7 +75,7 @@ impl PlanStatistics {
 /// The prompts of a plan's filters, label tests, joins, and remaining
 /// result columns, as `Operators.prompts`.
 pub fn plan_prompts(found: &Operators) -> Vec<Prompt> {
-    let mut calls: Vec<&quail_physical::ModelCall> = Vec::new();
+    let mut calls: Vec<&crate::physical::ModelCall> = Vec::new();
     for (_, predicates) in &found.filters {
         calls.extend(
             predicates

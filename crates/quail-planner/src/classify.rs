@@ -1,16 +1,15 @@
-//! AI.CLASSIFY's statistics, scoring rule, cost, and spec, as
-//! `quail/planner/operators/classify.py` builds them.
+//! AI.CLASSIFY's statistics, scoring rule, cost, and spec.
 
 use std::collections::BTreeSet;
 
-use quail_cost::budgets::{chunk_budget, tree_attention_allowed};
-use quail_cost::classify::{self, ClassifyCost, ClassifyInputs, suffix_lengths};
-use quail_cost::quantity::Quantity;
-use quail_cost::sol::unrounded_seconds;
-use quail_cost::specs::{DeviceSpec, ModelSpec};
-use quail_cost::statistics::{AliasStats, round_half_even};
-use quail_cost::work::{Work, packed};
-use quail_physical::{ClassifySpec, ModelCall, Prompt};
+use crate::cost::budgets::{chunk_budget, tree_attention_allowed};
+use crate::cost::classify::{self, ClassifyCost, ClassifyInputs, suffix_lengths};
+use crate::cost::quantity::Quantity;
+use crate::cost::sol::unrounded_seconds;
+use crate::cost::specs::{DeviceSpec, ModelSpec};
+use crate::cost::statistics::{AliasStats, round_half_even};
+use crate::cost::work::{Work, packed};
+use crate::physical::{ClassifySpec, ModelCall, Prompt};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -528,7 +527,7 @@ impl ClassifyTable {
         let head = prompt.preamble_token_ids.clone();
         let note = label_parts(&prompt, &self.alias).1;
         let partner_label = label_parts(&prompt, partner).0;
-        let block = round_half_even(partner_tokens) as i64 + tail.len() as i64 - 1;
+        let block = round_half_even(partner_tokens) + tail.len() as i64 - 1;
         let suffixes: Vec<i64> = suffix_lengths(LETTERS_SCORING, &labels, 0, 1, &[])
             .map_err(CompileError::new)?
             .into_iter()
@@ -636,7 +635,7 @@ impl ClassifyTable {
         head.extend(anchor_label);
         let tail = prompt.tail_token_ids.clone();
         let question =
-            partner_label.len() as i64 + round_half_even(partner_tokens) as i64 + tail.len() as i64;
+            partner_label.len() as i64 + round_half_even(partner_tokens) + tail.len() as i64;
         let need = head.len() as i64 + self.longest + frame.len() as i64 + question;
         if need > self.chunk {
             return over_budget(
@@ -719,7 +718,7 @@ impl ClassifyTable {
         let (tail, frame, blocks) = choice_token_parts(&prompt, tokenizer)?;
         let note = label_parts(&prompt, &self.alias).1;
         let partner_label = label_parts(&prompt, partner).0;
-        let request = round_half_even(partner_tokens) as i64 + tail.len() as i64;
+        let request = round_half_even(partner_tokens) + tail.len() as i64;
         let estimated = classify::estimate_suffixes(
             &self.inputs(
                 expected_rows,

@@ -1,13 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/quail",
-    "crates/quail-cost",
-    "crates/quail-inputs",
     "crates/quail-datafusion",
-    "crates/quail-native",
-    "crates/quail-physical",
     "crates/quail-planner",
+    "crates/quail-python",
 ]
 
 # The dev profile is the one to edit and rebuild with: `uv sync`, maturin,

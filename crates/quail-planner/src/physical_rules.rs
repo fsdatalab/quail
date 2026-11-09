@@ -1,14 +1,13 @@
-//! Rules that change executable graphs, as `quail/planner/rules/physical.py`
-//! defines them, and the loop that applies them to a plan, as
-//! `apply_plan_rules`.
+//! Rules that change executable graphs, and the loop that applies them
+//! to a plan.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quail_cost::budgets::{cheaper_attention_path, chunk_budget, tree_attention_allowed};
-use quail_cost::packing::choose_pass_groups;
-use quail_cost::retention::coefficients;
-use quail_cost::statistics::AliasStats;
-use quail_physical::{PhysicalGraph, PhysicalNode, build_pipelines, topological_nodes};
+use crate::cost::budgets::{cheaper_attention_path, chunk_budget, tree_attention_allowed};
+use crate::cost::packing::choose_pass_groups;
+use crate::cost::retention::coefficients;
+use crate::cost::statistics::AliasStats;
+use crate::physical::{PhysicalGraph, PhysicalNode, build_pipelines, topological_nodes};
 use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;
@@ -510,7 +509,7 @@ fn should_retain_kv(
         return Ok(None);
     }
     let statistics = plan_statistics(found, context)?;
-    let joins: Vec<&quail_physical::Node<quail_physical::AiJoinAttributes>> = graph
+    let joins: Vec<&crate::physical::Node<crate::physical::AiJoinAttributes>> = graph
         .nodes
         .iter()
         .filter_map(|node| match node {
@@ -534,7 +533,7 @@ fn should_retain_kv(
         }
         grouped.last_mut().expect("a group").push(index);
     }
-    let sequence: Vec<(quail_cost::joins::PricedJoin, String)> = grouped
+    let sequence: Vec<(crate::cost::joins::PricedJoin, String)> = grouped
         .iter()
         .flatten()
         .map(|index| {
@@ -939,7 +938,7 @@ fn choose_attention_path(graph: &PhysicalGraph, context: &PlanningContext) -> Re
                     };
                     // a partner's rows: its document and the question tail
                     let rows = stage.pair_tail_tokens as f64
-                        + quail_cost::quantity::python_sum(
+                        + crate::cost::quantity::python_sum(
                             stage
                                 .partners
                                 .iter()
@@ -1029,7 +1028,7 @@ fn should_stop_answers_early(graph: &PhysicalGraph, context: &PlanningContext) -
         .iter()
         .flat_map(|column| {
             let mut names = vec![crate::expressions::projected_name(column)];
-            if let quail_physical::Projected::Expression(expression) = column {
+            if let crate::physical::Projected::Expression(expression) = column {
                 names.extend(
                     crate::expressions::column_references(expression)
                         .into_iter()
@@ -1040,8 +1039,8 @@ fn should_stop_answers_early(graph: &PhysicalGraph, context: &PlanningContext) -
         })
         .collect();
     let filters: Vec<(
-        Vec<quail_physical::ColumnRef>,
-        &quail_physical::ValueExpression,
+        Vec<crate::physical::ColumnRef>,
+        &crate::physical::ValueExpression,
     )> = graph
         .nodes
         .iter()
@@ -1073,13 +1072,13 @@ fn should_stop_answers_early(graph: &PhysicalGraph, context: &PlanningContext) -
         let mut tests = Vec::new();
         let mut read_elsewhere = projected.iter().any(|column| reads(column));
         for (references, predicate) in &filters {
-            let mine = |reference: &quail_physical::ColumnRef| {
+            let mine = |reference: &crate::physical::ColumnRef| {
                 reference.alias == alias && reads(&reference.column)
             };
             if !references.iter().any(mine) {
                 continue;
             }
-            let alone = matches!(predicate, quail_physical::ValueExpression::Value(_))
+            let alone = matches!(predicate, crate::physical::ValueExpression::Value(_))
                 && references
                     .iter()
                     .all(|reference| reference.alias == alias && reference.column == name);

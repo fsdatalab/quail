@@ -17,7 +17,7 @@ Use `explain(verbose=True)` to inspect the choices and candidate costs.
 4. It builds a physical plan for each candidate and applies physical rules.
 5. It selects the lowest estimated GPU time. Ties keep the first candidate.
 
-See [planning.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail/src/planning.rs)
+See [planning.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-python/src/planning.rs)
 and [optimize.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/optimize.rs).
 
 ## Cost estimates
@@ -49,7 +49,7 @@ Compute rates depend on the operation's precision and the device
 specification. These estimates do not include CPU work or kernel launch
 time. Compare them with measurements from `explain(analyze=True)`.
 
-See [roofline.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-cost/src/roofline.rs)
+See [roofline.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/cost/roofline.rs)
 and the [filter cost explanation](https://fsdatalab.github.io/blog/ai-filter-cost-estimates/).
 
 ### Speed of light estimate
@@ -207,4 +207,4 @@ work to combine partial attention values. Ties choose unified attention.
 The comparison uses the model's attention precision and device bandwidth.
 It excludes kernel launch time. Models that do not support tree attention
 use unified attention. See [attention paths](/docs/architecture/execution#attention-paths)
-and [cheaper_attention_path](https://github.com/fsdatalab/quail/blob/main/crates/quail-cost/src/budgets.rs).
+and [cheaper_attention_path](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/cost/budgets.rs).

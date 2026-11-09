@@ -43,6 +43,21 @@ VLLM_PLUGIN_DIR = Path(__file__).parent / "vllm_plugin"
 REPOSITORY = Path(__file__).resolve().parents[2]
 NATIVE_SOURCE = "/opt/quail-native"
 MATURIN = "maturin>=1.9,<2"
+# the native module alone, as a project: the image mounts the quail
+# package from source
+NATIVE_PROJECT = """\
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "quail-native"
+version = "0.1.0"
+
+[tool.maturin]
+manifest-path = "crates/quail-python/Cargo.toml"
+module-name = "_quail_native"
+"""
 # the model and device spec files quail.specs reads
 SPEC_DATA = Path(__file__).resolve().parents[1] / "specs" / "data"
 
@@ -81,12 +96,13 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
             .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True)
             .uv_pip_install(MATURIN, uv_version=UV_VERSION)
             .run_commands(
+                f"cat > {NATIVE_SOURCE}/pyproject.toml <<'EOF'\n{NATIVE_PROJECT}EOF",
                 # an image builds once: Cargo's default release settings,
                 # not the workspace's fast-rebuild ones
                 f"cd {NATIVE_SOURCE} && PATH=$HOME/.cargo/bin:$PATH "
                 "CARGO_PROFILE_RELEASE_INCREMENTAL=false "
                 "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 "
-                f"maturin build --release -m crates/quail-native/Cargo.toml "
+                "maturin build --release "
                 f"-o {NATIVE_SOURCE}/wheels",
                 # the image's environment has no pip; a wheel is a zip archive
                 "python -c \"import glob, sysconfig, zipfile; "

@@ -1,17 +1,16 @@
-//! Choose each table's step order, the join order, and the anchors, as
-//! `quail/planner/search` does.
+//! Choose each table's step order, the join order, and the anchors.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use quail_cost::budgets::parallel_copies;
-use quail_cost::joins::{
+use crate::cost::budgets::parallel_copies;
+use crate::cost::joins::{
     PricedJoin, longest_join_input, packed_join_work, stage_work as join_work,
 };
-use quail_cost::quantity::Quantity;
-use quail_cost::sol::speed_of_light;
-use quail_cost::statistics::AliasStats;
-use quail_cost::work::{Work, ask, scan};
-use quail_physical::Prompt;
+use crate::cost::quantity::Quantity;
+use crate::cost::sol::speed_of_light;
+use crate::cost::statistics::AliasStats;
+use crate::cost::work::{Work, ask, scan};
+use crate::physical::Prompt;
 
 use crate::classify::classify_seconds;
 use crate::columns::{ColumnSpec, column_spec};
@@ -217,7 +216,7 @@ pub fn table_steps(
         let (first, later) = if estimate {
             let tail = context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
             let cost = |fresh: bool| {
-                StepCost::Curve(CostCurve::Linear(quail_cost::filters::filter_cost(
+                StepCost::Curve(CostCurve::Linear(crate::cost::filters::filter_cost(
                     tail,
                     mean_tokens,
                     &context.model,
@@ -253,8 +252,8 @@ pub fn table_steps(
 }
 
 /// The classification calls a filter tests or SELECT returns, as `LabelWork.calls`.
-pub fn label_calls(found: &Operators) -> Vec<(quail_physical::ModelCall, String)> {
-    let mut calls: Vec<(quail_physical::ModelCall, String)> = Vec::new();
+pub fn label_calls(found: &Operators) -> Vec<(crate::physical::ModelCall, String)> {
+    let mut calls: Vec<(crate::physical::ModelCall, String)> = Vec::new();
     for (alias, tests) in &found.column_filters {
         for test in tests {
             if test.call.kind == "label" && !calls.iter().any(|(call, _)| *call == test.call) {
@@ -1161,7 +1160,7 @@ pub fn choose_operator_order(
 mod tests {
     use std::path::Path;
 
-    use quail_cost::specs::{read_devices, read_models};
+    use crate::cost::specs::{read_devices, read_models};
 
     use super::*;
 

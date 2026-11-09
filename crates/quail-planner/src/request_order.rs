@@ -4,10 +4,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quail_cost::budgets::chunk_budget;
-use quail_cost::statistics::AliasStats;
-use quail_cost::work::Work;
-use quail_physical::{PhysicalNode, PortRef, port};
+use crate::cost::budgets::chunk_budget;
+use crate::cost::statistics::AliasStats;
+use crate::cost::work::Work;
+use crate::physical::{PhysicalNode, PortRef, port};
 use serde::Serialize;
 
 use crate::context::PlanningContext;

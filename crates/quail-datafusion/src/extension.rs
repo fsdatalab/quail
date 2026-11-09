@@ -23,8 +23,8 @@ use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::physical_planner::ExtensionPlanner;
 
-use crate::exec::{ModelRegionPlanner, QuailQueryPlanner, RegionRunner};
 use crate::functions::quail_functions;
+use crate::region::exec::{ModelRegionPlanner, QuailQueryPlanner, RegionRunner};
 use crate::rules::{logical_rules, with_quail_rules};
 use crate::{LowerAiCalls, SnowflakeRegexpLike, StructFieldAccess};
 
@@ -106,7 +106,7 @@ impl QuailExtension {
         for function in quail_functions() {
             state.register_udf(function)?;
         }
-        state.register_udf(crate::regexps::regexp_functions())?;
+        state.register_udf(crate::functions::regexps::regexp_functions())?;
         state.register_expr_planner(Arc::new(StructFieldAccess))?;
         state.register_function_rewrite(Arc::new(SnowflakeRegexpLike))?;
         Ok(state)

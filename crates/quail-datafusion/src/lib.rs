@@ -6,6 +6,14 @@
 //! Quail plans, become one `ModelRegion` node. DataFusion plans and runs
 //! everything else; a [`RegionRunner`] plans and runs each model region.
 //!
+//! | Module | Contents |
+//! | --- | --- |
+//! | [`functions`] | the AI functions as UDFs, and SQL dialect support |
+//! | [`ai`] | `AiNode`, one AI call as a plan node |
+//! | [`rules`] | `LowerAiCalls` and the optimizer rules around `AiNode`s |
+//! | [`region`] | `ModelRegion`, `ClaimModelRegions`, and `ModelRegionExec` |
+//! | [`derive`] | a region's operators, read from its DataFusion plan |
+//!
 //! ```ignore
 //! let context = quail_datafusion::session_context(runner);
 //! context.register_table("reviews", reviews)?;
@@ -17,37 +25,12 @@
 //!     .await?;
 //! ```
 
-mod absorb;
 pub mod ai;
-mod binding;
-mod claim;
 pub mod derive;
-mod distinct;
-mod exec;
-pub mod expressions;
 mod extension;
-mod field_access;
-mod functions;
-mod guards;
-mod hints;
-mod identified;
-mod join_back;
-mod keyed;
-mod lift;
-mod limit;
-mod lower;
-mod or_guards;
-pub mod partial;
-mod placement;
-mod projection;
-mod regexps;
-mod region;
-pub mod region_hint;
-mod repeated;
+pub mod functions;
+pub mod region;
 pub mod rules;
-mod shared;
-pub mod similar;
-mod substring;
 
 use std::sync::Arc;
 
@@ -57,31 +40,31 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 
-pub use absorb::AbsorbIntoAiNodes;
-pub use claim::ClaimModelRegions;
-pub use distinct::{EliminateDistinct, PushDownDistinct};
-pub use exec::{
+pub use extension::QuailExtension;
+pub use functions::field_access::StructFieldAccess;
+pub use functions::regexps::SnowflakeRegexpLike;
+pub use functions::{AI_FUNCTION_NAMES, SPAN_SUFFIX, is_ai_call, quail_functions};
+pub use region::ModelRegion;
+pub use region::claim::ClaimModelRegions;
+pub use region::exec::{
     InputBatches, InputRows, InputStream, ModelRegionExec, ModelRegionPlanner, RegionBatches,
     RegionRunner, collect_inputs,
 };
-pub use extension::QuailExtension;
-pub use field_access::StructFieldAccess;
-pub use functions::{AI_FUNCTION_NAMES, SPAN_SUFFIX, is_ai_call, quail_functions};
-pub use guards::PushDownCaseGuards;
-pub use identified::IdentifiedTable;
-pub use keyed::{PushDownCountThreshold, PushDownSemiJoinFetch};
-pub use limit::PushDownLimitIntoAiNodes;
-pub use lower::{LowerAiCalls, lower_ai_calls};
-pub use or_guards::PushDownOrGuards;
-pub use placement::PlaceAiNodes;
-pub use projection::PushDownProjectionIntoAiNodes;
-pub use regexps::SnowflakeRegexpLike;
-pub use region::ModelRegion;
-pub use region_hint::{RegionColumn, RegionColumns, RegionHint};
-pub use repeated::MergeRepeatedAiCalls;
+pub use region::identified::IdentifiedTable;
+pub use region::region_hint::{RegionColumn, RegionColumns, RegionHint};
+pub use region::shared::{ROW_COLUMN, SharedInput, SharedInputExec};
+pub use rules::absorb::AbsorbIntoAiNodes;
+pub use rules::distinct::{EliminateDistinct, PushDownDistinct};
+pub use rules::guards::PushDownCaseGuards;
+pub use rules::keyed::{PushDownCountThreshold, PushDownSemiJoinFetch};
+pub use rules::limit::PushDownLimitIntoAiNodes;
+pub use rules::lower::{LowerAiCalls, lower_ai_calls};
+pub use rules::or_guards::PushDownOrGuards;
+pub use rules::placement::PlaceAiNodes;
+pub use rules::projection::PushDownProjectionIntoAiNodes;
+pub use rules::repeated::MergeRepeatedAiCalls;
+pub use rules::substring::PushDownSubstringPrechecks;
 pub use rules::{LOGICAL_RULES, logical_rule};
-pub use shared::{ROW_COLUMN, SharedInput, SharedInputExec};
-pub use substring::PushDownSubstringPrechecks;
 
 /// Build a DataFusion session state with Quail registered.
 ///

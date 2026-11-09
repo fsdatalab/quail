@@ -1,7 +1,7 @@
 """Compile SQL with DataFusion and Quail's rules.
 
-DataFusion parses and binds the statement, Quail's analyzer rule claims
-its model region, and Rust derives the region's operators from
+DataFusion parses and binds the statement, Quail's last optimizer rule
+claims its model regions, and Rust derives the region's operators from
 DataFusion's plan of it. A CTE or FROM subquery the region does not
 read through is its own region, whose rows the reading region takes as
 an input.

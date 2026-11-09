@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use quail_physical::{
+use crate::physical::{
     Alias, Asked, ColumnRef, Equality, ExtractStruct, ModelCall, Projected, ValueExpression,
 };
 use serde_json::Value;

@@ -1,9 +1,8 @@
-//! Planned anchor reuse at each execution boundary, as
-//! `quail/planner/graph/retention.py`.
+//! Planned anchor reuse at each execution boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quail_cost::joins::PricedJoin;
+use crate::cost::joins::PricedJoin;
 use serde_json::{Map, Value};
 
 use crate::statistics::thin;

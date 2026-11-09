@@ -1,5 +1,4 @@
-//! Price a physical plan: each node on its own, and the plan as a whole,
-//! as `quail/planner/graph/pricing.py` and `passes.py` price them.
+//! Price a physical plan: each node on its own, and the plan as a whole.
 //!
 //! The plan's seconds pack every node's work into forward passes
 //! together and add the seconds-priced nodes, so node prices do not add
@@ -7,14 +6,14 @@
 
 use std::collections::BTreeMap;
 
-use quail_cost::budgets::{floor_divide, pages_of, parallel_copies};
-use quail_cost::extract::{self, ExtractInputs};
-use quail_cost::quantity::{Quantity, numpy_sum};
-use quail_cost::score::score_fixed_tokens;
-use quail_cost::sol::speed_of_light;
-use quail_cost::statistics::{AliasStats, round_half_even};
-use quail_cost::work::{Work, ask, packed, scan};
-use quail_physical::{AiFilterAttributes, PhysicalNode, build_pipelines, resident_inputs};
+use crate::cost::budgets::{floor_divide, pages_of, parallel_copies};
+use crate::cost::extract::{self, ExtractInputs};
+use crate::cost::quantity::{Quantity, numpy_sum};
+use crate::cost::score::score_fixed_tokens;
+use crate::cost::sol::speed_of_light;
+use crate::cost::statistics::{AliasStats, round_half_even};
+use crate::cost::work::{Work, ask, packed, scan};
+use crate::physical::{AiFilterAttributes, PhysicalNode, build_pipelines, resident_inputs};
 use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;
@@ -182,7 +181,7 @@ pub fn expected_documents(node: &PhysicalNode) -> f64 {
 /// The positions of each pass group's operators, in execution order.
 pub fn pass_members(nodes: &[PhysicalNode]) -> Vec<Vec<usize>> {
     let mut groups: Vec<(i64, Vec<usize>)> = Vec::new();
-    for index in quail_physical::topological_nodes(nodes) {
+    for index in crate::physical::topological_nodes(nodes) {
         let group = nodes[index].pass_group();
         if group < 0 {
             continue;
@@ -343,7 +342,7 @@ impl PlanPricer {
         }
         let residents = resident_inputs(nodes, &pipelines);
         let mut out = Priced::new();
-        for index in quail_physical::topological_nodes(nodes) {
+        for index in crate::physical::topological_nodes(nodes) {
             let node = &nodes[index];
             let mut entry = Map::new();
             let resident = residents.contains(node.id());

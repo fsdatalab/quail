@@ -1,12 +1,11 @@
 //! The physical plan of a request backend: one `RequestExecution` node
 //! that submits each document or pair to vLLM or SGLang, with the scans
-//! before it and the result nodes after it, as
-//! `quail/baselines/planning.py` builds it.
+//! before it and the result nodes after it.
 //!
 //! The request node and its specs are written as the JSON their Python
 //! codecs read, since only the request executor reads them.
 
-use quail_physical::{Node, PhysicalNode, PortRef, ScanAttributes, input_ports, port};
+use crate::physical::{Node, PhysicalNode, PortRef, ScanAttributes, input_ports, port};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -293,7 +292,7 @@ fn refusal(
         }
     }
     if found.projection.columns.iter().any(|column| match column {
-        quail_physical::Projected::Expression(expression) => {
+        crate::physical::Projected::Expression(expression) => {
             aliased_call(expression, &[]).is_some_and(|call| call.probabilities)
         }
         _ => false,
@@ -598,7 +597,7 @@ fn without_bos(text: &str, bos_text: &str) -> String {
 /// The one preamble the prompts share, as token ids and text.
 fn request_preamble(
     context: &PlanningContext,
-    prompts: &[quail_physical::Prompt],
+    prompts: &[crate::physical::Prompt],
 ) -> Result<(Vec<i64>, String), CompileError> {
     let mut preambles: Vec<Vec<i64>> = Vec::new();
     for prompt in prompts {
