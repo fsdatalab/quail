@@ -610,7 +610,7 @@ def main():
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
-        scale_factor=args.scale_factor,
+        scale_factor=args.sf,
         config=quail.EngineConfig(
             gpus=args.gpus,
             model=args.model,
